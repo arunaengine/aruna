@@ -20,7 +20,7 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
-use aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
+use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncEvictedDocument,
     DocumentSyncNetEvent, DocumentSyncOutboxEvent, DocumentSyncPublish,
@@ -83,7 +83,6 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::dht::constants::MAX_CLOCK_SKEW_SECS;
 use crate::error::{NetError, Result};
 use crate::streams::BiStream;
 
@@ -3392,6 +3391,7 @@ fn overlay_realm_authorization_assignment_reducer_materialization(
 fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
+    now: u64,
 ) {
     if !reducer_state
         .conflicts
@@ -3436,7 +3436,7 @@ fn overlay_realm_config_reducer_materialization(
 
     // Union, so a locally accepted revocation is never dropped because the
     // replicated set has not carried it yet.
-    config.merge_revocations(reducer_state, unix_timestamp_secs());
+    config.merge_revocations(reducer_state, now);
 
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
@@ -3479,6 +3479,7 @@ fn overlay_realm_config_reducer_materialization(
 fn realm_config_from_reducer_materialization(
     realm_id: RealmId,
     reducer_state: &AdminDocumentReducerState,
+    now: u64,
 ) -> Option<RealmConfigDocument> {
     let metadata_replication = reducer_state.materialized_realm_config_metadata_replication()?;
     let discovery = reducer_state.materialized_realm_config_discovery()?;
@@ -3505,7 +3506,7 @@ fn realm_config_from_reducer_materialization(
         band_pools: Vec::new(),
         revoked_tokens: Vec::new(),
     };
-    overlay_realm_config_reducer_materialization(&mut config, reducer_state);
+    overlay_realm_config_reducer_materialization(&mut config, reducer_state, now);
     Some(config)
 }
 
@@ -3842,6 +3843,30 @@ async fn persist_stale_admin_document_event(
             .await?;
             Ok(true)
         }
+    }
+}
+
+async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<()> {
+    match storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted })
+            if aborted == txn_id =>
+        {
+            Ok(())
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while aborting transaction: {other:?}"
+        ))),
+    }
+}
+
+async fn abort_error(storage: &StorageHandle, txn_id: TxnId, error: NetError) -> NetError {
+    match abort_txn(storage, txn_id).await {
+        Ok(()) => error,
+        Err(abort) => NetError::Dht(format!("{error}; transaction abort failed: {abort}")),
     }
 }
 
@@ -4323,72 +4348,195 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         ));
     }
 
+    let is_revocation = matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    );
+    if event.origin_node_id != event.actor.node_id
+        || event.actor.realm_id != realm_id
+        || event.actor.user_id.realm_id != realm_id
+    {
+        return Err(NetError::Bootstrap(
+            "realm config event actor and origin do not match the target realm".to_string(),
+        ));
+    }
+
     for _ in 0..3 {
+        let raw_now = unix_timestamp_secs();
         let txn_id = start_storage_transaction(storage).await?;
-        let previous_state = storage_read_from_transaction(
+        let previous_state = match storage_read_from_transaction(
             storage,
             ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
             admin_document_reducer_state_key(&event.target),
             Some(txn_id),
         )
-        .await?
-        .map(|bytes| decode_admin_document_reducer_state(&bytes))
-        .transpose()
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        let previous_config = storage_read_from_transaction(
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| decode_admin_document_reducer_state(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        let previous_config = match storage_read_from_transaction(
             storage,
             document_target.storage_keyspace().to_string(),
             document_target.storage_key(),
             Some(txn_id),
         )
-        .await?
-        .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-        .transpose()
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
 
+        if is_revocation {
+            let valid = previous_config.as_ref().is_some_and(|config| {
+                config.realm_id == realm_id && config.has_node(event.origin_node_id)
+            });
+            if !valid {
+                return Err(
+                    abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(
+                            "revocation origin is not an onboarded realm node in the transaction snapshot"
+                                .to_string(),
+                        ),
+                    )
+                    .await,
+                );
+            }
+            if let AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash,
+                expires_at,
+                token_owner,
+            } = &event.op
+                && (!aruna_core::auth::valid_token_hash(token_hash)
+                    || !valid_revocation_expiry(*expires_at, raw_now)
+                    || token_owner.is_nil()
+                    || token_owner.realm_id != realm_id)
+            {
+                return Err(abort_error(
+                    storage,
+                    txn_id,
+                    NetError::Bootstrap(
+                        "replicated revocation has invalid hash, expiry, or owner".to_string(),
+                    ),
+                )
+                .await);
+            }
+        }
+
+        let effective_now = previous_state
+            .as_ref()
+            .map_or(raw_now, |state| state.revocation_floor.max(raw_now));
         let mut reducer_state = previous_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-        reducer_state
-            .apply(&event)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        reducer_state.compact_revocations(unix_timestamp_secs());
+        let apply_status = match reducer_state.apply(&event) {
+            Ok(status) => status,
+            Err(error) => {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        };
+        reducer_state.compact_revocations(effective_now);
 
-        let mut writes = Vec::new();
+        let mut config_changed = false;
         let config = match previous_config {
             Some(mut config) => {
                 if config.realm_id != realm_id {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
-                    return Err(NetError::Bootstrap(format!(
-                        "stored realm config document id {realm_id} does not match payload realm id {}",
-                        config.realm_id
-                    )));
+                    return Err(
+                        abort_error(
+                            storage,
+                            txn_id,
+                            NetError::Bootstrap(format!(
+                                "stored realm config document id {realm_id} does not match payload realm id {}",
+                                config.realm_id
+                            )),
+                        )
+                        .await,
+                    );
                 }
-                overlay_realm_config_reducer_materialization(&mut config, &reducer_state);
+                let before = config.clone();
+                overlay_realm_config_reducer_materialization(
+                    &mut config,
+                    &reducer_state,
+                    effective_now,
+                );
+                config_changed = config != before;
                 Some(config)
             }
-            None => realm_config_from_reducer_materialization(realm_id, &reducer_state),
+            None => {
+                let config = realm_config_from_reducer_materialization(
+                    realm_id,
+                    &reducer_state,
+                    effective_now,
+                );
+                config_changed = config.is_some();
+                config
+            }
         };
+        if matches!(apply_status, AdminDocumentApplyStatus::Duplicate)
+            && previous_state
+                .as_ref()
+                .is_some_and(|previous| previous == &reducer_state)
+            && !config_changed
+        {
+            abort_txn(storage, txn_id).await?;
+            return Ok(());
+        }
+
+        let mut writes = Vec::new();
         if let Some(config) = config {
+            let bytes = match config.to_bytes(&event.actor) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
             writes.push((
                 document_target.storage_keyspace().to_string(),
                 document_target.storage_key(),
-                config
-                    .to_bytes(&event.actor)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                    .into(),
+                bytes.into(),
             ));
         }
-        writes.push(
-            admin_document_reducer_state_write_entry(&reducer_state)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-        );
-        writes.extend(
-            admin_document_conflict_write_entries(&reducer_state)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-        );
+        let reducer_write = match admin_document_reducer_state_write_entry(&reducer_state) {
+            Ok(write) => write,
+            Err(error) => {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        };
+        writes.push(reducer_write);
+        let conflict_writes = match admin_document_conflict_write_entries(&reducer_state) {
+            Ok(writes) => writes,
+            Err(error) => {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        };
+        writes.extend(conflict_writes);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             previous_state.as_ref(),
@@ -4406,16 +4554,9 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             Err(NetError::Dht(message))
                 if message == StorageError::TransactionConflict.to_string() =>
             {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                abort_txn(storage, txn_id).await?;
             }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
         }
     }
     Err(NetError::Dht(
@@ -5712,12 +5853,9 @@ async fn validate_realm_config_admin_authority(
                 reason: "current realm config is unavailable".to_string(),
             });
         };
-        if !matches!(
-            configured_node_kind(config, &event.origin_node_id),
-            Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server)
-        ) {
+        if !config.has_node(event.origin_node_id) {
             return Ok(AdminEventValidation::Rejected(
-                "revocation event origin is not a current management or server node".to_string(),
+                "revocation event origin is not a current realm node".to_string(),
             ));
         }
         return Ok(AdminEventValidation::Accepted);
@@ -6690,11 +6828,6 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
     Ok(iroh::EndpointAddr::from(endpoint_id))
 }
 
-fn valid_revocation_expiry(expires_at: u64, now: u64) -> bool {
-    expires_at.saturating_sub(now)
-        <= MAX_BEARER_TOKEN_LIFETIME_SECS.saturating_add(MAX_CLOCK_SKEW_SECS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6704,6 +6837,7 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use aruna_core::alpn::Alpn;
+    use aruna_core::auth::{MAX_BEARER_TOKEN_LIFETIME_SECS, REVOCATION_GRACE_SECS};
     use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
@@ -6799,11 +6933,117 @@ mod tests {
     fn revocation_expiry_bound() {
         // The shared admission window bounds replicated reducer retention.
         let now = 1_000;
-        let bound = now + MAX_BEARER_TOKEN_LIFETIME_SECS + MAX_CLOCK_SKEW_SECS;
+        let bound = now + MAX_BEARER_TOKEN_LIFETIME_SECS + REVOCATION_GRACE_SECS;
 
         assert!(valid_revocation_expiry(bound, now));
         assert!(!valid_revocation_expiry(bound + 1, now));
         assert!(!valid_revocation_expiry(u64::MAX, now));
+    }
+
+    #[test]
+    fn floor_stays_monotonic() {
+        // A clock rollback must not resurrect compacted revocation paths.
+        let realm_id = RealmId::from_bytes([75; 32]);
+        let actor = test_actor(
+            44,
+            UserId::local(Ulid::from_parts(1_800, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let token_hash = aruna_core::auth::bearer_token_hash("floor-token");
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        state
+            .apply(&test_admin_event(
+                Ulid::from_parts(1_801, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at: 10_000,
+                    token_owner: actor.user_id,
+                },
+            ))
+            .expect("revocation applies");
+
+        state.compact_revocations(10_000);
+        state.compact_revocations(9_999);
+
+        assert_eq!(state.revocation_floor, 10_000);
+        assert!(
+            state
+                .materialized_revoked_tokens()
+                .contains_key(&token_hash)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_state_aborts() {
+        // A decode failure after transaction start must release the snapshot.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([76; 32]);
+        let actor = test_actor(
+            45,
+            UserId::local(Ulid::from_parts(1_810, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                admin_document_reducer_state_key(&target),
+                vec![0xff].into(),
+            )],
+        )
+        .await
+        .expect("malformed state writes");
+
+        assert!(
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(1_811, 1),
+                    target.clone(),
+                    &actor,
+                    1,
+                    AdminDocumentOperation::RealmConfigSettingsSet {
+                        metadata_replication: MetadataReplicationConfig::new(3),
+                        discovery: test_discovery(27, "https://abort.example:443"),
+                    },
+                ),
+            )
+            .await
+            .is_err()
+        );
+        storage_batch_delete_to(
+            &storage,
+            vec![(
+                ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                admin_document_reducer_state_key(&target),
+            )],
+        )
+        .await
+        .expect("malformed state deletes");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(1_812, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(27, "https://abort.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("valid state applies after abort");
     }
 
     #[tokio::test]
@@ -7754,7 +7994,7 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.default_strategy_id = Some(prior_default);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state);
+        overlay_realm_config_reducer_materialization(&mut config, &state, unix_timestamp_secs());
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -7787,7 +8027,7 @@ mod tests {
         );
         assert_eq!(state.materialized_realm_config_default_strategy(), None);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state);
+        overlay_realm_config_reducer_materialization(&mut config, &state, unix_timestamp_secs());
         assert_eq!(config.default_strategy_id, None);
     }
 
@@ -8066,9 +8306,26 @@ mod tests {
         .await
         .expect("settings bootstrap the config doc");
 
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_631, 2),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: actor.node_id,
+                    kind: RealmNodeKind::Server,
+                },
+            ),
+        )
+        .await
+        .expect("realm node bootstraps revocation authority");
+
         let token_hash = aruna_core::auth::bearer_token_hash("replicated-token");
         let expires_at = unix_timestamp_secs() + 600;
-        for (index, seq) in [(1_632u64, 2u64), (1_633, 3)] {
+        for (index, seq) in [(1_632u64, 3u64), (1_633, 4)] {
             apply_admin_document_operation_to_storage(
                 &storage,
                 document_target.clone(),
@@ -8094,9 +8351,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unauthorized_revocation() {
-        // A signed event from an eligible node carries the publisher's admission;
-        // a User node is not eligible to publish revocations.
+    async fn accepts_user_origin() {
+        // Onboarded node kind changes must not make event arrival order diverge.
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([61; 32]);
         let attacker = test_actor(
@@ -8151,6 +8407,36 @@ mod tests {
             AdminEventValidation::Accepted
         );
 
+        let long_event = test_admin_event(
+            Ulid::from_parts(1_654, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &attacker,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("long-token"),
+                expires_at: unix_timestamp_secs()
+                    + MAX_BEARER_TOKEN_LIFETIME_SECS
+                    + REVOCATION_GRACE_SECS
+                    + 1,
+                token_owner: attacker.user_id,
+            },
+        );
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &long_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("long expiry validation runs"),
+            AdminEventValidation::Rejected(reason)
+                if reason == "revoked bearer token expiry exceeds the admission window"
+        ));
+
         config.nodes[0].kind = RealmNodeKind::User;
         storage_batch_write_to(
             &storage,
@@ -8186,11 +8472,17 @@ mod tests {
                 &PlacementRef::NIL,
             )
             .await
-            .expect("ineligible origin validation runs"),
-            AdminEventValidation::Rejected(
-                "revocation event origin is not a current management or server node".to_string(),
-            )
+            .expect("onboarded user origin validation runs"),
+            AdminEventValidation::Accepted
         );
+        apply_admin_document_operation_to_storage(&storage, config_target.clone(), user_event)
+            .await
+            .expect("onboarded user revocation applies");
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(config.token_revoked(
+            &aruna_core::auth::bearer_token_hash("owned-token"),
+            unix_timestamp_secs()
+        ));
     }
 
     #[tokio::test]
@@ -8224,12 +8516,29 @@ mod tests {
         .await
         .expect("settings bootstrap the config doc");
 
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_641, 2),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: actor.node_id,
+                    kind: RealmNodeKind::Server,
+                },
+            ),
+        )
+        .await
+        .expect("realm node bootstraps revocation authority");
+
         let expired = aruna_core::auth::bearer_token_hash("expired-token");
         let live = aruna_core::auth::bearer_token_hash("live-token");
         let now = unix_timestamp_secs();
         for (index, seq, token_hash, expires_at) in [
-            (1_642u64, 2u64, expired.clone(), now - 1),
-            (1_643, 3, live.clone(), now + 600),
+            (1_642u64, 3u64, expired.clone(), now - 1),
+            (1_643, 4, live.clone(), now + 600),
         ] {
             apply_admin_document_operation_to_storage(
                 &storage,
@@ -8283,7 +8592,9 @@ mod tests {
         );
         let token_hash = aruna_core::auth::bearer_token_hash("redundant-token");
         let expires_at = unix_timestamp_secs() + 600;
-        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let mut seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        seed_config.ensure_node(actor_a.node_id, RealmNodeKind::Server);
+        seed_config.ensure_node(actor_b.node_id, RealmNodeKind::Server);
         storage_batch_write_to(
             &storage,
             vec![target_write_entry(
@@ -8307,7 +8618,7 @@ mod tests {
                 token_owner: actor_a.user_id,
             },
         );
-        apply_admin_document_operation_to_storage(&storage, document_target.clone(), first)
+        apply_admin_document_operation_to_storage(&storage, document_target.clone(), first.clone())
             .await
             .expect("first revocation applies");
         let config_key = document_target.storage_key();
@@ -8318,6 +8629,19 @@ mod tests {
         )
         .await
         .expect("config exists after first revocation");
+        apply_admin_document_operation_to_storage(&storage, document_target.clone(), first)
+            .await
+            .expect("duplicate revocation applies");
+        assert_eq!(
+            before,
+            read_storage_value(
+                &storage,
+                document_target.storage_keyspace(),
+                document_target.storage_key(),
+            )
+            .await
+            .expect("config exists after duplicate revocation")
+        );
 
         let second = test_admin_event(
             Ulid::from_parts(1_693, 1),
