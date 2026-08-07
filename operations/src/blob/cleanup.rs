@@ -28,41 +28,46 @@ const CLEANUP_PAGE_SIZE: usize = 128;
 
 /// A cleanup row an operation has emitted but storage has not yet accepted.
 /// The row is the only durable record that the written object exists, so the
-/// work is held until the write succeeds and retried once when it does not.
+/// work is held until the write succeeds.
 #[derive(Debug, Default, PartialEq)]
 pub struct PendingCleanup {
     work: Option<BlobCleanupWork>,
-    retried: bool,
+    key: Option<Key>,
+    channel_closed: bool,
 }
 
 impl PendingCleanup {
     /// The write effect for one row. `None` means the row will never encode,
     /// leaving the caller with the failure it already carries.
     pub fn queue(&mut self, work: BlobCleanupWork) -> Option<Effect> {
-        let effect = cleanup_row_write(&work)?;
+        let key = cleanup_row_key(&work);
+        let effect = cleanup_row_write(&work, &key)?;
         self.work = Some(work);
+        self.key = Some(key);
+        self.channel_closed = false;
         Some(effect)
     }
 
     pub fn accepted(&mut self) {
         self.work = None;
+        self.key = None;
     }
 
-    /// One retry, then the object is logged: after that nothing but this line
-    /// names the bytes that were written.
+    /// Re-emit one write per temporary rejection; the caller remains queued.
     pub fn retry(&mut self, error: &StorageError) -> Option<Effect> {
-        let work = self.work.take()?;
-        if self.retried {
-            log_refused_row(&work, error);
+        if self.channel_closed {
             return None;
         }
-        self.retried = true;
-        self.queue(work)
+        if matches!(error, StorageError::ChannelClosed) {
+            self.channel_closed = true;
+            return None;
+        }
+        cleanup_row_write(self.work.as_ref()?, self.key.as_ref()?)
     }
 }
 
-fn cleanup_row_write(work: &BlobCleanupWork) -> Option<Effect> {
-    let key = match work {
+fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
+    match work {
         BlobCleanupWork::ReconcileWrite { location, .. } => {
             location.ulid.to_bytes().to_vec().into()
         }
@@ -71,11 +76,14 @@ fn cleanup_row_write(work: &BlobCleanupWork) -> Option<Effect> {
         | BlobCleanupWork::ReconcileReservation { .. } => {
             Ulid::generate().to_bytes().to_vec().into()
         }
-    };
+    }
+}
+
+fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
     match work.to_bytes() {
         Ok(bytes) => Some(Effect::Storage(StorageEffect::Write {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key,
+            key: key.clone(),
             value: bytes.into(),
             txn_id: None,
         })),
@@ -84,22 +92,6 @@ fn cleanup_row_write(work: &BlobCleanupWork) -> Option<Effect> {
             None
         }
     }
-}
-
-fn log_refused_row(work: &BlobCleanupWork, error: &StorageError) {
-    let Some(location) = work.location() else {
-        warn!(error = %error, "Blob cleanup row could not be queued");
-        return;
-    };
-    error!(
-        event = "blob.cleanup.row_refused",
-        backend = %location.backend,
-        storage_bucket = %location.storage_bucket,
-        backend_path = %location.backend_path,
-        blob_size = location.blob_size,
-        error = %error,
-        "Cleanup row refused; the written object is named nowhere else"
-    );
 }
 
 pub fn schedule_blob_cleanup_effect() -> Effect {
@@ -410,17 +402,16 @@ mod tests {
     }
 
     #[test]
-    fn retries_refused_row() {
-        // The row is the only durable record of the written bytes, so it is
-        // held until storage accepts it and retried once when it does not.
+    fn retains_refused_row() {
+        // A temporary storage rejection must not discard the only location.
         let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
         let error = aruna_core::errors::StorageError::QueueFull;
         let mut pending = PendingCleanup::default();
 
-        assert!(pending.queue(work).is_some());
-        assert!(pending.retry(&error).is_some());
-        assert!(pending.retry(&error).is_none());
-        assert!(pending.retry(&error).is_none());
+        let first = pending.queue(work).unwrap();
+        assert_eq!(pending.retry(&error), Some(first));
+        let first = pending.retry(&error).unwrap();
+        assert_eq!(pending.retry(&error), Some(first));
 
         let mut pending = PendingCleanup::default();
         assert!(
@@ -430,6 +421,22 @@ mod tests {
         );
         pending.accepted();
         assert!(pending.retry(&error).is_none());
+    }
+
+    #[test]
+    fn closed_retry_stops() {
+        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
+        let mut pending = PendingCleanup::default();
+        assert!(pending.queue(work).is_some());
+
+        assert_eq!(
+            pending.retry(&aruna_core::errors::StorageError::ChannelClosed),
+            None
+        );
+        assert_eq!(
+            pending.retry(&aruna_core::errors::StorageError::Timeout),
+            None
+        );
     }
 
     fn group_delete_work() -> Vec<u8> {
