@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_alias_page_over_limit() {
+    fn rejects_alias_overflow() {
         let mut op = ResolveBlobPermissionPathsOperation::new([10u8; 32]);
         op.start();
         op.step(Event::Storage(StorageEvent::TransactionStarted {

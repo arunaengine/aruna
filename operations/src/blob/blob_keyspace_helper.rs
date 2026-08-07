@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_hash_page_sets_limit() {
+    fn checks_page_limit() {
         let Effect::Storage(StorageEffect::Iter { limit, .. }) =
             iter_hash_page(&[7u8; 32], None, None, 1024).unwrap()
         else {
