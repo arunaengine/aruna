@@ -13,9 +13,9 @@ use aruna_core::storage_entries::{
     watch_subscription_write_entry,
 };
 use aruna_core::structs::{
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef, RealmId,
-    WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_subscription_key,
-    watch_subscription_prefix,
+    AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef,
+    RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    parse_watch_subscription_key, watch_subscription_prefix,
 };
 use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
@@ -26,9 +26,7 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::driver::DriverContext;
-use crate::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_authorization,
-};
+use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
@@ -43,11 +41,15 @@ pub const WATCH_SUBSCRIPTION_CAP_REACHED: &str = "notification watch subscriptio
 /// holder proxy to surface a 403 to the API layer.
 pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
     "watch subscription owner lacks READ on the watched path";
+pub const WATCH_SUBSCRIPTION_UNAVAILABLE: &str =
+    "watch subscription authorization is temporarily unavailable";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WatchSubscriptionError {
     #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
     Unauthorized(WatchAuthorizationMetricReason),
+    #[error("{WATCH_SUBSCRIPTION_UNAVAILABLE}: {0}")]
+    AuthorizationUnavailable(String),
     #[error("watch path prefix must not be empty")]
     EmptyPrefix,
     #[error("watch path prefix must not start with a slash")]
@@ -108,13 +110,16 @@ pub async fn create_replicated_watch_subscription(
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     let subscription =
         validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
-    match evaluate_watch_authorization(
+    match evaluate_watch_creation(
         context,
         owner.realm_id,
-        owner,
+        &AuthContext {
+            user_id: owner,
+            realm_id: owner.realm_id,
+            path_restrictions: None,
+        },
         &subscription.path_prefix,
         subscription.event_mask,
-        &subscription.authorization,
     )
     .await
     .map_err(WatchSubscriptionError::Storage)?
@@ -123,10 +128,8 @@ pub async fn create_replicated_watch_subscription(
         WatchAuthorization::Denied(reason) => {
             return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
         }
-        WatchAuthorization::Unavailable(_) => {
-            return Err(WatchSubscriptionError::Unauthorized(
-                WatchAuthorizationMetricReason::AuthorizationUnavailable,
-            ));
+        WatchAuthorization::Unavailable(error) => {
+            return Err(WatchSubscriptionError::AuthorizationUnavailable(error));
         }
     }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;

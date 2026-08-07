@@ -17,7 +17,8 @@ use crate::notifications::inbox::{
 use crate::notifications::placement::filter_locally_held_watch_subscriptions;
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_authorization, evaluate_watch_event_authorization,
+    WatchAuthorization, evaluate_watch_authorization, evaluate_watch_delivery,
+    evaluate_watch_event_authorization,
 };
 use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 
@@ -199,7 +200,7 @@ async fn stage_watch_expansion(
     let mut records = Vec::new();
     let mut dropped = false;
     for (subscription, event, routed) in candidates {
-        match evaluate_watch_authorization(
+        match evaluate_watch_delivery(
             context,
             realm_id,
             subscription.owner,

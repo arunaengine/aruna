@@ -317,8 +317,8 @@ pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
 /// proxied exactly like a notification inbox record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchAuthorizationBinding {
-    /// Legacy creating-token fields retained for stored postcard compatibility.
-    /// Delivery authorization is based only on the owner's current permissions.
+    /// Creation metadata is validated at every holder boundary; current owner
+    /// policy remains authoritative for delivery.
     pub token_hash: String,
     pub expires_at_secs: u64,
     pub path_restrictions: Option<Vec<PathRestriction>>,
@@ -333,11 +333,7 @@ impl WatchAuthorizationBinding {
                 .token_hash
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            && self
-                .path_restrictions
-                .iter()
-                .flatten()
-                .all(|restriction| globset::Glob::new(&restriction.pattern).is_ok())
+            && self.path_restrictions.is_none()
     }
 }
 
@@ -1008,6 +1004,13 @@ mod tests {
         let mut binding = WatchAuthorizationBinding::default();
         assert!(binding.is_valid());
         binding.token_hash.make_ascii_uppercase();
+        assert!(!binding.is_valid());
+    }
+
+    #[test]
+    fn rejects_binding_scope() {
+        let mut binding = WatchAuthorizationBinding::default();
+        binding.path_restrictions = Some(Vec::new());
         assert!(!binding.is_valid());
     }
 

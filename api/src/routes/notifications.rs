@@ -1,6 +1,5 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission_with, require_realm_auth,
-    require_unrestricted_realm_auth,
+    ValidatedArunaBearerTokenCarrier, ensure_permission_with, require_unrestricted_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
@@ -990,7 +989,7 @@ pub async fn create_watch(
     Extension(_bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     if request.path_prefix.is_empty()
         || request.path_prefix.starts_with('/')
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
@@ -2312,7 +2311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_creation_honors_path_restricted_token() {
+    async fn rejects_restricted_watch() {
         let realm_id = realm_id(9);
         let holder = node(9);
         let (_dir, state) = build_state(realm_id, holder).await;
@@ -2331,7 +2330,7 @@ mod tests {
             .expect_err("delegated token must be rejected");
         assert!(matches!(list_err, ServerError::Forbidden));
 
-        let _ = create_watch(
+        let create_err = create_watch(
             State(state.clone()),
             Extension(Some(auth.clone())),
             bearer(),
@@ -2341,19 +2340,7 @@ mod tests {
             }),
         )
         .await
-        .expect("delegated token may watch its allowed prefix");
-
-        let create_err = create_watch(
-            State(state.clone()),
-            Extension(Some(auth.clone())),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: data_watch_resource_path(group_id, holder, "bucket", "private/"),
-                events: vec!["data_uploaded".to_string()],
-            }),
-        )
-        .await
-        .expect_err("delegated token must not watch outside its prefix");
+        .expect_err("delegated token must be rejected");
         assert!(matches!(create_err, ServerError::Forbidden));
 
         let delete_err = delete_watch(

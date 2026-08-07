@@ -34,8 +34,8 @@ use crate::notifications::watch::interest::{
     mark_watch_interest_dirty, schedule_watch_interest_publish,
 };
 use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_UNAUTHORIZED, create_replicated_watch_subscription,
-    delete_replicated_watch_subscription,
+    WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
+    create_replicated_watch_subscription, delete_replicated_watch_subscription,
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -196,11 +196,9 @@ async fn build_response(
                     ));
                 }
                 Ok(WatchAuthorization::Unavailable(_)) => {
-                    return NotificationTransportMessage::Reject(format!(
-                        "{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}",
-                        aruna_core::metrics::WatchAuthorizationMetricReason::AuthorizationUnavailable
-                            .as_str()
-                    ));
+                    return NotificationTransportMessage::Reject(
+                        WATCH_SUBSCRIPTION_UNAVAILABLE.to_string(),
+                    );
                 }
                 Err(error) => return NotificationTransportMessage::Reject(error),
             }
@@ -1549,7 +1547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_restriction_ignored() {
+    async fn restricted_binding_hidden() {
         let (a, b, recipient) = delivery_pair(80).await;
         install_watch_authorization(&b, recipient.realm_id, recipient, &[]).await;
         let mut watch = watch_record(recipient, 2);
@@ -1569,12 +1567,12 @@ mod tests {
         }]);
         seed_inbox(&b, &[watch.clone()]).await;
 
-        assert_eq!(
+        assert!(
             list_remote(&a.net, b.net.node_id(), recipient, None, 10)
                 .await
-                .expect("list with a legacy token restriction")
-                .0,
-            vec![watch]
+                .expect("list with restricted binding")
+                .0
+                .is_empty()
         );
     }
 

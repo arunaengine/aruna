@@ -28,8 +28,9 @@ use crate::notifications::watch::authorization::{
 };
 use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED, WatchSubscriptionError,
-    create_replicated_watch_subscription, delete_replicated_watch_subscription,
+    WATCH_SUBSCRIPTION_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED,
+    WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_replicated_watch_subscription,
+    delete_replicated_watch_subscription,
 };
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
@@ -384,6 +385,7 @@ pub async fn create_watch_for_user(
             WatchSubscriptionError::Unauthorized(reason) => {
                 WatchDispatchError::Unauthorized(reason)
             }
+            WatchSubscriptionError::AuthorizationUnavailable(_) => WatchDispatchError::Unavailable,
             other => WatchDispatchError::Internal(other.to_string()),
         })?;
         schedule_watch_interest_publish(context).await;
@@ -411,6 +413,8 @@ pub async fn create_watch_for_user(
                 .and_then(WatchAuthorizationMetricReason::parse)
             {
                 WatchDispatchError::Unauthorized(reason)
+            } else if reason.starts_with(WATCH_SUBSCRIPTION_UNAVAILABLE) {
+                WatchDispatchError::Unavailable
             } else {
                 WatchDispatchError::Remote(reason)
             }

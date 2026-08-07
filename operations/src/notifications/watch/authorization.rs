@@ -17,10 +17,13 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::driver::{DriverContext, drive};
 use crate::notifications::placement::filter_locally_held_watch_subscriptions;
 use crate::notifications::watch::subscriptions::list_watch_subscriptions;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::request_policy::{
+    PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
+};
 
 const WATCH_CREATE_OPERATION: &str = "notifications.create_watch";
+const WATCH_LIST_OPERATION: &str = "notifications.list_watches";
+const WATCH_DELIVERY_OPERATION: &str = "notifications.deliver_watch";
 
 pub struct AuthorizedWatchSubscriptions {
     pub subscriptions: Vec<WatchSubscription>,
@@ -132,8 +135,54 @@ pub async fn evaluate_watch_authorization(
     owner: UserId,
     path_prefix: &str,
     event_mask: WatchEventMask,
-    _authorization: &WatchAuthorizationBinding,
+    authorization: &WatchAuthorizationBinding,
 ) -> Result<WatchAuthorization, String> {
+    evaluate_watch_scope(
+        context,
+        realm_id,
+        owner,
+        path_prefix,
+        event_mask,
+        authorization,
+        WATCH_LIST_OPERATION,
+    )
+    .await
+}
+
+pub async fn evaluate_watch_delivery(
+    context: &DriverContext,
+    realm_id: RealmId,
+    owner: UserId,
+    path_prefix: &str,
+    event_mask: WatchEventMask,
+    authorization: &WatchAuthorizationBinding,
+) -> Result<WatchAuthorization, String> {
+    evaluate_watch_scope(
+        context,
+        realm_id,
+        owner,
+        path_prefix,
+        event_mask,
+        authorization,
+        WATCH_DELIVERY_OPERATION,
+    )
+    .await
+}
+
+async fn evaluate_watch_scope(
+    context: &DriverContext,
+    realm_id: RealmId,
+    owner: UserId,
+    path_prefix: &str,
+    event_mask: WatchEventMask,
+    authorization: &WatchAuthorizationBinding,
+    operation: &str,
+) -> Result<WatchAuthorization, String> {
+    if !authorization.is_valid() {
+        return Ok(WatchAuthorization::Denied(
+            WatchAuthorizationDenial::InvalidState,
+        ));
+    }
     let Some(permission_path) = watch_permission_path(realm_id, path_prefix, event_mask) else {
         return Ok(WatchAuthorization::Denied(
             WatchAuthorizationDenial::InvalidState,
@@ -148,6 +197,7 @@ pub async fn evaluate_watch_authorization(
             path_restrictions: None,
         },
         permission_path,
+        operation,
     )
     .await
 }
@@ -164,7 +214,14 @@ pub async fn evaluate_watch_creation(
             WatchAuthorizationDenial::InvalidState,
         ));
     };
-    evaluate_permission_path(context, realm_id, auth_context.clone(), permission_path).await
+    evaluate_permission_path(
+        context,
+        realm_id,
+        auth_context.clone(),
+        permission_path,
+        WATCH_CREATE_OPERATION,
+    )
+    .await
 }
 
 pub async fn authorize_forwarded_watch(
@@ -198,26 +255,14 @@ pub async fn authorize_forwarded_watch(
         realm_id,
         path_restrictions: None,
     };
-    match authorize(
+    evaluate_permission_path(
         context,
         realm_id,
-        &auth_context,
-        &permission_path,
-        &Permission::READ,
-        PolicyRequestExtras::operation(WATCH_CREATE_OPERATION),
+        auth_context,
+        permission_path,
+        WATCH_CREATE_OPERATION,
     )
     .await
-    {
-        Ok(()) => Ok(WatchAuthorization::Authorized),
-        Err(AuthorizeError::PermissionDenied)
-        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(
-            WatchAuthorization::Denied(WatchAuthorizationDenial::PermissionDenied),
-        ),
-        Err(AuthorizeError::Policy(PolicyEnforcementError::Unavailable(error))) => {
-            Ok(WatchAuthorization::Unavailable(error))
-        }
-        Err(AuthorizeError::CheckFailed(error)) => Err(error),
-    }
 }
 
 async fn evaluate_permission_path(
@@ -225,6 +270,7 @@ async fn evaluate_permission_path(
     realm_id: RealmId,
     auth_context: AuthContext,
     permission_path: String,
+    operation: &str,
 ) -> Result<WatchAuthorization, String> {
     if auth_context.user_id.is_nil()
         || auth_context.user_id.realm_id != realm_id
@@ -234,20 +280,22 @@ async fn evaluate_permission_path(
             WatchAuthorizationDenial::InvalidOwner,
         ));
     }
-    match drive(
+    if auth_context.path_restrictions.is_some() {
+        return Ok(WatchAuthorization::Denied(
+            WatchAuthorizationDenial::TokenRestricted,
+        ));
+    }
+    let allowed = match drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context,
-            path: permission_path,
+            auth_context: auth_context.clone(),
+            path: permission_path.clone(),
             required_permission: Permission::READ,
         }),
         context,
     )
     .await
     {
-        Ok(true) => Ok(WatchAuthorization::Authorized),
-        Ok(false) => Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::PermissionDenied,
-        )),
+        Ok(allowed) => allowed,
         // A path whose realm, group or authorization state is absent is simply
         // unreadable. Answering it exactly as a denied role keeps a watch from
         // separating "does not exist" from "you may not read it", which is the
@@ -258,17 +306,47 @@ async fn evaluate_permission_path(
             | AuthorizationError::InvalidGroupId
             | AuthorizationError::GroupNotFound
             | AuthorizationError::AuthDocNotFound),
-        ) => Ok(WatchAuthorization::Unavailable(error.to_string())),
-        Err(error) => Err(error.to_string()),
+        ) => return Ok(WatchAuthorization::Unavailable(error.to_string())),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !allowed {
+        return Ok(WatchAuthorization::Denied(
+            WatchAuthorizationDenial::PermissionDenied,
+        ));
+    }
+    match enforce_policies(
+        context,
+        realm_id,
+        &policy_request_with(
+            &permission_path,
+            &Permission::READ,
+            Some(&auth_context.user_id),
+            PolicyRequestExtras::operation(operation),
+        ),
+    )
+    .await
+    {
+        Ok(()) => Ok(WatchAuthorization::Authorized),
+        Err(PolicyEnforcementError::Denied { .. }) => Ok(WatchAuthorization::Denied(
+            WatchAuthorizationDenial::PermissionDenied,
+        )),
+        Err(PolicyEnforcementError::Unavailable(error)) => {
+            Ok(WatchAuthorization::Unavailable(error))
+        }
     }
 }
 
 pub async fn evaluate_watch_event_authorization(
     context: &DriverContext,
     owner: UserId,
-    _authorization: &WatchAuthorizationBinding,
+    authorization: &WatchAuthorizationBinding,
     event: &WatchEvent,
 ) -> Result<WatchAuthorization, String> {
+    if !authorization.is_valid() {
+        return Ok(WatchAuthorization::Denied(
+            WatchAuthorizationDenial::InvalidState,
+        ));
+    }
     let Some(permission_path) = watch_event_permission_path(event) else {
         return Ok(WatchAuthorization::Denied(
             WatchAuthorizationDenial::InvalidState,
@@ -283,6 +361,7 @@ pub async fn evaluate_watch_event_authorization(
             path_restrictions: None,
         },
         permission_path,
+        WATCH_DELIVERY_OPERATION,
     )
     .await
 }
@@ -363,6 +442,7 @@ pub async fn evaluate_watch_notification_authorization(
             path_restrictions: None,
         },
         permission_path,
+        WATCH_LIST_OPERATION,
     )
     .await
 }
