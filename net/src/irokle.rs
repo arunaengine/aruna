@@ -149,6 +149,7 @@ struct PublishEventsOutcome {
 struct PeerSelection {
     peers: BTreeSet<PeerId>,
     truncated: bool,
+    round: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -452,15 +453,9 @@ impl DocumentSyncService {
     /// reconcile skip arm), and ops not authored by the local node are rejected
     /// since an eviction is by construction the local node's own chain.
     pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
-        if let Err(error) = self
-            .fanout_cursors
-            .remove(topic_cursor_key(eviction.topic_id))
-        {
-            warn!(
-                %error,
-                topic_id = %eviction.topic_id,
-                "Failed to clear document sync fan-out cursor after topic reset"
-            );
+        self.clear_cursor(eviction.topic_id);
+        if let Err(error) = self.flush_database() {
+            warn!(%error, topic_id = %eviction.topic_id, "Failed to persist document sync fan-out cursor reset");
         }
         let local_peer = self.node.peer_id();
         let mut documents = Vec::new();
@@ -635,8 +630,11 @@ impl DocumentSyncService {
         let selection = self.sync_peer_selection(&peers, &topic_id)?;
         self.log_peer_selection(topic_id, &selection);
         self.allow_sync_peers(&selection.peers)?;
-        self.sync_topic(topic_id, selection).await?;
-        self.flush_database()
+        let round = selection.round;
+        let result = self.sync_topic(topic_id, selection).await;
+        self.advance_cursor(topic_id, round)?;
+        self.flush_database()?;
+        result
     }
 
     pub fn allow_document_sync_peers(
@@ -1051,7 +1049,21 @@ impl DocumentSyncService {
                         error: error.to_string(),
                     };
                 }
-                if let Err(error) = self.sync_topic(topic_id, selection).await {
+                let round = selection.round;
+                let result = self.sync_topic(topic_id, selection).await;
+                if let Err(error) = self.advance_cursor(topic_id, round) {
+                    return DocumentSyncNetEvent::Error {
+                        target: None,
+                        error: error.to_string(),
+                    };
+                }
+                if let Err(error) = result {
+                    if let Err(persist_error) = self.flush_database() {
+                        return DocumentSyncNetEvent::Error {
+                            target: None,
+                            error: persist_error.to_string(),
+                        };
+                    }
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -1060,6 +1072,9 @@ impl DocumentSyncService {
             }
             Ok(false) => {
                 if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &peers).await {
+                    if let Err(persist_error) = self.flush_database() {
+                        warn!(%persist_error, %topic_id, "Failed to persist document sync bootstrap cleanup");
+                    }
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -1103,6 +1118,7 @@ impl DocumentSyncService {
 
         let mut seen_topics = BTreeSet::new();
         let mut topic_ids_out: Vec<irokle_crate::TopicId> = Vec::new();
+        let mut bootstrap_cursor_dirty = false;
         for topic_id in topic_ids {
             if !seen_topics.insert(topic_id) {
                 continue;
@@ -1110,6 +1126,7 @@ impl DocumentSyncService {
             match self.has_topic(topic_id) {
                 Ok(true) => topic_ids_out.push(topic_id),
                 Ok(false) => {
+                    bootstrap_cursor_dirty = true;
                     // Join-only: an unknown topic whose genesis is nowhere to be
                     // found yet (e.g. an empty shard whose rank-0 holder has not
                     // created it) is skipped, not fatal — it arrives via gossip
@@ -1127,6 +1144,15 @@ impl DocumentSyncService {
                         error: error.to_string(),
                     };
                 }
+            }
+        }
+
+        if bootstrap_cursor_dirty {
+            if let Err(error) = self.flush_database() {
+                return DocumentSyncNetEvent::Error {
+                    target: None,
+                    error: error.to_string(),
+                };
             }
         }
 
@@ -1518,7 +1544,17 @@ impl DocumentSyncService {
     }
 
     fn next_sync_round(&self, topic_id: irokle_crate::TopicId) -> Result<u64> {
-        advance_cursor(&self.fanout_cursors, topic_id)
+        current_cursor(&self.fanout_cursors, topic_id)
+    }
+
+    fn advance_cursor(&self, topic_id: irokle_crate::TopicId, round: u64) -> Result<()> {
+        advance_cursor(&self.fanout_cursors, topic_id, round)
+    }
+
+    fn clear_cursor(&self, topic_id: irokle_crate::TopicId) {
+        if let Err(error) = remove_cursor(&self.fanout_cursors, topic_id) {
+            warn!(%error, %topic_id, "Failed to clear document sync fan-out cursor");
+        }
     }
 
     fn sync_peer_selection(
@@ -1682,24 +1718,37 @@ impl DocumentSyncService {
             return Ok(());
         }
         for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
-            let mut groups = BTreeMap::new();
+            let mut groups: BTreeMap<
+                BTreeSet<PeerId>,
+                (PeerSelection, Vec<(irokle_crate::TopicId, u64)>),
+            > = BTreeMap::new();
             for topic_id in chunk.iter().copied() {
                 let selection = self.sync_peer_selection(peers, &topic_id)?;
+                let round = selection.round;
                 let selected = selection.peers.clone();
                 if let Some((group, topics)) = groups.get_mut(&selected) {
                     group.truncated |= selection.truncated;
-                    topics.push(topic_id);
+                    topics.push((topic_id, round));
                 } else {
-                    groups.insert(selected, (selection, vec![topic_id]));
+                    groups.insert(selected, (selection, vec![(topic_id, round)]));
                 }
             }
             for (_, (selection, topics)) in groups {
-                let Some(topic_id) = topics.first() else {
+                let Some((topic_id, _)) = topics.first() else {
                     continue;
                 };
                 self.log_peer_selection(*topic_id, &selection);
                 self.allow_sync_peers(&selection.peers)?;
-                self.sync_topic_batch(&topics, selection).await?;
+                let topic_ids = topics
+                    .iter()
+                    .map(|(topic_id, _)| *topic_id)
+                    .collect::<Vec<_>>();
+                let result = self.sync_topic_batch(&topic_ids, selection).await;
+                for (topic_id, round) in topics {
+                    self.advance_cursor(topic_id, round)?;
+                }
+                self.flush_database()?;
+                result?;
             }
         }
         Ok(())
@@ -1873,7 +1922,25 @@ impl DocumentSyncService {
         let mut first_error = None;
         for peer in selection.peers {
             match self.bootstrap_topic_from_peer(topic_id, peer).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => match self.has_topic(topic_id) {
+                    Ok(true) => {
+                        self.advance_cursor(topic_id, selection.round)?;
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        let error = NetError::TopicNotReady(topic_id.to_string());
+                        warn!(%peer, %topic_id, "Document sync bootstrap peer has no topic");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%peer, %topic_id, error = %error, "Document sync bootstrap topic check failed");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                },
                 Err(error) => {
                     warn!(%peer, %topic_id, error = %error, "Document sync bootstrap attempt failed");
                     if first_error.is_none() {
@@ -1882,6 +1949,8 @@ impl DocumentSyncService {
                 }
             }
         }
+        // Advance after attempted peers so omitted candidates rotate into the next retry.
+        self.advance_cursor(topic_id, selection.round)?;
         Err(first_error.unwrap_or_else(|| {
             NetError::Bootstrap(format!(
                 "no peers available to bootstrap document sync topic {topic_id}"
@@ -5930,6 +5999,7 @@ fn select_sync_peers(
     PeerSelection {
         peers,
         truncated: candidate_count > selected,
+        round,
     }
 }
 
@@ -7054,13 +7124,32 @@ fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     ByteView::from(key)
 }
 
-fn advance_cursor(
+fn current_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
 ) -> Result<u64> {
-    let updated = cursors
+    let Some(value) = cursors
+        .get(topic_cursor_key(topic_id))
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+    else {
+        return Ok(0);
+    };
+    if value.len() != std::mem::size_of::<u64>() {
+        return Ok(0);
+    }
+    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+    bytes.copy_from_slice(value.as_ref());
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn advance_cursor(
+    cursors: &fjall::OptimisticTxKeyspace,
+    topic_id: irokle_crate::TopicId,
+    round: u64,
+) -> Result<()> {
+    cursors
         .update_fetch(topic_cursor_key(topic_id), |value| {
-            let current = value
+            let stored = value
                 .filter(|value| value.len() == std::mem::size_of::<u64>())
                 .map(|value| {
                     let mut bytes = [0u8; std::mem::size_of::<u64>()];
@@ -7068,24 +7157,24 @@ fn advance_cursor(
                     u64::from_be_bytes(bytes)
                 })
                 .unwrap_or_default();
-            Some(fjall::Slice::from(current.wrapping_add(1).to_be_bytes()))
+            if stored == round {
+                Some(fjall::Slice::from(round.wrapping_add(1).to_be_bytes()))
+            } else {
+                value.cloned()
+            }
         })
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let Some(updated) = updated else {
-        return Err(NetError::Bootstrap(
-            "document sync fan-out cursor update returned no value".to_string(),
-        ));
-    };
-    if updated.len() != std::mem::size_of::<u64>() {
-        return Err(NetError::Bootstrap(
-            "document sync fan-out cursor has invalid length".to_string(),
-        ));
-    }
-    let mut bytes = [0u8; std::mem::size_of::<u64>()];
-    bytes.copy_from_slice(updated.as_ref());
-    // Reserve the next slice before sending; failed or crashed attempts must
-    // not hold the same peers forever.
-    Ok(u64::from_be_bytes(bytes).wrapping_sub(1))
+    // Advance only after network attempts; a crash before persistence safely repeats them.
+    Ok(())
+}
+
+fn remove_cursor(
+    cursors: &fjall::OptimisticTxKeyspace,
+    topic_id: irokle_crate::TopicId,
+) -> Result<()> {
+    cursors
+        .remove(topic_cursor_key(topic_id))
+        .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
 fn deferred_topics_key() -> ByteView {
@@ -7621,7 +7710,8 @@ mod tests {
                     fjall::KeyspaceCreateOptions::default,
                 )
                 .expect("fanout cursor keyspace");
-            assert_eq!(advance_cursor(&cursors, topic_id).expect("first cursor"), 0);
+            assert_eq!(current_cursor(&cursors, topic_id).expect("first cursor"), 0);
+            advance_cursor(&cursors, topic_id, 0).expect("advance cursor");
             db.persist(fjall::PersistMode::SyncAll)
                 .expect("persist fanout cursor");
         }
@@ -7636,8 +7726,54 @@ mod tests {
             )
             .expect("reopen fanout cursor keyspace");
         assert_eq!(
-            advance_cursor(&cursors, topic_id).expect("restarted cursor"),
-            1,
+            current_cursor(&cursors, topic_id).expect("restarted cursor"),
+            1
+        );
+    }
+
+    #[test]
+    fn fanout_cursor_clear() {
+        // A topic reset can remove stale fan-out progress before re-emission.
+        let selection = select_sync_peers((1u8..=9).map(peer), peer(0), b"missing-topic", 0);
+        assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+        assert!(selection.truncated);
+        let root = TempDir::new().expect("fanout cursor clear tempdir");
+        let topic_id = topic(43);
+        {
+            let db = fjall::OptimisticTxDatabase::builder(root.path())
+                .manual_journal_persist(true)
+                .open()
+                .expect("fanout cursor clear database");
+            let cursors = db
+                .keyspace(
+                    DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                    fjall::KeyspaceCreateOptions::default,
+                )
+                .expect("fanout cursor clear keyspace");
+            advance_cursor(&cursors, topic_id, 0).expect("create fanout cursor");
+            assert!(
+                cursors
+                    .contains_key(topic_cursor_key(topic_id))
+                    .expect("find fanout cursor")
+            );
+            remove_cursor(&cursors, topic_id).expect("clear fanout cursor");
+            db.persist(fjall::PersistMode::SyncAll)
+                .expect("persist cleared fanout cursor");
+        }
+        let db = fjall::OptimisticTxDatabase::builder(root.path())
+            .manual_journal_persist(true)
+            .open()
+            .expect("reopen fanout cursor clear database");
+        let cursors = db
+            .keyspace(
+                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .expect("reopen fanout cursor clear keyspace");
+        assert!(
+            !cursors
+                .contains_key(topic_cursor_key(topic_id))
+                .expect("find cleared fanout cursor")
         );
     }
 
@@ -7675,6 +7811,7 @@ mod tests {
             PeerSelection {
                 peers: BTreeSet::from([selected]),
                 truncated: false,
+                round: 0,
             }
         });
 
@@ -12274,6 +12411,7 @@ mod tests {
         let selection = PeerSelection {
             peers: BTreeSet::from([ok_peer, failed_peer]),
             truncated: false,
+            round: 0,
         };
 
         let error = DocumentSyncService::fan_out_peer_syncs(
