@@ -3743,6 +3743,15 @@ async fn apply_metadata_registry_upsert_to_storage(
     };
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
+        let delete_present = match delete_record_txn(storage, record.document_id, txn_id).await {
+            Ok(delete) => delete.is_some(),
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
         match record_fenced_txn(storage, &record, txn_id).await {
             Ok(true) => {
                 let deletes = metadata_registry_delete_entries(record.group_id, record.document_id);
@@ -3837,14 +3846,48 @@ async fn apply_metadata_registry_upsert_to_storage(
                 .await;
             return Ok(MetadataPlacementOutcome::Rejected);
         }
-        if existing
-            .as_ref()
-            .is_some_and(|existing| incoming_metadata_registry_stale_or_equal(existing, &record))
-        {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Ok(MetadataPlacementOutcome::Accepted(()));
+        if let Some(existing) = existing.as_ref().filter(|existing| {
+            delete_present || incoming_metadata_registry_stale_or_equal(existing, &record)
+        }) {
+            let repairs = match registry_sidecar_repairs(storage, existing, txn_id).await {
+                Ok(repairs) => repairs,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if repairs.is_empty() {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Accepted(()));
+            }
+            match storage_batch_delete_and_write_in_transaction(
+                storage,
+                txn_id,
+                Vec::new(),
+                repairs,
+            )
+            .await
+            {
+                Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
+                Err(NetError::Dht(message))
+                    if message == StorageError::TransactionConflict.to_string() =>
+                {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            }
         }
 
         let entries = base_entries.clone();
@@ -5312,6 +5355,25 @@ fn metadata_registry_freshness(record: &MetadataRegistryRecord) -> (u64, Ulid) {
     (record.updated_at_ms, record.last_event_id)
 }
 
+async fn registry_sidecar_repairs(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    let entries = metadata_registry_write_entries(record)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut repairs = Vec::new();
+    for (key_space, key, value) in entries.into_iter().skip(1) {
+        let current =
+            storage_read_from_transaction(storage, key_space.clone(), key.clone(), Some(txn_id))
+                .await?;
+        if current.as_ref() != Some(&value) {
+            repairs.push((key_space, key, value));
+        }
+    }
+    Ok(repairs)
+}
+
 async fn graph_record_txn(
     storage: &StorageHandle,
     graph_iri: &str,
@@ -5374,7 +5436,14 @@ async fn record_fenced_txn(
     txn_id: TxnId,
 ) -> Result<bool> {
     if let Some(delete) = delete_record_txn(storage, record.document_id, txn_id).await? {
-        return Ok(record.last_event_id <= delete.deleted_after_event_id);
+        return Ok(!registry_live_txn(
+            storage,
+            record.group_id,
+            record.document_id,
+            &delete,
+            txn_id,
+        )
+        .await?);
     }
     Ok(graph_record_txn(storage, &record.graph_iri, txn_id)
         .await?
@@ -12453,6 +12522,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_replay_repairs() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let group_id = Ulid::from_parts(2_110, 1);
+        let actor = test_actor(1, UserId::nil(realm_id), realm_id);
+        let strategy_id = Ulid::from_parts(2_113, 1);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.default_strategy_id = Some(strategy_id);
+        config.strategies.push(PlacementStrategy {
+            strategy_id,
+            name: "test".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        });
+        config.placement_bindings.push(PlacementBinding {
+            handle: PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
+        let placement = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 4,
+        };
+        let document_id = MetaResourceId::from_parts(
+            2_111,
+            PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            BucketId::new(placement.shard as u16).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
+        let mut record = registry_record(
+            group_id,
+            document_id,
+            "datasets/replay-repair",
+            100,
+            Ulid::from_parts(2_112, 1),
+        );
+        record.placement = placement;
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                DocumentSyncTarget::RealmConfig { realm_id }
+                    .storage_keyspace()
+                    .to_string(),
+                DocumentSyncTarget::RealmConfig { realm_id }.storage_key(),
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+        let mut entries = metadata_registry_write_entries(&record).expect("registry entries build");
+        let primary = entries.remove(0);
+        storage_batch_write_to(&storage, vec![primary])
+            .await
+            .expect("registry primary writes");
+
+        apply_metadata_registry_upsert_to_storage(
+            &storage,
+            record.clone(),
+            postcard::to_allocvec(&record).expect("registry serializes"),
+        )
+        .await
+        .expect("equal registry replay repairs sidecars");
+
+        assert_registry_record_present(&storage, &record).await;
+    }
+
+    #[tokio::test]
+    async fn registry_fence_ulid() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(2_120, 1);
+        let document_id = Ulid::from_parts(2_121, 1);
+        let boundary = Ulid::from_parts(2_122, 1);
+        let delete = metadata_delete_lifecycle(
+            group_id,
+            document_id,
+            200,
+            Ulid::from_parts(2_123, 1),
+            boundary,
+        );
+        write_document_lifecycle_record(&storage, &delete).await;
+        let record = registry_record(
+            group_id,
+            document_id,
+            "datasets/post-delete",
+            100,
+            Ulid::from_parts(2_124, 1),
+        );
+        let txn_id = start_storage_transaction(&storage)
+            .await
+            .expect("fence transaction starts");
+        assert!(
+            record_fenced_txn(&storage, &record, txn_id)
+                .await
+                .expect("newer ULID fence checks")
+        );
+        match storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
+            other => panic!("unexpected fence transaction result: {other:?}"),
+        }
+
+        let live = registry_record(group_id, document_id, "datasets/post-delete", 300, boundary);
+        write_registry_record(&storage, &live).await;
+        let stale = registry_record(
+            group_id,
+            document_id,
+            "datasets/post-delete",
+            100,
+            Ulid::from_parts(2_124, 1),
+        );
+        let txn_id = start_storage_transaction(&storage)
+            .await
+            .expect("stale fence transaction starts");
+        assert!(
+            !record_fenced_txn(&storage, &stale, txn_id)
+                .await
+                .expect("stale registry fence checks live primary")
+        );
+        match storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
+            other => panic!("unexpected stale fence transaction result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn registry_strategy_fenced() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(2_100, 1);
@@ -13292,13 +13503,14 @@ mod tests {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1_570, 1);
         let document_id = Ulid::from_parts(1_571, 1);
-        let stale_event_id = Ulid::from_parts(1_572, 1);
+        let deleted_after_event_id = Ulid::from_parts(1_572, 1);
+        let newer_event_id = Ulid::from_parts(1_574, 1);
         let delete_lifecycle = metadata_delete_lifecycle(
             group_id,
             document_id,
             200,
             Ulid::from_parts(1_573, 1),
-            stale_event_id,
+            deleted_after_event_id,
         );
         assert!(
             apply_metadata_document_lifecycle_to_storage(
@@ -13314,16 +13526,17 @@ mod tests {
             document_id,
             "datasets/stale-after-tombstone",
             100,
-            stale_event_id,
+            newer_event_id,
         );
 
-        apply_metadata_registry_upsert_to_storage(
+        let outcome = apply_metadata_registry_upsert_to_storage(
             &storage,
             stale.clone(),
             postcard::to_allocvec(&stale).expect("stale registry serializes"),
         )
         .await
         .expect("late registry upsert is fenced by tombstone");
+        assert!(matches!(outcome, MetadataPlacementOutcome::Accepted(())));
 
         assert_registry_record_deleted(&storage, group_id, document_id).await;
         assert_eq!(
