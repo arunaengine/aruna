@@ -700,7 +700,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             request,
                                         )
                                         .with_policy_paths(policy_paths)
-                                        .with_policy_candidates(policy_candidates, had_denial);
+                                        .with_policy_candidates(policy_candidates, had_denial)
+                                        .with_snapshot();
                                         if let Err(error) =
                                             drive(op, self.context.as_ref()).await
                                         {
