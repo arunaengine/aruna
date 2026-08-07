@@ -22,10 +22,8 @@ use std::any::{type_name, type_name_of_val};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::group_backends::{RecordReadError, parse_read};
@@ -234,11 +232,8 @@ impl std::fmt::Debug for DriverContext {
 
 const MAX_SUBOP_DEPTH: usize = 32;
 const AUDIT_FANOUT_CONCURRENCY: usize = 8;
-const AUDIT_ADMISSION_LIMIT: usize = 16;
 const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
 const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
-static AUDIT_ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_ADMISSION_LIMIT)));
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -441,18 +436,31 @@ fn cap_audit_nodes(
     batch: &mut AuditPageBatch,
 ) -> BTreeSet<NodeId> {
     let mut selected = BTreeSet::new();
-    let mut overflow = 0usize;
+    let mut overflow = false;
     for node in nodes {
         if selected.contains(&node) {
             continue;
         }
-        if selected.len() == MAX_AUDIT_PEERS {
-            overflow = overflow.saturating_add(1);
-        } else {
+        if selected.len() < MAX_AUDIT_PEERS {
+            selected.insert(node);
+            continue;
+        }
+        overflow = true;
+        let Some(largest) = selected
+            .iter()
+            .max_by(|left, right| left.as_bytes().cmp(right.as_bytes()))
+            .copied()
+        else {
+            continue;
+        };
+        if node.as_bytes() < largest.as_bytes() {
+            selected.remove(&largest);
             selected.insert(node);
         }
     }
-    batch.missing_overflow = batch.missing_overflow.saturating_add(overflow);
+    if overflow {
+        batch.missing_overflow = batch.missing_overflow.max(1);
+    }
     selected
 }
 
@@ -470,12 +478,6 @@ async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -
     if remaining.is_empty() {
         return Event::Net(NetEvent::AuditPages(batch));
     }
-    let Some(_admission) = AUDIT_ADMISSION.clone().try_acquire_owned().ok() else {
-        for node in remaining {
-            batch.mark_missing(node);
-        }
-        return Event::Net(NetEvent::AuditPages(batch));
-    };
 
     let requests = stream::iter(nodes.into_iter().map(|node| {
         let request = request.clone();
@@ -933,6 +935,10 @@ mod test {
             .collect::<Vec<_>>();
         let duplicate = nodes[0];
         nodes.push(duplicate);
+        let mut expected = nodes.clone();
+        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        expected.dedup();
+        expected.truncate(MAX_AUDIT_PEERS);
         let mut batch = AuditPageBatch::new();
 
         let nodes = cap_audit_nodes(nodes, &mut batch);
@@ -941,11 +947,11 @@ mod test {
         assert_eq!(batch.missing_nodes.len(), 0);
         assert_eq!(batch.missing_overflow, 1);
         assert!(batch.completed_nodes.is_empty());
-        assert!(
-            nodes
-                .iter()
-                .zip(nodes.iter().skip(1))
-                .all(|(left, right)| left.as_bytes() < right.as_bytes())
+        assert_eq!(
+            nodes,
+            expected
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
         );
     }
 
