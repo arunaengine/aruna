@@ -1788,9 +1788,9 @@ pub async fn references_metadata(
         .list_cached_registry_records()
         .await
         .map_err(map_metadata_internal_error)?;
+    let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
 
     if request.resolve {
-        let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
         let entry = resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?;
         return Ok(MetadataReferencesExecution {
             references: entry.into_iter().collect(),
@@ -1805,7 +1805,7 @@ pub async fn references_metadata(
         request.predicate.as_deref(),
     )
     .await
-    .map_err(map_metadata_internal_error)?;
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
 
     let registry_by_id: HashMap<Ulid, &MetadataRegistryRecord> = registry
         .iter()
@@ -1854,10 +1854,8 @@ pub async fn references_metadata(
     }
 
     if references.is_empty()
-        && let Some(entry) = {
-            let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
+        && let Some(entry) =
             resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?
-        }
     {
         references.push(entry);
     }

@@ -5929,22 +5929,17 @@ impl CraqleAuthorizer for ScopeAuthorizer<'_> {
 }
 
 async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, MetadataError> {
-    let graphs = tokio::task::spawn_blocking({
-        let inner = inner.clone();
-        move || inner.node.graphs()
-    })
-    .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-    .map_err(|error| MetadataError::Backend(error.to_string()))?;
-
-    let mut visible = Vec::with_capacity(graphs.len());
-    for graph in graphs {
-        let graph_iri = graph.as_str().to_string();
-        if !metadata_graph_deleted(inner.clone(), inner.storage_handle.clone(), &graph_iri).await? {
-            visible.push(graph_iri);
-        }
-    }
-    Ok(visible)
+    let records = inner
+        .visibility_cache
+        .registry_records_any()
+        .map(|(records, _)| records)
+        .ok_or_else(|| {
+            MetadataError::Backend("metadata registry snapshot unavailable".to_string())
+        })?;
+    let records = super::api::filter_live_records(&inner.storage_handle, records.as_ref())
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    Ok(records.into_iter().map(|record| record.graph_iri).collect())
 }
 
 async fn select_authorized_graphs(
