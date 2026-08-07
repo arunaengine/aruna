@@ -802,6 +802,7 @@ async fn hidden_bucket_registered() {
                 name: "partial".to_string(),
                 created_by: test_user_id(),
                 max_bytes: Some(0),
+                deadline: None,
                 blob: stream_from_bytes(b"x"),
             })
             .await,
@@ -977,6 +978,7 @@ async fn hidden_spool_roundtrip() {
             name: "input.zip".to_string(),
             created_by: test_user_id(),
             max_bytes: Some(16),
+            deadline: None,
             blob: stream_from_bytes(b"hidden"),
         })
         .await
@@ -1069,6 +1071,7 @@ async fn hidden_spool_limits() {
             name: "seed".to_string(),
             created_by: test_user_id(),
             max_bytes: None,
+            deadline: None,
             blob: stream_from_bytes(b"seed"),
         })
         .await
@@ -1090,6 +1093,7 @@ async fn hidden_spool_limits() {
                 name: "limited".to_string(),
                 created_by: test_user_id(),
                 max_bytes: Some(3),
+                deadline: None,
                 blob: stream_from_bytes(b"four"),
             })
             .await,
@@ -1148,6 +1152,7 @@ async fn sweeps_demoted_backend() {
             name: "leftover".to_string(),
             created_by: test_user_id(),
             max_bytes: None,
+            deadline: None,
             blob: stream_from_bytes(b"leftover"),
         })
         .await
@@ -1189,6 +1194,7 @@ async fn range_passes_writes() {
             name: "source".to_string(),
             created_by: test_user_id(),
             max_bytes: None,
+            deadline: None,
             blob: stream_from_bytes(b"source"),
         })
         .await

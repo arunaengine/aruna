@@ -57,6 +57,7 @@ async fn spool_archive(
             name: "consortium".to_string(),
             created_by: UserId::nil(RealmId::from_bytes([seed; 32])),
             max_bytes: Some(expected_size),
+            deadline: None,
             blob: BackendStream::new(stream::iter([Ok::<Bytes, std::io::Error>(
                 Bytes::from_static(bytes),
             )])),

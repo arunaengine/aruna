@@ -2261,6 +2261,7 @@ async fn assemble_export(
             name: "rocrate.zip".to_string(),
             created_by: spec.auth_context.user_id,
             max_bytes: Some(spec.limits.export_artifact_bytes),
+            deadline: None,
             blob: BackendStream::new(tokio_util::io::ReaderStream::new(reader)),
         })
         .await;
@@ -3033,6 +3034,7 @@ mod tests {
                 name: "fixture".to_string(),
                 created_by: UserId::nil(RealmId::from_bytes([seed; 32])),
                 max_bytes: Some(1024 * 1024),
+                deadline: None,
                 blob: fixture_stream(bytes),
             })
             .await

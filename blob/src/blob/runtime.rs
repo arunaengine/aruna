@@ -144,6 +144,10 @@ impl BlobHandle {
 
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
         let (class, kind) = classify_effect(&effect);
+        let deadline = match &effect {
+            BlobEffect::SpoolHidden { deadline, .. } => *deadline,
+            _ => None,
+        };
         let slots = match class {
             EffectClass::Transfer => Some(self.handler.transfer_slots.clone()),
             EffectClass::Read => Some(self.handler.read_slots.clone()),
@@ -153,7 +157,22 @@ impl BlobHandle {
         let permit = match slots {
             Some(slots) => {
                 let queued = Instant::now();
-                let permit = slots.acquire_owned().await;
+                let permit = match deadline {
+                    Some(deadline) => match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        slots.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return Event::Blob(BlobEvent::Error(BlobError::WriteError(
+                                "blob effect deadline expired".to_string(),
+                            )));
+                        }
+                    },
+                    None => slots.acquire_owned().await,
+                };
                 let queue_wait = queued.elapsed();
                 if queue_wait >= QUEUE_WAIT_WARN {
                     tracing::warn!(
@@ -401,10 +420,13 @@ impl BlobHandler {
                 name,
                 created_by,
                 max_bytes,
+                deadline,
                 blob,
             } => {
-                Box::pin(self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob))
-                    .await
+                Box::pin(
+                    self.spool_hidden_blob(namespace, &name, created_by, max_bytes, deadline, blob),
+                )
+                .await
             }
             BlobEffect::ReadHiddenRange { location, range } => {
                 Box::pin(self.read_hidden_range(location, range)).await

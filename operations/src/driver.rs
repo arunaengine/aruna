@@ -1,7 +1,9 @@
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
 use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
-use aruna_core::effects::{AuditPageEffect, Effect, JobControlEffect, NetEffect, StorageEffect};
+use aruna_core::effects::{
+    AuditPageEffect, BlobEffect, Effect, JobControlEffect, NetEffect, StorageEffect,
+};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{
     BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
@@ -759,8 +761,20 @@ pub async fn drive_until<O: Operation>(
             } else if expired {
                 dispatch_effect(effect, context, 0).await
             } else {
+                let managed = matches!(
+                    &effect,
+                    Effect::Blob(BlobEffect::SpoolHidden {
+                        deadline: Some(_),
+                        ..
+                    })
+                );
+                // The blob adapter owns the writer abort at its deadline.
                 let dispatch = Box::pin(dispatch_effect(effect, context, 0));
-                match tokio::time::timeout_at(deadline, dispatch).await {
+                match if managed {
+                    Ok(dispatch.await)
+                } else {
+                    tokio::time::timeout_at(deadline, dispatch).await
+                } {
                     Ok(event) => event,
                     Err(_) => {
                         expired = true;
@@ -1301,6 +1315,7 @@ mod test {
                         name: "deadline".to_string(),
                         created_by: aruna_core::UserId::default(),
                         max_bytes: None,
+                        deadline: None,
                         blob: aruna_core::stream::BackendStream::new(
                             futures_util::stream::pending::<
                                 Result<bytes::Bytes, aruna_core::stream::StreamError>,

@@ -183,6 +183,7 @@ pub async fn upload_rocrate(
             media_type,
             expires_at_ms,
             max_bytes: limit,
+            deadline: Some(deadline.into_std()),
             blob: upload_body_stream(body, deadline),
         }),
         &state.get_ctx(),
@@ -1082,7 +1083,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn upload_idle_times_out() {
+    async fn upload_idle_timeout() {
         let body = Body::from_stream(stream::pending::<Result<Bytes, std::io::Error>>());
         let mut upload = upload_body_stream(body, Instant::now() + UPLOAD_DEADLINE);
         let task = tokio::spawn(async move { upload.next().await });

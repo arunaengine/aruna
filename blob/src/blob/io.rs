@@ -16,9 +16,11 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use tokio::time::{Instant, timeout, timeout_at};
 use ulid::Ulid;
 
 /// Tenant writers open with an explicit chunk so a small-chunk stream cannot
@@ -34,6 +36,18 @@ async fn open_writer(
     }
 }
 
+async fn with_deadline<F, T>(deadline: Option<StdInstant>, future: F) -> Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    match deadline {
+        Some(deadline) => timeout_at(Instant::from_std(deadline), future)
+            .await
+            .map_err(|_| ()),
+        None => Ok(future.await),
+    }
+}
+
 impl BlobHandler {
     pub(super) async fn write_stream_to_location(
         &self,
@@ -41,7 +55,7 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        Box::pin(self.write_stream_limit(location, operator, blob, None)).await
+        Box::pin(self.write_stream_limit(location, operator, blob, None, None)).await
     }
 
     async fn write_stream_limit(
@@ -50,29 +64,57 @@ impl BlobHandler {
         operator: Operator,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
         max_bytes: Option<u64>,
+        deadline: Option<StdInstant>,
     ) -> BlobEvent {
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-        let Ok(mut writer) = open_writer(&operator, &storage_path, &location.backend).await else {
-            return BlobEvent::Error(BlobError::OperatorCreationFailed(
-                "Failed to create writer from operator".to_string(),
-            ));
+        let mut writer = match with_deadline(
+            deadline,
+            open_writer(&operator, &storage_path, &location.backend),
+        )
+        .await
+        {
+            Ok(Ok(writer)) => writer,
+            Ok(Err(_)) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(
+                    "Failed to create writer from operator".to_string(),
+                ));
+            }
+            Err(()) => {
+                self.delete_path(&operator, &storage_path).await;
+                return BlobEvent::Error(BlobError::WriteError(
+                    "blob write deadline expired".to_string(),
+                ));
+            }
         };
 
         let mut hasher = Hasher::new();
         let mut bytes_written = 0u64;
-        while let Some(chunk) = blob.next().await {
+        loop {
+            let chunk = match with_deadline(deadline, blob.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(()) => {
+                    self.abort_writer(&mut writer, &operator, &storage_path)
+                        .await;
+                    return BlobEvent::Error(BlobError::WriteError(
+                        "blob write deadline expired".to_string(),
+                    ));
+                }
+            };
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    abort_partial_writer(&mut writer, &operator, &storage_path).await;
+                    self.abort_writer(&mut writer, &operator, &storage_path)
+                        .await;
                     return BlobEvent::Error(BlobError::StreamFailed(err.to_string()));
                 }
             };
             let Some(next_size) = bytes_written.checked_add(bytes.len() as u64) else {
-                abort_partial_writer(&mut writer, &operator, &storage_path).await;
+                self.abort_writer(&mut writer, &operator, &storage_path)
+                    .await;
                 return BlobEvent::Error(BlobError::SizeLimitExceeded {
                     limit: max_bytes.unwrap_or(u64::MAX),
                 });
@@ -80,20 +122,43 @@ impl BlobHandler {
             if let Some(limit) = max_bytes
                 && next_size > limit
             {
-                abort_partial_writer(&mut writer, &operator, &storage_path).await;
+                self.abort_writer(&mut writer, &operator, &storage_path)
+                    .await;
                 return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
             }
             hasher.update(&bytes);
-            if let Err(err) = writer.write(bytes.to_vec()).await {
-                abort_partial_writer(&mut writer, &operator, &storage_path).await;
-                return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+            match with_deadline(deadline, writer.write(bytes.to_vec())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    self.abort_writer(&mut writer, &operator, &storage_path)
+                        .await;
+                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                }
+                Err(()) => {
+                    self.abort_writer(&mut writer, &operator, &storage_path)
+                        .await;
+                    return BlobEvent::Error(BlobError::WriteError(
+                        "blob write deadline expired".to_string(),
+                    ));
+                }
             }
             bytes_written = next_size;
         }
 
-        if let Err(err) = writer.close().await {
-            abort_partial_writer(&mut writer, &operator, &storage_path).await;
-            return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+        match with_deadline(deadline, writer.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.abort_writer(&mut writer, &operator, &storage_path)
+                    .await;
+                return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+            }
+            Err(()) => {
+                self.abort_writer(&mut writer, &operator, &storage_path)
+                    .await;
+                return BlobEvent::Error(BlobError::WriteError(
+                    "blob write deadline expired".to_string(),
+                ));
+            }
         }
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
@@ -106,6 +171,7 @@ impl BlobHandler {
         name: &str,
         created_by: UserId,
         max_bytes: Option<u64>,
+        deadline: Option<StdInstant>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         // Hidden blobs are job spool, never routed: they always use the default.
@@ -114,10 +180,16 @@ impl BlobHandler {
             Ok(config) => config.root.clone(),
             Err(err) => return BlobEvent::Error(err),
         };
-        let backend_bucket = match self.eval_backend_bucket(&resolved.backend).await {
-            Ok(bucket) => bucket,
-            Err(err) => return BlobEvent::Error(err),
-        };
+        let backend_bucket =
+            match with_deadline(deadline, self.eval_backend_bucket(&resolved.backend)).await {
+                Ok(Ok(bucket)) => bucket,
+                Ok(Err(err)) => return BlobEvent::Error(err),
+                Err(()) => {
+                    return BlobEvent::Error(BlobError::WriteError(
+                        "blob write deadline expired".to_string(),
+                    ));
+                }
+            };
         let ulid = Ulid::generate();
         let backend_path = match build_hidden_path(namespace, name, ulid) {
             Ok(path) => path,
@@ -148,7 +220,7 @@ impl BlobHandler {
                 Err(err) => return BlobEvent::Error(err),
             };
         let location = match self
-            .write_stream_limit(location, operator, blob, max_bytes)
+            .write_stream_limit(location, operator, blob, max_bytes, deadline)
             .await
         {
             BlobEvent::WriteFinished { location } => location,
@@ -166,19 +238,82 @@ impl BlobHandler {
                 "hidden blob hash has an invalid length".to_string(),
             ));
         };
-        if let Err(err) = self
-            .increment_bucket_load(&location.backend, &location.storage_bucket)
-            .await
+        match with_deadline(
+            deadline,
+            self.increment_bucket_load(&location.backend, &location.storage_bucket),
+        )
+        .await
         {
-            if let Err(cleanup) = self.discard_hidden(&location).await {
-                return BlobEvent::Error(cleanup);
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let cleanup = timeout(
+                    self.control_plane_io_timeout(),
+                    self.discard_hidden(&location),
+                )
+                .await;
+                if !matches!(&cleanup, Ok(Ok(())))
+                    && let (Ok(operator), Ok(storage_path)) = (
+                        self.operator_from_location(&location),
+                        location.get_storage_path(),
+                    )
+                {
+                    self.delete_path(&operator, &storage_path).await;
+                }
+                if let Ok(Err(cleanup)) = cleanup {
+                    return BlobEvent::Error(cleanup);
+                }
+                return BlobEvent::Error(err);
             }
-            return BlobEvent::Error(err);
+            Err(()) => {
+                if let (Ok(operator), Ok(storage_path)) = (
+                    self.operator_from_location(&location),
+                    location.get_storage_path(),
+                ) {
+                    self.delete_path(&operator, &storage_path).await;
+                }
+                return BlobEvent::Error(BlobError::WriteError(
+                    "blob write deadline expired".to_string(),
+                ));
+            }
         }
         BlobEvent::HiddenSpooled {
             size: location.blob_size,
             location,
             blake3,
+        }
+    }
+
+    async fn abort_writer(
+        &self,
+        writer: &mut opendal::Writer,
+        operator: &Operator,
+        storage_path: &str,
+    ) {
+        if timeout(
+            self.control_plane_io_timeout(),
+            abort_partial_writer(writer, operator, storage_path),
+        )
+        .await
+        .is_err()
+        {
+            self.delete_path(operator, storage_path).await;
+        }
+    }
+
+    async fn delete_path(&self, operator: &Operator, storage_path: &str) {
+        match timeout(
+            self.control_plane_io_timeout(),
+            operator.delete(storage_path),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, storage_path, "failed to delete partial blob output");
+            }
+            Err(_) => {
+                tracing::warn!(storage_path, "timed out deleting partial blob output");
+            }
         }
     }
 

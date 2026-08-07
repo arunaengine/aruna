@@ -10,6 +10,7 @@ use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
 use smallvec::smallvec;
+use std::time::Instant;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -23,6 +24,7 @@ pub struct CreateRoCrateUploadConfig {
     pub media_type: RoCrateMediaType,
     pub expires_at_ms: u64,
     pub max_bytes: u64,
+    pub deadline: Option<Instant>,
     pub blob: BackendStream<Result<Bytes, StreamError>>,
 }
 
@@ -63,6 +65,7 @@ pub struct CreateRoCrateUploadOperation {
     media_type: RoCrateMediaType,
     expires_at_ms: u64,
     max_bytes: u64,
+    deadline: Option<Instant>,
     blob: Option<BackendStream<Result<Bytes, StreamError>>>,
     record: Option<RoCrateUploadRecord>,
     hidden_key: Option<HiddenBlobKey>,
@@ -79,6 +82,7 @@ impl CreateRoCrateUploadOperation {
             media_type: config.media_type,
             expires_at_ms: config.expires_at_ms,
             max_bytes: config.max_bytes,
+            deadline: config.deadline,
             blob: Some(config.blob),
             record: None,
             hidden_key: None,
@@ -241,6 +245,7 @@ impl Operation for CreateRoCrateUploadOperation {
             name: "input".to_string(),
             created_by: self.owner,
             max_bytes: Some(self.max_bytes),
+            deadline: self.deadline,
             blob,
         })]
     }
@@ -523,6 +528,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn upload_operation() -> (CreateRoCrateUploadOperation, BackendLocation) {
+        upload_operation_with(None)
+    }
+
+    fn upload_operation_with(
+        deadline: Option<Instant>,
+    ) -> (CreateRoCrateUploadOperation, BackendLocation) {
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let location = BackendLocation {
@@ -547,11 +558,27 @@ mod tests {
             media_type: RoCrateMediaType::Zip,
             expires_at_ms: 20,
             max_bytes: 10,
+            deadline,
             blob: BackendStream::new(
                 futures_util::stream::empty::<Result<Bytes, std::io::Error>>(),
             ),
         });
         (operation, location)
+    }
+
+    #[test]
+    fn carries_deadline() {
+        let deadline = Instant::now();
+        let (mut operation, _) = upload_operation_with(Some(deadline));
+        let [
+            Effect::Blob(BlobEffect::SpoolHidden {
+                deadline: actual, ..
+            }),
+        ] = operation.start().as_slice()
+        else {
+            panic!("expected hidden spool effect")
+        };
+        assert_eq!(*actual, Some(deadline));
     }
 
     #[test]

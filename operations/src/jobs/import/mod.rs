@@ -523,6 +523,7 @@ async fn spool_source(
             name: "input".to_string(),
             created_by,
             max_bytes: Some(limit),
+            deadline: None,
             blob,
         })
         .await;
@@ -1978,6 +1979,7 @@ mod tests {
                 name: "input".to_string(),
                 created_by: owner,
                 max_bytes: Some(1),
+                deadline: None,
                 blob: BackendStream::new(stream::iter([Ok::<Bytes, io::Error>(
                     Bytes::from_static(b"x"),
                 )])),

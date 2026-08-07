@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
@@ -76,6 +76,7 @@ pub enum BlobEffect {
         name: String,
         created_by: UserId,
         max_bytes: Option<u64>,
+        deadline: Option<Instant>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
     ReadHiddenRange {

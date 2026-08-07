@@ -1490,6 +1490,7 @@ async fn upload_media(
             name: "input".to_string(),
             created_by: fixture.actor.user_id,
             max_bytes: Some(size),
+            deadline: None,
             blob,
         })
         .await
