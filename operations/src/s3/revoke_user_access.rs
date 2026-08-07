@@ -125,12 +125,18 @@ impl RevokeUserAccessOperation {
             Ok(index) => index,
             Err(err) => return self.emit_error(err.into()),
         };
-        if !index.remove(&self.access_key) {
-            return self.emit_error(RevokeUserAccessError::IndexInconsistent);
-        }
         let Some(mut access) = self.access.clone() else {
             return self.emit_error(RevokeUserAccessError::NotFound);
         };
+        let indexed = index.remove(&self.access_key);
+        if !indexed && access.revoked_at.is_some() {
+            self.output = Some(Ok(access));
+            self.state = RevokeUserAccessState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
+        if !indexed {
+            return self.emit_error(RevokeUserAccessError::IndexInconsistent);
+        }
         if access.revoked_at.is_none() {
             access.revoked_at = Some(SystemTime::now());
         }
