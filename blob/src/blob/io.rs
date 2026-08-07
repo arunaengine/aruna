@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -51,17 +52,17 @@ where
 
 struct HiddenReservation {
     handler: BlobHandler,
-    key: Option<HiddenBlobKey>,
+    key: Arc<StdMutex<Option<HiddenBlobKey>>>,
     operator: Option<Operator>,
     storage_path: Option<String>,
     writer: Option<opendal::Writer>,
 }
 
 impl HiddenReservation {
-    fn new(handler: BlobHandler, key: Option<HiddenBlobKey>) -> Self {
+    fn new(handler: BlobHandler) -> Self {
         Self {
             handler,
-            key,
+            key: Arc::new(StdMutex::new(None)),
             operator: None,
             storage_path: None,
             writer: None,
@@ -83,7 +84,13 @@ impl HiddenReservation {
 
     fn commit(&mut self) {
         self.writer = None;
-        self.key = None;
+        if let Ok(mut key) = self.key.lock() {
+            *key = None;
+        }
+    }
+
+    fn finish(&mut self) {
+        self.writer = None;
     }
 
     async fn fail(&mut self, error: BlobError) -> BlobEvent {
@@ -112,21 +119,27 @@ impl HiddenReservation {
             Ok(())
         };
         cleanup?;
-        let Some(key) = self.key.as_ref() else {
+        let Some(key) = self.key.lock().ok().and_then(|key| key.clone()) else {
             return Ok(());
         };
-        self.handler.release_hidden(key).await?;
-        self.key = None;
+        self.handler.release_hidden(&key).await?;
+        if let Ok(mut current) = self.key.lock() {
+            *current = None;
+        }
         Ok(())
+    }
+
+    fn key_slot(&self) -> Arc<StdMutex<Option<HiddenBlobKey>>> {
+        Arc::clone(&self.key)
     }
 }
 
 impl Drop for HiddenReservation {
     fn drop(&mut self) {
-        if self.key.is_none() && self.writer.is_none() {
+        if self.key.lock().map_or(true, |key| key.is_none()) && self.writer.is_none() {
             return;
         }
-        let key = self.key.take();
+        let key = self.key.lock().ok().and_then(|mut key| key.take());
         let handler = self.handler.clone();
         let operator = self.operator.take();
         let storage_path = self.storage_path.take();
@@ -184,7 +197,7 @@ impl BlobHandler {
         deadline: Option<StdInstant>,
         reservation: Option<&mut HiddenReservation>,
     ) -> BlobEvent {
-        let mut plain = HiddenReservation::new(self.clone(), None);
+        let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
@@ -304,7 +317,7 @@ impl BlobHandler {
                     .await;
             }
         }
-        reservation.commit();
+        reservation.finish();
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
         BlobEvent::WriteFinished { location }
@@ -330,18 +343,26 @@ impl BlobHandler {
             Ok(path) => path,
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
         };
+        let mut reservation = HiddenReservation::new(self.clone());
         let key = match with_deadline(
             deadline,
-            self.reserve_hidden_key(&resolved.backend, &root, &backend_path),
+            self.reserve_hidden_key(
+                &resolved.backend,
+                &root,
+                &backend_path,
+                reservation.key_slot(),
+            ),
         )
         .await
         {
             Ok(Ok(key)) => key,
-            Ok(Err(err)) => return BlobEvent::Error(err),
+            Ok(Err(err)) => return reservation.fail(err).await,
             Err(()) => {
-                return BlobEvent::Error(BlobError::WriteError(
-                    "blob write deadline expired".to_string(),
-                ));
+                return reservation
+                    .fail(BlobError::WriteError(
+                        "blob write deadline expired".to_string(),
+                    ))
+                    .await;
             }
         };
         let backend_bucket = key.storage_bucket.clone();
@@ -368,11 +389,9 @@ impl BlobHandler {
             {
                 Ok(operator) => operator,
                 Err(err) => {
-                    let mut reservation = HiddenReservation::new(self.clone(), Some(key));
                     return reservation.fail(err).await;
                 }
             };
-        let mut reservation = HiddenReservation::new(self.clone(), Some(key.clone()));
         let location = match self
             .write_stream_limit(
                 location,
@@ -389,26 +408,15 @@ impl BlobHandler {
         };
         let Some(hash) = location.get_blake3() else {
             let error = BlobError::IntegrityCheckFailed("hidden blob hash is missing".to_string());
-            return match self.discard_hidden(&location).await {
-                Ok(()) => match self.release_hidden(&key).await {
-                    Ok(()) => BlobEvent::Error(error),
-                    Err(cleanup) => BlobEvent::Error(cleanup),
-                },
-                Err(cleanup) => BlobEvent::Error(cleanup),
-            };
+            return reservation.fail(error).await;
         };
         let Ok(blake3) = hash.try_into() else {
             let error = BlobError::IntegrityCheckFailed(
                 "hidden blob hash has an invalid length".to_string(),
             );
-            return match self.discard_hidden(&location).await {
-                Ok(()) => match self.release_hidden(&key).await {
-                    Ok(()) => BlobEvent::Error(error),
-                    Err(cleanup) => BlobEvent::Error(cleanup),
-                },
-                Err(cleanup) => BlobEvent::Error(cleanup),
-            };
+            return reservation.fail(error).await;
         };
+        reservation.commit();
         BlobEvent::HiddenSpooled {
             size: location.blob_size,
             location,
@@ -448,12 +456,6 @@ impl BlobHandler {
                 "timed out deleting partial blob output".to_string(),
             )),
         }
-    }
-
-    async fn discard_hidden(&self, location: &BackendLocation) -> Result<(), BlobError> {
-        let operator = self.operator_from_location(location)?;
-        let storage_path = location.get_storage_path()?;
-        self.delete_path(&operator, &storage_path).await
     }
 
     async fn release_hidden(&self, key: &HiddenBlobKey) -> Result<(), BlobError> {
@@ -864,6 +866,14 @@ impl BlobHandler {
                 return BlobEvent::Error(error);
             }
         }
+        let reservations = match self.hidden_reservations().await {
+            Ok(keys) => keys,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        for key in reservations {
+            let modified_at = hidden_timestamp(&key.backend_path);
+            entries.push(HiddenBlobEntry { key, modified_at });
+        }
         entries.sort_by(|left, right| {
             (
                 &left.key.backend,
@@ -876,6 +886,7 @@ impl BlobHandler {
                     &right.key.backend_path,
                 ))
         });
+        entries.dedup_by(|left, right| left.key == right.key);
         BlobEvent::HiddenListed { entries }
     }
 

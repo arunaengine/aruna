@@ -14,6 +14,7 @@ use aruna_core::types::TxnId;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use ulid::Ulid;
 
@@ -156,6 +157,7 @@ impl BlobHandler {
         backend: &BackendRef,
         root: &str,
         backend_path: &str,
+        key_slot: Arc<StdMutex<Option<HiddenBlobKey>>>,
     ) -> Result<HiddenBlobKey, BlobError> {
         let config = self.registry.config_for(backend)?.clone();
         let rounds = if config.max_bucket_size.is_some() {
@@ -173,6 +175,9 @@ impl BlobHandler {
                 backend_path.to_string(),
             )
             .map_err(BlobError::ConversionError)?;
+            *key_slot.lock().map_err(|_| {
+                BlobError::ReadError("hidden bucket reservation state is poisoned".to_string())
+            })? = Some(key.clone());
             let outcome = match self
                 .try_reserve_key(backend, &bucket, &key, config.max_bucket_size)
                 .await
@@ -229,6 +234,41 @@ impl BlobHandler {
         Err(BlobError::ReadError(
             "hidden bucket release kept conflicting".to_string(),
         ))
+    }
+
+    pub(super) async fn hidden_reservations(&self) -> Result<Vec<HiddenBlobKey>, BlobError> {
+        let mut keys = Vec::new();
+        let mut start_after = None;
+        loop {
+            let event = self
+                .storage
+                .send_effect(Effect::Storage(StorageEffect::Iter {
+                    key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                    prefix: None,
+                    start: start_after.clone().map(IterStart::After),
+                    limit: 1024,
+                    txn_id: None,
+                }))
+                .await;
+            let Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) = event
+            else {
+                return Err(BlobError::ReadError(
+                    "unexpected hidden reservation iteration event".to_string(),
+                ));
+            };
+            for (key, _) in values {
+                let key: HiddenBlobKey = postcard::from_bytes(key.as_ref())
+                    .map_err(|error| BlobError::ConversionError(error.into()))?;
+                keys.push(key);
+            }
+            let Some(next_start_after) = next_start_after else {
+                return Ok(keys);
+            };
+            start_after = Some(next_start_after);
+        }
     }
 
     async fn try_reserve_key(
