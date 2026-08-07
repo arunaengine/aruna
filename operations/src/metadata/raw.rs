@@ -7,8 +7,9 @@ use aruna_core::keyspaces::{
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_RAW_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentLifecycleRecord,
-    MetadataError, MetadataGraphLifecycleRecord, MetadataMaterializationState, MetadataRawRevision,
+    METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataCreateEventPayload,
+    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
+    MetadataGraphLifecycleRecord, MetadataMaterializationState, MetadataRawRevision,
     apply_raw_upsert, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
@@ -23,15 +24,13 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::handle::METADATA_REGISTRY_CANDIDATE_LIMIT;
-use crate::metadata::protocol::MAX_MESSAGE_SIZE;
 use crate::metadata::repository::{
     parse_materialization_status_read, read_materialization_status_effect,
 };
 
 const RAW_PAGE_SIZE: usize = 1;
-const RAW_EVENT_LIMIT: usize = METADATA_REGISTRY_CANDIDATE_LIMIT;
-const RAW_ENCODED_LIMIT: usize = MAX_MESSAGE_SIZE;
+const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
+const RAW_ENCODED_LIMIT: usize = METADATA_RAW_BYTES_LIMIT as usize;
 
 #[derive(Debug, Default)]
 struct RawLoadBudget {
@@ -134,9 +133,6 @@ pub async fn load_raw_view(
     document_id: Ulid,
     txn_id: Option<TxnId>,
 ) -> Result<Option<MetadataRawView>, MetadataRawReadError> {
-    let Some(revision) = load_raw_revision(context, document_id, None, txn_id).await? else {
-        return Ok(None);
-    };
     let status = parse_materialization_status_read(
         context
             .storage_handle
@@ -151,6 +147,10 @@ pub async fn load_raw_view(
             MetadataRawReadError::Conversion(error)
         }
     })?;
+    let revision = load_raw_revision(context, document_id, txn_id).await?;
+    let Some(revision) = revision else {
+        return Ok(None);
+    };
     let projection_state = status
         .as_ref()
         .map(|status| status.state)
@@ -173,7 +173,6 @@ pub async fn load_raw_view(
 pub async fn load_raw_revision(
     context: &DriverContext,
     document_id: Ulid,
-    event_cursor: Option<Ulid>,
     txn_id: Option<TxnId>,
 ) -> Result<Option<MetadataRawRevision>, MetadataRawReadError> {
     if raw_deleted(context, document_id, txn_id).await? {
@@ -183,7 +182,7 @@ pub async fn load_raw_revision(
         context,
         document_id,
         None,
-        event_cursor,
+        None,
         txn_id,
         RawLoadBudget::default(),
     )
@@ -247,7 +246,7 @@ pub(crate) async fn prepare_raw_event(
     cache: &mut RawStateCache,
 ) -> Result<RawEventPlan, MetadataRawReadError> {
     if !cache.loaded {
-        cache.state = read_raw_state(context, event.record.document_id).await?;
+        cache.state = read_raw_state(context, event.record.document_id, None).await?;
         cache.loaded = true;
     }
     let (state, rebuild) = match cache.state.as_ref() {
@@ -463,13 +462,14 @@ fn event_matches_state(event: &MetadataCreateEventRecord, state: &RawRevisionSta
 async fn read_raw_state(
     context: &DriverContext,
     document_id: Ulid,
+    txn_id: Option<TxnId>,
 ) -> Result<Option<RawRevisionState>, MetadataRawReadError> {
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_RAW_REVISION_KEYSPACE.to_string(),
             key: raw_revision_key(document_id),
-            txn_id: None,
+            txn_id,
         })
         .await
     {

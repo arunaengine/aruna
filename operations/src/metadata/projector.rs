@@ -506,7 +506,10 @@ pub async fn project_metadata_create_events(
             .and_then(|config| config.as_ref());
         let authored_here = local_node_id == Some(event.node_id)
             && (!registry_exists || needs_materialization || holders_changed);
-        let outbox = if authored_here && !event.record.holder_node_ids.is_empty() {
+        let has_live_holders = realm_config.is_some_and(|config| {
+            !resolve_shard_holders(config, &event.record.placement).is_empty()
+        });
+        let outbox = if authored_here && has_live_holders {
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
             Some(create_event_outbox_record(&event, realm_config, true))
@@ -867,24 +870,14 @@ async fn expand_create_event_holders_cached(
 
 fn expand_create_event_holders(
     mut event: MetadataCreateEventRecord,
-    local_node_id: Option<NodeId>,
-    realm_config: Option<&RealmConfigDocument>,
+    _local_node_id: Option<NodeId>,
+    _realm_config: Option<&RealmConfigDocument>,
 ) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
     event.record.last_event_id = event.event_id;
     let mut holders = event.record.holder_node_ids.clone();
     sort_node_ids(&mut holders);
-
-    if local_node_id != Some(event.node_id) {
-        event.record.holder_node_ids = holders;
-        return Ok(event);
-    };
-
-    // Holders are derived from the bucket the create stamped, never re-chosen:
-    // this runs again on replay, and a config change between runs would move the
-    // document to a different topic.
-    event.record.holder_node_ids = realm_config
-        .map(|config| resolve_shard_holders(config, &event.record.placement))
-        .unwrap_or_default();
+    // The create event freezes its origins; replays must not mint new holders.
+    event.record.holder_node_ids = holders;
     Ok(event)
 }
 
@@ -1486,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_origin_expands_holders_with_rendezvous() {
+    fn metadata_origin_preserves_holders() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1)];
@@ -1497,11 +1490,7 @@ mod tests {
             expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
                 .expect("holders expand");
 
-        assert_eq!(
-            expanded.record.holder_node_ids,
-            resolve_shard_holders(&config, &event.record.placement)
-        );
-        assert_eq!(expanded.record.holder_node_ids.len(), 3);
+        assert_eq!(expanded.record.holder_node_ids, vec![node(1)]);
         assert!(expanded.record.holder_node_ids.contains(&event.node_id));
         assert_eq!(expanded.record.last_event_id, event.event_id);
     }
@@ -1648,8 +1637,7 @@ mod tests {
         };
         let lifecycle: MetadataDocumentLifecycleRecord =
             postcard::from_bytes(&value).expect("lifecycle decodes");
-        let mut expected_event = event;
-        expected_event.record.holder_node_ids.clear();
+        let expected_event = event;
         assert_eq!(
             lifecycle,
             MetadataDocumentLifecycleRecord::Upsert {
@@ -1659,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_strategy_replica_count_overrides_legacy_factor() {
+    fn metadata_strategy_preserves_holders() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1), node(4)];
@@ -1682,15 +1670,14 @@ mod tests {
         let expanded =
             expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
                 .expect("holders resolve");
-        let expected = resolve_shard_holders(&config, &event.record.placement);
+        let expected = vec![node(1), node(4)];
 
         assert_eq!(config.metadata_replication.default_replication_factor, 4);
         assert_eq!(expanded.record.holder_node_ids, expected);
-        assert_eq!(expanded.record.holder_node_ids.len(), 2);
     }
 
     #[test]
-    fn metadata_origin_excludes_user_node_from_holders() {
+    fn metadata_origin_keeps_holders() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1)];
@@ -1713,11 +1700,7 @@ mod tests {
         let expanded = expand_create_event_holders(event, Some(node(1)), Some(&config))
             .expect("holders expand");
 
-        let mut actual = expanded.record.holder_node_ids;
-        sort_node_ids(&mut actual);
-        let mut expected = vec![node(2), node(3), node(4)];
-        sort_node_ids(&mut expected);
-        assert_eq!(actual, expected);
+        assert_eq!(expanded.record.holder_node_ids, vec![node(1)]);
     }
 
     #[test]

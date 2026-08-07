@@ -1,14 +1,20 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{
+    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_RAW_BUDGET_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::metadata::{
-    MetadataApplyRoCrateRequest, MetadataCreateEventPayload, MetadataCreateEventRecord,
-    MetadataDocumentLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataGraphPolicy, MetadataRequestDurability,
+    METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataApplyRoCrateRequest,
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentLifecycleRecord,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRawOriginBudget,
+    MetadataRequestDurability, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    document_sync_revision_write_entry, metadata_document_lifecycle_write_entry,
+    document_sync_revision_write_entry, metadata_create_acceptance_key,
+    metadata_document_lifecycle_write_entry, metadata_event_log_key, metadata_event_log_prefix,
+    raw_budget_entry, raw_budget_key,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
@@ -32,6 +38,9 @@ use crate::metadata::repository::{
     StorageReadError, metadata_event_projection_write_entries, parse_registry_read,
     read_registry_effect,
 };
+use crate::sync_placement::sort_node_ids;
+
+const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateMetadataDocumentConfig {
@@ -60,6 +69,9 @@ pub struct UpdateMetadataDocumentOperation {
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
     update_event: Option<MetadataCreateEventRecord>,
+    raw_budget: Option<MetadataRawOriginBudget>,
+    next_raw_budget: Option<MetadataRawOriginBudget>,
+    accepted_create: Option<MetadataCreateEventRecord>,
     realm_config: Option<RealmConfigDocument>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
@@ -73,6 +85,8 @@ enum UpdateMetadataDocumentState {
     ValidateMutation,
     StartTransaction,
     ReadFence,
+    ReadRawFence,
+    ReadRawEvents,
     WriteUpdateBatch,
     CommitTransaction,
     ScheduleMaterializationDrain,
@@ -93,6 +107,8 @@ pub enum UpdateMetadataDocumentError {
     DocumentNotFound,
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("metadata raw update budget exceeded")]
+    RawLimit,
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -110,6 +126,9 @@ impl UpdateMetadataDocumentOperation {
             txn_id: None,
             record: None,
             update_event: None,
+            raw_budget: None,
+            next_raw_budget: None,
+            accepted_create: None,
             realm_config: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
@@ -256,6 +275,10 @@ impl UpdateMetadataDocumentOperation {
                 &change,
             )?);
         }
+        let Some(raw_budget) = self.next_raw_budget.as_ref() else {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        };
+        writes.push(raw_budget_entry(raw_budget)?);
         Ok(Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -275,6 +298,176 @@ impl UpdateMetadataDocumentOperation {
             state,
             expected,
             got,
+        })
+    }
+
+    fn origin_quota(
+        &self,
+        event: &MetadataCreateEventRecord,
+    ) -> Result<MetadataRawOriginBudget, UpdateMetadataDocumentError> {
+        if event.record.document_id != self.config.document_id
+            || event.record.establishing_event_id != event.event_id
+            || event.record.last_event_id != event.event_id
+            || !matches!(
+                event.payload,
+                MetadataCreateEventPayload::Scaffold { .. }
+                    | MetadataCreateEventPayload::RoCrate { .. }
+            )
+        {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        let mut origins = event.record.holder_node_ids.clone();
+        if origins.is_empty() {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        let original = origins.clone();
+        sort_node_ids(&mut origins);
+        if origins != original {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        let encoded_bytes = postcard::serialized_size(event)
+            .map_err(|_| UpdateMetadataDocumentError::RawLimit)
+            .and_then(|size| {
+                u64::try_from(size).map_err(|_| UpdateMetadataDocumentError::RawLimit)
+            })?;
+        raw_quotas(
+            event.record.document_id,
+            &origins,
+            event.node_id,
+            encoded_bytes,
+        )
+        .and_then(|budgets| {
+            budgets
+                .into_iter()
+                .find(|budget| budget.node_id == self.config.actor.node_id)
+        })
+        .ok_or(UpdateMetadataDocumentError::RawLimit)
+    }
+
+    fn valid_budget(
+        &self,
+        budget: &MetadataRawOriginBudget,
+        quota: &MetadataRawOriginBudget,
+    ) -> bool {
+        budget.document_id == self.config.document_id
+            && budget.node_id == self.config.actor.node_id
+            && budget.event_limit == quota.event_limit
+            && budget.byte_limit == quota.byte_limit
+            && budget.events >= quota.events
+            && budget.encoded_bytes >= quota.encoded_bytes
+            && budget.events <= budget.event_limit
+            && budget.encoded_bytes <= budget.byte_limit
+    }
+
+    fn history_budget(
+        &self,
+        values: &[(ByteView, ByteView)],
+        next_start_after: Option<&ByteView>,
+    ) -> Result<(MetadataRawOriginBudget, usize, u64), UpdateMetadataDocumentError> {
+        if values.len() > RAW_EVENT_LIMIT || next_start_after.is_some() {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        let Some(create) = self.accepted_create.as_ref() else {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        };
+        let quota = self.origin_quota(create)?;
+        let mut events = 0u32;
+        let mut encoded_bytes = 0u64;
+        let mut total_bytes = 0u64;
+        let mut saw_create = false;
+        for (key, value) in values {
+            let event: MetadataCreateEventRecord =
+                postcard::from_bytes(value).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
+            if key != &metadata_event_log_key(self.config.document_id, event.event_id)
+                || event.record.document_id != self.config.document_id
+            {
+                return Err(UpdateMetadataDocumentError::RawLimit);
+            }
+            let value_len =
+                u64::try_from(value.len()).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
+            total_bytes = total_bytes
+                .checked_add(value_len)
+                .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+            if total_bytes > METADATA_RAW_BYTES_LIMIT {
+                return Err(UpdateMetadataDocumentError::RawLimit);
+            }
+            if &event == create {
+                saw_create = true;
+            }
+            if event.node_id == self.config.actor.node_id {
+                events = events
+                    .checked_add(1)
+                    .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(value_len)
+                    .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+            }
+        }
+        if !saw_create || events > quota.event_limit || encoded_bytes > quota.byte_limit {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        Ok((
+            MetadataRawOriginBudget {
+                document_id: quota.document_id,
+                node_id: quota.node_id,
+                event_limit: quota.event_limit,
+                byte_limit: quota.byte_limit,
+                events,
+                encoded_bytes,
+            },
+            values.len(),
+            total_bytes,
+        ))
+    }
+
+    fn check_raw_budget(
+        &self,
+        history_events: usize,
+        history_bytes: u64,
+    ) -> Result<MetadataRawOriginBudget, UpdateMetadataDocumentError> {
+        let Some(event) = self.update_event.as_ref() else {
+            return Err(UpdateMetadataDocumentError::MissingTransaction);
+        };
+        if history_events >= RAW_EVENT_LIMIT {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        let Some(budget) = self.raw_budget.as_ref() else {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        };
+        let Some(create) = self.accepted_create.as_ref() else {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        };
+        let quota = self.origin_quota(create)?;
+        if !self.valid_budget(budget, &quota) || budget.events >= budget.event_limit {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        let event_bytes =
+            postcard::serialized_size(event).map_err(aruna_core::errors::ConversionError::from)?;
+        let event_bytes =
+            u64::try_from(event_bytes).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
+        if history_bytes
+            .checked_add(event_bytes)
+            .is_none_or(|bytes| bytes > METADATA_RAW_BYTES_LIMIT)
+        {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        let encoded_bytes = budget
+            .encoded_bytes
+            .checked_add(event_bytes)
+            .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+        if encoded_bytes > budget.byte_limit {
+            return Err(UpdateMetadataDocumentError::RawLimit);
+        }
+        Ok(MetadataRawOriginBudget {
+            document_id: budget.document_id,
+            node_id: budget.node_id,
+            event_limit: budget.event_limit,
+            byte_limit: budget.byte_limit,
+            events: budget
+                .events
+                .checked_add(1)
+                .ok_or(UpdateMetadataDocumentError::RawLimit)?,
+            encoded_bytes,
         })
     }
 }
@@ -432,15 +625,111 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
+                    self.state = UpdateMetadataDocumentState::ReadRawFence;
+                    smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: vec![
+                            (
+                                METADATA_RAW_BUDGET_KEYSPACE.to_string(),
+                                raw_budget_key(self.config.document_id, self.config.actor.node_id,),
+                            ),
+                            (
+                                METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                                metadata_create_acceptance_key(self.config.document_id),
+                            ),
+                        ],
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+            },
+            UpdateMetadataDocumentState::ReadRawFence => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    let [(_, raw_budget), (_, accepted_create)] = values.as_slice() else {
+                        return self.unexpected_event(
+                            "metadata raw sidecar read",
+                            format!("batch read with {} values", values.len()),
+                        );
+                    };
+                    let Some(value) = accepted_create.clone() else {
+                        return self.fail(UpdateMetadataDocumentError::RawLimit);
+                    };
+                    let create: MetadataCreateEventRecord = match postcard::from_bytes(&value) {
+                        Ok(create) => create,
+                        Err(_) => return self.fail(UpdateMetadataDocumentError::RawLimit),
+                    };
+                    let quota = match self.origin_quota(&create) {
+                        Ok(quota) => quota,
+                        Err(error) => return self.fail(error),
+                    };
+                    self.accepted_create = Some(create);
+                    let budget = match raw_budget.clone() {
+                        Some(value) => {
+                            let budget: MetadataRawOriginBudget = match postcard::from_bytes(&value)
+                            {
+                                Ok(budget) => budget,
+                                Err(_) => {
+                                    return self.fail(UpdateMetadataDocumentError::RawLimit);
+                                }
+                            };
+                            if !self.valid_budget(&budget, &quota) {
+                                return self.fail(UpdateMetadataDocumentError::RawLimit);
+                            }
+                            budget
+                        }
+                        None => None,
+                    };
+                    self.raw_budget = budget;
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateMetadataDocumentState::ReadRawEvents;
+                    smallvec![Effect::Storage(StorageEffect::Iter {
+                        key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                        prefix: Some(metadata_event_log_prefix(self.config.document_id)),
+                        start: None,
+                        limit: RAW_EVENT_LIMIT,
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("raw sidecar read result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::ReadRawEvents => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    let (reconstructed, history_events, history_bytes) =
+                        match self.history_budget(&values, next_start_after.as_ref()) {
+                            Ok(history) => history,
+                            Err(error) => return self.fail(error),
+                        };
+                    if self
+                        .raw_budget
+                        .as_ref()
+                        .is_some_and(|budget| &reconstructed != budget)
+                    {
+                        return self.fail(UpdateMetadataDocumentError::RawLimit);
+                    }
+                    self.raw_budget = Some(reconstructed);
+                    self.next_raw_budget =
+                        match self.check_raw_budget(history_events, history_bytes) {
+                            Ok(budget) => Some(budget),
+                            Err(error) => return self.fail(error),
+                        };
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = UpdateMetadataDocumentState::WriteUpdateBatch;
                     match self.write_update_batch_effect(txn_id) {
                         Ok(effect) => smallvec![effect],
                         Err(error) => self.fail(error),
                     }
                 }
-                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
-                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
-                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("raw event iteration result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::WriteUpdateBatch => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {

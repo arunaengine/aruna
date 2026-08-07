@@ -606,6 +606,7 @@ pub async fn create_metadata_document_routed(
             payload: config.payload.clone(),
         },
         None,
+        false,
     )
     .await?;
     match response {
@@ -656,23 +657,36 @@ pub async fn update_metadata_document_routed(
         ));
     }
     let local_node_id = actor.node_id;
-    let local_holds = holds_placement(&config, &placement, local_node_id);
+    let current_holders = resolve_shard_holders(&config, &placement);
+    let holders = record.map_or_else(
+        || current_holders.clone(),
+        |record| holder_intersection(&current_holders, &record.holder_node_ids),
+    );
+    if record.is_some() && holders.is_empty() {
+        return Err(MetadataWriteError::Undeliverable(
+            "metadata document has no active frozen holder with history capacity".to_string(),
+        ));
+    }
+    let local_holds = holders.contains(&local_node_id);
+    let mut local_capacity = false;
     if local_holds && let Some(record) = record {
-        return update_metadata_document(
+        match update_metadata_document(
             UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-                actor,
+                actor: actor.clone(),
                 group_id: record.group_id,
                 document_id,
                 public: public.unwrap_or(record.public),
-                mutation,
+                mutation: mutation.clone(),
             }),
             context.as_ref(),
         )
         .await
-        .map_err(Into::into);
+        {
+            Ok(record) => return Ok(record),
+            Err(UpdateMetadataDocumentError::RawLimit) => local_capacity = true,
+            Err(error) => return Err(error.into()),
+        }
     }
-    let holders = resolve_shard_holders(&config, &placement);
-
     let response = forward_to_holders(
         context,
         &holders,
@@ -684,6 +698,7 @@ pub async fn update_metadata_document_routed(
             mutation,
         },
         local_holds.then_some(local_node_id),
+        local_capacity,
     )
     .await?;
     match response {
@@ -740,7 +755,17 @@ pub async fn delete_metadata_document_routed(
         ));
     }
     let local_node_id = actor.node_id;
-    let local_holds = holds_placement(&config, &placement, local_node_id);
+    let current_holders = resolve_shard_holders(&config, &placement);
+    let holders = record.map_or_else(
+        || current_holders.clone(),
+        |record| holder_intersection(&current_holders, &record.holder_node_ids),
+    );
+    if record.is_some() && holders.is_empty() {
+        return Err(MetadataWriteError::Undeliverable(
+            "metadata document has no active frozen holder with history capacity".to_string(),
+        ));
+    }
+    let local_holds = holders.contains(&local_node_id);
     if local_holds && let Some(record) = record {
         return delete_metadata_document(
             DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
@@ -750,8 +775,6 @@ pub async fn delete_metadata_document_routed(
         .await
         .map_err(Into::into);
     }
-    let holders = resolve_shard_holders(&config, &placement);
-
     let response = forward_to_holders(
         context,
         &holders,
@@ -761,6 +784,7 @@ pub async fn delete_metadata_document_routed(
             document_id,
         },
         local_holds.then_some(local_node_id),
+        false,
     )
     .await?;
     match response {
@@ -1051,6 +1075,9 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(record) => MetadataTransportMessage::ForwardedRecord {
                     record: Box::new(record),
                 },
+                Err(UpdateMetadataDocumentError::RawLimit) => {
+                    MetadataTransportMessage::ForwardedMetadataHistoryCapacity
+                }
                 Err(UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(
                     message,
                 ))) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
@@ -1366,6 +1393,11 @@ async fn held_record(
             "metadata registry record does not match its structured placement".to_string(),
         ));
     }
+    if !record.holder_node_ids.contains(&local_node_id) {
+        return Err(HeldRecordError::Unavailable(
+            "node is not a frozen holder for this metadata document".to_string(),
+        ));
+    }
     Ok(record)
 }
 
@@ -1452,12 +1484,14 @@ async fn forward_to_holders(
     holders: &[NodeId],
     message: MetadataTransportMessage,
     local_miss: Option<NodeId>,
+    local_capacity: bool,
 ) -> Result<MetadataTransportMessage, MetadataWriteError> {
     let Some(metadata_handle) = context.metadata_handle.as_ref() else {
         return Err(MetadataWriteError::Undeliverable(
             "no metadata handle to forward with".to_string(),
         ));
     };
+    let holders = distinct_holders(holders);
     let local_node_id = local_miss.or_else(|| context.net_handle.as_ref().map(|net| net.node_id()));
     let tracks_not_found = matches!(
         &message,
@@ -1466,7 +1500,9 @@ async fn forward_to_holders(
     );
 
     let mut failures: Vec<String> = Vec::new();
-    let mut not_found = usize::from(local_miss.is_some());
+    let mut not_found = usize::from(local_miss.is_some_and(|local| holders.contains(&local)));
+    let mut capacity =
+        usize::from(local_capacity && local_miss.is_some_and(|local| holders.contains(&local)));
     for holder in holders
         .iter()
         .filter(|holder| Some(**holder) != local_node_id)
@@ -1492,6 +1528,19 @@ async fn forward_to_holders(
             Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => {
                 failures.push(format!("{holder}: holder placement view is unavailable"));
             }
+            Ok(MetadataTransportMessage::ForwardedMetadataHistoryCapacity)
+                if matches!(
+                    &message,
+                    MetadataTransportMessage::ForwardUpdateDocument { .. }
+                ) =>
+            {
+                capacity += 1;
+            }
+            Ok(MetadataTransportMessage::ForwardedMetadataHistoryCapacity) => {
+                failures.push(format!(
+                    "{holder}: holder returned metadata history capacity for a non-update"
+                ));
+            }
             Ok(MetadataTransportMessage::Reject(error)) => {
                 warn!(holder = %holder, error = %error, "Holder rejected a forwarded metadata write");
                 return Err(MetadataWriteError::Undeliverable(format!(
@@ -1511,6 +1560,12 @@ async fn forward_to_holders(
         }
     }
 
+    if !holders.is_empty() && capacity == holders.len() {
+        return Err(MetadataWriteError::Undeliverable(
+            "metadata history capacity reached on every holder".to_string(),
+        ));
+    }
+
     if tracks_not_found && !holders.is_empty() && not_found == holders.len() {
         return Err(MetadataWriteError::NotFound);
     }
@@ -1526,6 +1581,25 @@ async fn forward_to_holders(
         "Metadata write reached a non-holder and no holder accepted the forward"
     );
     Err(MetadataWriteError::Undeliverable(detail))
+}
+
+fn distinct_holders(holders: &[NodeId]) -> Vec<NodeId> {
+    let mut distinct = Vec::with_capacity(holders.len());
+    for holder in holders.iter().copied() {
+        if !distinct.contains(&holder) {
+            distinct.push(holder);
+        }
+    }
+    distinct
+}
+
+fn holder_intersection(current: &[NodeId], frozen: &[NodeId]) -> Vec<NodeId> {
+    let holders = current
+        .iter()
+        .copied()
+        .filter(|holder| frozen.contains(holder))
+        .collect::<Vec<_>>();
+    distinct_holders(&holders)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1972,6 +2046,26 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), TOKEN_REVOKE_PEER_LIMIT);
         assert!(first.iter().all(|peer| peers.contains(peer)));
+    }
+
+    #[test]
+    fn holders_deduplicate() {
+        let first = node(1);
+        let second = node(2);
+
+        assert_eq!(
+            distinct_holders(&[first, second, first, second]),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn frozen_holders_intersect() {
+        let current = [node(1), node(2)];
+        let frozen = [node(2), node(3)];
+
+        assert_eq!(holder_intersection(&current, &frozen), vec![node(2)]);
+        assert!(holder_intersection(&[node(1)], &[node(2)]).is_empty());
     }
 
     #[tokio::test]
