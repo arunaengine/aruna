@@ -10,8 +10,8 @@ use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
     REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH,
-    USER_NAME_PATH, decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
-    group_role_user_assignment_from_path, group_role_user_assignment_path,
+    RevocationIndex, USER_NAME_PATH, decode_admin_document_reducer_state, group_role_id_from_path,
+    group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
     overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
     realm_config_node_path, realm_config_oidc_provider_id_from_path, realm_role_path,
     realm_role_user_assignment_from_path, realm_role_user_assignment_path, user_attribute_path,
@@ -3392,6 +3392,7 @@ fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
+    revocation_index: &RevocationIndex,
 ) {
     if !reducer_state
         .conflicts
@@ -3436,7 +3437,7 @@ fn overlay_realm_config_reducer_materialization(
 
     // Union, so a locally accepted revocation is never dropped because the
     // replicated set has not carried it yet.
-    config.merge_revocations(reducer_state, now);
+    config.merge_revocation_index(revocation_index, now);
 
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
@@ -3480,6 +3481,7 @@ fn realm_config_from_reducer_materialization(
     realm_id: RealmId,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
+    revocation_index: &RevocationIndex,
 ) -> Option<RealmConfigDocument> {
     let metadata_replication = reducer_state.materialized_realm_config_metadata_replication()?;
     let discovery = reducer_state.materialized_realm_config_discovery()?;
@@ -3506,7 +3508,7 @@ fn realm_config_from_reducer_materialization(
         band_pools: Vec::new(),
         revoked_tokens: Vec::new(),
     };
-    overlay_realm_config_reducer_materialization(&mut config, reducer_state, now);
+    overlay_realm_config_reducer_materialization(&mut config, reducer_state, now, revocation_index);
     Some(config)
 }
 
@@ -4445,10 +4447,18 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         let mut reducer_state = previous_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-        if let Err(error) = reducer_state.apply(&event) {
+        let mut revocation_index = reducer_state.revocation_index(effective_now);
+        if is_revocation {
+            if let Err(error) = reducer_state.apply_revocation_event(&event, &mut revocation_index)
+            {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        } else if let Err(error) = reducer_state.apply(&event) {
             return Err(abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await);
         }
-        reducer_state.compact_revocations(effective_now);
+        revocation_index.compact(&mut reducer_state);
 
         let mut config_changed = false;
         let config = match previous_config {
@@ -4471,6 +4481,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     &mut config,
                     &reducer_state,
                     effective_now,
+                    &revocation_index,
                 );
                 config_changed = config != before;
                 Some(config)
@@ -4480,6 +4491,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     realm_id,
                     &reducer_state,
                     effective_now,
+                    &revocation_index,
                 );
                 config_changed = config.is_some();
                 config
@@ -7989,7 +8001,9 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.default_strategy_id = Some(prior_default);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state, unix_timestamp_secs());
+        let now = unix_timestamp_secs();
+        let index = state.revocation_index(now);
+        overlay_realm_config_reducer_materialization(&mut config, &state, now, &index);
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -8022,7 +8036,8 @@ mod tests {
         );
         assert_eq!(state.materialized_realm_config_default_strategy(), None);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state, unix_timestamp_secs());
+        let index = state.revocation_index(now);
+        overlay_realm_config_reducer_materialization(&mut config, &state, now, &index);
         assert_eq!(config.default_strategy_id, None);
     }
 
@@ -8609,7 +8624,8 @@ mod tests {
                 .any(|path| path.contains(&expired))
         );
         let mut future_config = config;
-        overlay_realm_config_reducer_materialization(&mut future_config, &state, future);
+        let index = state.revocation_index(future);
+        overlay_realm_config_reducer_materialization(&mut future_config, &state, future, &index);
         assert_eq!(future_config.revoked_tokens.len(), 1);
     }
 
