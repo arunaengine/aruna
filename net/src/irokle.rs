@@ -4507,23 +4507,25 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         }
 
         let mut writes = Vec::new();
-        if let Some(config) = config {
-            let bytes = match config.to_bytes(&event.actor) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return Err(abort_error(
-                        storage,
-                        txn_id,
-                        NetError::Bootstrap(error.to_string()),
-                    )
-                    .await);
-                }
-            };
-            writes.push((
-                document_target.storage_keyspace().to_string(),
-                document_target.storage_key(),
-                bytes.into(),
-            ));
+        if config_changed {
+            if let Some(config) = config {
+                let bytes = match config.to_bytes(&event.actor) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return Err(abort_error(
+                            storage,
+                            txn_id,
+                            NetError::Bootstrap(error.to_string()),
+                        )
+                        .await);
+                    }
+                };
+                writes.push((
+                    document_target.storage_keyspace().to_string(),
+                    document_target.storage_key(),
+                    bytes.into(),
+                ));
+            }
         }
         let reducer_write = match admin_document_reducer_state_write_entry(&reducer_state) {
             Ok(write) => write,
@@ -4534,15 +4536,23 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             }
         };
         writes.push(reducer_write);
-        let conflict_writes = match admin_document_conflict_write_entries(&reducer_state) {
-            Ok(writes) => writes,
-            Err(error) => {
-                return Err(
-                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
-                );
-            }
-        };
-        writes.extend(conflict_writes);
+        if previous_state
+            .as_ref()
+            .is_none_or(|previous| previous.conflicts != reducer_state.conflicts)
+        {
+            let conflict_writes = match admin_document_conflict_write_entries(&reducer_state) {
+                Ok(writes) => writes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.extend(conflict_writes);
+        }
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             previous_state.as_ref(),
@@ -5755,11 +5765,21 @@ async fn validate_replicated_admin_event(
         return Ok(authorized);
     }
 
-    let mut reducer_state =
-        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-    if reducer_state.target != event.target {
+    if previous_state
+        .as_ref()
+        .is_some_and(|state| state.target != event.target)
+    {
         return reject("stored admin reducer state has the wrong target");
     }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    ) {
+        return Ok(AdminEventValidation::Accepted);
+    }
+
+    let mut reducer_state =
+        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
     if let Err(error) = reducer_state.apply(event) {
         return Ok(AdminEventValidation::Rejected(format!(
             "admin operation is malformed: {error}"
@@ -8699,7 +8719,7 @@ mod tests {
         );
 
         let second = test_admin_event(
-            Ulid::from_parts(1_693, 1),
+            Ulid::from_parts(1_691, 1),
             target.clone(),
             &actor_b,
             1,
