@@ -6,6 +6,7 @@ use super::cors::{
 use super::s3_service::ArunaS3Service;
 use crate::cors::CorsConfig;
 use crate::error::S3ServerError;
+use crate::rate_limit::{LocalKey, LocalLease};
 use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
 use aruna_core::credential_seal::CredentialSealKey;
@@ -434,6 +435,7 @@ struct ResponseBody {
     response_activity: Arc<ConnectionActivity>,
     cancellation: BoxFuture<'static, ()>,
     active: Option<ActiveRequestGuard>,
+    lease: Option<LocalLease>,
     ended: bool,
 }
 
@@ -444,6 +446,7 @@ impl ResponseBody {
         activity: Arc<ConnectionActivity>,
         response_activity: Arc<ConnectionActivity>,
         active: ActiveRequestGuard,
+        lease: LocalLease,
     ) -> Self {
         let connection_activity = activity.clone();
         let body_activity = response_activity.clone();
@@ -460,6 +463,7 @@ impl ResponseBody {
             response_activity,
             cancellation,
             active: Some(active),
+            lease: Some(lease),
             ended: false,
         }
     }
@@ -471,6 +475,7 @@ impl hyper::body::Body for ResponseBody {
 
     fn finish(&mut self) {
         self.active.take();
+        self.lease.take();
     }
 
     fn poll_frame(
@@ -869,7 +874,7 @@ impl Service<Request<Incoming>> for WrappingService {
         let charged_ip = self
             .peer_ip
             .map(|peer| crate::forwarded::client_ip(&self.trusted_proxies, peer, &parts.headers));
-        let s3s_request = s3s::HttpRequest::from_parts(parts, body);
+        let mut s3s_request = s3s::HttpRequest::from_parts(parts, body);
         let shared = self.shared.clone();
         let cors = self.cors.clone();
         let driver_ctx = self.driver_ctx.clone();
@@ -926,6 +931,37 @@ impl Service<Request<Incoming>> for WrappingService {
                 record_s3_request(&metrics, &method, code, "body_limited", started.elapsed());
                 return Ok(response);
             }
+            let mut local_lease = LocalLease::default();
+            if let Some(charged_ip) = charged_ip {
+                let permit = match rate_limits.try_acquire_local(LocalKey::Ip(charged_ip)) {
+                    Some(permit) => permit,
+                    None => {
+                        drop(request_permit);
+                        drop(s3s_request);
+                        let response = slow_down_response(1);
+                        let code = response.status().as_u16();
+                        emit_request_completed(&span, "s3", code, started);
+                        record_s3_request(
+                            &metrics,
+                            &method,
+                            code,
+                            "local_limited",
+                            started.elapsed(),
+                        );
+                        return Ok(response);
+                    }
+                };
+                if !local_lease.hold(permit) {
+                    drop(request_permit);
+                    drop(s3s_request);
+                    let response = slow_down_response(1);
+                    let code = response.status().as_u16();
+                    emit_request_completed(&span, "s3", code, started);
+                    record_s3_request(&metrics, &method, code, "local_limited", started.elapsed());
+                    return Ok(response);
+                }
+            }
+            s3s_request.extensions_mut().insert(local_lease.clone());
             activity.begin_request();
             let deadline_activity = Arc::new(ConnectionActivity::default());
             let deadline = tokio::time::Instant::now() + STREAM_LIFETIME_TIMEOUT;
@@ -1144,6 +1180,7 @@ impl Service<Request<Incoming>> for WrappingService {
                             activity.clone(),
                             response_activity,
                             active_guard,
+                            local_lease,
                         ))
                     }))
                 }
@@ -1151,6 +1188,7 @@ impl Service<Request<Incoming>> for WrappingService {
                     drop(request_permit);
                     drop(capture_permit.take());
                     drop(egress_permit);
+                    drop(local_lease);
                     stream_activity.stop();
                     Err(error)
                 }
@@ -1420,6 +1458,7 @@ mod tests {
             activity.clone(),
             response_activity.clone(),
             active,
+            LocalLease::default(),
         );
         let ready = Arc::new(Notify::new());
         let task_ready = ready.clone();
@@ -1538,6 +1577,7 @@ mod tests {
             activity.clone(),
             response_activity.clone(),
             active,
+            LocalLease::default(),
         );
         let sibling = Arc::new(ConnectionActivity::default());
         sibling.mark_request();
@@ -1599,6 +1639,13 @@ mod tests {
     fn holds_response_permit() {
         let limit = Arc::new(Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().expect("permit");
+        let local_limit = Arc::new(Semaphore::new(1));
+        let local_permit = local_limit
+            .clone()
+            .try_acquire_owned()
+            .expect("local permit");
+        let lease = LocalLease::default();
+        assert!(lease.hold(local_permit));
         let activity = Arc::new(ConnectionActivity::default());
         activity.begin_request();
         let deadline = Arc::new(ConnectionActivity::default());
@@ -1610,11 +1657,14 @@ mod tests {
             activity.clone(),
             stream_activity,
             active,
+            lease,
         );
         assert_eq!(limit.available_permits(), 0);
+        assert_eq!(local_limit.available_permits(), 0);
         assert_eq!(activity.active.load(Ordering::Acquire), 1);
         drop(body);
         assert_eq!(limit.available_permits(), 1);
+        assert_eq!(local_limit.available_permits(), 1);
         assert_eq!(activity.active.load(Ordering::Acquire), 0);
     }
 
