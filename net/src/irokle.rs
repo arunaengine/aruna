@@ -7092,7 +7092,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_peers_order_free() {
+    fn sync_peers_permutation() {
         let forward = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject");
         let reverse = select_sync_peers(
             (1u8..=32).rev().map(peer),
