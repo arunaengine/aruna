@@ -338,18 +338,24 @@ impl RevokeTokenOperation {
                 continue;
             };
             let Ok(record) = postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) else {
-                pending_deletes.push((
-                    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
-                    index_key,
-                ));
+                pending_deletes.extend([
+                    (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (
+                        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                        index_key,
+                    ),
+                ]);
                 continue;
             };
             let Some((token_hash, expires_at, token_owner)) = self.pending_revocation(&record)
             else {
-                pending_deletes.push((
-                    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
-                    index_key,
-                ));
+                pending_deletes.extend([
+                    (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (
+                        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                        index_key,
+                    ),
+                ]);
                 continue;
             };
             if !revocation_retained(expires_at, self.config.now) {
