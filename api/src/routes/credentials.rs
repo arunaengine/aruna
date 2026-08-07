@@ -6,7 +6,8 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::s3::create_user_access::{
-    CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
+    CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
+    DEFAULT_CREDENTIAL_TTL,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use aruna_operations::s3::list_user_access::{ListUserAccessInput, ListUserAccessOperation};
@@ -311,6 +312,9 @@ pub async fn create_s3_credentials(
                 access_key_id,
                 access_secret: access_secret.expose().to_string(),
             }),
+        )),
+        Err(CreateUserAccessError::LimitReached) => Err(ServerError::Conflict(
+            "active credential limit reached".to_string(),
         )),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }

@@ -88,27 +88,27 @@ impl S3Access for AuthProvider {
         let action = get_s3_operation_permission(&operation_name)
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
-        // Per-access-key budget after authentication; the connection's IP bucket
-        // is charged earlier in `WrappingService`, so a request is never
-        // double-charged for its address.
-        let principal = cx
-            .credentials()
-            .map(|credentials| credentials.access_key.clone());
-        if let Some(principal) = principal.as_deref()
-            && self.rate_limits.check_principal(principal).is_err()
-        {
-            return Err(s3_error!(SlowDown, "Reduce your request rate"));
-        }
-
         // Unsigned requests are checked as the Everyone principal, but only for
         // the public object-byte read surface.
-        let access_key_id = match principal {
+        let access_key_id = match cx
+            .credentials()
+            .map(|credentials| credentials.access_key.clone())
+        {
             Some(access_key_id) => access_key_id,
             None => return self.check_anonymous(cx, action).await,
         };
 
         // Fetch user access -> GetUserAccess state machine
         let user_access = self.query_user_access(&access_key_id).await?;
+        // Charge the stable identity after lookup so credential rotation cannot
+        // multiply the authenticated request budget.
+        if self
+            .rate_limits
+            .check_principal(user_access.user_identity)
+            .is_err()
+        {
+            return Err(s3_error!(SlowDown, "Reduce your request rate"));
+        }
         let Some(permit) = self
             .rate_limits
             .try_acquire_local(LocalKey::User(user_access.user_identity))

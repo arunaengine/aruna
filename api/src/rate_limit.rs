@@ -208,11 +208,12 @@ impl ApiRateLimits {
 
     /// Charges the authenticated principal's bucket, independent of the IP
     /// bucket so a request is never double-charged for its address.
-    pub fn check_principal(&self, principal: &str) -> Result<(), u64> {
+    pub fn check_principal(&self, principal: UserId) -> Result<(), u64> {
         self.maybe_maintain();
         let now = self.clock.now();
+        let principal = principal.to_string();
         self.per_principal
-            .check_key(&principal.to_string())
+            .check_key(&principal)
             .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
     }
 }
@@ -255,11 +256,11 @@ pub async fn principal_middleware(
         .get::<Option<AuthContext>>()
         .cloned()
         .flatten()
-        .map(|auth| auth.user_id.to_string());
+        .map(|auth| auth.user_id);
     let Some(principal) = principal else {
         return next.run(request).await;
     };
-    match state.rate_limits().check_principal(&principal) {
+    match state.rate_limits().check_principal(principal) {
         Ok(()) => next.run(request).await,
         Err(retry_after) => too_many_requests(retry_after),
     }
@@ -316,10 +317,10 @@ mod tests {
         // A principal is bounded independently of any source address.
         let limits = ApiRateLimits::for_test(3);
         for _ in 0..3 {
-            assert!(limits.check_principal("user-a").is_ok());
+            assert!(limits.check_principal(user(1)).is_ok());
         }
-        assert!(limits.check_principal("user-a").is_err());
-        assert!(limits.check_principal("user-b").is_ok());
+        assert!(limits.check_principal(user(1)).is_err());
+        assert!(limits.check_principal(user(2)).is_ok());
     }
 
     #[test]
@@ -331,9 +332,9 @@ mod tests {
         assert!(limits.check_ip(ip).is_ok());
         assert!(limits.check_ip(ip).is_err());
         // The principal bucket is untouched by the exhausted IP bucket.
-        assert!(limits.check_principal("user-a").is_ok());
-        assert!(limits.check_principal("user-a").is_ok());
-        assert!(limits.check_principal("user-a").is_err());
+        assert!(limits.check_principal(user(1)).is_ok());
+        assert!(limits.check_principal(user(1)).is_ok());
+        assert!(limits.check_principal(user(1)).is_err());
     }
 
     fn user(number: u128) -> UserId {
