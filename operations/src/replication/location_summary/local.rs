@@ -388,6 +388,11 @@ impl LocationSummaryOperation {
             Ok(_) => return self.deny(),
             Err(error) => return self.fail(error.into()),
         };
+        if let Some(peer) = self.peer
+            && ensure_realm_peer(&realm, peer, self.request.realm_id, true).is_err()
+        {
+            return self.deny();
+        }
         let Some((_, Some(group_value))) = values.get(2) else {
             return self.deny();
         };
@@ -662,13 +667,13 @@ mod tests {
     use super::{LocationSummaryError, LocationSummaryOperation};
     use crate::replication::location_summary::fixtures::{node_id, realm_id, request};
     use crate::replication::protocol::LocationCopyStorage;
-    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         BackendLocation, BackendRef, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-        RealmConfigDocument,
+        RealmConfigDocument, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use std::collections::HashMap;
@@ -1008,6 +1013,54 @@ mod tests {
             panic!("expected a realm read first, got {effects:?}")
         };
         assert_eq!(key_space, aruna_core::keyspaces::REALM_CONFIG_KEYSPACE);
+    }
+
+    #[test]
+    fn peer_removed_read() {
+        // A peer removed in the fenced realm snapshot must not disclose data.
+        let peer = node_id(4);
+        let stream_id = Ulid::from(13u128);
+        let mut initial = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
+        initial.ensure_node(peer, RealmNodeKind::Server);
+        let mut operation = LocationSummaryOperation::new_incoming(
+            peer,
+            node_id(5),
+            stream_id,
+            request(Some(Ulid::from_bytes([3u8; 16]))),
+        )
+        .with_policy(true);
+        operation.start();
+        operation.step(read_result(Some(postcard::to_allocvec(&initial).unwrap())));
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(14u128),
+        }));
+        let mut batch = policy_batch();
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+            unreachable!();
+        };
+        let current = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
+        values[1].1 = Some(postcard::to_allocvec(&current).unwrap().into());
+        let effects = operation.step(batch);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from(14u128),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::SendMessage { .. })]
+        ));
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
+            stream_id,
+        }));
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::ConnectionClosed { stream_id },
+        ));
+
+        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
     }
 
     #[test]
