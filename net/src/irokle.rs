@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aruna_core::DhtKeyId;
@@ -330,6 +330,7 @@ pub struct DocumentSyncService {
     // Flips true on the first realm-config-driven peer refresh, after which
     // `configured_peers` no longer grant admission.
     realm_config_materialized: Arc<AtomicBool>,
+    selection_round: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -418,6 +419,7 @@ impl DocumentSyncService {
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
+            selection_round: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -612,7 +614,8 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        let selection = self.sync_peer_selection(&peers, &topic_id);
+        let round = self.next_sync_round();
+        let selection = self.sync_peer_selection(&peers, &topic_id, round);
         self.log_peer_selection(topic_id, &selection);
         self.allow_sync_peers(&selection.peers)?;
         self.sync_topic(topic_id, selection).await?;
@@ -1013,9 +1016,10 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> DocumentSyncNetEvent {
+        let round = self.next_sync_round();
         match self.has_topic(topic_id) {
             Ok(true) => {
-                let selection = self.sync_peer_selection(&peers, &topic_id);
+                let selection = self.sync_peer_selection(&peers, &topic_id, round);
                 self.log_peer_selection(topic_id, &selection);
                 if let Err(error) = self.allow_sync_peers(&selection.peers) {
                     return DocumentSyncNetEvent::Error {
@@ -1031,7 +1035,10 @@ impl DocumentSyncService {
                 }
             }
             Ok(false) => {
-                if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &peers).await {
+                if let Err(error) = self
+                    .bootstrap_topic_from_peers(topic_id, &peers, round)
+                    .await
+                {
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -1072,6 +1079,7 @@ impl DocumentSyncService {
     ) -> DocumentSyncNetEvent {
         let sync_started = Instant::now();
         let target_count = topic_ids.len();
+        let round = self.next_sync_round();
 
         let mut seen_topics = BTreeSet::new();
         let mut topic_ids_out: Vec<irokle_crate::TopicId> = Vec::new();
@@ -1086,7 +1094,10 @@ impl DocumentSyncService {
                     // found yet (e.g. an empty shard whose rank-0 holder has not
                     // created it) is skipped, not fatal — it arrives via gossip
                     // or a later anti-entropy pass.
-                    match self.bootstrap_topic_from_peers(topic_id, &peers).await {
+                    match self
+                        .bootstrap_topic_from_peers(topic_id, &peers, round)
+                        .await
+                    {
                         Ok(()) => topic_ids_out.push(topic_id),
                         Err(error) => {
                             debug!(%topic_id, error = %error, "skipping unbootstrappable document sync topic");
@@ -1105,7 +1116,7 @@ impl DocumentSyncService {
         let bootstrap_elapsed = sync_started.elapsed();
         let topic_ids = topic_ids_out;
         let peer_sync_started = Instant::now();
-        if let Err(error) = self.sync_topics(topic_ids.clone(), &peers).await {
+        if let Err(error) = self.sync_topics(topic_ids.clone(), &peers, round).await {
             return DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
@@ -1489,18 +1500,37 @@ impl DocumentSyncService {
         sync_peers
     }
 
+    fn next_sync_round(&self) -> u64 {
+        self.selection_round.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn sync_peer_selection(
         &self,
         peers: &[NodeId],
         topic_id: &irokle_crate::TopicId,
+        round: u64,
     ) -> PeerSelection {
         let mut subject = [0u8; 64];
         subject[..32].copy_from_slice(topic_id.as_ref());
         subject[32..].copy_from_slice(self.node.peer_id().as_bytes());
         if peers.is_empty() {
             let defaults = self.default_peers.read();
-            select_sync_peers(defaults.iter().copied(), self.node.peer_id(), &subject)
+            let candidate_count = defaults
+                .iter()
+                .filter(|peer| **peer != self.node.peer_id())
+                .count();
+            select_sync_peers(
+                defaults.iter().copied(),
+                self.node.peer_id(),
+                &subject,
+                round,
+                candidate_count,
+            )
         } else {
+            let candidate_count = peers
+                .iter()
+                .filter(|node_id| node_id_to_peer_id(node_id) != self.node.peer_id())
+                .count();
             select_sync_peers(
                 peers
                     .iter()
@@ -1508,6 +1538,8 @@ impl DocumentSyncService {
                     .map(|node_id| node_id_to_peer_id(&node_id)),
                 self.node.peer_id(),
                 &subject,
+                round,
+                candidate_count,
             )
         }
     }
@@ -1638,18 +1670,23 @@ impl DocumentSyncService {
         &self,
         topic_ids: Vec<irokle_crate::TopicId>,
         peers: &[NodeId],
+        round: u64,
     ) -> Result<()> {
         if topic_ids.is_empty() {
             return Ok(());
         }
         for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
-            let Some(topic_id) = chunk.first() else {
-                continue;
-            };
-            let selection = self.sync_peer_selection(peers, topic_id);
-            self.log_peer_selection(*topic_id, &selection);
-            self.allow_sync_peers(&selection.peers)?;
-            self.sync_topic_batch(chunk, selection).await?;
+            let groups = group_sync_topics(chunk, |topic_id| {
+                self.sync_peer_selection(peers, &topic_id, round)
+            });
+            for (_, (selection, topics)) in groups {
+                let Some(topic_id) = topics.first() else {
+                    continue;
+                };
+                self.log_peer_selection(*topic_id, &selection);
+                self.allow_sync_peers(&selection.peers)?;
+                self.sync_topic_batch(&topics, selection).await?;
+            }
         }
         Ok(())
     }
@@ -1815,8 +1852,9 @@ impl DocumentSyncService {
         &self,
         topic_id: irokle_crate::TopicId,
         peers: &[NodeId],
+        round: u64,
     ) -> Result<()> {
-        let selection = self.sync_peer_selection(peers, &topic_id);
+        let selection = self.sync_peer_selection(peers, &topic_id, round);
         self.log_peer_selection(topic_id, &selection);
         self.allow_sync_peers(&selection.peers)?;
         let mut first_error = None;
@@ -7101,7 +7139,13 @@ mod tests {
 
     #[test]
     fn sync_peers_bounded() {
-        let selection = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject");
+        let selection = select_sync_peers(
+            (1u8..=32).map(peer),
+            peer(0),
+            b"document-sync-subject",
+            0,
+            32,
+        );
 
         assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
         assert!(selection.truncated);
