@@ -414,18 +414,21 @@ pub async fn list_visible_metadata_documents(
             .filter(|record| record.realm_id == realm_id)
             .map(|record| (record.realm_id, record.group_id)),
     )
-    .await;
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let policy_user = request.auth.as_ref().map(|auth| auth.user_id);
     let record_visible = |record: &MetadataRegistryRecord| {
         permissions.record_visible(record)
-            && evaluators.get(&record.group_id).is_some_and(|evaluator| {
-                evaluator
-                    .evaluate(&metadata_read_request(
-                        &record.permission_path,
-                        policy_user.as_ref(),
-                    ))
-                    .is_ok()
-            })
+            && evaluators
+                .get(&(record.realm_id, record.group_id))
+                .is_some_and(|evaluator| {
+                    evaluator
+                        .evaluate(&metadata_read_request(
+                            &record.permission_path,
+                            policy_user.as_ref(),
+                        ))
+                        .is_ok()
+                })
     };
 
     let mut total_estimate = None;
@@ -878,7 +881,8 @@ pub(crate) async fn local_path_candidates(
             .iter()
             .map(|record| (record.realm_id, record.group_id)),
     )
-    .await;
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let policy_user = auth.map(|auth| auth.user_id);
     let mut candidates = records
         .into_iter()
@@ -891,14 +895,16 @@ pub(crate) async fn local_path_candidates(
                 requested_path: record.document_path.clone(),
             };
             let visible = permissions.record_visible(&record)
-                && evaluators.get(&record.group_id).is_some_and(|evaluator| {
-                    evaluator
-                        .evaluate(&metadata_read_request(
-                            &record.permission_path,
-                            policy_user.as_ref(),
-                        ))
-                        .is_ok()
-                });
+                && evaluators
+                    .get(&(record.realm_id, record.group_id))
+                    .is_some_and(|evaluator| {
+                        evaluator
+                            .evaluate(&metadata_read_request(
+                                &record.permission_path,
+                                policy_user.as_ref(),
+                            ))
+                            .is_ok()
+                    });
             let record = visible.then_some(record);
             Ok(MetadataPathCandidate { claim, record })
         })

@@ -17,7 +17,9 @@ use thiserror::Error;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
+use crate::request_policy::{
+    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {
@@ -71,6 +73,8 @@ pub enum SearchBucketsError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Policy(#[from] PolicyEnforcementError),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -283,7 +287,7 @@ pub async fn search_local_buckets(
     input: SearchBucketsInput,
 ) -> Result<Vec<BucketSearchHit>, SearchBucketsError> {
     let limit = input.limit.clamp(1, SearchBucketsOperation::MAX_LIMIT);
-    let mut evaluators: HashMap<GroupId, PolicyEvaluator> = HashMap::new();
+    let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
     let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
     let mut start_after = input.start_after.clone();
     loop {
@@ -299,10 +303,10 @@ pub async fn search_local_buckets(
             .hits
             .iter()
             .map(|hit| hit.group_id)
-            .filter(|group_id| !evaluators.contains_key(group_id))
+            .filter(|group_id| !evaluators.contains_key(&(input.realm_id, *group_id)))
             .map(|group_id| (input.realm_id, group_id))
             .collect::<Vec<_>>();
-        evaluators.extend(PolicyEvaluator::load_bulk(context, pending).await);
+        evaluators.extend(PolicyEvaluator::load_bulk(context, pending).await?);
         for hit in output.hits {
             if !policy_allows(&evaluators, &input, &hit) {
                 continue;
@@ -323,7 +327,7 @@ pub async fn search_local_buckets(
 /// under the S3 bucket-read action so one policy covers both read surfaces. A
 /// group with no loaded evaluator fails closed.
 fn policy_allows(
-    evaluators: &HashMap<GroupId, PolicyEvaluator>,
+    evaluators: &HashMap<(RealmId, GroupId), PolicyEvaluator>,
     input: &SearchBucketsInput,
     hit: &BucketSearchHit,
 ) -> bool {
@@ -335,7 +339,7 @@ fn policy_allows(
         PolicyRequestExtras::operation("s3.ListBuckets"),
     );
     evaluators
-        .get(&hit.group_id)
+        .get(&(input.realm_id, hit.group_id))
         .is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
 }
 

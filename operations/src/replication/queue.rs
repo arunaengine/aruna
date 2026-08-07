@@ -13,7 +13,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, Permission, SyncMode,
     SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
-    blob_bucket_permission_path, data_watch_resource_path, sync_relationship_key,
+    blob_object_permission_path, data_watch_resource_path, sync_relationship_key,
     sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -61,38 +61,6 @@ pub struct BlobReplicationJobRecord {
     pub origin: Option<SyncOrigin>,
     pub upstream_sources: Vec<ArunaArn>,
     pub writer_auth_context: Option<AuthContext>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct OriginBlobReplicationJobRecord {
-    input: ReplicateScopeInput,
-    source_delete_marker: Option<bool>,
-    due_at_ms: u64,
-    attempts: u32,
-    last_error: Option<String>,
-    relationship_id: Option<Ulid>,
-    enqueued_at_ms: u64,
-    origin: Option<SyncOrigin>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct PreviousBlobReplicationJobRecord {
-    input: ReplicateScopeInput,
-    source_delete_marker: Option<bool>,
-    due_at_ms: u64,
-    attempts: u32,
-    last_error: Option<String>,
-    relationship_id: Option<Ulid>,
-    enqueued_at_ms: u64,
-}
-
-#[derive(Deserialize, Serialize)]
-struct LegacyBlobReplicationJobRecord {
-    input: ReplicateScopeInput,
-    source_delete_marker: Option<bool>,
-    due_at_ms: u64,
-    attempts: u32,
-    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,27 +114,6 @@ pub struct LiveReplicationObligationRecord {
     pub upstream_sources: Vec<ArunaArn>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct OriginLiveReplicationObligationRecord {
-    local_node_id: NodeId,
-    auth_context: AuthContext,
-    bucket: String,
-    key: String,
-    version_id: Ulid,
-    delete_marker: bool,
-    origin: Option<SyncOrigin>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct LegacyLiveReplicationObligationRecord {
-    local_node_id: NodeId,
-    auth_context: AuthContext,
-    bucket: String,
-    key: String,
-    version_id: Ulid,
-    delete_marker: bool,
-}
-
 #[derive(Serialize)]
 struct LiveReplicationObligationIdentity<'a> {
     bucket: &'a str,
@@ -198,6 +145,7 @@ impl BlobReplicationJobRecord {
         source_delete_marker: Option<bool>,
         due_at_ms: u64,
     ) -> Self {
+        let writer_auth_context = Some(input.auth_context.clone());
         Self {
             input,
             source_delete_marker,
@@ -208,7 +156,7 @@ impl BlobReplicationJobRecord {
             enqueued_at_ms: due_at_ms,
             origin: None,
             upstream_sources: Vec::new(),
-            writer_auth_context: None,
+            writer_auth_context,
         }
     }
 
@@ -244,61 +192,13 @@ impl BlobReplicationJobRecord {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        match postcard::from_bytes(bytes) {
-            Ok(record) => Ok(record),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                let mut previous = bytes.to_vec();
-                previous.extend(postcard::to_allocvec(&Option::<AuthContext>::None)?);
-                if let Ok(record) = postcard::from_bytes(&previous) {
-                    return Ok(record);
-                }
-                if let Ok(previous) = postcard::from_bytes::<OriginBlobReplicationJobRecord>(bytes)
-                {
-                    return Ok(Self {
-                        input: previous.input,
-                        source_delete_marker: previous.source_delete_marker,
-                        due_at_ms: previous.due_at_ms,
-                        attempts: previous.attempts,
-                        last_error: previous.last_error,
-                        relationship_id: previous.relationship_id,
-                        enqueued_at_ms: previous.enqueued_at_ms,
-                        origin: previous.origin,
-                        upstream_sources: Vec::new(),
-                        writer_auth_context: None,
-                    });
-                }
-                if let Ok(previous) =
-                    postcard::from_bytes::<PreviousBlobReplicationJobRecord>(bytes)
-                {
-                    return Ok(Self {
-                        input: previous.input,
-                        source_delete_marker: previous.source_delete_marker,
-                        due_at_ms: previous.due_at_ms,
-                        attempts: previous.attempts,
-                        last_error: previous.last_error,
-                        relationship_id: previous.relationship_id,
-                        enqueued_at_ms: previous.enqueued_at_ms,
-                        origin: None,
-                        upstream_sources: Vec::new(),
-                        writer_auth_context: None,
-                    });
-                }
-                let legacy: LegacyBlobReplicationJobRecord = postcard::from_bytes(bytes)?;
-                Ok(Self {
-                    input: legacy.input,
-                    source_delete_marker: legacy.source_delete_marker,
-                    due_at_ms: legacy.due_at_ms,
-                    attempts: legacy.attempts,
-                    last_error: legacy.last_error,
-                    relationship_id: None,
-                    enqueued_at_ms: legacy.due_at_ms,
-                    origin: None,
-                    upstream_sources: Vec::new(),
-                    writer_auth_context: None,
-                })
-            }
-            Err(error) => Err(error.into()),
+        let record: Self = postcard::from_bytes(bytes)?;
+        if record.writer_auth_context.is_none() {
+            return Err(ConversionError::FromStrError(
+                "replication job is missing its source writer".to_string(),
+            ));
         }
+        Ok(record)
     }
 }
 
@@ -338,37 +238,7 @@ impl LiveReplicationObligationRecord {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        match postcard::from_bytes(bytes) {
-            Ok(record) => Ok(record),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                if let Ok(previous) =
-                    postcard::from_bytes::<OriginLiveReplicationObligationRecord>(bytes)
-                {
-                    return Ok(Self {
-                        local_node_id: previous.local_node_id,
-                        auth_context: previous.auth_context,
-                        bucket: previous.bucket,
-                        key: previous.key,
-                        version_id: previous.version_id,
-                        delete_marker: previous.delete_marker,
-                        origin: previous.origin,
-                        upstream_sources: Vec::new(),
-                    });
-                }
-                let legacy: LegacyLiveReplicationObligationRecord = postcard::from_bytes(bytes)?;
-                Ok(Self {
-                    local_node_id: legacy.local_node_id,
-                    auth_context: legacy.auth_context,
-                    bucket: legacy.bucket,
-                    key: legacy.key,
-                    version_id: legacy.version_id,
-                    delete_marker: legacy.delete_marker,
-                    origin: None,
-                    upstream_sources: Vec::new(),
-                })
-            }
-            Err(error) => Err(error.into()),
-        }
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -1121,6 +991,7 @@ fn live_replication_jobs_from_config(
                 Some(delete_marker),
                 now_ms,
             )
+            .with_writer_auth(auth_context.clone())
         })
         .collect()
 }
@@ -1327,13 +1198,13 @@ pub async fn process_blob_replication_batch(
     })
 }
 
-async fn creator_can_read(
+async fn source_can_read(
     context: &DriverContext,
-    relationship: &SyncRelationship,
+    auth_context: &AuthContext,
+    source_node_id: NodeId,
+    bucket: &str,
+    key: &str,
 ) -> Result<(bool, GroupId), (String, Option<GroupId>)> {
-    let Some(bucket) = relationship.source.bucket() else {
-        return Err(("sync source is not an S3 bucket".to_string(), None));
-    };
     let bucket_info = match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
         Ok(Some(Ok(bucket_info))) => bucket_info,
         Ok(Some(Err(error))) => return Err((error.to_string(), None)),
@@ -1343,17 +1214,8 @@ async fn creator_can_read(
         Err(error) => return Err((error.to_string(), None)),
     };
     let group_id = bucket_info.group_id;
-    let auth_context = AuthContext {
-        user_id: relationship.created_by,
-        realm_id: relationship.source.realm_id,
-        path_restrictions: None,
-    };
-    let path = blob_bucket_permission_path(
-        relationship.source.realm_id,
-        group_id,
-        relationship.source.node_id,
-        bucket,
-    );
+    let path =
+        blob_object_permission_path(auth_context.realm_id, group_id, source_node_id, bucket, key);
     match authorize(
         context,
         auth_context.realm_id,
@@ -1373,6 +1235,15 @@ async fn creator_can_read(
             Err((error.to_string(), Some(group_id)))
         }
         Err(AuthorizeError::CheckFailed(error)) => Err((error, Some(group_id))),
+    }
+}
+
+fn source_key(input: &ReplicateScopeInput) -> Option<&str> {
+    match &input.target {
+        ReplicateScopeTarget::Object { key } | ReplicateScopeTarget::Version { key, .. } => {
+            Some(key)
+        }
+        ReplicateScopeTarget::Bucket | ReplicateScopeTarget::Prefix(_) => None,
     }
 }
 
@@ -1517,7 +1388,18 @@ async fn process_blob_replication_job(
             );
             return Ok(BlobReplicationJobOutcome::Succeeded);
         }
-        match creator_can_read(context, &relationship).await {
+        let Some(bucket) = relationship.source.bucket() else {
+            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        };
+        let creator = AuthContext {
+            user_id: relationship.created_by,
+            realm_id: relationship.source.realm_id,
+            path_restrictions: None,
+        };
+        let Some(key) = source_key(&job.input) else {
+            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        };
+        match source_can_read(context, &creator, relationship.source.node_id, bucket, key).await {
             Ok((true, group_id)) => watch_group_id = Some(group_id),
             Ok((false, group_id)) => {
                 let mut relationship = relationship;
@@ -1550,6 +1432,28 @@ async fn process_blob_replication_job(
         );
         Some(relationship)
     } else {
+        let Some(writer) = job.writer_auth_context.as_ref() else {
+            error!(
+                bucket = %job.input.bucket,
+                "Dropping replication job without durable source writer"
+            );
+            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        };
+        let Some(key) = source_key(&job.input) else {
+            error!(
+                bucket = %job.input.bucket,
+                "Dropping replication job without an exact source object"
+            );
+            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        };
+        let Some(source_node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+            return Err("source node identity unavailable".to_string());
+        };
+        match source_can_read(context, writer, source_node_id, &job.input.bucket, key).await {
+            Ok((true, _)) => {}
+            Ok((false, _)) => return Ok(BlobReplicationJobOutcome::TerminalFailure),
+            Err((error, _)) => return Err(error),
+        }
         None
     };
 
@@ -2747,7 +2651,8 @@ mod tests {
         let group_id = Ulid::from_parts(2, 2);
         write_bucket(&storage, "bucket").await;
         write_auth_docs(&storage, group_id).await;
-        write_group_policy(&storage, group_id, "operation == 's3.GetObject'").await;
+        let path = blob_object_permission_path(realm(), group_id, node(1), "bucket", "key");
+        write_group_policy(&storage, group_id, &format!("path == '{path}'")).await;
         let relationship = relationship(79, 2, None, true);
         write_relationship(&storage, &relationship).await;
         let context = DriverContext {
@@ -2888,7 +2793,21 @@ mod tests {
             compute_handle: None,
         };
 
-        let Err((_, group_id)) = creator_can_read(&context, &relationship(83, 2, None, true)).await
+        let relationship = relationship(83, 2, None, true);
+        let source_bucket = relationship.source.bucket().unwrap();
+        let creator = AuthContext {
+            user_id: relationship.created_by,
+            realm_id: relationship.source.realm_id,
+            path_restrictions: None,
+        };
+        let Err((_, group_id)) = source_can_read(
+            &context,
+            &creator,
+            relationship.source.node_id,
+            source_bucket,
+            "key",
+        )
+        .await
         else {
             panic!("missing auth documents must fail revalidation")
         };
@@ -2933,7 +2852,7 @@ mod tests {
             enqueued_at_ms: due_at_ms,
             origin: None,
             upstream_sources: Vec::new(),
-            writer_auth_context: None,
+            writer_auth_context: Some(auth_context()),
         };
         let (key_space, key, value) = blob_replication_job_write_entry(&future_job).unwrap();
         match storage
@@ -2975,60 +2894,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_job_decodes() {
-        let origin_record = OriginBlobReplicationJobRecord {
-            input: on_demand_input(),
-            source_delete_marker: Some(false),
-            due_at_ms: 96,
-            attempts: 2,
-            last_error: None,
-            relationship_id: Some(Ulid::from(10u128)),
-            enqueued_at_ms: 12,
-            origin: Some(SyncOrigin {
-                relationship_id: Ulid::from(10u128),
-                hop_count: 1,
-            }),
-        };
-        let origin_bytes = postcard::to_allocvec(&origin_record).unwrap();
-        let origin_decoded = BlobReplicationJobRecord::from_bytes(&origin_bytes).unwrap();
-        assert_eq!(origin_decoded.origin, origin_record.origin);
-        assert!(origin_decoded.upstream_sources.is_empty());
-
-        let previous = PreviousBlobReplicationJobRecord {
-            input: on_demand_input(),
-            source_delete_marker: Some(true),
-            due_at_ms: 84,
-            attempts: 4,
-            last_error: None,
-            relationship_id: Some(Ulid::from(9u128)),
-            enqueued_at_ms: 21,
-        };
-        let previous_bytes = postcard::to_allocvec(&previous).unwrap();
-        let previous_decoded = BlobReplicationJobRecord::from_bytes(&previous_bytes).unwrap();
-        assert_eq!(previous_decoded.relationship_id, previous.relationship_id);
-        assert_eq!(previous_decoded.enqueued_at_ms, previous.enqueued_at_ms);
-        assert_eq!(previous_decoded.origin, None);
-        assert!(previous_decoded.upstream_sources.is_empty());
-
-        let legacy = LegacyBlobReplicationJobRecord {
-            input: on_demand_input(),
-            source_delete_marker: Some(false),
-            due_at_ms: 42,
-            attempts: 3,
-            last_error: Some("retry".to_string()),
-        };
-        let bytes = postcard::to_allocvec(&legacy).unwrap();
-
-        let decoded = BlobReplicationJobRecord::from_bytes(&bytes).unwrap();
-
-        assert_eq!(decoded.input, legacy.input);
-        assert_eq!(decoded.source_delete_marker, Some(false));
-        assert_eq!(decoded.due_at_ms, 42);
-        assert_eq!(decoded.attempts, 3);
-        assert_eq!(decoded.last_error.as_deref(), Some("retry"));
-        assert_eq!(decoded.relationship_id, None);
-        assert_eq!(decoded.enqueued_at_ms, 42);
-        assert!(decoded.upstream_sources.is_empty());
+    fn job_requires_writer() {
+        let mut record = BlobReplicationJobRecord::new(on_demand_input(), None, 42);
+        record.writer_auth_context = None;
+        let bytes = record.to_bytes().unwrap();
+        assert!(BlobReplicationJobRecord::from_bytes(&bytes).is_err());
 
         let first = BlobReplicationJobRecord::new_relationship(
             on_demand_input(),
@@ -3049,47 +2919,6 @@ mod tests {
         assert!(is_access_denied("Replication requires WRITE permission"));
         assert!(is_access_denied("access_denied"));
         assert!(!is_access_denied("quota"));
-    }
-
-    #[test]
-    fn legacy_obligation_decodes() {
-        let origin_record = OriginLiveReplicationObligationRecord {
-            local_node_id: node(1),
-            auth_context: auth_context(),
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            version_id: Ulid::from(8u128),
-            delete_marker: false,
-            origin: Some(SyncOrigin {
-                relationship_id: Ulid::from(9u128),
-                hop_count: 2,
-            }),
-        };
-        let origin_bytes = postcard::to_allocvec(&origin_record).unwrap();
-        let origin_decoded = LiveReplicationObligationRecord::from_bytes(&origin_bytes).unwrap();
-        assert_eq!(origin_decoded.origin, origin_record.origin);
-        assert!(origin_decoded.upstream_sources.is_empty());
-
-        let legacy = LegacyLiveReplicationObligationRecord {
-            local_node_id: node(1),
-            auth_context: auth_context(),
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            version_id: Ulid::from(7u128),
-            delete_marker: true,
-        };
-        let bytes = postcard::to_allocvec(&legacy).unwrap();
-
-        let decoded = LiveReplicationObligationRecord::from_bytes(&bytes).unwrap();
-
-        assert_eq!(decoded.local_node_id, legacy.local_node_id);
-        assert_eq!(decoded.auth_context, legacy.auth_context);
-        assert_eq!(decoded.bucket, legacy.bucket);
-        assert_eq!(decoded.key, legacy.key);
-        assert_eq!(decoded.version_id, legacy.version_id);
-        assert!(decoded.delete_marker);
-        assert_eq!(decoded.origin, None);
-        assert!(decoded.upstream_sources.is_empty());
     }
 
     #[test]
