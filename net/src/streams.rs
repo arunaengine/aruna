@@ -2,6 +2,7 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,7 +12,6 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_util::sync::CancellationToken;
-use parking_lot::Mutex;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 
 use crate::connection_pool::{ConnectionLease, ConnectionPool};
@@ -24,6 +24,28 @@ use crate::telemetry::{
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOUND_CONNECTION_GLOBAL_LIMIT: usize = 256;
 const INBOUND_CONNECTION_PEER_LIMIT: usize = 8;
+const INBOUND_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const INBOUND_CONNECTION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
+
+struct ConnectionTimers {
+    idle: Pin<Box<tokio::time::Sleep>>,
+    lifetime: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl ConnectionTimers {
+    fn new() -> Self {
+        Self {
+            idle: Box::pin(tokio::time::sleep(INBOUND_CONNECTION_IDLE_TIMEOUT)),
+            lifetime: Box::pin(tokio::time::sleep(INBOUND_CONNECTION_LIFETIME)),
+        }
+    }
+
+    fn activity(&mut self) {
+        self.idle
+            .as_mut()
+            .reset(tokio::time::Instant::now() + INBOUND_CONNECTION_IDLE_TIMEOUT);
+    }
+}
 
 #[derive(Debug, Default)]
 struct InboundConnectionBudget {
@@ -432,6 +454,25 @@ mod tests {
         assert_eq!(state.global, 0);
         assert!(state.per_peer.is_empty());
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_resets_idle() {
+        let mut timers = ConnectionTimers::new();
+        tokio::time::advance(INBOUND_CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        timers.activity();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!timers.idle.is_elapsed());
+        tokio::time::advance(INBOUND_CONNECTION_IDLE_TIMEOUT).await;
+        assert!(timers.idle.is_elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifetime_ignores_activity() {
+        let mut timers = ConnectionTimers::new();
+        timers.activity();
+        tokio::time::advance(INBOUND_CONNECTION_LIFETIME).await;
+        assert!(timers.lifetime.is_elapsed());
+    }
 }
 
 async fn run_dht_connection(
@@ -439,29 +480,40 @@ async fn run_dht_connection(
     dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
     peer_id: NodeId,
 ) {
+    let mut timers = ConnectionTimers::new();
     loop {
-        match conn.accept_bi().await {
-            Ok((send, recv)) => match dht_handler.try_send((send, recv, peer_id)) {
-                Ok(()) => {}
-                Err(TrySendError::Full((mut send, mut recv, _))) => {
-                    warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue full");
-                    let _ = send.finish();
-                    let _ = recv.stop(0u32.into());
-                }
-                Err(TrySendError::Closed((mut send, mut recv, _))) => {
-                    warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue closed");
-                    let _ = send.finish();
-                    let _ = recv.stop(0u32.into());
+        tokio::select! {
+            _ = &mut timers.lifetime => {
+                conn.close(0u32.into(), b"inbound lifetime");
+                return;
+            }
+            _ = &mut timers.idle => {
+                conn.close(0u32.into(), b"inbound idle");
+                return;
+            }
+            incoming = conn.accept_bi() => match incoming {
+                Ok((send, recv)) => match dht_handler.try_send((send, recv, peer_id)) {
+                    Ok(()) => timers.activity(),
+                    Err(TrySendError::Full((mut send, mut recv, _))) => {
+                        warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue full");
+                        let _ = send.finish();
+                        let _ = recv.stop(0u32.into());
+                    }
+                    Err(TrySendError::Closed((mut send, mut recv, _))) => {
+                        warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue closed");
+                        let _ = send.finish();
+                        let _ = recv.stop(0u32.into());
+                        return;
+                    }
+                },
+                Err(err) => {
+                    trace!(
+                        node_id = %peer_id,
+                        error = %err,
+                        "Inbound DHT connection stopped accepting streams"
+                    );
                     return;
                 }
-            },
-            Err(err) => {
-                trace!(
-                    node_id = %peer_id,
-                    error = %err,
-                    "Inbound DHT connection stopped accepting streams"
-                );
-                return;
             }
         }
     }
@@ -473,32 +525,43 @@ async fn run_app_connection(
     stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
     peer_id: NodeId,
 ) {
+    let mut timers = ConnectionTimers::new();
     loop {
-        match conn.accept_bi().await {
-            Ok((send, recv)) => {
-                match stream_handler.try_send((alpn, BiStream(send, recv, None), peer_id)) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full((_, mut stream, _))) => {
-                        warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue full");
-                        let _ = stream.0.finish();
-                        let _ = stream.1.stop(0u32.into());
-                    }
-                    Err(TrySendError::Closed((_, mut stream, _))) => {
-                        warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue closed");
-                        let _ = stream.0.finish();
-                        let _ = stream.1.stop(0u32.into());
-                        return;
+        tokio::select! {
+            _ = &mut timers.lifetime => {
+                conn.close(0u32.into(), b"inbound lifetime");
+                return;
+            }
+            _ = &mut timers.idle => {
+                conn.close(0u32.into(), b"inbound idle");
+                return;
+            }
+            incoming = conn.accept_bi() => match incoming {
+                Ok((send, recv)) => {
+                    match stream_handler.try_send((alpn, BiStream(send, recv, None), peer_id)) {
+                        Ok(()) => timers.activity(),
+                        Err(TrySendError::Full((_, mut stream, _))) => {
+                            warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue full");
+                            let _ = stream.0.finish();
+                            let _ = stream.1.stop(0u32.into());
+                        }
+                        Err(TrySendError::Closed((_, mut stream, _))) => {
+                            warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue closed");
+                            let _ = stream.0.finish();
+                            let _ = stream.1.stop(0u32.into());
+                            return;
+                        }
                     }
                 }
-            }
-            Err(err) => {
-                trace!(
-                    node_id = %peer_id,
-                    alpn = %alpn,
-                    error = %err,
-                    "Inbound app connection stopped accepting streams"
-                );
-                return;
+                Err(err) => {
+                    trace!(
+                        node_id = %peer_id,
+                        alpn = %alpn,
+                        error = %err,
+                        "Inbound app connection stopped accepting streams"
+                    );
+                    return;
+                }
             }
         }
     }
