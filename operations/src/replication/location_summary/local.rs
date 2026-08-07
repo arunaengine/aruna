@@ -16,7 +16,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, GroupStorageBackend, Permission, RealmConfigDocument, VersionKey,
-    blob_object_permission_path,
+    blob_bucket_permission_path, blob_object_permission_path,
 };
 use aruna_core::types::{Effects, UserId};
 use smallvec::smallvec;
@@ -66,6 +66,7 @@ pub struct LocationSummaryOperation {
     bucket: Option<BucketInfo>,
     /// Identity of the bucket record the READ check was evaluated against.
     authorized: Option<(Ulid, SystemTime, UserId)>,
+    policy_allowed: bool,
     state: SummaryState,
     version_id: Option<Ulid>,
     blake3: Option<[u8; 32]>,
@@ -104,6 +105,7 @@ impl LocationSummaryOperation {
             stream_id,
             bucket: None,
             authorized: None,
+            policy_allowed: false,
             state: SummaryState::Init,
             version_id,
             blake3: None,
@@ -173,6 +175,11 @@ impl LocationSummaryOperation {
             key: self.request.bucket.as_bytes().to_vec().into(),
             txn_id: None,
         })
+    }
+
+    pub fn with_policy(mut self, allowed: bool) -> Self {
+        self.policy_allowed = allowed;
+        self
     }
 
     fn read_bucket(&mut self) -> Effects {
@@ -302,13 +309,22 @@ impl LocationSummaryOperation {
         let group_id = bucket.group_id;
         self.authorized = Some(bucket.identity());
         self.bucket = Some(bucket);
-        let path = blob_object_permission_path(
-            self.request.realm_id,
-            group_id,
-            local_node,
-            &self.request.bucket,
-            &self.request.key,
-        );
+        let path = if self.request.key.is_empty() {
+            blob_bucket_permission_path(
+                self.request.realm_id,
+                group_id,
+                local_node,
+                &self.request.bucket,
+            )
+        } else {
+            blob_object_permission_path(
+                self.request.realm_id,
+                group_id,
+                local_node,
+                &self.request.bucket,
+                &self.request.key,
+            )
+        };
         self.state = SummaryState::CheckPermission;
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -325,7 +341,7 @@ impl LocationSummaryOperation {
             return self.unexpected(event);
         };
         match allowed {
-            Ok(true) => self.resolve_version(),
+            Ok(true) if self.policy_allowed => self.resolve_version(),
             _ => self.deny(),
         }
     }
@@ -441,6 +457,11 @@ impl Operation for LocationSummaryOperation {
     type Error = LocationSummaryError;
 
     fn start(&mut self) -> Effects {
+        if self.request.auth_context.realm_id != self.request.realm_id
+            || self.request.auth_context.user_id.realm_id != self.request.realm_id
+        {
+            return self.deny();
+        }
         match self.peer {
             Some(_) => self.read_realm(),
             None => self.read_bucket(),
@@ -553,7 +574,8 @@ mod tests {
 
     /// Answers the bucket read and the READ check every local answer starts with.
     fn authorized(version_id: Option<Ulid>) -> LocationSummaryOperation {
-        let mut operation = LocationSummaryOperation::new_local(node_id(5), request(version_id));
+        let mut operation =
+            LocationSummaryOperation::new_local(node_id(5), request(version_id)).with_policy(true);
         operation.start();
         operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
         operation.step(Event::SubOperation(
@@ -704,6 +726,22 @@ mod tests {
 
         operation.step(Event::SubOperation(
             aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+
+        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+    }
+
+    #[test]
+    fn policy_refuses_denied() {
+        let mut operation = LocationSummaryOperation::new_local(
+            node_id(5),
+            request(Some(Ulid::from_bytes([3u8; 16]))),
+        )
+        .with_policy(false);
+        operation.start();
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
         ));
 
         assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));

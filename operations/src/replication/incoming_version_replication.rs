@@ -107,6 +107,8 @@ pub enum IncomingVersionReplicationError {
     RoutingInputsFailed(String),
     #[error("writer_access_denied")]
     WriterPermissionDenied,
+    #[error("manifest_access_denied")]
+    ManifestPermissionDenied,
     #[error("Replication hop limit exceeded")]
     HopLimitExceeded,
     #[error("Reference replication manifest is missing source metadata")]
@@ -191,6 +193,7 @@ pub struct IncomingVersionReplicationOperation {
     /// Set when the destination backend is over its cap, which only refuses a
     /// negotiation that asks for the bytes.
     destination_full: Option<RoutingError>,
+    manifest_policy: Option<String>,
     writer_policy: Option<String>,
 }
 
@@ -236,6 +239,7 @@ impl IncomingVersionReplicationOperation {
             rocrate_limits: RoCrateLimits::default(),
             routing: NodeRouting::default(),
             destination_full: None,
+            manifest_policy: None,
             writer_policy: None,
         }
     }
@@ -260,6 +264,11 @@ impl IncomingVersionReplicationOperation {
 
     pub fn with_writer_policy(mut self, path: Option<String>) -> Self {
         self.writer_policy = path;
+        self
+    }
+
+    pub fn with_manifest_policy(mut self, path: Option<String>) -> Self {
+        self.manifest_policy = path;
         self
     }
 
@@ -536,14 +545,15 @@ impl IncomingVersionReplicationOperation {
         )]
     }
 
-    /// #332: the pushing peer authorizes by its authenticated node identity at
-    /// the ingress gate, never by the forgeable manifest auth context. The
-    /// original writer's context can only narrow, so it stays as a deny check.
-    fn check_writer_permission(&mut self, group_id: Ulid) -> Effects {
+    fn check_permissions(&mut self, group_id: Ulid) -> Effects {
+        let path = self.target_authorization_path(group_id);
+        if self.manifest_policy.as_deref() != Some(path.as_str()) {
+            return self
+                .reject_negotiation(IncomingVersionReplicationError::ManifestPermissionDenied);
+        }
         if self.manifest.writer_auth_context.is_none() {
             return self.read_existing_version();
         }
-        let path = self.target_authorization_path(group_id);
         match self.writer_policy.as_deref() {
             Some(allowed) if allowed == path.as_str() => self.read_existing_version(),
             _ => self.reject_negotiation(IncomingVersionReplicationError::WriterPermissionDenied),
@@ -1124,13 +1134,13 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn write_live_obligation(&mut self) -> Effects {
+        let Some(auth_context) = self.manifest.writer_auth_context.clone() else {
+            return self.start_commit_quota();
+        };
         self.state = IncomingVersionReplicationState::WriteLiveObligation;
         let record = LiveReplicationObligationRecord::new(
             self.local_node_id,
-            self.manifest
-                .writer_auth_context
-                .clone()
-                .unwrap_or_else(|| self.manifest.auth_context.clone()),
+            auth_context,
             self.manifest.bucket.clone(),
             self.manifest.key.clone(),
             self.manifest.version_id,
@@ -1348,14 +1358,18 @@ impl Operation for IncomingVersionReplicationOperation {
         {
             return self.reject_negotiation(IncomingVersionReplicationError::HopLimitExceeded);
         }
-        if self.manifest.auth_context.realm_id != self.local_realm_id {
+        if self.manifest.auth_context.realm_id != self.local_realm_id
+            || self.manifest.auth_context.user_id.realm_id != self.local_realm_id
+        {
             return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
         }
         if self
             .manifest
             .writer_auth_context
             .as_ref()
-            .is_some_and(|auth| auth.realm_id != self.local_realm_id)
+            .is_some_and(|auth| {
+                auth.realm_id != self.local_realm_id || auth.user_id.realm_id != self.local_realm_id
+            })
         {
             return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
         }
@@ -1379,6 +1393,11 @@ impl Operation for IncomingVersionReplicationOperation {
                     if self.create_attempted {
                         return self.reject_negotiation(
                             IncomingVersionReplicationError::DestinationBucketNotFound,
+                        );
+                    }
+                    if self.manifest_policy.is_none() {
+                        return self.reject_negotiation(
+                            IncomingVersionReplicationError::ManifestPermissionDenied,
                         );
                     }
                     return self.create_destination_bucket();
@@ -1420,9 +1439,7 @@ impl Operation for IncomingVersionReplicationOperation {
                             .fail(IncomingVersionReplicationError::RoutingInputsFailed(error));
                     }
                 }
-                self.check_writer_permission(
-                    self.destination_group_id.unwrap_or(self.manifest.group_id),
-                )
+                self.check_permissions(self.destination_group_id.unwrap_or(self.manifest.group_id))
             }
             IncomingVersionReplicationState::CreateDestinationBucket => {
                 let Event::SubOperation(SubOperationEvent::BucketCreated { result }) = event else {
@@ -2358,6 +2375,7 @@ mod tests {
         op: &mut IncomingVersionReplicationOperation,
         group_id: Ulid,
     ) -> Effect {
+        op.manifest_policy = Some(op.target_authorization_path(group_id));
         let effects = op.start();
         assert_eq!(
             op.state,
@@ -2828,6 +2846,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_user_realm() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.auth_context.user_id =
+            UserId::local(Ulid::generate(), RealmId::from_bytes([8u8; 32]));
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+
+        let effects = op.start();
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::RealmMismatch
+                .to_string()
+                .as_str(),
+        );
+    }
+
+    #[test]
     fn obligation_keeps_origin() {
         let origin = SyncOrigin {
             relationship_id: Ulid::generate(),
@@ -2849,6 +2890,7 @@ mod tests {
             test_realm_id(),
             manifest,
         );
+        op.manifest.writer_auth_context = Some(op.manifest.auth_context.clone());
 
         let effects = op.write_live_obligation();
 
@@ -3193,6 +3235,7 @@ mod tests {
     fn write_version_indexes_non_current_materialized_version_by_content_hash() {
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         manifest.current_version = false;
+        manifest.writer_auth_context = Some(manifest.auth_context.clone());
         let group_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
@@ -3565,6 +3608,7 @@ mod tests {
         );
         let mut bucket_info = make_bucket_info(test_group_id());
         bucket_info.storage_routing = rules;
+        op.manifest_policy = Some(op.target_authorization_path(bucket_info.group_id));
 
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
@@ -3739,6 +3783,7 @@ mod tests {
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
+        op.manifest_policy = Some(op.target_authorization_path(test_group_id()));
 
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
@@ -3780,6 +3825,7 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.writer_auth_context = Some(manifest.auth_context.clone());
         let stream_id = Ulid::generate();
+        let group_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -3787,16 +3833,12 @@ mod tests {
             manifest,
         )
         .with_writer_policy(None);
+        op.manifest_policy = Some(op.target_authorization_path(group_id));
 
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(
-                make_bucket_info(Ulid::generate())
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
+            value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
         }));
         let effects = load_routing(&mut op, GroupRoutingInputs::default());
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
@@ -3819,28 +3861,49 @@ mod tests {
     fn rejects_missing_policy() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.writer_auth_context = Some(manifest.auth_context.clone());
+        let group_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
+        op.manifest_policy = Some(op.target_authorization_path(group_id));
 
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(
-                make_bucket_info(Ulid::generate())
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
+            value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
         }));
         let effects = load_routing(&mut op, GroupRoutingInputs::default());
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         expect_rejected_negotiation(
             &effects[0],
             IncomingVersionReplicationError::WriterPermissionDenied
+                .to_string()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn rejects_manifest_policy() {
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::DeleteMarker),
+        )
+        .with_manifest_policy(None);
+        let group_id = Ulid::generate();
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
+        }));
+        let effects = load_routing(&mut op, GroupRoutingInputs::default());
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::ManifestPermissionDenied
                 .to_string()
                 .as_str(),
         );
@@ -3858,7 +3921,9 @@ mod tests {
         );
         let group_id = Ulid::generate();
         let path = op.target_authorization_path(group_id);
-        op = op.with_writer_policy(Some(path));
+        op = op
+            .with_manifest_policy(Some(path.clone()))
+            .with_writer_policy(Some(path));
 
         let _effects = advance_to_version_lookup(&mut op, group_id);
         assert_eq!(
@@ -4086,6 +4151,7 @@ mod tests {
             test_realm_id(),
             manifest,
         );
+        op.manifest_policy = Some(op.target_authorization_path(test_group_id()));
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
