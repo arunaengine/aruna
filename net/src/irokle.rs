@@ -97,6 +97,9 @@ const DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT: usize = 8;
 const DOCUMENT_SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+// A frame is meaningful progress; a byte trickle cannot retain a permit forever.
+const DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 // Admission budgets: worst-case inbound cost is bounded before any stream is
 // drained, per pushing peer and for the node as a whole.
 const DOCUMENT_SYNC_INBOUND_PEER_STREAMS: usize = 8;
@@ -911,8 +914,12 @@ impl DocumentSyncService {
         let BiStream(mut send, mut recv, _) = stream;
         let mut byte_reservation =
             InboundByteReservation::new(self.inbound_budget.clone(), node_id_to_peer_id(&peer));
-        let (messages, touched_topics) =
-            read_inbound_sync_messages(&mut recv, &mut byte_reservation).await?;
+        let (messages, touched_topics) = timeout(
+            DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT,
+            read_inbound_sync_messages(&mut recv, &mut byte_reservation),
+        )
+        .await
+        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT))??;
         let read_elapsed = stream_started.elapsed();
         let message_count = messages.len();
         let handle_started = Instant::now();
@@ -6632,7 +6639,12 @@ async fn read_inbound_sync_messages(
     let mut topics = BTreeSet::new();
     let mut bytes_read = 0usize;
     let mut frame_index = 0usize;
-    while let Some(frame) = read_next_inbound_sync_frame(recv, &mut bytes_read, reservation).await?
+    while let Some(frame) = timeout(
+        DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT,
+        read_next_inbound_sync_frame(recv, &mut bytes_read, reservation),
+    )
+    .await
+    .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT))??
     {
         frame_index = frame_index.saturating_add(1);
         if messages.len() >= DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT {
@@ -7080,6 +7092,11 @@ mod tests {
         assert!(budget.acquire(peer(3)).is_none());
         fill.clear();
         assert!(budget.acquire(peer(3)).is_some());
+    }
+
+    #[test]
+    fn inbound_timeout_order() {
+        assert!(DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT < DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT);
     }
 
     #[test]
