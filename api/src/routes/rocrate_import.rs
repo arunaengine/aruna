@@ -10,7 +10,7 @@ use aruna_core::structs::{
     blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
 };
 use aruna_operations::create_metadata_document::mint_job_document;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::jobs::import::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
     load_rocrate_upload,
@@ -29,8 +29,10 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -41,6 +43,8 @@ use crate::server_state::ServerState;
 
 const ZIP_MEDIA_TYPE: &str = "application/zip";
 const ELN_MEDIA_TYPE: &str = "application/vnd.eln+zip";
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -140,6 +144,7 @@ pub async fn upload_rocrate(
     headers: HeaderMap,
     body: Body,
 ) -> ServerResult<(StatusCode, Json<UploadRoCrateResponse>)> {
+    let deadline = Instant::now() + UPLOAD_DEADLINE;
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let media_type = parse_media_type(&headers)?;
     let limit = state.rocrate_limits().direct_upload_bytes;
@@ -153,6 +158,11 @@ pub async fn upload_rocrate(
             "upload exceeds limit {limit}"
         )));
     }
+    let Some(upload_slot) = state.try_rocrate_slot() else {
+        return Err(ServerError::ServiceUnavailableReason(
+            "RO-Crate upload capacity is temporarily exhausted".to_string(),
+        ));
+    };
     let expires_at_ms = aruna_core::util::unix_timestamp_millis()
         .checked_add(state.rocrate_limits().upload_retention_ms)
         .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string()))?;
@@ -160,21 +170,27 @@ pub async fn upload_rocrate(
         .ok()
         .and_then(DateTime::<Utc>::from_timestamp_millis)
         .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
-    let owner_node_url = owner_node_url(&state).await?;
+    let owner_node_url = timeout_at(deadline, owner_node_url(&state))
+        .await
+        .map_err(|_| {
+            ServerError::ServiceUnavailableReason("RO-Crate upload deadline expired".to_string())
+        })??;
     let upload_id = Ulid::generate();
-    let record = drive(
+    let record = drive_until(
         CreateRoCrateUploadOperation::new(CreateRoCrateUploadConfig {
             upload_id,
             owner: auth.user_id,
             media_type,
             expires_at_ms,
             max_bytes: limit,
-            blob: upload_body_stream(body),
+            blob: upload_body_stream(body, deadline),
         }),
         &state.get_ctx(),
+        deadline,
     )
     .await
     .map_err(map_upload_error)?;
+    drop(upload_slot);
     Ok((
         StatusCode::CREATED,
         Json(UploadRoCrateResponse {
@@ -539,8 +555,35 @@ async fn load_bucket(
     }
 }
 
-fn upload_body_stream(body: Body) -> BackendStream<Result<Bytes, aruna_core::stream::StreamError>> {
-    let body = Mutex::new(Box::pin(body.into_data_stream()));
+fn upload_body_stream(
+    body: Body,
+    deadline: Instant,
+) -> BackendStream<Result<Bytes, aruna_core::stream::StreamError>> {
+    let body = body.into_data_stream();
+    let body = Mutex::new(Box::pin(stream::unfold(
+        (body, deadline, false),
+        |(mut body, deadline, finished)| async move {
+            if finished {
+                return None;
+            }
+            let idle_deadline = (Instant::now() + UPLOAD_IDLE_TIMEOUT).min(deadline);
+            match timeout_at(idle_deadline, body.next()).await {
+                Ok(Some(Ok(bytes))) => Some((Ok(bytes), (body, deadline, false))),
+                Ok(Some(Err(error))) => Some((
+                    Err(std::io::Error::other(error.to_string())),
+                    (body, deadline, true),
+                )),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "RO-Crate upload stream timed out",
+                    )),
+                    (body, deadline, true),
+                )),
+            }
+        },
+    )));
     BackendStream::new(stream::poll_fn(move |cx| {
         let mut body = body.lock().unwrap_or_else(|error| error.into_inner());
         body.as_mut().poll_next(cx)
@@ -641,6 +684,7 @@ async fn owner_node_url(state: &ServerState) -> ServerResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_state::ROCRATE_UPLOAD_SLOTS;
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -1035,6 +1079,40 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::PayloadTooLarge(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_idle_times_out() {
+        let body = Body::from_stream(stream::pending::<Result<Bytes, std::io::Error>>());
+        let mut upload = upload_body_stream(body, Instant::now() + UPLOAD_DEADLINE);
+        let task = tokio::spawn(async move { upload.next().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(UPLOAD_IDLE_TIMEOUT).await;
+        let item = task.await.unwrap().unwrap().unwrap_err();
+        assert!(item.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn upload_slots_bounded() {
+        let (_dir, state, user) = plain_state(test_limits()).await;
+        let permits: Vec<_> = (0..ROCRATE_UPLOAD_SLOTS)
+            .map(|_| state.try_rocrate_slot().expect("upload slot"))
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(ZIP_MEDIA_TYPE));
+        let result = upload_rocrate(
+            State(state.clone()),
+            Extension(auth(user)),
+            headers,
+            Body::empty(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::ServiceUnavailableReason(_))
+        ));
+        drop(permits);
+        assert!(state.try_rocrate_slot().is_some());
     }
 
     #[tokio::test]

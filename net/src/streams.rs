@@ -2,13 +2,16 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_util::sync::CancellationToken;
+use parking_lot::Mutex;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 
 use crate::connection_pool::{ConnectionLease, ConnectionPool};
@@ -19,6 +22,66 @@ use crate::telemetry::{
 };
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const INBOUND_CONNECTION_GLOBAL_LIMIT: usize = 256;
+const INBOUND_CONNECTION_PEER_LIMIT: usize = 8;
+
+#[derive(Debug, Default)]
+struct InboundConnectionBudget {
+    state: Mutex<InboundConnectionState>,
+}
+
+#[derive(Debug, Default)]
+struct InboundConnectionState {
+    global: usize,
+    per_peer: BTreeMap<NodeId, usize>,
+}
+
+impl InboundConnectionBudget {
+    fn acquire(self: &Arc<Self>) -> Option<InboundConnectionPermit> {
+        let mut state = self.state.lock();
+        if state.global >= INBOUND_CONNECTION_GLOBAL_LIMIT {
+            return None;
+        }
+        state.global += 1;
+        Some(InboundConnectionPermit {
+            budget: self.clone(),
+            peer: None,
+        })
+    }
+}
+
+struct InboundConnectionPermit {
+    budget: Arc<InboundConnectionBudget>,
+    peer: Option<NodeId>,
+}
+
+impl InboundConnectionPermit {
+    fn admit(&mut self, peer: NodeId) -> bool {
+        let mut state = self.budget.state.lock();
+        let held = state.per_peer.get(&peer).copied().unwrap_or(0);
+        if held >= INBOUND_CONNECTION_PEER_LIMIT {
+            return false;
+        }
+        *state.per_peer.entry(peer).or_insert(0) += 1;
+        self.peer = Some(peer);
+        true
+    }
+}
+
+impl Drop for InboundConnectionPermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock();
+        state.global = state.global.saturating_sub(1);
+        if let Some(peer) = self.peer.take() {
+            if let Some(held) = state.per_peer.get_mut(&peer) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    state.per_peer.remove(&peer);
+                }
+            }
+        }
+    }
+}
 
 pub use iroh::endpoint::{RecvStream, SendStream};
 
@@ -227,17 +290,25 @@ pub async fn run_accept_loop(
     document_sync: std::sync::Arc<DocumentSyncService>,
     shutdown: CancellationToken,
 ) {
+    let inbound_budget = Arc::new(InboundConnectionBudget::default());
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
 
+                let Some(permit) = inbound_budget.acquire() else {
+                    warn!("Dropping inbound Iroh connection: connection limit reached");
+                    incoming.refuse();
+                    continue;
+                };
+
                 let dht_handler = dht_handler.clone();
                 let stream_handler = stream_handler.clone();
                 let document_sync = document_sync.clone();
 
                 tokio::spawn(async move {
+                    let mut permit = permit;
                     let accepting = match incoming.accept() {
                         Ok(accepting) => accepting,
                         Err(_) => return,
@@ -261,6 +332,13 @@ pub async fn run_accept_loop(
 
                     let alpn_bytes = conn.alpn().to_vec();
                     let peer_id = conn.remote_id();
+                    if !permit.admit(peer_id) {
+                        warn!(
+                            node_id = %peer_id,
+                            "Dropping inbound Iroh connection: peer limit reached"
+                        );
+                        return;
+                    }
 
                     match Alpn::from_bytes(&alpn_bytes) {
                         Some(Alpn::Dht) => {
@@ -290,6 +368,69 @@ pub async fn run_accept_loop(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn global_cap() {
+        let budget = Arc::new(InboundConnectionBudget::default());
+        let mut permits = Vec::new();
+        for _ in 0..INBOUND_CONNECTION_GLOBAL_LIMIT {
+            permits.push(budget.acquire().expect("within global limit"));
+        }
+        assert!(budget.acquire().is_none());
+    }
+
+    #[test]
+    fn peer_cap() {
+        let budget = Arc::new(InboundConnectionBudget::default());
+        let mut permits = Vec::new();
+        for _ in 0..INBOUND_CONNECTION_PEER_LIMIT {
+            let mut permit = budget.acquire().expect("within global limit");
+            assert!(permit.admit(peer(1)));
+            permits.push(permit);
+        }
+
+        let mut blocked = budget.acquire().expect("global capacity remains");
+        assert!(!blocked.admit(peer(1)));
+    }
+
+    #[test]
+    fn peer_fairness() {
+        let budget = Arc::new(InboundConnectionBudget::default());
+        let mut first = Vec::new();
+        for _ in 0..INBOUND_CONNECTION_PEER_LIMIT {
+            let mut permit = budget.acquire().expect("within global limit");
+            assert!(permit.admit(peer(1)));
+            first.push(permit);
+        }
+
+        let mut second = budget.acquire().expect("global capacity remains");
+        assert!(second.admit(peer(2)));
+        drop(first.pop());
+        let mut retry = budget.acquire().expect("released global capacity");
+        assert!(retry.admit(peer(1)));
+    }
+
+    #[test]
+    fn permit_release() {
+        let budget = Arc::new(InboundConnectionBudget::default());
+        {
+            let mut permit = budget.acquire().expect("within global limit");
+            assert!(permit.admit(peer(1)));
+        }
+
+        let state = budget.state.lock();
+        assert_eq!(state.global, 0);
+        assert!(state.per_peer.is_empty());
     }
 }
 
