@@ -234,42 +234,6 @@ async fn manifest_policy(
     Ok((manifest_path, writer_path))
 }
 
-async fn location_policy(
-    context: &DriverContext,
-    local_realm: RealmId,
-    local_node: NodeId,
-    request: &crate::replication::protocol::LocationSummaryRequest,
-) -> Result<bool, String> {
-    if request.realm_id != local_realm || !auth_matches(&request.auth_context, local_realm) {
-        return Ok(false);
-    }
-    let group_id = match drive(GetBucketInfoOperation::new(request.bucket.clone()), context).await {
-        Ok(Some(Ok(info))) => info.group_id,
-        Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => return Ok(false),
-        Ok(Some(Err(error))) => return Err(error.to_string()),
-        Err(error) => return Err(error.to_string()),
-    };
-    let path = if request.key.is_empty() {
-        blob_bucket_permission_path(local_realm, group_id, local_node, &request.bucket)
-    } else {
-        blob_object_permission_path(
-            local_realm,
-            group_id,
-            local_node,
-            &request.bucket,
-            &request.key,
-        )
-    };
-    allow_policy(
-        context,
-        &request.auth_context,
-        &path,
-        &Permission::READ,
-        "s3.GetObject",
-    )
-    .await
-}
-
 async fn bao_policy(
     context: &DriverContext,
     local_realm: RealmId,
@@ -741,28 +705,19 @@ impl InboundEventHandler for OperationsInboundHandler {
                                     Ok(VersionReplicationMessage::LocationSummaryRequest(
                                         request,
                                     )) => {
-                                        let policy_allowed = match location_policy(
-                                            self.context.as_ref(),
-                                            *net_handle.realm_id(),
-                                            net_handle.node_id(),
-                                            &request,
-                                        )
-                                        .await
-                                        {
-                                            Ok(allowed) => allowed,
-                                            Err(error) => {
-                                                error!(peer = %node_id, stream_id = %stream_id, error = %error, "Refusing inbound location summary with unavailable request policy");
-                                                close_failed_bao(&blob_handle, stream_id).await;
-                                                return;
-                                            }
-                                        };
+                                        let identity_allowed = request.realm_id
+                                            == *net_handle.realm_id()
+                                            && auth_matches(
+                                                &request.auth_context,
+                                                *net_handle.realm_id(),
+                                            );
                                         let op = LocationSummaryOperation::new_incoming(
                                             node_id,
                                             net_handle.node_id(),
                                             stream_id,
                                             request,
                                         )
-                                        .with_policy(policy_allowed);
+                                        .with_policy(identity_allowed);
                                         if let Err(error) = drive(op, self.context.as_ref()).await {
                                             error!(
                                                 peer = %node_id,
