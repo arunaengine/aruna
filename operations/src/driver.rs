@@ -436,13 +436,24 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
     Event::Net(NetEvent::JobControl(event))
 }
 
-fn cap_audit_nodes(nodes: &mut Vec<NodeId>, batch: &mut AuditPageBatch) {
-    nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    nodes.dedup();
-    for node in nodes.iter().skip(MAX_AUDIT_PEERS) {
-        batch.mark_missing(*node);
+fn cap_audit_nodes(
+    nodes: impl IntoIterator<Item = NodeId>,
+    batch: &mut AuditPageBatch,
+) -> BTreeSet<NodeId> {
+    let mut selected = BTreeSet::new();
+    let mut overflow = 0usize;
+    for node in nodes {
+        if selected.contains(&node) {
+            continue;
+        }
+        if selected.len() == MAX_AUDIT_PEERS {
+            overflow = overflow.saturating_add(1);
+        } else {
+            selected.insert(node);
+        }
     }
-    nodes.truncate(MAX_AUDIT_PEERS);
+    batch.missing_overflow = batch.missing_overflow.saturating_add(overflow);
+    selected
 }
 
 /// Requests every node's local audit page over the metadata control transport,
@@ -454,9 +465,8 @@ async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -
         request,
     } = effect;
     let mut batch = AuditPageBatch::with_limit(request.limit);
-    let mut nodes = input_nodes;
-    cap_audit_nodes(&mut nodes, &mut batch);
-    let mut remaining = nodes.iter().copied().collect::<BTreeSet<_>>();
+    let nodes = cap_audit_nodes(input_nodes, &mut batch);
+    let mut remaining = nodes.clone();
     if remaining.is_empty() {
         return Event::Net(NetEvent::AuditPages(batch));
     }
@@ -925,15 +935,17 @@ mod test {
         nodes.push(duplicate);
         let mut batch = AuditPageBatch::new();
 
-        cap_audit_nodes(&mut nodes, &mut batch);
+        let nodes = cap_audit_nodes(nodes, &mut batch);
 
         assert_eq!(nodes.len(), MAX_AUDIT_PEERS);
-        assert_eq!(batch.missing_nodes.len(), 1);
+        assert_eq!(batch.missing_nodes.len(), 0);
+        assert_eq!(batch.missing_overflow, 1);
         assert!(batch.completed_nodes.is_empty());
         assert!(
             nodes
-                .windows(2)
-                .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+                .iter()
+                .zip(nodes.iter().skip(1))
+                .all(|(left, right)| left.as_bytes() < right.as_bytes())
         );
     }
 
