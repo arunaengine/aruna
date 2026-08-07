@@ -17,19 +17,19 @@ use crate::usage_stats::{
 };
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
+    BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    BucketInfo, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
     RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey, ReplicationItemKind,
     ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits, RoutingError, StorageRoutingRule,
-    UsageDelta, VersionKey, blob_bucket_permission_path, blob_object_permission_path,
+    UsageDelta, VersionKey, WriteOwner, blob_bucket_permission_path, blob_object_permission_path,
     resolve_backend,
 };
 use aruna_core::task::TaskEvent;
@@ -72,7 +72,9 @@ enum IncomingVersionReplicationState {
     WriteLiveObligation,
     CheckCommitQuota,
     UpdateUsage,
+    WriteCleanupRow,
     CommitTransaction,
+    ReleaseReservation,
     ScheduleUsage,
     ScheduleLiveDrain,
     SendApplyRejected,
@@ -186,6 +188,9 @@ pub struct IncomingVersionReplicationOperation {
     pending_head_transition_effects: VecDeque<Effect>,
     pending_version_effects: VecDeque<Effect>,
     cleanup_blob_location: Option<BackendLocation>,
+    cleanup_key: Option<Vec<u8>>,
+    cleanup_value: Option<Vec<u8>>,
+    release_id: Option<Ulid>,
     apply_committed: bool,
     output: Option<Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>>,
     rocrate_limits: RoCrateLimits,
@@ -234,6 +239,9 @@ impl IncomingVersionReplicationOperation {
             pending_head_transition_effects: VecDeque::new(),
             pending_version_effects: VecDeque::new(),
             cleanup_blob_location: None,
+            cleanup_key: None,
+            cleanup_value: None,
+            release_id: None,
             apply_committed: false,
             output: None,
             rocrate_limits: RoCrateLimits::default(),
@@ -303,7 +311,9 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::WriteLiveObligation => "WriteLiveObligation",
             IncomingVersionReplicationState::CheckCommitQuota => "CheckCommitQuota",
             IncomingVersionReplicationState::UpdateUsage => "UpdateUsage",
+            IncomingVersionReplicationState::WriteCleanupRow => "WriteCleanupRow",
             IncomingVersionReplicationState::CommitTransaction => "CommitTransaction",
+            IncomingVersionReplicationState::ReleaseReservation => "ReleaseReservation",
             IncomingVersionReplicationState::ScheduleUsage => "ScheduleUsage",
             IncomingVersionReplicationState::ScheduleLiveDrain => "ScheduleLiveDrain",
             IncomingVersionReplicationState::SendApplyRejected => "SendApplyRejected",
@@ -1154,6 +1164,69 @@ impl IncomingVersionReplicationOperation {
         }
     }
 
+    fn cleanup_key(location: &BackendLocation) -> Vec<u8> {
+        location.ulid.to_bytes().to_vec()
+    }
+
+    fn prepare_cleanup(&mut self) -> Result<(), IncomingVersionReplicationError> {
+        if self.cleanup_value.is_some() {
+            return Ok(());
+        }
+        let Some(location) = self.received_blob_location.as_ref() else {
+            return Ok(());
+        };
+        let Some(blake3) = location
+            .get_blake3()
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
+        else {
+            return Err(IncomingVersionReplicationError::MissingBlobLocation);
+        };
+        let work = BlobCleanupWork::ReconcileWrite {
+            location: location.clone(),
+            owner: WriteOwner::Blob {
+                blake3,
+                realm_id: self.local_realm_id,
+                ttl_ms: self.rocrate_limits.holder_ttl_ms,
+            },
+        };
+        self.cleanup_key = Some(Self::cleanup_key(location));
+        self.cleanup_value = Some(work.to_bytes().map_err(ConversionError::from)?);
+        Ok(())
+    }
+
+    fn cleanup_effect(&self, txn_id: Ulid) -> Option<Effect> {
+        Some(Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: self.cleanup_key.clone()?.into(),
+            value: self.cleanup_value.clone()?.into(),
+            txn_id: Some(txn_id),
+        }))
+    }
+
+    fn commit_or_cleanup(&mut self) -> Effects {
+        if self.manifest.kind != ReplicationItemKind::Materialized
+            || self.is_reference_item()
+            || self.received_blob_location.is_none()
+        {
+            return self.commit_transaction();
+        }
+        if let Err(error) = self.prepare_cleanup() {
+            return self.fail(error);
+        }
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(IncomingVersionReplicationError::StorageError(
+                StorageError::TransactionNotFound,
+            ));
+        };
+        let Some(effect) = self.cleanup_effect(txn_id) else {
+            return self.fail(IncomingVersionReplicationError::ReplicationError(
+                ReplicationError::ReplicationFailed,
+            ));
+        };
+        self.state = IncomingVersionReplicationState::WriteCleanupRow;
+        smallvec![effect]
+    }
+
     fn usage_delta(&self) -> Result<UsageDelta, IncomingVersionReplicationError> {
         let bytes = match self.manifest.kind {
             ReplicationItemKind::Materialized => i128::from(self.incoming_logical_bytes()?),
@@ -1180,7 +1253,7 @@ impl IncomingVersionReplicationOperation {
         if self.manifest.kind == ReplicationItemKind::DeleteMarker {
             let update = UsageCounterUpdate::for_group(group_id, group_delta);
             if update.is_noop() {
-                return self.commit_transaction();
+                return self.commit_or_cleanup();
             }
             self.usage_update = Some(update);
             return self.start_usage_update();
@@ -1247,6 +1320,66 @@ impl IncomingVersionReplicationOperation {
         };
         self.state = IncomingVersionReplicationState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_commit_failure(&mut self, error: StorageError) -> Effects {
+        if error.proves_no_commit() {
+            return self.fail(error.into());
+        }
+
+        self.txn_id = None;
+        self.cleanup_blob_location = None;
+        self.output = Some(Err(error.into()));
+        self.release_or_reject()
+    }
+
+    fn release_or_reject(&mut self) -> Effects {
+        let Some(id) = self
+            .received_blob_location
+            .as_ref()
+            .map(|location| location.ulid)
+        else {
+            return self.send_apply_rejected();
+        };
+        self.release_id = Some(id);
+        self.state = IncomingVersionReplicationState::ReleaseReservation;
+        smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+    }
+
+    fn handle_release(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
+            return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::ReservationReleased)",
+                received: event,
+            });
+        };
+        if self.release_id != Some(id) {
+            return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "matching reservation id",
+                received: Event::Blob(BlobEvent::ReservationReleased { id }),
+            });
+        }
+        self.release_id = None;
+        if self.apply_committed {
+            self.state = IncomingVersionReplicationState::ScheduleUsage;
+            smallvec![schedule_usage_snapshot_publish_effect()]
+        } else {
+            self.send_apply_rejected()
+        }
+    }
+
+    fn handle_cleanup_write(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => self.commit_transaction(),
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::{WriteResult|Error})",
+                received: other,
+            }),
+        }
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
@@ -1746,12 +1879,22 @@ impl Operation for IncomingVersionReplicationOperation {
                 }
             }
             IncomingVersionReplicationState::ReceiveBlob => {
-                let Event::Blob(BlobEvent::ReplicationFinished { location }) = event else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Blob(BlobEvent::ReplicationFinished)",
-                        received: event,
-                    });
+                let location = match event {
+                    Event::Blob(BlobEvent::ReplicationFinished { location }) => location,
+                    Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
+                        self.received_blob_location = Some(location.clone());
+                        self.cleanup_blob_location = Some(location);
+                        return self.fail(IncomingVersionReplicationError::ReplicationError(
+                            ReplicationError::ReplicationFailed,
+                        ));
+                    }
+                    other => {
+                        return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                            state: self.state_name(),
+                            expected: "Event::Blob(BlobEvent::{ReplicationFinished|WriteCleanup})",
+                            received: other,
+                        });
+                    }
                 };
                 if let Err(err) = self.validate_materialized_location(&location) {
                     self.received_blob_location = Some(location.clone());
@@ -1993,6 +2136,8 @@ impl Operation for IncomingVersionReplicationOperation {
                 };
                 self.start_commit_quota()
             }
+            IncomingVersionReplicationState::WriteCleanupRow => self.handle_cleanup_write(event),
+            IncomingVersionReplicationState::ReleaseReservation => self.handle_release(event),
             IncomingVersionReplicationState::CheckCommitQuota => {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(IncomingVersionReplicationError::StorageError(
@@ -2026,32 +2171,43 @@ impl Operation for IncomingVersionReplicationOperation {
                 };
                 match update.step(event, txn_id) {
                     Ok(Some(effects)) => effects,
-                    Ok(None) => self.commit_transaction(),
+                    Ok(None) => self.commit_or_cleanup(),
                     Err(error) => self.fail(error.into()),
                 }
             }
-            IncomingVersionReplicationState::CommitTransaction => {
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                        received: event,
-                    });
-                };
-                self.txn_id = None;
-                self.cleanup_blob_location = None;
-                self.apply_committed = true;
-                debug!(
-                    bucket = %self.manifest.bucket,
-                    key = %self.manifest.key,
-                    version_id = %self.manifest.version_id,
-                    stream_id = %self.stream_id,
-                    kind = ?self.manifest.kind,
-                    "Committed incoming replication transaction"
-                );
-                self.state = IncomingVersionReplicationState::ScheduleUsage;
-                smallvec![schedule_usage_snapshot_publish_effect()]
-            }
+            IncomingVersionReplicationState::CommitTransaction => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.txn_id = None;
+                    self.cleanup_blob_location = None;
+                    self.apply_committed = true;
+                    debug!(
+                        bucket = %self.manifest.bucket,
+                        key = %self.manifest.key,
+                        version_id = %self.manifest.version_id,
+                        stream_id = %self.stream_id,
+                        kind = ?self.manifest.kind,
+                        "Committed incoming replication transaction"
+                    );
+                    if let Some(id) = self
+                        .received_blob_location
+                        .as_ref()
+                        .map(|location| location.ulid)
+                    {
+                        self.release_id = Some(id);
+                        self.state = IncomingVersionReplicationState::ReleaseReservation;
+                        smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+                    } else {
+                        self.state = IncomingVersionReplicationState::ScheduleUsage;
+                        smallvec![schedule_usage_snapshot_publish_effect()]
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.handle_commit_failure(error),
+                other => self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                    state: self.state_name(),
+                    expected: "Event::Storage(StorageEvent::{TransactionCommitted|Error})",
+                    received: other,
+                }),
+            },
             IncomingVersionReplicationState::ScheduleUsage => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. })
                 | Event::Task(TaskEvent::Error { .. }) => {
@@ -2179,7 +2335,14 @@ impl Operation for IncomingVersionReplicationOperation {
     fn abort(&mut self) -> Effects {
         let mut effects = smallvec![];
 
-        if let Some(location) = self.cleanup_blob_location.take() {
+        let cleanup_location = match &self.state {
+            IncomingVersionReplicationState::CommitTransaction => {
+                self.cleanup_blob_location = None;
+                None
+            }
+            _ => self.cleanup_blob_location.take(),
+        };
+        if let Some(location) = cleanup_location {
             effects.push(Effect::Blob(BlobEffect::Delete { location }));
         }
         if let Some(txn_id) = self.txn_id.take() {
@@ -2206,21 +2369,21 @@ mod tests {
     use crate::replication::queue::LiveReplicationObligationRecord;
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
+    use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-        S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState,
-        BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
+        AuthContext, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
+        BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
         MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
         ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget,
         SourceConnectorKind, SourceMetadata, StagingStrategy, StorageRoutingRule,
-        VersionSourceBinding,
+        VersionSourceBinding, WriteOwner,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::time::SystemTime;
@@ -3810,6 +3973,42 @@ mod tests {
     }
 
     #[test]
+    fn write_cleanup_rejects() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let stream_id = Ulid::generate();
+        let received = make_location();
+        let mut op = IncomingVersionReplicationOperation::new(
+            stream_id,
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+        op.state = IncomingVersionReplicationState::ReceiveBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
+            location: received.clone(),
+            message: "marker write failed".to_string(),
+        })));
+        assert_eq!(op.received_blob_location, Some(received.clone()));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::CleanupReceivedBlob
+        );
+        assert_eq!(
+            effects[0],
+            Effect::Blob(BlobEffect::Delete { location: received })
+        );
+    }
+
+    #[test]
     fn unbuildable_bucket_rejects() {
         // One create attempt, still missing, then reject and close the stream.
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
@@ -4159,6 +4358,191 @@ mod tests {
             effects[0],
             Effect::Blob(BlobEffect::CloseConnection { .. })
         ));
+    }
+
+    #[test]
+    fn unknown_commit_preserves() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let received = make_location();
+        let txn_id = Ulid::generate();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+        op.txn_id = Some(txn_id);
+        op.received_blob_location = Some(received.clone());
+        op.cleanup_blob_location = Some(received.clone());
+        let release_id = received.ulid;
+
+        let effects = op.commit_or_cleanup();
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key,
+                value,
+                txn_id: write_txn,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected transactional reconciliation row, got {effects:?}")
+        };
+        assert_eq!(*write_txn, Some(txn_id));
+        assert_eq!(key.as_ref(), received.ulid.to_bytes().as_slice());
+        assert!(matches!(
+            BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+            BlobCleanupWork::ReconcileWrite {
+                owner: WriteOwner::Blob {
+                    blake3: [1u8; 32],
+                    realm_id,
+                    ..
+                },
+                ..
+            } if realm_id == test_realm_id()
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"cleanup".to_vec().into(),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CommitTransaction);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReleaseReservation
+        );
+        assert_eq!(op.txn_id, None);
+        assert_eq!(op.cleanup_blob_location, None);
+        assert_eq!(
+            effects,
+            smallvec![Effect::Blob(BlobEffect::ReleaseReservation {
+                id: release_id
+            })]
+        );
+        let effects = op.step(Event::Blob(BlobEvent::ReservationReleased {
+            id: release_id,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| { matches!(effect, Effect::Storage(StorageEffect::Write { .. })) })
+        );
+        let effects = op.abort();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| { matches!(effect, Effect::Blob(BlobEffect::Delete { .. })) })
+        );
+    }
+
+    #[test]
+    fn release_after_commit() {
+        let received = make_location();
+        let id = received.ulid;
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        op.state = IncomingVersionReplicationState::CommitTransaction;
+        op.txn_id = Some(Ulid::generate());
+        op.received_blob_location = Some(received.clone());
+        op.cleanup_blob_location = Some(received);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::generate(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation { id: observed })] if *observed == id
+        ));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReleaseReservation
+        );
+
+        let effects = op.step(Event::Blob(BlobEvent::ReservationReleased { id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ScheduleUsage);
+        assert_eq!(effects.len(), 1);
+    }
+
+    #[test]
+    fn conflict_commit_deletes() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let stream_id = Ulid::generate();
+        let received = make_location();
+        let txn_id = Ulid::generate();
+        let mut op = IncomingVersionReplicationOperation::new(
+            stream_id,
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+        op.state = IncomingVersionReplicationState::CommitTransaction;
+        op.txn_id = Some(txn_id);
+        op.cleanup_blob_location = Some(received.clone());
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::AbortTransaction);
+        assert_eq!(
+            effects[0],
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id })
+        );
+        let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::CleanupReceivedBlob
+        );
+        assert_eq!(
+            effects[0],
+            Effect::Blob(BlobEffect::Delete { location: received })
+        );
+    }
+
+    #[test]
+    fn commit_abort_preserves() {
+        let received = make_location();
+        let txn_id = Ulid::generate();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        op.state = IncomingVersionReplicationState::CommitTransaction;
+        op.txn_id = Some(txn_id);
+        op.cleanup_blob_location = Some(received);
+
+        let effects = op.abort();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| { matches!(effect, Effect::Blob(BlobEffect::Delete { .. })) })
+        );
+        assert!(effects.contains(&Effect::Storage(StorageEffect::AbortTransaction { txn_id })));
     }
 
     #[test]
