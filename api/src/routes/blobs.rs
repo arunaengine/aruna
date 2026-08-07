@@ -382,7 +382,7 @@ pub async fn blob_locations(
         auth_context: auth,
     };
     let local = drive(
-        LocationSummaryOperation::new_local(local_node, request.clone()),
+        LocationSummaryOperation::new_local(local_node, request.clone()).with_policy(true),
         ctx.as_ref(),
     )
     .await
