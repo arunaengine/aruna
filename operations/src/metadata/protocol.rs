@@ -1,10 +1,10 @@
-use aruna_core::audit::{AuditPageRequest, AuditPageResponse};
+use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
@@ -16,6 +16,7 @@ use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+const AUDIT_FRAME_OVERHEAD: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataPathCandidate {
@@ -252,24 +253,43 @@ pub(crate) async fn write_encoded_message(
 }
 
 pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMessage, String> {
+    read_message_cap(&mut stream.1, MAX_MESSAGE_SIZE).await
+}
+
+pub(crate) async fn read_message_cap<R>(
+    reader: &mut R,
+    max_size: usize,
+) -> Result<MetadataTransportMessage, String>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     let mut len_buf = [0u8; 4];
-    stream
-        .1
+    reader
         .read_exact(&mut len_buf)
         .await
         .map_err(|err| err.to_string())?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_MESSAGE_SIZE {
+    if len > max_size {
         return Err("metadata frame exceeds maximum size".to_string());
     }
 
     let mut bytes = vec![0u8; len];
-    stream
-        .1
+    reader
         .read_exact(&mut bytes)
         .await
         .map_err(|err| err.to_string())?;
     postcard::from_bytes(&bytes).map_err(|err| err.to_string())
+}
+
+fn audit_frame_cap() -> usize {
+    MAX_AUDIT_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
+}
+
+pub(crate) fn response_cap(message: &MetadataTransportMessage) -> usize {
+    match message {
+        MetadataTransportMessage::ForwardAuditPage { .. } => audit_frame_cap(),
+        _ => MAX_MESSAGE_SIZE,
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +475,43 @@ mod tests {
         let oversized = "x".repeat(MAX_METADATA_BEARER_TOKEN_LEN + 1);
 
         assert!(MetadataAuthToken::bearer(oversized).is_err());
+    }
+
+    #[tokio::test]
+    async fn audit_frame_rejects_oversize() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+
+        let error = read_message_cap(&mut reader, audit_frame_cap())
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata frame exceeds maximum size");
+    }
+
+    #[tokio::test]
+    async fn audit_frame_reads_within_cap() {
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: Vec::new(),
+                next_start_after: None,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        assert!(bytes.len() <= audit_frame_cap());
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 4);
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+
+        assert_eq!(
+            read_message_cap(&mut reader, audit_frame_cap())
+                .await
+                .unwrap(),
+            message
+        );
     }
 
     #[test]

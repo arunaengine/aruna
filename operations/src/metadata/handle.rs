@@ -53,7 +53,7 @@ use ulid::Ulid;
 
 use super::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, read_message,
-    write_encoded_message, write_message,
+    read_message_cap, response_cap, write_encoded_message, write_message,
 };
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
@@ -6100,6 +6100,7 @@ async fn send_request(
 ) -> Result<MetadataTransportMessage, MetadataRequestError> {
     let span = Span::current();
     let total_started = Instant::now();
+    let max_response_size = response_cap(&message);
 
     let bytes = encode_message(&message)
         .map_err(MetadataError::Backend)
@@ -6128,7 +6129,7 @@ async fn send_request(
     record_elapsed_ms(&span, "finish_ms", finish_started);
 
     let read_started = Instant::now();
-    let response = read_transport_message(&mut stream)
+    let response = read_transport_cap(&mut stream, max_response_size)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "read_ms", read_started);
@@ -6234,6 +6235,21 @@ async fn read_transport_message(
 ) -> Result<MetadataTransportMessage, MetadataError> {
     let result: Result<Result<MetadataTransportMessage, String>, tokio::time::error::Elapsed> =
         timeout(METADATA_IO_TIMEOUT, read_message(stream)).await;
+    result
+        .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
+        .map_err(MetadataError::Backend)
+}
+
+async fn read_transport_cap(
+    stream: &mut BiStream,
+    max_size: usize,
+) -> Result<MetadataTransportMessage, MetadataError> {
+    let result: Result<Result<MetadataTransportMessage, String>, tokio::time::error::Elapsed> =
+        timeout(
+            METADATA_IO_TIMEOUT,
+            read_message_cap(&mut stream.1, max_size),
+        )
+        .await;
     result
         .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
         .map_err(MetadataError::Backend)
