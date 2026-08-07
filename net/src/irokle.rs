@@ -5431,9 +5431,42 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     if lifecycle_stale_txn(storage, &target, change, txn_id).await? {
         return Ok(None);
     }
+    let mut acceptance_to_write = None;
     if let MetadataDocumentLifecycleRecord::Upsert { event } = record {
         validate_metadata_event(event)?;
         if create_fence_txn(storage, event, txn_id).await? {
+            return Ok(None);
+        }
+
+        let accepted = storage_read_from_transaction(
+            storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+            metadata_create_acceptance_key(event.record.document_id),
+            Some(txn_id),
+        )
+        .await?
+        .map(|value| {
+            postcard::from_bytes::<MetadataCreateEventRecord>(&value)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+        })
+        .transpose()?;
+        if let Some(accepted) = accepted.as_ref() {
+            validate_metadata_event(accepted)?;
+        }
+        if event_is_create(event) {
+            if accepted
+                .as_ref()
+                .is_some_and(|accepted| !same_create_event(accepted, event))
+            {
+                return Ok(None);
+            }
+            if accepted.is_none() {
+                acceptance_to_write = Some(event.as_ref());
+            }
+        } else if accepted.as_ref().is_none_or(|accepted| {
+            !event_is_create(accepted)
+                || !registry_identity_matches(&accepted.record, &event.record)
+        }) {
             return Ok(None);
         }
     }
@@ -5447,9 +5480,7 @@ async fn metadata_document_lifecycle_write_entries_if_current(
             metadata_document_delete_write_entries(event)?
         }
     };
-    if let MetadataDocumentLifecycleRecord::Upsert { event } = record
-        && event_is_create(event)
-    {
+    if let Some(event) = acceptance_to_write {
         entries.push(
             metadata_create_acceptance_write_entry(event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -13974,6 +14005,108 @@ mod tests {
         assert_eq!(
             postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
             event
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_acceptance_fence() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(11, 1);
+        let document_id = Ulid::from_parts(12, 1);
+        let event_id = Ulid::from_parts(13, 1);
+        let accepted = metadata_create_event(group_id, document_id, 100, event_id, 7);
+        let accepted_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(accepted.clone()),
+        };
+        assert!(
+            apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &accepted_lifecycle,
+                metadata_lifecycle_change(&accepted_lifecycle, node(8)),
+            )
+            .await
+            .expect("accepted lifecycle create applies")
+        );
+
+        let mut divergent = accepted.clone();
+        divergent.event_id = Ulid::from_parts(14, 1);
+        divergent.record.establishing_event_id = divergent.event_id;
+        divergent.record.last_event_id = divergent.event_id;
+        let divergent_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(divergent),
+        };
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &divergent_lifecycle,
+                metadata_lifecycle_change(&divergent_lifecycle, node(8)),
+            )
+            .await
+            .expect("divergent lifecycle create is fenced")
+        );
+        let acceptance = read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(document_id),
+        )
+        .await
+        .expect("create acceptance remains");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+            accepted
+        );
+
+        let orphan_id = Ulid::from_parts(15, 1);
+        let mut orphan = metadata_create_event(group_id, orphan_id, 200, orphan_id, 7);
+        orphan.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        let orphan_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(orphan),
+        };
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &orphan_lifecycle,
+                metadata_lifecycle_change(&orphan_lifecycle, node(8)),
+            )
+            .await
+            .expect("lifecycle update without acceptance is fenced")
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+                metadata_create_acceptance_key(orphan_id),
+            )
+            .await
+            .is_none()
+        );
+
+        let mut mismatched = accepted.clone();
+        mismatched.event_id = Ulid::from_parts(16, 1);
+        mismatched.record.updated_at_ms = 200;
+        mismatched.record.last_event_id = mismatched.event_id;
+        mismatched.record.placement = PlacementRef {
+            strategy_id: Ulid::from_parts(17, 1),
+            epoch: 1,
+            shard: 1,
+        };
+        mismatched.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        mismatched.occurred_at_ms = 200;
+        let mismatched_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(mismatched),
+        };
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &mismatched_lifecycle,
+                metadata_lifecycle_change(&mismatched_lifecycle, node(8)),
+            )
+            .await
+            .expect("mismatched lifecycle update is fenced")
         );
     }
 
