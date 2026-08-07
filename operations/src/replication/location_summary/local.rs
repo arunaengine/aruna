@@ -5,18 +5,20 @@ use crate::realm_peer::ensure_realm_peer;
 use crate::replication::protocol::{
     LocationCopyStorage, LocationSummary, LocationSummaryRequest, VersionReplicationMessage,
 };
+use crate::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFunctions};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CurrentVersionPointer, GroupStorageBackend, Permission, RealmConfigDocument, VersionKey,
-    blob_bucket_permission_path, blob_object_permission_path,
+    CurrentVersionPointer, GroupAuthorizationDocument, GroupStorageBackend, Permission,
+    RealmConfigDocument, VersionKey, blob_bucket_permission_path, blob_object_permission_path,
 };
 use aruna_core::types::{Effects, UserId};
 use smallvec::smallvec;
@@ -28,12 +30,15 @@ enum SummaryState {
     Init,
     ReadRealm,
     ReadBucket,
+    StartPolicy,
+    ReadPolicy,
     CheckPermission,
     ReadHead,
     ReadVersion,
     ReadLocation,
     ReadBackend,
-    VerifyBucket,
+    CommitTransaction,
+    AbortTransaction,
     SendSummary,
     SendDenial,
     Close,
@@ -66,7 +71,10 @@ pub struct LocationSummaryOperation {
     bucket: Option<BucketInfo>,
     /// Identity of the bucket record the READ check was evaluated against.
     authorized: Option<(Ulid, SystemTime, UserId)>,
+    permission_path: Option<String>,
+    txn_id: Option<Ulid>,
     policy_allowed: bool,
+    policy_current: bool,
     state: SummaryState,
     version_id: Option<Ulid>,
     blake3: Option<[u8; 32]>,
@@ -105,7 +113,10 @@ impl LocationSummaryOperation {
             stream_id,
             bucket: None,
             authorized: None,
+            permission_path: None,
+            txn_id: None,
             policy_allowed: false,
+            policy_current: false,
             state: SummaryState::Init,
             version_id,
             blake3: None,
@@ -120,12 +131,15 @@ impl LocationSummaryOperation {
             SummaryState::Init => "init",
             SummaryState::ReadRealm => "read_realm",
             SummaryState::ReadBucket => "read_bucket",
+            SummaryState::StartPolicy => "start_policy",
+            SummaryState::ReadPolicy => "read_policy",
             SummaryState::CheckPermission => "check_permission",
             SummaryState::ReadHead => "read_head",
             SummaryState::ReadVersion => "read_version",
             SummaryState::ReadLocation => "read_location",
             SummaryState::ReadBackend => "read_backend",
-            SummaryState::VerifyBucket => "verify_bucket",
+            SummaryState::CommitTransaction => "commit_transaction",
+            SummaryState::AbortTransaction => "abort_transaction",
             SummaryState::SendSummary => "send_summary",
             SummaryState::SendDenial => "send_denial",
             SummaryState::Close => "close",
@@ -137,10 +151,14 @@ impl LocationSummaryOperation {
     fn fail(&mut self, error: LocationSummaryError) -> Effects {
         self.output = Some(Err(error));
         self.state = SummaryState::Error;
-        match self.stream_id {
-            Some(stream_id) => smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })],
-            None => smallvec![],
+        let mut effects = smallvec![];
+        if let Some(txn_id) = self.txn_id.take() {
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
+        if let Some(stream_id) = self.stream_id {
+            effects.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }));
+        }
+        effects
     }
 
     fn unexpected(&mut self, event: Event) -> Effects {
@@ -173,7 +191,7 @@ impl LocationSummaryOperation {
         Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.request.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
+            txn_id: self.txn_id,
         })
     }
 
@@ -187,6 +205,34 @@ impl LocationSummaryOperation {
         smallvec![self.bucket_read()]
     }
 
+    fn start_policy(&mut self) -> Effects {
+        self.state = SummaryState::StartPolicy;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: true
+        })]
+    }
+
+    fn read_policy(&mut self) -> Effects {
+        let Some(bucket) = self.bucket.as_ref() else {
+            return self.fail(LocationSummaryError::BucketNotFound);
+        };
+        self.state = SummaryState::ReadPolicy;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    S3_BUCKET_KEYSPACE.to_string(),
+                    self.request.bucket.as_bytes().to_vec().into(),
+                ),
+                (
+                    REALM_CONFIG_KEYSPACE.to_string(),
+                    self.request.realm_id.as_bytes().to_vec().into(),
+                ),
+                (AUTH_KEYSPACE.to_string(), bucket.group_id.to_bytes().into(),),
+            ],
+            txn_id: self.txn_id,
+        })]
+    }
+
     fn read_head(&mut self) -> Effects {
         let key = match BlobHeadKey::new(&self.request.bucket, &self.request.key).to_bytes() {
             Ok(key) => key,
@@ -196,7 +242,7 @@ impl LocationSummaryOperation {
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             key: key.into(),
-            txn_id: None,
+            txn_id: self.txn_id,
         })]
     }
 
@@ -213,13 +259,13 @@ impl LocationSummaryOperation {
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key: key.into(),
-            txn_id: None,
+            txn_id: self.txn_id,
         })]
     }
 
     fn read_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = SummaryState::ReadLocation;
-        smallvec![blob_location_read(&key, None)]
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn read_backend(&mut self, backend_id: Ulid) -> Effects {
@@ -227,36 +273,19 @@ impl LocationSummaryOperation {
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
             key: backend_id.to_bytes().to_vec().into(),
-            txn_id: None,
+            txn_id: self.txn_id,
         })]
     }
 
-    /// The head, version, location and backend reads share no snapshot with the
-    /// bucket the caller was authorized against, so that record is read once
-    /// more before anything ships.
     fn answer(&mut self) -> Effects {
-        self.state = SummaryState::VerifyBucket;
-        smallvec![self.bucket_read()]
-    }
-
-    /// A bucket deleted and recreated under the same name is a different bucket
-    /// with a different group, and a delete always stamps a fresh `created_at`,
-    /// so an unchanged identity proves no replacement happened in between.
-    fn handle_verify(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
+        let Some(txn_id) = self.txn_id.take() else {
+            return self.fail(LocationSummaryError::Unexpected {
+                state: "answer",
+                event: "missing read transaction".to_string(),
+            });
         };
-        let current = match value {
-            Some(value) => match BucketInfo::from_bytes(&value) {
-                Ok(bucket) => bucket.identity(),
-                Err(error) => return self.fail(error.into()),
-            },
-            None => return self.fail(LocationSummaryError::BucketNotFound),
-        };
-        if Some(current) != self.authorized {
-            return self.deny();
-        }
-        self.send_answer()
+        self.state = SummaryState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn send_answer(&mut self) -> Effects {
@@ -325,6 +354,74 @@ impl LocationSummaryOperation {
                 &self.request.key,
             )
         };
+        self.permission_path = Some(path);
+        self.start_policy()
+    }
+
+    fn handle_start_policy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.unexpected(event);
+        };
+        self.txn_id = Some(txn_id);
+        self.read_policy()
+    }
+
+    fn handle_policy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected(event);
+        };
+        let Some((_, Some(bucket_value))) = values.first() else {
+            return self.deny();
+        };
+        let current = match BucketInfo::from_bytes(bucket_value) {
+            Ok(bucket) => bucket,
+            Err(error) => return self.fail(error.into()),
+        };
+        if Some(current.identity()) != self.authorized {
+            return self.deny();
+        }
+        let Some((_, Some(realm_value))) = values.get(1) else {
+            return self.deny();
+        };
+        let realm = match RealmConfigDocument::from_bytes(realm_value) {
+            Ok(realm) if realm.realm_id == self.request.realm_id => realm,
+            Ok(_) => return self.deny(),
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some((_, Some(group_value))) = values.get(2) else {
+            return self.deny();
+        };
+        let group = match GroupAuthorizationDocument::from_bytes(group_value) {
+            Ok(group) if group.group_id == current.group_id => group,
+            Ok(_) => return self.deny(),
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(path) = self.permission_path.as_deref() else {
+            return self.deny();
+        };
+        let request = policy_request_with(
+            path,
+            &Permission::READ,
+            Some(&self.request.auth_context.user_id),
+            PolicyRequestExtras::operation("s3.GetObject"),
+        );
+        let realm_set = match CompiledPolicySet::compile(&realm.request_policies) {
+            Ok(set) => set,
+            Err(_) => return self.deny(),
+        };
+        let group_set = match CompiledPolicySet::compile(&group.policies) {
+            Ok(set) => set,
+            Err(_) => return self.deny(),
+        };
+        self.policy_current = self.policy_allowed
+            && matches!(
+                realm_set.evaluate(&request, &PolicyFunctions::default()),
+                PolicyDecision::Allowed
+            )
+            && matches!(
+                group_set.evaluate(&request, &PolicyFunctions::default()),
+                PolicyDecision::Allowed
+            );
         self.state = SummaryState::CheckPermission;
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -341,16 +438,41 @@ impl LocationSummaryOperation {
             return self.unexpected(event);
         };
         match allowed {
-            Ok(true) if self.policy_allowed => self.resolve_version(),
+            Ok(true) if self.policy_current => self.resolve_version(),
             _ => self.deny(),
         }
+    }
+
+    fn handle_commit(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.unexpected(event);
+        };
+        self.send_answer()
+    }
+
+    fn handle_abort(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
+            return self.unexpected(event);
+        };
+        self.send_denial()
     }
 
     /// A refusal is answered rather than dropped: a caller must be able to tell
     /// a node that will not answer from one that cannot.
     fn deny(&mut self) -> Effects {
+        if let Some(txn_id) = self.txn_id.take() {
+            self.output = Some(Err(LocationSummaryError::Denied));
+            self.state = SummaryState::AbortTransaction;
+            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
+        }
+        self.send_denial()
+    }
+
+    fn send_denial(&mut self) -> Effects {
         let Some(stream_id) = self.stream_id else {
-            return self.fail(LocationSummaryError::Denied);
+            self.output = Some(Err(LocationSummaryError::Denied));
+            self.state = SummaryState::Error;
+            return smallvec![];
         };
         let payload = match VersionReplicationMessage::LocationSummaryDenied.to_bytes() {
             Ok(payload) => payload,
@@ -473,12 +595,15 @@ impl Operation for LocationSummaryOperation {
             SummaryState::Init => self.start(),
             SummaryState::ReadRealm => self.handle_realm(event),
             SummaryState::ReadBucket => self.handle_bucket(event),
+            SummaryState::StartPolicy => self.handle_start_policy(event),
+            SummaryState::ReadPolicy => self.handle_policy(event),
             SummaryState::CheckPermission => self.handle_permission(event),
             SummaryState::ReadHead => self.handle_head(event),
             SummaryState::ReadVersion => self.handle_version(event),
             SummaryState::ReadLocation => self.handle_location(event),
             SummaryState::ReadBackend => self.handle_backend(event),
-            SummaryState::VerifyBucket => self.handle_verify(event),
+            SummaryState::CommitTransaction => self.handle_commit(event),
+            SummaryState::AbortTransaction => self.handle_abort(event),
             SummaryState::SendSummary => {
                 let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
                     return self.unexpected(event);
@@ -521,10 +646,14 @@ impl Operation for LocationSummaryOperation {
 
     fn abort(&mut self) -> Effects {
         self.state = SummaryState::Error;
-        match self.stream_id {
-            Some(stream_id) => smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })],
-            None => smallvec![],
+        let mut effects = smallvec![];
+        if let Some(txn_id) = self.txn_id.take() {
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
+        if let Some(stream_id) = self.stream_id {
+            effects.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }));
+        }
+        effects
     }
 }
 
@@ -536,7 +665,11 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{BackendLocation, BackendRef, BlobVersion, BucketInfo};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::{
+        BackendLocation, BackendRef, BlobVersion, BucketInfo, GroupAuthorizationDocument,
+        RealmConfigDocument,
+    };
     use aruna_core::types::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -578,15 +711,54 @@ mod tests {
             LocationSummaryOperation::new_local(node_id(5), request(version_id)).with_policy(true);
         operation.start();
         operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(11u128),
+        }));
+        operation.step(policy_batch());
         operation.step(Event::SubOperation(
             aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
         ));
         operation
     }
 
-    /// Answers the closing re-read with the same record the check ran against.
+    fn policy_batch() -> Event {
+        let realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
+        let group = GroupAuthorizationDocument::new_default_group_doc(
+            UserId::nil(realm_id()),
+            realm_id(),
+            bucket_info().group_id,
+        );
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    b"bucket".to_vec().into(),
+                    Some(bucket_info().to_bytes().unwrap().into()),
+                ),
+                (
+                    b"realm".to_vec().into(),
+                    Some(postcard::to_allocvec(&realm).unwrap().into()),
+                ),
+                (
+                    b"group".to_vec().into(),
+                    Some(
+                        group
+                            .to_bytes(&aruna_core::structs::Actor {
+                                node_id: node_id(5),
+                                user_id: UserId::nil(realm_id()),
+                                realm_id: realm_id(),
+                            })
+                            .unwrap()
+                            .into(),
+                    ),
+                ),
+            ],
+        })
+    }
+
     fn verify(operation: &mut LocationSummaryOperation) {
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::from(11u128),
+        }));
     }
 
     fn read_result(value: Option<Vec<u8>>) -> Event {
@@ -682,20 +854,30 @@ mod tests {
     fn replaced_bucket_denied() {
         // A bucket deleted and recreated under another group must not answer to
         // a caller authorized against the generation the read started on.
-        let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
-        operation.step(read_result(Some(materialized().to_bytes().unwrap())));
-        operation.step(read_result(Some(
-            location(BackendRef::node_default(), None)
-                .to_bytes()
-                .unwrap(),
-        )));
-
+        let mut operation = LocationSummaryOperation::new_local(
+            node_id(5),
+            request(Some(Ulid::from_bytes([3u8; 16]))),
+        )
+        .with_policy(true);
+        operation.start();
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(11u128),
+        }));
         let replaced = BucketInfo {
             group_id: Ulid::from_bytes([9u8; 16]),
             created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
             ..bucket_info()
         };
-        operation.step(read_result(Some(replaced.to_bytes().unwrap())));
+        let mut batch = policy_batch();
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+            unreachable!();
+        };
+        values[0].1 = Some(replaced.to_bytes().unwrap().into());
+        operation.step(batch);
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from(11u128),
+        }));
 
         assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
     }
@@ -703,15 +885,27 @@ mod tests {
     #[test]
     fn deleted_bucket_fails() {
         // A bucket that vanished mid-read has no answer to give.
-        let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
-        operation.step(read_result(None));
+        let mut operation = LocationSummaryOperation::new_local(
+            node_id(5),
+            request(Some(Ulid::from_bytes([3u8; 16]))),
+        )
+        .with_policy(true);
+        operation.start();
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(11u128),
+        }));
+        let mut batch = policy_batch();
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+            unreachable!();
+        };
+        values[0].1 = None;
+        operation.step(batch);
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from(11u128),
+        }));
 
-        operation.step(read_result(None));
-
-        assert_eq!(
-            operation.finalize(),
-            Err(LocationSummaryError::BucketNotFound)
-        );
+        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
     }
 
     #[test]
@@ -723,10 +917,17 @@ mod tests {
         );
         operation.start();
         operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(11u128),
+        }));
+        operation.step(policy_batch());
 
         operation.step(Event::SubOperation(
             aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
         ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from(11u128),
+        }));
 
         assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
     }
@@ -740,9 +941,53 @@ mod tests {
         .with_policy(false);
         operation.start();
         operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(11u128),
+        }));
+        operation.step(policy_batch());
         operation.step(Event::SubOperation(
             aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
         ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from(11u128),
+        }));
+
+        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+    }
+
+    #[test]
+    fn policy_snapshot_denies() {
+        let mut operation = LocationSummaryOperation::new_local(
+            node_id(5),
+            request(Some(Ulid::from_bytes([3u8; 16]))),
+        )
+        .with_policy(true);
+        operation.start();
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(11u128),
+        }));
+        let mut batch = policy_batch();
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+            unreachable!();
+        };
+        let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
+        realm.request_policies.push(RequestPolicy {
+            policy_id: Ulid::from(12u128),
+            name: "deny-all".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "true".to_string(),
+            enabled: true,
+        });
+        values[1].1 = Some(postcard::to_allocvec(&realm).unwrap().into());
+        operation.step(batch);
+        operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from(11u128),
+        }));
 
         assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
     }
