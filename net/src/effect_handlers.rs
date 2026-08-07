@@ -1,4 +1,4 @@
-use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
+use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{DhtEvent, JobControlEvent, NetEvent, StreamEvent};
@@ -39,11 +39,10 @@ pub async fn handle_net_effect(
         )),
         NetEffect::AuditPage(audit) => {
             let mut batch = AuditPageBatch::with_limit(audit.request.limit);
-            let nodes = audit
-                .nodes
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>();
-            for node in nodes.into_iter().take(MAX_AUDIT_PEERS) {
+            let mut nodes = audit.nodes;
+            nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            nodes.dedup();
+            for node in nodes {
                 batch.mark_missing(node);
             }
             NetEvent::AuditPages(batch)
