@@ -1,5 +1,6 @@
 use crate::NodeId;
 use crate::admin_document_reducer::AdminDocumentReducerState;
+use crate::auth::revocation_live;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
@@ -517,7 +518,7 @@ impl RealmConfigDocument {
     pub fn token_revoked(&self, token_hash: &str, now: u64) -> bool {
         self.revoked_tokens
             .iter()
-            .any(|entry| entry.token_hash == token_hash && entry.expires_at >= now)
+            .any(|entry| entry.token_hash == token_hash && revocation_live(entry.expires_at, now))
     }
 
     /// Unions the locally accepted revocations with the reducer's materialized
@@ -537,7 +538,7 @@ impl RealmConfigDocument {
         }
         self.revoked_tokens = merged
             .into_iter()
-            .filter(|(_, expires_at)| *expires_at >= now)
+            .filter(|(_, expires_at)| revocation_live(*expires_at, now))
             .map(|(token_hash, expires_at)| TokenRevocation {
                 token_hash,
                 expires_at,
