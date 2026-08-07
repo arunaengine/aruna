@@ -129,6 +129,92 @@ mod failing_close {
     }
 }
 
+mod failing_cleanup {
+    use opendal::raw::oio;
+    use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
+    use opendal::{Buffer, Builder, Capability, Error, ErrorKind, Metadata, Operator};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CleanupBuilder {
+        delete_calls: Arc<AtomicUsize>,
+    }
+
+    impl Builder for CleanupBuilder {
+        type Config = ();
+
+        fn build(self) -> opendal::Result<impl Access> {
+            Ok(CleanupBackend {
+                delete_calls: self.delete_calls,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CleanupBackend {
+        delete_calls: Arc<AtomicUsize>,
+    }
+
+    impl Access for CleanupBackend {
+        type Reader = ();
+        type Writer = CleanupWriter;
+        type Lister = ();
+        type Deleter = ();
+        type Copier = ();
+
+        fn info(&self) -> std::sync::Arc<AccessorInfo> {
+            let info = std::sync::Arc::new(AccessorInfo::default());
+            info.set_scheme("cleanup_fails").set_root("/").set_native_capability(Capability {
+                write: true,
+                delete: true,
+                ..Default::default()
+            });
+            info
+        }
+
+        async fn write(
+            &self,
+            _path: &str,
+            _args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            Ok((RpWrite::new(), CleanupWriter))
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::new(ErrorKind::Unexpected, "injected delete failure"))
+        }
+    }
+
+    struct CleanupWriter;
+
+    impl oio::Write for CleanupWriter {
+        async fn write(&mut self, _bs: Buffer) -> opendal::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> opendal::Result<Metadata> {
+            Err(Error::new(ErrorKind::Unexpected, "injected close failure"))
+        }
+
+        async fn abort(&mut self) -> opendal::Result<()> {
+            Err(Error::new(ErrorKind::Unexpected, "injected abort failure"))
+        }
+    }
+
+    pub(super) fn operator_with_deletes() -> (Operator, Arc<AtomicUsize>) {
+        let delete_calls = Arc::new(AtomicUsize::new(0));
+        let operator = Operator::new(CleanupBuilder {
+            delete_calls: delete_calls.clone(),
+        })
+        .unwrap()
+        .finish();
+        (operator, delete_calls)
+    }
+
+}
+
 async fn loopback_net_handle() -> (NetHandle, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
@@ -1536,7 +1622,11 @@ async fn write_finalization_failure_emits_no_success_or_load() {
         .await;
 
     assert!(
-        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        matches!(
+            event,
+            BlobEvent::Error(BlobError::WriteCleanup { location: actual, .. })
+                if actual == location
+        ),
         "close failure must surface as an error, got {event:?}"
     );
     assert_eq!(
@@ -1643,7 +1733,11 @@ async fn compose_close_fails() {
         .await;
 
     assert!(
-        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        matches!(
+            event,
+            BlobEvent::Error(BlobError::WriteCleanup { location: actual, .. })
+                if actual == target
+        ),
         "compose close failure must surface as an error, got {event:?}"
     );
     assert_eq!(
@@ -1662,16 +1756,104 @@ async fn compose_close_fails() {
 async fn replication_close_fails() {
     let (operator, aborts) = failing_close::operator_with_aborts();
     let mut writer =
-        crate::bao_tree::OpenDalWriter::new(&operator, "obj/replica", Duration::from_secs(5))
-            .await
-            .unwrap();
+        crate::bao_tree::OpenDalWriter::new(
+            &operator,
+            "obj/replica",
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
 
     iroh_io::AsyncSliceWriter::write_bytes_at(&mut writer, 0, bytes::Bytes::from_static(b"data"))
         .await
         .unwrap();
 
-    assert!(writer.finalize().await.is_err());
+    let error = writer.finalize().await.unwrap_err();
+    assert!(matches!(
+        error,
+        BlobError::WriteError(message) if message.contains("injected finalization failure")
+    ));
     assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn compose_cleanup_error() {
+    let context = setup_blob_handle(5).await;
+    let target = make_test_location();
+    let (operator, delete_calls) = failing_cleanup::operator_with_deletes();
+    let event = context
+        .blob_handle
+        .handler
+        .compose_parts_to_location(target.clone(), operator, Vec::new())
+        .await;
+
+    let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {
+        panic!("unresolved compose cleanup must retain its location");
+    };
+    assert_eq!(location, target);
+    assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn write_cleanup_error() {
+    let context = setup_blob_handle(5).await;
+    let location = make_test_location();
+    let (operator, delete_calls) = failing_cleanup::operator_with_deletes();
+    let event = context
+        .blob_handle
+        .handler
+        .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
+        .await;
+
+    let BlobEvent::Error(BlobError::WriteCleanup { location: actual, .. }) = event else {
+        panic!("uncertain write cleanup must retain its location");
+    };
+    assert_eq!(actual, location);
+    assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn replication_cleanup_error() {
+    let (operator, delete_calls) = failing_cleanup::operator_with_deletes();
+    let writer = crate::bao_tree::OpenDalWriter::new(
+        &operator,
+        "obj/replica",
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        writer.finalize().await,
+        Err(BlobError::DeleteError(_))
+    ));
+    assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn delete_missing_safe() {
+    let context = setup_blob_handle(5).await;
+    let root = tempdir().unwrap();
+    let operator = crate::opendal::init_operator(
+        Backend::FileSystem,
+        HashMap::from([(
+            "root".to_string(),
+            root.path().to_str().unwrap().to_string(),
+        )]),
+        &crate::egress::EgressGuard::new(EgressPolicy::loopback()).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        context
+            .blob_handle
+            .handler
+            .delete_path(&operator, "missing")
+            .await,
+        Ok(())
+    );
 }
 
 #[test]
