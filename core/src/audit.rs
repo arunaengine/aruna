@@ -199,10 +199,10 @@ impl AuditPageBatch {
         let record_bytes =
             postcard::to_allocvec(&entry.record).map_err(|_| AuditPageError::TooLarge)?;
         let entry_bytes = entry.key.len() + record_bytes.len();
-        if bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
-            return Err(AuditPageError::TooLarge);
-        }
         let Some(current) = self.records.get(&entry.key) else {
+            if bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
+                return Err(AuditPageError::TooLarge);
+            }
             return Ok(AuditEntryPlan {
                 decision: PageDecision::Insert,
                 bytes: bytes + entry_bytes,
@@ -649,5 +649,51 @@ mod tests {
         assert!(!batch.completed_nodes.contains(&node));
         assert!(batch.missing_nodes.contains(&node));
         assert!(batch.missing_nodes.contains(&existing));
+    }
+
+    #[test]
+    fn duplicate_at_cap() {
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let document_id = Ulid::from_bytes([3u8; 16]);
+        let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let request = request(realm_id, group_id, document_id);
+        let duplicate = entry(
+            group_id,
+            document_id,
+            Ulid::from_bytes([1u8; 16]),
+            realm_id,
+            node,
+        );
+        let mut batch = AuditPageBatch::new();
+        batch
+            .add_page(
+                node,
+                AuditPageResponse {
+                    records: vec![duplicate.clone()],
+                    next_start_after: None,
+                },
+                &request,
+            )
+            .unwrap();
+        // A duplicate must not consume capacity when the aggregate is full.
+        batch.bytes = MAX_AUDIT_BATCH_BYTES;
+
+        assert!(
+            batch
+                .add_page(
+                    node,
+                    AuditPageResponse {
+                        records: vec![duplicate],
+                        next_start_after: None,
+                    },
+                    &request,
+                )
+                .is_ok()
+        );
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.bytes, MAX_AUDIT_BATCH_BYTES);
+        assert!(batch.completed_nodes.contains(&node));
+        assert!(batch.missing_nodes.is_empty());
     }
 }
