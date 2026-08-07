@@ -799,84 +799,314 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
 fn cleanup_effect(effect: &StorageEffect) -> Option<(Ulid, CleanupKind)> {
     match effect {
         StorageEffect::AbortTransaction { txn_id } => Some((*txn_id, CleanupKind::Abort)),
-        StorageEffect::CommitTransaction { txn_id } => Some((*txn_id, CleanupKind::CommitUnknown)),
+        StorageEffect::CommitTransaction { txn_id } => Some((*txn_id, CleanupKind::CommitQueued)),
         _ => None,
     }
 }
 
-fn retain_cleanup(
-    pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+fn reserve_cleanup(
+    pending: &mut BTreeMap<Ulid, CleanupEntry>,
     txn_id: Ulid,
     kind: CleanupKind,
-) -> bool {
-    let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
-    if !pending.contains_key(&txn_id) && pending.len() >= MAX_TRANSACTION_CLEANUP {
-        return false;
+) -> Result<CleanupAdmission, StorageError> {
+    let previous = pending.get(&txn_id).map(|entry| entry.kind);
+    match (kind, previous) {
+        (
+            CleanupKind::Abort,
+            Some(CleanupKind::CommitQueued | CleanupKind::CommitUnknown | CleanupKind::Committed),
+        )
+        | (CleanupKind::CommitQueued, Some(CleanupKind::Abort | CleanupKind::Aborted))
+        | (CleanupKind::CommitUnknown, Some(CleanupKind::Abort | CleanupKind::Aborted)) => {
+            return Err(StorageError::TransactionConflict);
+        }
+        (
+            CleanupKind::CommitQueued,
+            Some(CleanupKind::CommitQueued | CleanupKind::CommitUnknown),
+        ) => {
+            return Err(StorageError::CommitFailed);
+        }
+        _ => {}
     }
-    let entry = pending
-        .entry(txn_id)
-        .or_insert(CleanupEntry { kind, attempts: 0 });
-    if matches!(kind, CleanupKind::CommitUnknown) {
-        entry.kind = kind;
+
+    if previous.is_none() {
+        if pending.len() >= MAX_TRANSACTION_CLEANUP {
+            return Err(StorageError::TransactionConflict);
+        }
+        pending.insert(txn_id, CleanupEntry { kind, attempts: 0 });
+    } else if matches!(
+        (kind, previous),
+        (CleanupKind::Abort, Some(CleanupKind::Open))
+            | (CleanupKind::CommitQueued, Some(CleanupKind::Open))
+            | (CleanupKind::CommitUnknown, Some(CleanupKind::CommitQueued))
+    ) {
+        if let Some(entry) = pending.get_mut(&txn_id) {
+            entry.kind = kind;
+            entry.attempts = 0;
+        }
     }
-    true
+
+    Ok(CleanupAdmission {
+        txn_id,
+        requested: kind,
+        previous,
+    })
+}
+
+fn rollback_cleanup(pending: &mut BTreeMap<Ulid, CleanupEntry>, admission: CleanupAdmission) {
+    if !matches!(admission.requested, CleanupKind::CommitQueued) {
+        return;
+    }
+    let Some(entry) = pending.get(&admission.txn_id) else {
+        return;
+    };
+    if !matches!(entry.kind, CleanupKind::CommitQueued) {
+        return;
+    }
+    match admission.previous {
+        Some(previous) => {
+            if let Some(entry) = pending.get_mut(&admission.txn_id) {
+                entry.kind = previous;
+                entry.attempts = 0;
+            }
+        }
+        None => {
+            pending.remove(&admission.txn_id);
+        }
+    }
 }
 
 fn observe_cleanup(
     pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
     cleanup: Option<(Ulid, CleanupKind)>,
     event: &StorageEvent,
-) {
+) -> bool {
     let Some((txn_id, kind)) = cleanup else {
-        return;
+        return false;
     };
-    let terminal = match (kind, event) {
+    let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
+    if pending
+        .get(&txn_id)
+        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed | CleanupKind::Aborted))
+    {
+        return true;
+    }
+    let terminal_kind = match (kind, event) {
         (CleanupKind::Abort, StorageEvent::TransactionAborted { txn_id: aborted })
             if txn_id == *aborted =>
         {
-            true
+            Some(CleanupKind::Aborted)
         }
         (
             CleanupKind::Abort,
             StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             },
-        ) => true,
-        (CleanupKind::CommitUnknown, StorageEvent::TransactionCommitted { txn_id: committed })
-            if txn_id == *committed =>
-        {
-            true
-        }
-        (CleanupKind::CommitUnknown, StorageEvent::Error { error })
+        ) => Some(CleanupKind::Aborted),
+        (
+            CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
+            StorageEvent::TransactionCommitted { txn_id: committed },
+        ) if txn_id == *committed => Some(CleanupKind::Committed),
+        (CleanupKind::CommitQueued | CleanupKind::CommitUnknown, StorageEvent::Error { error })
             if matches!(
                 error,
                 StorageError::TransactionConflict | StorageError::TransactionNotFound
             ) =>
         {
-            true
+            Some(CleanupKind::Aborted)
         }
-        _ => false,
+        _ => None,
     };
-    let downgrade = matches!(kind, CleanupKind::CommitUnknown)
-        && matches!(
-            event,
-            StorageEvent::Error {
-                error: StorageError::QueueFull
-            }
-        );
-    let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
-    if downgrade {
+    if let Some(terminal_kind) = terminal_kind {
         if let Some(entry) = pending.get_mut(&txn_id) {
-            entry.kind = CleanupKind::Abort;
+            entry.kind = terminal_kind;
             entry.attempts = 0;
         }
-    } else if terminal {
-        pending.remove(&txn_id);
+        return true;
+    } else if matches!(
+        (kind, event),
+        (
+            CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
+            StorageEvent::Error {
+                error: StorageError::CommitFailed
+            }
+        )
+    ) {
+        if let Some(entry) = pending.get_mut(&txn_id)
+            && matches!(
+                entry.kind,
+                CleanupKind::CommitQueued | CleanupKind::CommitUnknown
+            )
+        {
+            entry.kind = CleanupKind::CommitUnknown;
+            entry.attempts = 0;
+        }
+    } else if matches!(
+        (kind, event),
+        (
+            CleanupKind::CommitQueued,
+            StorageEvent::Error {
+                error: StorageError::Timeout | StorageError::ChannelClosed
+            }
+        )
+    ) {
+        if let Some(entry) = pending.get_mut(&txn_id)
+            && matches!(entry.kind, CleanupKind::CommitQueued)
+        {
+            entry.kind = CleanupKind::CommitUnknown;
+            entry.attempts = 0;
+        }
     } else if let Some(entry) = pending.get_mut(&txn_id)
         && matches!(entry.kind, CleanupKind::Abort)
     {
         entry.attempts = entry.attempts.saturating_add(1);
     }
+    false
+}
+
+fn finish_cleanup(pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>, txn_id: Ulid) {
+    pending
+        .lock()
+        .expect("transaction cleanup mutex poisoned")
+        .remove(&txn_id);
+}
+
+impl ResponseToken {
+    fn empty() -> Self {
+        Self {
+            handle: None,
+            cleanup: None,
+        }
+    }
+
+    fn new(handle: &StorageHandle, effect: &StorageEffect) -> Self {
+        let cleanup = match effect {
+            StorageEffect::StartTransaction { .. } => Some(ResponseCleanup::Start(None)),
+            StorageEffect::CommitTransaction { txn_id } => Some(ResponseCleanup::Commit(*txn_id)),
+            StorageEffect::AbortTransaction { txn_id } => {
+                Some(ResponseCleanup::Abort(*txn_id, true))
+            }
+            _ => {
+                active_txn_id_for_effect(effect).map(|txn_id| ResponseCleanup::Abort(txn_id, false))
+            }
+        };
+        Self {
+            handle: cleanup.as_ref().map(|_| handle.clone()),
+            cleanup,
+        }
+    }
+
+    fn abort(handle: &StorageHandle, txn_id: Ulid) -> Self {
+        Self {
+            handle: Some(handle.clone()),
+            cleanup: Some(ResponseCleanup::Abort(txn_id, false)),
+        }
+    }
+
+    fn observe(&mut self, event: &StorageEvent) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        let cleanup = match cleanup {
+            ResponseCleanup::Start(None) => match event {
+                StorageEvent::TransactionStarted { txn_id } => {
+                    ResponseCleanup::Start(Some(*txn_id))
+                }
+                _ => ResponseCleanup::Start(None),
+            },
+            ResponseCleanup::Abort(txn_id, force) => {
+                if matches!(
+                    event,
+                    StorageEvent::TransactionAborted { txn_id: aborted }
+                        if txn_id == *aborted
+                ) || matches!(
+                    event,
+                    StorageEvent::Error {
+                        error: StorageError::TransactionNotFound
+                    }
+                ) {
+                    ResponseCleanup::Terminal(txn_id)
+                } else {
+                    ResponseCleanup::Abort(txn_id, force)
+                }
+            }
+            ResponseCleanup::Commit(txn_id) => {
+                if matches!(
+                    event,
+                    StorageEvent::TransactionCommitted { txn_id: committed }
+                        if txn_id == *committed
+                ) || matches!(
+                    event,
+                    StorageEvent::Error {
+                        error: StorageError::TransactionConflict
+                            | StorageError::TransactionNotFound
+                    }
+                ) {
+                    ResponseCleanup::Terminal(txn_id)
+                } else {
+                    ResponseCleanup::Commit(txn_id)
+                }
+            }
+            cleanup => cleanup,
+        };
+        self.cleanup = Some(cleanup);
+    }
+
+    fn claim(mut self) {
+        self.disarm();
+    }
+
+    fn disarm(&mut self) {
+        let cleanup = self.cleanup.take();
+        let handle = self.handle.take();
+        if let (Some(ResponseCleanup::Terminal(txn_id)), Some(handle)) = (cleanup, handle) {
+            finish_cleanup(&handle.transaction_cleanup, txn_id);
+        }
+    }
+}
+
+impl Drop for ResponseToken {
+    fn drop(&mut self) {
+        let cleanup = self.cleanup.take();
+        let Some(cleanup) = cleanup else {
+            self.handle = None;
+            return;
+        };
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        match cleanup {
+            ResponseCleanup::Start(Some(txn_id)) => {
+                let _ = handle.retain_transaction(txn_id, false);
+            }
+            ResponseCleanup::Abort(txn_id, force) => {
+                let retry = force
+                    && handle
+                        .transaction_cleanup
+                        .lock()
+                        .expect("transaction cleanup mutex poisoned")
+                        .get(&txn_id)
+                        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Abort));
+                let retained = handle.retain_transaction(txn_id, false);
+                if retry && retained {
+                    handle.retry_abort(txn_id, "response_abandoned");
+                }
+            }
+            ResponseCleanup::Commit(txn_id) => {
+                if !handle.retain_transaction(txn_id, true) {
+                    let _ = handle.retain_transaction(txn_id, false);
+                }
+            }
+            ResponseCleanup::Terminal(txn_id) => {
+                finish_cleanup(&handle.transaction_cleanup, txn_id);
+            }
+            ResponseCleanup::Start(None) => {}
+        }
+    }
+}
+
+fn response_channel(token: ResponseToken) -> (ResponseSender, oneshot::Receiver<StorageReply>) {
+    let (sender, receiver) = oneshot::channel();
+    (ResponseSender::new(sender, token), receiver)
 }
 
 #[async_trait]
@@ -989,8 +1219,8 @@ impl FjallStorage {
         }
     }
 
-    fn observe_cleanup(&self, cleanup: Option<(Ulid, CleanupKind)>, event: &StorageEvent) {
-        observe_cleanup(&self.transaction_cleanup, cleanup, event);
+    fn observe_cleanup(&self, cleanup: Option<(Ulid, CleanupKind)>, event: &StorageEvent) -> bool {
+        observe_cleanup(&self.transaction_cleanup, cleanup, event)
     }
 
     fn retry_cleanup(&mut self) {
@@ -1001,12 +1231,14 @@ impl FjallStorage {
             .iter()
             .filter_map(|(txn_id, entry)| {
                 (matches!(entry.kind, CleanupKind::Abort) && entry.attempts < MAX_CLEANUP_ATTEMPTS)
-                    .then_some(*txn_id)
+                    .then_some((*txn_id, entry.kind))
             })
             .collect::<Vec<_>>();
-        for txn_id in retry {
+        for (txn_id, kind) in retry {
             let event = self.abort_transaction(txn_id);
-            self.observe_cleanup(Some((txn_id, CleanupKind::Abort)), &event);
+            if self.observe_cleanup(Some((txn_id, kind)), &event) {
+                finish_cleanup(&self.transaction_cleanup, txn_id);
+            }
         }
     }
 
@@ -1125,29 +1357,16 @@ impl FjallStorage {
         let _guard = span.enter();
         let operation = storage_effect_kind(&effect);
         let key_space = storage_effect_key_space(&effect).map(str::to_string);
-        let active_txn_id = active_txn_id_for_effect(&effect);
         let cleanup = cleanup_effect(&effect);
         let queue_wait = enqueued_at.elapsed();
         span.record("queue_wait_ms", duration_ms(queue_wait));
-        let starts_transaction = matches!(effect, StorageEffect::StartTransaction { .. });
-        let completes_transaction = matches!(
-            effect,
-            StorageEffect::CommitTransaction { .. } | StorageEffect::AbortTransaction { .. }
-        );
 
-        if response_tx.is_disconnected()
+        if response_tx.is_closed()
             && !matches!(
                 effect,
                 StorageEffect::AbortTransaction { .. } | StorageEffect::CommitTransaction { .. }
             )
         {
-            if let Some(txn_id) = active_txn_id {
-                self.cleanup_abandoned_transaction(
-                    txn_id,
-                    operation,
-                    "abandoned_before_processing",
-                );
-            }
             warn!(
                 event = "storage.request.abandoned",
                 operation, "Skipping abandoned storage request"
@@ -1158,6 +1377,7 @@ impl FjallStorage {
         let service_started = Instant::now();
         let event = self.process_effect(effect);
         self.observe_cleanup(cleanup, &event);
+        response_tx.observe(&event);
         self.retry_cleanup();
         let service_elapsed = service_started.elapsed();
         let total_elapsed = enqueued_at.elapsed();
@@ -1172,30 +1392,21 @@ impl FjallStorage {
             service_elapsed,
             result,
         );
-        if response_tx.is_disconnected() {
-            let abandoned_txn_id = if starts_transaction {
-                match &event {
-                    StorageEvent::TransactionStarted { txn_id } => Some(*txn_id),
-                    _ => None,
-                }
-            } else if completes_transaction {
-                None
-            } else {
-                active_txn_id
-            };
+        drop(in_flight);
+        Self::deliver_response(response_tx, event, operation, result);
+    }
 
-            if let Some(txn_id) = abandoned_txn_id {
-                self.cleanup_abandoned_transaction(txn_id, operation, "abandoned_after_processing");
-            }
+    fn deliver_response(
+        response_tx: ResponseSender,
+        event: StorageEvent,
+        operation: &'static str,
+        result: &'static str,
+    ) {
+        if !response_tx.send(event) {
             warn!(
                 event = "storage.response.abandoned",
-                operation,
-                result = storage_event_kind(&event),
-                "Dropping storage response for abandoned request"
+                operation, result, "Dropping storage response for failed delivery"
             );
-        } else {
-            drop(in_flight);
-            response_tx.send(event);
         }
     }
 
@@ -1215,7 +1426,7 @@ impl FjallStorage {
 
         let mut members = std::mem::take(group);
         members.retain(|item| {
-            if item.1.is_disconnected() {
+            if item.1.is_closed() {
                 let _guard = item.2.enter();
                 warn!(
                     event = "storage.request.abandoned",
@@ -1293,9 +1504,7 @@ impl FjallStorage {
                 result,
             );
             drop(in_flight);
-            if !response_tx.is_disconnected() {
-                response_tx.send(event);
-            }
+            let _ = response_tx.send(event);
         }
     }
 
@@ -1357,39 +1566,6 @@ impl FjallStorage {
                 Ok(StorageEvent::BatchDeleteResult { entries })
             }
             _ => Err(StorageError::InvalidEffect),
-        }
-    }
-
-    fn cleanup_abandoned_transaction(
-        &mut self,
-        txn_id: Ulid,
-        operation: &'static str,
-        reason: &'static str,
-    ) {
-        match self.abort_transaction(txn_id) {
-            StorageEvent::TransactionAborted { .. } => warn!(
-                event = "storage.transaction.aborted",
-                txn_id = %txn_id,
-                operation,
-                reason,
-                "Aborted abandoned storage transaction"
-            ),
-            StorageEvent::Error { error } => warn!(
-                event = "storage.transaction.abort_failed",
-                txn_id = %txn_id,
-                operation,
-                reason,
-                error = %error,
-                "Failed to abort abandoned storage transaction"
-            ),
-            other => warn!(
-                event = "storage.transaction.abort_unexpected",
-                txn_id = %txn_id,
-                operation,
-                reason,
-                result = storage_event_kind(&other),
-                "Unexpected result while aborting abandoned storage transaction"
-            ),
         }
     }
 
