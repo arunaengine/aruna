@@ -2,7 +2,7 @@ use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
 use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{DhtEvent, JobControlEvent, NetEvent, StreamEvent};
-use aruna_core::id::hex_prefix;
+use aruna_core::id::{NodeId, hex_prefix};
 use tracing::{trace, warn};
 
 use crate::{DhtHandle, DocumentSyncService};
@@ -38,17 +38,23 @@ pub async fn handle_net_effect(
             "job-control effect must be dispatched by the operations runner".to_string(),
         )),
         NetEffect::AuditPage(audit) => {
-            let mut batch = AuditPageBatch::with_limit(audit.request.limit);
-            if audit.nodes.len() > MAX_AUDIT_PEERS {
-                batch.missing_overflow = audit.nodes.len().saturating_sub(MAX_AUDIT_PEERS);
-                return NetEvent::AuditPages(batch);
-            }
-            for node in audit.nodes {
-                batch.mark_missing(node);
-            }
-            NetEvent::AuditPages(batch)
+            NetEvent::AuditPages(audit_fallback(audit.nodes, audit.request.limit))
         }
     }
+}
+
+fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
+    let mut batch = AuditPageBatch::with_limit(limit);
+    if nodes.len() > MAX_AUDIT_PEERS {
+        // An oversized effect violates the operation's peer-selection bound;
+        // do not enumerate an attacker-controlled list in the fallback.
+        batch.missing_overflow = nodes.len().saturating_sub(MAX_AUDIT_PEERS);
+        return batch;
+    }
+    for node in nodes {
+        batch.mark_missing(node);
+    }
+    batch
 }
 
 #[tracing::instrument(
@@ -151,5 +157,42 @@ fn stream_effect_kind(effect: &StreamEffect) -> &'static str {
     match effect {
         StreamEffect::Open { .. } => "open",
         StreamEffect::Close { .. } => "close",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_fallback;
+    use aruna_core::audit::MAX_AUDIT_PEERS;
+    use aruna_core::id::NodeId;
+
+    fn make_node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn rejects_overflow() {
+        let nodes = (1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap())
+            .map(make_node)
+            .collect();
+        let batch = audit_fallback(nodes, usize::MAX);
+
+        assert!(batch.records.is_empty());
+        assert!(batch.completed_nodes.is_empty());
+        assert!(batch.missing_nodes.is_empty());
+        assert_eq!(batch.missing_overflow, 1);
+    }
+
+    #[test]
+    fn keeps_unique() {
+        let first = make_node(1);
+        let second = make_node(2);
+        let batch = audit_fallback(vec![second, first, first], usize::MAX);
+
+        assert_eq!(
+            batch.missing_nodes.into_iter().collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(batch.missing_overflow, 0);
     }
 }
