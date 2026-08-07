@@ -676,7 +676,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                             if !self.valid_budget(&budget, &quota) {
                                 return self.fail(UpdateMetadataDocumentError::RawLimit);
                             }
-                            budget
+                            Some(budget)
                         }
                         None => None,
                     };

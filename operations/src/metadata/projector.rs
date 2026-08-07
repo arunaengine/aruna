@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_origin_preserves_holders() {
+    fn origin_holders_frozen() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1)];
@@ -1647,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_strategy_preserves_holders() {
+    fn strategy_holders_frozen() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1), node(4)];
@@ -1677,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_origin_keeps_holders() {
+    fn user_origin_frozen() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1)];
