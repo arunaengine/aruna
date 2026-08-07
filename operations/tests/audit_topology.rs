@@ -14,7 +14,8 @@ use aruna_operations::create_metadata_document::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
-    ListAuditOperation, ListAuditRequest, LocalAuditPageOperation, MAX_AUDIT_PAGE_SIZE, list_audit,
+    AUDIT_DEADLINE_SECS, ListAuditOperation, ListAuditRequest, LocalAuditPageOperation,
+    MAX_AUDIT_PAGE_SIZE, list_audit,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use ulid::Ulid;
@@ -71,6 +72,7 @@ async fn nonholder_audit_trail() -> TestResult<()> {
         reader.node_id(),
         Some(realm.bearer_token()),
         request(group_id, None, None, DOCUMENTS * 4),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(AUDIT_DEADLINE_SECS),
     )
     .await?;
     assert!(!full.partial, "every node was reachable");
@@ -87,6 +89,7 @@ async fn nonholder_audit_trail() -> TestResult<()> {
             reader.node_id(),
             Some(realm.bearer_token()),
             request(group_id, None, cursor.clone(), 2),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(AUDIT_DEADLINE_SECS),
         )
         .await?;
         assert!(page.records.len() <= 2, "page exceeded the requested limit");
@@ -164,6 +167,7 @@ async fn nonholder_audit_trail() -> TestResult<()> {
         reader.node_id(),
         Some(realm.bearer_token()),
         request(group_id, None, None, DOCUMENTS * 4),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(AUDIT_DEADLINE_SECS),
     )
     .await?;
     assert!(

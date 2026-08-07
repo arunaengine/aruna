@@ -7,7 +7,7 @@ use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, MetadataAuditOperation, Permission};
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::audit::{
-    ListAuditError, ListAuditRequest, list_audit as gather_audit,
+    AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest, list_audit as gather_audit,
 };
 use aruna_operations::metadata::forward::is_user_origin;
 use axum::extract::{Query, State};
@@ -17,6 +17,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -98,7 +99,8 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
         (status = 200, description = "Audit records", body = AuditPageResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 503, description = "Audit service unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -108,6 +110,7 @@ pub async fn list_audit(
     Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<AuditPageResponse>)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&query.group_id)?;
     let document_id = query
@@ -116,17 +119,25 @@ pub async fn list_audit(
         .map(|id| Ulid::from_str(id).map_err(|_| ServerError::BadRequest))
         .transpose()?;
     let ctx = state.get_ctx();
-    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
-        .await
-        .map_err(map_metadata_api_error)?;
+    let user_origin = tokio::time::timeout_at(
+        deadline,
+        is_user_origin(&ctx, state.get_realm_id(), state.get_node_id()),
+    )
+    .await
+    .map_err(|_| ServerError::ServiceUnavailable)?
+    .map_err(map_metadata_api_error)?;
     if !user_origin {
-        ensure_permission(
-            &state,
-            &auth,
-            format!("/{}/g/{group_id}/admin", state.get_realm_id()),
-            Permission::WRITE,
+        tokio::time::timeout_at(
+            deadline,
+            ensure_permission(
+                &state,
+                &auth,
+                format!("/{}/g/{group_id}/admin", state.get_realm_id()),
+                Permission::WRITE,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| ServerError::ServiceUnavailable)??;
     }
 
     // Peers re-check the same group-admin authority, so carry the caller's token.
@@ -151,6 +162,7 @@ pub async fn list_audit(
             limit: query.limit,
             local_authorized: !user_origin,
         },
+        deadline,
     )
     .await
     .map_err(|error| match error {

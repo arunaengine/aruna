@@ -26,7 +26,7 @@ use ulid::Ulid;
 
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::driver::{DriverContext, drive, drive_until};
+use crate::driver::{DriverContext, drive_until};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 
@@ -36,7 +36,7 @@ const AUDIT_CURSOR_VERSION: u8 = 1;
 const MAX_AUDIT_CURSOR_BYTES: usize = 256;
 const MAX_AUDIT_CURSOR_CHARS: usize = 384;
 const AUDIT_ADMISSION_LIMIT: usize = 16;
-const AUDIT_DEADLINE_SECS: u64 = 30;
+pub const AUDIT_DEADLINE_SECS: u64 = 30;
 static AUDIT_ADMISSION: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_ADMISSION_LIMIT)));
 
@@ -364,12 +364,7 @@ impl ListAuditOperation {
         config_digest: [u8; 32],
     ) -> Self {
         let limit = limit.clamp(1, MAX_AUDIT_PAGE_SIZE);
-        let peer_limit = if include_local {
-            MAX_AUDIT_PEERS.saturating_sub(1)
-        } else {
-            MAX_AUDIT_PEERS
-        };
-        let (selected, omitted, missing_count) = select_peers(peers, peer_limit);
+        let (selected, omitted, missing_count) = select_peers(peers, MAX_AUDIT_PEERS);
         let mut batch = AuditPageBatch::with_limit(limit);
         for node in omitted {
             batch.mark_missing(node);
@@ -467,11 +462,15 @@ impl Operation for ListAuditOperation {
                     Ok(page) => {
                         if !page.records.is_empty() {
                             let source = self.local_node;
-                            if let Err(error) = self.batch.add_page(source, page, &self.request()) {
+                            let mut local_batch = AuditPageBatch::with_limit(self.limit);
+                            if let Err(error) = local_batch.add_page(source, page, &self.request())
+                            {
                                 self.error = Some(ListAuditError::Storage(error.to_string()));
                                 self.state = FanState::Done;
                                 return smallvec![];
                             }
+                            local_batch.completed_nodes.clear();
+                            self.batch.merge(local_batch);
                         }
                     }
                     Err(error) => {
@@ -610,6 +609,7 @@ pub async fn list_audit(
     local_node: NodeId,
     auth_token: Option<MetadataAuthToken>,
     request: ListAuditRequest,
+    deadline: tokio::time::Instant,
 ) -> Result<AuditAggregate, ListAuditError> {
     let _admission = AUDIT_ADMISSION
         .clone()
@@ -627,7 +627,10 @@ pub async fn list_audit(
     let mut digest_ready = false;
     let mut include_local = false;
     let mut user_origin = false;
-    match load_realm_config(context, realm_id).await {
+    let config = tokio::time::timeout_at(deadline, load_realm_config(context, realm_id))
+        .await
+        .map_err(|_| ListAuditError::Unavailable)?;
+    match config {
         None => partial = true,
         Some(config) => {
             match config.digest() {
@@ -699,7 +702,6 @@ pub async fn list_audit(
         auth_token,
         config_digest,
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
     let mut aggregate = drive_until(operation, context, deadline).await?;
     aggregate.partial |= partial;
     if aggregate.partial {
@@ -715,8 +717,9 @@ pub(crate) async fn serve_local_audit(
     peer: NodeId,
     request: AuditPageRequest,
 ) -> MetadataTransportMessage {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
     MetadataTransportMessage::ForwardedAuditPage {
-        result: local_audit_result(context, peer, request).await,
+        result: local_audit_result(context, peer, request, deadline).await,
     }
 }
 
@@ -724,7 +727,12 @@ async fn local_audit_result(
     context: &Arc<DriverContext>,
     peer: NodeId,
     request: AuditPageRequest,
+    deadline: tokio::time::Instant,
 ) -> Result<AuditPageResponse, MetadataReadError> {
+    let _admission = AUDIT_ADMISSION
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| MetadataReadError::Unavailable)?;
     let net_handle = context
         .net_handle
         .as_ref()
@@ -734,22 +742,37 @@ async fn local_audit_result(
         return Err(MetadataReadError::Unavailable);
     }
     validate_request(&request).map_err(|_| MetadataReadError::Unavailable)?;
-    let config = load_realm_config(context.as_ref(), realm_id)
+    let config = tokio::time::timeout_at(deadline, load_realm_config(context.as_ref(), realm_id))
         .await
+        .map_err(|_| MetadataReadError::Unavailable)?
         .ok_or(MetadataReadError::Unavailable)?;
     if config.digest().ok() != Some(request.config_digest) {
+        return Err(MetadataReadError::Unavailable);
+    }
+    let local_node = net_handle.node_id();
+    if !config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == local_node.to_string() && node.kind.is_sync_eligible())
+    {
         return Err(MetadataReadError::Unavailable);
     }
     let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
-    let auth = metadata
-        .authorize_read_peer(peer, request.auth_token.clone(), false)
-        .await?
-        .ok_or(MetadataReadError::Unauthorized)?;
+    let auth_result = tokio::time::timeout_at(
+        deadline,
+        metadata.authorize_read_peer(peer, request.auth_token.clone(), false),
+    )
+    .await
+    .map_err(|_| MetadataReadError::Unavailable)?;
+    let auth = auth_result?.ok_or(MetadataReadError::Unauthorized)?;
     let path = format!("/{realm_id}/g/{}/admin", request.group_id);
-    authorize_admin(context, auth, path).await?;
+    let auth_result = tokio::time::timeout_at(deadline, authorize_admin(context, auth, path))
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    auth_result?;
 
     let operation = LocalAuditPageOperation::new(
         realm_id,
@@ -758,7 +781,7 @@ async fn local_audit_result(
         request.start_after,
         request.limit.clamp(1, MAX_AUDIT_PAGE_SIZE),
     );
-    drive(operation, context.as_ref())
+    drive_until(operation, context.as_ref(), deadline)
         .await
         .map_err(|_| MetadataReadError::Unavailable)
 }
@@ -961,7 +984,7 @@ mod tests {
         let Effect::Net(NetEffect::AuditPage(effect)) = &effects[0] else {
             panic!("local page must precede peer fan-out");
         };
-        assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS - 1);
+        assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS);
 
         let mut remote_operation = ListAuditOperation::new(
             realm_id,
@@ -980,6 +1003,45 @@ mod tests {
             panic!("remote page must fan out directly");
         };
         assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS);
+    }
+
+    #[test]
+    fn local_plus_peers() {
+        let realm_id = RealmId([1u8; 32]);
+        let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let group = Ulid::from_bytes([2u8; 16]);
+        let doc = Ulid::from_bytes([3u8; 16]);
+        let peers: Vec<_> = (2u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap())
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let mut operation = ListAuditOperation::new(
+            realm_id,
+            local,
+            true,
+            group,
+            Some(doc),
+            peers.clone(),
+            None,
+            10,
+            None,
+            [0u8; 32],
+        );
+        operation.start();
+        let record = record(group, doc, realm_id);
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                metadata_audit_key(group, doc, Ulid::from_bytes([4u8; 16])),
+                postcard::to_allocvec(&record).unwrap().into(),
+            )],
+            next_start_after: None,
+        }));
+        let mut batch = AuditPageBatch::new();
+        batch.completed_nodes.extend(peers);
+        operation.step(Event::Net(NetEvent::AuditPages(batch)));
+        let result = operation.finalize().unwrap();
+        assert!(!result.partial);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.missing_overflow, 0);
     }
 
     #[test]
@@ -1053,6 +1115,7 @@ mod tests {
                 limit: Some(10),
                 local_authorized: true,
             },
+            tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS),
         )
         .await;
         assert!(matches!(result, Err(ListAuditError::Unavailable)));
@@ -1310,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_doc_key() {
+    fn rejects_bad_doc() {
         let realm_id = RealmId([9u8; 32]);
         let group = Ulid::from_bytes([3u8; 16]);
         let doc = Ulid::from_bytes([4u8; 16]);
