@@ -568,18 +568,21 @@ struct TransactionTracker {
 }
 
 impl TransactionTracker {
-    fn observe(&mut self, effect: Option<TransactionEffect>, event: &Event) -> Option<TxnId> {
+    fn reject_start(&self, effect: Option<TransactionEffect>) -> bool {
+        matches!(effect, Some(TransactionEffect::Start))
+            && self.states.len() >= MAX_TRACKED_TRANSACTIONS
+    }
+
+    fn observe(&mut self, effect: Option<TransactionEffect>, event: &Event) {
         match (effect, event) {
             (
                 Some(TransactionEffect::Start),
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }),
             ) => {
-                if self.states.len() >= MAX_TRACKED_TRANSACTIONS {
-                    warn!(%txn_id, "Too many transactions tracked by operation driver");
-                    Some(*txn_id)
-                } else {
+                if self.states.len() < MAX_TRACKED_TRANSACTIONS {
                     self.states.insert(*txn_id, TransactionState::Open);
-                    None
+                } else {
+                    warn!(%txn_id, "Transaction tracker observed an unexpected start");
                 }
             }
             (
@@ -587,14 +590,16 @@ impl TransactionTracker {
                 Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }),
             ) if txn_id == *committed => {
                 self.states.remove(&txn_id);
-                None
             }
             (
                 Some(TransactionEffect::Commit(txn_id)),
                 Event::Storage(StorageEvent::Error { error }),
-            ) if error.proves_no_commit() => {
+            ) if matches!(
+                error,
+                StorageError::TransactionConflict | StorageError::TransactionNotFound
+            ) =>
+            {
                 self.states.remove(&txn_id);
-                None
             }
             (
                 Some(TransactionEffect::Commit(txn_id)),
@@ -603,21 +608,18 @@ impl TransactionTracker {
                 if self.states.contains_key(&txn_id) {
                     self.states.insert(txn_id, TransactionState::CommitUnknown);
                 }
-                None
             }
             (
                 Some(TransactionEffect::Abort(txn_id)),
                 Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted }),
             ) if txn_id == *aborted => {
                 self.states.remove(&txn_id);
-                None
             }
             (
                 Some(TransactionEffect::Abort(txn_id)),
                 Event::Storage(StorageEvent::Error { error }),
             ) if matches!(error, StorageError::TransactionNotFound) => {
                 self.states.remove(&txn_id);
-                None
             }
             (
                 Some(TransactionEffect::Abort(txn_id)),
@@ -626,9 +628,8 @@ impl TransactionTracker {
                 if self.states.contains_key(&txn_id) {
                     self.states.insert(txn_id, TransactionState::AbortFailed);
                 }
-                None
             }
-            _ => None,
+            _ => {}
         }
     }
 
@@ -694,13 +695,15 @@ fn drive_suboperation<'a>(
                 while let Some(effect) = queue.pop_front() {
                     let transaction = transaction_effect(&effect);
                     hold_backends(context, &effect, &mut holds);
-                    let event = dispatch_effect(effect, context, depth).await;
-                    let emergency_abort = tracker.observe(transaction, &event);
-                    if let Some(txn_id) = emergency_abort {
-                        queue.push_front(Effect::Storage(StorageEffect::AbortTransaction {
-                            txn_id,
-                        }));
-                    }
+                    let event = if tracker.reject_start(transaction) {
+                        warn!("Transaction tracker capacity reached");
+                        Event::Storage(StorageEvent::Error {
+                            error: StorageError::TransactionConflict,
+                        })
+                    } else {
+                        dispatch_effect(effect, context, depth).await
+                    };
+                    tracker.observe(transaction, &event);
                     queue.extend(operation.step(event));
                 }
 
@@ -749,10 +752,15 @@ pub async fn drive_until<O: Operation>(
         while let Some(effect) = queue.pop_front() {
             let transaction = transaction_effect(&effect);
             hold_backends(context, &effect, &mut holds);
-            let dispatch = Box::pin(dispatch_effect(effect, context, 0));
-            let event = if expired {
-                dispatch.await
+            let event = if tracker.reject_start(transaction) {
+                warn!("Transaction tracker capacity reached");
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                })
+            } else if expired {
+                dispatch_effect(effect, context, 0).await
             } else {
+                let dispatch = Box::pin(dispatch_effect(effect, context, 0));
                 match tokio::time::timeout_at(deadline, dispatch).await {
                     Ok(event) => event,
                     Err(_) => {
@@ -767,10 +775,7 @@ pub async fn drive_until<O: Operation>(
                     }
                 }
             };
-            let emergency_abort = tracker.observe(transaction, &event);
-            if let Some(txn_id) = emergency_abort {
-                queue.push_front(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-            }
+            tracker.observe(transaction, &event);
             queue.extend(operation.step(event));
         }
 
@@ -811,11 +816,15 @@ pub async fn drive<O: Operation>(
         while let Some(effect) = queue.pop_front() {
             let transaction = transaction_effect(&effect);
             hold_backends(context, &effect, &mut holds);
-            let event = Box::pin(dispatch_effect(effect, context, 0)).await;
-            let emergency_abort = tracker.observe(transaction, &event);
-            if let Some(txn_id) = emergency_abort {
-                queue.push_front(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-            }
+            let event = if tracker.reject_start(transaction) {
+                warn!("Transaction tracker capacity reached");
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                })
+            } else {
+                Box::pin(dispatch_effect(effect, context, 0)).await
+            };
+            tracker.observe(transaction, &event);
             queue.extend(operation.step(event));
         }
 
@@ -883,7 +892,7 @@ mod test {
     use crate::driver::{DriverContext, cap_audit_nodes, drive};
     use aruna_core::{
         audit::{AuditPageBatch, MAX_AUDIT_PEERS},
-        effects::{Effect, StagingSourceEffect, StorageEffect},
+        effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect},
         errors::StorageError,
         events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
         operation::{Operation, boxed_suboperation},
@@ -894,6 +903,7 @@ mod test {
     use aruna_storage::storage;
     use byteview::ByteView;
     use std::convert::Infallible;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -1254,6 +1264,79 @@ mod test {
         }
     }
 
+    #[derive(Debug)]
+    struct DeadlineOperation {
+        state: u8,
+        txn_id: Option<TxnId>,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartialEq for DeadlineOperation {
+        fn eq(&self, other: &Self) -> bool {
+            self.state == other.state && self.txn_id == other.txn_id
+        }
+    }
+
+    impl Operation for DeadlineOperation {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.txn_id = Some(txn_id);
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: "default".to_string(),
+                        key: ByteView::from(*b"staged-marker"),
+                        value: ByteView::from(*b"staged"),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
+                    self.ready.notify_one();
+                    self.state = 3;
+                    smallvec::smallvec![Effect::Blob(BlobEffect::SpoolHidden {
+                        namespace: ulid::Ulid::from_bytes([7u8; 16]),
+                        name: "deadline".to_string(),
+                        created_by: aruna_core::UserId::default(),
+                        max_bytes: None,
+                        blob: aruna_core::stream::BackendStream::new(
+                            futures_util::stream::pending::<
+                                Result<bytes::Bytes, aruna_core::stream::StreamError>,
+                            >(),
+                        ),
+                    })]
+                }
+                (Event::Blob(_), 3) => {
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 4
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.state == 4)
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.state = 4;
+            smallvec::smallvec![]
+        }
+    }
+
     async fn marker_absent(context: &DriverContext) -> bool {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
@@ -1335,6 +1418,19 @@ mod test {
     }
 
     #[test]
+    fn commit_queue_kept() {
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        let queued = Event::Storage(StorageEvent::Error {
+            error: StorageError::QueueFull,
+        });
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        tracker.observe(Some(TransactionEffect::Commit(id)), &queued);
+        assert_eq!(tracker.states.get(&id), Some(&TransactionState::Open));
+    }
+
+    #[test]
     fn abort_failure_kept() {
         let id = ulid::Ulid::generate();
         let mut tracker = TransactionTracker::default();
@@ -1357,18 +1453,13 @@ mod test {
         for _ in 0..MAX_TRACKED_TRANSACTIONS {
             let id = ulid::Ulid::generate();
             let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
-            assert!(
-                tracker
-                    .observe(Some(TransactionEffect::Start), &started)
-                    .is_none()
-            );
+            assert!(!tracker.reject_start(Some(TransactionEffect::Start)));
+            tracker.observe(Some(TransactionEffect::Start), &started);
         }
         let id = ulid::Ulid::generate();
         let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
-        assert_eq!(
-            tracker.observe(Some(TransactionEffect::Start), &started),
-            Some(id)
-        );
+        assert!(tracker.reject_start(Some(TransactionEffect::Start)));
+        tracker.observe(Some(TransactionEffect::Start), &started);
         assert_eq!(tracker.states.len(), MAX_TRACKED_TRANSACTIONS);
     }
 
@@ -1455,6 +1546,59 @@ mod test {
             staged_value(&context).await,
             Some(ByteView::from(*b"staged"))
         );
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_rollback() {
+        let temp_dir = tempdir().unwrap();
+        let temp_root = temp_dir.path().to_str().unwrap().to_string();
+        let blob_root = format!("{temp_root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+        let net_handle =
+            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
+                .await
+                .unwrap();
+        let blob_handle = aruna_blob::blob::BlobHandler::new(
+            aruna_core::structs::BackendConfig {
+                backend_type: aruna_core::structs::Backend::FileSystem,
+                root: blob_root,
+                service_config: std::collections::HashMap::new(),
+                bucket_prefix: Some("aruna-test-".to_string()),
+                max_bucket_size: Some(1),
+                multipart_bucket: Some("uploaded-parts".to_string()),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle,
+        )
+        .await
+        .unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: Some(blob_handle),
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let operation = DeadlineOperation {
+            state: 0,
+            txn_id: None,
+            ready: ready.clone(),
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(operation, &task_context, deadline).await
+        });
+
+        ready.notified().await;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        assert!(task.await.unwrap().unwrap());
+        assert_eq!(staged_value(&context).await, None);
         assert!(transaction_reopens(&context).await);
     }
 
