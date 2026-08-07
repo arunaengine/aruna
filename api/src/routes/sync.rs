@@ -1,6 +1,6 @@
 use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, ensure_permission_with,
-    require_realm_auth, require_unrestricted_realm_auth,
+    require_unrestricted_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
@@ -397,7 +397,7 @@ pub async fn list_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(params): Query<SyncListParams>,
 ) -> ServerResult<Json<SyncListResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     if params.bucket.as_deref().is_some_and(str::is_empty)
         || params.prefix.as_deref().is_some_and(str::is_empty)
     {
@@ -466,7 +466,7 @@ pub async fn get_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<Json<SyncDetailResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, _) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -506,7 +506,7 @@ pub async fn update_sync(
     Path(id): Path<String>,
     Json(request): Json<UpdateSyncRequest>,
 ) -> ServerResult<Json<SyncRelationshipResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let id = parse_id(&id)?;
     let mut relationship =
@@ -634,7 +634,7 @@ pub async fn delete_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, direction) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -1331,6 +1331,61 @@ mod tests {
             .await
             .unwrap_err();
             assert!(matches!(error, ServerError::Forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_restricted_control() {
+        for restrictions in [
+            Some(vec![PathRestriction {
+                pattern: "/restricted/**".to_string(),
+                permission: Permission::READ,
+            }]),
+            Some(Vec::new()),
+        ] {
+            let (_storage_dir, state, mut auth, _) = test_state().await;
+            auth.path_restrictions = restrictions;
+
+            assert!(matches!(
+                list_sync(
+                    State(state.clone()),
+                    Extension(Some(auth.clone())),
+                    Query(SyncListParams::default()),
+                )
+                .await,
+                Err(ServerError::Forbidden)
+            ));
+            assert!(matches!(
+                get_sync(
+                    State(state.clone()),
+                    Extension(Some(auth.clone())),
+                    Path("invalid".to_string()),
+                )
+                .await,
+                Err(ServerError::Forbidden)
+            ));
+            assert!(matches!(
+                update_sync(
+                    State(state.clone()),
+                    Extension(Some(auth.clone())),
+                    Extension(None),
+                    Path("invalid".to_string()),
+                    Json(UpdateSyncRequest {
+                        reference_handling: ApiReferenceHandling::Materialize,
+                    }),
+                )
+                .await,
+                Err(ServerError::Forbidden)
+            ));
+            assert!(matches!(
+                delete_sync(
+                    State(state),
+                    Extension(Some(auth)),
+                    Path("invalid".to_string()),
+                )
+                .await,
+                Err(ServerError::Forbidden)
+            ));
         }
     }
 
