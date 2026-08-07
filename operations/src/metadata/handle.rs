@@ -1279,13 +1279,8 @@ impl MetadataHandle {
         let audit_deadline =
             tokio::time::Instant::now() + Duration::from_secs(super::audit::AUDIT_DEADLINE_SECS);
         let read_started = Instant::now();
-        let (message, frame_budget) = read_message_budget(
-            &mut stream.1,
-            super::protocol::MAX_MESSAGE_SIZE,
-            &self.inner.inbound_frame_bytes,
-        )
-        .await
-        .map_err(MetadataError::Backend)?;
+        let (message, frame_budget) =
+            read_budget(&mut stream.1, &self.inner.inbound_frame_bytes).await?;
         let is_audit = matches!(&message, MetadataTransportMessage::ForwardAuditPage { .. });
         let span = Span::current();
         record_elapsed_ms(&span, "read_ms", read_started);
@@ -6416,6 +6411,22 @@ async fn read_transport_message(
         .map_err(MetadataError::Backend)
 }
 
+async fn read_budget<R>(
+    reader: &mut R,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> Result<(MetadataTransportMessage, tokio::sync::OwnedSemaphorePermit), MetadataError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    timeout(
+        METADATA_IO_TIMEOUT,
+        read_message_budget(reader, super::protocol::MAX_MESSAGE_SIZE, budget),
+    )
+    .await
+    .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
+    .map_err(MetadataError::Backend)
+}
+
 async fn read_transport_cap(
     stream: &mut BiStream,
     max_size: usize,
@@ -6684,6 +6695,38 @@ mod tests {
             Err(MetadataError::Backend(message))
                 if message == "sync mirror request timed out"
         ));
+    }
+
+    async fn assert_timeout(frame: &[u8], held: bool) {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        writer.write_all(frame).await.unwrap();
+        let budget = Arc::new(tokio::sync::Semaphore::new(8));
+        let task_budget = budget.clone();
+        let task = tokio::spawn(async move {
+            let mut reader = reader;
+            read_budget(&mut reader, &task_budget).await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(budget.available_permits(), if held { 0 } else { 8 });
+
+        tokio::time::advance(METADATA_IO_TIMEOUT).await;
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            MetadataError::Backend(message)
+                if message == "timed out waiting for metadata message"
+        ));
+        assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_timeout() {
+        assert_timeout(&[0], false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_timeout() {
+        assert_timeout(&[0, 0, 0, 0, 8], true).await;
     }
 
     #[test]
