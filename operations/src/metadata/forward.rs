@@ -89,6 +89,7 @@ pub enum MetadataWriteError {
 }
 
 const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
+const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Route for a write against `placement`, from the local node's point of view.
@@ -149,18 +150,22 @@ pub async fn forward_token_revoke(
         return Err(MetadataApiError::ServiceUnavailable);
     };
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
-    let peers = config
-        .nodes
-        .iter()
-        .filter(|node| {
-            matches!(
-                &node.kind,
-                RealmNodeKind::Management | RealmNodeKind::Server
-            )
-        })
-        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .filter(|peer| Some(*peer) != local_node_id)
-        .collect::<Vec<_>>();
+    let mut subject = bearer_token_hash(&token).into_bytes();
+    subject.extend_from_slice(&Ulid::new().to_bytes());
+    let peers = rank_revoke_peers(
+        config
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    &node.kind,
+                    RealmNodeKind::Management | RealmNodeKind::Server
+                )
+            })
+            .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+            .filter(|peer| Some(*peer) != local_node_id),
+        &subject,
+    );
     if peers.is_empty() {
         return Err(MetadataApiError::ServiceUnavailable);
     }
@@ -185,20 +190,24 @@ where
     F: FnMut(NodeId, MetadataTransportMessage) -> Fut,
     Fut: Future<Output = Result<MetadataTransportMessage, MetadataRequestError>>,
 {
-    let subject = match &message {
-        MetadataTransportMessage::ForwardTokenRevocation { token, .. } => bearer_token_hash(token),
-        _ => return Err(MetadataApiError::ServiceUnavailable),
-    };
-    let selected = rank_revoke_peers(peers, subject.as_bytes());
-    for peer in selected {
+    let mut seen = Vec::with_capacity(TOKEN_REVOKE_PEER_LIMIT);
+    for peer in peers.iter().copied() {
+        if seen.len() >= TOKEN_REVOKE_PEER_LIMIT {
+            break;
+        }
+        if seen.contains(&peer) {
+            continue;
+        }
+        seen.push(peer);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        match timeout(remaining, request(peer, message.clone())).await {
+        let attempt = remaining.min(TOKEN_REVOKE_ATTEMPT_TIMEOUT);
+        match timeout(attempt, request(peer, message.clone())).await {
             Err(_) => {
-                warn!(%peer, "Token revocation forwarding deadline elapsed");
-                break;
+                warn!(%peer, "Token revocation forwarding attempt timed out");
+                continue;
             }
             Ok(Ok(MetadataTransportMessage::ForwardedTokenRevoked)) => return Ok(()),
             Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
@@ -218,48 +227,38 @@ where
                 return Err(MetadataApiError::ServiceUnavailable);
             }
             Ok(Err(error)) => {
+                // Revocation is keyed by token hash, so an ambiguous write is safe to replay.
                 warn!(%peer, %error, "Failed to forward a token revocation");
-                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
-                    break;
-                }
             }
         }
     }
     Err(MetadataApiError::ServiceUnavailable)
 }
 
-fn rank_revoke_peers(peers: &[NodeId], subject: &[u8]) -> Vec<NodeId> {
+fn rank_revoke_peers(peers: impl IntoIterator<Item = NodeId>, subject: &[u8]) -> Vec<NodeId> {
     let mut ranked = Vec::with_capacity(TOKEN_REVOKE_PEER_LIMIT);
-    for peer in peers.iter().copied() {
-        if ranked.iter().any(|candidate| candidate.0 == peer) {
-            continue;
-        }
+    for peer in peers {
         let score = neg_log2_q48(selector_hash(ROLE_NODE, subject, peer.as_bytes()));
+        insert_revoke_peer(&mut ranked, peer, score);
+    }
+    ranked.into_iter().map(|(peer, _)| peer).collect()
+}
+
+fn insert_revoke_peer(ranked: &mut Vec<(NodeId, u64)>, peer: NodeId, score: u64) {
+    if ranked.iter().any(|candidate| candidate.0 == peer) {
+        return;
+    }
+    let position = ranked.iter().position(|candidate| {
+        score < candidate.1 || (score == candidate.1 && peer.as_bytes() < candidate.0.as_bytes())
+    });
+    let Some(position) = position else {
         if ranked.len() < TOKEN_REVOKE_PEER_LIMIT {
             ranked.push((peer, score));
-            continue;
         }
-        let Some((worst_index, (worst_peer, worst_score))) =
-            ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
-                left.1
-                    .cmp(&right.1)
-                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
-            })
-        else {
-            continue;
-        };
-        if score < *worst_score
-            || (score == *worst_score && peer.as_bytes() < worst_peer.as_bytes())
-        {
-            ranked[worst_index] = (peer, score);
-        }
-    }
-    ranked.sort_unstable_by(|left, right| {
-        left.1
-            .cmp(&right.1)
-            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
-    });
-    ranked.into_iter().map(|(peer, _)| peer).collect()
+        return;
+    };
+    ranked.insert(position, (peer, score));
+    ranked.truncate(TOKEN_REVOKE_PEER_LIMIT);
 }
 
 /// Whether the origin currently holds a structured metadata document's bucket.
@@ -1764,10 +1763,13 @@ mod tests {
     #[tokio::test]
     async fn capacity_then_success() {
         let peers = vec![node(1), node(2)];
-        let order = rank_revoke_peers(&peers, bearer_token_hash("target-token").as_bytes());
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
         let mut calls = Vec::new();
         let result = run_revoke(
-            &peers,
+            &order,
             revoke_message(),
             Instant::now() + TOKEN_REVOKE_DEADLINE,
             |peer, _| {
@@ -1786,12 +1788,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stops_possible_send() {
+    async fn retries_possible_send() {
         let peers = vec![node(1), node(2)];
-        let order = rank_revoke_peers(&peers, bearer_token_hash("target-token").as_bytes());
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
         let mut calls = Vec::new();
         let result = run_revoke(
-            &peers,
+            &order,
             revoke_message(),
             Instant::now() + TOKEN_REVOKE_DEADLINE,
             |peer, _| {
@@ -1807,17 +1812,20 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-        assert_eq!(calls, vec![order[0]]);
+        assert!(result.is_ok());
+        assert_eq!(calls, order);
     }
 
     #[tokio::test]
     async fn all_capacity_unavailable() {
         let peers = vec![node(1), node(2)];
-        let order = rank_revoke_peers(&peers, bearer_token_hash("target-token").as_bytes());
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
         let mut calls = Vec::new();
         let result = run_revoke(
-            &peers,
+            &order,
             revoke_message(),
             Instant::now() + TOKEN_REVOKE_DEADLINE,
             |peer, _| {
@@ -1836,10 +1844,13 @@ mod tests {
     #[tokio::test]
     async fn reject_stops_retry() {
         let peers = vec![node(1), node(2)];
-        let order = rank_revoke_peers(&peers, bearer_token_hash("target-token").as_bytes());
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
         let mut calls = Vec::new();
         let result = run_revoke(
-            &peers,
+            &order,
             revoke_message(),
             Instant::now() + TOKEN_REVOKE_DEADLINE,
             |peer, _| {
@@ -1882,8 +1893,8 @@ mod tests {
         let peers = (1..=16).map(node).collect::<Vec<_>>();
         let reversed = peers.iter().copied().rev().collect::<Vec<_>>();
         let subject = bearer_token_hash("target-token");
-        let first = rank_revoke_peers(&peers, subject.as_bytes());
-        let second = rank_revoke_peers(&reversed, subject.as_bytes());
+        let first = rank_revoke_peers(peers.iter().copied(), subject.as_bytes());
+        let second = rank_revoke_peers(reversed.iter().copied(), subject.as_bytes());
 
         assert_eq!(first, second);
         assert_eq!(first.len(), TOKEN_REVOKE_PEER_LIMIT);
