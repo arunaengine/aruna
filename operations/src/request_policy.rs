@@ -97,8 +97,8 @@ impl PolicyEvaluator {
         group_id: GroupId,
         txn_id: TxnId,
     ) -> Result<Self, PolicyEnforcementError> {
-        let realm = realm_scope_with_txn(context, realm_id, txn_id).await?;
-        let group = group_scope_with_txn(context, realm_id, group_id, txn_id).await?;
+        let realm = realm_txn_scope(context, realm_id, txn_id).await?;
+        let group = group_txn_scope(context, realm_id, group_id, txn_id).await?;
         Ok(Self { realm, group })
     }
 
@@ -212,7 +212,7 @@ async fn group_scope(
     }
 }
 
-async fn realm_scope_with_txn(
+async fn realm_txn_scope(
     context: &DriverContext,
     realm_id: RealmId,
     txn_id: TxnId,
@@ -229,7 +229,7 @@ async fn realm_scope_with_txn(
     }
 }
 
-async fn group_scope_with_txn(
+async fn group_txn_scope(
     context: &DriverContext,
     realm_id: RealmId,
     group_id: GroupId,

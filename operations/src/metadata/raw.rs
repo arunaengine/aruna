@@ -16,7 +16,7 @@ use aruna_core::storage_entries::{
     metadata_graph_lifecycle_key, raw_revision_key,
 };
 use aruna_core::structs::MetadataRegistryRecord;
-use aruna_core::types::Key;
+use aruna_core::types::{Key, TxnId};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -88,14 +88,15 @@ pub enum MetadataRawReadError {
 pub async fn load_raw_view(
     context: &DriverContext,
     document_id: Ulid,
+    txn_id: Option<TxnId>,
 ) -> Result<Option<MetadataRawView>, MetadataRawReadError> {
-    let Some(revision) = load_raw_revision(context, document_id, None).await? else {
+    let Some(revision) = load_raw_revision(context, document_id, None, txn_id).await? else {
         return Ok(None);
     };
     let status = parse_materialization_status_read(
         context
             .storage_handle
-            .send_effect(read_materialization_status_effect(document_id, None))
+            .send_effect(read_materialization_status_effect(document_id, txn_id))
             .await,
     )
     .map_err(|error| match error {
@@ -129,24 +130,26 @@ pub async fn load_raw_revision(
     context: &DriverContext,
     document_id: Ulid,
     event_cursor: Option<Ulid>,
+    txn_id: Option<TxnId>,
 ) -> Result<Option<MetadataRawRevision>, MetadataRawReadError> {
-    if raw_deleted(context, document_id).await? {
+    if raw_deleted(context, document_id, txn_id).await? {
         return Ok(None);
     }
-    let events = load_raw_events(context, document_id, None, event_cursor).await?;
+    let events = load_raw_events(context, document_id, None, event_cursor, txn_id).await?;
     resolve_raw_revision(&events).map_err(Into::into)
 }
 
 async fn raw_deleted(
     context: &DriverContext,
     document_id: Ulid,
+    txn_id: Option<TxnId>,
 ) -> Result<bool, MetadataRawReadError> {
     let document = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
             key: metadata_document_lifecycle_key(document_id),
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -169,7 +172,7 @@ async fn raw_deleted(
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             key: metadata_graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document_id)),
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -202,6 +205,7 @@ pub(crate) async fn prepare_raw_event(
                 event.record.document_id,
                 Some(state.last_event_id),
                 Some(event.event_id),
+                None,
             )
             .await?;
             if !events
@@ -255,6 +259,7 @@ async fn initial_raw_state(
                 event.record.document_id,
                 None,
                 Some(event.event_id),
+                None,
             )
             .await?
         }
@@ -293,6 +298,7 @@ async fn rebuild_raw_state(
             event.record.document_id,
             Some(start_event_id),
             Some(end_event_id),
+            None,
         )
         .await?,
     );
@@ -455,6 +461,7 @@ async fn load_raw_events(
     document_id: Ulid,
     start_after: Option<Ulid>,
     event_cursor: Option<Ulid>,
+    txn_id: Option<TxnId>,
 ) -> Result<Vec<MetadataCreateEventRecord>, MetadataRawReadError> {
     let prefix = metadata_event_log_prefix(document_id);
     let mut start: Option<Key> =
@@ -468,7 +475,7 @@ async fn load_raw_events(
                 prefix: Some(prefix.clone()),
                 start: start.take().map(IterStart::After),
                 limit: RAW_PAGE_SIZE,
-                txn_id: None,
+                txn_id,
             })
             .await;
         let (values, next_start_after) = match event {

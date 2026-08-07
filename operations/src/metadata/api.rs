@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
@@ -24,7 +25,7 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::telemetry::record_elapsed_ms;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, TxnId};
 use aruna_core::{MetaResourceId, NodeId, StructuredId};
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
@@ -59,6 +60,7 @@ use crate::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::list_groups::ListGroupOperation;
 use crate::metadata::repository::{
     LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
+    parse_registry_read, read_registry_by_document_effect,
 };
 use crate::permission_rules::GroupPermissionRules;
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
@@ -1302,7 +1304,7 @@ pub async fn get_visible_metadata_document(
     request: GetVisibleMetadataDocumentRequest,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     let record = load_record_by_document(context, request.document_id).await?;
-    ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
+    ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
     ensure_record_materialized_for_graph_read(context, &record).await?;
     Ok(record)
 }
@@ -1312,8 +1314,11 @@ pub async fn export_metadata_rocrate(
     realm_id: RealmId,
     request: ExportMetadataRoCrateRequest,
 ) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    if request.view == MetadataRoCrateExportView::Raw {
+        return export_raw(context, realm_id, request).await;
+    }
     let record = load_record_by_document(context, request.document_id).await?;
-    ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
+    ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
 
     match request.view {
         MetadataRoCrateExportView::Full => {
@@ -1349,19 +1354,86 @@ pub async fn export_metadata_rocrate(
                 record,
             })
         }
-        MetadataRoCrateExportView::Raw => {
-            let raw = crate::metadata::raw::load_raw_view(context, record.document_id)
+        MetadataRoCrateExportView::Raw => Err(MetadataApiError::Internal(
+            "raw export snapshot dispatch mismatch".to_string(),
+        )),
+    }
+}
+
+async fn export_raw(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: ExportMetadataRoCrateRequest,
+) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    let mut owner = context
+        .storage_handle
+        .start_transaction(true)
+        .await
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+    let txn_id = owner.id();
+    let result = export_raw_txn(context, realm_id, &request, txn_id).await;
+    match result {
+        Ok(result) => {
+            owner.unknown();
+            match context
+                .storage_handle
+                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
                 .await
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-                .ok_or(MetadataApiError::NotFound)?;
-            let dataset_digest = raw.revision.dataset_digest;
-            Ok(ExportMetadataRoCrateResult::Raw {
-                record,
-                raw,
-                dataset_digest,
-            })
+            {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    owner.finish();
+                    Ok(result)
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    Err(MetadataApiError::Internal(error.to_string()))
+                }
+                other => Err(MetadataApiError::Internal(format!(
+                    "unexpected read snapshot commit event: {other:?}"
+                ))),
+            }
+        }
+        Err(error) => {
+            match context
+                .storage_handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await
+            {
+                Event::Storage(StorageEvent::TransactionAborted { .. })
+                | Event::Storage(StorageEvent::Error {
+                    error: aruna_core::errors::StorageError::TransactionNotFound,
+                }) => owner.finish(),
+                _ => {}
+            }
+            Err(error)
         }
     }
+}
+
+async fn export_raw_txn(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: &ExportMetadataRoCrateRequest,
+    txn_id: TxnId,
+) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    let record = load_record_txn(context, request.document_id, txn_id).await?;
+    ensure_record_readable(
+        context,
+        realm_id,
+        request.auth.as_ref(),
+        &record,
+        Some(txn_id),
+    )
+    .await?;
+    let raw = crate::metadata::raw::load_raw_view(context, record.document_id, Some(txn_id))
+        .await
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+        .ok_or(MetadataApiError::NotFound)?;
+    let dataset_digest = raw.revision.dataset_digest;
+    Ok(ExportMetadataRoCrateResult::Raw {
+        record,
+        raw,
+        dataset_digest,
+    })
 }
 
 pub async fn query_metadata_document(
@@ -1372,7 +1444,7 @@ pub async fn query_metadata_document(
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
     ensure_supported_query_form(&request.query)?;
     let record = load_record_by_document(context, request.document_id).await?;
-    ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
+    ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
     let metadata = context
         .metadata_handle
         .as_ref()
@@ -2255,12 +2327,107 @@ async fn load_record_by_document(
     }
 }
 
+async fn load_record_txn(
+    context: &DriverContext,
+    document_id: Ulid,
+    txn_id: TxnId,
+) -> Result<MetadataRegistryRecord, MetadataApiError> {
+    let event = context
+        .storage_handle
+        .send_effect(read_registry_by_document_effect(document_id, Some(txn_id)))
+        .await;
+    match parse_registry_read(event) {
+        Ok(Some(record)) => {
+            if record_deleted_txn(context, &record, txn_id).await? {
+                Err(MetadataApiError::NotFound)
+            } else {
+                Ok(record)
+            }
+        }
+        Ok(None) => Err(MetadataApiError::NotFound),
+        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
+        Err(StorageReadError::Conversion(error)) => {
+            Err(MetadataApiError::Internal(error.to_string()))
+        }
+    }
+}
+
 async fn record_deleted(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<bool, MetadataApiError> {
     Ok(metadata_graph_is_deleted(context, &record.graph_iri).await?
         || document_deleted(context, record.document_id).await?)
+}
+
+async fn record_deleted_txn(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<bool, MetadataApiError> {
+    Ok(graph_deleted_txn(context, &record.graph_iri, txn_id).await?
+        || document_deleted_txn(context, record.document_id, txn_id).await?)
+}
+
+async fn graph_deleted_txn(
+    context: &DriverContext,
+    graph_iri: &str,
+    txn_id: TxnId,
+) -> Result<bool, MetadataApiError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_graph_lifecycle_key(graph_iri),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            Ok(record.is_deleted())
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataApiError::Internal(error.to_string()))
+        }
+        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+    }
+}
+
+async fn document_deleted_txn(
+    context: &DriverContext,
+    document_id: Ulid,
+    txn_id: TxnId,
+) -> Result<bool, MetadataApiError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_document_lifecycle_key(document_id),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&value)
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            Ok(matches!(
+                record,
+                MetadataDocumentLifecycleRecord::Delete { .. }
+            ))
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataApiError::Internal(error.to_string()))
+        }
+        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+    }
 }
 
 async fn document_deleted(
@@ -2327,22 +2494,29 @@ async fn ensure_record_readable(
     realm_id: RealmId,
     auth: Option<&AuthContext>,
     record: &MetadataRegistryRecord,
+    txn_id: Option<TxnId>,
 ) -> Result<(), MetadataApiError> {
     if record.public {
         // A policy denial on a found public record must read as NotFound, matching
         // the private-denied path, so read-by-id is not an existence oracle.
-        return crate::request_policy::enforce_policies(
-            context,
-            realm_id,
-            &crate::request_policy::policy_request_with(
-                &record.permission_path,
-                &Permission::READ,
-                auth.map(|auth| &auth.user_id),
-                crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
-            ),
-        )
-        .await
-        .map_err(|_| MetadataApiError::NotFound);
+        let request = crate::request_policy::policy_request_with(
+            &record.permission_path,
+            &Permission::READ,
+            auth.map(|auth| &auth.user_id),
+            crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+        );
+        let result = match txn_id {
+            Some(txn_id) => crate::request_policy::PolicyEvaluator::load_with_txn(
+                context,
+                realm_id,
+                record.group_id,
+                txn_id,
+            )
+            .await
+            .and_then(|evaluator| evaluator.evaluate(&request)),
+            None => crate::request_policy::enforce_policies(context, realm_id, &request).await,
+        };
+        return result.map_err(|_| MetadataApiError::NotFound);
     }
     // Read-by-id must not distinguish an unreadable record from an absent one:
     // present-but-unreadable, including anonymous callers, maps to NotFound so
@@ -2354,8 +2528,10 @@ async fn ensure_record_readable(
         context,
         realm_id,
         auth,
+        record.group_id,
         record.permission_path.clone(),
         Permission::READ,
+        txn_id,
     )
     .await
     {
@@ -2417,42 +2593,48 @@ async fn ensure_permission(
     context: &DriverContext,
     realm_id: RealmId,
     auth: AuthContext,
+    group_id: GroupId,
     path: String,
     required_permission: Permission,
+    txn_id: Option<TxnId>,
 ) -> Result<(), MetadataApiError> {
     if auth.realm_id != realm_id {
         return Err(MetadataApiError::Forbidden);
     }
     let auth_user = auth.user_id;
-    let allowed = aruna_core::telemetry::time_stage(
-        "permission",
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth,
-                path: path.clone(),
-                required_permission: required_permission.clone(),
-            }),
-            context,
-        ),
-    )
-    .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => MetadataApiError::Forbidden,
-        _ => MetadataApiError::Internal(err.to_string()),
-    })?;
+    let config = CheckPermissionsConfig {
+        auth_context: auth,
+        path: path.clone(),
+        required_permission: required_permission.clone(),
+    };
+    let operation = match txn_id {
+        Some(txn_id) => CheckPermissionsOperation::new_with_txn(config, txn_id),
+        None => CheckPermissionsOperation::new(config),
+    };
+    let allowed = aruna_core::telemetry::time_stage("permission", drive(operation, context))
+        .await
+        .map_err(|err| match err {
+            AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::AuthDocNotFound => MetadataApiError::Forbidden,
+            _ => MetadataApiError::Internal(err.to_string()),
+        })?;
     if !allowed {
         return Err(MetadataApiError::Forbidden);
     }
-    crate::request_policy::enforce_policies(
-        context,
-        realm_id,
-        &metadata_read_request(&path, Some(&auth_user)),
-    )
-    .await
-    .map_err(|_| MetadataApiError::Forbidden)?;
+    let request = metadata_read_request(&path, Some(&auth_user));
+    match txn_id {
+        Some(txn_id) => crate::request_policy::PolicyEvaluator::load_with_txn(
+            context, realm_id, group_id, txn_id,
+        )
+        .await
+        .and_then(|evaluator| evaluator.evaluate(&request))
+        .map_err(|_| MetadataApiError::Forbidden)?,
+        None => crate::request_policy::enforce_policies(context, realm_id, &request)
+            .await
+            .map_err(|_| MetadataApiError::Forbidden)?,
+    }
     Ok(())
 }
 
