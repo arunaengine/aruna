@@ -114,7 +114,7 @@ impl RevokeUserAccessOperation {
         })]
     }
 
-    fn handle_owner_index_read(&mut self, event: Event) -> Effects {
+    fn handle_index_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(RevokeUserAccessError::InvalidOperationState);
         };
@@ -214,7 +214,7 @@ impl Operation for RevokeUserAccessOperation {
             RevokeUserAccessState::Init => self.handle_init(),
             RevokeUserAccessState::StartTransaction => self.handle_transaction_started(event),
             RevokeUserAccessState::ReadUserAccess => self.handle_user_access_read(event),
-            RevokeUserAccessState::ReadOwnerIndex => self.handle_owner_index_read(event),
+            RevokeUserAccessState::ReadOwnerIndex => self.handle_index_read(event),
             RevokeUserAccessState::WriteUserAccess => self.handle_user_access_written(event),
             RevokeUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
             RevokeUserAccessState::Finish => smallvec![],
