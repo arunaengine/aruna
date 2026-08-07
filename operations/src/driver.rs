@@ -16,10 +16,12 @@ use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use futures_util::{StreamExt, stream};
 use std::any::{type_name, type_name_of_val};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
@@ -228,6 +230,8 @@ impl std::fmt::Debug for DriverContext {
 }
 
 const MAX_SUBOP_DEPTH: usize = 32;
+const AUDIT_FANOUT_CONCURRENCY: usize = 8;
+const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -433,23 +437,58 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
 /// concurrently so one unreachable node cannot spend the whole request deadline.
 /// An unreachable or denied node is reported so the aggregator records it missing.
 async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -> Event {
-    let AuditPageEffect { nodes, request } = effect;
-    let pages = futures_util::future::join_all(nodes.into_iter().map(|node| {
-        let request = request.clone();
-        async move {
-            match crate::metadata::audit::send_audit_request(context, node, request).await {
-                Ok(response) => AuditPageEvent::Page {
-                    node,
-                    response: Box::new(response),
-                },
-                Err(error) => AuditPageEvent::Unavailable {
-                    node,
-                    message: format!("{error:?}"),
-                },
+    let AuditPageEffect {
+        nodes: input_nodes,
+        request,
+    } = effect;
+    let mut remaining = BTreeSet::new();
+    let nodes = input_nodes
+        .into_iter()
+        .filter(|node| remaining.insert(*node))
+        .collect::<Vec<_>>();
+    let mut pages = Vec::new();
+    {
+        let requests = stream::iter(nodes.into_iter().map(|node| {
+            let request = request.clone();
+            async move {
+                let page = match crate::metadata::audit::send_audit_request(context, node, request)
+                    .await
+                {
+                    Ok(response) => AuditPageEvent::Page {
+                        node,
+                        response: Box::new(response),
+                    },
+                    Err(error) => AuditPageEvent::Unavailable {
+                        node,
+                        message: format!("{error:?}"),
+                    },
+                };
+                (node, page)
             }
+        }))
+        .buffer_unordered(AUDIT_FANOUT_CONCURRENCY);
+        futures_util::pin_mut!(requests);
+        let deadline = tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE;
+        loop {
+            let next = match tokio::time::timeout_at(deadline, requests.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+            let Some((node, page)) = next else {
+                break;
+            };
+            remaining.remove(&node);
+            pages.push(page);
         }
-    }))
-    .await;
+    }
+    pages.extend(
+        remaining
+            .into_iter()
+            .map(|node| AuditPageEvent::Unavailable {
+                node,
+                message: "audit fan-out deadline exceeded".to_string(),
+            }),
+    );
     Event::Net(NetEvent::AuditPages(pages))
 }
 

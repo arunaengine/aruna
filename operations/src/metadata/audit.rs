@@ -284,6 +284,11 @@ impl ListAuditOperation {
         auth_token: Option<MetadataAuthToken>,
         config_digest: [u8; 32],
     ) -> Self {
+        let mut seen = BTreeSet::new();
+        let peers = peers
+            .into_iter()
+            .filter(|node| seen.insert(*node))
+            .collect();
         Self {
             group_id,
             document_id,
@@ -658,19 +663,21 @@ mod tests {
     fn peers_share_effect() {
         // Every peer is asked in one adapter round: with one effect per peer the
         // runner contacts them serially and unreachable nodes add up to a timeout.
-        let peers: Vec<aruna_core::types::NodeId> = (1u8..=3)
+        let unique: Vec<aruna_core::types::NodeId> = (1u8..=3)
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
+        let mut peers = unique.clone();
+        peers.insert(1, unique[0]);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let mut operation =
-            ListAuditOperation::new(group_id, None, peers.clone(), None, 10, None, [0u8; 32]);
+            ListAuditOperation::new(group_id, None, peers, None, 10, None, [0u8; 32]);
 
         let effects = operation.start();
         assert_eq!(effects.len(), 2);
         let Effect::Net(NetEffect::AuditPage(fan_out)) = &effects[1] else {
             panic!("the peer fan-out must be a single net effect");
         };
-        assert_eq!(fan_out.nodes, peers);
+        assert_eq!(fan_out.nodes, unique);
 
         operation.step(Event::Storage(StorageEvent::IterResult {
             values: Vec::new(),
@@ -692,6 +699,37 @@ mod tests {
         assert!(aggregate.partial);
         assert_eq!(aggregate.missing_nodes.len(), peers.len());
         assert!(aggregate.records.is_empty());
+    }
+
+    #[test]
+    fn success_has_cursor() {
+        let realm_id = RealmId([9u8; 32]);
+        let group = Ulid::from_bytes([3u8; 16]);
+        let doc = Ulid::from_bytes([4u8; 16]);
+        let node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let page = AuditPageResponse {
+            records: vec![entry(group, doc, Ulid::from_bytes([1u8; 16]), realm_id)],
+            next_start_after: Some(
+                metadata_audit_key(group, doc, Ulid::from_bytes([1u8; 16])).to_vec(),
+            ),
+        };
+        let mut operation =
+            ListAuditOperation::new(group, Some(doc), vec![node], None, 10, None, [0u8; 32]);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        operation.step(Event::Net(NetEvent::AuditPages(vec![
+            AuditPageEvent::Page {
+                node,
+                response: Box::new(page),
+            },
+        ])));
+
+        let aggregate = operation.finalize().unwrap();
+        assert!(!aggregate.partial);
+        assert!(aggregate.next_cursor.is_some());
     }
 
     #[test]

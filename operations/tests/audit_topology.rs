@@ -1,9 +1,9 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Distributed audit coverage: audit rows are node-local projections, so a
-//! complete trail is gathered from a non-holder by fanning out to every realm
-//! metadata node, merging holder projections by key, paging across the merge,
-//! and surfacing an unreachable node as a partial status rather than a false 200.
+//! Distributed audit coverage: audit rows are node-local projections.
+//!
+//! A non-holder fans out to every metadata node, merges holder pages, and
+//! reports unreachable nodes as partial rather than a false 200.
 
 mod topology;
 
