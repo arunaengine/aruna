@@ -453,7 +453,7 @@ impl DoctorTokenValidationState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for DoctorTokenValidationState {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+    async fn is_token_revoked(&self, token_hash: &str) -> bool {
         self.revoked_token_hashes.contains(token_hash)
     }
 

@@ -24,10 +24,10 @@ use tracing::warn;
 
 #[async_trait]
 pub trait ArunaBearerTokenValidationState: Sync {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool;
+    async fn is_token_revoked(&self, token_hash: &str) -> bool;
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool;
 
-    async fn decoding_key_for_issuer(
+    async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
@@ -128,7 +128,7 @@ where
         .await
         .is_ok()
     {
-        state.decoding_key_for_issuer(issuer).await?
+        state.issuer_decoding_key(issuer).await?
     } else {
         decoding_key_from_base64_public_key(issuer)?
     };
@@ -137,7 +137,7 @@ where
     validate_aruna_bearer_token_claims(state, &claims.claims).await?;
 
     let token_hash = bearer_token_hash(token);
-    if state.is_bearer_token_revoked(&token_hash).await {
+    if state.is_token_revoked(&token_hash).await {
         return Err(ArunaBearerTokenError::TokenRevoked);
     }
 

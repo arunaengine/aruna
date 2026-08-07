@@ -26,7 +26,7 @@ struct TestAuthState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for TestAuthState {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+    async fn is_token_revoked(&self, token_hash: &str) -> bool {
         self.revocation_reads.fetch_add(1, Ordering::Relaxed);
         self.revoked_hashes.contains(token_hash)
     }

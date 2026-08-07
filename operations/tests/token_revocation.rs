@@ -57,7 +57,7 @@ struct PeerAuthState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for PeerAuthState {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+    async fn is_token_revoked(&self, token_hash: &str) -> bool {
         realm_token_revoked(&self.storage, self.realm_id, token_hash).await
     }
 

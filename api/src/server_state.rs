@@ -550,7 +550,7 @@ impl ServerState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for ServerState {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+    async fn is_token_revoked(&self, token_hash: &str) -> bool {
         // The replicated realm config is the only revocation authority; it is
         // expiry-bounded, so revoking cannot grow a durable set without limit.
         realm_token_revoked(&self.driver_ctx.storage_handle, self.realm_id, token_hash).await
@@ -560,7 +560,7 @@ impl ArunaBearerTokenValidationState for ServerState {
         self.trusted_realms_list.read().await.contains(realm_id)
     }
 
-    async fn decoding_key_for_issuer(
+    async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {

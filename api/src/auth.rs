@@ -446,7 +446,7 @@ struct RevocationBlindState<'a>(&'a ServerState);
 
 #[async_trait::async_trait]
 impl ArunaBearerTokenValidationState for RevocationBlindState<'_> {
-    async fn is_bearer_token_revoked(&self, _token_hash: &str) -> bool {
+    async fn is_token_revoked(&self, _token_hash: &str) -> bool {
         false
     }
 
@@ -454,11 +454,11 @@ impl ArunaBearerTokenValidationState for RevocationBlindState<'_> {
         self.0.is_trusted_realm(realm_id).await
     }
 
-    async fn decoding_key_for_issuer(
+    async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
-        self.0.decoding_key_for_issuer(issuer_pubkey).await
+        self.0.issuer_decoding_key(issuer_pubkey).await
     }
 }
 
