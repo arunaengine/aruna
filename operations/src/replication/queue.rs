@@ -544,6 +544,11 @@ pub struct QueueLiveVersionReplicationInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueLiveVersionReplicationState {
     Init,
+    StartObligation,
+    ReadObligation,
+    WriteObligation,
+    CommitObligation,
+    AbortObligation,
     ReadRelationships,
     ReadConfig,
     ReadExistingJobs,
@@ -566,6 +571,10 @@ pub struct QueueLiveVersionReplicationOperation {
     cursor: LiveReplicationContinuation,
     continuation_pending: bool,
     relationship_work: usize,
+    seed_key: Option<Key>,
+    seed_value: Option<ByteView>,
+    txn_id: Option<Ulid>,
+    abort_error: Option<BlobReplicationQueueError>,
     output: Option<Result<QueueBlobReplicationResult, BlobReplicationQueueError>>,
 }
 
@@ -585,6 +594,10 @@ impl QueueLiveVersionReplicationOperation {
             },
             continuation_pending: false,
             relationship_work: 0,
+            seed_key: None,
+            seed_value: None,
+            txn_id: None,
+            abort_error: None,
             output: None,
         }
     }
@@ -593,6 +606,90 @@ impl QueueLiveVersionReplicationOperation {
         self.state = QueueLiveVersionReplicationState::Error;
         self.output = Some(Err(error));
         smallvec![]
+    }
+
+    fn seed_record(&self) -> LiveReplicationObligationRecord {
+        let mut record = LiveReplicationObligationRecord::new(
+            self.input.local_node_id,
+            self.input.auth_context.clone(),
+            self.input.bucket.clone(),
+            self.input.key.clone(),
+            self.input.version_id,
+            self.input.delete_marker,
+        );
+        record.continuation = Some(LiveReplicationContinuation::default());
+        record
+    }
+
+    fn start_obligation(&mut self) -> Effects {
+        let record = self.seed_record();
+        let (_, key, value) = match live_replication_obligation_write_entry(&record) {
+            Ok(entry) => entry,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.seed_key = Some(key);
+        self.seed_value = Some(value);
+        self.state = QueueLiveVersionReplicationState::StartObligation;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn abort_obligation(&mut self, error: Option<BlobReplicationQueueError>) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                "obligation transaction is not active".to_string(),
+            ));
+        };
+        self.abort_error = error;
+        self.state = QueueLiveVersionReplicationState::AbortObligation;
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    }
+
+    fn write_obligation(&mut self) -> Effects {
+        let (Some(key), Some(value), Some(txn_id)) =
+            (self.seed_key.clone(), self.seed_value.clone(), self.txn_id)
+        else {
+            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                "obligation write is not prepared".to_string(),
+            ));
+        };
+        self.state = QueueLiveVersionReplicationState::WriteObligation;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key,
+            value,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn read_obligation(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                "obligation transaction is not active".to_string(),
+            ));
+        };
+        let Some(key) = self.seed_key.clone() else {
+            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                "obligation key is not prepared".to_string(),
+            ));
+        };
+        self.state = QueueLiveVersionReplicationState::ReadObligation;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn commit_obligation(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                "obligation transaction is not active".to_string(),
+            ));
+        };
+        self.state = QueueLiveVersionReplicationState::CommitObligation;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn read_relationships(&mut self, start: Option<Key>) -> Effects {
@@ -780,14 +877,72 @@ impl Operation for QueueLiveVersionReplicationOperation {
     type Error = BlobReplicationQueueError;
 
     fn start(&mut self) -> Effects {
-        self.read_relationships(self.cursor.relationship_after.clone().map(ByteView::from))
+        self.start_obligation()
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            QueueLiveVersionReplicationState::Init => {
-                self.read_relationships(self.cursor.relationship_after.clone().map(ByteView::from))
-            }
+            QueueLiveVersionReplicationState::Init => self.start_obligation(),
+            QueueLiveVersionReplicationState::StartObligation => match event {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                    self.txn_id = Some(txn_id);
+                    self.read_obligation()
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                ))),
+            },
+            QueueLiveVersionReplicationState::ReadObligation => match event {
+                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                    self.write_obligation()
+                }
+                Event::Storage(StorageEvent::ReadResult {
+                    value: Some(value), ..
+                }) => match LiveReplicationObligationRecord::from_bytes(&value) {
+                    Ok(_) => self.abort_obligation(None),
+                    Err(_) => self.write_obligation(),
+                },
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.abort_obligation(Some(error.into()))
+                }
+                other => self.abort_obligation(Some(BlobReplicationQueueError::UnexpectedEvent(
+                    format!("{other:?}"),
+                ))),
+            },
+            QueueLiveVersionReplicationState::WriteObligation => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => self.commit_obligation(),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.abort_obligation(Some(error.into()))
+                }
+                other => self.abort_obligation(Some(BlobReplicationQueueError::UnexpectedEvent(
+                    format!("{other:?}"),
+                ))),
+            },
+            QueueLiveVersionReplicationState::CommitObligation => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.schedule_drain(),
+                Event::Storage(StorageEvent::Error { error })
+                    if matches!(error, StorageError::TransactionConflict) =>
+                {
+                    self.schedule_drain()
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                ))),
+            },
+            QueueLiveVersionReplicationState::AbortObligation => match event {
+                Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                    match self.abort_error.take() {
+                        Some(error) => self.fail(error),
+                        None => self.schedule_drain(),
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                ))),
+            },
             QueueLiveVersionReplicationState::ReadRelationships => match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
