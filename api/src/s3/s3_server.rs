@@ -26,18 +26,22 @@ use s3s::host::SingleDomain;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, trace};
 
-/// Concurrent S3 connections served at once; further connections wait for a
-/// slot so a flood cannot spawn unbounded connection tasks.
+const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Concurrent S3 connections served at once; connections at capacity are
+/// dropped so a flood cannot spawn unbounded connection tasks.
 pub const DEFAULT_S3_MAX_CONNECTIONS: usize = 1_024;
 /// Concurrent S3 requests processed at once, acquired before the expensive
 /// s3s parse/body/storage work.
@@ -155,6 +159,30 @@ pub struct S3Server {
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
+#[derive(Default)]
+struct FirstRequest {
+    seen: AtomicBool,
+    notify: Notify,
+}
+
+impl FirstRequest {
+    fn mark(&self) {
+        if !self.seen.swap(true, Ordering::Release) {
+            self.notify.notify_one();
+        }
+    }
+
+    fn seen(&self) -> bool {
+        self.seen.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        if !self.seen() {
+            self.notify.notified().await;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WrappingService {
     shared: S3Service, // Aruna specific implementation of S3 trait
@@ -169,6 +197,8 @@ pub struct WrappingService {
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
     // Held across each request so concurrent expensive processing is bounded.
     request_limit: Arc<Semaphore>,
+    // Disarms the connection's initial deadline after its first complete request.
+    first_request: Option<Arc<FirstRequest>>,
     // Proxies whose forwarded client address may be charged instead of the peer.
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
@@ -283,6 +313,10 @@ impl S3Server {
     ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let connection_limit = self.connection_limit.clone();
+        let max_streams = self
+            .request_limit
+            .available_permits()
+            .clamp(1, u32::MAX as usize) as u32;
         let service = WrappingService {
             shared: self.s3service,
             cors: self.cors,
@@ -292,9 +326,15 @@ impl S3Server {
             peer_ip: None,
             rate_limits: self.rate_limits,
             request_limit: self.request_limit,
+            first_request: None,
             trusted_proxies: self.trusted_proxies,
         };
-        let connection = ConnBuilder::new(TokioExecutor::new());
+        let mut connection = ConnBuilder::new(TokioExecutor::new());
+        connection
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(INITIAL_REQUEST_TIMEOUT);
+        connection.http2().max_concurrent_streams(max_streams);
 
         let server = async move {
             loop {
@@ -305,18 +345,27 @@ impl S3Server {
                         continue;
                     }
                 };
-                // Bound concurrent connections: wait for a slot before spawning,
-                // and hold the permit for the connection's whole lifetime.
-                let permit = match connection_limit.clone().acquire_owned().await {
+                // Bound concurrent connections without retaining sockets at capacity.
+                let permit = match connection_limit.clone().try_acquire_owned() {
                     Ok(permit) => permit,
-                    Err(_) => break,
+                    Err(TryAcquireError::NoPermits) => {
+                        drop(socket);
+                        continue;
+                    }
+                    Err(TryAcquireError::Closed) => break,
                 };
                 let mut service = service.clone();
                 service.peer_ip = Some(peer.ip());
+                let first_request = Arc::new(FirstRequest::default());
+                service.first_request = Some(first_request.clone());
                 let conn = connection.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = conn.serve_connection(TokioIo::new(socket), service).await;
+                    run_connection(
+                        first_request,
+                        conn.serve_connection(TokioIo::new(socket), service),
+                    )
+                    .await;
                 });
             }
         };
@@ -343,6 +392,9 @@ impl Service<Request<Incoming>> for WrappingService {
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
+        if let Some(first_request) = self.first_request.as_ref() {
+            first_request.mark();
+        }
         let (mut parts, body) = req.into_parts();
         let method = parts.method.clone();
         let path = parts.uri.path().to_string();
@@ -427,7 +479,25 @@ impl Service<Request<Incoming>> for WrappingService {
             }
             // Bound concurrent request processing before the expensive s3s
             // parse, body handling, and storage work.
-            let _request_permit = request_limit.acquire_owned().await.ok();
+            let _request_permit = match request_limit.try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+                    // Dropping the request lets hyper drain or close HTTP/1
+                    // bodies and reset HTTP/2 streams without desynchronizing.
+                    drop(s3s_request);
+                    let response = slow_down_response(1);
+                    let code = response.status().as_u16();
+                    emit_request_completed(&span, "s3", code, started);
+                    record_s3_request(
+                        &metrics,
+                        &method,
+                        code,
+                        "admission_limited",
+                        started.elapsed(),
+                    );
+                    return Ok(response);
+                }
+            };
             let bucket_cors = if origin_header.is_some() {
                 match load_bucket_cors_config(driver_ctx, bucket).await {
                     Ok(bucket_cors) => bucket_cors,
@@ -536,6 +606,26 @@ impl Service<Request<Incoming>> for WrappingService {
     }
 }
 
+async fn run_connection<F>(first_request: Arc<FirstRequest>, connection: F)
+where
+    F: Future<Output = hyper::Result<()>> + Send,
+{
+    let mut connection = Box::pin(connection);
+    let initial = tokio::time::timeout(INITIAL_REQUEST_TIMEOUT, first_request.wait());
+    tokio::pin!(initial);
+
+    tokio::select! {
+        result = &mut connection => {
+            let _ = result;
+        }
+        result = &mut initial => {
+            if result.is_ok() || first_request.seen() {
+                let _ = connection.await;
+            }
+        }
+    }
+}
+
 fn slow_down_response(retry_after: u64) -> HttpResponse {
     const SLOW_DOWN_BODY: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SlowDown</Code><Message>Reduce your request rate.</Message></Error>";
     let mut response = http::Response::builder()
@@ -593,6 +683,77 @@ async fn load_bucket_cors_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_full_connection() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = limit.clone().try_acquire_owned().expect("first permit");
+        assert!(matches!(
+            limit.clone().try_acquire_owned(),
+            Err(TryAcquireError::NoPermits)
+        ));
+        drop(permit);
+        limit.close();
+        assert!(matches!(
+            limit.try_acquire_owned(),
+            Err(TryAcquireError::Closed)
+        ));
+    }
+
+    #[test]
+    fn slows_full_request() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = limit.clone().try_acquire_owned().expect("first permit");
+        let response = match limit.clone().try_acquire_owned() {
+            Ok(_) => panic!("request unexpectedly admitted"),
+            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => slow_down_response(1),
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        drop(permit);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_expires_silent() {
+        let first_request = Arc::new(FirstRequest::default());
+        let task = tokio::spawn(run_connection(first_request, async {
+            std::future::pending::<hyper::Result<()>>().await
+        }));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(INITIAL_REQUEST_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        task.await.expect("deadline task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn valid_request_disarms() {
+        let first_request = Arc::new(FirstRequest::default());
+        let marker = first_request.clone();
+        let task = tokio::spawn(run_connection(first_request, async move {
+            marker.mark();
+            Ok::<(), hyper::Error>(())
+        }));
+        task.await.expect("request task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_request_survives() {
+        let first_request = Arc::new(FirstRequest::default());
+        let marker = first_request.clone();
+        let task = tokio::spawn(run_connection(first_request, async move {
+            marker.mark();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<(), hyper::Error>(())
+        }));
+        tokio::task::yield_now().await;
+        tokio::time::advance(INITIAL_REQUEST_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        task.await.expect("request task joins");
+    }
 
     #[tokio::test]
     async fn charges_forwarded_client() {
