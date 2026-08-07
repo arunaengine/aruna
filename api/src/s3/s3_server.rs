@@ -371,10 +371,10 @@ impl ConnectionActivity {
         }
     }
 
-    async fn wait_idle(&self) {
+    async fn wait_idle(&self) -> bool {
         loop {
             if self.is_cancelled() || self.stopped.load(Ordering::Acquire) {
-                return;
+                return false;
             }
             let generation = self.generation.load(Ordering::Acquire);
             let notified = self.notify.notified();
@@ -385,10 +385,12 @@ impl ConnectionActivity {
                 _ = notified => {}
                 _ = tokio::time::sleep(CONNECTION_IDLE_TIMEOUT) => {
                     if generation == self.generation.load(Ordering::Acquire)
+                        && !self.is_cancelled()
+                        && !self.stopped.load(Ordering::Acquire)
                         && self.active.load(Ordering::Acquire) == 0
                     {
                         self.cancel();
-                        return;
+                        return true;
                     }
                 }
             }
@@ -1058,8 +1060,11 @@ impl Service<Request<Incoming>> for WrappingService {
                     let response_activity = Arc::new(ConnectionActivity::default());
                     response_activity.touch();
                     let idle_task_activity = response_activity.clone();
+                    let response_connection = activity.clone();
                     tokio::spawn(async move {
-                        idle_task_activity.wait_idle().await;
+                        if idle_task_activity.wait_idle().await {
+                            response_connection.cancel();
+                        }
                     });
                     Ok(response.map(|body| {
                         s3s::Body::http_body_unsync(ResponseBody::new(
@@ -1325,6 +1330,47 @@ mod tests {
         activity.end_request();
         activity.stop();
         watcher.await.expect("idle watcher joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_response_closes() {
+        let activity = Arc::new(ConnectionActivity::default());
+        activity.mark_request();
+        activity.begin_request();
+        let response_activity = Arc::new(ConnectionActivity::default());
+        response_activity.touch();
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = limit.clone().try_acquire_owned().expect("permit");
+        let active = ActiveRequestGuard::new(activity.clone());
+        let body = ResponseBody::new(
+            s3s::Body::empty(),
+            permit,
+            activity.clone(),
+            response_activity.clone(),
+            active,
+        );
+        let ready = Arc::new(Notify::new());
+        let task_ready = ready.clone();
+        let idle_activity = response_activity.clone();
+        let idle_connection = activity.clone();
+        let watcher = tokio::spawn(async move {
+            task_ready.notify_one();
+            if idle_activity.wait_idle().await {
+                idle_connection.cancel();
+            }
+        });
+        let connection_activity = activity.clone();
+        let connection = tokio::spawn(async move {
+            let _body = body;
+            connection_activity.wait_cancelled().await;
+        });
+        ready.notified().await;
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT).await;
+        watcher.await.expect("response watcher joins");
+        assert!(activity.is_cancelled());
+        connection.await.expect("connection task joins");
+        assert_eq!(limit.available_permits(), 1);
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
     }
 
     #[test]
