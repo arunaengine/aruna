@@ -683,6 +683,10 @@ impl MetadataVisibilityCache {
     // entries never outlive their fill TTL, so a missed update converges to
     // storage truth within one TTL via the periodic refill.
     fn upsert_registry_records(&self, updates: &[MetadataRegistryRecord]) {
+        self.upsert_at(updates, None);
+    }
+
+    fn upsert_at(&self, updates: &[MetadataRegistryRecord], expected_generation: Option<u64>) {
         if updates.is_empty() {
             return;
         }
@@ -690,6 +694,9 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        if expected_generation.is_some_and(|generation| self.current_generation() != generation) {
+            return;
+        }
         self.advance_generation();
         let Some(entry) = registry.as_mut() else {
             return;
@@ -889,6 +896,12 @@ impl MetadataHandle {
 
     pub fn upsert_cached_registry_records(&self, records: &[MetadataRegistryRecord]) {
         self.inner.visibility_cache.upsert_registry_records(records);
+    }
+
+    pub(super) fn upsert_cached_at(&self, record: MetadataRegistryRecord, generation: u64) {
+        self.inner
+            .visibility_cache
+            .upsert_at(std::slice::from_ref(&record), Some(generation));
     }
 
     pub fn remove_cached_registry_record(&self, document_id: Ulid) {
@@ -7453,6 +7466,22 @@ mod tests {
         let cache = MetadataVisibilityCache::new();
         cache.upsert_registry_records(&[registry_record("datasets/a")]);
         assert!(cache.registry_records().is_none());
+    }
+
+    #[test]
+    fn stale_cache_callback() {
+        let record = registry_record("datasets/race");
+        let cache = filled_cache(vec![record.clone()]);
+        let generation = cache.current_generation();
+
+        cache.remove_registry_record(record.document_id);
+        cache.upsert_at(std::slice::from_ref(&record), Some(generation));
+
+        assert!(
+            cache
+                .registry_records()
+                .is_some_and(|records| records.is_empty())
+        );
     }
 
     #[test]

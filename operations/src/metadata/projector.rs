@@ -30,6 +30,7 @@ use aruna_core::structs::{
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use aruna_storage::StorageHandle;
+use aruna_storage::storage::TransactionOwner;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use std::sync::OnceLock;
@@ -390,6 +391,10 @@ pub async fn project_metadata_create_events(
         return Ok(0);
     }
 
+    let cache_generation = context
+        .metadata_handle
+        .as_ref()
+        .map(|handle| handle.visibility_generation());
     let mut realm_configs = BTreeMap::new();
     let mut lifecycle_cache: BTreeMap<String, bool> = BTreeMap::new();
     let mut registry_cache: BTreeMap<Ulid, Option<MetadataRegistryRecord>> = BTreeMap::new();
@@ -582,24 +587,19 @@ pub async fn project_metadata_create_events(
     }
 
     if !writes.is_empty() {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        }
+        let graph_iris = projected_records
+            .iter()
+            .map(|record| record.graph_iri.clone())
+            .collect::<BTreeSet<_>>();
+        transactional_projection_write(context, writes, graph_iris).await?;
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-            metadata_handle.upsert_cached_registry_records(&projected_records);
+            if let Some(cache_generation) = cache_generation {
+                for record in projected_records {
+                    metadata_handle.upsert_cached_at(record, cache_generation);
+                }
+            } else {
+                metadata_handle.upsert_cached_registry_records(&projected_records);
+            }
         }
     }
     if !outboxes.is_empty() {
@@ -618,6 +618,134 @@ pub async fn project_metadata_create_events(
     }
 
     Ok(projected)
+}
+
+async fn abort_projection_transaction(
+    storage: &StorageHandle,
+    owner: &mut TransactionOwner,
+    txn_id: Ulid,
+) {
+    match storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionAborted { .. })
+        | Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionNotFound,
+        }) => owner.finish(),
+        _ => {}
+    }
+}
+
+async fn transactional_projection_write(
+    context: &DriverContext,
+    writes: Vec<(String, ByteView, ByteView)>,
+    graph_iris: BTreeSet<String>,
+) -> Result<(), MetadataProjectionError> {
+    // Read lifecycle keys in the same transaction as registry writes so a
+    // delete commit conflicts instead of allowing storage resurrection.
+    if graph_iris.is_empty() {
+        return Err(MetadataProjectionError::UnexpectedEvent(
+            "metadata projection write missing lifecycle fence".to_string(),
+        ));
+    }
+    let storage = &context.storage_handle;
+    let mut owner = storage.start_transaction(false).await?;
+    let txn_id = owner.id().ok_or_else(|| {
+        MetadataProjectionError::UnexpectedEvent(
+            "metadata projection transaction owner missing id".to_string(),
+        )
+    })?;
+    let reads = graph_iris
+        .iter()
+        .map(|graph_iri| {
+            (
+                METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                metadata_graph_lifecycle_key(graph_iri),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected_reads = reads.len();
+    let values = match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values })
+            if values.len() == expected_reads =>
+        {
+            values
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_projection_transaction(storage, &mut owner, txn_id).await;
+            return Err(error.into());
+        }
+        other => {
+            abort_projection_transaction(storage, &mut owner, txn_id).await;
+            return Err(MetadataProjectionError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    for (_, value) in values {
+        let Some(value) = value else {
+            continue;
+        };
+        let lifecycle = match postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                abort_projection_transaction(storage, &mut owner, txn_id).await;
+                return Err(ConversionError::from(error).into());
+            }
+        };
+        if lifecycle.is_deleted() {
+            abort_projection_transaction(storage, &mut owner, txn_id).await;
+            return Err(StorageError::TransactionConflict.into());
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_projection_transaction(storage, &mut owner, txn_id).await;
+            return Err(error.into());
+        }
+        other => {
+            abort_projection_transaction(storage, &mut owner, txn_id).await;
+            return Err(MetadataProjectionError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            owner.finish();
+            Ok(())
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            match &error {
+                StorageError::TransactionConflict | StorageError::TransactionNotFound => {
+                    owner.finish();
+                }
+                StorageError::CommitFailed => owner.unknown(),
+                _ => {}
+            }
+            Err(error.into())
+        }
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
 }
 
 async fn write_pending_projection_markers(
@@ -1151,6 +1279,64 @@ mod tests {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
             other => panic!("unexpected storage event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn tombstone_blocks_projection() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let event = create_event();
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            event.record.graph_iri.clone(),
+            event.record.realm_id,
+            event.record.group_id,
+            event.record.document_id,
+            2,
+        );
+        write_entries(
+            &storage,
+            vec![
+                aruna_core::storage_entries::metadata_graph_lifecycle_write_entry(&tombstone)
+                    .expect("tombstone serializes"),
+            ],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let result = transactional_projection_write(
+            &context,
+            aruna_core::storage_entries::metadata_registry_write_entries(&event.record)
+                .expect("registry writes serialize"),
+            BTreeSet::from([event.record.graph_iri.clone()]),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(MetadataProjectionError::Storage(
+                StorageError::TransactionConflict
+            ))
+        ));
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: aruna_core::keyspaces::METADATA_INDEX_KEYSPACE.to_string(),
+                    key: aruna_core::storage_entries::metadata_registry_key(
+                        event.record.group_id,
+                        event.record.document_id,
+                    ),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
     }
 
     #[tokio::test]
