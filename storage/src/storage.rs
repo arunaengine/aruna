@@ -2987,8 +2987,10 @@ mod tests {
             let handle = handle.clone();
             async move { handle.send_storage_effect(cleanup_write()).await }
         });
+        tokio::task::yield_now().await;
         let (effect, ..) = receiver.recv().await.expect("filler effect");
         assert!(!super::is_cleanup_write(&effect));
+        assert!(handle.transaction_cleanup.try_lock().is_ok());
         let (effect, response_tx, ..) = receiver.recv().await.expect("cleanup effect");
         assert!(super::is_cleanup_write(&effect));
         assert!(response_tx.send(StorageEvent::WriteResult {
