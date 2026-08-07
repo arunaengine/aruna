@@ -47,18 +47,17 @@ struct LocalTable {
 
 impl LocalTable {
     fn try_acquire(&mut self, key: LocalKey) -> Option<OwnedSemaphorePermit> {
-        self.entries.retain(|_, entry| entry.strong_count() != 0);
-        let semaphore = match self.entries.get(&key).and_then(Weak::upgrade) {
-            Some(semaphore) => semaphore,
-            None => {
-                if self.entries.len() >= LOCAL_TABLE_LIMIT {
-                    return None;
-                }
-                let semaphore = Arc::new(Semaphore::new(LOCAL_PERMITS));
-                self.entries.insert(key, Arc::downgrade(&semaphore));
-                semaphore
+        if let Some(semaphore) = self.entries.get(&key).and_then(Weak::upgrade) {
+            return semaphore.try_acquire_owned().ok();
+        }
+        if self.entries.len() >= LOCAL_TABLE_LIMIT {
+            self.entries.retain(|_, entry| entry.strong_count() != 0);
+            if self.entries.len() >= LOCAL_TABLE_LIMIT {
+                return None;
             }
-        };
+        }
+        let semaphore = Arc::new(Semaphore::new(LOCAL_PERMITS));
+        self.entries.insert(key, Arc::downgrade(&semaphore));
         semaphore.try_acquire_owned().ok()
     }
 }
