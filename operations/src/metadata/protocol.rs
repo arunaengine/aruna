@@ -419,7 +419,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use aruna_core::audit::AuditPageEntry;
+    use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
     use aruna_core::structs::{
         AuthContext, MetadataAuditOperation, MetadataAuditRecord, PathRestriction, Permission,
@@ -663,6 +663,57 @@ mod tests {
             .write_all(&[AUDIT_REQUEST_VARIANT as u8])
             .await
             .unwrap();
+        let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata audit frame exceeds maximum size");
+        assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+    }
+
+    #[test]
+    fn audit_variants_match() {
+        let messages = [
+            (
+                MetadataTransportMessage::ForwardAuditPage {
+                    request: AuditPageRequest {
+                        auth_token: None,
+                        config_digest: [0; 32],
+                        realm_id: RealmId([0; 32]),
+                        group_id: Ulid::nil(),
+                        document_id: None,
+                        start_after: None,
+                        limit: 1,
+                    },
+                },
+                AUDIT_REQUEST_VARIANT,
+            ),
+            (
+                MetadataTransportMessage::ForwardedAuditPage {
+                    result: Ok(AuditPageResponse {
+                        records: Vec::new(),
+                        next_start_after: None,
+                    }),
+                },
+                AUDIT_RESPONSE_VARIANT,
+            ),
+        ];
+
+        for (message, expected) in messages {
+            let bytes = postcard::to_allocvec(&message).unwrap();
+            assert_eq!(postcard::from_bytes::<u32>(&bytes).unwrap(), expected);
+            assert_eq!(frame_class(&message), AUDIT_FRAME);
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_wire_varint() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+        writer.write_all(&[0x9f, 0]).await.unwrap();
         let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
 
         let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
