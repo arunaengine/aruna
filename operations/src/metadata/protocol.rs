@@ -17,6 +17,8 @@ pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
+const STANDARD_FRAME: u8 = 0;
+const AUDIT_FRAME: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataPathCandidate {
@@ -222,7 +224,7 @@ pub async fn write_message(
     message: &MetadataTransportMessage,
 ) -> Result<(), String> {
     let bytes = encode_message(message)?;
-    write_encoded_message(stream, &bytes).await
+    write_encoded_message(stream, frame_class(message), &bytes).await
 }
 
 pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
@@ -236,8 +238,17 @@ pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u
 
 pub(crate) async fn write_encoded_message(
     stream: &mut BiStream,
+    class: u8,
     bytes: &[u8],
 ) -> Result<(), String> {
+    if class != STANDARD_FRAME && class != AUDIT_FRAME {
+        return Err("invalid metadata frame class".to_string());
+    }
+    stream
+        .0
+        .write_all(&[class])
+        .await
+        .map_err(|err| err.to_string())?;
     stream
         .0
         .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -263,13 +274,25 @@ pub(crate) async fn read_message_cap<R>(
 where
     R: AsyncRead + Unpin + ?Sized,
 {
+    let mut class_buf = [0u8; 1];
+    reader
+        .read_exact(&mut class_buf)
+        .await
+        .map_err(|err| err.to_string())?;
+    let class = class_buf[0];
+    let class_size = match class {
+        STANDARD_FRAME => MAX_MESSAGE_SIZE,
+        AUDIT_FRAME => audit_frame_cap(),
+        _ => return Err("invalid metadata frame class".to_string()),
+    };
+
     let mut len_buf = [0u8; 4];
     reader
         .read_exact(&mut len_buf)
         .await
         .map_err(|err| err.to_string())?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > max_size {
+    if len > class_size.min(max_size) {
         return Err("metadata frame exceeds maximum size".to_string());
     }
 
@@ -278,7 +301,11 @@ where
         .read_exact(&mut bytes)
         .await
         .map_err(|err| err.to_string())?;
-    postcard::from_bytes(&bytes).map_err(|err| err.to_string())
+    let message = postcard::from_bytes(&bytes).map_err(|err| err.to_string())?;
+    if frame_class(&message) != class {
+        return Err("metadata frame class does not match message".to_string());
+    }
+    Ok(message)
 }
 
 fn audit_frame_cap() -> usize {
@@ -289,6 +316,14 @@ pub(crate) fn response_cap(message: &MetadataTransportMessage) -> usize {
     match message {
         MetadataTransportMessage::ForwardAuditPage { .. } => audit_frame_cap(),
         _ => MAX_MESSAGE_SIZE,
+    }
+}
+
+pub(crate) fn frame_class(message: &MetadataTransportMessage) -> u8 {
+    match message {
+        MetadataTransportMessage::ForwardAuditPage { .. }
+        | MetadataTransportMessage::ForwardedAuditPage { .. } => AUDIT_FRAME,
+        _ => STANDARD_FRAME,
     }
 }
 
@@ -478,9 +513,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_frame_rejects_oversize() {
+    async fn audit_frame_rejects() {
         let (mut writer, mut reader) = tokio::io::duplex(16);
         let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
         writer.write_all(&length.to_be_bytes()).await.unwrap();
 
         let error = read_message_cap(&mut reader, audit_frame_cap())
@@ -490,7 +526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_frame_reads_within_cap() {
+    async fn audit_frame_reads() {
         let message = MetadataTransportMessage::ForwardedAuditPage {
             result: Ok(AuditPageResponse {
                 records: Vec::new(),
@@ -500,6 +536,7 @@ mod tests {
         let bytes = postcard::to_allocvec(&message).unwrap();
         assert!(bytes.len() <= audit_frame_cap());
         let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 4);
+        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
         writer
             .write_all(&(bytes.len() as u32).to_be_bytes())
             .await
@@ -511,6 +548,31 @@ mod tests {
                 .await
                 .unwrap(),
             message
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_class_matches() {
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: Vec::new(),
+                next_start_after: None,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+
+        assert_eq!(
+            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap_err(),
+            "metadata frame class does not match message"
         );
     }
 

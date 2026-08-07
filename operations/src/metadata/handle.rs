@@ -52,8 +52,8 @@ use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::protocol::{
-    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, read_message,
-    read_message_cap, response_cap, write_encoded_message, write_message,
+    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
+    read_message, read_message_cap, response_cap, write_encoded_message, write_message,
 };
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
@@ -6115,7 +6115,7 @@ async fn send_request(
     record_elapsed_ms(&span, "open_stream_ms", open_started);
 
     let write_started = Instant::now();
-    write_encoded_transport_message(&mut stream, &bytes)
+    write_encoded_transport_message(&mut stream, frame_class(&message), &bytes)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "write_ms", write_started);
@@ -6168,7 +6168,7 @@ async fn send_export_request(
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))
         .map_err(MetadataRequestError::definitely_not_sent)?;
-    write_encoded_transport_message(&mut stream, &bytes)
+    write_encoded_transport_message(&mut stream, frame_class(&message), &bytes)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     stream
@@ -6221,10 +6221,14 @@ async fn write_transport_message(
 
 async fn write_encoded_transport_message(
     stream: &mut BiStream,
+    class: u8,
     bytes: &[u8],
 ) -> Result<(), MetadataError> {
-    let result: Result<Result<(), String>, tokio::time::error::Elapsed> =
-        timeout(METADATA_IO_TIMEOUT, write_encoded_message(stream, bytes)).await;
+    let result: Result<Result<(), String>, tokio::time::error::Elapsed> = timeout(
+        METADATA_IO_TIMEOUT,
+        write_encoded_message(stream, class, bytes),
+    )
+    .await;
     result
         .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
         .map_err(MetadataError::Backend)
