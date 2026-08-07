@@ -6,7 +6,9 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
+use aruna_core::keyspaces::{
+    NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+};
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::storage_entries::{
     document_sync_revision_write_entry, watch_subscription_delete_entry,
@@ -17,8 +19,9 @@ use aruna_core::structs::{
     RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
     parse_watch_subscription_key, watch_subscription_prefix,
 };
-use aruna_core::types::{TxnId, UserId};
+use aruna_core::types::{Key, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
+use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -34,6 +37,7 @@ use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 /// always covers a subscription set with a wide safety margin.
 const WATCH_SUBSCRIPTION_LIST_LIMIT: usize = 256;
 const WATCH_SUBSCRIPTION_PAGE_LIMIT: usize = 256;
+const WATCH_SUBSCRIPTION_COUNT_PREFIX: &[u8] = b"count/";
 
 /// Stable reject reason for a cap-exceeded create; matched verbatim by the
 /// holder proxy to surface a 409 to the API layer.
@@ -196,6 +200,24 @@ fn validate_subscription_fields(
     Ok(())
 }
 
+fn watch_count_key(realm_id: RealmId) -> Key {
+    let mut key = WATCH_SUBSCRIPTION_COUNT_PREFIX.to_vec();
+    key.extend_from_slice(realm_id.as_bytes());
+    ByteView::from(key)
+}
+
+fn count_value(count: usize) -> Value {
+    Value::from((count as u64).to_be_bytes().to_vec())
+}
+
+fn decode_count(value: &[u8]) -> Result<usize, String> {
+    let bytes: [u8; 8] = value
+        .try_into()
+        .map_err(|_| "invalid watch subscription count".to_string())?;
+    usize::try_from(u64::from_be_bytes(bytes))
+        .map_err(|_| "watch subscription count does not fit usize".to_string())
+}
+
 async fn create_subscription(
     storage: &StorageHandle,
     subscription: WatchSubscription,
@@ -236,6 +258,62 @@ async fn create_once(
         }
     };
 
+    let realm_count = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key: watch_count_key(subscription.owner.realm_id),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => match decode_count(&value) {
+            Ok(count) => count,
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(CreateFailure::Fatal(error));
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            let values = match storage
+                .send_storage_effect(StorageEffect::Iter {
+                    key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+                    prefix: Some(UserId::storage_prefix(subscription.owner.realm_id)),
+                    start: None,
+                    limit: NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP.saturating_add(1),
+                    txn_id: Some(txn_id),
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+                Event::Storage(StorageEvent::Error { error }) => {
+                    return Err(abort_and_classify(storage, txn_id, error).await);
+                }
+                other => {
+                    abort_txn(storage, txn_id).await;
+                    return Err(CreateFailure::Fatal(format!(
+                        "unexpected watch subscription count scan event: {other:?}"
+                    )));
+                }
+            };
+            values.len()
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(abort_and_classify(storage, txn_id, error).await);
+        }
+        other => {
+            abort_txn(storage, txn_id).await;
+            return Err(CreateFailure::Fatal(format!(
+                "unexpected watch subscription count read event: {other:?}"
+            )));
+        }
+    };
+    if realm_count >= NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP {
+        abort_txn(storage, txn_id).await;
+        return Err(CreateFailure::Cap);
+    }
+
     let existing = match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
@@ -269,7 +347,14 @@ async fn create_once(
             return Err(CreateFailure::Fatal(error.to_string()));
         }
     };
-    let mut writes = vec![subscription_write];
+    let mut writes = vec![
+        subscription_write,
+        (
+            NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            watch_count_key(subscription.owner.realm_id),
+            count_value(realm_count + 1),
+        ),
+    ];
     writes.push(watch_interest_dirty_marker_write(
         subscription.owner.realm_id,
     ));
@@ -429,6 +514,46 @@ async fn delete_once(
         }
     }
 
+    let realm_count = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key: watch_count_key(owner.realm_id),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => match decode_count(&value) {
+            Ok(count) if count > 0 => count,
+            Ok(_) => {
+                abort_txn(storage, txn_id).await;
+                return Err(CreateFailure::Fatal(
+                    "watch subscription count is zero for a stored row".to_string(),
+                ));
+            }
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(CreateFailure::Fatal(error));
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            abort_txn(storage, txn_id).await;
+            return Err(CreateFailure::Fatal(
+                "watch subscription count is missing".to_string(),
+            ));
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(abort_and_classify(storage, txn_id, error).await);
+        }
+        other => {
+            abort_txn(storage, txn_id).await;
+            return Err(CreateFailure::Fatal(format!(
+                "unexpected watch subscription count read event: {other:?}"
+            )));
+        }
+    };
+
     let (key_space, key) = watch_subscription_delete_entry(owner, watch_id);
     match storage
         .send_storage_effect(StorageEffect::Delete {
@@ -450,7 +575,14 @@ async fn delete_once(
         }
     }
 
-    let mut writes = vec![watch_interest_dirty_marker_write(owner.realm_id)];
+    let mut writes = vec![
+        watch_interest_dirty_marker_write(owner.realm_id),
+        (
+            NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            watch_count_key(owner.realm_id),
+            count_value(realm_count - 1),
+        ),
+    ];
     if let Some(replication) = replication {
         let target = watch_subscription_target(owner, watch_id);
         let revision_entry =
@@ -901,6 +1033,56 @@ mod tests {
                 .len(),
             NOTIFICATION_WATCH_PER_USER_CAP
         );
+    }
+
+    #[tokio::test]
+    async fn realm_cap_create() {
+        let (_dir, storage) = temp_storage();
+        let realm = RealmId([6u8; 32]);
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                    key: watch_count_key(realm),
+                    value: count_value(NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert_eq!(
+            create_watch_subscription(&storage, user(6, 1), "full".to_string(), mask(), 1).await,
+            Err(WatchSubscriptionError::CapExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_releases_cap() {
+        let (_dir, storage) = temp_storage();
+        let realm = RealmId([5u8; 32]);
+        let owner = user(5, 1);
+        let created = create_watch_subscription(&storage, owner, "one".to_string(), mask(), 1)
+            .await
+            .expect("create succeeds");
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                    key: watch_count_key(realm),
+                    value: count_value(NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        delete_watch_subscription(&storage, owner, created.watch_id)
+            .await
+            .expect("delete succeeds");
+        create_watch_subscription(&storage, owner, "two".to_string(), mask(), 2)
+            .await
+            .expect("released capacity accepts create");
     }
 
     // Revocation hides a watch but does not delete its replicated row. Those
