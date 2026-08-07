@@ -4445,14 +4445,9 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         let mut reducer_state = previous_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-        let apply_status = match reducer_state.apply(&event) {
-            Ok(status) => status,
-            Err(error) => {
-                return Err(
-                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
-                );
-            }
-        };
+        if let Err(error) = reducer_state.apply(&event) {
+            return Err(abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await);
+        }
         reducer_state.compact_revocations(effective_now);
 
         let mut config_changed = false;
@@ -4490,10 +4485,9 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                 config
             }
         };
-        if matches!(apply_status, AdminDocumentApplyStatus::Duplicate)
-            && previous_state
-                .as_ref()
-                .is_some_and(|previous| previous == &reducer_state)
+        if previous_state
+            .as_ref()
+            .is_some_and(|previous| previous == &reducer_state)
             && !config_changed
         {
             abort_txn(storage, txn_id).await?;
@@ -5854,9 +5848,10 @@ async fn validate_realm_config_admin_authority(
             });
         };
         if !config.has_node(event.origin_node_id) {
-            return Ok(AdminEventValidation::Rejected(
-                "revocation event origin is not a current realm node".to_string(),
-            ));
+            return Ok(AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
+                reason: "revocation event origin onboarding is not yet materialized".to_string(),
+            });
         }
         return Ok(AdminEventValidation::Accepted);
     }
@@ -8407,6 +8402,38 @@ mod tests {
             AdminEventValidation::Accepted
         );
 
+        config.nodes.clear();
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&attacker)
+                    .expect("unonboarded config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("unonboarded config writes");
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("unonboarded origin validation runs"),
+            AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(id)),
+                ..
+            } if id == realm_id
+        ));
+
+        config.ensure_node(attacker.node_id, RealmNodeKind::User);
         let long_event = test_admin_event(
             Ulid::from_parts(1_654, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
@@ -8437,7 +8464,6 @@ mod tests {
                 if reason == "revoked bearer token expiry exceeds the admission window"
         ));
 
-        config.nodes[0].kind = RealmNodeKind::User;
         storage_batch_write_to(
             &storage,
             vec![target_write_entry(
@@ -8565,13 +8591,26 @@ mod tests {
             .expect("reducer state exists");
         assert!(state.materialized_revoked_tokens().contains_key(&live));
         assert!(
-            !state
+            state
                 .user_subject_ids
                 .keys()
                 .any(|path| path.contains(&expired))
         );
         let config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(!config.token_revoked(&expired, now));
         assert_eq!(config.revoked_tokens.len(), 1);
+
+        let future = now + REVOCATION_GRACE_SECS + 1;
+        state.compact_revocations(future);
+        assert!(
+            !state
+                .user_subject_ids
+                .keys()
+                .any(|path| path.contains(&expired))
+        );
+        let mut future_config = config;
+        overlay_realm_config_reducer_materialization(&mut future_config, &state, future);
+        assert_eq!(future_config.revoked_tokens.len(), 1);
     }
 
     #[tokio::test]
