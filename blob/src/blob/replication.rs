@@ -286,36 +286,34 @@ impl BlobHandler {
             }
         };
 
-        // Reserved before the replica is written so a stats failure never
-        // orphans bytes a retry would rewrite under a fresh ulid.
+        // Reserve and record the destination before the replica is written.
         let backend_root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
-            Err(err) => return BlobEvent::Error(err),
-        };
-        let backend_bucket = match self.reserve_bucket(&resolved.backend).await {
-            Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
         let ulid = Ulid::generate();
         location.backend = resolved.backend.clone();
         location.storage_class = resolved.storage_class.clone();
         location.root = backend_root;
-        location.storage_bucket = backend_bucket.clone();
         location.backend_path = match rebuild_backend_path(&location.backend_path, ulid) {
             Ok(path) => path,
-            Err(err) => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
-                return BlobEvent::Error(BlobError::ConversionError(err));
-            }
+            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
         };
         location.ulid = ulid;
+        let Some(mut reservation) = self.hold_reservation(location.ulid) else {
+            return BlobEvent::Error(BlobError::ReplicationFailed(
+                "too many active blob reservations".to_string(),
+            ));
+        };
+        let location = match self.reserve_bucket(&resolved.backend, &location).await {
+            Ok(location) => location,
+            Err(err) => return BlobEvent::Error(err),
+        };
 
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
+                _ = self.release_reservation(&location).await;
                 return BlobEvent::Error(err);
             }
         };
@@ -323,8 +321,7 @@ impl BlobHandler {
         let stream = match self.connection_handle(stream_id).await {
             Ok(stream) => stream,
             Err(event) => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
+                _ = self.release_reservation(&location).await;
                 return event;
             }
         };
@@ -334,8 +331,7 @@ impl BlobHandler {
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
+                _ = self.release_reservation(&location).await;
                 return BlobEvent::Error(e);
             }
         };
@@ -348,8 +344,7 @@ impl BlobHandler {
         {
             Ok(writer) => writer,
             Err(err) => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
+                _ = self.release_reservation(&location).await;
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
             }
         };
@@ -368,8 +363,7 @@ impl BlobHandler {
         let event = match decode_result {
             Err(err) => {
                 writer.abort().await;
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
+                _ = self.release_reservation(&location).await;
                 BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
             }
             Ok(()) => {
@@ -377,8 +371,7 @@ impl BlobHandler {
                 let actual_blake3 = writer.hasher.finalize().blake3;
                 match writer.finalize().await {
                     Err(err) => {
-                        self.release_bucket(&resolved.backend, &backend_bucket)
-                            .await;
+                        _ = self.release_reservation(&location).await;
                         BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
                     }
                     Ok(()) => {
@@ -390,14 +383,20 @@ impl BlobHandler {
                                     "failed to delete hash-mismatched replicated blob"
                                 );
                             }
-                            self.release_bucket(&resolved.backend, &backend_bucket)
-                                .await;
+                            _ = self.release_reservation(&location).await;
                             BlobEvent::Error(BlobError::IntegrityCheckFailed(
                                 "replicated content hash mismatch".to_string(),
                             ))
                         } else {
                             location.hashes = hashes;
-                            BlobEvent::ReplicationFinished { location }
+                            reservation.retain();
+                            match self.finalize_reservation(&location).await {
+                                Ok(()) => BlobEvent::ReplicationFinished { location },
+                                Err(error) => BlobEvent::Error(BlobError::WriteCleanup {
+                                    location,
+                                    message: error.to_string(),
+                                }),
+                            }
                         }
                     }
                 }

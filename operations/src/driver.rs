@@ -616,6 +616,7 @@ fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
 
 fn managed_effect(effect: &Effect) -> bool {
     match effect {
+        Effect::Blob(BlobEffect::ReleaseReservation { .. }) => true,
         Effect::Blob(BlobEffect::SpoolHidden {
             deadline: Some(_), ..
         }) => true,

@@ -100,6 +100,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         | BlobEffect::ReadHiddenRange { location, .. }
         | BlobEffect::Replicate { location, .. }
         | BlobEffect::ServeRead { location, .. } => push(&mut ids, &location.backend),
+        BlobEffect::ReleaseReservation { .. } => {}
         BlobEffect::DeleteHidden { key } => push(&mut ids, &key.backend),
         BlobEffect::SpoolHidden { .. }
         | BlobEffect::ListHidden { .. }

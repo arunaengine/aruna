@@ -76,6 +76,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ReadRange { .. } => (EffectClass::Read, "read_range"),
         BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
+        BlobEffect::ReleaseReservation { .. } => (EffectClass::Local, "release_reservation"),
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
         BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
@@ -210,6 +211,22 @@ impl BlobHandle {
             );
         }
         Event::Blob(blob_event)
+    }
+
+    pub async fn reconcile_reservation(
+        &self,
+        location: aruna_core::structs::BackendLocation,
+    ) -> Result<bool, BlobError> {
+        let effect = BlobEffect::Delete {
+            location: location.clone(),
+        };
+        let _hold = self.handler.hold_backends(&effect)?;
+        let handler = self.handler.with_group_backends(&effect).await?;
+        handler.reconcile_reservation(location).await
+    }
+
+    pub fn clear_reservation(&self, id: Ulid) {
+        self.handler.clear_active(id);
     }
 
     pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
@@ -350,6 +367,7 @@ impl BlobHandler {
             spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
             inflight: Arc::new(AtomicUsize::new(0)),
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
@@ -415,6 +433,10 @@ impl BlobHandler {
                 Box::pin(self.read_blob_range(location, range)).await
             }
             BlobEffect::Delete { location } => Box::pin(self.delete_blob(location)).await,
+            BlobEffect::ReleaseReservation { id } => {
+                self.clear_active(id);
+                BlobEvent::ReservationReleased { id }
+            }
             BlobEffect::SpoolHidden {
                 namespace,
                 name,

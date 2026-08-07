@@ -71,6 +71,9 @@ pub enum BlobEffect {
     Delete {
         location: BackendLocation,
     },
+    ReleaseReservation {
+        id: Ulid,
+    },
     SpoolHidden {
         namespace: Ulid,
         name: String,

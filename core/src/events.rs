@@ -78,6 +78,9 @@ pub enum BlobEvent {
         stream_size: u64,
     },
     DeleteFinished,
+    ReservationReleased {
+        id: Ulid,
+    },
     HiddenSpooled {
         location: BackendLocation,
         blake3: [u8; 32],
