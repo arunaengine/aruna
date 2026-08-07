@@ -60,6 +60,7 @@ use crate::request_policy::{
 const METADATA_PATH: &str = "ro-crate-metadata.json";
 const REPORT_PATH: &str = "aruna-export-report.json";
 const REMOTE_ATTEMPTS: usize = 8;
+const MAX_LOCAL_CANDIDATES: usize = REMOTE_ATTEMPTS / 2;
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
 const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
 const SCHEMA_CONTENT_HTTPS_IRI: &str = "https://schema.org/contentUrl";
@@ -611,7 +612,7 @@ async fn extend_hash_candidates(
     authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<bool, ExportFailure> {
     if let Some((cached, cached_denied)) = resolved_aliases.get(&hash) {
-        merge_candidates(candidates, cached);
+        merge_candidates(candidates, cached, MAX_LOCAL_CANDIDATES);
         *denied |= *cached_denied;
     } else {
         if !alias_cache.contains_key(&hash) {
@@ -646,7 +647,11 @@ async fn extend_hash_candidates(
         for aliases in distinct.values() {
             for alias in aliases {
                 match resolve_alias(ctx, alias, authorized_aliases).await? {
-                    ResolveResult::Candidate(candidate) => resolved.push(candidate),
+                    ResolveResult::Candidate(candidate) => {
+                        if resolved.len() < MAX_LOCAL_CANDIDATES {
+                            resolved.push(candidate);
+                        }
+                    }
                     ResolveResult::Denied => alias_denied = true,
                     ResolveResult::Missing { .. } => {}
                 }
@@ -656,7 +661,7 @@ async fn extend_hash_candidates(
         let (cached, cached_denied) = resolved_aliases
             .get(&hash)
             .ok_or_else(|| ExportFailure::Retryable("alias cache unavailable".to_string()))?;
-        merge_candidates(candidates, cached);
+        merge_candidates(candidates, cached, MAX_LOCAL_CANDIDATES);
         *denied |= *cached_denied;
     }
 
@@ -683,7 +688,7 @@ async fn extend_hash_candidates(
             expected_blake3: Some(hash),
         });
     }
-    merge_candidates(candidates, &holder_candidates);
+    merge_candidates(candidates, &holder_candidates, REMOTE_ATTEMPTS);
     Ok(false)
 }
 
@@ -745,7 +750,14 @@ fn collect_aliases(
     Ok(distinct)
 }
 
-fn merge_candidates(target: &mut Vec<ExportCandidate>, additions: &[ExportCandidate]) {
+fn merge_candidates(
+    target: &mut Vec<ExportCandidate>,
+    additions: &[ExportCandidate],
+    limit: usize,
+) {
+    if target.len() >= limit {
+        return;
+    }
     let mut local = BTreeSet::<(String, Ulid)>::new();
     let mut remote = BTreeSet::<(NodeId, [u8; 32])>::new();
     for candidate in target.iter() {
@@ -764,6 +776,9 @@ fn merge_candidates(target: &mut Vec<ExportCandidate>, additions: &[ExportCandid
         }
     }
     for candidate in additions {
+        if target.len() >= limit {
+            break;
+        }
         let insert = match &candidate.source {
             CandidateSource::Local {
                 permission_path, ..
@@ -1103,9 +1118,11 @@ fn learn_probe_hash(entity: &mut ExportEntity, candidate_index: usize, hash: [u8
         resolved_version,
         expected_blake3: Some(hash),
     };
-    if !entity.candidates.contains(&fallback) {
-        entity.candidates.push(fallback);
-    }
+    merge_candidates(
+        &mut entity.candidates,
+        std::slice::from_ref(&fallback),
+        REMOTE_ATTEMPTS,
+    );
     true
 }
 
@@ -3503,6 +3520,49 @@ mod tests {
         }
         assert_eq!(cache.len(), MAX_HASH_ALIASES);
         assert!(cache_aliases(&mut cache, [255; 32], Vec::new()).is_err());
+    }
+
+    #[test]
+    fn caps_repeated_hashes() {
+        let realm_id = RealmId::from_bytes([24; 32]);
+        let group_id = Ulid::from_bytes([25; 16]);
+        let hash = [26; 32];
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "object".to_string(),
+            ulid: Ulid::from_bytes([27; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::nil(realm_id),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+        let aliases = (0..MAX_HASH_ALIASES)
+            .map(|index| ExportCandidate {
+                source: CandidateSource::Local {
+                    location: location.clone(),
+                    group_id,
+                    permission_path: format!("/alias/{index}"),
+                },
+                report_source: ExportReportSource::Hash,
+                resolved_version: Some(Ulid::from_bytes([index as u8; 16])),
+                expected_blake3: Some(hash),
+            })
+            .collect::<Vec<_>>();
+
+        for _ in 0..3 {
+            let mut candidates = Vec::new();
+            merge_candidates(&mut candidates, &aliases, MAX_LOCAL_CANDIDATES);
+            assert_eq!(candidates.len(), MAX_LOCAL_CANDIDATES);
+            merge_candidates(&mut candidates, &aliases, MAX_LOCAL_CANDIDATES);
+            assert_eq!(candidates.len(), MAX_LOCAL_CANDIDATES);
+        }
     }
 
     #[test]
