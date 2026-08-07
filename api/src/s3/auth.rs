@@ -1,5 +1,6 @@
 use super::s3_server::S3OpLabel;
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
+use crate::rate_limit::{LocalKey, LocalLease};
 use aruna_core::credential_seal::{CredentialSealKey, SealedS3Secret};
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
@@ -156,6 +157,22 @@ impl S3Access for AuthProvider {
             .await
             .map_err(map_authorize_error)?;
         }
+
+        let Some(permit) = self
+            .rate_limits
+            .try_acquire_local(LocalKey::User(user_access.user_identity))
+        else {
+            return Err(s3_error!(SlowDown, "Reduce your request rate"));
+        };
+        let lease = cx
+            .extensions_mut()
+            .get::<LocalLease>()
+            .cloned()
+            .unwrap_or_default();
+        if !lease.hold(permit) {
+            return Err(s3_error!(SlowDown, "Reduce your request rate"));
+        }
+        cx.extensions_mut().insert(lease);
 
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(user_access);

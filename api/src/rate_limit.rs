@@ -6,6 +6,7 @@ use crate::error::ErrorResponse;
 use crate::forwarded::client_ip;
 use crate::server_state::ServerState;
 use aruna_core::structs::AuthContext;
+use aruna_core::UserId;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -14,9 +15,12 @@ use axum::response::Response;
 use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const IP_REQUESTS_PER_MINUTE: u32 = 6_000;
 const IP_BURST: u32 = 1_000;
@@ -24,8 +28,60 @@ const PRINCIPAL_REQUESTS_PER_MINUTE: u32 = 3_000;
 const PRINCIPAL_BURST: u32 = 500;
 /// Every N checks the keyed stores drop entries that are fully replenished.
 const MAINTENANCE_INTERVAL: u64 = 4_096;
+const LOCAL_PERMITS: usize = 16;
+const LOCAL_TABLE_LIMIT: usize = 4_096;
+const LOCAL_LEASE_LIMIT: usize = 2;
 
 type Keyed<K> = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum LocalKey {
+    User(UserId),
+    Ip(IpAddr),
+}
+
+#[derive(Default)]
+struct LocalTable {
+    entries: HashMap<LocalKey, Weak<Semaphore>>,
+}
+
+impl LocalTable {
+    fn try_acquire(&mut self, key: LocalKey) -> Option<OwnedSemaphorePermit> {
+        self.entries.retain(|_, entry| entry.strong_count() != 0);
+        let semaphore = match self.entries.get(&key).and_then(Weak::upgrade) {
+            Some(semaphore) => semaphore,
+            None => {
+                if self.entries.len() >= LOCAL_TABLE_LIMIT {
+                    return None;
+                }
+                let semaphore = Arc::new(Semaphore::new(LOCAL_PERMITS));
+                self.entries.insert(key, Arc::downgrade(&semaphore));
+                semaphore
+            }
+        };
+        semaphore.try_acquire_owned().ok()
+    }
+}
+
+/// A request extension that keeps local admission permits alive through the
+/// response body. The server may clone this slot before handing the request to
+/// s3s and move its clone into the response wrapper.
+#[derive(Clone, Default)]
+pub(crate) struct LocalLease(Arc<Mutex<Vec<OwnedSemaphorePermit>>>);
+
+impl LocalLease {
+    pub(crate) fn hold(&self, permit: OwnedSemaphorePermit) -> bool {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.len() >= LOCAL_LEASE_LIMIT {
+            return false;
+        }
+        slot.push(permit);
+        true
+    }
+}
 
 impl std::fmt::Debug for ApiRateLimits {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,6 +94,7 @@ pub struct ApiRateLimits {
     per_principal: Keyed<String>,
     clock: DefaultClock,
     checks: AtomicU64,
+    local: Mutex<LocalTable>,
 }
 
 impl Default for ApiRateLimits {
@@ -65,7 +122,15 @@ impl ApiRateLimits {
             per_principal: RateLimiter::keyed(quota(principal_per_minute, burst)),
             clock: DefaultClock::default(),
             checks: AtomicU64::new(0),
+            local: Mutex::new(LocalTable::default()),
         }
+    }
+
+    pub(crate) fn try_acquire_local(&self, key: LocalKey) -> Option<OwnedSemaphorePermit> {
+        self.local
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_acquire(key)
     }
 
     /// Tight quotas for tests that must observe a denial quickly.
@@ -176,9 +241,12 @@ fn too_many_requests(retry_after: u64) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::ApiRateLimits;
+    use super::{ApiRateLimits, LocalKey, LocalLease, LOCAL_PERMITS, LOCAL_TABLE_LIMIT};
+    use aruna_core::structs::RealmId;
+    use aruna_core::UserId;
     use std::net::IpAddr;
     use std::str::FromStr;
+    use ulid::Ulid;
 
     #[test]
     fn limits_by_ip() {
@@ -220,5 +288,71 @@ mod tests {
         assert!(limits.check_principal("user-a").is_ok());
         assert!(limits.check_principal("user-a").is_ok());
         assert!(limits.check_principal("user-a").is_err());
+    }
+
+    fn user(number: u128) -> UserId {
+        UserId::local(Ulid::from_u128(number), RealmId([1u8; 32]))
+    }
+
+    #[test]
+    fn limits_local_user() {
+        let limits = ApiRateLimits::default();
+        let key = LocalKey::User(user(1));
+        let mut permits = Vec::new();
+        for _ in 0..LOCAL_PERMITS {
+            permits.push(limits.try_acquire_local(key).expect("local permit"));
+        }
+        assert!(limits.try_acquire_local(key).is_none());
+        drop(permits.pop());
+        assert!(limits.try_acquire_local(key).is_some());
+    }
+
+    #[test]
+    fn permits_distinct_users() {
+        let limits = ApiRateLimits::default();
+        assert!(limits
+            .try_acquire_local(LocalKey::User(user(1)))
+            .is_some());
+        assert!(limits
+            .try_acquire_local(LocalKey::User(user(2)))
+            .is_some());
+    }
+
+    #[test]
+    fn prunes_dead_local() {
+        let limits = ApiRateLimits::default();
+        let mut permits = Vec::with_capacity(LOCAL_TABLE_LIMIT);
+        for number in 0..LOCAL_TABLE_LIMIT as u128 {
+            permits.push(
+                limits
+                    .try_acquire_local(LocalKey::User(user(number)))
+                    .expect("table entry permit"),
+            );
+        }
+        assert!(limits
+            .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
+            .is_none());
+        drop(permits);
+        assert!(limits
+            .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
+            .is_some());
+    }
+
+    #[test]
+    fn clone_keeps_lease() {
+        let limits = ApiRateLimits::default();
+        let key = LocalKey::User(user(3));
+        let mut permits = Vec::new();
+        for _ in 0..LOCAL_PERMITS - 1 {
+            permits.push(limits.try_acquire_local(key).expect("local permit"));
+        }
+        let lease = LocalLease::default();
+        assert!(lease.hold(limits.try_acquire_local(key).expect("local permit")));
+        let clone = lease.clone();
+        drop(lease);
+        assert!(limits.try_acquire_local(key).is_none());
+        drop(clone);
+        assert!(limits.try_acquire_local(key).is_some());
+        drop(permits);
     }
 }
