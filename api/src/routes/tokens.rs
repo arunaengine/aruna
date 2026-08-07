@@ -4,7 +4,7 @@ use crate::auth::{
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::metadata::map_metadata_api_error;
 use crate::server_state::ServerState;
-use aruna_core::auth::bearer_token_hash;
+use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::driver::drive;
@@ -69,6 +69,10 @@ pub async fn revoke_token(
         .await
         .map_err(|_| ServerError::BadRequest)?;
     let expires_at = claims.exp;
+    let now = unix_timestamp_secs();
+    if !valid_revocation_expiry(expires_at, now) {
+        return Err(ServerError::BadRequest);
+    }
     let subject: AuthContext = claims.try_into().map_err(|_| ServerError::BadRequest)?;
     if auth.user_id != subject.user_id && !user_origin {
         ensure_permission(
@@ -115,7 +119,7 @@ pub async fn revoke_token(
             } else {
                 RevokeTokenAdmission::Privileged
             },
-            now: unix_timestamp_secs(),
+            now,
         }),
         ctx.as_ref(),
     )
@@ -129,6 +133,7 @@ fn map_revoke_error(error: RevokeTokenError) -> ServerError {
         RevokeTokenError::CapacityReached => {
             ServerError::ServiceUnavailableReason("token_revocation_capacity_reached".to_string())
         }
+        RevokeTokenError::InvalidTokenExpiry => ServerError::BadRequest,
         error => ServerError::InternalError(error.to_string()),
     }
 }

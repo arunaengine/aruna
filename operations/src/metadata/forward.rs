@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::auth::bearer_token_hash;
+use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
@@ -16,6 +16,7 @@ use aruna_core::structs::{
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
+use rand::seq::SliceRandom;
 use thiserror::Error;
 use tracing::{error, warn};
 use ulid::Ulid;
@@ -161,12 +162,9 @@ pub async fn forward_token_revoke(
         return Err(MetadataApiError::ServiceUnavailable);
     }
 
-    let digest = blake3::hash(token.as_bytes());
-    let start = usize::from(u16::from_be_bytes([
-        digest.as_bytes()[0],
-        digest.as_bytes()[1],
-    ])) % peers.len();
-    peers.rotate_left(start);
+    let mut seen = HashSet::new();
+    peers.retain(|peer| seen.insert(*peer));
+    peers.shuffle(&mut rand::rng());
     let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
     run_revoke(&peers, message, |peer, message| {
         metadata.request_forwarded_write(peer, message)
@@ -205,9 +203,6 @@ where
             }
             Err(error) => {
                 warn!(%peer, %error, "Failed to forward a token revocation");
-                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
-                    return Err(MetadataApiError::ServiceUnavailable);
-                }
             }
         }
     }
@@ -1022,6 +1017,10 @@ pub(crate) async fn apply_token_revoke(
         Err(error) => return reject(format!("invalid token revocation target: {error}")),
     };
     let expires_at = claims.exp;
+    let now = unix_timestamp_secs();
+    if !valid_revocation_expiry(expires_at, now) {
+        return reject("token revocation expiry is outside the supported window");
+    }
     let subject: AuthContext = match claims.try_into() {
         Ok(subject) => subject,
         Err(error) => return reject(format!("invalid token revocation subject: {error}")),
@@ -1056,7 +1055,7 @@ pub(crate) async fn apply_token_revoke(
             } else {
                 RevokeTokenAdmission::Privileged
             },
-            now: unix_timestamp_secs(),
+            now,
         }),
         context.as_ref(),
     )
@@ -1720,6 +1719,26 @@ mod tests {
             } else {
                 MetadataTransportMessage::ForwardedTokenRevoked
             }))
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, peers);
+    }
+
+    #[tokio::test]
+    async fn retries_possible_send() {
+        let peers = vec![node(1), node(2)];
+        let mut calls = Vec::new();
+        let result = run_revoke(&peers, revoke_message(), |peer, _| {
+            calls.push(peer);
+            if peer == peers[0] {
+                std::future::ready(Err(MetadataRequestError::possibly_sent(
+                    MetadataError::HandleMissing,
+                )))
+            } else {
+                std::future::ready(Ok(MetadataTransportMessage::ForwardedTokenRevoked))
+            }
         })
         .await;
 
