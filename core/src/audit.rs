@@ -117,6 +117,17 @@ impl AuditPageBatch {
             self.mark_missing(node);
             return Err(error);
         }
+        // Page validation bounds the owned input before this bounded batch clone.
+        let mut staged = self.clone();
+        if let Err(error) = staged.merge_page(node, page) {
+            self.mark_missing(node);
+            return Err(error);
+        }
+        *self = staged;
+        Ok(())
+    }
+
+    fn merge_page(&mut self, node: NodeId, page: AuditPageResponse) -> Result<(), AuditPageError> {
         if !self.mark_complete(node) {
             return Err(AuditPageError::TooManyPeers);
         }
@@ -138,7 +149,6 @@ impl AuditPageBatch {
                     .map_err(|_| AuditPageError::TooLarge)?
                     .len();
             if self.bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
-                self.mark_missing(node);
                 return Err(AuditPageError::TooLarge);
             }
             match self.records.entry(entry.key.clone()) {
@@ -171,8 +181,7 @@ impl AuditPageBatch {
                                 && self.bytes.saturating_add(entry_bytes - current_bytes)
                                     > MAX_AUDIT_BATCH_BYTES
                             {
-                                self.mark_missing(node);
-                                continue;
+                                return Err(AuditPageError::TooLarge);
                             }
                             self.bytes = self.bytes.saturating_sub(current_bytes);
                             self.bytes = self.bytes.saturating_add(entry_bytes);
@@ -408,4 +417,98 @@ fn invalid_iri(record: &MetadataAuditRecord) -> bool {
 fn key_document(key: &[u8]) -> Option<Ulid> {
     let bytes = key.get(16..32)?.try_into().ok()?;
     Some(Ulid::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::MetadataAuditOperation;
+    use crate::types::UserId;
+
+    fn key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Vec<u8> {
+        let mut key = Vec::with_capacity(AUDIT_KEY_BYTES);
+        key.extend_from_slice(&group_id.to_bytes());
+        key.extend_from_slice(&document_id.to_bytes());
+        key.extend_from_slice(&audit_id.to_bytes());
+        key
+    }
+
+    fn entry(
+        group_id: GroupId,
+        document_id: Ulid,
+        audit_id: Ulid,
+        realm_id: RealmId,
+        node: NodeId,
+    ) -> AuditPageEntry {
+        AuditPageEntry {
+            key: key(group_id, document_id, audit_id),
+            record: MetadataAuditRecord {
+                realm_id,
+                group_id,
+                document_id,
+                graph_iri: "urn:test".to_string(),
+                user_id: UserId::local(Ulid::from_bytes([1u8; 16]), realm_id),
+                node_id: node,
+                operation: MetadataAuditOperation::Create,
+                occurred_at_ms: 1,
+                details: Some("detail".to_string()),
+            },
+        }
+    }
+
+    fn request(realm_id: RealmId, group_id: GroupId, document_id: Ulid) -> AuditPageRequest {
+        AuditPageRequest {
+            auth_token: None,
+            config_digest: [0u8; 32],
+            realm_id,
+            group_id,
+            document_id: Some(document_id),
+            start_after: None,
+            limit: MAX_AUDIT_RECORDS,
+        }
+    }
+
+    #[test]
+    fn overflow_page_atomic() {
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let document_id = Ulid::from_bytes([3u8; 16]);
+        let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let request = request(realm_id, group_id, document_id);
+        let first = entry(
+            group_id,
+            document_id,
+            Ulid::from_bytes([1u8; 16]),
+            realm_id,
+            node,
+        );
+        let second = entry(
+            group_id,
+            document_id,
+            Ulid::from_bytes([2u8; 16]),
+            realm_id,
+            node,
+        );
+        let mut batch = AuditPageBatch::new();
+        let first_bytes = first.key.len() + postcard::to_allocvec(&first.record).unwrap().len();
+        // Seed accounting just below the cap so the second entry would overflow.
+        batch.bytes = MAX_AUDIT_BATCH_BYTES - first_bytes;
+        let bytes = batch.bytes;
+
+        let error = batch.add_page(
+            node,
+            AuditPageResponse {
+                records: vec![first, second.clone()],
+                next_start_after: Some(second.key),
+            },
+            &request,
+        );
+
+        assert_eq!(error, Err(AuditPageError::TooLarge));
+        assert!(batch.records.is_empty());
+        assert_eq!(batch.bytes, bytes);
+        assert!(batch.horizon.is_none());
+        assert!(!batch.completed_nodes.contains(&node));
+        assert!(batch.missing_nodes.contains(&node));
+    }
 }

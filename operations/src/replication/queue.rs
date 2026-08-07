@@ -138,6 +138,17 @@ struct BlobReplicationJobScan {
     next_cursor: ReplicationScanCursor,
 }
 
+struct RelationshipPage {
+    values: Vec<(Vec<u8>, SyncRelationship)>,
+    next: Option<Vec<u8>>,
+}
+
+struct LiveRepairWrite {
+    queued: usize,
+    continuation: Option<LiveReplicationContinuation>,
+    progressed: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct ReplicationScanCursor {
     generation: u64,
@@ -1803,23 +1814,57 @@ async fn process_live_replication_obligations(
 ) -> Result<LiveReplicationRepairResult, BlobReplicationQueueError> {
     let (obligations, has_more) =
         read_live_replication_obligations(&context.storage_handle).await?;
-    let mut relationship_cache = HashMap::new();
-    let mut relationship_work = 0usize;
+    let mut starts = HashMap::<String, Option<Vec<u8>>>::new();
     for (_, obligation) in &obligations {
         if obligation
             .origin
             .as_ref()
             .is_some_and(|origin| origin.hop_count >= 4)
-            || relationship_cache.contains_key(&obligation.bucket)
+            || obligation
+                .continuation
+                .as_ref()
+                .is_some_and(|cursor| cursor.relationships_complete)
         {
             continue;
         }
+        let start = obligation
+            .continuation
+            .as_ref()
+            .and_then(|cursor| cursor.relationship_after.clone());
+        starts
+            .entry(obligation.bucket.clone())
+            .and_modify(|current| {
+                let replace = match (current.as_ref(), start.as_ref()) {
+                    (Some(current), Some(start)) => start < current,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if replace {
+                    *current = start.clone();
+                }
+            })
+            .or_insert(start);
+    }
+    let mut relationship_cache = HashMap::<String, RelationshipPage>::new();
+    let mut relationship_work = 0usize;
+    for (bucket, start) in starts {
         let remaining = LIVE_REPLICATION_RELATIONSHIP_LIMIT.saturating_sub(relationship_work);
-        let relationships =
-            read_relationships_limit(&context.storage_handle, &obligation.bucket, remaining)
-                .await?;
-        relationship_work = relationship_work.saturating_add(relationships.len());
-        relationship_cache.insert(obligation.bucket.clone(), relationships);
+        if remaining == 0 {
+            break;
+        }
+        let page =
+            read_relationships_limit(&context.storage_handle, &bucket, start, remaining).await?;
+        relationship_work = relationship_work.saturating_add(page.values.len());
+        relationship_cache.insert(bucket, page);
+    }
+    let mut config_cache = HashMap::new();
+    for (_, obligation) in &obligations {
+        if obligation.origin.is_none() && !config_cache.contains_key(&obligation.bucket) {
+            config_cache.insert(
+                obligation.bucket.clone(),
+                read_bucket_replication_config(&context.storage_handle, &obligation.bucket).await?,
+            );
+        }
     }
     let mut result = LiveReplicationRepairResult {
         has_more,
@@ -1827,14 +1872,40 @@ async fn process_live_replication_obligations(
     };
 
     for (obligation_key, obligation) in obligations {
-        let relationships = relationship_cache
+        let cursor = obligation.continuation.clone().unwrap_or_default();
+        let relationships = if cursor.relationships_complete {
+            None
+        } else {
+            relationship_cache.get(&obligation.bucket)
+        };
+        if !cursor.relationships_complete && relationships.is_none() {
+            result.has_more = true;
+            continue;
+        }
+        let config = config_cache
             .get(&obligation.bucket)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let queued = write_live_jobs(&context.storage_handle, &obligation, relationships).await?;
-        delete_live_obligation(&context.storage_handle, obligation_key).await?;
+            .and_then(|config| config.as_ref());
+        let write =
+            write_live_jobs(&context.storage_handle, &obligation, relationships, config).await?;
+        if !write.progressed {
+            result.has_more = true;
+            continue;
+        }
+        if let Some(continuation) = write.continuation {
+            let mut next = obligation.clone();
+            next.continuation = Some(continuation);
+            write_live_obligation(&context.storage_handle, &next).await?;
+            result.has_more = true;
+        } else {
+            delete_live_obligation(
+                &context.storage_handle,
+                obligation_key,
+                obligation.continuation.as_ref(),
+            )
+            .await?;
+        }
         result.processed = result.processed.saturating_add(1);
-        result.queued = result.queued.saturating_add(queued);
+        result.queued = result.queued.saturating_add(write.queued);
     }
 
     Ok(result)
@@ -1864,7 +1935,7 @@ async fn read_live_replication_obligations(
                     Err(error) => {
                         let key = key.to_vec();
                         warn!(error = %error, key = ?key, "Deleting malformed live replication obligation");
-                        delete_live_obligation(storage, key).await?;
+                        delete_live_obligation(storage, key, None).await?;
                     }
                 }
             }
@@ -1893,6 +1964,112 @@ async fn read_bucket_replication_config(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
         }) => Ok(BucketInfo::from_bytes(value.as_ref())?.replication),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+fn continuation_newer(
+    candidate: &LiveReplicationContinuation,
+    current: &LiveReplicationContinuation,
+) -> bool {
+    if candidate.relationships_complete != current.relationships_complete {
+        return candidate.relationships_complete;
+    }
+    if candidate.relationships_complete {
+        return candidate.config_after > current.config_after;
+    }
+    match (&candidate.relationship_after, &current.relationship_after) {
+        (Some(candidate), Some(current)) => candidate > current,
+        (Some(_), None) => true,
+        (None, Some(_)) | (None, None) => false,
+    }
+}
+
+async fn write_live_obligation(
+    storage: &StorageHandle,
+    record: &LiveReplicationObligationRecord,
+) -> Result<(), BlobReplicationQueueError> {
+    let (key_space, key, value) = live_replication_obligation_write_entry(record)?;
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let (current, valid) = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.clone(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => (None, true),
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => match LiveReplicationObligationRecord::from_bytes(&value) {
+            Ok(record) => (Some(record), true),
+            Err(_) => (None, false),
+        },
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_cursor(storage, txn_id).await;
+            return Err(error.into());
+        }
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let should_write = !valid
+        || match current.as_ref() {
+            None => true,
+            Some(current) => match (record.continuation.as_ref(), current.continuation.as_ref()) {
+                (Some(candidate), Some(current)) => continuation_newer(candidate, current),
+                (Some(_), None) => true,
+                (None, None) | (None, Some(_)) => false,
+            },
+        };
+    if !should_write {
+        abort_cursor(storage, txn_id).await;
+        return Ok(());
+    }
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_cursor(storage, txn_id).await;
+            return Err(error.into());
+        }
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -1943,22 +2120,24 @@ async fn read_relationships(
 async fn read_relationships_limit(
     storage: &StorageHandle,
     bucket: &str,
+    start: Option<Vec<u8>>,
     limit: usize,
-) -> Result<Vec<SyncRelationship>, BlobReplicationQueueError> {
-    if limit == 0 {
-        return Err(BlobReplicationQueueError::UnexpectedEvent(
-            "live replication relationship limit exceeded".to_string(),
-        ));
-    }
-    let mut start_after = None;
+) -> Result<RelationshipPage, BlobReplicationQueueError> {
+    let mut start_after = start.clone();
     let mut relationships = Vec::with_capacity(limit.min(REPLICATION_SCAN_PAGE_SIZE));
+    if limit == 0 {
+        return Ok(RelationshipPage {
+            values: relationships,
+            next: None,
+        });
+    }
     loop {
         let page_limit = (limit - relationships.len()).min(REPLICATION_SCAN_PAGE_SIZE);
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
                 prefix: Some(sync_relationship_prefix(bucket).into()),
-                start: start_after.take().map(IterStart::After),
+                start: start_after.take().map(|key| IterStart::After(key.into())),
                 limit: page_limit,
                 txn_id: None,
             })
@@ -1978,19 +2157,22 @@ async fn read_relationships_limit(
         for (key, value) in values {
             let relationship = SyncRelationship::from_bytes(&value)?;
             validate_sync_key(bucket, &key, &relationship)?;
-            relationships.push(relationship);
+            relationships.push((key.to_vec(), relationship));
         }
         if relationships.len() == limit {
-            if next_start_after.is_some() {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(
-                    "live replication relationship limit exceeded".to_string(),
-                ));
-            }
-            return Ok(relationships);
+            return Ok(RelationshipPage {
+                values: relationships,
+                next: next_start_after.map(|key| key.to_vec()),
+            });
         }
         match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(relationships),
+            Some(next) => start_after = Some(next.to_vec()),
+            None => {
+                return Ok(RelationshipPage {
+                    values: relationships,
+                    next: None,
+                });
+            }
         }
     }
 }
@@ -1998,14 +2180,19 @@ async fn read_relationships_limit(
 async fn write_live_jobs(
     storage: &StorageHandle,
     obligation: &LiveReplicationObligationRecord,
-    relationships: &[SyncRelationship],
-) -> Result<usize, BlobReplicationQueueError> {
+    relationships: Option<&RelationshipPage>,
+    config: Option<&BucketReplicationConfig>,
+) -> Result<LiveRepairWrite, BlobReplicationQueueError> {
     if obligation
         .origin
         .as_ref()
         .is_some_and(|origin| origin.hop_count >= 4)
     {
-        return Ok(0);
+        return Ok(LiveRepairWrite {
+            queued: 0,
+            continuation: None,
+            progressed: true,
+        });
     }
     let inbound_source = match obligation.origin.as_ref() {
         Some(origin) => read_inbound_source(storage, &obligation.bucket, origin).await?,
@@ -2019,76 +2206,116 @@ async fn write_live_jobs(
     {
         upstream_sources.push(source);
     }
-    let mut relationship_jobs =
-        Vec::with_capacity(relationships.len().min(LIVE_REPLICATION_JOB_LIMIT));
+    let mut cursor = obligation.continuation.clone().unwrap_or_default();
+    let mut relationship_jobs = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
     let mut relationship_targets = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
-    for relationship in relationships {
-        let target = relationship
-            .target
-            .bucket()
-            .map(|bucket| (relationship.target.node_id, bucket.to_string()));
-        if let Some(job) = relationship_job(
-            obligation.local_node_id,
-            RelationshipJobTarget {
-                bucket: &obligation.bucket,
-                key: &obligation.key,
-                version_id: obligation.version_id,
-                delete_marker: obligation.delete_marker,
-            },
-            relationship,
-            obligation.origin.as_ref(),
-            &upstream_sources,
-        )
-        .map(|job| job.with_writer_auth(obligation.auth_context.clone()))
-        {
-            if relationship_jobs.len() >= LIVE_REPLICATION_JOB_LIMIT {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(
-                    "live replication job limit exceeded".to_string(),
-                ));
+    if !cursor.relationships_complete {
+        let Some(page) = relationships else {
+            return Ok(LiveRepairWrite {
+                queued: 0,
+                continuation: None,
+                progressed: false,
+            });
+        };
+        let mut found = false;
+        let mut complete = page.next.is_none();
+        for (index, (key, relationship)) in page.values.iter().enumerate() {
+            if cursor
+                .relationship_after
+                .as_ref()
+                .is_some_and(|after| key <= after)
+            {
+                continue;
             }
-            relationship_jobs.push(job);
-            if let Some(target) = target {
-                relationship_targets.push(target);
+            found = true;
+            cursor.relationship_after = Some(key.clone());
+            let target = relationship
+                .target
+                .bucket()
+                .map(|bucket| (relationship.target.node_id, bucket.to_string()));
+            if let Some(job) = relationship_job(
+                obligation.local_node_id,
+                RelationshipJobTarget {
+                    bucket: &obligation.bucket,
+                    key: &obligation.key,
+                    version_id: obligation.version_id,
+                    delete_marker: obligation.delete_marker,
+                },
+                relationship.clone(),
+                obligation.origin.as_ref(),
+                &upstream_sources,
+            )
+            .map(|job| job.with_writer_auth(obligation.auth_context.clone()))
+            {
+                if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
+                    complete = false;
+                    break;
+                }
+                relationship_jobs.push(job);
+                if let Some(target) = target {
+                    relationship_targets.push(target);
+                }
+                if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
+                    complete = index + 1 == page.values.len() && page.next.is_none();
+                    break;
+                }
             }
+        }
+        if !found {
+            if page.next.is_none() {
+                cursor.relationship_after = None;
+                cursor.relationships_complete = true;
+            } else {
+                return Ok(LiveRepairWrite {
+                    queued: 0,
+                    continuation: None,
+                    progressed: false,
+                });
+            }
+        } else if complete {
+            cursor.relationship_after = None;
+            cursor.relationships_complete = true;
+        } else {
+            cursor.relationships_complete = false;
+            cursor.config_after = 0;
         }
     }
-    let legacy_jobs = match (
-        obligation.origin.is_none(),
-        read_bucket_replication_config(storage, &obligation.bucket).await?,
-    ) {
-        (true, Some(config)) => {
-            let config = filter_config(config, &relationship_targets);
-            let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(relationship_jobs.len());
-            if count_config_jobs(obligation.local_node_id, obligation.delete_marker, &config)
-                > available
-            {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(
-                    "live replication job limit exceeded".to_string(),
-                ));
-            }
-            live_replication_jobs_from_config(
-                obligation.local_node_id,
-                &obligation.auth_context,
-                &obligation.bucket,
-                &obligation.key,
-                obligation.version_id,
-                obligation.delete_marker,
-                config,
-            )
+    let mut continuation = (!cursor.relationships_complete).then(|| cursor.clone());
+    if cursor.relationships_complete
+        && obligation.origin.is_none()
+        && let Some(config) = config
+    {
+        let config = filter_config(config.clone(), &relationship_targets);
+        let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(relationship_jobs.len());
+        let (legacy, next_config) = config_jobs_page(
+            obligation.local_node_id,
+            &obligation.auth_context,
+            &obligation.bucket,
+            &obligation.key,
+            obligation.version_id,
+            obligation.delete_marker,
+            config,
+            cursor.config_after,
+            available,
+        );
+        relationship_jobs.extend(legacy);
+        if let Some(next_config) = next_config {
+            cursor.config_after = next_config;
+            continuation = Some(cursor);
+        } else {
+            cursor.config_after = 0;
+            continuation = None;
         }
-        (false, _) | (_, None) => Vec::new(),
-    };
-    relationship_jobs.extend(legacy_jobs);
+    }
     let jobs = relationship_jobs;
     if jobs.is_empty() {
-        return Ok(0);
+        return Ok(LiveRepairWrite {
+            queued: 0,
+            continuation,
+            progressed: true,
+        });
     }
 
-    if jobs.len() > LIVE_REPLICATION_JOB_LIMIT {
-        return Err(BlobReplicationQueueError::UnexpectedEvent(
-            "live replication job limit exceeded".to_string(),
-        ));
-    }
     let reads = jobs
         .iter()
         .map(|job| {
@@ -2119,7 +2346,7 @@ async fn write_live_jobs(
         ));
     }
 
-    let mut writes = Vec::new();
+    let mut writes = Vec::with_capacity(jobs.len());
     for (job, (_, value)) in jobs.iter().zip(values) {
         match value {
             Some(value) => match BlobReplicationJobRecord::from_bytes(&value) {
@@ -2130,7 +2357,11 @@ async fn write_live_jobs(
         }
     }
     if writes.is_empty() {
-        return Ok(0);
+        return Ok(LiveRepairWrite {
+            queued: 0,
+            continuation,
+            progressed: true,
+        });
     }
     match storage
         .send_storage_effect(StorageEffect::BatchWrite {
@@ -2139,7 +2370,11 @@ async fn write_live_jobs(
         })
         .await
     {
-        Event::Storage(StorageEvent::BatchWriteResult { entries }) => Ok(entries.len()),
+        Event::Storage(StorageEvent::BatchWriteResult { entries }) => Ok(LiveRepairWrite {
+            queued: entries.len(),
+            continuation,
+            progressed: true,
+        }),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -2187,16 +2422,76 @@ async fn read_inbound_source(
 async fn delete_live_obligation(
     storage: &StorageHandle,
     key: Vec<u8>,
+    expected: Option<&LiveReplicationContinuation>,
 ) -> Result<(), BlobReplicationQueueError> {
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let current = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key: ByteView::from(key.clone()),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_cursor(storage, txn_id).await;
+            return Err(error.into());
+        }
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let should_delete = match current {
+        None => false,
+        Some(value) => match LiveReplicationObligationRecord::from_bytes(&value) {
+            Ok(record) => record.continuation.as_ref() == expected,
+            Err(_) => expected.is_none(),
+        },
+    };
+    if !should_delete {
+        abort_cursor(storage, txn_id).await;
+        return Ok(());
+    }
     match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             key: ByteView::from(key),
-            txn_id: None,
+            txn_id: Some(txn_id),
         })
         .await
     {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_cursor(storage, txn_id).await;
+            return Err(error.into());
+        }
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -3571,14 +3866,16 @@ mod tests {
         let relationships = read_relationships_limit(
             &storage,
             &obligation.bucket,
+            None,
             LIVE_REPLICATION_RELATIONSHIP_LIMIT,
         )
         .await
         .unwrap();
         assert_eq!(
-            write_live_jobs(&storage, &obligation, &relationships)
+            write_live_jobs(&storage, &obligation, Some(&relationships), None)
                 .await
-                .unwrap(),
+                .unwrap()
+                .queued,
             1
         );
         let jobs = read_jobs(&storage).await;
