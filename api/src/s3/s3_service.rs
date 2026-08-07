@@ -3024,8 +3024,14 @@ impl S3 for ArunaS3Service {
         let body = req
             .extensions
             .get::<DeleteObjectsBody>()
-            .ok_or_else(|| s3_error!(InternalError, "Missing DeleteObjects request body"))?
-            .bytes();
+            .ok_or_else(|| s3_error!(InternalError, "Missing DeleteObjects request body"))?;
+        if body.exceeded() {
+            return Err(s3_error!(
+                MaxMessageLengthExceeded,
+                "DeleteObjects request body exceeds 2 MiB"
+            ));
+        }
+        let body = body.take_bytes();
         validate_delete_checksum(&req.headers, &body)?;
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {

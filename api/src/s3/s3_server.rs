@@ -23,22 +23,32 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::HttpError;
 use s3s::HttpResponse;
 use s3s::host::SingleDomain;
+use s3s::s3_error;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, Semaphore, TryAcquireError};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, trace};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const DELETE_OBJECTS_MAX_BODY: usize = 2 * 1024 * 1024;
+const MAX_H2_STREAMS: u32 = 32;
+
+fn h2_stream_limit(max_requests: usize) -> u32 {
+    max_requests.clamp(1, MAX_H2_STREAMS as usize) as u32
+}
 
 /// Concurrent S3 connections served at once; connections at capacity are
 /// dropped so a flood cannot spawn unbounded connection tasks.
@@ -55,21 +65,48 @@ pub const DEFAULT_S3_MAX_CONCURRENT_REQUESTS: usize = 512;
 #[derive(Clone)]
 pub struct S3OpLabel(Arc<OnceLock<String>>);
 
+#[derive(Default)]
+struct DeleteObjectsState {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct DeleteObjectsBody(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct DeleteObjectsBody(Arc<Mutex<DeleteObjectsState>>);
 
 impl DeleteObjectsBody {
-    pub(crate) fn bytes(&self) -> Vec<u8> {
+    fn append(&self, data: &[u8]) -> usize {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = DELETE_OBJECTS_MAX_BODY.saturating_sub(state.bytes.len());
+        let copied = data.len().min(remaining);
+        state.bytes.extend_from_slice(&data[..copied]);
+        state.exceeded |= copied < data.len();
+        copied
+    }
+
+    pub(crate) fn take_bytes(&self) -> Vec<u8> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut state.bytes)
+    }
+
+    pub(crate) fn exceeded(&self) -> bool {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .exceeded
     }
 }
 
 struct CaptureDeleteObjectsBody {
     inner: Pin<Box<Incoming>>,
     captured: DeleteObjectsBody,
+    ended: bool,
 }
 
 impl hyper::body::Body for CaptureDeleteObjectsBody {
@@ -80,27 +117,46 @@ impl hyper::body::Body for CaptureDeleteObjectsBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
         match self.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    self.captured
-                        .0
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .extend_from_slice(data);
+                let Some(data) = frame.data_ref() else {
+                    return Poll::Ready(Some(Ok(frame)));
+                };
+                let copied = self.captured.append(data);
+                if copied < data.len() {
+                    self.ended = true;
+                    return Poll::Ready(Some(Ok(hyper::body::Frame::data(data.slice(..copied)))));
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            other => other,
+            Poll::Ready(None) => {
+                self.ended = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.ended = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.ended || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
+        let mut hint = self.inner.size_hint();
+        if hint
+            .upper()
+            .is_none_or(|upper| upper > DELETE_OBJECTS_MAX_BODY as u64)
+        {
+            hint.set_upper(DELETE_OBJECTS_MAX_BODY as u64);
+        }
+        hint
     }
 }
 
@@ -156,30 +212,199 @@ pub struct S3Server {
     seal_key: CredentialSealKey,
     connection_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
+    max_requests: usize,
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
 #[derive(Default)]
-struct FirstRequest {
-    seen: AtomicBool,
+struct ConnectionActivity {
+    generation: AtomicU64,
+    cancelled: AtomicBool,
     notify: Notify,
 }
 
-impl FirstRequest {
-    fn mark(&self) {
-        if !self.seen.swap(true, Ordering::Release) {
-            self.notify.notify_one();
+impl ConnectionActivity {
+    fn touch(&self) {
+        if !self.cancelled.load(Ordering::Acquire) {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.notify.notify_waiters();
         }
     }
 
-    fn seen(&self) -> bool {
-        self.seen.load(Ordering::Acquire)
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
-    async fn wait(&self) {
-        if !self.seen() {
-            self.notify.notified().await;
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn wait_cancelled(&self) {
+        while !self.is_cancelled() {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let generation = self.generation.load(Ordering::Acquire);
+            let notified = self.notify.notified();
+            if generation != self.generation.load(Ordering::Acquire) {
+                continue;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(CONNECTION_IDLE_TIMEOUT) => {
+                    if generation == self.generation.load(Ordering::Acquire) {
+                        self.cancel();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ActivityStream<S> {
+    inner: S,
+    activity: Arc<ConnectionActivity>,
+}
+
+impl<S> ActivityStream<S> {
+    fn new(inner: S, activity: Arc<ConnectionActivity>) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ActivityStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result
+            && buf.filled().len() > before
+        {
+            self.activity.touch();
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(written)) = result
+            && written > 0
+        {
+            self.activity.touch();
+        }
+        result
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(written)) = result
+            && written > 0
+        {
+            self.activity.touch();
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct ResponseBody {
+    inner: Pin<Box<s3s::Body>>,
+    permit: Option<OwnedSemaphorePermit>,
+    activity: Arc<ConnectionActivity>,
+    ended: bool,
+}
+
+impl ResponseBody {
+    fn new(
+        inner: s3s::Body,
+        permit: OwnedSemaphorePermit,
+        activity: Arc<ConnectionActivity>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            permit: Some(permit),
+            activity,
+            ended: false,
+        }
+    }
+}
+
+impl hyper::body::Body for ResponseBody {
+    type Data = hyper::body::Bytes;
+    type Error = s3s::StdError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        if self.activity.is_cancelled() {
+            self.ended = true;
+            self.permit.take();
+            return Poll::Ready(Some(Err(Box::new(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "S3 connection became idle",
+            )))));
+        }
+        match self.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(None) => {
+                self.ended = true;
+                self.permit.take();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.ended = true;
+                self.permit.take();
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -197,8 +422,8 @@ pub struct WrappingService {
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
     // Held across each request so concurrent expensive processing is bounded.
     request_limit: Arc<Semaphore>,
-    // Disarms the connection's initial deadline after its first complete request.
-    first_request: Option<Arc<FirstRequest>>,
+    // Cancels request and response futures when the connection has no I/O progress.
+    activity: Option<Arc<ConnectionActivity>>,
     // Proxies whose forwarded client address may be charged instead of the peer.
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
@@ -265,6 +490,7 @@ impl S3Server {
             seal_key,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONNECTIONS)),
             request_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONCURRENT_REQUESTS)),
+            max_requests: DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
             trusted_proxies: Arc::new(Vec::new()),
         })
     }
@@ -274,6 +500,7 @@ impl S3Server {
     pub fn with_concurrency_limits(mut self, max_connections: usize, max_requests: usize) -> Self {
         self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
         self.request_limit = Arc::new(Semaphore::new(max_requests.max(1)));
+        self.max_requests = max_requests.max(1);
         self
     }
 
@@ -313,10 +540,7 @@ impl S3Server {
     ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let connection_limit = self.connection_limit.clone();
-        let max_streams = self
-            .request_limit
-            .available_permits()
-            .clamp(1, u32::MAX as usize) as u32;
+        let max_streams = h2_stream_limit(self.max_requests);
         let service = WrappingService {
             shared: self.s3service,
             cors: self.cors,
@@ -326,7 +550,7 @@ impl S3Server {
             peer_ip: None,
             rate_limits: self.rate_limits,
             request_limit: self.request_limit,
-            first_request: None,
+            activity: None,
             trusted_proxies: self.trusted_proxies,
         };
         let mut connection = ConnBuilder::new(TokioExecutor::new());
@@ -334,7 +558,10 @@ impl S3Server {
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(INITIAL_REQUEST_TIMEOUT);
-        connection.http2().max_concurrent_streams(max_streams);
+        connection
+            .http2()
+            .max_concurrent_streams(max_streams)
+            .keep_alive_interval(None);
 
         let server = async move {
             loop {
@@ -356,14 +583,17 @@ impl S3Server {
                 };
                 let mut service = service.clone();
                 service.peer_ip = Some(peer.ip());
-                let first_request = Arc::new(FirstRequest::default());
-                service.first_request = Some(first_request.clone());
+                let activity = Arc::new(ConnectionActivity::default());
+                service.activity = Some(activity.clone());
                 let conn = connection.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     run_connection(
-                        first_request,
-                        conn.serve_connection(TokioIo::new(socket), service),
+                        activity.clone(),
+                        conn.serve_connection(
+                            TokioIo::new(ActivityStream::new(socket, activity.clone())),
+                            service,
+                        ),
                     )
                     .await;
                 });
@@ -392,9 +622,6 @@ impl Service<Request<Incoming>> for WrappingService {
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        if let Some(first_request) = self.first_request.as_ref() {
-            first_request.mark();
-        }
         let (mut parts, body) = req.into_parts();
         let method = parts.method.clone();
         let path = parts.uri.path().to_string();
@@ -442,12 +669,24 @@ impl Service<Request<Incoming>> for WrappingService {
             && parts.uri.query().is_some_and(|query| {
                 url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == "delete")
             });
+        let oversized_delete = delete_objects
+            && parts
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > DELETE_OBJECTS_MAX_BODY as u64);
+        let captured = (!oversized_delete && delete_objects).then(DeleteObjectsBody::default);
+        if let Some(activity) = self.activity.clone() {
+            parts.extensions.insert(activity);
+        }
         let body = if delete_objects {
-            let captured = DeleteObjectsBody::default();
+            let captured = captured.clone().unwrap_or_default();
             parts.extensions.insert(captured.clone());
             s3s::Body::http_body_unsync(CaptureDeleteObjectsBody {
                 inner: Box::pin(body),
                 captured,
+                ended: false,
             })
         } else {
             body.into()
@@ -464,6 +703,10 @@ impl Service<Request<Incoming>> for WrappingService {
         let metrics = self.metrics.clone();
         let rate_limits = self.rate_limits.clone();
         let request_limit = self.request_limit.clone();
+        let activity = self
+            .activity
+            .clone()
+            .unwrap_or_else(|| Arc::new(ConnectionActivity::default()));
         Box::pin(async move {
             // Charge the transport IP before CORS, signature checks, credential
             // reads, or body handling, so unsigned or invalid requests cannot
@@ -479,7 +722,7 @@ impl Service<Request<Incoming>> for WrappingService {
             }
             // Bound concurrent request processing before the expensive s3s
             // parse, body handling, and storage work.
-            let _request_permit = match request_limit.try_acquire_owned() {
+            let request_permit = match request_limit.try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
                     // Dropping the request lets hyper drain or close HTTP/1
@@ -498,6 +741,14 @@ impl Service<Request<Incoming>> for WrappingService {
                     return Ok(response);
                 }
             };
+            if oversized_delete {
+                drop(s3s_request);
+                let response = oversized_delete_response()?;
+                let code = response.status().as_u16();
+                emit_request_completed(&span, "s3", code, started);
+                record_s3_request(&metrics, &method, code, "body_limited", started.elapsed());
+                return Ok(response);
+            }
             let bucket_cors = if origin_header.is_some() {
                 match load_bucket_cors_config(driver_ctx, bucket).await {
                     Ok(bucket_cors) => bucket_cors,
@@ -565,7 +816,29 @@ impl Service<Request<Incoming>> for WrappingService {
                 return Ok(response);
             }
 
-            let mut result = shared.call(s3s_request).instrument(span.clone()).await;
+            let result = tokio::select! {
+                result = shared.call(s3s_request).instrument(span.clone()) => result,
+                _ = activity.wait_cancelled() => {
+                    drop(request_permit);
+                    return Err(connection_error());
+                }
+            };
+            let mut result = match result {
+                Ok(response) => Ok(response.map(|body| {
+                    s3s::Body::http_body_unsync(ResponseBody::new(
+                        body,
+                        request_permit,
+                        activity.clone(),
+                    ))
+                })),
+                Err(error) => {
+                    drop(request_permit);
+                    Err(error)
+                }
+            };
+            if captured.as_ref().is_some_and(DeleteObjectsBody::exceeded) {
+                result = oversized_delete_response();
+            }
             if let Ok(response) = &mut result {
                 let bucket_rule = bucket_cors.as_ref().and_then(|config| {
                     origin
@@ -606,24 +879,36 @@ impl Service<Request<Incoming>> for WrappingService {
     }
 }
 
-async fn run_connection<F>(first_request: Arc<FirstRequest>, connection: F)
+async fn run_connection<F>(activity: Arc<ConnectionActivity>, connection: F)
 where
     F: Future + Send,
 {
     let mut connection = Box::pin(connection);
-    let initial = tokio::time::timeout(INITIAL_REQUEST_TIMEOUT, first_request.wait());
-    tokio::pin!(initial);
 
     tokio::select! {
         result = &mut connection => {
             let _ = result;
         }
-        result = &mut initial => {
-            if result.is_ok() || first_request.seen() {
-                let _ = connection.await;
-            }
+        _ = activity.wait_idle() => {
+            activity.cancel();
         }
     }
+}
+
+fn connection_error() -> HttpError {
+    HttpError::new(Box::new(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "S3 connection became idle",
+    )))
+}
+
+fn oversized_delete_response() -> Result<HttpResponse, HttpError> {
+    s3_error!(
+        MaxMessageLengthExceeded,
+        "DeleteObjects request body exceeds 2 MiB"
+    )
+    .to_http_response()
+    .map_err(|error| HttpError::new(Box::new(error)))
 }
 
 fn slow_down_response(retry_after: u64) -> HttpResponse {
@@ -714,45 +999,64 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn deadline_expires_silent() {
-        let first_request = Arc::new(FirstRequest::default());
-        let task = tokio::spawn(run_connection(first_request, async {
+    async fn idle_connection_closes() {
+        let activity = Arc::new(ConnectionActivity::default());
+        let task = tokio::spawn(run_connection(activity, async {
             std::future::pending::<hyper::Result<()>>().await
         }));
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
-        tokio::time::advance(INITIAL_REQUEST_TIMEOUT).await;
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT).await;
         tokio::task::yield_now().await;
         assert!(task.is_finished());
-        task.await.expect("deadline task joins");
+        task.await.expect("idle task joins");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn valid_request_disarms() {
-        let first_request = Arc::new(FirstRequest::default());
-        let marker = first_request.clone();
-        let task = tokio::spawn(run_connection(first_request, async move {
-            marker.mark();
-            Ok::<(), hyper::Error>(())
-        }));
-        task.await.expect("request task joins");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn long_request_survives() {
-        let first_request = Arc::new(FirstRequest::default());
-        let marker = first_request.clone();
-        let task = tokio::spawn(run_connection(first_request, async move {
-            marker.mark();
-            tokio::time::sleep(Duration::from_secs(60)).await;
+    async fn progress_keeps_alive() {
+        let activity = Arc::new(ConnectionActivity::default());
+        let marker = activity.clone();
+        let task = tokio::spawn(run_connection(activity, async move {
+            tokio::time::sleep(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+            marker.touch();
+            tokio::time::sleep(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
             Ok::<(), hyper::Error>(())
         }));
         tokio::task::yield_now().await;
-        tokio::time::advance(INITIAL_REQUEST_TIMEOUT).await;
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
         task.await.expect("request task joins");
+    }
+
+    #[test]
+    fn caps_delete_body() {
+        let body = DeleteObjectsBody::default();
+        assert_eq!(
+            body.append(&vec![0; DELETE_OBJECTS_MAX_BODY]),
+            DELETE_OBJECTS_MAX_BODY
+        );
+        assert_eq!(body.append(b"overflow"), 0);
+        assert!(body.exceeded());
+        assert_eq!(body.take_bytes().len(), DELETE_OBJECTS_MAX_BODY);
+    }
+
+    #[test]
+    fn holds_response_permit() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = limit.clone().try_acquire_owned().expect("permit");
+        let activity = Arc::new(ConnectionActivity::default());
+        let body = ResponseBody::new(s3s::Body::empty(), permit, activity);
+        assert_eq!(limit.available_permits(), 0);
+        drop(body);
+        assert_eq!(limit.available_permits(), 1);
+    }
+
+    #[test]
+    fn caps_h2_streams() {
+        assert_eq!(h2_stream_limit(1), 1);
+        assert_eq!(h2_stream_limit(512), MAX_H2_STREAMS);
     }
 
     #[tokio::test]
