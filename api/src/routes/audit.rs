@@ -2,12 +2,14 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, parse_group_id, require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::metadata::map_metadata_api_error;
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, MetadataAuditOperation, Permission};
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::audit::{
     ListAuditError, ListAuditRequest, list_audit as gather_audit,
 };
+use aruna_operations::metadata::forward::is_user_origin;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -31,7 +33,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct AuditQuery {
-    /// Group whose audit trail is read. Requires group admin authority.
+    /// Group whose audit trail is read; User origins forward the bearer.
     pub group_id: String,
     /// Optional narrowing to one metadata document.
     #[serde(default)]
@@ -62,10 +64,12 @@ pub struct AuditPageResponse {
     pub records: Vec<AuditRecordResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// True when the result may be missing records from listed nodes.
+    /// True when records may be missing or conflicting; partial pages have no cursor.
     pub partial: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing_nodes: Vec<String>,
+    /// Number of omitted missing nodes beyond the bounded node list.
+    pub missing_overflow: usize,
 }
 
 fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
@@ -111,19 +115,30 @@ pub async fn list_audit(
         .as_deref()
         .map(|id| Ulid::from_str(id).map_err(|_| ServerError::BadRequest))
         .transpose()?;
-    // The trail names actors and operations, so it is group-admin only.
-    ensure_permission(
-        &state,
-        &auth,
-        format!("/{}/g/{group_id}/admin", state.get_realm_id()),
-        Permission::WRITE,
-    )
-    .await?;
+    let ctx = state.get_ctx();
+    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?;
+    if !user_origin {
+        ensure_permission(
+            &state,
+            &auth,
+            format!("/{}/g/{group_id}/admin", state.get_realm_id()),
+            Permission::WRITE,
+        )
+        .await?;
+    }
 
     // Peers re-check the same group-admin authority, so carry the caller's token.
-    let forward_token = forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
-        .map_err(|_| ServerError::BadRequest)?;
-    let ctx = state.get_ctx();
+    let forward_token = if user_origin {
+        let carrier = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
+        forwarded_bearer(Some(carrier.as_str()))
+            .map_err(map_metadata_api_error)?
+            .ok_or(ServerError::Unauthorized)?
+    } else {
+        forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
+            .map_err(map_metadata_api_error)?
+    };
     let page = gather_audit(
         ctx.as_ref(),
         state.get_realm_id(),
@@ -167,6 +182,7 @@ pub async fn list_audit(
                 .iter()
                 .map(|node| node.to_string())
                 .collect(),
+            missing_overflow: page.missing_overflow,
         }),
     ))
 }
