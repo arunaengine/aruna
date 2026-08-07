@@ -1,5 +1,5 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth,
+    ValidatedArunaBearerTokenCarrier, ensure_permission_with, parse_group_id, require_realm_auth,
     require_unrestricted_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -43,6 +43,7 @@ use aruna_operations::metadata::forward::{
     update_metadata_document_routed as run_update_metadata_document,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
@@ -1034,11 +1035,12 @@ pub async fn submit_rocrate_export(
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_permission(
+    ensure_permission_with(
         &state,
-        auth.clone(),
+        &auth,
         record.permission_path,
         Permission::READ,
+        PolicyRequestExtras::operation("metadata.read"),
     )
     .await?;
     let result = submit_export_job(

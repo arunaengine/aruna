@@ -77,6 +77,7 @@ const METADATA_ESTIMATE_MIN_LIMIT: usize = 24;
 const METADATA_SUMMARY_FANOUT_LIMIT: usize = 8;
 const METADATA_REFERENCES_DEFAULT_LIMIT: usize = 25;
 const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
+const MAX_POLICY_CANDIDATES: usize = 1024;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
 const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
 const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -350,15 +351,18 @@ pub async fn list_visible_metadata_documents(
     let limit = effective_list_limit(request.limit, request.auth.is_none());
     let offset = request.offset.unwrap_or(0);
 
-    let group_ids = match request.group_id {
+    let group_ids = check_policy_limit(match request.group_id {
         Some(group_id) => vec![group_id],
-        None => drive(ListGroupOperation::new(), context)
-            .await
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-            .into_iter()
-            .map(|group| group.group_id)
-            .collect(),
-    };
+        None => drive(
+            ListGroupOperation::with_pagination(MAX_POLICY_CANDIDATES + 1, 0),
+            context,
+        )
+        .await
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+        .into_iter()
+        .map(|group| group.group_id)
+        .collect(),
+    })?;
     // Summary listings and recency listings must show documents whose projection
     // has not landed yet; the pending keyspace is scanned once per request,
     // never once per group.
@@ -1584,6 +1588,13 @@ fn effective_list_limit(requested: Option<usize>, anonymous: bool) -> usize {
         .clamp(1, maximum)
 }
 
+fn check_policy_limit(group_ids: Vec<GroupId>) -> Result<Vec<GroupId>, MetadataApiError> {
+    if group_ids.len() > MAX_POLICY_CANDIDATES {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(group_ids)
+}
+
 async fn load_group_records(
     context: &DriverContext,
     group_id: GroupId,
@@ -1615,15 +1626,18 @@ async fn load_claim_records(
     realm_id: RealmId,
     group_id: Option<GroupId>,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let group_ids = match group_id {
+    let group_ids = check_policy_limit(match group_id {
         Some(group_id) => vec![group_id],
-        None => drive(ListGroupOperation::new(), context)
-            .await
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-            .into_iter()
-            .map(|group| group.group_id)
-            .collect(),
-    };
+        None => drive(
+            ListGroupOperation::with_pagination(MAX_POLICY_CANDIDATES + 1, 0),
+            context,
+        )
+        .await
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+        .into_iter()
+        .map(|group| group.group_id)
+        .collect(),
+    })?;
     let mut pending = load_pending_records(context, group_id).await?;
     let mut records = Vec::new();
     for group_id in group_ids {
@@ -1955,7 +1969,7 @@ async fn ensure_permission(
     crate::request_policy::enforce_policies(
         context,
         realm_id,
-        &crate::request_policy::policy_request(&path, &required_permission, Some(&auth_user)),
+        &metadata_read_request(&path, Some(&auth_user)),
     )
     .await
     .map_err(|_| MetadataApiError::Forbidden)?;
@@ -3251,6 +3265,28 @@ mod tests {
             MAX_LIST_METADATA_LIMIT
         );
         assert_eq!(effective_list_limit(Some(0), true), 1);
+    }
+
+    #[test]
+    fn policy_scope_limit() {
+        let within = (0..MAX_POLICY_CANDIDATES)
+            .map(|_| Ulid::generate())
+            .collect();
+        assert!(check_policy_limit(within).is_ok());
+
+        let over = (0..=MAX_POLICY_CANDIDATES)
+            .map(|_| Ulid::generate())
+            .collect();
+        assert!(matches!(
+            check_policy_limit(over),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn metadata_read_operation() {
+        let request = metadata_read_request("/realm/g/group/meta/document", None);
+        assert_eq!(request.operation, "metadata.read");
     }
 
     // The record lives only in the registry cache and the graph was never
