@@ -1345,6 +1345,9 @@ impl Operation for IncomingVersionReplicationOperation {
     type Error = IncomingVersionReplicationError;
 
     fn start(&mut self) -> Effects {
+        if let Err(error) = self.manifest.validate() {
+            return self.reject_negotiation(error.into());
+        }
         if self.is_reference_item()
             && let Err(error) = self.reference_version()
         {
@@ -2197,7 +2200,8 @@ mod tests {
         IncomingVersionReplicationState,
     };
     use crate::replication::protocol::{
-        MaterializedBlobInfo, SyncOrigin, VersionReplicationManifest, VersionReplicationMessage,
+        MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, SyncOrigin, VersionReplicationManifest,
+        VersionReplicationMessage,
     };
     use crate::replication::queue::LiveReplicationObligationRecord;
     use aruna_core::UserId;
@@ -2851,6 +2855,29 @@ mod tests {
             IncomingVersionReplicationError::HopLimitExceeded
                 .to_string()
                 .as_str(),
+        );
+    }
+
+    #[test]
+    fn rejects_manifest_size() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.metadata.insert(
+            "metadata".to_string(),
+            "x".repeat(MAX_REPLICATION_VALUE_BYTES + 1),
+        );
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+
+        let effects = op.start();
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            "Failed to convert from str: replication manifest entry is too large",
         );
     }
 
