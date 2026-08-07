@@ -1370,7 +1370,9 @@ async fn export_raw(
         .start_transaction(true)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let txn_id = owner.id();
+    let txn_id = owner.id().ok_or_else(|| {
+        MetadataApiError::Internal("read snapshot owner missing transaction".to_string())
+    })?;
     let result = export_raw_txn(context, realm_id, &request, txn_id).await;
     match result {
         Ok(result) => {
