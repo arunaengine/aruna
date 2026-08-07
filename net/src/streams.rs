@@ -2,15 +2,18 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
-use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 
@@ -26,6 +29,69 @@ const INBOUND_CONNECTION_GLOBAL_LIMIT: usize = 256;
 const INBOUND_CONNECTION_PEER_LIMIT: usize = 8;
 const INBOUND_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INBOUND_CONNECTION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Clone, Debug)]
+pub struct InboundAdmission {
+    realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    bootstrap_peers: Arc<RwLock<BTreeSet<NodeId>>>,
+    realm_config_materialized: Arc<AtomicBool>,
+    materialized_signal: watch::Sender<bool>,
+    membership_signal: watch::Sender<u64>,
+}
+
+impl InboundAdmission {
+    pub fn new(
+        realm_peers: Arc<RwLock<Vec<NodeId>>>,
+        bootstrap_peers: impl IntoIterator<Item = NodeId>,
+    ) -> Self {
+        let (materialized_signal, _) = watch::channel(false);
+        let (membership_signal, _) = watch::channel(0);
+        Self {
+            realm_peers,
+            bootstrap_peers: Arc::new(RwLock::new(bootstrap_peers.into_iter().collect())),
+            realm_config_materialized: Arc::new(AtomicBool::new(false)),
+            materialized_signal,
+            membership_signal,
+        }
+    }
+
+    fn allows_peer(&self, peer: NodeId) -> bool {
+        let realm_peers = self.realm_peers.read();
+        if self.realm_config_materialized.load(Ordering::Acquire) {
+            realm_peers.contains(&peer)
+        } else {
+            realm_peers.contains(&peer) || self.bootstrap_peers.read().contains(&peer)
+        }
+    }
+
+    pub(crate) fn add_bootstrap(&self, peer: NodeId) {
+        let mut bootstrap_peers = self.bootstrap_peers.write();
+        if !self.realm_config_materialized.load(Ordering::Acquire) {
+            bootstrap_peers.insert(peer);
+        }
+    }
+
+    pub(crate) fn mark_materialized(&self) {
+        self.bootstrap_peers.write().clear();
+        self.realm_config_materialized
+            .store(true, Ordering::Release);
+        self.materialized_signal.send_replace(true);
+        self.membership_signal
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+    }
+
+    fn materialized(&self) -> bool {
+        self.realm_config_materialized.load(Ordering::Acquire)
+    }
+
+    fn materialized_watch(&self) -> watch::Receiver<bool> {
+        self.materialized_signal.subscribe()
+    }
+
+    fn membership_watch(&self) -> watch::Receiver<u64> {
+        self.membership_signal.subscribe()
+    }
+}
 
 struct ConnectionTimers {
     idle: Pin<Box<tokio::time::Sleep>>,
@@ -310,27 +376,29 @@ pub async fn run_accept_loop(
     dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
     stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
     document_sync: std::sync::Arc<DocumentSyncService>,
+    inbound_admission: InboundAdmission,
     shutdown: CancellationToken,
 ) {
     let inbound_budget = Arc::new(InboundConnectionBudget::default());
+    let handshake_budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_GLOBAL_LIMIT));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
 
-                let Some(permit) = inbound_budget.acquire() else {
-                    warn!("Dropping inbound Iroh connection: connection limit reached");
+                let dht_handler = dht_handler.clone();
+                let stream_handler = stream_handler.clone();
+                let document_sync = document_sync.clone();
+                let inbound_admission = inbound_admission.clone();
+                let inbound_budget = inbound_budget.clone();
+                let Ok(handshake_permit) = handshake_budget.clone().try_acquire_owned() else {
+                    warn!("Dropping inbound Iroh connection: handshake limit reached");
                     incoming.refuse();
                     continue;
                 };
 
-                let dht_handler = dht_handler.clone();
-                let stream_handler = stream_handler.clone();
-                let document_sync = document_sync.clone();
-
                 tokio::spawn(async move {
-                    let mut permit = permit;
                     let accepting = match incoming.accept() {
                         Ok(accepting) => accepting,
                         Err(_) => return,
@@ -354,40 +422,138 @@ pub async fn run_accept_loop(
 
                     let alpn_bytes = conn.alpn().to_vec();
                     let peer_id = conn.remote_id();
-                    if !permit.admit(peer_id) {
+                    let Some(alpn) = Alpn::from_bytes(&alpn_bytes) else {
                         warn!(
                             node_id = %peer_id,
-                            "Dropping inbound Iroh connection: peer limit reached"
+                            "Dropping incoming connection with unknown ALPN"
                         );
+                        conn.close(0u32.into(), b"unknown ALPN");
+                        return;
+                    };
+                    let known_peer = inbound_admission.allows_peer(peer_id);
+                    if !known_peer && inbound_admission.materialized() {
+                        warn!(
+                            node_id = %peer_id,
+                            "Dropping inbound Iroh connection: realm admission rejected"
+                        );
+                        conn.close(0u32.into(), b"realm admission");
                         return;
                     }
-
-                    match Alpn::from_bytes(&alpn_bytes) {
-                        Some(Alpn::Dht) => {
-                            run_dht_connection(conn, dht_handler, peer_id).await;
-                        }
-                        Some(
-                            alpn @ (Alpn::Bao
-                            | Alpn::DocumentSync
-                            | Alpn::Metadata
-                            | Alpn::NativeReference
-                            | Alpn::Notification
-                            | Alpn::Shard
-                            | Alpn::JobControl),
-                        ) => {
-                            if alpn == Alpn::DocumentSync {
-                                document_sync.register_inbound_connection(&conn);
-                            }
-                            run_app_connection(conn, alpn, stream_handler, peer_id).await;
-                        }
-                        None => {
+                    if known_peer {
+                        drop(handshake_permit);
+                        let Some(mut permit) = inbound_budget.acquire() else {
+                            warn!("Dropping inbound Iroh connection: connection limit reached");
+                            conn.close(0u32.into(), b"connection limit");
+                            return;
+                        };
+                        if !permit.admit(peer_id) {
                             warn!(
-                                "Dropping incoming connection with unknown ALPN: {:?}",
-                                alpn_bytes
+                                node_id = %peer_id,
+                                "Dropping inbound Iroh connection: peer limit reached"
                             );
+                            return;
+                        }
+
+                        run_admitted(
+                            conn,
+                            alpn,
+                            dht_handler,
+                            stream_handler,
+                            document_sync,
+                            peer_id,
+                            inbound_admission,
+                        )
+                        .await;
+                    } else {
+                        warn!(
+                            node_id = %peer_id,
+                            alpn = %alpn,
+                            timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                            "Serving provisional inbound Iroh session"
+                        );
+                        let timeout_conn = conn.clone();
+                        let materialized_conn = conn.clone();
+                        let mut materialized = inbound_admission.materialized_watch();
+                        tokio::select! {
+                            result = tokio::time::timeout(
+                                STREAM_IO_TIMEOUT,
+                                run_connection(
+                                    conn,
+                                    alpn,
+                                    dht_handler,
+                                    stream_handler,
+                                    document_sync,
+                                    peer_id,
+                                ),
+                            ) => {
+                                if result.is_err() {
+                                    warn!(
+                                        node_id = %peer_id,
+                                        alpn = %alpn,
+                                        timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                                        "Timed out provisional inbound Iroh session"
+                                    );
+                                    timeout_conn.close(0u32.into(), b"provisional timeout");
+                                }
+                            }
+                            _ = async {
+                                loop {
+                                    if *materialized.borrow() {
+                                        break;
+                                    }
+                                    if materialized.changed().await.is_err() {
+                                        break;
+                                    }
+                                }
+                            } => {
+                                warn!(
+                                    node_id = %peer_id,
+                                    alpn = %alpn,
+                                    "Closed provisional inbound Iroh session after realm admission"
+                                );
+                                materialized_conn.close(0u32.into(), b"realm admission");
+                            }
                         }
                     }
                 });
+            }
+        }
+    }
+}
+
+async fn run_admitted(
+    conn: Connection,
+    alpn: Alpn,
+    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    document_sync: std::sync::Arc<DocumentSyncService>,
+    peer_id: NodeId,
+    admission: InboundAdmission,
+) {
+    let close_conn = conn.clone();
+    let mut membership = admission.membership_watch();
+    if !admission.allows_peer(peer_id) {
+        close_conn.close(0u32.into(), b"realm membership");
+        return;
+    }
+
+    let session = run_connection(
+        conn,
+        alpn,
+        dht_handler,
+        stream_handler,
+        document_sync,
+        peer_id,
+    );
+    tokio::pin!(session);
+    loop {
+        tokio::select! {
+            _ = &mut session => return,
+            changed = membership.changed() => {
+                if changed.is_err() || !admission.allows_peer(peer_id) {
+                    close_conn.close(0u32.into(), b"realm membership");
+                    return;
+                }
             }
         }
     }
@@ -409,6 +575,21 @@ mod tests {
             permits.push(budget.acquire().expect("within global limit"));
         }
         assert!(budget.acquire().is_none());
+    }
+
+    #[test]
+    fn handshake_cap() {
+        let budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_GLOBAL_LIMIT));
+        let mut permits = Vec::new();
+        for _ in 0..INBOUND_CONNECTION_GLOBAL_LIMIT {
+            permits.push(
+                budget
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("within handshake limit"),
+            );
+        }
+        assert!(budget.clone().try_acquire_owned().is_err());
     }
 
     #[test]
@@ -453,6 +634,77 @@ mod tests {
         let state = budget.state.lock();
         assert_eq!(state.global, 0);
         assert!(state.per_peer.is_empty());
+    }
+
+    #[test]
+    fn admission_switches() {
+        let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
+        let admission = InboundAdmission::new(realm_peers.clone(), [peer(2)]);
+
+        assert!(admission.allows_peer(peer(1)));
+        assert!(admission.allows_peer(peer(2)));
+
+        admission.mark_materialized();
+        assert!(admission.allows_peer(peer(1)));
+        assert!(!admission.allows_peer(peer(2)));
+
+        *realm_peers.write() = vec![peer(3)];
+        assert!(admission.allows_peer(peer(3)));
+        assert!(!admission.allows_peer(peer(1)));
+    }
+
+    #[test]
+    fn unknown_is_provisional() {
+        let admission = InboundAdmission::new(Arc::new(RwLock::new(Vec::new())), []);
+        let materialized = admission.materialized_watch();
+
+        assert!(!admission.allows_peer(peer(1)));
+        assert!(!admission.materialized());
+        admission.mark_materialized();
+        assert!(admission.materialized());
+        assert!(*materialized.borrow());
+        assert!(!admission.allows_peer(peer(1)));
+    }
+
+    #[test]
+    fn bootstrap_updates() {
+        let realm_peers = Arc::new(RwLock::new(Vec::new()));
+        let admission = InboundAdmission::new(realm_peers, []);
+
+        admission.add_bootstrap(peer(1));
+        assert!(admission.allows_peer(peer(1)));
+
+        admission.mark_materialized();
+        admission.add_bootstrap(peer(2));
+        assert!(!admission.allows_peer(peer(2)));
+    }
+
+    #[test]
+    fn membership_retains() {
+        let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
+        let admission = InboundAdmission::new(realm_peers.clone(), []);
+        admission.mark_materialized();
+        let mut changes = admission.membership_watch();
+
+        *realm_peers.write() = vec![peer(1), peer(2)];
+        admission.mark_materialized();
+
+        assert!(changes.has_changed().expect("membership watch open"));
+        assert!(admission.allows_peer(peer(1)));
+    }
+
+    #[test]
+    fn membership_removes() {
+        let realm_peers = Arc::new(RwLock::new(vec![peer(1), peer(2)]));
+        let admission = InboundAdmission::new(realm_peers.clone(), []);
+        admission.mark_materialized();
+        let mut changes = admission.membership_watch();
+
+        *realm_peers.write() = vec![peer(2)];
+        admission.mark_materialized();
+
+        assert!(changes.has_changed().expect("membership watch open"));
+        assert!(!admission.allows_peer(peer(1)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -515,6 +767,31 @@ async fn run_dht_connection(
                     return;
                 }
             }
+        }
+    }
+}
+
+async fn run_connection(
+    conn: Connection,
+    alpn: Alpn,
+    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    document_sync: std::sync::Arc<DocumentSyncService>,
+    peer_id: NodeId,
+) {
+    match alpn {
+        Alpn::Dht => run_dht_connection(conn, dht_handler, peer_id).await,
+        alpn @ (Alpn::Bao
+        | Alpn::DocumentSync
+        | Alpn::Metadata
+        | Alpn::NativeReference
+        | Alpn::Notification
+        | Alpn::Shard
+        | Alpn::JobControl) => {
+            if alpn == Alpn::DocumentSync {
+                document_sync.register_inbound_connection(&conn);
+            }
+            run_app_connection(conn, alpn, stream_handler, peer_id).await;
         }
     }
 }

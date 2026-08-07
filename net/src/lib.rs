@@ -398,6 +398,7 @@ struct NetInner {
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     notification_watch_metrics: NotificationWatchMetrics,
     notification_wakes: broadcast::Sender<UserId>,
@@ -523,10 +524,17 @@ impl NetHandle {
         let mut peer_hints = config.peer_nodes.clone();
         peer_hints.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
         let peer_hints = unique_peer_nodes(peer_hints, node_id);
-        let realm_peer_nodes = read_persisted_realm_peer_nodes(&storage, config.realm_id, node_id)
-            .await?
-            .unwrap_or_default();
+        let persisted_realm_peers =
+            read_persisted_realm_peer_nodes(&storage, config.realm_id, node_id).await?;
+        let realm_peer_nodes = persisted_realm_peers.clone().unwrap_or_default();
         let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
+        let inbound_admission = streams::InboundAdmission::new(
+            realm_peers.clone(),
+            peer_hints.iter().chain(realm_peer_nodes.iter()).copied(),
+        );
+        if persisted_realm_peers.is_some() {
+            inbound_admission.mark_materialized();
+        }
         let watch_interest = Arc::new(RwLock::new(WatchInterestTable::default()));
         let (notification_wakes, _) = broadcast::channel(NOTIFICATION_WAKE_CAPACITY);
         let dashboard_epoch = Ulid::generate();
@@ -677,6 +685,7 @@ impl NetHandle {
 
         let endpoint_for_accept = endpoint.clone();
         let document_sync_for_accept = document_sync.clone();
+        let inbound_admission_for_accept = inbound_admission.clone();
         let shutdown_for_accept = shutdown.child_token();
         let accept_task = tokio::spawn(async move {
             streams::run_accept_loop(
@@ -684,6 +693,7 @@ impl NetHandle {
                 dht_tx,
                 stream_tx,
                 document_sync_for_accept,
+                inbound_admission_for_accept,
                 shutdown_for_accept,
             )
             .await;
@@ -797,6 +807,7 @@ impl NetHandle {
             discovery_method,
             relay_method,
             realm_peers,
+            inbound_admission,
             watch_interest,
             notification_watch_metrics: NotificationWatchMetrics::default(),
             notification_wakes,
@@ -966,6 +977,7 @@ impl NetHandle {
             return;
         }
 
+        self.inner.inbound_admission.add_bootstrap(endpoint_addr.id);
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
@@ -991,6 +1003,7 @@ impl NetHandle {
             return;
         }
 
+        self.inner.inbound_admission.add_bootstrap(node_id);
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -1130,6 +1143,7 @@ impl NetHandle {
 
     async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
         *self.inner.realm_peers.write() = peers.clone();
+        self.inner.inbound_admission.mark_materialized();
         replace_dht_signed_authorized_nodes(
             &self.inner.dht_signed_authorized_nodes,
             &peers,
