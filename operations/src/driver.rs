@@ -12,7 +12,7 @@ use aruna_core::structs::{
     BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot,
     StorageRoutingRule, UsageCounters, usage_backend_keys,
 };
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -514,6 +514,34 @@ fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
     }
 }
 
+fn note_transaction_effect(open_txn: &mut Option<TxnId>, effect: &Effect) {
+    if let Effect::Storage(
+        StorageEffect::CommitTransaction { txn_id } | StorageEffect::AbortTransaction { txn_id },
+    ) = effect
+        && *open_txn == Some(*txn_id)
+    {
+        *open_txn = None;
+    }
+}
+
+fn note_transaction_event(open_txn: &mut Option<TxnId>, event: &Event) {
+    if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
+        *open_txn = Some(*txn_id);
+    }
+}
+
+async fn abort_leaked_transaction(open_txn: Option<TxnId>, context: &DriverContext, depth: usize) {
+    if let Some(txn_id) = open_txn {
+        warn!(%txn_id, "Aborting a transaction left open by an operation");
+        let _ = Box::pin(dispatch_effect(
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id }),
+            context,
+            depth,
+        ))
+        .await;
+    }
+}
+
 fn drive_suboperation<'a>(
     mut operation: Box<dyn SubOperation>,
     context: &'a DriverContext,
@@ -531,11 +559,14 @@ fn drive_suboperation<'a>(
             );
             let mut queue: VecDeque<_> = operation.start().into_iter().collect();
             let mut holds = Vec::new();
+            let mut open_txn = None;
 
             while !operation.is_complete() {
                 while let Some(effect) = queue.pop_front() {
+                    note_transaction_effect(&mut open_txn, &effect);
                     hold_backends(context, &effect, &mut holds);
                     let event = dispatch_effect(effect, context, depth).await;
+                    note_transaction_event(&mut open_txn, &event);
                     queue.extend(operation.step(event));
                 }
 
@@ -547,6 +578,7 @@ fn drive_suboperation<'a>(
                 }
             }
 
+            abort_leaked_transaction(open_txn, context, depth).await;
             trace!(
                 event = "suboperation.completed",
                 operation = %operation_name,
@@ -577,9 +609,11 @@ pub async fn drive_until<O: Operation>(
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut expired = false;
     let mut holds = Vec::new();
+    let mut open_txn = None;
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
+            note_transaction_effect(&mut open_txn, &effect);
             hold_backends(context, &effect, &mut holds);
             let dispatch = Box::pin(dispatch_effect(effect, context, 0));
             let event = if expired {
@@ -599,6 +633,7 @@ pub async fn drive_until<O: Operation>(
                     }
                 }
             };
+            note_transaction_event(&mut open_txn, &event);
             queue.extend(operation.step(event));
         }
 
@@ -609,6 +644,7 @@ pub async fn drive_until<O: Operation>(
             }
         }
     }
+    abort_leaked_transaction(open_txn, context, 0).await;
     operation.finalize()
 }
 
@@ -632,11 +668,14 @@ pub async fn drive<O: Operation>(
 
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut holds = Vec::new();
+    let mut open_txn = None;
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
+            note_transaction_effect(&mut open_txn, &effect);
             hold_backends(context, &effect, &mut holds);
             let event = Box::pin(dispatch_effect(effect, context, 0)).await;
+            note_transaction_event(&mut open_txn, &event);
             queue.extend(operation.step(event));
         }
 
@@ -647,6 +686,7 @@ pub async fn drive<O: Operation>(
             }
         }
     }
+    abort_leaked_transaction(open_txn, context, 0).await;
     let result = operation.finalize();
     match &result {
         Ok(_) => trace!(
@@ -982,6 +1022,150 @@ mod test {
         fn abort(&mut self) -> aruna_core::types::Effects {
             smallvec::smallvec![]
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct MarkerAbortOperation {
+        state: u8,
+        fail: bool,
+    }
+
+    impl Operation for MarkerAbortOperation {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { .. }), 1) if self.fail => {
+                    self.state = 3;
+                    smallvec::smallvec![]
+                }
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id,
+                    })]
+                }
+                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 2) => {
+                    self.state = 3;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 3
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.fail { Err(()) } else { Ok(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"abort-marker"),
+                value: ByteView::from(*b"ran"),
+                txn_id: None,
+            })]
+        }
+    }
+
+    async fn marker_absent(context: &DriverContext) -> bool {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"abort-marker"),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event");
+        };
+        value.is_none()
+    }
+
+    async fn transaction_reopens(context: &DriverContext) -> bool {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            return false;
+        };
+        matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await,
+            Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted })
+                if aborted == txn_id
+        )
+    }
+
+    #[tokio::test]
+    async fn drive_commit_safe() {
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let result = drive(
+            MarkerAbortOperation {
+                state: 0,
+                fail: false,
+            },
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(marker_absent(&context).await);
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test]
+    async fn drive_error_cleanup() {
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let result = drive(
+            MarkerAbortOperation {
+                state: 0,
+                fail: true,
+            },
+            &context,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(marker_absent(&context).await);
+        assert!(transaction_reopens(&context).await);
     }
 
     /// Never finishes on its own, so only the deadline can end it. The step cap
