@@ -1,8 +1,8 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
 use crate::opendal::abort_partial_writer;
-use aruna_net::streams::{RecvStream, SendStream};
 use aruna_core::errors::BlobError;
+use aruna_net::streams::{RecvStream, SendStream};
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncSeekExt};
 use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
@@ -301,27 +301,16 @@ impl OpenDalWriter {
         )
         .await;
         if let Err(err) = close_result {
-            return match abort_partial_writer(
-                &mut self.writer,
-                self.control_timeout,
-            )
-            .await
-            {
+            return match abort_partial_writer(&mut self.writer, self.control_timeout).await {
                 Ok(()) => Err(BlobError::WriteError(err.to_string())),
-                Err(cleanup) => Err(BlobError::DeleteError(format!(
-                    "{err}; {cleanup}"
-                ))),
+                Err(cleanup) => Err(BlobError::DeleteError(format!("{err}; {cleanup}"))),
             };
         }
         Ok(())
     }
 
     pub async fn abort(mut self) -> Result<(), BlobError> {
-        abort_partial_writer(
-            &mut self.writer,
-            self.control_timeout,
-        )
-        .await
+        abort_partial_writer(&mut self.writer, self.control_timeout).await
     }
 }
 

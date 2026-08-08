@@ -464,6 +464,7 @@ async fn snapshot_export(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_entries(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
@@ -599,6 +600,7 @@ async fn resolve_entries(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn extend_hash_candidates(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
@@ -627,12 +629,8 @@ async fn extend_hash_candidates(
         let aliases = alias_cache
             .get(&hash)
             .ok_or_else(|| ExportFailure::Retryable("alias cache unavailable".to_string()))?;
-        let distinct = collect_aliases(
-            aliases,
-            spec.auth_context.realm_id,
-            alias_paths,
-            alias_keys,
-        )?;
+        let distinct =
+            collect_aliases(aliases, spec.auth_context.realm_id, alias_paths, alias_keys)?;
         let groups = distinct
             .keys()
             .map(|(group_id, _)| *group_id)
@@ -641,7 +639,7 @@ async fn extend_hash_candidates(
         load_policies(ctx, spec, policies, groups).await?;
         let mut resolved = Vec::new();
         let mut alias_denied = false;
-        for (key, _) in &distinct {
+        for key in distinct.keys() {
             if !authorized_aliases.contains_key(key) {
                 let allowed = alias_allowed(spec, key.0, &key.1, permission_rules, policies)?;
                 authorized_aliases.insert(key.clone(), allowed);
@@ -707,7 +705,9 @@ fn cache_aliases(
     }
     let cached = alias_cache
         .values()
-        .try_fold(0usize, |total, aliases| total.checked_add(aliases.len().max(1)))
+        .try_fold(0usize, |total, aliases| {
+            total.checked_add(aliases.len().max(1))
+        })
         .ok_or_else(|| ExportFailure::Retryable("export alias limit exceeded".to_string()))?;
     let cost = aliases.len().max(1);
     if cached
@@ -976,7 +976,7 @@ async fn resolve_alias_txn(
         source: CandidateSource::Local {
             location,
             group_id: alias.group_id,
-            permission_path,
+            permission_path: permission_path.to_string(),
             node_id: alias.node_id,
             bucket: alias.bucket.clone(),
             key: alias.key.clone(),
@@ -1188,14 +1188,20 @@ async fn load_candidate_policies(
     checkpoint: &ExportCheckpoint,
     policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
 ) -> Result<(), ExportFailure> {
-    let groups = checkpoint.entities.iter().flat_map(|entity| {
-        entity.candidates.iter().filter_map(|candidate| {
-            let CandidateSource::Local { group_id, .. } = &candidate.source else {
-                return None;
-            };
-            Some(*group_id)
+    // Collected eagerly: a closure iterator held across the await trips
+    // rustc's "not general enough" limitation on the spawned job future.
+    let groups: Vec<GroupId> = checkpoint
+        .entities
+        .iter()
+        .flat_map(|entity| {
+            entity.candidates.iter().filter_map(|candidate| {
+                let CandidateSource::Local { group_id, .. } = &candidate.source else {
+                    return None;
+                };
+                Some(*group_id)
+            })
         })
-    });
+        .collect();
     load_policies(ctx, spec, policies, groups).await
 }
 
@@ -1251,36 +1257,7 @@ fn learn_probe_hash(entity: &mut ExportEntity, candidate_index: usize, hash: [u8
     true
 }
 
-async fn probe_sources(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    checkpoint: &mut ExportCheckpoint,
-    candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
-) -> Result<Vec<ProbedEntry>, ExportFailure> {
-    let mut policies = BTreeMap::new();
-    let mut permission_rules = BTreeMap::new();
-    let mut alias_paths = BTreeSet::new();
-    let mut alias_keys = BTreeSet::new();
-    let mut alias_cache = BTreeMap::new();
-    let mut resolved_aliases = BTreeMap::new();
-    let mut authorized_aliases = BTreeMap::new();
-    load_candidate_policies(ctx, spec, checkpoint, &mut policies).await?;
-    probe_sources_checked(
-        ctx,
-        spec,
-        checkpoint,
-        candidate_failures,
-        &mut policies,
-        &mut permission_rules,
-        &mut alias_paths,
-        &mut alias_keys,
-        &mut alias_cache,
-        &mut resolved_aliases,
-        &mut authorized_aliases,
-    )
-    .await
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn probe_sources_checked(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
@@ -1417,16 +1394,6 @@ async fn probe_sources_checked(
     Ok(probed)
 }
 
-async fn open_candidate(
-    driver: &DriverContext,
-    spec: &ExportRoCrateSpec,
-    candidate: &ExportCandidate,
-    metadata_only: bool,
-) -> Result<CandidateOpen, ExportFailure> {
-    let policies = BTreeMap::new();
-    open_candidate_checked(driver, spec, &policies, candidate, metadata_only).await
-}
-
 async fn open_candidate_checked(
     driver: &DriverContext,
     spec: &ExportRoCrateSpec,
@@ -1500,6 +1467,7 @@ async fn open_candidate_checked(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_local_txn(
     driver: &DriverContext,
     spec: &ExportRoCrateSpec,
@@ -2533,26 +2501,6 @@ async fn assemble_export(
     }
 }
 
-async fn write_archive(
-    writer: tokio::io::DuplexStream,
-    metadata: Vec<u8>,
-    entries: Vec<PlannedEntry>,
-    report: Option<Vec<u8>>,
-    cancel: tokio_util::sync::CancellationToken,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(), ExportFailure> {
-    write_archive_checked(
-        writer,
-        metadata,
-        entries,
-        report,
-        std::sync::Arc::new(BTreeMap::new()),
-        cancel,
-        shutdown,
-    )
-    .await
-}
-
 async fn write_archive_checked(
     writer: tokio::io::DuplexStream,
     metadata: Vec<u8>,
@@ -2889,6 +2837,69 @@ fn retryable(message: impl Into<String>) -> JobRunOutcome {
 
 fn permanent(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::permanent(message.into()))
+}
+
+#[cfg(test)]
+async fn probe_sources(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+    candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
+) -> Result<Vec<ProbedEntry>, ExportFailure> {
+    let mut policies = BTreeMap::new();
+    let mut permission_rules = BTreeMap::new();
+    let mut alias_paths = BTreeSet::new();
+    let mut alias_keys = BTreeSet::new();
+    let mut alias_cache = BTreeMap::new();
+    let mut resolved_aliases = BTreeMap::new();
+    let mut authorized_aliases = BTreeMap::new();
+    load_candidate_policies(ctx, spec, checkpoint, &mut policies).await?;
+    probe_sources_checked(
+        ctx,
+        spec,
+        checkpoint,
+        candidate_failures,
+        &mut policies,
+        &mut permission_rules,
+        &mut alias_paths,
+        &mut alias_keys,
+        &mut alias_cache,
+        &mut resolved_aliases,
+        &mut authorized_aliases,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn open_candidate(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    candidate: &ExportCandidate,
+    metadata_only: bool,
+) -> Result<CandidateOpen, ExportFailure> {
+    let policies = BTreeMap::new();
+    open_candidate_checked(driver, spec, &policies, candidate, metadata_only).await
+}
+
+#[cfg(test)]
+async fn write_archive(
+    writer: tokio::io::DuplexStream,
+    metadata: Vec<u8>,
+    entries: Vec<PlannedEntry>,
+    report: Option<Vec<u8>>,
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), ExportFailure> {
+    write_archive_checked(
+        writer,
+        metadata,
+        entries,
+        report,
+        std::sync::Arc::new(BTreeMap::new()),
+        cancel,
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -3802,7 +3813,7 @@ mod tests {
             "bucket",
             "key",
         );
-        let aliases = (0..=MAX_HASH_ALIASES)
+        let aliases = (0..MAX_HASH_ALIASES)
             .map(|index| {
                 let mut alias = alias.clone();
                 alias.key = format!("key-{index}");
@@ -3810,6 +3821,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut paths = BTreeSet::new();
+        // The budget is cumulative across pages: a primed entry pushes this
+        // in-cap page over the limit.
+        paths.insert((Ulid::from_bytes([21; 16]), "primed/path".to_string()));
         let mut keys = BTreeSet::new();
         assert!(matches!(
             collect_aliases(&aliases, realm_id, &mut paths, &mut keys),

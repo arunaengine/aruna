@@ -662,7 +662,6 @@ mod tests {
         }
         let stored = drive(GetUserAccessOperation::new(access.access_key), &ctx.driver)
             .await
-            .unwrap()
             .unwrap();
         assert!(stored.is_none());
     }

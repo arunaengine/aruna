@@ -67,7 +67,7 @@ fn budget_error(message: &str) -> MetadataRawReadError {
 }
 
 fn event_size(event: &MetadataCreateEventRecord) -> Result<usize, MetadataRawReadError> {
-    postcard::serialized_size(event).map_err(ConversionError::from)
+    Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -234,7 +234,8 @@ async fn raw_deleted(
                     .map_err(ConversionError::from)
             })
             .transpose()
-            .map(|deleted| deleted.unwrap_or(false)),
+            .map(|deleted| deleted.unwrap_or(false))
+            .map_err(MetadataRawReadError::from),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
     }

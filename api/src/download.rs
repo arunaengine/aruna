@@ -40,7 +40,10 @@ pub(crate) fn body(
 ) -> Body {
     let (sender, receiver) = mpsc::channel(CHANNEL_SIZE);
     tokio::spawn(pump(source, sender, permit));
-    Body::from_stream(receiver)
+    Body::from_stream(futures_util::stream::unfold(
+        receiver,
+        |mut receiver| async move { receiver.recv().await.map(|item| (item, receiver)) },
+    ))
 }
 
 async fn pump(
@@ -85,7 +88,7 @@ async fn pump(
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadPermit, IDLE_LIMIT, body};
+    use super::{CHANNEL_SIZE, DownloadPermit, IDLE_LIMIT, body};
     use aruna_core::stream::BackendStream;
     use axum::body::to_bytes;
     use bytes::Bytes;

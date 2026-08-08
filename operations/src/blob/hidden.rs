@@ -147,7 +147,7 @@ async fn save_cursor(
 async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOutcome, String> {
     let deadline = Instant::now() + SWEEP_BUDGET;
     let mut cursor = load_cursor(&context.storage_handle, deadline).await?;
-    let mut cleanup_pending = false;
+    let cleanup_pending;
     let mut uploads_deleted = 0;
     let mut orphans_deleted = 0;
     let more = match cursor.phase {
@@ -253,7 +253,9 @@ async fn sweep_upload_cleanups(
                     pending = true;
                     continue;
                 }
-                if let Err(error) = delete_cleanup(context, storage_key, deadline).await {
+                if let Err(error) =
+                    delete_cleanup(&context.storage_handle, storage_key, deadline).await
+                {
                     warn!(error = %error, "Failed to delete upload cleanup row");
                     pending = true;
                 }

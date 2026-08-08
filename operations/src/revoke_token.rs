@@ -210,7 +210,7 @@ impl RevokeTokenOperation {
         let Some(document_value) = document_value else {
             return Err(RevokeTokenError::RealmConfigNotFound);
         };
-        let mut document = RealmConfigDocument::from_bytes(&document_value)?;
+        let document = RealmConfigDocument::from_bytes(&document_value)?;
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
             .as_ref()
@@ -228,7 +228,7 @@ impl RevokeTokenOperation {
             return Err(AdminDocumentReducerError::TargetMismatch.into());
         }
 
-        let mut reducer_state = previous_reducer_state
+        let reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
         let effective_now = reducer_state.revocation_floor.max(self.config.now);
@@ -378,6 +378,7 @@ impl RevokeTokenOperation {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_capacity(
         &mut self,
         document: RealmConfigDocument,

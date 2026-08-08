@@ -542,7 +542,7 @@ mod tests {
         assert!(batch.records.is_empty());
         assert!(batch.has_more);
         assert_eq!(batch.next_start_after, Some(corrupt_key.clone()));
-        let next = read_outbox_records(&storage, batch.next_start_after, 1)
+        let next = read_outbox_records(&storage, &[], batch.next_start_after, 1)
             .await
             .expect("outbox read after malformed page succeeds");
         assert_eq!(next.records, vec![(outbox_key(&valid).to_vec(), valid)]);

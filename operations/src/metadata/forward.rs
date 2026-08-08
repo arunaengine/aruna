@@ -158,7 +158,7 @@ pub async fn forward_token_revoke(
     };
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
     let mut subject = bearer_token_hash(&token).into_bytes();
-    subject.extend_from_slice(&Ulid::new().to_bytes());
+    subject.extend_from_slice(&Ulid::generate().to_bytes());
     let peers = rank_revoke_peers(
         config
             .nodes
@@ -1909,7 +1909,7 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_then_success() {
-        let peers = vec![node(1), node(2)];
+        let peers = [node(1), node(2)];
         let order = rank_revoke_peers(
             peers.iter().copied(),
             bearer_token_hash("target-token").as_bytes(),
@@ -1936,7 +1936,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_possible_send() {
-        let peers = vec![node(1), node(2)];
+        let peers = [node(1), node(2)];
         let order = rank_revoke_peers(
             peers.iter().copied(),
             bearer_token_hash("target-token").as_bytes(),
@@ -1965,7 +1965,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_capacity_unavailable() {
-        let peers = vec![node(1), node(2)];
+        let peers = [node(1), node(2)];
         let order = rank_revoke_peers(
             peers.iter().copied(),
             bearer_token_hash("target-token").as_bytes(),
@@ -1990,7 +1990,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_stops_retry() {
-        let peers = vec![node(1), node(2)];
+        let peers = [node(1), node(2)];
         let order = rank_revoke_peers(
             peers.iter().copied(),
             bearer_token_hash("target-token").as_bytes(),

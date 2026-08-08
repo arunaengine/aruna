@@ -306,7 +306,7 @@ impl BlobHandler {
                 "too many active blob reservations".to_string(),
             ));
         };
-        let location = match self.reserve_bucket(&resolved.backend, &location).await {
+        let mut location = match self.reserve_bucket(&resolved.backend, &location).await {
             Ok(location) => location,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -345,9 +345,7 @@ impl BlobHandler {
         .await
         {
             Ok(writer) => writer,
-            Err(BlobLibError::IoError(error))
-                if error.kind() == std::io::ErrorKind::TimedOut =>
-            {
+            Err(BlobLibError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
                 reservation.retain();
                 return BlobEvent::Error(BlobError::WriteCleanup {
                     location,
@@ -372,21 +370,19 @@ impl BlobHandler {
         drop(stream);
 
         let event = match decode_result {
-            Err(err) => {
-                match writer.abort().await {
-                    Ok(()) => {
-                        _ = self.release_reservation(&location).await;
-                        BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
-                    }
-                    Err(cleanup) => {
-                        reservation.retain();
-                        BlobEvent::Error(BlobError::WriteCleanup {
-                            location,
-                            message: format!("{err}; {cleanup}"),
-                        })
-                    }
+            Err(err) => match writer.abort().await {
+                Ok(()) => {
+                    _ = self.release_reservation(&location).await;
+                    BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
                 }
-            }
+                Err(cleanup) => {
+                    reservation.retain();
+                    BlobEvent::Error(BlobError::WriteCleanup {
+                        location,
+                        message: format!("{err}; {cleanup}"),
+                    })
+                }
+            },
             Ok(()) => {
                 let hashes = writer.hasher.to_map();
                 let actual_blake3 = writer.hasher.finalize().blake3;

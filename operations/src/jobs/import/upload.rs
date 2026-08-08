@@ -1,13 +1,13 @@
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent, TaskEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     HiddenBlobKey, JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord,
 };
-use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
@@ -708,11 +708,12 @@ mod tests {
     fn carries_deadline() {
         let deadline = Instant::now();
         let (mut operation, _) = upload_operation_with(Some(deadline));
+        let effects = operation.start();
         let [
             Effect::Blob(BlobEffect::SpoolHidden {
                 deadline: actual, ..
             }),
-        ] = operation.start().as_slice()
+        ] = effects.as_slice()
         else {
             panic!("expected hidden spool effect")
         };

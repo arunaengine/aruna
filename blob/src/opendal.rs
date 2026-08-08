@@ -25,8 +25,7 @@ pub(crate) async fn abort_partial_writer(
             )))
         }
         Err(_) => Err(BlobError::DeleteError(
-            "partial blob cleanup is uncertain: timed out aborting partial blob writer"
-                .to_string(),
+            "partial blob cleanup is uncertain: timed out aborting partial blob writer".to_string(),
         )),
     }
 }

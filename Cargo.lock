@@ -322,6 +322,7 @@ dependencies = [
  "bao-tree",
  "blake3",
  "bytes",
+ "byteview",
  "crc-fast",
  "futures",
  "http 1.4.2",

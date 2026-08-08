@@ -453,7 +453,7 @@ impl CreateMetadataDocumentOperation {
         self.create_event = Some(create_event.clone());
         self.record = Some(create_event.record.clone());
         self.state = CreateMetadataDocumentState::AppendCreateEvent;
-        let encoded_bytes = match postcard::serialized_size(&create_event) {
+        let encoded_bytes = match postcard::experimental::serialized_size(&create_event) {
             Ok(size) => size,
             Err(error) => {
                 return self.fail(CreateMetadataDocumentError::ConversionError(error.into()));

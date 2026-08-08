@@ -143,9 +143,11 @@ pub async fn list_audit(
     // Peers re-check the same group-admin authority, so carry the caller's token.
     let forward_token = if user_origin {
         let carrier = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
-        forwarded_bearer(Some(carrier.as_str()))
-            .map_err(map_metadata_api_error)?
-            .ok_or(ServerError::Unauthorized)?
+        Some(
+            forwarded_bearer(Some(carrier.as_str()))
+                .map_err(map_metadata_api_error)?
+                .ok_or(ServerError::Unauthorized)?,
+        )
     } else {
         forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
             .map_err(map_metadata_api_error)?

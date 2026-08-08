@@ -75,6 +75,22 @@ pub(crate) struct LocalPermit {
     semaphore: Arc<Semaphore>,
 }
 
+impl LocalPermit {
+    #[cfg(test)]
+    pub(crate) fn test_permit(semaphore: Arc<Semaphore>) -> Self {
+        let permit = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("test semaphore has a free permit");
+        Self {
+            permit: Some(permit),
+            table: Weak::new(),
+            key: LocalKey::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            semaphore,
+        }
+    }
+}
+
 impl Drop for LocalPermit {
     fn drop(&mut self) {
         let Some(permit) = self.permit.take() else {
@@ -338,7 +354,7 @@ mod tests {
     }
 
     fn user(number: u128) -> UserId {
-        UserId::local(Ulid::from_u128(number), RealmId([1u8; 32]))
+        UserId::local(Ulid::from(number), RealmId([1u8; 32]))
     }
 
     #[test]

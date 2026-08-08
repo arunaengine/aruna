@@ -435,7 +435,7 @@ impl LocationSummaryOperation {
             CheckPermissionsOperation::new_with_txn(
                 CheckPermissionsConfig {
                     auth_context: self.request.auth_context.clone(),
-                    path,
+                    path: path.to_string(),
                     required_permission: Permission::READ,
                 },
                 txn_id,

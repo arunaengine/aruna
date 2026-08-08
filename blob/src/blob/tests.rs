@@ -165,11 +165,13 @@ mod failing_cleanup {
 
         fn info(&self) -> std::sync::Arc<AccessorInfo> {
             let info = std::sync::Arc::new(AccessorInfo::default());
-            info.set_scheme("cleanup_fails").set_root("/").set_native_capability(Capability {
-                write: true,
-                delete: true,
-                ..Default::default()
-            });
+            info.set_scheme("cleanup_fails")
+                .set_root("/")
+                .set_native_capability(Capability {
+                    write: true,
+                    delete: true,
+                    ..Default::default()
+                });
             info
         }
 
@@ -212,7 +214,6 @@ mod failing_cleanup {
         .finish();
         (operator, delete_calls)
     }
-
 }
 
 async fn loopback_net_handle() -> (NetHandle, tempfile::TempDir) {
@@ -1624,8 +1625,8 @@ async fn write_finalization_failure_emits_no_success_or_load() {
     assert!(
         matches!(
             event,
-            BlobEvent::Error(BlobError::WriteCleanup { location: actual, .. })
-                if actual == location
+            BlobEvent::Error(BlobError::WriteCleanup { location: ref actual, .. })
+                if *actual == location
         ),
         "close failure must surface as an error, got {event:?}"
     );
@@ -1735,8 +1736,8 @@ async fn compose_close_fails() {
     assert!(
         matches!(
             event,
-            BlobEvent::Error(BlobError::WriteCleanup { location: actual, .. })
-                if actual == target
+            BlobEvent::Error(BlobError::WriteCleanup { location: ref actual, .. })
+                if *actual == target
         ),
         "compose close failure must surface as an error, got {event:?}"
     );
@@ -1755,15 +1756,14 @@ async fn compose_close_fails() {
 #[tokio::test]
 async fn replication_close_fails() {
     let (operator, aborts) = failing_close::operator_with_aborts();
-    let mut writer =
-        crate::bao_tree::OpenDalWriter::new(
-            &operator,
-            "obj/replica",
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+    let mut writer = crate::bao_tree::OpenDalWriter::new(
+        &operator,
+        "obj/replica",
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
 
     iroh_io::AsyncSliceWriter::write_bytes_at(&mut writer, 0, bytes::Bytes::from_static(b"data"))
         .await
@@ -1806,7 +1806,10 @@ async fn write_cleanup_error() {
         .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
         .await;
 
-    let BlobEvent::Error(BlobError::WriteCleanup { location: actual, .. }) = event else {
+    let BlobEvent::Error(BlobError::WriteCleanup {
+        location: actual, ..
+    }) = event
+    else {
         panic!("uncertain write cleanup must retain its location");
     };
     assert_eq!(actual, location);

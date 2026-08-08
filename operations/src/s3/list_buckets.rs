@@ -168,7 +168,8 @@ impl ListBucketsOperation {
         if let Some(next) = next_start_after {
             self.next_storage_start_after = Some(next);
             if self.scanned_rows == Self::MAX_SCAN_ROWS {
-                return self.finish_cursor(self.next_storage_start_after.as_ref());
+                let cursor = self.next_storage_start_after.clone();
+                return self.finish_cursor(cursor.as_ref());
             }
             return self.emit_scan();
         }

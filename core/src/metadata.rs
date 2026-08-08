@@ -1130,7 +1130,7 @@ mod tests {
     fn raw_quotas_sum() {
         let document_id = Ulid::generate();
         let create = create_event(document_id, Ulid::from_parts(1, 1));
-        let create_bytes = u64::try_from(postcard::serialized_size(&create).unwrap()).unwrap();
+        let create_bytes = u64::try_from(postcard::to_allocvec(&create).unwrap().len()).unwrap();
         let budgets = raw_quotas(
             document_id,
             &[node(2), node(1), node(2)],
@@ -1139,9 +1139,11 @@ mod tests {
         )
         .unwrap();
 
+        let mut expected = [node(1), node(2)];
+        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         assert_eq!(budgets.len(), 2);
-        assert_eq!(budgets[0].node_id, node(1));
-        assert_eq!(budgets[1].node_id, node(2));
+        assert_eq!(budgets[0].node_id, expected[0]);
+        assert_eq!(budgets[1].node_id, expected[1]);
         assert_eq!(
             budgets.iter().map(|budget| budget.event_limit).sum::<u32>(),
             METADATA_RAW_EVENT_LIMIT
