@@ -17,15 +17,15 @@ use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, Actor, ArtifactRef, AuthContext, Backend, BackendConfig, BackendLocation,
     BackendRef, BlobLocationKey, BlobVersion, BucketInfo, ExportReportRow, ExportReportSource,
-    ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE, GroupAuthorizationDocument, JobId, JobPayload,
-    JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
+    ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, JobId,
+    JobPayload, JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
     RoCrateLimits, VersionKey, VersionedObjectArn,
 };
@@ -401,6 +401,13 @@ async fn seed_holder(
             group_auth.to_bytes(&actor)?.into(),
         ),
         (
+            GROUP_KEYSPACE.to_string(),
+            group_id.to_bytes().to_vec().into(),
+            group_record(owner, realm_id, group_id, &group_auth)
+                .to_bytes(&actor)?
+                .into(),
+        ),
+        (
             S3_BUCKET_KEYSPACE.to_string(),
             BUCKET.as_bytes().to_vec().into(),
             bucket.to_bytes()?.into(),
@@ -466,6 +473,13 @@ async fn seed_exporter(
             group_id.to_bytes().to_vec().into(),
             group_auth.to_bytes(&actor)?.into(),
         ),
+        (
+            GROUP_KEYSPACE.to_string(),
+            group_id.to_bytes().to_vec().into(),
+            group_record(owner, realm_id, group_id, &group_auth)
+                .to_bytes(&actor)?
+                .into(),
+        ),
     ];
     match node
         .context
@@ -478,6 +492,23 @@ async fn seed_exporter(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         event => Err(format!("exporter seed failed: {event:?}").into()),
+    }
+}
+
+/// Policy loading resolves the group record before group policies apply, so both
+/// nodes need it locally alongside the authorization document.
+fn group_record(
+    owner: UserId,
+    realm_id: RealmId,
+    group_id: GroupId,
+    auth: &GroupAuthorizationDocument,
+) -> Group {
+    Group {
+        display_name: "remote".to_string(),
+        group_id,
+        realm_id,
+        roles: auth.roles.keys().copied().collect(),
+        owner,
     }
 }
 
