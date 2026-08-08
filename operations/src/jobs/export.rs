@@ -3661,6 +3661,206 @@ mod tests {
         source.net.shutdown().await;
     }
 
+    fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext {
+        JobContext {
+            driver,
+            job_id: JobId::from_bytes([84; 16]),
+            owner_node_id,
+            claim_token: Ulid::from_bytes([85; 16]),
+            final_attempt: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&aruna_core::structs::JobProgress {
+                current: 0,
+                total: None,
+                unit: "entries".to_string(),
+            }),
+        }
+    }
+
+    /// Seeds one node with a locally stored object and the checkpoint candidate
+    /// that names it.
+    async fn local_candidate() -> (BaoNode, UserId, ExportCandidate) {
+        let realm_id = RealmId::from_bytes([101; 32]);
+        let owner = UserId::local(Ulid::from_bytes([102; 16]), realm_id);
+        let group_id = Ulid::from_bytes([103; 16]);
+        let version_id = Ulid::from_bytes([104; 16]);
+        let node = bao_node(realm_id).await;
+        let node_id = node.net.node_id();
+        let Event::Blob(BlobEvent::WriteFinished { location }) = node
+            .driver
+            .blob_handle
+            .as_ref()
+            .unwrap()
+            .send_blob_effect(BlobEffect::Write {
+                resolved: aruna_core::structs::ResolvedBackend::node_default(),
+                bucket: "remote".to_string(),
+                key: "payload".to_string(),
+                created_by: owner,
+                blob: byte_stream(FIXTURE_BYTES),
+            })
+            .await
+        else {
+            panic!("local blob write failed")
+        };
+        let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+        seed_bao(&node, node_id, owner, group_id, version_id, &location).await;
+        let candidate = ExportCandidate {
+            source: CandidateSource::Local {
+                location,
+                group_id,
+                permission_path: blob_object_permission_path(
+                    realm_id, group_id, node_id, "remote", "payload",
+                ),
+                node_id,
+                bucket: "remote".to_string(),
+                key: "payload".to_string(),
+            },
+            report_source: ExportReportSource::Local,
+            resolved_version: Some(version_id),
+            expected_blake3: Some(hash),
+        };
+        (node, owner, candidate)
+    }
+
+    #[tokio::test]
+    async fn revalidates_local_candidate() {
+        // A checkpoint outlives the state it was planned from, so a candidate
+        // naming a stale group, path, or hash must be refused, not opened.
+        let (node, owner, candidate) = local_candidate().await;
+        let spec = remote_spec(owner.realm_id, owner);
+        let driver = node.driver.as_ref();
+
+        assert!(matches!(
+            open_candidate(driver, &spec, &candidate, true).await.unwrap(),
+            CandidateOpen::Opened(BaoReadOutput::Metadata { blake3, .. })
+                if Some(blake3) == candidate.expected_blake3
+        ));
+
+        let mut foreign_group = candidate.clone();
+        let CandidateSource::Local { group_id, .. } = &mut foreign_group.source else {
+            panic!("expected a local candidate")
+        };
+        *group_id = Ulid::from_bytes([105; 16]);
+        let mut foreign_path = candidate.clone();
+        let CandidateSource::Local {
+            permission_path, ..
+        } = &mut foreign_path.source
+        else {
+            panic!("expected a local candidate")
+        };
+        *permission_path = format!("{permission_path}-sibling");
+        let mut stale_hash = candidate.clone();
+        stale_hash.expected_blake3 = Some([106; 32]);
+
+        for stale in [foreign_group, foreign_path, stale_hash] {
+            assert!(matches!(
+                open_candidate(driver, &spec, &stale, true).await.unwrap(),
+                CandidateOpen::Status(OpenStatus::Missing)
+            ));
+        }
+        node.net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn denies_local_read() {
+        // Each refusal toggles one input away from an open that succeeded: first
+        // the requesting identity, then a realm policy denying the export read.
+        let (node, owner, candidate) = local_candidate().await;
+        let realm_id = owner.realm_id;
+        let driver = node.driver.as_ref();
+
+        assert!(matches!(
+            open_candidate(driver, &remote_spec(realm_id, owner), &candidate, true)
+                .await
+                .unwrap(),
+            CandidateOpen::Opened(_)
+        ));
+
+        let stranger = UserId::local(Ulid::from_bytes([107; 16]), realm_id);
+        assert!(matches!(
+            open_candidate(driver, &remote_spec(realm_id, stranger), &candidate, true)
+                .await
+                .unwrap(),
+            CandidateOpen::Status(OpenStatus::Denied)
+        ));
+
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
+        config
+            .request_policies
+            .push(aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::from_bytes([108; 16]),
+                name: "no export reads".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: "operation == 's3.GetObject'".to_string(),
+                enabled: true,
+            });
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        assert!(matches!(
+            driver
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                    key: realm_id.as_bytes().to_vec().into(),
+                    value: config.to_bytes(&actor).unwrap().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert!(matches!(
+            open_candidate(driver, &remote_spec(realm_id, owner), &candidate, true)
+                .await
+                .unwrap(),
+            CandidateOpen::Status(OpenStatus::Denied)
+        ));
+        node.net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn alias_needs_scopes() {
+        // A hash alias is authorized only from rules and policy loaded for its
+        // own group; an unloaded scope must fail closed instead of allowing.
+        let (node, owner, candidate) = local_candidate().await;
+        let CandidateSource::Local {
+            group_id,
+            permission_path,
+            ..
+        } = &candidate.source
+        else {
+            panic!("expected a local candidate")
+        };
+        let spec = remote_spec(owner.realm_id, owner);
+        let ctx = job_context(node.driver.clone(), node.net.node_id());
+        let mut rules = BTreeMap::new();
+        load_rules(&ctx, &spec, &mut rules, [*group_id])
+            .await
+            .unwrap();
+        let mut policies = BTreeMap::new();
+        load_policies(&ctx, &spec, &mut policies, [*group_id])
+            .await
+            .unwrap();
+
+        assert!(alias_allowed(&spec, *group_id, permission_path, &rules, &policies).unwrap());
+        assert!(!alias_allowed(&spec, *group_id, "/other/object", &rules, &policies).unwrap());
+        assert!(matches!(
+            alias_allowed(&spec, *group_id, permission_path, &BTreeMap::new(), &policies),
+            Err(ExportFailure::Retryable(message)) if message == "authorization rules unavailable"
+        ));
+        assert!(matches!(
+            alias_allowed(&spec, *group_id, permission_path, &rules, &BTreeMap::new()),
+            Err(ExportFailure::Retryable(message)) if message == "object policy unavailable"
+        ));
+        node.net.shutdown().await;
+    }
+
     #[test]
     fn learns_probe_hash() {
         let realm_id = RealmId::from_bytes([2; 32]);
@@ -4240,20 +4440,7 @@ mod tests {
             ..Default::default()
         };
         let failures = BTreeMap::from([(0, BTreeMap::from([(0, OpenStatus::Corrupt)]))]);
-        let ctx = JobContext {
-            driver: Arc::new(fixture.driver_context.clone()),
-            job_id: JobId::from_bytes([84; 16]),
-            owner_node_id: node_id,
-            claim_token: Ulid::from_bytes([85; 16]),
-            final_attempt: false,
-            cancel: tokio_util::sync::CancellationToken::new(),
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            progress: ProgressReporter::from_progress(&aruna_core::structs::JobProgress {
-                current: 0,
-                total: None,
-                unit: "entries".to_string(),
-            }),
-        };
+        let ctx = job_context(Arc::new(fixture.driver_context.clone()), node_id);
 
         assert!(matches!(
             probe_sources(

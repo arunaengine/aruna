@@ -864,6 +864,169 @@ mod tests {
         );
     }
 
+    /// Drives a failed record write through record deletion so the operation
+    /// waits in `CleanupBlob` with the spooled blob still owned.
+    fn cleanup_operation() -> (CreateRoCrateUploadOperation, BackendLocation) {
+        let (mut operation, location) = upload_operation();
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::HiddenSpooled {
+            location: location.clone(),
+            blake3: [4u8; 32],
+            size: 7,
+        }));
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError,
+        }));
+        operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: upload_key(Ulid::from_bytes([2u8; 16])),
+        }));
+        (operation, location)
+    }
+
+    #[test]
+    fn retries_blob_cleanup() {
+        // A hidden blob that resists deletion is retried a bounded number of
+        // times and then handed to the sweeper instead of being orphaned.
+        let (mut operation, location) = cleanup_operation();
+        let hidden_key = HiddenBlobKey::try_from(&location).unwrap();
+        for _ in 0..2 {
+            let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ReadError(
+                "gone".to_string(),
+            ))));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::DeleteHidden { key })] if key == &hidden_key
+            ));
+        }
+        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ReadError(
+            "gone".to_string(),
+        ))));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected durable cleanup row")
+        };
+        assert_eq!(key_space, ROCRATE_UPLOAD_CLEANUP_KEYSPACE);
+        assert_eq!(
+            RoCrateUploadCleanup::from_bytes(value.as_ref())
+                .unwrap()
+                .hidden_key,
+            hidden_key
+        );
+        assert!(matches!(
+            operation
+                .step(Event::Storage(StorageEvent::WriteResult {
+                    key: upload_key(Ulid::from_bytes([2u8; 16])),
+                }))
+                .as_slice(),
+            [Effect::Task(TaskEffect::ShortenTimer { .. })]
+        ));
+        assert!(operation.finalize().is_err());
+    }
+
+    #[test]
+    fn sweeps_without_obligation() {
+        // Even when the durable row cannot be written, the sweep is still
+        // requested and the operation terminates instead of retrying forever.
+        let (mut operation, _) = cleanup_operation();
+        let mut effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)));
+        for _ in 0..2 {
+            effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)));
+        }
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { .. })]
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                operation
+                    .step(Event::Storage(StorageEvent::Error {
+                        error: StorageError::WriteError,
+                    }))
+                    .as_slice(),
+                [Effect::Storage(StorageEffect::Write { .. })]
+            ));
+        }
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::SweepHiddenBlobs,
+                after,
+            })] if after.is_zero()
+        ));
+        assert!(
+            operation
+                .step(Event::Task(TaskEvent::Error {
+                    key: Some(TaskKey::SweepHiddenBlobs),
+                    message: "no runtime".to_string(),
+                }))
+                .is_empty()
+        );
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(CreateRoCrateUploadError::Blob(BlobError::ChannelClosed))
+        );
+    }
+
+    #[test]
+    fn aborts_during_cleanup() {
+        // Aborting mid-cleanup must re-emit the outstanding compensation so the
+        // record row and the hidden blob are never left behind.
+        let (mut operation, location) = upload_operation();
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::HiddenSpooled {
+            location: location.clone(),
+            blake3: [4u8; 32],
+            size: 7,
+        }));
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError,
+        }));
+        assert!(matches!(
+            operation.abort().as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == ROCRATE_UPLOAD_KEYSPACE
+        ));
+
+        operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: upload_key(Ulid::from_bytes([2u8; 16])),
+        }));
+        assert!(matches!(
+            operation.abort().as_slice(),
+            [Effect::Blob(BlobEffect::DeleteHidden { key })]
+                if key == &HiddenBlobKey::try_from(&location).unwrap()
+        ));
+
+        for _ in 0..3 {
+            operation.step(Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)));
+        }
+        assert!(matches!(
+            operation.abort().as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == ROCRATE_UPLOAD_CLEANUP_KEYSPACE
+        ));
+
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: upload_key(Ulid::from_bytes([2u8; 16])),
+        }));
+        assert!(matches!(
+            operation.abort().as_slice(),
+            [Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::SweepHiddenBlobs,
+                ..
+            })]
+        ));
+    }
+
     #[tokio::test]
     async fn reclaims_expired_upload() {
         let dir = tempdir().unwrap();
