@@ -55,6 +55,8 @@ enum CleanupKind {
 struct CleanupEntry {
     kind: CleanupKind,
     attempts: u8,
+    /// An effect for this entry is in the worker queue; retries must not race it.
+    queued: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -585,7 +587,12 @@ impl StorageHandle {
                 Instant::now(),
                 in_flight,
             )) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    if let Some(entry) = pending.get_mut(&txn_id) {
+                        entry.queued = true;
+                    }
+                    Ok(())
+                }
                 Err(TrySendError::Full(item)) => {
                     rollback_cleanup(&mut pending, admission);
                     // The item's ResponseToken re-locks the cleanup mutex on drop.
@@ -687,6 +694,7 @@ impl StorageHandle {
         let (response_tx, _response_rx) = response_channel(ResponseToken::abort(self, txn_id));
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
+        self.mark_queued(txn_id, true);
         match self.channel_for(&effect).try_send((
             effect,
             response_tx,
@@ -695,12 +703,7 @@ impl StorageHandle {
             in_flight,
         )) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => warn!(
-                event = "storage.transaction.abort_enqueue_full",
-                txn_id = %txn_id,
-                reason,
-                "Failed to enqueue storage transaction abort: queue full"
-            ),
+            Err(TrySendError::Full(_)) => self.requeue_warn(txn_id, reason),
             Err(TrySendError::Disconnected(_)) => {
                 self.transaction_cleanup
                     .lock()
@@ -714,6 +717,27 @@ impl StorageHandle {
                 );
             }
         }
+    }
+
+    fn mark_queued(&self, txn_id: Ulid, queued: bool) {
+        if let Some(entry) = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .get_mut(&txn_id)
+        {
+            entry.queued = queued;
+        }
+    }
+
+    fn requeue_warn(&self, txn_id: Ulid, reason: &'static str) {
+        self.mark_queued(txn_id, false);
+        warn!(
+            event = "storage.transaction.abort_enqueue_full",
+            txn_id = %txn_id,
+            reason,
+            "Failed to enqueue storage transaction abort: queue full"
+        );
     }
 
     fn retry_abort(&self, txn_id: Ulid, reason: &'static str) {
@@ -856,7 +880,14 @@ fn reserve_cleanup(
         if pending.len() >= MAX_TRANSACTION_CLEANUP {
             return Err(StorageError::TransactionConflict);
         }
-        pending.insert(txn_id, CleanupEntry { kind, attempts: 0 });
+        pending.insert(
+            txn_id,
+            CleanupEntry {
+                kind,
+                attempts: 0,
+                queued: false,
+            },
+        );
     } else if matches!(
         (kind, previous),
         (CleanupKind::Abort, Some(CleanupKind::Open))
@@ -907,6 +938,9 @@ fn observe_cleanup(
         return false;
     };
     let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
+    if let Some(entry) = pending.get_mut(&txn_id) {
+        entry.queued = false;
+    }
     if pending
         .get(&txn_id)
         .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed | CleanupKind::Aborted))
@@ -1254,8 +1288,11 @@ impl FjallStorage {
             .filter_map(|(txn_id, entry)| {
                 // CommitUnknown probes with an abort: a still-open transaction
                 // aborts, a resolved one reports NotFound; both are terminal.
+                // Queued entries are owned by an in-flight effect; racing it
+                // would surface a spurious TransactionNotFound to the caller.
                 (matches!(entry.kind, CleanupKind::Abort | CleanupKind::CommitUnknown)
-                    && entry.attempts < MAX_CLEANUP_ATTEMPTS)
+                    && entry.attempts < MAX_CLEANUP_ATTEMPTS
+                    && !entry.queued)
                     .then_some((*txn_id, entry.kind))
             })
             .collect::<Vec<_>>();
@@ -1672,6 +1709,7 @@ impl FjallStorage {
                 CleanupEntry {
                     kind: CleanupKind::Open,
                     attempts: 0,
+                    queued: false,
                 },
             );
             break candidate;
@@ -3397,6 +3435,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::CommitUnknown,
                 attempts: 0,
+                queued: false,
             },
         );
         assert!(handle.retain_transaction(txn_id, true));
@@ -3421,6 +3460,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::Open,
                 attempts: 0,
+                queued: false,
             },
         );
         let mut owner = super::TransactionOwner::new(handle, txn_id);
@@ -3449,6 +3489,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::Open,
                 attempts: 0,
+                queued: false,
             },
         );
 
@@ -3473,6 +3514,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::Open,
                 attempts: 0,
+                queued: false,
             },
         );
         let effect = StorageEffect::StartTransaction { read: true };
@@ -3514,6 +3556,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::CommitQueued,
                 attempts: 0,
+                queued: false,
             },
         );
         let effect = StorageEffect::CommitTransaction { txn_id };
@@ -3540,6 +3583,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::Open,
                 attempts: 0,
+                queued: false,
             },
         );
         let effect = StorageEffect::Write {
@@ -3570,6 +3614,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::Open,
                 attempts: 0,
+                queued: false,
             },
         );
         let effect = StorageEffect::CommitTransaction { txn_id };
@@ -3595,6 +3640,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::CommitUnknown,
                 attempts: 0,
+                queued: false,
             },
         );
 
@@ -3623,6 +3669,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::CommitUnknown,
                 attempts: 0,
+                queued: false,
             },
         );
         let mut storage = super::FjallStorage {
@@ -3648,6 +3695,76 @@ mod tests {
     }
 
     #[test]
+    fn retry_skips_queued() {
+        // A queued abort is owned by the in-flight effect; a retry racing it
+        // would surface a spurious TransactionNotFound to the caller.
+        let dir = tempdir().unwrap();
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .manual_journal_persist(true)
+            .open()
+            .unwrap();
+        let txn_id = Ulid::from_parts(3, 4);
+        let txn = db.write_tx().unwrap();
+        let transaction_cleanup =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        transaction_cleanup.lock().unwrap().insert(
+            txn_id,
+            super::CleanupEntry {
+                kind: super::CleanupKind::Abort,
+                attempts: 0,
+                queued: true,
+            },
+        );
+        let mut storage = super::FjallStorage {
+            store: super::Store::new(db),
+            persist_policy: FjallPersistPolicy::default(),
+            txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
+            transaction_cleanup,
+            read_pool: Vec::new(),
+            next_reader: 0,
+            bulk_read_pool: Vec::new(),
+            next_bulk_reader: 0,
+        };
+
+        storage.retry_cleanup();
+        assert!(storage.txns.contains_key(&txn_id));
+
+        storage
+            .transaction_cleanup
+            .lock()
+            .unwrap()
+            .get_mut(&txn_id)
+            .unwrap()
+            .queued = false;
+        storage.retry_cleanup();
+        assert!(storage.txns.is_empty());
+    }
+
+    #[test]
+    fn handoff_marks_queued() {
+        let (handle, receivers) = StorageHandle::new();
+        let txn_id = Ulid::from_parts(1, 8);
+        handle.transaction_cleanup.lock().unwrap().insert(
+            txn_id,
+            super::CleanupEntry {
+                kind: super::CleanupKind::Open,
+                attempts: 0,
+                queued: false,
+            },
+        );
+
+        assert!(handle.retain_transaction(txn_id, false));
+        receivers
+            .foreground
+            .try_recv()
+            .expect("handoff should enqueue abort");
+        assert!(matches!(
+            handle.transaction_cleanup.lock().unwrap().get(&txn_id),
+            Some(entry) if entry.queued
+        ));
+    }
+
+    #[test]
     fn queued_commit_fences() {
         let txn_id = Ulid::from_parts(2, 2);
         let mut pending = std::collections::BTreeMap::new();
@@ -3656,6 +3773,7 @@ mod tests {
             super::CleanupEntry {
                 kind: super::CleanupKind::Open,
                 attempts: 0,
+                queued: false,
             },
         );
         assert!(
