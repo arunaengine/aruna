@@ -2671,7 +2671,14 @@ async fn ensure_permission(
     if !allowed {
         return Err(MetadataApiError::Forbidden);
     }
-    let request = metadata_read_request(&path, Some(&auth_user));
+    // Policies must see the permission the RBAC check enforced; a fixed read
+    // would let a write-deny policy pass unevaluated.
+    let request = crate::request_policy::policy_request_with(
+        &path,
+        &required_permission,
+        Some(&auth_user),
+        crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+    );
     match txn_id {
         Some(txn_id) => crate::request_policy::PolicyEvaluator::load_with_txn(
             context, realm_id, group_id, txn_id,
@@ -3338,7 +3345,7 @@ where
                         fanout_stats.nodes_failed = fanout_stats.failed_partitions.len()
                             + omitted_nodes
                             + usize::from(fanout_stats.discovery_failed);
-                        if !allow_partial && fanout_stats.nodes_failed > omitted_nodes {
+                        if !allow_partial && fanout_stats.nodes_failed > 0 {
                             return Err(MetadataApiError::ServiceUnavailable);
                         }
                         break;
@@ -3391,7 +3398,9 @@ where
             if not_found {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
-            if !allow_partial && fanout_stats.nodes_failed > omitted_nodes {
+            // Nodes omitted by the fanout cap truncate the answer, so a caller
+            // that asked for a complete result must not be told it is complete.
+            if !allow_partial && fanout_stats.nodes_failed > 0 {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
             node_parts.sort_by_key(|(node_index, _, _)| *node_index);
@@ -4865,8 +4874,16 @@ mod tests {
             policies,
         };
         // The policy evaluator reads the group through GetGroupOperation, which
-        // needs the group record as well as the auth doc.
+        // needs the group record as well as the auth doc, and fails closed
+        // without the realm config.
         let entries = [
+            (
+                aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
+                Key::from(*TEST_REALM_ID.as_bytes()),
+                RealmConfigDocument::default_for_realm(TEST_REALM_ID, Vec::new())
+                    .to_bytes(&actor)
+                    .expect("realm config encodes"),
+            ),
             (
                 AUTH_KEYSPACE,
                 Key::from(*TEST_REALM_ID.as_bytes()),
@@ -5724,6 +5741,100 @@ mod tests {
         assert_eq!(stats.nodes_queried, 3);
         assert_eq!(stats.nodes_failed, 1);
         assert_eq!(stats.failed_partitions, vec![hanging]);
+    }
+
+    #[tokio::test]
+    async fn capped_fanout_incomplete() {
+        // More realm nodes than the fanout cap truncates the node set, which a
+        // caller that refused partial results must not receive as complete.
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let nodes = (0..=METADATA_DISTRIBUTED_QUERY_MAX_NODES)
+            .map(|index| iroh::SecretKey::from_bytes(&[60 + index as u8; 32]).public())
+            .collect::<Vec<_>>();
+        let local = nodes[0];
+        let local_call: MetadataNodeCall<usize> =
+            metadata_node_call((), |(), _| async move { Ok(1) });
+        let remote_call: MetadataNodeCall<usize> =
+            metadata_node_call((), |(), _| async move { Ok(2) });
+
+        let result = run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([13u8; 32]),
+            local,
+            MetadataFanoutScope::new(Some(MetadataApiQueryMode::Distributed), Some(nodes), false),
+            MetadataFanoutOperation::Search,
+            local_call,
+            remote_call,
+            |_, _| {},
+            map_read_error,
+        )
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn write_policy_denies() {
+        // The policy must be evaluated with the permission the caller asked for,
+        // so a write-deny policy cannot be bypassed by a fixed read request.
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let user = UserId::local(Ulid::generate(), TEST_REALM_ID);
+        let path = format!("/{TEST_REALM_ID}/g/{group_id}/data/object");
+        write_policy_docs(
+            &test,
+            group_id,
+            user_role(
+                user,
+                HashMap::from([(
+                    format!("/{TEST_REALM_ID}/g/{group_id}/**"),
+                    Permission::WRITE,
+                )]),
+            ),
+            vec![aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "no-writes".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: "permission == 'write'".to_string(),
+                enabled: true,
+            }],
+        )
+        .await;
+
+        let denied = ensure_permission(
+            &test.context,
+            TEST_REALM_ID,
+            auth_for(user),
+            group_id,
+            path.clone(),
+            Permission::WRITE,
+            None,
+        )
+        .await;
+        // The same role allows the read, so the denial comes from the policy.
+        let allowed = ensure_permission(
+            &test.context,
+            TEST_REALM_ID,
+            auth_for(user),
+            group_id,
+            path,
+            Permission::READ,
+            None,
+        )
+        .await;
+
+        assert!(matches!(denied, Err(MetadataApiError::Forbidden)));
+        assert!(allowed.is_ok());
     }
 
     #[test]
