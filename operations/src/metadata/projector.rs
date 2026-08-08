@@ -1301,6 +1301,63 @@ mod tests {
         }
     }
 
+    async fn store_realm_config(storage: &StorageHandle, config: &RealmConfigDocument) {
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: config.realm_id,
+        };
+        let bytes = postcard::to_allocvec(config).expect("realm config serializes");
+        match storage
+            .send_effect(crate::document_repository::write_effect(
+                &target, bytes, None,
+            ))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_mint_retries() {
+        // A locally authored create whose shard has no live holder must keep its
+        // pending marker so a later placement change still mints the genesis.
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let mut event = create_event();
+        event.node_id = node(1);
+        let live = realm_config(event.record.realm_id, &[node(1), node(2), node(3)]);
+        let event = stamped(event, &live);
+        let mut holderless = live.clone();
+        holderless.nodes.clear();
+        store_realm_config(&storage, &holderless).await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let marker_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+
+        let projected =
+            project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
+                .await
+                .expect("projection succeeds");
+        assert_eq!(projected, 1);
+        assert!(pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+
+        store_realm_config(&storage, &live).await;
+        let projected =
+            project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
+                .await
+                .expect("retry projection succeeds");
+
+        assert_eq!(projected, 1);
+        assert!(!pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+    }
+
     async fn pending_projection_marker_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
         match storage
             .send_storage_effect(StorageEffect::Read {

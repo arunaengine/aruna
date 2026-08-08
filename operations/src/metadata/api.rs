@@ -4254,6 +4254,196 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn foreign_lifecycle_rejected() {
+        // A well-formed lifecycle entry that belongs to another document must
+        // not be allowed to decide this record's visibility.
+        let test = metadata_test();
+        let graph_record = public_record(Ulid::generate(), Ulid::generate());
+        let document_record = public_record(Ulid::generate(), Ulid::generate());
+        let stranger = public_record(Ulid::generate(), Ulid::generate());
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            stranger.graph_iri.clone(),
+            stranger.realm_id,
+            stranger.group_id,
+            stranger.document_id,
+            2,
+        );
+        write_entry(
+            &test,
+            (
+                METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                metadata_graph_lifecycle_key(&graph_record.graph_iri),
+                ByteView::from(postcard::to_allocvec(&tombstone).expect("tombstone encodes")),
+            ),
+        )
+        .await;
+        let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+            event: aruna_core::metadata::MetadataDocumentDeleteRecord {
+                event_id: Ulid::generate(),
+                tombstone,
+                deleted_after_event_id: stranger.last_event_id,
+            },
+        };
+        write_entry(
+            &test,
+            (
+                METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+                metadata_document_lifecycle_key(document_record.document_id),
+                ByteView::from(postcard::to_allocvec(&lifecycle).expect("lifecycle encodes")),
+            ),
+        )
+        .await;
+
+        assert!(
+            filter_live_records(&test.context.storage_handle, &[graph_record])
+                .await
+                .is_err()
+        );
+        assert!(
+            filter_live_records(&test.context.storage_handle, &[document_record])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn group_scan_capped() {
+        // Without the visibility cache the listing scans storage directly, and
+        // must refuse rather than hand back a truncated group.
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let first = public_record(group_id, Ulid::generate());
+        let second = public_record(group_id, Ulid::generate());
+        for record in [&first, &second] {
+            for entry in aruna_core::storage_entries::metadata_registry_write_entries(record)
+                .expect("registry entries encode")
+            {
+                write_entry(&test, entry).await;
+            }
+        }
+        let context = DriverContext {
+            storage_handle: test.context.storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let within = load_group_records(&context, group_id, 2)
+            .await
+            .expect("group scan succeeds");
+        let over = load_group_records(&context, group_id, 1).await;
+
+        assert_eq!(within.len(), 2);
+        assert!(matches!(over, Err(MetadataApiError::ServiceUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn pending_scan_capped() {
+        // The pending-projection sweep is bounded by the candidate budget so a
+        // large backlog cannot be silently cut short.
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let first = public_record(group_id, Ulid::generate());
+        let second = public_record(group_id, Ulid::generate());
+        write_pending_marker(&test, &first).await;
+        write_pending_marker(&test, &second).await;
+
+        let within = load_pending_records(&test.context, Some(group_id), 2)
+            .await
+            .expect("pending scan succeeds");
+        let over = load_pending_records(&test.context, Some(group_id), 1).await;
+
+        assert_eq!(within.get(&group_id).map(Vec::len), Some(2));
+        assert!(matches!(over, Err(MetadataApiError::ServiceUnavailable)));
+    }
+
+    fn raw_request(document_id: Ulid) -> ExportMetadataRoCrateRequest {
+        ExportMetadataRoCrateRequest {
+            document_id,
+            auth: None,
+            view: MetadataRoCrateExportView::Raw,
+            limit: None,
+            offset: None,
+            after: None,
+        }
+    }
+
+    async fn seed_raw_document(test: &MetadataTest, record: &MetadataRegistryRecord) {
+        seed_policy_docs(test, record.group_id).await;
+        for entry in aruna_core::storage_entries::metadata_registry_write_entries(record)
+            .expect("registry entries encode")
+        {
+            write_entry(test, entry).await;
+        }
+        let event = MetadataCreateEventRecord {
+            event_id: record.last_event_id,
+            record: record.clone(),
+            user_id: UserId::local(Ulid::generate(), TEST_REALM_ID),
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            payload: MetadataCreateEventPayload::RoCrate {
+                jsonld: "{\"@context\":\"https://w3id.org/ro/crate/1.1/context\",\"@graph\":[]}"
+                    .to_string(),
+            },
+            occurred_at_ms: 1,
+        };
+        write_entry(
+            test,
+            aruna_core::storage_entries::metadata_create_event_write_entry(&event)
+                .expect("event entry encodes"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn raw_export_fenced() {
+        // The raw export answers from one read snapshot: a document tombstoned
+        // after its registry row was written must no longer export.
+        let test = metadata_test();
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        seed_raw_document(&test, &record).await;
+
+        let exported = export_metadata_rocrate(
+            &test.context,
+            TEST_REALM_ID,
+            raw_request(record.document_id),
+        )
+        .await
+        .expect("raw export succeeds");
+        assert!(matches!(exported, ExportMetadataRoCrateResult::Raw { .. }));
+        let foreign = export_metadata_rocrate(
+            &test.context,
+            RealmId::from_bytes([9u8; 32]),
+            raw_request(record.document_id),
+        )
+        .await;
+        assert!(matches!(foreign, Err(MetadataApiError::NotFound)));
+
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        write_entry(
+            &test,
+            metadata_graph_lifecycle_write_entry(&tombstone).expect("tombstone encodes"),
+        )
+        .await;
+
+        let fenced = export_metadata_rocrate(
+            &test.context,
+            TEST_REALM_ID,
+            raw_request(record.document_id),
+        )
+        .await;
+
+        assert!(matches!(fenced, Err(MetadataApiError::NotFound)));
+    }
+
     #[test]
     fn anonymous_limit_clamped() {
         assert_eq!(
@@ -4344,6 +4534,144 @@ mod tests {
         assert_eq!(first.len(), METADATA_DISTRIBUTED_QUERY_MAX_NODES);
         assert!(first.contains(&local));
         assert_eq!(first.iter().collect::<HashSet<_>>().len(), first.len());
+    }
+
+    fn path_config(
+        nodes: u8,
+        shard_count: u32,
+        replica_count: Option<u32>,
+    ) -> (RealmConfigDocument, Ulid) {
+        let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 3);
+        let strategy = aruna_core::structs::PlacementStrategy {
+            strategy_id: Ulid::from_bytes([5u8; 16]),
+            name: "metadata-registry".to_string(),
+            replica_count,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count,
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy.clone()];
+        for seed in 1..=nodes {
+            config.ensure_node(
+                iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+                RealmNodeKind::Server,
+            );
+        }
+        (config, strategy.strategy_id)
+    }
+
+    fn holder_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(30)
+    }
+
+    #[tokio::test]
+    async fn shard_counts_match() {
+        // The reported replica count per shard is what the merge waits for, so
+        // it must equal the holders the selection actually dispatches to.
+        let (config, strategy_id) = path_config(6, 8, Some(2));
+        let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+
+        let (selections, replica_counts) = select_path_holders(
+            &config,
+            TEST_REALM_ID,
+            Ulid::from_parts(0, 1),
+            "datasets/lookup",
+            strategy_id,
+            8,
+            Some(2),
+            local,
+            holder_deadline(),
+        )
+        .expect("holder selection succeeds");
+
+        assert_eq!(replica_counts.len(), 8);
+        assert!(selections.len() <= METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+        for (shard, expected) in replica_counts.iter().copied().enumerate() {
+            let dispatched = selections
+                .iter()
+                .filter(|selection| selection.shards.contains(&(shard as u32)))
+                .count();
+            assert_eq!(expected, dispatched);
+            assert!(expected > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn everywhere_covers_shards() {
+        // An everywhere strategy places every holder on every shard, so each
+        // selection must answer for all of them.
+        let (config, strategy_id) = path_config(4, 8, None);
+        let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+
+        let (selections, replica_counts) = select_path_holders(
+            &config,
+            TEST_REALM_ID,
+            Ulid::from_parts(0, 1),
+            "datasets/lookup",
+            strategy_id,
+            8,
+            None,
+            local,
+            holder_deadline(),
+        )
+        .expect("holder selection succeeds");
+
+        assert_eq!(selections.len(), 4);
+        assert_eq!(replica_counts, vec![4; 8]);
+        for selection in &selections {
+            assert_eq!(selection.shards, (0..8).collect::<Vec<_>>());
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_shard_rejected() {
+        // More shard holders than the fan-out cap leaves shards with nobody to
+        // ask; the lookup must fail instead of resolving from the rest.
+        let (config, strategy_id) = path_config(200, 64, Some(1));
+        let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+
+        let result = select_path_holders(
+            &config,
+            TEST_REALM_ID,
+            Ulid::from_parts(0, 1),
+            "datasets/lookup",
+            strategy_id,
+            64,
+            Some(1),
+            local,
+            holder_deadline(),
+        );
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+    }
+
+    #[test]
+    fn divergent_paths_fail() {
+        // Two peers that resolved the same path differently must not be
+        // reduced to one of the two answers.
+        let winner = sanitize_path_winner(public_record(Ulid::generate(), Ulid::generate()))
+            .expect("valid path winner");
+        let result = MetadataPathLookupResult {
+            winner,
+            conflicts: Vec::new(),
+        };
+
+        let resolved = reduce_path_response(Some(result.clone()), None, false, false, false)
+            .expect("a single agreeing answer resolves");
+        assert_eq!(resolved.winner, result.winner);
+        assert!(matches!(
+            reduce_path_response(Some(result), None, true, false, false),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+        assert!(matches!(
+            reduce_path_response(None, None, false, true, false),
+            Err(MetadataApiError::NotFound)
+        ));
+        assert!(matches!(
+            reduce_path_response(None, None, false, false, false),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
     }
 
     #[test]

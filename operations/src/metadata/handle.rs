@@ -6897,6 +6897,99 @@ mod tests {
             .expect("metadata persistence flushes");
     }
 
+    fn memory_handle(storage: StorageHandle) -> (TempDir, MetadataHandle) {
+        let metadata_dir = tempdir().expect("metadata dir");
+        let metadata_handle = MetadataHandle::new_with_options(
+            metadata_dir.path(),
+            node_id_from_seed(9),
+            storage,
+            None,
+            None,
+            None,
+            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+        )
+        .expect("metadata handle opens");
+        (metadata_dir, metadata_handle)
+    }
+
+    async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected batch write result: {other:?}"),
+        }
+    }
+
+    fn registry_entries(record: &MetadataRegistryRecord) -> Vec<(String, ByteView, ByteView)> {
+        aruna_core::storage_entries::metadata_registry_write_entries(record)
+            .expect("registry entries encode")
+    }
+
+    #[tokio::test]
+    async fn group_records_live() {
+        let (_storage_dir, storage) = auth_storage();
+        let group_id = Ulid::generate();
+        let live = group_record(group_id, "datasets/live");
+        let gone = group_record(group_id, "datasets/gone");
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            gone.graph_iri.clone(),
+            gone.realm_id,
+            gone.group_id,
+            gone.document_id,
+            2,
+        );
+        let mut writes = registry_entries(&live);
+        writes.extend(registry_entries(&gone));
+        writes.push(
+            aruna_core::storage_entries::metadata_graph_lifecycle_write_entry(&tombstone)
+                .expect("tombstone encodes"),
+        );
+        store_entries(&storage, writes).await;
+        let (_metadata_dir, handle) = memory_handle(storage);
+
+        let records = handle
+            .list_group_records(group_id, 16)
+            .await
+            .expect("group listing succeeds");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.document_id)
+                .collect::<Vec<_>>(),
+            vec![live.document_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn group_records_capped() {
+        // The scan must refuse to answer past its candidate budget instead of
+        // returning a silently truncated group listing.
+        let (_storage_dir, storage) = auth_storage();
+        let group_id = Ulid::generate();
+        let mut writes = registry_entries(&group_record(group_id, "datasets/one"));
+        writes.extend(registry_entries(&group_record(group_id, "datasets/two")));
+        store_entries(&storage, writes).await;
+        let (_metadata_dir, handle) = memory_handle(storage);
+
+        let within = handle
+            .list_group_records(group_id, 2)
+            .await
+            .expect("group listing succeeds");
+        let over = handle.list_group_records(group_id, 1).await;
+
+        assert_eq!(within.len(), 2);
+        assert!(matches!(
+            over,
+            Err(MetadataError::Backend(message)) if message.contains("candidate limit exceeded")
+        ));
+    }
+
     #[tokio::test]
     async fn tombstone_blocks_apply() {
         let (_storage_dir, storage) = auth_storage();
@@ -7092,6 +7185,79 @@ mod tests {
         .await;
 
         assert_eq!(auth, Err(MetadataReadError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn bucket_realm_mismatch() {
+        // The same valid token authorizes its own realm and is denied for
+        // another one, so the denial is the realm boundary and not a bad token.
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+        let peer = node_id_from_seed(31);
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_realm_config(&storage, realm_id, &[peer]).await;
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
+        let auth_token = MetadataAuthToken::bearer(token).unwrap();
+
+        let allowed = bucket_search_auth(
+            &state,
+            &storage,
+            peer,
+            Some(realm_id),
+            Some(auth_token.clone()),
+        )
+        .await;
+        let denied = bucket_search_auth(
+            &state,
+            &storage,
+            peer,
+            Some(RealmId([21u8; 32])),
+            Some(auth_token),
+        )
+        .await;
+
+        assert_eq!(allowed.map(|auth| auth.realm_id), Ok(realm_id));
+        assert_eq!(denied, Err(MetadataReadError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn revocation_blind_decode() {
+        // Revoking a token must still decode its claims, while every other
+        // check the validator runs stays in force.
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_revoked_config(&storage, realm_id, &token).await;
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
+
+        assert!(matches!(
+            validate_aruna_bearer_token(&state, &token).await,
+            Err(ArunaBearerTokenError::TokenRevoked)
+        ));
+        let claims = decode_aruna_bearer_token(&RevocationBlindValidation(&state), &token)
+            .await
+            .expect("revoked token still decodes for revocation");
+        assert_eq!(claims.sub, user_id.to_string());
+
+        let (_untrusted_dir, untrusted_storage) = auth_storage();
+        let untrusted = MetadataAuthValidationState::new(untrusted_storage, Some(realm_id));
+        assert!(
+            decode_aruna_bearer_token(&RevocationBlindValidation(&untrusted), &token)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
