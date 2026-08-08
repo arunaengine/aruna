@@ -189,9 +189,11 @@ mod tests {
         let second = make_node(2);
         let batch = audit_fallback(vec![second, first, first], usize::MAX);
 
+        let mut expected = vec![first, second];
+        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         assert_eq!(
             batch.missing_nodes.into_iter().collect::<Vec<_>>(),
-            vec![first, second]
+            expected
         );
         assert_eq!(batch.missing_overflow, 0);
     }

@@ -1610,10 +1610,7 @@ impl AdminDocumentReducerState {
             .groups
             .remove(token_hash)
             .unwrap_or_default();
-        let winner = self.canonicalize_group(token_hash, group, candidate);
-        let Some(winner) = winner else {
-            return None;
-        };
+        let winner = self.canonicalize_group(token_hash, group, candidate)?;
         Some(winner.dot)
     }
 

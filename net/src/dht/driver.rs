@@ -1831,6 +1831,7 @@ async fn reserve_key_slot(
         .map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,

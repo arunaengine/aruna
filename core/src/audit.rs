@@ -301,12 +301,7 @@ impl AuditPageBatch {
             });
         }
         self.conflict |= other.conflict || plan.conflict;
-        for (candidate, decision) in other
-            .records
-            .into_iter()
-            .map(|(_, candidate)| candidate)
-            .zip(plan.decisions)
-        {
+        for (candidate, decision) in other.records.into_values().zip(plan.decisions) {
             self.apply_entry(candidate.source, candidate.entry, decision);
         }
         self.bytes = plan.bytes;
@@ -453,13 +448,12 @@ pub fn validate_page(
         }
         previous = Some(&entry.key);
     }
-    if let Some(marker) = &page.next_start_after {
-        if marker.len() != AUDIT_KEY_BYTES
+    if let Some(marker) = &page.next_start_after
+        && (marker.len() != AUDIT_KEY_BYTES
             || !marker.starts_with(&prefix)
-            || page.records.last().is_none_or(|entry| &entry.key != marker)
-        {
-            return Err(AuditPageError::InvalidMarker);
-        }
+            || page.records.last().is_none_or(|entry| &entry.key != marker))
+    {
+        return Err(AuditPageError::InvalidMarker);
     }
     Ok(())
 }

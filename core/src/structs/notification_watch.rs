@@ -1033,8 +1033,10 @@ mod tests {
 
     #[test]
     fn rejects_binding_scope() {
-        let mut binding = WatchAuthorizationBinding::default();
-        binding.path_restrictions = Some(Vec::new());
+        let binding = WatchAuthorizationBinding {
+            path_restrictions: Some(Vec::new()),
+            ..Default::default()
+        };
         assert!(!binding.is_valid());
     }
 
