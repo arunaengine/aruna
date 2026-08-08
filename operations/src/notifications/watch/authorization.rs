@@ -723,45 +723,49 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
-        RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
+        Actor, Group, GroupAuthorizationDocument, PathRestriction, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
+        data_watch_resource_path,
     };
-    use aruna_storage::FjallStorage;
+    use aruna_storage::{FjallStorage, StorageHandle};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    // A public (Everyone) role granting READ on the watched bucket would let a
-    // nil caller through on the permission path alone. Anonymous callers own no
-    // inbox to deliver into, so the nil-owner guard must still refuse the watch
-    // before any role is evaluated, even where the resource is publicly readable.
-    #[tokio::test]
-    async fn current_owner_decides() {
+    fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempfile::tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let realm_id = RealmId([9u8; 32]);
-        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
-        let group_id = Ulid::from_bytes([4u8; 16]);
-        let node_id = node(3);
+        (
+            dir,
+            DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            },
+        )
+    }
 
+    /// Seeds every document policy loading resolves: realm authorization, the
+    /// group record behind group policies, its authorization and the realm config.
+    async fn seed_watch_auth(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        node_id: NodeId,
+        owner: UserId,
+        group_auth: &GroupAuthorizationDocument,
+    ) {
+        let group_id = group_auth.group_id;
         let actor = Actor {
             node_id,
             user_id: owner,
             realm_id,
         };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let mut group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
-        group_auth
-            .roles
-            .values_mut()
-            .find(|role| role.name == "viewer")
-            .expect("viewer role")
-            .assigned_users
-            .insert(UserId::nil(realm_id));
-        // Policy loading resolves the group record before group policies apply.
         let group = Group {
             display_name: "watch".to_string(),
             group_id,
@@ -806,15 +810,38 @@ mod tests {
                 other => panic!("unexpected auth write event: {other:?}"),
             }
         }
+    }
 
-        let context = DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+    // A public (Everyone) role granting READ on the watched bucket would let a
+    // nil caller through on the permission path alone. Anonymous callers own no
+    // inbox to deliver into, so the nil-owner guard must still refuse the watch
+    // before any role is evaluated, even where the resource is publicly readable.
+    #[tokio::test]
+    async fn current_owner_decides() {
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([9u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let node_id = node(3);
+
+        let mut group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        group_auth
+            .roles
+            .values_mut()
+            .find(|role| role.name == "viewer")
+            .expect("viewer role")
+            .assigned_users
+            .insert(UserId::nil(realm_id));
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+
         let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
         let expired_binding = WatchAuthorizationBinding {
             expires_at_secs: 1,
@@ -1051,5 +1078,195 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_prefix_binding() {
+        // An unbound binding over the same foreign prefix is authorized, so the
+        // refusal can only come from the binding, not from a missing grant.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([5u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
+        let foreign = data_watch_resource_path(group_id, node_id, "other", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let bound = WatchAuthorizationBinding {
+            watch_path_prefix: prefix.clone(),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, owner, &prefix, mask, &bound)
+                .await
+                .expect("bound prefix"),
+            WatchAuthorization::Authorized
+        ));
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, owner, &foreign, mask, &bound)
+                .await
+                .expect("foreign prefix"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidState)
+        ));
+        assert!(matches!(
+            authorize_forwarded_watch(
+                &context,
+                realm_id,
+                owner,
+                &foreign,
+                mask,
+                &WatchAuthorizationBinding::default(),
+            )
+            .await
+            .expect("unbound prefix"),
+            WatchAuthorization::Authorized
+        ));
+    }
+
+    #[tokio::test]
+    async fn forwarded_owner_scope() {
+        // A forwarded watch is only ever created for a real user of this realm.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([6u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let binding = WatchAuthorizationBinding::default();
+
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, owner, &prefix, mask, &binding)
+                .await
+                .expect("realm owner"),
+            WatchAuthorization::Authorized
+        ));
+        assert!(matches!(
+            authorize_forwarded_watch(
+                &context,
+                realm_id,
+                UserId::nil(realm_id),
+                &prefix,
+                mask,
+                &binding,
+            )
+            .await
+            .expect("anonymous owner"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidOwner)
+        ));
+        let outsider = UserId::new(Ulid::from_bytes([1u8; 16]), RealmId([7u8; 32]));
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, outsider, &prefix, mask, &binding)
+                .await
+                .expect("foreign realm owner"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidOwner)
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_binding_denied() {
+        // The owner holds READ throughout: only the binding's own validity decides
+        // whether a stored watch may still be delivered.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([3u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let mut binding = WatchAuthorizationBinding::default();
+
+        assert!(matches!(
+            evaluate_watch_delivery(&context, realm_id, owner, &prefix, mask, &binding)
+                .await
+                .expect("valid binding"),
+            WatchAuthorization::Authorized
+        ));
+        binding.path_restrictions = Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{group_id}/**"),
+            permission: Permission::READ,
+        }]);
+        assert!(matches!(
+            evaluate_watch_delivery(&context, realm_id, owner, &prefix, mask, &binding)
+                .await
+                .expect("restricted binding"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidState)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restricted_token_refused() {
+        // The restriction covers the watched path, so the refusal is the blanket
+        // rule that a path-restricted token may not open a watch at all.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([4u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let mut auth_context = AuthContext {
+            user_id: owner,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        assert!(matches!(
+            evaluate_watch_creation(&context, realm_id, &auth_context, &prefix, mask)
+                .await
+                .expect("unrestricted token"),
+            WatchAuthorization::Authorized
+        ));
+        auth_context.path_restrictions = Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{group_id}/**"),
+            permission: Permission::READ,
+        }]);
+        assert!(matches!(
+            evaluate_watch_creation(&context, realm_id, &auth_context, &prefix, mask)
+                .await
+                .expect("restricted token"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::TokenRestricted)
+        ));
     }
 }

@@ -916,6 +916,63 @@ mod tests {
         }
     }
 
+    async fn retry_rows(storage: &StorageHandle, realm: RealmId) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                prefix: Some(watch_retry_prefix(realm).into()),
+                start: None,
+                limit: 64,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                .collect(),
+            other => panic!("unexpected iter event: {other:?}"),
+        }
+    }
+
+    async fn write_retry(context: &DriverContext, key: &[u8], retry: &WatchEventRetry) {
+        let value = postcard::to_allocvec(retry).expect("encode retry");
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                    key: key.to_vec().into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn commit_retry(
+        context: &DriverContext,
+        realm: RealmId,
+        key: &[u8],
+        retry: &WatchEventRetry,
+    ) -> Result<(), UpsertFailure> {
+        let value = postcard::to_allocvec(retry).expect("encode retry");
+        let txn_id = start_write_transaction(context).await?;
+        if let Err(error) = stage_retry_write(context, realm, txn_id, key.to_vec(), value).await {
+            abort_transaction(context, txn_id).await;
+            return Err(error);
+        }
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+            other => panic!("unexpected commit event: {other:?}"),
+        }
+    }
+
     async fn count_inbox(storage: &StorageHandle) -> usize {
         match storage
             .send_storage_effect(StorageEffect::Iter {
@@ -1171,5 +1228,242 @@ mod tests {
         assert_eq!(outcome.0.written, 1);
         assert_eq!(outcome.0.recipients, vec![authorized_owner]);
         assert!(outcome.1);
+    }
+
+    #[tokio::test]
+    async fn paging_defers_remainder() {
+        // Owners past the first subscription page must survive as a durable retry
+        // row and still be delivered by the drain, exactly once.
+        let (_dir, context) = temp_context();
+        let realm = RealmId([5u8; 32]);
+        let (local_node_id, config) = local_config(realm);
+        let actor = user(realm, 2);
+        let group_id = Ulid::from_bytes([6u8; 16]);
+        let late_owner = user(realm, 200);
+        install_authorization(&context, realm, local_node_id, group_id, late_owner).await;
+
+        let mut events = vec![upload_event(realm, actor, group_id, local_node_id)];
+        while events.len() < NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+            let mut quiet = upload_event(realm, actor, group_id, local_node_id);
+            let mut bytes = [9u8; 16];
+            bytes[..8].copy_from_slice(&(events.len() as u64).to_be_bytes());
+            quiet.event_id = Ulid::from_bytes(bytes);
+            quiet.path = data_watch_resource_path(group_id, local_node_id, "quiet", "object");
+            events.push(quiet);
+        }
+        let page = page_limit(events.len()).expect("page limit");
+        for seed in 1..=page {
+            create_watch_subscription(
+                &context.storage_handle,
+                user(realm, seed as u8),
+                data_watch_resource_path(group_id, local_node_id, "idle", ""),
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+                1,
+            )
+            .await
+            .expect("create");
+        }
+        create_watch_subscription(
+            &context.storage_handle,
+            late_owner,
+            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            1,
+        )
+        .await
+        .expect("create");
+
+        let deferred = expand_watch_events(&context, realm, &config, local_node_id, &events)
+            .await
+            .expect("first page commits");
+        assert_eq!(deferred.0.written, 0, "the match sits past the first page");
+        assert_eq!(count_inbox(&context.storage_handle).await, 0);
+        let rows = retry_rows(&context.storage_handle, realm).await;
+        assert_eq!(rows.len(), 1, "the unscanned remainder is queued");
+        assert_eq!(rows[0].0, watch_retry_key(realm, events[0].event_id));
+
+        drain_watch_events(&context, realm, &config, local_node_id)
+            .await
+            .expect("drain resumes at the cursor");
+        assert_eq!(count_inbox(&context.storage_handle).await, 1);
+        assert!(
+            retry_rows(&context.storage_handle, realm).await.is_empty(),
+            "a completed retry row is removed"
+        );
+
+        drain_watch_events(&context, realm, &config, local_node_id)
+            .await
+            .expect("empty drain");
+        assert_eq!(count_inbox(&context.storage_handle).await, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_rejects_foreign() {
+        // Only the carried realm changes between the rejected and applied row, so
+        // the refusal can only come from the realm scope check.
+        let (_dir, context) = temp_context();
+        let realm = RealmId([6u8; 32]);
+        let foreign_realm = RealmId([7u8; 32]);
+        let (local_node_id, config) = local_config(realm);
+        let owner = user(realm, 1);
+        let group_id = Ulid::from_bytes([8u8; 16]);
+        install_authorization(&context, realm, local_node_id, group_id, owner).await;
+        create_watch_subscription(
+            &context.storage_handle,
+            owner,
+            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            1,
+        )
+        .await
+        .expect("create");
+
+        let local = upload_event(realm, user(realm, 2), group_id, local_node_id);
+        let mut foreign = local.clone();
+        foreign.realm_id = foreign_realm;
+        let key = watch_retry_key(realm, foreign.event_id);
+        let cursor = Some(watch_subscription_key(user(realm, 0), Ulid::nil()).to_vec());
+        write_retry(
+            &context,
+            &key,
+            &WatchEventRetry {
+                events: vec![foreign],
+                cursor: cursor.clone(),
+            },
+        )
+        .await;
+        assert!(
+            drain_watch_events(&context, realm, &config, local_node_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(retry_rows(&context.storage_handle, realm).await.len(), 1);
+        assert_eq!(count_inbox(&context.storage_handle).await, 0);
+
+        write_retry(
+            &context,
+            &key,
+            &WatchEventRetry {
+                events: vec![local],
+                cursor,
+            },
+        )
+        .await;
+        drain_watch_events(&context, realm, &config, local_node_id)
+            .await
+            .expect("in-realm row applies");
+        assert!(retry_rows(&context.storage_handle, realm).await.is_empty());
+        assert_eq!(count_inbox(&context.storage_handle).await, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_cursor_monotonic() {
+        // The last write rewinds the cursor; only an advancing second write can
+        // leave the queued row at `ahead`.
+        let (_dir, context) = temp_context();
+        let realm = RealmId([9u8; 32]);
+        let node_id = local_config(realm).0;
+        let event = upload_event(realm, user(realm, 2), Ulid::from_bytes([3u8; 16]), node_id);
+        let key = watch_retry_key(realm, event.event_id);
+        let behind = watch_subscription_key(user(realm, 2), Ulid::nil()).to_vec();
+        let ahead = watch_subscription_key(user(realm, 9), Ulid::nil()).to_vec();
+        for cursor in [behind.clone(), ahead.clone(), behind] {
+            commit_retry(
+                &context,
+                realm,
+                &key,
+                &WatchEventRetry {
+                    events: vec![event.clone()],
+                    cursor: Some(cursor),
+                },
+            )
+            .await
+            .expect("stage retry");
+        }
+
+        let rows = retry_rows(&context.storage_handle, realm).await;
+        assert_eq!(rows.len(), 1, "a retry row is replaced, not duplicated");
+        let stored: WatchEventRetry = postcard::from_bytes(&rows[0].1).expect("decode retry");
+        assert_eq!(stored.cursor, Some(ahead));
+    }
+
+    #[tokio::test]
+    async fn retry_row_cap() {
+        // The row cap must not strand a queued page: an existing row still updates.
+        let (_dir, context) = temp_context();
+        let realm = RealmId([10u8; 32]);
+        let node_id = local_config(realm).0;
+        let base = upload_event(realm, user(realm, 2), Ulid::from_bytes([3u8; 16]), node_id);
+        let cursor = watch_subscription_key(user(realm, 2), Ulid::nil()).to_vec();
+        let mut queued = Vec::new();
+        for seed in 0..NOTIFICATION_WATCH_RETRY_BATCH_CAP {
+            let mut event = base.clone();
+            event.event_id = Ulid::from_bytes([seed as u8 + 20; 16]);
+            let key = watch_retry_key(realm, event.event_id);
+            commit_retry(
+                &context,
+                realm,
+                &key,
+                &WatchEventRetry {
+                    events: vec![event.clone()],
+                    cursor: Some(cursor.clone()),
+                },
+            )
+            .await
+            .expect("seed row");
+            queued.push((key, event));
+        }
+
+        let mut overflow = base;
+        overflow.event_id = Ulid::from_bytes([99u8; 16]);
+        let error = commit_retry(
+            &context,
+            realm,
+            &watch_retry_key(realm, overflow.event_id),
+            &WatchEventRetry {
+                events: vec![overflow],
+                cursor: Some(cursor),
+            },
+        )
+        .await
+        .expect_err("row cap refuses a new row");
+        assert!(matches!(error, UpsertFailure::Fatal(message) if message.contains("row cap")));
+
+        let (key, event) = queued.remove(0);
+        commit_retry(
+            &context,
+            realm,
+            &key,
+            &WatchEventRetry {
+                events: vec![event],
+                cursor: Some(watch_subscription_key(user(realm, 9), Ulid::nil()).to_vec()),
+            },
+        )
+        .await
+        .expect("queued row still advances");
+        assert_eq!(
+            retry_rows(&context.storage_handle, realm).await.len(),
+            NOTIFICATION_WATCH_RETRY_BATCH_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_cap_rejected() {
+        let (_dir, context) = temp_context();
+        let realm = RealmId([11u8; 32]);
+        let (local_node_id, config) = local_config(realm);
+        let event = upload_event(
+            realm,
+            user(realm, 2),
+            Ulid::from_bytes([3u8; 16]),
+            local_node_id,
+        );
+        let events = vec![event; NOTIFICATION_WATCH_EVENT_BATCH_SIZE + 1];
+
+        let error = expand_watch_events(&context, realm, &config, local_node_id, &events)
+            .await
+            .expect_err("over-cap batch");
+        assert!(error.contains("exceeds cap"), "{error}");
+        assert_eq!(count_inbox(&context.storage_handle).await, 0);
     }
 }

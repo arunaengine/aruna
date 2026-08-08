@@ -750,10 +750,15 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{BackendRef, RealmId, RoCrateCheckpointRefs, RoCrateMediaType};
+    use aruna_core::structs::{
+        ArtifactRef, AuthContext, BackendRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload,
+        JobState, RealmId, RoCrateCheckpointRefs, RoCrateLimits, RoCrateMediaType,
+    };
     use aruna_core::types::UserId;
+    use aruna_storage::FjallStorage;
     use serde::Serialize;
     use std::collections::HashMap;
+    use tempfile::tempdir;
 
     fn upload_record(
         upload_id: Ulid,
@@ -867,5 +872,367 @@ mod tests {
 
         assert_eq!(refs.hidden_locations, vec![location]);
         assert!(!remainder.is_empty());
+    }
+
+    fn temp_context() -> (tempfile::TempDir, DriverContext) {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        (
+            dir,
+            DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            },
+        )
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + SWEEP_BUDGET
+    }
+
+    fn hidden_location(namespace: Ulid, name: &str) -> BackendLocation {
+        let mut location = upload_record(namespace, 0, None).location;
+        location.backend_path = format!("_jobs/{namespace}/{name}");
+        location
+    }
+
+    fn job_record(job_id: JobId, state: JobState) -> JobRecord {
+        let realm = RealmId::from_bytes([1u8; 32]);
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::ExportRoCrate(ExportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: UserId::nil(realm),
+                    realm_id: realm,
+                    path_restrictions: None,
+                },
+                document_id: Ulid::from_bytes([2u8; 16]),
+                limits: RoCrateLimits::default(),
+            }),
+            UserId::nil(realm),
+            iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            0,
+            0,
+            None,
+        );
+        record.state = state;
+        record
+    }
+
+    fn export_result(location: BackendLocation) -> JobResultPayload {
+        JobResultPayload::ExportRoCrate(ExportRoCrateResult {
+            artifact: Some(ArtifactRef {
+                location,
+                blake3: [0u8; 32],
+                size: 1,
+                expires_at_ms: 0,
+            }),
+            included: 0,
+            omitted: Default::default(),
+            report_digest: [0u8; 32],
+        })
+    }
+
+    async fn write_row(storage: &StorageHandle, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: ByteView::from(key),
+                    value: ByteView::from(value),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn stored_upload(storage: &StorageHandle, upload_id: Ulid) -> bool {
+        read_value(
+            storage,
+            ROCRATE_UPLOAD_KEYSPACE,
+            ByteView::from(upload_id.to_bytes().to_vec()),
+            None,
+            deadline(),
+        )
+        .await
+        .expect("read upload")
+        .is_some()
+    }
+
+    #[tokio::test]
+    async fn upload_guards_liveness() {
+        // Only the clock moves between the protected and the sweepable case.
+        let (_dir, context) = temp_context();
+        let upload_id = Ulid::from_bytes([4u8; 16]);
+        let record = upload_record(upload_id, 10, None);
+        let key = HiddenBlobKey::try_from(&record.location).expect("hidden key");
+        write_row(
+            &context.storage_handle,
+            ROCRATE_UPLOAD_KEYSPACE,
+            upload_id.to_bytes().to_vec(),
+            postcard::to_allocvec(&record).expect("encode upload"),
+        )
+        .await;
+
+        assert!(
+            is_protected(&context, &key, 9, deadline())
+                .await
+                .expect("live upload")
+        );
+        assert!(
+            !is_protected(&context, &key, 10, deadline())
+                .await
+                .expect("expired upload")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_guards_key() {
+        // A live record protects the blob it points at, not its whole namespace.
+        let (_dir, context) = temp_context();
+        let upload_id = Ulid::from_bytes([5u8; 16]);
+        let record = upload_record(upload_id, 10, None);
+        let key = HiddenBlobKey::try_from(&record.location).expect("hidden key");
+        let sibling = HiddenBlobKey::try_from(&hidden_location(upload_id, "input_02"))
+            .expect("sibling hidden key");
+        write_row(
+            &context.storage_handle,
+            ROCRATE_UPLOAD_KEYSPACE,
+            upload_id.to_bytes().to_vec(),
+            postcard::to_allocvec(&record).expect("encode upload"),
+        )
+        .await;
+
+        assert!(
+            is_protected(&context, &key, 9, deadline())
+                .await
+                .expect("recorded blob")
+        );
+        assert!(
+            !is_protected(&context, &sibling, 9, deadline())
+                .await
+                .expect("unrecorded blob")
+        );
+    }
+
+    #[tokio::test]
+    async fn job_guards_hidden() {
+        // A running export owns its namespace; once terminal it keeps only the
+        // artifact it published.
+        let (_dir, context) = temp_context();
+        let job_id = JobId::from_bytes([5u8; 16]);
+        let namespace = Ulid::from_bytes(job_id.to_bytes());
+        let artifact = hidden_location(namespace, "artifact_01");
+        let key = HiddenBlobKey::try_from(&artifact).expect("hidden key");
+        let scratch = HiddenBlobKey::try_from(&hidden_location(namespace, "artifact_02"))
+            .expect("scratch hidden key");
+        let running = job_record(job_id, JobState::Running);
+        write_row(
+            &context.storage_handle,
+            JOB_KEYSPACE,
+            job_record_key(job_id).to_vec(),
+            running.to_bytes().expect("encode job"),
+        )
+        .await;
+
+        assert!(
+            is_protected(&context, &scratch, 0, deadline())
+                .await
+                .expect("running job")
+        );
+
+        let mut finished = job_record(job_id, JobState::Succeeded);
+        finished.result = Some(export_result(artifact));
+        write_row(
+            &context.storage_handle,
+            JOB_KEYSPACE,
+            job_record_key(job_id).to_vec(),
+            finished.to_bytes().expect("encode job"),
+        )
+        .await;
+
+        assert!(
+            is_protected(&context, &key, 0, deadline())
+                .await
+                .expect("published artifact")
+        );
+        assert!(
+            !is_protected(&context, &scratch, 0, deadline())
+                .await
+                .expect("finished scratch blob")
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_live() {
+        // The claim only removes a record that is no longer live.
+        let (_dir, context) = temp_context();
+        let upload_id = Ulid::from_bytes([6u8; 16]);
+        write_row(
+            &context.storage_handle,
+            ROCRATE_UPLOAD_KEYSPACE,
+            upload_id.to_bytes().to_vec(),
+            postcard::to_allocvec(&upload_record(upload_id, 10, None)).expect("encode upload"),
+        )
+        .await;
+
+        assert_eq!(
+            delete_unclaimed(&context.storage_handle, upload_id, 9, deadline())
+                .await
+                .expect("live record"),
+            RecordCleanup::Protected
+        );
+        assert!(stored_upload(&context.storage_handle, upload_id).await);
+        assert_eq!(
+            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+                .await
+                .expect("expired record"),
+            RecordCleanup::Deleted
+        );
+        assert!(!stored_upload(&context.storage_handle, upload_id).await);
+        assert_eq!(
+            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+                .await
+                .expect("absent record"),
+            RecordCleanup::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_checks_claim() {
+        // An expired record claimed by a job lives exactly as long as that job.
+        let (_dir, context) = temp_context();
+        let job_id = JobId::from_bytes([5u8; 16]);
+        let upload_id = Ulid::from_bytes([7u8; 16]);
+        write_row(
+            &context.storage_handle,
+            ROCRATE_UPLOAD_KEYSPACE,
+            upload_id.to_bytes().to_vec(),
+            postcard::to_allocvec(&upload_record(upload_id, 0, Some(job_id)))
+                .expect("encode upload"),
+        )
+        .await;
+        write_row(
+            &context.storage_handle,
+            JOB_KEYSPACE,
+            job_record_key(job_id).to_vec(),
+            job_record(job_id, JobState::Running)
+                .to_bytes()
+                .expect("encode job"),
+        )
+        .await;
+
+        assert_eq!(
+            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+                .await
+                .expect("claimed by a running job"),
+            RecordCleanup::Protected
+        );
+        write_row(
+            &context.storage_handle,
+            JOB_KEYSPACE,
+            job_record_key(job_id).to_vec(),
+            job_record(job_id, JobState::Failed)
+                .to_bytes()
+                .expect("encode job"),
+        )
+        .await;
+        assert_eq!(
+            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+                .await
+                .expect("claimed by a finished job"),
+            RecordCleanup::Deleted
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_key_mismatch() {
+        // A row filed under a foreign key must not drive cleanup of the upload id
+        // it names. Blob deletion is unreachable here, so both passes stay pending.
+        let (_dir, mismatched) = temp_context();
+        let victim = Ulid::from_bytes([8u8; 16]);
+        let record = postcard::to_allocvec(&upload_record(victim, 0, None)).expect("encode upload");
+        write_row(
+            &mismatched.storage_handle,
+            ROCRATE_UPLOAD_KEYSPACE,
+            Ulid::from_bytes([9u8; 16]).to_bytes().to_vec(),
+            record.clone(),
+        )
+        .await;
+
+        let mut cursor = None;
+        let outcome = sweep_uploads(&mismatched, 10, &mut cursor, deadline())
+            .await
+            .expect("scan completes");
+        assert_eq!(outcome, (0, false, true));
+        assert!(
+            stored_upload(&mismatched.storage_handle, Ulid::from_bytes([9u8; 16])).await,
+            "the mismatched row is retained"
+        );
+
+        let (_other_dir, keyed) = temp_context();
+        write_row(
+            &keyed.storage_handle,
+            ROCRATE_UPLOAD_KEYSPACE,
+            victim.to_bytes().to_vec(),
+            record,
+        )
+        .await;
+        let mut cursor = None;
+        assert!(
+            sweep_uploads(&keyed, 10, &mut cursor, deadline())
+                .await
+                .expect("scan completes")
+                .2
+        );
+        assert!(
+            !stored_upload(&keyed.storage_handle, victim).await,
+            "a correctly keyed stale row is claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_advances_phase() {
+        // The sweep persists its phase and keeps asking for another pass until a
+        // cycle completes; a phase that fails is retried, not skipped.
+        let (_dir, context) = temp_context();
+        let first = sweep_at(&context, 0).await.expect("cleanup phase");
+        assert!(first.cleanup_pending, "the cycle is unfinished");
+        assert!(matches!(
+            load_cursor(&context.storage_handle, deadline())
+                .await
+                .expect("cursor")
+                .phase,
+            SweepPhase::Uploads
+        ));
+
+        let second = sweep_at(&context, 0).await.expect("uploads phase");
+        assert_eq!(second.uploads_deleted, 0);
+        assert!(second.cleanup_pending);
+        assert!(matches!(
+            load_cursor(&context.storage_handle, deadline())
+                .await
+                .expect("cursor")
+                .phase,
+            SweepPhase::Hidden
+        ));
+
+        let error = sweep_at(&context, 0)
+            .await
+            .expect_err("the hidden phase needs a blob adapter");
+        assert!(error.contains("blob handle"), "{error}");
+        assert!(matches!(
+            load_cursor(&context.storage_handle, deadline())
+                .await
+                .expect("cursor")
+                .phase,
+            SweepPhase::Hidden
+        ));
     }
 }
