@@ -7,13 +7,11 @@ use std::time::SystemTime;
 use aruna_core::compute::{
     has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
-use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, OutputDestination, OutputSelection,
     blob_group_permission_path,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::service::{
@@ -21,7 +19,7 @@ use aruna_operations::jobs::service::{
     submit_execution_job,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -34,6 +32,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
 use crate::error::ServerError;
+use crate::forwarded::external_base_url;
 use crate::server_state::ServerState;
 
 /// GA4GH TES version this facade implements.
@@ -401,8 +400,12 @@ fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
     tag = "tes",
     responses((status = 200, body = TesServiceInfo))
 )]
-pub async fn service_info(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
-    let base_url = external_base_url(&headers);
+pub async fn service_info(
+    State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let info = TesServiceInfo {
         id: format!("org.aruna.{}", state.get_realm_id()),
         name: format!("Aruna Realm {}", state.get_realm_id()),
@@ -526,6 +529,7 @@ pub async fn get_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(query): Query<ViewQuery>,
@@ -559,7 +563,7 @@ pub async fn get_task(
         return TesError::not_found("TES task not found").into_response();
     }
 
-    let base_url = external_base_url(&headers);
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     tes_json_response(StatusCode::OK, project_task(&record, view, &base_url))
 }
 
@@ -586,6 +590,7 @@ pub async fn get_task(
 pub async fn list_tasks(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(query): Query<ListTasksQuery>,
@@ -625,7 +630,7 @@ pub async fn list_tasks(
         Err(error) => return TesError::internal(error).into_response(),
     };
 
-    let base_url = external_base_url(&headers);
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let tasks = records
         .iter()
         .map(|record| project_task(record, view, &base_url))
@@ -1293,8 +1298,13 @@ async fn authenticate_tes(
         | Err(GetUserAccessError::NotFound) => return Err(TesError::unauthorized()),
         Ok(Some(Err(error))) | Err(error) => return Err(TesError::internal(error.to_string())),
     };
-    let secret_matches =
-        blake3::hash(provided_secret.as_slice()) == blake3::hash(access.secret.as_bytes());
+    // The secret seals with this node's issuer-local key, so it opens only for a
+    // credential this node issued; a foreign or tampered record never matches.
+    let secret_matches = access
+        .open_secret(state.credential_seal_key())
+        .is_ok_and(|plaintext| {
+            blake3::hash(provided_secret.as_slice()) == blake3::hash(plaintext.as_bytes())
+        });
     if access.access_key != access_key
         || access.user_identity.realm_id != state.get_realm_id()
         || access.issued_by != *state.get_node_id().as_bytes()
@@ -1362,27 +1372,17 @@ async fn ensure_group_write(
     auth: &AuthContext,
     group_id: Ulid,
 ) -> Result<(), TesError> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
-            required_permission: aruna_core::structs::Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
+        aruna_core::structs::Permission::WRITE,
     )
     .await
     .map_err(|error| match error {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => TesError::forbidden("no write access to group"),
-        other => TesError::internal(other.to_string()),
-    })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(TesError::forbidden("no write access to group"))
-    }
+        crate::error::ServerError::InternalError(message) => TesError::internal(message),
+        _ => TesError::forbidden("no write access to group"),
+    })
 }
 
 fn decode_page_token(token: Option<&str>) -> Result<Option<Vec<u8>>, TesError> {
@@ -1404,19 +1404,6 @@ fn rfc3339(ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(ms as i64)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
-}
-
-fn external_base_url(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("http");
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(http::header::HOST))
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("localhost");
-    format!("{scheme}://{host}")
 }
 
 fn tes_json_response<T: Serialize>(status: StatusCode, value: T) -> Response {
@@ -1529,10 +1516,12 @@ mod tests {
     use aruna_operations::jobs::service::read_owned_job;
 
     use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_ACCESS_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
+    };
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, JobError, NodeCapabilities, OutputObject,
-        RealmAuthorizationDocument, RealmId, UserAccess, WorkspaceMode,
+        Actor, Group, GroupAuthorizationDocument, JobError, NodeCapabilities, OutputObject,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, WorkspaceMode,
     };
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
@@ -1561,18 +1550,30 @@ mod tests {
         })
     }
 
+    const TES_SECRET: &str = "tes-secret";
+
     fn credential(group_id: Ulid) -> UserAccess {
         let user_identity = user(2);
         UserAccess {
             access_key: UserAccess::build_access_key("tes").unwrap(),
             user_identity,
             group_id,
-            secret: "tes-secret".to_string(),
+            secret: aruna_core::credential_seal::SealedS3Secret::empty(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: *node_id().as_bytes(),
             revoked_at: None,
         }
+    }
+
+    /// A credential whose secret is sealed with the node's issuer-local key, as
+    /// the create-credential path would have produced.
+    fn sealed(state: &ServerState, group_id: Ulid) -> UserAccess {
+        let mut access = credential(group_id);
+        access
+            .seal_secret(state.credential_seal_key(), TES_SECRET)
+            .unwrap();
+        access
     }
 
     fn basic_headers(access: &UserAccess, secret: &str) -> HeaderMap {
@@ -1604,21 +1605,44 @@ mod tests {
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm());
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(owner, realm(), group_id);
-        for (key, value) in [
+        let group = Group {
+            display_name: "tes-group".to_string(),
+            group_id,
+            realm_id: realm(),
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        // Request-policy loading fails closed without the realm config, the group
+        // record, and the group auth document.
+        for (key_space, key, value) in [
             (
+                REALM_CONFIG_KEYSPACE,
+                realm().as_bytes().to_vec(),
+                RealmConfigDocument::default_for_realm(realm(), Vec::new())
+                    .to_bytes(&actor)
+                    .unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
                 realm().as_bytes().to_vec(),
                 realm_auth.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 group_id.to_bytes().to_vec(),
                 group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
             ),
         ] {
             let _ = state
                 .get_ctx()
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: AUTH_KEYSPACE.to_string(),
+                    key_space: key_space.to_string(),
                     key: key.into(),
                     value: value.into(),
                     txn_id: None,
@@ -2290,7 +2314,7 @@ mod tests {
     async fn rejects_basic() {
         let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         let mut revoked = access.clone();
         revoked.revoked_at = Some(SystemTime::now());
         let mut expired = access.clone();
@@ -2315,17 +2339,13 @@ mod tests {
     #[tokio::test]
     async fn rejects_restricted_basic() {
         let (_dir, state) = build_state(false).await;
-        let mut access = credential(Ulid::from_bytes([5u8; 16]));
+        let mut access = sealed(&state, Ulid::from_bytes([5u8; 16]));
         access.path_restrictions = Some(Vec::new());
         write_credential(&state, &access).await;
 
-        let error = authenticate_tes(
-            &state,
-            None,
-            &basic_headers(&access, access.secret.as_str()),
-        )
-        .await
-        .unwrap_err();
+        let error = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET))
+            .await
+            .unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
@@ -2333,7 +2353,7 @@ mod tests {
     async fn creates_tagless_basic() {
         let (_dir, state) = build_state(true).await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
         let mut task = sample_task(group);
@@ -2342,7 +2362,7 @@ mod tests {
         let response = create_task(
             State(state.clone()),
             Extension(None),
-            basic_headers(&access, access.secret.as_str()),
+            basic_headers(&access, TES_SECRET),
             Json(task),
         )
         .await;
@@ -2382,14 +2402,14 @@ mod tests {
         // Without S3 mounts, TES falls back to a kept workspace and snapshot inputs.
         let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
 
         let response = create_task(
             State(state.clone()),
             Extension(None),
-            basic_headers(&access, access.secret.as_str()),
+            basic_headers(&access, TES_SECRET),
             Json(sample_task(group)),
         )
         .await;
@@ -2419,9 +2439,9 @@ mod tests {
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
         let sibling = Ulid::from_bytes([6u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
-        let headers = basic_headers(&access, access.secret.as_str());
+        let headers = basic_headers(&access, TES_SECRET);
         let caller = authenticate_tes(&state, None, &headers).await.unwrap();
         assert_eq!(caller.auth.user_id, owner);
         assert_eq!(caller.credential_group, Some(group));
@@ -2442,6 +2462,7 @@ mod tests {
             State(state.clone()),
             Extension(None),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers.clone(),
             Path(visible_id.to_string()),
             Query(ViewQuery::default()),
@@ -2452,6 +2473,7 @@ mod tests {
             State(state.clone()),
             Extension(None),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers.clone(),
             Path(hidden_id.to_string()),
             Query(ViewQuery::default()),
@@ -2481,6 +2503,7 @@ mod tests {
         let listed = list_tasks(
             State(state),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers,
             RawQuery(None),
             Query(ListTasksQuery::default()),
@@ -2501,9 +2524,9 @@ mod tests {
         let (_dir, state) = build_state(false).await;
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
-        let headers = basic_headers(&access, access.secret.as_str());
+        let headers = basic_headers(&access, TES_SECRET);
         let (spec, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
         insert_job(
             &state.get_ctx().storage_handle,
@@ -2515,6 +2538,7 @@ mod tests {
         let listed = list_tasks(
             State(state),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers,
             RawQuery(None),
             Query(ListTasksQuery {
@@ -2549,6 +2573,7 @@ mod tests {
             State(state.clone()),
             Extension(auth_for(owner)),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
             Path(job_id.to_string()),
             Query(ViewQuery {
@@ -2563,6 +2588,7 @@ mod tests {
             State(state.clone()),
             Extension(auth_for(user(3))),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
             Path(job_id.to_string()),
             Query(ViewQuery::default()),

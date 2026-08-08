@@ -156,7 +156,8 @@ async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<Backe
         for (_, value) in values {
             if let Ok(
                 BlobCleanupWork::DeleteBlob { location }
-                | BlobCleanupWork::ReconcileWrite { location, .. },
+                | BlobCleanupWork::ReconcileWrite { location, .. }
+                | BlobCleanupWork::ReconcileReservation { location },
             ) = BlobCleanupWork::from_bytes(value.as_ref())
             {
                 holding.insert(location.backend);

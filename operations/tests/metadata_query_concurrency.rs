@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::metadata::{
     MetadataCreateCrateRequest, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
     MetadataGraphPolicy, MetadataQueryResults, MetadataRequestDurability,
@@ -16,7 +18,7 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{metadata_graph_lifecycle_write_entry, metadata_registry_key};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, MetadataRegistryRecord, PlacementRef,
-    RealmAuthorizationDocument, RealmId,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
@@ -64,12 +66,66 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
         None,
         options,
     )?;
+    // Policy loading fails closed without realm config and group documents.
+    let group_id = Ulid::generate();
+    let owner = aruna_core::UserId::nil(REALM);
+    let actor = Actor {
+        node_id,
+        user_id: owner,
+        realm_id: REALM,
+    };
+    let config = RealmConfigDocument::default_for_realm(REALM, Vec::new());
+    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(REALM);
+    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, REALM, group_id);
+    let group = Group {
+        display_name: "harness-group".to_string(),
+        group_id,
+        realm_id: REALM,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
+    let writes: Vec<(&str, Key, Value)> = vec![
+        (
+            REALM_CONFIG_KEYSPACE,
+            (*REALM.as_bytes()).into(),
+            config.to_bytes(&actor)?.into(),
+        ),
+        (
+            AUTH_KEYSPACE,
+            (*REALM.as_bytes()).into(),
+            realm_auth.to_bytes(&actor)?.into(),
+        ),
+        (
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor)?.into(),
+        ),
+        (
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor)?.into(),
+        ),
+    ];
+    for (key_space, key, value) in writes {
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value,
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => return Err(format!("harness fixture write failed: {other:?}").into()),
+        }
+    }
     Ok(TestHarness {
         _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         storage,
         handle,
-        group_id: Ulid::generate(),
+        group_id,
     })
 }
 

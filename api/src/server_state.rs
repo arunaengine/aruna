@@ -2,7 +2,8 @@ use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
-use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_core::credential_seal::CredentialSealKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -14,7 +15,7 @@ use aruna_core::structs::{
     Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId, RoCrateLimits,
 };
 use aruna_operations::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
 };
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -40,13 +41,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::warn;
 use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
+pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
+pub(crate) const DOWNLOAD_SLOTS: usize = 256;
 #[derive(Clone, Debug)]
 pub struct ServerState {
     // Contains neccessary drivers for request handling
@@ -55,8 +58,6 @@ pub struct ServerState {
     node_capabilities: NodeCapabilities,
     // Bounded TTL + LRU cache of trusted issuer decoding keys
     issuer_keys: Arc<IssuerKeyCache>,
-    // Contains token id as a string, so also invalid ids get banned
-    token_revocation_list: Arc<RwLock<HashSet<String, ahash::RandomState>>>,
     // Contains trusted realms
     trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
     initial_admin_claim: Option<Arc<AtomicBool>>,
@@ -64,6 +65,9 @@ pub struct ServerState {
     realm_id: RealmId,
     // Realm membership
     node_id: NodeId,
+    // Issuer-local key that seals S3 credential secrets at rest, derived from
+    // this node's secret so it matches the S3 verifier on the same node.
+    credential_seal_key: CredentialSealKey,
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -74,6 +78,11 @@ pub struct ServerState {
     // True when this node can mount S3 inputs (Kubernetes with a CSI driver).
     s3_mounts_available: bool,
     rocrate_limits: RoCrateLimits,
+    // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
+    trusted_proxies: Vec<ipnet::IpNet>,
+    rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
+    rocrate_upload_slots: Arc<Semaphore>,
+    download_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -140,12 +149,6 @@ impl ServerState {
         oidc_validator: Option<Arc<OidcValidator>>,
         jobs_runtime: Arc<JobsRuntime>,
     ) -> Self {
-        let token_revocation_list = load_persisted_state::<HashSet<String, ahash::RandomState>>(
-            driver_ctx.as_ref(),
-            TOKEN_REVOCATION_LIST_KEY,
-        )
-        .await
-        .unwrap_or_default();
         let mut trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
             driver_ctx.as_ref(),
             TRUSTED_REALMS_LIST_KEY,
@@ -162,14 +165,19 @@ impl ServerState {
             None
         };
         trusted_realms.insert(realm_id);
+        let credential_seal_key = driver_ctx
+            .net_handle
+            .as_ref()
+            .map(|net| net.credential_seal_key())
+            .unwrap_or_else(CredentialSealKey::random);
         let state = Self {
             driver_ctx,
             realm_id,
             node_id,
+            credential_seal_key,
             oidc_validator,
             jobs_runtime,
             node_capabilities,
-            token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
             issuer_keys: Arc::new(IssuerKeyCache::new()),
             initial_admin_claim,
@@ -178,6 +186,10 @@ impl ServerState {
             metrics: Arc::new(NodeMetrics::new()),
             s3_mounts_available: false,
             rocrate_limits: RoCrateLimits::default(),
+            trusted_proxies: Vec::new(),
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+            rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
+            download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
         };
         state.persist_trusted_realms().await;
         state
@@ -218,6 +230,33 @@ impl ServerState {
         &self.rocrate_limits
     }
 
+    pub fn with_trusted_proxies(mut self, proxies: Vec<ipnet::IpNet>) -> Self {
+        self.trusted_proxies = proxies;
+        self
+    }
+
+    pub fn trusted_proxies(&self) -> &[ipnet::IpNet] {
+        &self.trusted_proxies
+    }
+
+    /// Installs operator-configured request limiters. Call before serving.
+    pub fn with_rate_limits(mut self, limits: crate::rate_limit::ApiRateLimits) -> Self {
+        self.rate_limits = Arc::new(limits);
+        self
+    }
+
+    pub fn rate_limits(&self) -> &crate::rate_limit::ApiRateLimits {
+        &self.rate_limits
+    }
+
+    pub(crate) fn try_rocrate_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.rocrate_upload_slots.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) fn try_acquire_download(&self) -> Option<OwnedSemaphorePermit> {
+        self.download_slots.clone().try_acquire_owned().ok()
+    }
+
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {
         self.jobs_runtime.clone()
     }
@@ -243,6 +282,10 @@ impl ServerState {
 
     pub fn get_node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub fn credential_seal_key(&self) -> &CredentialSealKey {
+        &self.credential_seal_key
     }
 
     pub fn node_capabilities(&self) -> &NodeCapabilities {
@@ -398,19 +441,9 @@ impl ServerState {
         self.issuer_keys.len().await
     }
 
-    pub async fn add_token_to_blacklist(&self, token: &str) {
-        let hash = bearer_token_hash(token);
-        self.token_revocation_list.write().await.insert(hash);
-        self.persist_token_revocation_list().await;
-    }
     pub async fn add_trusted_realm(&self, realm_id: RealmId) {
         self.trusted_realms_list.write().await.insert(realm_id);
         self.persist_trusted_realms().await;
-    }
-
-    pub async fn is_token_blacklisted(&self, token: &str) -> bool {
-        let hash = bearer_token_hash(token);
-        self.token_revocation_list.read().await.get(&hash).is_some()
     }
 
     pub async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
@@ -491,16 +524,6 @@ impl ServerState {
         ))
     }
 
-    async fn persist_token_revocation_list(&self) {
-        let blacklist = self.token_revocation_list.read().await.clone();
-        persist_state(
-            self.driver_ctx.as_ref(),
-            TOKEN_REVOCATION_LIST_KEY,
-            &blacklist,
-        )
-        .await;
-    }
-
     async fn persist_trusted_realms(&self) {
         let trusted_realms = self.trusted_realms_list.read().await.clone();
         persist_state(
@@ -527,15 +550,21 @@ impl ServerState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for ServerState {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
-        self.token_revocation_list.read().await.contains(token_hash)
+    async fn is_token_revoked(
+        &self,
+        realm_id: &RealmId,
+        token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        // The issuing realm's replicated config is the only revocation
+        // authority; it is expiry-bounded, so the durable set stays limited.
+        realm_token_revoked(&self.driver_ctx.storage_handle, *realm_id, token_hash).await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
         self.trusted_realms_list.read().await.contains(realm_id)
     }
 
-    async fn decoding_key_for_issuer(
+    async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {

@@ -21,9 +21,10 @@ use tokio_util::io::ReaderStream;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::connectors::resolver::{ARUNA_NATIVE_ORIGIN_NODE_ID, ARUNA_NATIVE_RELATIONSHIP_ID};
 use crate::driver::{DriverContext, drive};
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
@@ -338,29 +339,45 @@ async fn prepare_reference(
                 ));
             }
         };
-    let permitted = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: relationship.created_by,
-                realm_id: relationship.source.realm_id,
-                path_restrictions: None,
-            },
-            path: blob_object_permission_path(
-                relationship.source.realm_id,
-                bucket_info.group_id,
-                relationship.source.node_id,
-                &request.bucket,
-                &request.key,
-            ),
-            required_permission: Permission::READ,
-        }),
+    let auth_context = AuthContext {
+        user_id: relationship.created_by,
+        realm_id: relationship.source.realm_id,
+        path_restrictions: None,
+    };
+    let path = blob_object_permission_path(
+        relationship.source.realm_id,
+        bucket_info.group_id,
+        relationship.source.node_id,
+        &request.bucket,
+        &request.key,
+    );
+    if let Err(error) = authorize(
         context,
+        auth_context.realm_id,
+        &auth_context,
+        &path,
+        &Permission::READ,
+        PolicyRequestExtras::operation(if request.head {
+            "s3.HeadObject"
+        } else {
+            "s3.GetObject"
+        }),
     )
     .await
-    .map_err(|error| NativeReferenceReject::Unavailable(error.to_string()))?;
-    if !permitted {
-        mark_access_denied(context, relationship).await;
-        return Err(NativeReferenceReject::AccessDenied);
+    {
+        match error {
+            AuthorizeError::PermissionDenied
+            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => {
+                mark_access_denied(context, relationship).await;
+                return Err(NativeReferenceReject::AccessDenied);
+            }
+            AuthorizeError::Policy(PolicyEnforcementError::Unavailable(error)) => {
+                return Err(NativeReferenceReject::Unavailable(error));
+            }
+            AuthorizeError::CheckFailed(error) => {
+                return Err(NativeReferenceReject::Unavailable(error));
+            }
+        }
     }
 
     if request.head {

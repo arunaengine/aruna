@@ -1,17 +1,21 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFunctions};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, HashPathIndexKey, Permission,
-    RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn, blob_object_permission_path,
+    BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, GroupAuthorizationDocument,
+    HashPathIndexKey, Permission, RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn,
+    blob_object_permission_path,
 };
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, GroupId, TxnId};
 use bytes::Bytes;
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -19,9 +23,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
-use crate::blob::blob_keyspace_helper::{blob_location_read, iter_hash_path_index_effect};
+use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm_peer::ensure_realm_peer;
+use crate::request_policy::{PolicyRequestExtras, policy_request_with};
 
 #[derive(Debug, PartialEq)]
 pub enum BaoReadOutput {
@@ -269,20 +274,29 @@ pub enum IncomingBaoReadResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IncomingBaoReadState {
     Init,
+    StartTransaction,
     ReadRealm,
     ReadExactVersion,
     ReadExactBucket,
-    ReadHashAliases,
-    ReadHashVersion,
+    ReadPolicy,
     CheckPermission,
+    ReadHashVersion,
     ReadLocation,
     SendAccepted,
     ServeRead,
     CloseMetadata,
+    CommitTransaction,
     SendRefusal,
     CloseRefusal,
+    AbortTransaction,
     Finish,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyNext {
+    Exact,
+    Hash,
 }
 
 #[derive(Debug, PartialEq)]
@@ -298,9 +312,18 @@ pub struct IncomingBaoReadOperation {
     blob_hash: Option<[u8; 32]>,
     location_key: Option<BlobLocationKey>,
     location: Option<BackendLocation>,
+    candidates_ready: bool,
     had_denial: bool,
     refusal: Option<BaoReadRefusal>,
     output: Option<Result<IncomingBaoReadResult, BaoReadError>>,
+    policy_paths: HashSet<String>,
+    snapshot: bool,
+    txn_id: Option<TxnId>,
+    result: Option<IncomingBaoReadResult>,
+    policy_path: Option<String>,
+    policy_group: Option<GroupId>,
+    policy_next: Option<PolicyNext>,
+    policy_current: bool,
 }
 
 impl IncomingBaoReadOperation {
@@ -323,10 +346,40 @@ impl IncomingBaoReadOperation {
             blob_hash: None,
             location_key: None,
             location: None,
+            candidates_ready: false,
             had_denial: false,
             refusal: None,
             output: None,
+            policy_paths: HashSet::new(),
+            snapshot: false,
+            txn_id: None,
+            result: None,
+            policy_path: None,
+            policy_group: None,
+            policy_next: None,
+            policy_current: false,
         }
+    }
+
+    pub fn with_policy_paths(mut self, paths: HashSet<String>) -> Self {
+        self.policy_paths = paths;
+        self
+    }
+
+    pub fn with_policy_candidates(
+        mut self,
+        candidates: Vec<HashPathIndexKey>,
+        had_denial: bool,
+    ) -> Self {
+        self.candidates = candidates.into();
+        self.candidates_ready = true;
+        self.had_denial = had_denial;
+        self
+    }
+
+    pub fn with_snapshot(mut self) -> Self {
+        self.snapshot = true;
+        self
     }
 
     fn exact_target(&self) -> Option<&VersionedObjectArn> {
@@ -348,7 +401,7 @@ impl IncomingBaoReadOperation {
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
             key: ByteView::from(self.request.realm_id.as_bytes().to_vec()),
-            txn_id: None,
+            txn_id: self.txn_id,
         })]
     }
 
@@ -364,7 +417,7 @@ impl IncomingBaoReadOperation {
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key: key.into(),
-            txn_id: None,
+            txn_id: self.txn_id,
         })]
     }
 
@@ -378,19 +431,134 @@ impl IncomingBaoReadOperation {
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: bucket.as_bytes().into(),
-            txn_id: None,
+            txn_id: self.txn_id,
         })]
     }
 
-    fn read_hash_aliases(&mut self) -> Effects {
-        let Some(hash) = self.hash_target() else {
-            return self.send_refusal(BaoReadRefusal::InvalidTarget);
+    fn start_policy(&mut self, group_id: GroupId, path: String, next: PolicyNext) -> Effects {
+        self.policy_group = Some(group_id);
+        self.policy_path = Some(path.clone());
+        self.policy_next = Some(next);
+        let Some(txn_id) = self.txn_id else {
+            return self.continue_policy(self.policy_paths.contains(&path));
         };
-        self.state = IncomingBaoReadState::ReadHashAliases;
-        match iter_hash_path_index_effect(&hash, None, None) {
-            Ok(effect) => smallvec![effect],
-            Err(error) => self.fail(error.into()),
+        self.state = IncomingBaoReadState::ReadPolicy;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    REALM_CONFIG_KEYSPACE.to_string(),
+                    self.request.realm_id.as_bytes().to_vec().into(),
+                ),
+                (AUTH_KEYSPACE.to_string(), group_id.to_bytes().into()),
+            ],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn continue_policy(&mut self, allowed: bool) -> Effects {
+        let Some(next) = self.policy_next else {
+            return self.fail(BaoReadError::NotFinished);
+        };
+        if !allowed {
+            return match next {
+                PolicyNext::Exact => self.send_refusal(BaoReadRefusal::ReadDenied),
+                PolicyNext::Hash => {
+                    self.had_denial = true;
+                    self.next_candidate()
+                }
+            };
         }
+        match next {
+            PolicyNext::Exact => self.read_exact_version(),
+            PolicyNext::Hash => {
+                let Some(candidate) = self.candidate.as_ref() else {
+                    return self.fail(BaoReadError::NotFinished);
+                };
+                let key =
+                    match VersionKey::new(&candidate.bucket, &candidate.key, candidate.version_id)
+                        .to_bytes()
+                    {
+                        Ok(key) => key,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                self.state = IncomingBaoReadState::ReadHashVersion;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    key: key.into(),
+                    txn_id: self.txn_id,
+                })]
+            }
+        }
+    }
+
+    fn handle_policy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected(event);
+        };
+        let Some((_, Some(realm_value))) = values.first() else {
+            return self.continue_policy(false);
+        };
+        let Some((_, Some(group_value))) = values.get(1) else {
+            return self.continue_policy(false);
+        };
+        let Ok(realm) = RealmConfigDocument::from_bytes(realm_value) else {
+            return self.continue_policy(false);
+        };
+        let Ok(group) = GroupAuthorizationDocument::from_bytes(group_value) else {
+            return self.continue_policy(false);
+        };
+        let Some(group_id) = self.policy_group else {
+            return self.continue_policy(false);
+        };
+        if group.group_id != group_id {
+            return self.continue_policy(false);
+        }
+        let Some(path) = self.policy_path.as_deref() else {
+            return self.continue_policy(false);
+        };
+        let request = policy_request_with(
+            path,
+            &Permission::READ,
+            Some(&self.request.auth_context.user_id),
+            PolicyRequestExtras::operation("s3.GetObject"),
+        );
+        let realm_set = match CompiledPolicySet::compile(&realm.request_policies) {
+            Ok(set) => set,
+            Err(_) => return self.continue_policy(false),
+        };
+        let group_set = match CompiledPolicySet::compile(&group.policies) {
+            Ok(set) => set,
+            Err(_) => return self.continue_policy(false),
+        };
+        self.policy_current = matches!(
+            realm_set.evaluate(&request, &PolicyFunctions::default()),
+            PolicyDecision::Allowed
+        ) && matches!(
+            group_set.evaluate(&request, &PolicyFunctions::default()),
+            PolicyDecision::Allowed
+        );
+        let Some(txn_id) = self.txn_id else {
+            return self.continue_policy(self.policy_current);
+        };
+        self.state = IncomingBaoReadState::CheckPermission;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new_with_txn(
+                CheckPermissionsConfig {
+                    auth_context: self.request.auth_context.clone(),
+                    path: path.to_string(),
+                    required_permission: Permission::READ,
+                },
+                txn_id,
+            ),
+            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
+        ))]
+    }
+
+    fn handle_permission(&mut self, event: Event) -> Effects {
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
+            return self.unexpected(event);
+        };
+        self.continue_policy(allowed.is_ok_and(|allowed| allowed && self.policy_current))
     }
 
     fn next_candidate(&mut self) -> Effects {
@@ -401,30 +569,10 @@ impl IncomingBaoReadOperation {
                 BaoReadRefusal::NotFound
             });
         };
-        let version_key = VersionKey::new(&candidate.bucket, &candidate.key, candidate.version_id);
-        let key = match version_key.to_bytes() {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
+        let path = candidate.permission_path();
+        let group_id = candidate.group_id;
         self.candidate = Some(candidate);
-        self.state = IncomingBaoReadState::ReadHashVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
-    }
-
-    fn check_permission(&mut self, path: String) -> Effects {
-        self.state = IncomingBaoReadState::CheckPermission;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.request.auth_context.clone(),
-                path,
-                required_permission: Permission::READ,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        self.start_policy(group_id, path, PolicyNext::Hash)
     }
 
     fn read_location(&mut self) -> Effects {
@@ -432,7 +580,7 @@ impl IncomingBaoReadOperation {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
         self.state = IncomingBaoReadState::ReadLocation;
-        smallvec![blob_location_read(&key, None)]
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn send_accepted(&mut self, location: BackendLocation) -> Effects {
@@ -469,6 +617,52 @@ impl IncomingBaoReadOperation {
         })]
     }
 
+    fn handle_start(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.unexpected(event);
+        };
+        self.txn_id = Some(txn_id);
+        self.read_realm()
+    }
+
+    fn commit_result(&mut self, result: IncomingBaoReadResult) -> Effects {
+        self.result = Some(result);
+        let Some(txn_id) = self.txn_id else {
+            self.output = Some(Ok(result));
+            self.state = IncomingBaoReadState::Finish;
+            return smallvec![];
+        };
+        self.state = IncomingBaoReadState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_commit(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.unexpected(event);
+        };
+        self.txn_id = None;
+        self.state = IncomingBaoReadState::Finish;
+        self.output = Some(Ok(self
+            .result
+            .take()
+            .unwrap_or(IncomingBaoReadResult::Probed)));
+        smallvec![]
+    }
+
+    fn handle_abort(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
+            return self.unexpected(event);
+        };
+        self.txn_id = None;
+        self.state = IncomingBaoReadState::Finish;
+        let refusal = self
+            .refusal
+            .take()
+            .unwrap_or(BaoReadRefusal::BackendFailure);
+        self.output = Some(Ok(IncomingBaoReadResult::Refused(refusal)));
+        smallvec![]
+    }
+
     fn fail(&mut self, error: BaoReadError) -> Effects {
         self.state = IncomingBaoReadState::Error;
         self.output = Some(Err(error));
@@ -487,18 +681,21 @@ impl IncomingBaoReadOperation {
     fn state_name(&self) -> &'static str {
         match self.state {
             IncomingBaoReadState::Init => "init",
+            IncomingBaoReadState::StartTransaction => "start_transaction",
             IncomingBaoReadState::ReadRealm => "read_realm",
             IncomingBaoReadState::ReadExactVersion => "read_exact_version",
             IncomingBaoReadState::ReadExactBucket => "read_exact_bucket",
-            IncomingBaoReadState::ReadHashAliases => "read_hash_aliases",
-            IncomingBaoReadState::ReadHashVersion => "read_hash_version",
+            IncomingBaoReadState::ReadPolicy => "read_policy",
             IncomingBaoReadState::CheckPermission => "check_permission",
+            IncomingBaoReadState::ReadHashVersion => "read_hash_version",
             IncomingBaoReadState::ReadLocation => "read_location",
             IncomingBaoReadState::SendAccepted => "send_accepted",
             IncomingBaoReadState::ServeRead => "serve_read",
             IncomingBaoReadState::CloseMetadata => "close_metadata",
+            IncomingBaoReadState::CommitTransaction => "commit_transaction",
             IncomingBaoReadState::SendRefusal => "send_refusal",
             IncomingBaoReadState::CloseRefusal => "close_refusal",
+            IncomingBaoReadState::AbortTransaction => "abort_transaction",
             IncomingBaoReadState::Finish => "finish",
             IncomingBaoReadState::Error => "error",
         }
@@ -533,8 +730,10 @@ impl IncomingBaoReadOperation {
                     .is_some_and(|expected| expected != *hash)
                 {
                     self.send_refusal(BaoReadRefusal::HashMismatch)
+                } else if self.candidates_ready {
+                    self.next_candidate()
                 } else {
-                    self.read_hash_aliases()
+                    self.send_refusal(BaoReadRefusal::BackendFailure)
                 }
             }
         }
@@ -580,39 +779,14 @@ impl IncomingBaoReadOperation {
         let target = self
             .exact_target()
             .expect("exact target required after exact bucket read");
-        self.check_permission(blob_object_permission_path(
+        let path = blob_object_permission_path(
             self.request.realm_id,
             bucket.group_id,
             self.local_node,
             &target.bucket,
             &target.key,
-        ))
-    }
-
-    fn handle_hash_aliases(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.unexpected(event);
-        };
-        let Some(hash) = self.hash_target() else {
-            return self.send_refusal(BaoReadRefusal::InvalidTarget);
-        };
-        let mut candidates = Vec::with_capacity(values.len());
-        for (key, _) in values {
-            let candidate = match HashPathIndexKey::from_bytes(key.as_ref()) {
-                Ok(candidate) => candidate,
-                Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
-            };
-            if candidate.realm_id == self.request.realm_id
-                && candidate.node_id == self.local_node
-                && candidate.blake3_hash == hash
-            {
-                candidates.push(candidate);
-            }
-        }
-        candidates
-            .sort_by_cached_key(|candidate| (candidate.permission_path(), candidate.version_id));
-        self.candidates = candidates.into();
-        self.next_candidate()
+        );
+        self.start_policy(bucket.group_id, path, PolicyNext::Exact)
     }
 
     fn handle_hash_version(&mut self, event: Event) -> Effects {
@@ -634,36 +808,7 @@ impl IncomingBaoReadOperation {
         }
         self.blob_hash = Some(hash);
         self.location_key = version.location_key();
-        let path = self
-            .candidate
-            .as_ref()
-            .expect("hash candidate required after version read")
-            .permission_path();
-        self.check_permission(path)
-    }
-
-    fn handle_permission(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected(event);
-        };
-        match allowed {
-            Ok(true) => {
-                if matches!(&self.request.target, BaoReadTarget::ExactVersion(_)) {
-                    self.read_exact_version()
-                } else {
-                    self.read_location()
-                }
-            }
-            Ok(false) => {
-                self.had_denial = true;
-                if matches!(&self.request.target, BaoReadTarget::Blake3(_)) {
-                    self.next_candidate()
-                } else {
-                    self.send_refusal(BaoReadRefusal::ReadDenied)
-                }
-            }
-            Err(_) => self.send_refusal(BaoReadRefusal::BackendFailure),
-        }
+        self.read_location()
     }
 
     fn handle_location(&mut self, event: Event) -> Effects {
@@ -698,15 +843,28 @@ impl Operation for IncomingBaoReadOperation {
     fn start(&mut self) -> Effects {
         if self.request.realm_id != self.local_realm
             || self.request.auth_context.realm_id != self.request.realm_id
+            || self.request.auth_context.user_id.realm_id != self.request.realm_id
         {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
+        }
+        if self.snapshot {
+            self.state = IncomingBaoReadState::StartTransaction;
+            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: true
+            })];
         }
         self.read_realm()
     }
 
     fn step(&mut self, event: Event) -> Effects {
         let event = match event {
-            Event::Storage(StorageEvent::Error { .. }) => {
+            Event::Storage(StorageEvent::Error { .. })
+                if !matches!(
+                    self.state,
+                    IncomingBaoReadState::CommitTransaction
+                        | IncomingBaoReadState::AbortTransaction
+                ) =>
+            {
                 return self.send_refusal(BaoReadRefusal::BackendFailure);
             }
             Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
@@ -714,12 +872,13 @@ impl Operation for IncomingBaoReadOperation {
         };
 
         match self.state {
+            IncomingBaoReadState::StartTransaction => self.handle_start(event),
             IncomingBaoReadState::ReadRealm => self.handle_realm(event),
             IncomingBaoReadState::ReadExactVersion => self.handle_exact_version(event),
             IncomingBaoReadState::ReadExactBucket => self.handle_exact_bucket(event),
-            IncomingBaoReadState::ReadHashAliases => self.handle_hash_aliases(event),
-            IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
+            IncomingBaoReadState::ReadPolicy => self.handle_policy(event),
             IncomingBaoReadState::CheckPermission => self.handle_permission(event),
+            IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
             IncomingBaoReadState::ReadLocation => self.handle_location(event),
             IncomingBaoReadState::SendAccepted => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
@@ -748,17 +907,13 @@ impl Operation for IncomingBaoReadOperation {
                 let Event::Blob(BlobEvent::ReadServed { .. }) = event else {
                     return self.unexpected(event);
                 };
-                self.state = IncomingBaoReadState::Finish;
-                self.output = Some(Ok(IncomingBaoReadResult::Served));
-                smallvec![]
+                self.commit_result(IncomingBaoReadResult::Served)
             }
             IncomingBaoReadState::CloseMetadata => {
                 let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
                     return self.unexpected(event);
                 };
-                self.state = IncomingBaoReadState::Finish;
-                self.output = Some(Ok(IncomingBaoReadResult::Probed));
-                smallvec![]
+                self.commit_result(IncomingBaoReadResult::Probed)
             }
             IncomingBaoReadState::SendRefusal => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
@@ -777,10 +932,17 @@ impl Operation for IncomingBaoReadOperation {
                     .refusal
                     .take()
                     .unwrap_or(BaoReadRefusal::BackendFailure);
-                self.state = IncomingBaoReadState::Finish;
-                self.output = Some(Ok(IncomingBaoReadResult::Refused(refusal)));
-                smallvec![]
+                self.refusal = Some(refusal);
+                let Some(txn_id) = self.txn_id else {
+                    self.state = IncomingBaoReadState::Finish;
+                    self.output = Some(Ok(IncomingBaoReadResult::Refused(refusal)));
+                    return smallvec![];
+                };
+                self.state = IncomingBaoReadState::AbortTransaction;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
+            IncomingBaoReadState::CommitTransaction => self.handle_commit(event),
+            IncomingBaoReadState::AbortTransaction => self.handle_abort(event),
             IncomingBaoReadState::Init => self.unexpected(event),
             IncomingBaoReadState::Finish | IncomingBaoReadState::Error => smallvec![],
         }
@@ -798,18 +960,24 @@ impl Operation for IncomingBaoReadOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.fail(BaoReadError::NotFinished)
+        let effects = self.fail(BaoReadError::NotFinished);
+        if let Some(txn_id) = self.txn_id.take() {
+            let mut effects = effects;
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+            return effects;
+        }
+        effects
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
 
     use aruna_core::UserId;
-    use aruna_core::effects::{BlobEffect, Effect};
-    use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
@@ -854,6 +1022,16 @@ mod tests {
             expected_blake3: Some(hash),
             metadata_only: false,
         }
+    }
+
+    fn read_path(local_node: aruna_core::NodeId) -> String {
+        aruna_core::structs::blob_object_permission_path(
+            test_realm(),
+            Ulid::from(5u128),
+            local_node,
+            "bucket",
+            "path/file.txt",
+        )
     }
 
     fn realm_value(peer: aruna_core::NodeId) -> byteview::ByteView {
@@ -983,6 +1161,37 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_reads_txn() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            read_request(local_node, [4u8; 32]),
+        )
+        .with_snapshot();
+
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: true
+            })]
+        ));
+        let txn_id = Ulid::from(10u128);
+        assert!(matches!(
+            operation
+                .step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
+                .as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(read_txn),
+                ..
+            })] if *read_txn == txn_id
+        ));
+    }
+
+    #[test]
     fn rejects_user_peer() {
         let local_node = node_from_seed(1);
         let peer = node_from_seed(2);
@@ -1027,11 +1236,6 @@ mod tests {
             key: Vec::<u8>::new().into(),
             value: Some(bucket_value()),
         }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
         assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
     }
 
@@ -1044,7 +1248,8 @@ mod tests {
         let mut request = read_request(local_node, hash);
         request.expected_blake3 = None;
         let mut operation =
-            IncomingBaoReadOperation::new(peer, local_node, test_realm(), stream_id, request);
+            IncomingBaoReadOperation::new(peer, local_node, test_realm(), stream_id, request)
+                .with_policy_paths(HashSet::from([read_path(local_node)]));
 
         operation.start();
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1055,9 +1260,6 @@ mod tests {
             key: Vec::<u8>::new().into(),
             value: Some(bucket_value()),
         }));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::<u8>::new().into(),
             value: Some(version_value(hash)),
@@ -1105,7 +1307,8 @@ mod tests {
             test_realm(),
             Ulid::from(9u128),
             read_request(local_node, [4u8; 32]),
-        );
+        )
+        .with_policy_paths(HashSet::from([read_path(local_node)]));
 
         operation.start();
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1116,14 +1319,35 @@ mod tests {
             key: Vec::<u8>::new().into(),
             value: Some(bucket_value()),
         }));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::<u8>::new().into(),
             value: Some(version_value([5u8; 32])),
         }));
 
         assert_eq!(refusal_from(&effects), BaoReadRefusal::HashMismatch);
+    }
+
+    #[test]
+    fn hash_requires_candidates() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let hash = [4u8; 32];
+        let mut request = read_request(local_node, hash);
+        request.target = BaoReadTarget::Blake3(hash);
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            request,
+        );
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(realm_value(peer)),
+        }));
+
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::BackendFailure);
     }
 }

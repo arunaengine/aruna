@@ -2,7 +2,7 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::delete_object::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{PathRestriction, RealmId};
 use aruna_core::types::{GroupId, NodeId, UserId};
 use ulid::Ulid;
 
@@ -20,6 +20,7 @@ pub struct DeleteObjectsInput {
     pub realm_id: RealmId,
     pub node_id: NodeId,
     pub deleted_by: UserId,
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 #[derive(Debug)]
@@ -44,7 +45,8 @@ pub async fn delete_objects(
                 realm_id: input.realm_id,
                 node_id: input.node_id,
                 deleted_by: input.deleted_by,
-            }),
+            })
+            .with_restrictions(input.restrictions.clone()),
             context,
         )
         .await
@@ -190,6 +192,7 @@ mod test {
                 realm_id,
                 node_id,
                 deleted_by: user_id,
+                restrictions: None,
             },
         )
         .await;
@@ -240,6 +243,7 @@ mod test {
                 realm_id,
                 node_id,
                 deleted_by: user_id,
+                restrictions: None,
             },
         )
         .await;

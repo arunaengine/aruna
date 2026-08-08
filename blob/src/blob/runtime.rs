@@ -1,5 +1,5 @@
 use super::group::{BackendClaim, GroupHold};
-use super::{BackendRegistry, BlobHandle, BlobHandler};
+use super::{BackendRegistry, BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
@@ -76,6 +76,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ReadRange { .. } => (EffectClass::Read, "read_range"),
         BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
+        BlobEffect::ReleaseReservation { .. } => (EffectClass::Local, "release_reservation"),
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
         BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
@@ -144,6 +145,10 @@ impl BlobHandle {
 
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
         let (class, kind) = classify_effect(&effect);
+        let deadline = match &effect {
+            BlobEffect::SpoolHidden { deadline, .. } => *deadline,
+            _ => None,
+        };
         let slots = match class {
             EffectClass::Transfer => Some(self.handler.transfer_slots.clone()),
             EffectClass::Read => Some(self.handler.read_slots.clone()),
@@ -153,7 +158,22 @@ impl BlobHandle {
         let permit = match slots {
             Some(slots) => {
                 let queued = Instant::now();
-                let permit = slots.acquire_owned().await;
+                let permit = match deadline {
+                    Some(deadline) => match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        slots.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return Event::Blob(BlobEvent::Error(BlobError::WriteError(
+                                "blob effect deadline expired".to_string(),
+                            )));
+                        }
+                    },
+                    None => slots.acquire_owned().await,
+                };
                 let queue_wait = queued.elapsed();
                 if queue_wait >= QUEUE_WAIT_WARN {
                     tracing::warn!(
@@ -191,6 +211,22 @@ impl BlobHandle {
             );
         }
         Event::Blob(blob_event)
+    }
+
+    pub async fn reconcile_reservation(
+        &self,
+        location: aruna_core::structs::BackendLocation,
+    ) -> Result<bool, BlobError> {
+        let effect = BlobEffect::Delete {
+            location: location.clone(),
+        };
+        let _hold = self.handler.hold_backends(&effect)?;
+        let handler = self.handler.with_group_backends(&effect).await?;
+        handler.reconcile_reservation(location).await
+    }
+
+    pub fn clear_reservation(&self, id: Ulid) {
+        self.handler.clear_active(id);
     }
 
     pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
@@ -325,11 +361,13 @@ impl BlobHandler {
             storage,
             net,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            connection_slots: Arc::new(Semaphore::new(CONNECTION_SLOTS)),
             transfer_slots: Arc::new(Semaphore::new(TRANSFER_SLOTS)),
             read_slots: Arc::new(Semaphore::new(READ_SLOTS)),
             spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
             inflight: Arc::new(AtomicUsize::new(0)),
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
@@ -395,22 +433,29 @@ impl BlobHandler {
                 Box::pin(self.read_blob_range(location, range)).await
             }
             BlobEffect::Delete { location } => Box::pin(self.delete_blob(location)).await,
+            BlobEffect::ReleaseReservation { id } => {
+                self.clear_active(id);
+                BlobEvent::ReservationReleased { id }
+            }
             BlobEffect::SpoolHidden {
                 namespace,
                 name,
                 created_by,
                 max_bytes,
+                deadline,
                 blob,
             } => {
-                Box::pin(self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob))
-                    .await
+                Box::pin(
+                    self.spool_hidden_blob(namespace, &name, created_by, max_bytes, deadline, blob),
+                )
+                .await
             }
             BlobEffect::ReadHiddenRange { location, range } => {
                 Box::pin(self.read_hidden_range(location, range)).await
             }
             BlobEffect::DeleteHidden { key } => Box::pin(self.delete_hidden_blob(key)).await,
-            BlobEffect::ListHidden { namespace } => {
-                Box::pin(self.list_hidden_blobs(namespace)).await
+            BlobEffect::ListHidden { namespace, cursor } => {
+                Box::pin(self.list_hidden_blobs(namespace, cursor)).await
             }
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
@@ -527,7 +572,24 @@ impl BlobHandler {
         peer: NodeId,
         stream: BiStream,
     ) -> Result<Ulid, BlobError> {
+        let slot = self
+            .connection_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                BlobError::ConnectionFailed("blob connection limit reached".to_string())
+            })?;
         let mut connections = self.connections.lock().await;
+        if connections
+            .values()
+            .filter(|connection| connection.peer == peer)
+            .count()
+            >= PEER_CONNECTIONS
+        {
+            return Err(BlobError::ConnectionFailed(
+                "peer blob connection limit reached".to_string(),
+            ));
+        }
         let stream_id = match stream_id {
             Some(stream_id) => {
                 if stream_id.is_nil() {
@@ -555,6 +617,7 @@ impl BlobHandler {
             super::Connection {
                 peer,
                 stream: Arc::new(Mutex::new(stream)),
+                _slot: slot,
             },
         );
         Ok(stream_id)

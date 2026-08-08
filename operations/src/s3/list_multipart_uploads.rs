@@ -32,6 +32,8 @@ pub enum ListMultipartUploadsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("multipart upload scan budget exhausted")]
+    ScanBudgetExceeded,
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
         state: ListMultipartUploadsState,
@@ -70,13 +72,16 @@ pub struct ListMultipartUploadsOperation {
     txn_id: Option<Ulid>,
     uploads: Vec<MultipartUpload>,
     scan_cursor: Option<Key>,
+    scan_rows: usize,
     scan_round_limit: usize,
+    max_scan_rows: usize,
     output: Option<Result<ListMultipartUploadsResult, ListMultipartUploadsError>>,
 }
 
 impl ListMultipartUploadsOperation {
     pub const DEFAULT_MAX_UPLOADS: usize = 1_000;
     const SCAN_ROUND_LIMIT: usize = 100;
+    const MAX_SCAN_ROWS: usize = 10_000;
 
     pub fn new(input: ListMultipartUploadsInput) -> Self {
         Self {
@@ -85,7 +90,9 @@ impl ListMultipartUploadsOperation {
             txn_id: None,
             uploads: Vec::new(),
             scan_cursor: None,
+            scan_rows: 0,
             scan_round_limit: Self::SCAN_ROUND_LIMIT,
+            max_scan_rows: Self::MAX_SCAN_ROWS,
             output: None,
         }
     }
@@ -93,6 +100,12 @@ impl ListMultipartUploadsOperation {
     #[cfg(test)]
     fn with_scan_limit(mut self, scan_round_limit: usize) -> Self {
         self.scan_round_limit = scan_round_limit;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
+        self.max_scan_rows = max_scan_rows;
         self
     }
 
@@ -138,12 +151,18 @@ impl ListMultipartUploadsOperation {
     }
 
     fn issue_upload_round(&mut self) -> Effects {
+        let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
+            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+        };
+        if remaining == 0 {
+            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+        }
         self.state = ListMultipartUploadsState::ReadUploads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             prefix: None,
             start: self.scan_cursor.take().map(IterStart::After),
-            limit: self.scan_round_limit,
+            limit: self.scan_round_limit.min(remaining),
             txn_id: self.txn_id,
         })]
     }
@@ -168,6 +187,14 @@ impl ListMultipartUploadsOperation {
             });
         };
 
+        let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
+            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+        };
+        if values.len() > remaining {
+            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+        }
+        self.scan_rows += values.len();
+
         for (_key, value) in values {
             let record = match MultipartUpload::from_bytes(value.as_ref()) {
                 Ok(record) => record,
@@ -183,9 +210,15 @@ impl ListMultipartUploadsOperation {
             }
             self.uploads.push(record);
         }
+        let mut uploads = std::mem::take(&mut self.uploads);
+        self.apply_marker(&mut uploads);
+        self.uploads = uploads;
 
         if next_start_after.is_none() {
             return self.finish_upload_scan();
+        }
+        if self.scan_rows >= self.max_scan_rows {
+            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
         }
 
         self.scan_cursor = next_start_after;
@@ -495,6 +528,30 @@ mod test {
         assert_eq!(result.uploads.len(), 1);
         assert_eq!(result.uploads[0].key, "target");
         assert!(!result.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn scan_budget_fails() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        for (index, key) in ["a", "b", "c"].into_iter().enumerate() {
+            seed_upload(
+                &storage_handle,
+                &upload_record(Ulid::from_bytes([(index + 1) as u8; 16]), "other", key),
+            )
+            .await;
+        }
+
+        let result = drive(
+            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_budget(2),
+            &driver_ctx,
+        )
+        .await;
+
+        assert_eq!(result, Err(ListMultipartUploadsError::ScanBudgetExceeded));
     }
 
     #[tokio::test]

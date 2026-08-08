@@ -337,6 +337,7 @@ pub async fn refresh_reference_metadata_with_context(
                 created_by,
                 state,
                 metadata,
+                published_by,
             } = version;
             let BlobVersionState::Reference {
                 source,
@@ -351,14 +352,17 @@ pub async fn refresh_reference_metadata_with_context(
                 None
             } else {
                 Some(
-                    match BlobVersion::reference(
-                        source,
-                        refresh.metadata,
-                        created_at,
-                        created_by,
-                        refresh.refreshed_at,
-                    )
-                    .with_metadata(metadata)
+                    match (BlobVersion {
+                        published_by,
+                        ..BlobVersion::reference(
+                            source,
+                            refresh.metadata,
+                            created_at,
+                            created_by,
+                            refresh.refreshed_at,
+                        )
+                        .with_metadata(metadata)
+                    })
                     .to_bytes()
                     {
                         Ok(value) => value,

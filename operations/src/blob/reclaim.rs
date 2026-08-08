@@ -315,7 +315,8 @@ pub async fn backend_status(
     for (key, value) in cleanups {
         let Ok(
             BlobCleanupWork::DeleteBlob { location }
-            | BlobCleanupWork::ReconcileWrite { location, .. },
+            | BlobCleanupWork::ReconcileWrite { location, .. }
+            | BlobCleanupWork::ReconcileReservation { location },
         ) = BlobCleanupWork::from_bytes(value.as_ref())
         else {
             continue;

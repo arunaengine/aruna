@@ -1,3 +1,6 @@
+pub use aruna_core::structs::{
+    NOTIFICATION_WATCH_INTEREST_BYTES_CAP, NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
+};
 use aruna_core::structs::{
     NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
@@ -8,6 +11,14 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 pub const NOTIFICATION_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+pub const NOTIFICATION_WATCH_EVENT_BATCH_SIZE: usize = 128;
+pub const NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP: usize = 1024;
+pub const NOTIFICATION_WATCH_DIRTY_REALM_CAP: usize = 4;
+pub const NOTIFICATION_WATCH_RETRY_BATCH_CAP: usize = 4;
+pub const NOTIFICATION_WATCH_RETRY_BYTES_CAP: usize = 1024 * 1024;
+pub const NOTIFICATION_WATCH_EXPANSION_WORK_CAP: usize = 4096;
+pub const NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP: usize = 1024;
+pub const NOTIFICATION_WATCH_EXPANSION_RECORD_CAP: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NotificationTransportMessage {

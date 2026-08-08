@@ -10,19 +10,10 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Serialize)]
-struct OidcSubjectKey<'a> {
-    kind: &'static str,
-    issuer: &'a str,
-    sub: &'a str,
-}
-
 pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> Result<String, ConversionError> {
-    Ok(serde_json::to_string(&OidcSubjectKey {
-        kind: "oidc",
-        issuer,
-        sub: subject_id,
-    })?)
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(crate::keys::oidc_subject_key(issuer, subject_id)))
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -247,10 +238,14 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn oidc_subject_key_uses_structured_encoding() {
+    fn hashes_oidc_subject() {
+        // The storage key must not leak the issuer or subject and must be stable.
+        let key = oidc_subject_key("https://issuer.example", "subject-1").unwrap();
+        assert!(!key.contains("issuer.example"));
+        assert!(!key.contains("subject-1"));
         assert_eq!(
-            oidc_subject_key("https://issuer.example", "subject-1").unwrap(),
-            r#"{"kind":"oidc","issuer":"https://issuer.example","sub":"subject-1"}"#
+            key,
+            oidc_subject_key("https://issuer.example", "subject-1").unwrap()
         );
     }
 

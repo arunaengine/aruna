@@ -1,3 +1,4 @@
+use crate::audit::AuditPageBatch;
 use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
@@ -77,6 +78,9 @@ pub enum BlobEvent {
         stream_size: u64,
     },
     DeleteFinished,
+    ReservationReleased {
+        id: Ulid,
+    },
     HiddenSpooled {
         location: BackendLocation,
         blake3: [u8; 32],
@@ -89,6 +93,7 @@ pub enum BlobEvent {
     HiddenDeleted,
     HiddenListed {
         entries: Vec<HiddenBlobEntry>,
+        next_cursor: Option<Vec<u8>>,
     },
     ConnectionEstablished {
         stream_id: Ulid,
@@ -180,6 +185,7 @@ pub enum NetEvent {
     DocumentSync(DocumentSyncNetEvent),
     Stream(StreamEvent),
     JobControl(JobControlEvent),
+    AuditPages(AuditPageBatch),
     Error(NetError),
 }
 

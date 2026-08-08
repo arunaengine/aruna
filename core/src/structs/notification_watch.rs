@@ -12,6 +12,8 @@ use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
 pub const NOTIFICATION_WATCH_MAX_PREFIX_LEN: usize = 1024;
+pub const NOTIFICATION_WATCH_INTEREST_ENTRY_CAP: usize = 1024;
+pub const NOTIFICATION_WATCH_INTEREST_BYTES_CAP: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataWatchResourcePath<'a> {
@@ -194,6 +196,14 @@ pub struct WatchEvent {
     pub detail: WatchEventDetail,
 }
 
+/// A bounded holder-side continuation for a watch event scan. The event batch
+/// is retained until every subscription page has been applied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchEventRetry {
+    pub events: Vec<WatchEvent>,
+    pub cursor: Option<Vec<u8>>,
+}
+
 /// Kind-specific payload carried by a [`WatchEvent`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WatchEventDetail {
@@ -317,8 +327,8 @@ pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
 /// proxied exactly like a notification inbox record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchAuthorizationBinding {
-    /// Legacy creating-token fields retained for stored postcard compatibility.
-    /// Delivery authorization is based only on the owner's current permissions.
+    /// Creation metadata is validated at every holder boundary; current owner
+    /// policy remains authoritative for delivery.
     pub token_hash: String,
     pub expires_at_secs: u64,
     pub path_restrictions: Option<Vec<PathRestriction>>,
@@ -333,11 +343,7 @@ impl WatchAuthorizationBinding {
                 .token_hash
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            && self
-                .path_restrictions
-                .iter()
-                .flatten()
-                .all(|restriction| globset::Glob::new(&restriction.pattern).is_ok())
+            && self.path_restrictions.is_none()
     }
 }
 
@@ -435,6 +441,7 @@ pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), Conver
 pub const WATCH_INTEREST_NODE_PREFIX: &[u8] = b"n/";
 pub const WATCH_INTEREST_DIRTY_PREFIX: &[u8] = b"dirty/";
 const WATCH_INTEREST_PENDING_PREFIX: &[u8] = b"pending/";
+const WATCH_INTEREST_RETRY_PREFIX: &[u8] = b"retry/";
 
 /// One coalesced interest entry: the union of every subscription a node holds
 /// for a realm that shares this path prefix.
@@ -533,6 +540,19 @@ pub fn watch_interest_pending_key(realm_id: RealmId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_PENDING_PREFIX.len() + 32);
     key.extend_from_slice(WATCH_INTEREST_PENDING_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+pub fn watch_retry_prefix(realm_id: RealmId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WATCH_INTEREST_RETRY_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_INTEREST_RETRY_PREFIX);
+    key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+pub fn watch_retry_key(realm_id: RealmId, event_id: Ulid) -> Vec<u8> {
+    let mut key = watch_retry_prefix(realm_id);
+    key.extend_from_slice(&event_id.to_bytes());
     key
 }
 
@@ -1008,6 +1028,15 @@ mod tests {
         let mut binding = WatchAuthorizationBinding::default();
         assert!(binding.is_valid());
         binding.token_hash.make_ascii_uppercase();
+        assert!(!binding.is_valid());
+    }
+
+    #[test]
+    fn rejects_binding_scope() {
+        let binding = WatchAuthorizationBinding {
+            path_restrictions: Some(Vec::new()),
+            ..Default::default()
+        };
         assert!(!binding.is_valid());
     }
 

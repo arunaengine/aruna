@@ -210,10 +210,24 @@ async fn mint_credential(
     node_id: NodeId,
     restrictions: Vec<PathRestriction>,
 ) -> Result<WorkspaceCredential, JobError> {
+    // Reject an oversized mount set permanently before any attempt intent so a
+    // job cannot loop retrying a credential the evaluator would reject.
+    if let Err(error) = aruna_core::permission_path::validate_restriction_limits(&restrictions) {
+        return Err(JobError::permanent(format!(
+            "workspace credential restrictions invalid: {error}"
+        )));
+    }
     let key_id = workspace_credential_id(record.job_id);
     let access_key = UserAccess::build_access_key(&key_id).map_err(|error| {
         JobError::permanent(format!("workspace credential key failed: {error}"))
     })?;
+    // The credential is issued and consumed on this node, so its secret seals
+    // and unseals with this node's issuer-local key.
+    let seal_key = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.credential_seal_key())
+        .ok_or_else(|| JobError::permanent("workspace credential needs a net handle"))?;
     match Box::pin(drive(
         GetUserAccessOperation::new(access_key.clone()),
         context,
@@ -230,9 +244,12 @@ async fn mint_credential(
                 return Err(JobError::permanent("workspace credential is invalid"));
             }
             if !access.is_expired(SystemTime::now()) {
+                let secret = access.open_secret(&seal_key).map_err(|error| {
+                    JobError::permanent(format!("workspace credential unseal failed: {error}"))
+                })?;
                 return Ok(WorkspaceCredential {
                     access_key: access.access_key,
-                    secret: access.secret,
+                    secret,
                 });
             }
             if record.attempt_intent.is_some() {
@@ -254,7 +271,7 @@ async fn mint_credential(
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_WALLTIME);
     let expiry = SystemTime::now() + walltime + CREDENTIAL_SLACK;
-    let (_, access) = Box::pin(drive(
+    let (_, secret, access) = Box::pin(drive(
         CreateUserAccessOperation::new_with_key(
             CreateUserAccessConfig {
                 user_identity: record.created_by,
@@ -264,6 +281,7 @@ async fn mint_credential(
                 issued_by: *node_id.as_bytes(),
             },
             key_id,
+            seal_key,
         ),
         context,
     ))
@@ -272,7 +290,7 @@ async fn mint_credential(
     .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?;
     Ok(WorkspaceCredential {
         access_key: access.access_key,
-        secret: access.secret,
+        secret: secret.expose().to_string(),
     })
 }
 
@@ -1072,9 +1090,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
+    };
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, JobId, JobPayload, RealmAuthorizationDocument, RealmId,
+        Actor, Group, GroupAuthorizationDocument, JobId, JobPayload, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -1167,8 +1188,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn credential_reuses_secret() {
+    struct CredentialFixture {
+        context: DriverContext,
+        net: aruna_net::NetHandle,
+        spec: ExecutionSpec,
+        record: JobRecord,
+        node_id: NodeId,
+        bucket: String,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn credential_fixture() -> CredentialFixture {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId([1; 32]);
@@ -1183,28 +1213,61 @@ mod tests {
         let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         let group_doc =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, spec.group_id);
-        for (key, value) in [
+        // Policy loading fails closed without the realm config and group record.
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        let group = Group {
+            display_name: "workspace".to_string(),
+            group_id: spec.group_id,
+            realm_id,
+            roles: group_doc.roles.keys().copied().collect(),
+            owner: user_id,
+        };
+        for (key_space, key, value) in [
             (
+                AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
                 realm_doc.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 spec.group_id.to_bytes().to_vec(),
                 group_doc.to_bytes(&actor).unwrap(),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_config.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                spec.group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
             ),
         ] {
             let _ = storage
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: AUTH_KEYSPACE.to_string(),
+                    key_space: key_space.to_string(),
                     key: key.into(),
                     value: value.into(),
                     txn_id: None,
                 })
                 .await;
         }
+        let net = aruna_net::NetHandle::new(
+            aruna_net::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
+                discovery_method: aruna_net::DiscoveryMethod::None,
+                relay_method: aruna_net::RelayMethod::None,
+                ..aruna_net::NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
         let context = DriverContext {
             storage_handle: storage,
-            net_handle: None,
+            net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
@@ -1221,6 +1284,29 @@ mod tests {
             None,
         );
         let bucket = JobRecord::workspace_bucket_name(job_id);
+        CredentialFixture {
+            context,
+            net,
+            spec,
+            record,
+            node_id,
+            bucket,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_reuses_secret() {
+        let CredentialFixture {
+            context,
+            net,
+            spec,
+            record,
+            node_id,
+            bucket,
+            _dir,
+        } = credential_fixture().await;
+        let realm_id = record.created_by.realm_id;
 
         let first = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
             .await
@@ -1240,7 +1326,31 @@ mod tests {
         .unwrap()
         .unwrap()
         .unwrap();
-        let restrictions = access.path_restrictions.unwrap();
+        let mut expired = access.clone();
+        expired.expiry = SystemTime::UNIX_EPOCH;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: expired.access_key.as_bytes().into(),
+                value: expired.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let renewed = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+            .await
+            .unwrap();
+        assert_eq!(renewed.access_key, first.access_key);
+        let renewed_access = Box::pin(drive(
+            GetUserAccessOperation::new(first.access_key.clone()),
+            &context,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(!renewed_access.is_expired(SystemTime::now()));
+        let restrictions = renewed_access.path_restrictions.unwrap();
         let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, &bucket);
         let permits = |path: &str| {
             restrictions.iter().any(|restriction| {
@@ -1253,6 +1363,116 @@ mod tests {
         assert!(permits(&bucket_path));
         assert!(permits(&format!("{bucket_path}/object")));
         assert!(!permits(&format!("{bucket_path}-sibling")));
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_foreign_seal() {
+        // A secret sealed by another node's key must refuse to be reused rather
+        // than hand the container an unusable or wrong secret.
+        let CredentialFixture {
+            context,
+            net,
+            spec,
+            record,
+            node_id,
+            bucket,
+            _dir,
+        } = credential_fixture().await;
+
+        let minted = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+            .await
+            .unwrap();
+        let mut access = Box::pin(drive(
+            GetUserAccessOperation::new(minted.access_key.clone()),
+            &context,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        access
+            .seal_secret(
+                &aruna_core::credential_seal::CredentialSealKey::random(),
+                "foreign",
+            )
+            .unwrap();
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: access.access_key.as_bytes().into(),
+                value: access.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let Err(error) =
+            mint_workspace_credential(&context, &spec, &record, node_id, &bucket).await
+        else {
+            panic!("a foreign seal must not yield a credential")
+        };
+
+        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert!(
+            error
+                .message
+                .starts_with("workspace credential unseal failed")
+        );
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_mounts() {
+        // Fifty patterns are the issuance cap, so twenty-five mounted buckets
+        // still pass and the twenty-sixth must fail permanently.
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId([1; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let spec = spec(Vec::new());
+        let record = JobRecord::new(
+            JobId::from_bytes([4; 16]),
+            JobPayload::Execution(spec.clone()),
+            user_id,
+            node_id,
+            1,
+            1,
+            None,
+        );
+        let buckets = |count: usize| {
+            (0..count)
+                .map(|index| format!("bucket-{index}"))
+                .collect::<BTreeSet<String>>()
+        };
+
+        // Without a net handle the accepted set fails later, past the limit check.
+        let Err(within) =
+            mint_input_credential(&context, &spec, &record, node_id, &buckets(25)).await
+        else {
+            panic!("a credential cannot be sealed without a net handle")
+        };
+        assert_eq!(within.message, "workspace credential needs a net handle");
+
+        let Err(over) =
+            mint_input_credential(&context, &spec, &record, node_id, &buckets(26)).await
+        else {
+            panic!("an over-limit mount set must not yield a credential")
+        };
+
+        assert_eq!(over.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert!(
+            over.message
+                .starts_with("workspace credential restrictions invalid")
+        );
     }
 
     #[test]

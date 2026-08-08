@@ -5,12 +5,13 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::permission_path::{compile_permission_matcher, validate_restriction_limits};
 use aruna_core::structs::{
     AuthContext, GroupAuthorizationDocument, MetadataRegistryRecord, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmId, Role,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
-use globset::{Glob, GlobMatcher};
+use globset::GlobMatcher;
 use smallvec::smallvec;
 use ulid::Ulid;
 
@@ -79,7 +80,7 @@ impl PermissionRules {
         {
             for (pattern, permission) in role.permissions {
                 rules.push(CompiledRule {
-                    matcher: Glob::new(&pattern)?.compile_matcher(),
+                    matcher: compile_permission_matcher(&pattern)?,
                     permission,
                     direct,
                     public,
@@ -89,11 +90,14 @@ impl PermissionRules {
 
         let restrictions = restrictions
             .map(|restrictions| {
+                // Defense in depth: an over-limit restriction set fails the
+                // collection (deny), mirroring the issuance-time rejection.
+                validate_restriction_limits(restrictions)?;
                 restrictions
                     .iter()
                     .map(|restriction| {
                         Ok(CompiledRestriction {
-                            matcher: Glob::new(&restriction.pattern)?.compile_matcher(),
+                            matcher: compile_permission_matcher(&restriction.pattern)?,
                             permission: restriction.permission.clone(),
                         })
                     })
@@ -243,6 +247,7 @@ pub struct PermissionRulesConfig {
 pub struct PermissionRulesOperation {
     config: PermissionRulesConfig,
     txn_id: Option<TxnId>,
+    external_txn: bool,
     group_id: Option<GroupId>,
     realm_auth_doc: Option<RealmAuthorizationDocument>,
     group_auth_doc: Option<GroupAuthorizationDocument>,
@@ -284,6 +289,20 @@ impl PermissionRulesOperation {
         PermissionRulesOperation {
             config,
             txn_id: None,
+            external_txn: false,
+            group_id: None,
+            realm_auth_doc: None,
+            group_auth_doc: None,
+            output: None,
+            state: PermissionRulesState::Init,
+        }
+    }
+
+    pub fn new_with_txn(config: PermissionRulesConfig, txn_id: TxnId) -> Self {
+        PermissionRulesOperation {
+            config,
+            txn_id: Some(txn_id),
+            external_txn: true,
             group_id: None,
             realm_auth_doc: None,
             group_auth_doc: None,
@@ -349,12 +368,20 @@ impl PermissionRulesOperation {
         let got = format!("{event:?}");
         if let (
             PermissionRulesState::CollectRules,
-            Event::Storage(StorageEvent::TransactionCommitted { .. }),
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
         ) = (self.state, event)
         {
-            match self.emit_rules() {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
+            if self.txn_id == Some(txn_id) {
+                match self.emit_rules() {
+                    Ok(effects) => effects,
+                    Err(err) => self.fail(err),
+                }
+            } else {
+                self.unexpected_event(
+                    self.state,
+                    "Event::Storage(StorageEvent::TransactionCommitted)",
+                    got,
+                )
             }
         } else {
             self.unexpected_event(
@@ -413,14 +440,18 @@ impl PermissionRulesOperation {
                 })])
             }
             None => {
-                self.state = PermissionRulesState::CollectRules;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction {
-                        txn_id: self
-                            .txn_id
-                            .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-                    }
-                )])
+                if self.external_txn {
+                    self.emit_rules()
+                } else {
+                    self.state = PermissionRulesState::CollectRules;
+                    Ok(smallvec![Effect::Storage(
+                        StorageEffect::CommitTransaction {
+                            txn_id: self
+                                .txn_id
+                                .ok_or_else(|| AuthorizationError::NoTransactionFound)?
+                        }
+                    )])
+                }
             }
         }
     }
@@ -429,18 +460,22 @@ impl PermissionRulesOperation {
         &mut self,
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, AuthorizationError> {
-        self.state = PermissionRulesState::CollectRules;
         self.group_auth_doc = Some(GroupAuthorizationDocument::from_bytes(
             &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
         )?);
 
-        Ok(smallvec![Effect::Storage(
-            StorageEffect::CommitTransaction {
-                txn_id: self
-                    .txn_id
-                    .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-            }
-        )])
+        if self.external_txn {
+            self.emit_rules()
+        } else {
+            self.state = PermissionRulesState::CollectRules;
+            Ok(smallvec![Effect::Storage(
+                StorageEffect::CommitTransaction {
+                    txn_id: self
+                        .txn_id
+                        .ok_or_else(|| AuthorizationError::NoTransactionFound)?
+                }
+            )])
+        }
     }
 
     fn emit_rules(&mut self) -> Result<Effects, AuthorizationError> {
@@ -511,7 +546,18 @@ impl PermissionRulesOperation {
 
     fn fail_on_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
+            let cleanup = if matches!(self.state, PermissionRulesState::CollectRules)
+                && !matches!(
+                    &error,
+                    aruna_core::errors::StorageError::TransactionConflict
+                        | aruna_core::errors::StorageError::QueueFull
+                        | aruna_core::errors::StorageError::TransactionNotFound
+                ) {
+                smallvec![]
+            } else {
+                self.abort()
+            };
+            return Err(self.fail_with_cleanup(error.into(), cleanup));
         }
 
         Ok(event)
@@ -524,6 +570,12 @@ impl Operation for PermissionRulesOperation {
     type Error = AuthorizationError;
 
     fn start(&mut self) -> Effects {
+        if self.external_txn {
+            return match self.read_realm_doc() {
+                Ok(effects) => effects,
+                Err(err) => self.fail(err),
+            };
+        }
         self.state = PermissionRulesState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -532,6 +584,9 @@ impl Operation for PermissionRulesOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if self.is_complete() {
+            return smallvec![];
+        }
         let event = match self.fail_on_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -560,6 +615,9 @@ impl Operation for PermissionRulesOperation {
     }
 
     fn abort(&mut self) -> Effects {
+        if self.external_txn {
+            return smallvec![];
+        }
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],
@@ -572,9 +630,13 @@ mod test {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, MetadataRegistryRecord, PathRestriction, Permission,
-        RealmAuthorizationDocument, RealmId, Role,
+        AuthContext, GroupAuthorizationDocument, MetadataRegistryRecord, PathRestriction,
+        Permission, RealmAuthorizationDocument, RealmId, Role,
     };
     use ulid::Ulid;
 
@@ -671,6 +733,70 @@ mod test {
         assert!(rules.allows(&granted, &Permission::READ));
         assert!(!rules.allows(&other, &Permission::READ));
         assert!(!rules.allows(&granted, &Permission::WRITE));
+    }
+
+    #[test]
+    fn star_stays_bounded() {
+        // A single-segment grant must not silently become recursive: `*` and
+        // `?` never cross `/`, only `**` spans segments.
+        let realm_id = RealmId([11u8; 32]);
+        let group_id = Ulid::generate();
+        let rules = direct_rules(HashMap::from([(
+            format!("/{realm_id}/g/{group_id}/*"),
+            Permission::READ,
+        )]));
+
+        assert!(rules.allows(&format!("/{realm_id}/g/{group_id}/data"), &Permission::READ));
+        assert!(!rules.allows(
+            &format!("/{realm_id}/g/{group_id}/data/node/bucket/key"),
+            &Permission::READ
+        ));
+    }
+
+    #[test]
+    fn malformed_fails_collection() {
+        // An uncompilable pattern denies the whole collection, never grants.
+        let realm_id = RealmId([12u8; 32]);
+        let group_id = Ulid::generate();
+        assert!(
+            PermissionRules::from_roles(
+                vec![CollectedRole {
+                    role: role(
+                        HashMap::from([(format!("/{realm_id}/g/{group_id}/["), Permission::READ)]),
+                        HashSet::new(),
+                    ),
+                    direct: true,
+                    public: false,
+                }],
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oversized_restrictions_deny() {
+        let realm_id = RealmId([13u8; 32]);
+        let group_id = Ulid::generate();
+        let pattern = format!("/{realm_id}/g/{group_id}/meta/**");
+        let restrictions = vec![
+            PathRestriction {
+                pattern: pattern.clone(),
+                permission: Permission::READ,
+            };
+            aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS + 1
+        ];
+        assert!(
+            PermissionRules::from_roles(
+                vec![CollectedRole {
+                    role: role(HashMap::from([(pattern, Permission::READ)]), HashSet::new()),
+                    direct: true,
+                    public: false,
+                }],
+                Some(&restrictions),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -785,5 +911,72 @@ mod test {
                 .expect("roles collected")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reuses_parent_txn() {
+        let realm_id = RealmId([14u8; 32]);
+        let group_id = Ulid::from(15u128);
+        let txn_id = Ulid::from(16u128);
+        let mut operation = PermissionRulesOperation::new_with_txn(
+            PermissionRulesConfig {
+                auth_context: AuthContext::anonymous(realm_id),
+                path: format!("/{realm_id}/g/{group_id}"),
+            },
+            txn_id,
+        );
+
+        let effects = operation.start();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: Some(read_txn),
+                ..
+            })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
+        ));
+
+        let realm = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(postcard::to_allocvec(&realm).unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: Some(read_txn),
+                ..
+            })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
+        ));
+
+        let group = GroupAuthorizationDocument::new_default_group_doc(
+            UserId::nil(realm_id),
+            realm_id,
+            group_id,
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(postcard::to_allocvec(&group).unwrap().into()),
+        }));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(operation.finalize().is_ok());
+
+        let mut failed = PermissionRulesOperation::new_with_txn(
+            PermissionRulesConfig {
+                auth_context: AuthContext::anonymous(realm_id),
+                path: format!("/{realm_id}/g/{group_id}"),
+            },
+            txn_id,
+        );
+        failed.start();
+        let effects = failed.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+        assert!(effects.is_empty());
+        assert!(failed.is_complete());
+        assert!(failed.finalize().is_err());
     }
 }

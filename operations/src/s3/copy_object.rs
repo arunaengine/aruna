@@ -3,7 +3,9 @@ use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{BackendLocation, RealmId, StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::{
+    BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
+};
 use aruna_core::types::{GroupId, NodeId};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,6 +35,7 @@ pub struct CopyObjectInput {
     pub quota_ceiling: Option<u64>,
     pub conditions: CopySourceConditions,
     pub metadata: Option<HashMap<String, String>>,
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -201,7 +204,8 @@ pub async fn copy_object(
             quota_ceiling: input.quota_ceiling,
             routing,
         })
-        .with_metadata(metadata),
+        .with_metadata(metadata)
+        .with_restrictions(input.restrictions.clone()),
         context,
     )
     .await
@@ -430,6 +434,7 @@ mod test {
                 quota_ceiling: None,
                 conditions: CopySourceConditions::default(),
                 metadata: None,
+                restrictions: None,
             },
         )
         .await
@@ -510,6 +515,7 @@ mod test {
                 quota_ceiling: None,
                 conditions: CopySourceConditions::default(),
                 metadata: None,
+                restrictions: None,
             },
         )
         .await
@@ -605,6 +611,7 @@ mod test {
                 quota_ceiling: None,
                 conditions: CopySourceConditions::default(),
                 metadata: None,
+                restrictions: None,
             },
         )
         .await
@@ -768,6 +775,7 @@ mod test {
                     ..Default::default()
                 },
                 metadata: None,
+                restrictions: None,
             },
         )
         .await

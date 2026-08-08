@@ -1,13 +1,13 @@
+use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, PathRestriction, Permission, UserAccess, blob_group_permission_path,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::create_user_access::{
-    CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
+    CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
+    DEFAULT_CREDENTIAL_TTL,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use aruna_operations::s3::list_user_access::{ListUserAccessInput, ListUserAccessOperation};
@@ -218,10 +218,7 @@ pub async fn list_s3_credentials(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ListS3CredentialsResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
 
     let credentials = drive(
         ListUserAccessOperation::new(ListUserAccessInput {
@@ -252,7 +249,8 @@ pub async fn list_s3_credentials(
         (status = 201, description = "Credentials created", body = CreateS3CredentialsResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 409, description = "Credential limit reached", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -271,33 +269,53 @@ pub async fn create_s3_credentials(
 
     let user_identity = auth.user_id;
     let group_id = Ulid::from_str(&request.group_id).map_err(|_| ServerError::BadRequest)?;
+    if request
+        .path_restrictions
+        .as_ref()
+        .is_some_and(|restrictions| {
+            restrictions.len() > aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS
+        })
+    {
+        return Err(ServerError::BadRequest);
+    }
     let group_root = blob_group_permission_path(realm_id, group_id, state.get_node_id());
     let path_restrictions =
         build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
             .await?;
     authorize_credential_issuance(&auth, &state, &group_root, path_restrictions.as_deref()).await?;
     let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
+    if let Some(restrictions) = path_restrictions.as_deref()
+        && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()
+    {
+        return Err(ServerError::BadRequest);
+    }
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
     let result = drive(
-        CreateUserAccessOperation::new(CreateUserAccessConfig {
-            user_identity,
-            group_id,
-            expiry,
-            path_restrictions,
-            issued_by: *node_id.as_bytes(),
-        }),
+        CreateUserAccessOperation::new(
+            CreateUserAccessConfig {
+                user_identity,
+                group_id,
+                expiry,
+                path_restrictions,
+                issued_by: *node_id.as_bytes(),
+            },
+            state.credential_seal_key().clone(),
+        ),
         &state.get_ctx(),
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     match result {
-        Ok((access_key_id, access_secret)) => Ok((
+        Ok((access_key_id, access_secret, _)) => Ok((
             StatusCode::CREATED,
             Json(CreateS3CredentialsResponse {
                 access_key_id,
-                access_secret: access_secret.secret,
+                access_secret: access_secret.expose().to_string(),
             }),
+        )),
+        Err(CreateUserAccessError::LimitReached) => Err(ServerError::Conflict(
+            "active credential limit reached".to_string(),
         )),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
@@ -321,7 +339,7 @@ pub async fn revoke_s3_credentials(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
 
     let credential = match drive(
         GetUserAccessOperation::new(access_key_id.clone()),
@@ -336,22 +354,21 @@ pub async fn revoke_s3_credentials(
         Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
     };
 
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth,
-            path: blob_group_permission_path(
+    // Credentials are user-owned like the list and create surfaces: write access
+    // to the group must not reach another member's credential, so revoking one
+    // needs either ownership or administrative authority over that user.
+    if credential.user_identity != auth.user_id {
+        crate::auth::ensure_permission(
+            &state,
+            &auth,
+            format!(
+                "/{}/admin/u/{}",
                 state.get_realm_id(),
-                credential.group_id,
-                state.get_node_id(),
+                credential.user_identity
             ),
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
+            Permission::WRITE,
+        )
+        .await?;
     }
 
     match drive(
@@ -627,28 +644,7 @@ async fn check_permission(
     path: String,
     required_permission: Permission,
 ) -> ServerResult<()> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path,
-            required_permission,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(err.to_string()),
-    })?;
-
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
-    }
+    crate::auth::ensure_permission(state, auth, path, required_permission).await
 }
 
 fn auth_pattern_may_apply_to_group_root(pattern: &str, group_root: &str) -> bool {
@@ -688,18 +684,55 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CreateS3PathRestriction, DelegationScope, NormalizedRestriction,
-        merge_effective_restrictions, normalize_auth_restrictions,
-        normalize_requested_restrictions, parse_permission,
-    };
+    use super::*;
     use crate::error::ServerError;
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::NodeCapabilities;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
-        AuthContext, PathRestriction, Permission, blob_group_permission_path,
+        Actor, AuthContext, Group, GroupAuthorizationDocument, PathRestriction, Permission,
+        RealmAuthorizationDocument, RealmConfigDocument, blob_group_permission_path,
     };
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_storage::storage::FjallStorage;
+    use std::sync::Arc;
+    use tempfile::TempDir;
     use ulid::Ulid;
+
+    async fn test_state() -> (TempDir, Arc<ServerState>, AuthContext) {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let state = Arc::new(
+            ServerState::new(
+                Arc::new(DriverContext {
+                    storage_handle: storage,
+                    net_handle: None,
+                    blob_handle: None,
+                    metadata_handle: None,
+                    task_handle: None,
+                    compute_handle: None,
+                }),
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+                JobsRuntime::new(),
+            )
+            .await,
+        );
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([3u8; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        (storage_dir, state, auth)
+    }
 
     fn test_auth_context(path_restrictions: Option<Vec<PathRestriction>>) -> AuthContext {
         let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -708,6 +741,106 @@ mod tests {
             realm_id,
             path_restrictions,
         }
+    }
+
+    /// State whose caller holds group write, plus a credential of another member.
+    async fn revoke_state() -> (TempDir, Arc<ServerState>, AuthContext, String) {
+        let (dir, state, auth) = test_state().await;
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: auth.user_id,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(auth.user_id, realm_id, group_id);
+        let group = Group {
+            display_name: "credential-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: auth.user_id,
+        };
+        for (key_space, key, value) in [
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                    .to_bytes(&actor)
+                    .unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            state
+                .get_ctx()
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+
+        let (access_key_id, _, _) = drive(
+            CreateUserAccessOperation::new(
+                CreateUserAccessConfig {
+                    user_identity: owner,
+                    group_id,
+                    expiry: SystemTime::now() + Duration::from_secs(3600),
+                    path_restrictions: None,
+                    issued_by: *node_id.as_bytes(),
+                },
+                state.credential_seal_key().clone(),
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        (dir, state, auth, access_key_id)
+    }
+
+    #[tokio::test]
+    async fn writer_cannot_revoke() {
+        // Group write must not reach the S3 credential of another member.
+        let (_dir, state, auth, access_key_id) = revoke_state().await;
+
+        let error = revoke_s3_credentials(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Path(access_key_id.clone()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::Forbidden));
+        let credential = drive(GetUserAccessOperation::new(access_key_id), &state.get_ctx())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!credential.is_revoked());
     }
 
     #[test]
@@ -855,6 +988,31 @@ mod tests {
             normalize_auth_restrictions(&auth, "/realm/g/group/data/node").unwrap(),
             Some(Vec::new())
         );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_scope() {
+        let (_storage_dir, state, auth) = test_state().await;
+        for restrictions in [
+            Some(vec![PathRestriction {
+                pattern: "/restricted/**".to_string(),
+                permission: Permission::READ,
+            }]),
+            Some(Vec::new()),
+        ] {
+            let mut restricted = auth.clone();
+            restricted.path_restrictions = restrictions;
+            let error = list_s3_credentials(State(state.clone()), Extension(Some(restricted)))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ServerError::Forbidden));
+        }
+
+        let (status, Json(response)) = list_s3_credentials(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.credentials.is_empty());
     }
 
     #[test]

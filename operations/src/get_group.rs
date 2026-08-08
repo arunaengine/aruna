@@ -4,7 +4,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{Group, GroupAuthorizationDocument};
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -18,6 +18,7 @@ pub struct GetGroupConfig {
 pub struct GetGroupOperation {
     config: GetGroupConfig,
     txn_id: Option<Ulid>,
+    external_txn: bool,
     group: Option<Group>,
     auth_doc: Option<GroupAuthorizationDocument>,
     output: Option<Result<(Group, GroupAuthorizationDocument), GetGroupError>>,
@@ -29,6 +30,19 @@ impl GetGroupOperation {
         GetGroupOperation {
             config,
             txn_id: None,
+            external_txn: false,
+            output: None,
+            group: None,
+            auth_doc: None,
+            state: GetGroupState::Init,
+        }
+    }
+
+    pub fn new_with_txn(config: GetGroupConfig, txn_id: TxnId) -> Self {
+        Self {
+            config,
+            txn_id: Some(txn_id),
+            external_txn: true,
             output: None,
             group: None,
             auth_doc: None,
@@ -68,6 +82,16 @@ impl GetGroupOperation {
         let value = value.ok_or_else(|| GetGroupError::AuthDocNotFound)?;
         let auth_doc = GroupAuthorizationDocument::from_bytes(&value)?;
         self.auth_doc = Some(auth_doc);
+        if self.external_txn {
+            self.state = GetGroupState::Finish;
+            self.output = Some(Ok((
+                self.group.clone().ok_or(GetGroupError::GroupNotFound)?,
+                self.auth_doc
+                    .clone()
+                    .ok_or(GetGroupError::AuthDocNotFound)?,
+            )));
+            return Ok(smallvec![]);
+        }
         let txn_id = self
             .txn_id
             .ok_or_else(|| GetGroupError::NoTransactionFound)?;
@@ -159,7 +183,9 @@ impl GetGroupOperation {
 
         match self.emit_parse_auth_doc(value) {
             Ok(effects) => {
-                self.state = GetGroupState::CommitTransaction;
+                if !self.external_txn {
+                    self.state = GetGroupState::CommitTransaction;
+                }
                 effects
             }
             Err(err) => self.fail(err),
@@ -227,6 +253,10 @@ impl Operation for GetGroupOperation {
     type Error = GetGroupError;
 
     fn start(&mut self) -> Effects {
+        if self.external_txn {
+            self.state = GetGroupState::GetGroup;
+            return self.emit_get_group();
+        }
         self.state = GetGroupState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -258,6 +288,9 @@ impl Operation for GetGroupOperation {
     }
 
     fn abort(&mut self) -> Effects {
+        if self.external_txn {
+            return smallvec![];
+        }
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],

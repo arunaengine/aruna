@@ -24,7 +24,7 @@ use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
 /// these; see [`DocumentSyncTarget::sync_topic_id`]).
-fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 6] {
+fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 5] {
     [
         DocumentSyncTarget::RealmAuthorization { realm_id },
         DocumentSyncTarget::RealmConfig { realm_id },
@@ -35,12 +35,6 @@ fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 6]
         },
         DocumentSyncTarget::NodeInfo { realm_id, node_id },
         DocumentSyncTarget::WatchInterest { realm_id, node_id },
-        // The access key is inert on the shared topic; any representative selects
-        // the single realm-wide user-access topic every node subscribes to.
-        DocumentSyncTarget::UserAccess {
-            realm_id,
-            access_key: String::new(),
-        },
     ]
 }
 

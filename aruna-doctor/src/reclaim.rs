@@ -138,7 +138,8 @@ fn status_output(database_path: &str) -> Result<ReclaimStatusOutput, ExplorerErr
         let (key, value) = entry.into_inner()?;
         if let Ok(
             BlobCleanupWork::DeleteBlob { location }
-            | BlobCleanupWork::ReconcileWrite { location, .. },
+            | BlobCleanupWork::ReconcileWrite { location, .. }
+            | BlobCleanupWork::ReconcileReservation { location },
         ) = BlobCleanupWork::from_bytes(value.as_ref())
         {
             let row = backends.entry(location.backend.to_string()).or_default();

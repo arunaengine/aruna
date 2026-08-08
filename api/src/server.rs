@@ -82,7 +82,12 @@ impl Server {
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
         }
-        router
+        // Outermost: the IP limiter runs before CORS, auth, and extraction so an
+        // invalid or expensive attempt still consumes IP capacity.
+        router.layer(from_fn_with_state(
+            self.state.clone(),
+            crate::rate_limit::ip_middleware,
+        ))
     }
 
     pub async fn run(self) -> Result<(), ServerSetupError> {
@@ -156,7 +161,9 @@ async fn redirect_swagger(
 
 #[cfg(test)]
 mod tests {
-    use super::{TIMEOUT_EXEMPT_ROUTES, is_exempt};
+    use super::{
+        DEFAULT_MAX_HTTP_BODY_SIZE, Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt,
+    };
     use axum::Router;
     use axum::body::Body;
     use axum::extract::MatchedPath;
@@ -165,6 +172,69 @@ mod tests {
     use axum::routing::post;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn limiter_precedes_auth() {
+        // An unauthenticated request must consume IP capacity: the gate sits
+        // outside auth, so router edits that move it inward break this.
+        use crate::rate_limit::ApiRateLimits;
+        use crate::server_state::ServerState;
+        use aruna_core::structs::{NodeCapabilities, RealmId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let driver_ctx = Arc::new(aruna_operations::driver::DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await
+            .with_rate_limits(ApiRateLimits::for_test(2)),
+        );
+
+        let router = Server::new(
+            state,
+            ServerConfig {
+                http_addr: "127.0.0.1:0".parse().unwrap(),
+                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                cors: crate::cors::CorsConfig::default(),
+                portal_csp: crate::csp::PortalCspConfig::default(),
+            },
+        )
+        .build_router();
+
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/users/credentials")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = router.clone().oneshot(request()).await.unwrap();
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _second = router.clone().oneshot(request()).await.unwrap();
+        let third = router.oneshot(request()).await.unwrap();
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 
     #[test]
     fn matches_exempt_route() {

@@ -1,6 +1,7 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
 use crate::opendal::abort_partial_writer;
+use aruna_core::errors::BlobError;
 use aruna_net::streams::{RecvStream, SendStream};
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncSeekExt};
@@ -151,10 +152,9 @@ impl AsyncStreamReader for RecvStreamWrapper<'_> {
 // ----- FuturesAsyncReader/opendal Writer impls for bao_tree ----------
 pub struct OpenDalWriter {
     writer: opendal::Writer,
-    operator: Operator,
-    storage_path: String,
     pub hasher: Hasher,
     idle_timeout: Duration,
+    control_timeout: Duration,
 }
 
 pub struct BaoReadWriter {
@@ -269,17 +269,25 @@ impl OpenDalWriter {
         operator: &Operator,
         storage_path: &str,
         idle_timeout: Duration,
+        control_timeout: Duration,
     ) -> Result<Self, BlobLibError> {
+        let writer = timeout(control_timeout, operator.writer(storage_path))
+            .await
+            .map_err(|_| {
+                BlobLibError::IoError(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out opening replicated blob writer",
+                ))
+            })??;
         Ok(Self {
-            writer: operator.writer(storage_path).await?,
-            operator: operator.clone(),
-            storage_path: storage_path.to_string(),
+            writer,
             hasher: Hasher::new(),
             idle_timeout,
+            control_timeout,
         })
     }
 
-    pub async fn finalize(mut self) -> std::io::Result<()> {
+    pub async fn finalize(mut self) -> Result<(), BlobError> {
         let close_result = with_transfer_idle_timeout(
             async {
                 self.writer
@@ -293,14 +301,16 @@ impl OpenDalWriter {
         )
         .await;
         if let Err(err) = close_result {
-            abort_partial_writer(&mut self.writer, &self.operator, &self.storage_path).await;
-            return Err(err);
+            return match abort_partial_writer(&mut self.writer, self.control_timeout).await {
+                Ok(()) => Err(BlobError::WriteError(err.to_string())),
+                Err(cleanup) => Err(BlobError::DeleteError(format!("{err}; {cleanup}"))),
+            };
         }
         Ok(())
     }
 
-    pub async fn abort(mut self) {
-        abort_partial_writer(&mut self.writer, &self.operator, &self.storage_path).await;
+    pub async fn abort(mut self) -> Result<(), BlobError> {
+        abort_partial_writer(&mut self.writer, self.control_timeout).await
     }
 }
 

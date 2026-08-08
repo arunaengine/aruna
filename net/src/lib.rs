@@ -398,6 +398,7 @@ struct NetInner {
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     notification_watch_metrics: NotificationWatchMetrics,
     notification_wakes: broadcast::Sender<UserId>,
@@ -523,10 +524,17 @@ impl NetHandle {
         let mut peer_hints = config.peer_nodes.clone();
         peer_hints.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
         let peer_hints = unique_peer_nodes(peer_hints, node_id);
-        let realm_peer_nodes = read_persisted_realm_peer_nodes(&storage, config.realm_id, node_id)
-            .await?
-            .unwrap_or_default();
+        let persisted_realm_peers =
+            read_persisted_realm_peer_nodes(&storage, config.realm_id, node_id).await?;
+        let realm_peer_nodes = persisted_realm_peers.clone().unwrap_or_default();
         let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
+        let inbound_admission = streams::InboundAdmission::new(
+            realm_peers.clone(),
+            peer_hints.iter().chain(realm_peer_nodes.iter()).copied(),
+        );
+        if persisted_realm_peers.is_some() {
+            inbound_admission.mark_materialized();
+        }
         let watch_interest = Arc::new(RwLock::new(WatchInterestTable::default()));
         let (notification_wakes, _) = broadcast::channel(NOTIFICATION_WAKE_CAPACITY);
         let dashboard_epoch = Ulid::generate();
@@ -580,11 +588,15 @@ impl NetHandle {
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::generate()))
             });
+        // Configured bootstrap peers join the persisted realm peers so a fresh
+        // joiner admits its seed's pushes before the first realm config applies.
+        let mut document_sync_peers = realm_peer_nodes.clone();
+        document_sync_peers.extend(peer_hints.iter().copied());
         let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
             endpoint.clone(),
             storage.clone(),
             document_sync_path,
-            &realm_peer_nodes,
+            &document_sync_peers,
             app_alpns,
             config.document_sync_runtime.unwrap_or_default(),
             config.fjall_persist_policy,
@@ -673,6 +685,7 @@ impl NetHandle {
 
         let endpoint_for_accept = endpoint.clone();
         let document_sync_for_accept = document_sync.clone();
+        let inbound_admission_for_accept = inbound_admission.clone();
         let shutdown_for_accept = shutdown.child_token();
         let accept_task = tokio::spawn(async move {
             streams::run_accept_loop(
@@ -680,6 +693,7 @@ impl NetHandle {
                 dht_tx,
                 stream_tx,
                 document_sync_for_accept,
+                inbound_admission_for_accept,
                 shutdown_for_accept,
             )
             .await;
@@ -793,6 +807,7 @@ impl NetHandle {
             discovery_method,
             relay_method,
             realm_peers,
+            inbound_admission,
             watch_interest,
             notification_watch_metrics: NotificationWatchMetrics::default(),
             notification_wakes,
@@ -822,6 +837,14 @@ impl NetHandle {
 
     pub fn sign(&self, message: &[u8]) -> iroh::Signature {
         self.inner.endpoint.secret_key().sign(message)
+    }
+
+    /// Issuer-local key that seals S3 credential secrets at rest. Derived from
+    /// this node's long-term secret, so only this node can unseal what it sealed.
+    pub fn credential_seal_key(&self) -> aruna_core::credential_seal::CredentialSealKey {
+        aruna_core::credential_seal::CredentialSealKey::derive(
+            &self.inner.endpoint.secret_key().to_bytes(),
+        )
     }
 
     pub fn realm_id(&self) -> &RealmId {
@@ -954,6 +977,7 @@ impl NetHandle {
             return;
         }
 
+        self.inner.inbound_admission.add_bootstrap(endpoint_addr.id);
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
@@ -979,6 +1003,7 @@ impl NetHandle {
             return;
         }
 
+        self.inner.inbound_admission.add_bootstrap(node_id);
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -1006,9 +1031,19 @@ impl NetHandle {
                 document.realm_id, self.inner.realm_id
             )));
         }
-        let peers = unique_peer_nodes(
+        // Connection admission covers every registered realm node, User kind
+        // included: user nodes forward metadata and job-control requests.
+        let admitted = unique_peer_nodes(
             document
                 .node_ids()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            self.inner.node_id,
+        );
+        self.inner.inbound_admission.set_admitted(admitted);
+        // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
+        let peers = unique_peer_nodes(
+            document
+                .sync_eligible_node_ids()
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?,
             self.inner.node_id,
         );
@@ -1118,6 +1153,7 @@ impl NetHandle {
 
     async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
         *self.inner.realm_peers.write() = peers.clone();
+        self.inner.inbound_admission.mark_materialized();
         replace_dht_signed_authorized_nodes(
             &self.inner.dht_signed_authorized_nodes,
             &peers,
@@ -2367,6 +2403,7 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
+        Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
@@ -3005,6 +3042,9 @@ mod tests {
         );
         document.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
         document.ensure_node(peer_a, aruna_core::structs::RealmNodeKind::Server);
+        // A User-kind node must never enter the sync fan-out set.
+        let user_node = make_secret(13).public();
+        document.ensure_node(user_node, aruna_core::structs::RealmNodeKind::User);
         let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());
 
         let peers = handle.refresh_realm_peers_from_document(&document).await?;

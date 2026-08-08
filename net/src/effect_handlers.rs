@@ -1,7 +1,8 @@
+use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{DhtEvent, JobControlEvent, NetEvent, StreamEvent};
-use aruna_core::id::hex_prefix;
+use aruna_core::id::{NodeId, hex_prefix};
 use tracing::{trace, warn};
 
 use crate::{DhtHandle, DocumentSyncService};
@@ -31,12 +32,25 @@ pub async fn handle_net_effect(
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
-        // Job-control effects are executed by the operations runner, which holds
-        // the driver context; they never reach this handler.
+        // Job-control and audit effects are executed by the operations runner,
+        // which holds the driver context; they never reach this handler.
         NetEffect::JobControl(_) => NetEvent::JobControl(JobControlEvent::Unavailable(
             "job-control effect must be dispatched by the operations runner".to_string(),
         )),
+        NetEffect::AuditPage(audit) => {
+            NetEvent::AuditPages(audit_fallback(audit.nodes, audit.request.limit))
+        }
     }
+}
+
+fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
+    let mut batch = AuditPageBatch::with_limit(limit);
+    // Every node of a fallback batch is missing; mark_missing bounds the set and
+    // rolls the excess into missing_overflow, so nothing is silently dropped.
+    for node in nodes {
+        batch.mark_missing(node);
+    }
+    batch
 }
 
 #[tracing::instrument(
@@ -124,6 +138,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DocumentSync(_) => "document_sync",
         NetEffect::Stream(_) => "stream",
         NetEffect::JobControl(_) => "job_control",
+        NetEffect::AuditPage(_) => "audit_page",
     }
 }
 
@@ -138,5 +153,46 @@ fn stream_effect_kind(effect: &StreamEffect) -> &'static str {
     match effect {
         StreamEffect::Open { .. } => "open",
         StreamEffect::Close { .. } => "close",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_fallback;
+    use aruna_core::audit::MAX_AUDIT_PEERS;
+    use aruna_core::id::NodeId;
+
+    fn make_node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn bounds_overflow() {
+        // A fallback batch has no completed node, so an oversized list must
+        // report the bounded prefix as missing instead of an empty page.
+        let nodes = (1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap())
+            .map(make_node)
+            .collect();
+        let batch = audit_fallback(nodes, usize::MAX);
+
+        assert!(batch.records.is_empty());
+        assert!(batch.completed_nodes.is_empty());
+        assert_eq!(batch.missing_nodes.len(), MAX_AUDIT_PEERS);
+        assert_eq!(batch.missing_overflow, 1);
+    }
+
+    #[test]
+    fn keeps_unique() {
+        let first = make_node(1);
+        let second = make_node(2);
+        let batch = audit_fallback(vec![second, first, first], usize::MAX);
+
+        let mut expected = vec![first, second];
+        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        assert_eq!(
+            batch.missing_nodes.into_iter().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(batch.missing_overflow, 0);
     }
 }

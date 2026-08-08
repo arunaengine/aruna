@@ -987,6 +987,7 @@ async fn snapshot_blob(
             quota_ceiling,
             retry_key: None,
             expected_bucket: bucket_info,
+            restrictions: auth.path_restrictions.clone(),
         },
     )
     .await

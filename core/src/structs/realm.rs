@@ -1,4 +1,6 @@
 use crate::NodeId;
+use crate::admin_document_reducer::{AdminDocumentReducerState, RevocationIndex};
+use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
@@ -14,7 +16,7 @@ use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use thiserror::Error;
 use ulid::Ulid;
@@ -170,6 +172,25 @@ pub struct RealmConfigDocument {
     /// Each coordinator grants node bands only from pools it owns; precedence
     /// is by lineage (see [`coordinator_spans`]).
     pub band_pools: Vec<BandPool>,
+    /// CEL request policies applied realm-wide (Class-1 replicated, so
+    /// evaluation is local on every node).
+    #[serde(default)]
+    pub request_policies: Vec<crate::request_policy::RequestPolicy>,
+    /// Bearer tokens revoked realm-wide. Class-1 replicated, so every node
+    /// rejects a token revoked on any other node.
+    #[serde(default)]
+    pub revoked_tokens: Vec<TokenRevocation>,
+    /// Highest validation/compaction time observed for the revocation set.
+    pub revocation_floor: u64,
+}
+
+/// One realm-wide bearer token revocation. The expiry is the revoked token's
+/// own `exp`: past it the token no longer validates, so the entry is pruned and
+/// the replicated set stays bounded by one token lifetime of revocations.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct TokenRevocation {
+    pub token_hash: String,
+    pub expires_at: u64,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -367,6 +388,11 @@ impl RealmConfigDocument {
         sort_canonical(&mut canonical.placement_bindings)?;
         sort_canonical(&mut canonical.placement_handle_ranges)?;
         sort_canonical(&mut canonical.band_pools)?;
+        // Revocations are excluded: the digest binds routing agreement between
+        // nodes, and a deny-list that converges independently would otherwise
+        // make every revocation reject forwarded requests until it replicated.
+        canonical.revoked_tokens.clear();
+        canonical.revocation_floor = 0;
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -388,6 +414,9 @@ impl RealmConfigDocument {
             quota: QuotaConfig::default(),
             description: String::new(),
             placement_map: Vec::new(),
+            request_policies: Vec::new(),
+            revoked_tokens: Vec::new(),
+            revocation_floor: 0,
             strategies: Vec::new(),
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
@@ -486,6 +515,54 @@ impl RealmConfigDocument {
         }
 
         self.nodes.push(RealmNode { node_id, kind });
+    }
+
+    /// Whether the realm-wide revocation set denies this bearer token hash.
+    /// The floor is stamped by whichever node merged last, so only a clock more
+    /// than the skew grace below it counts as a rollback and fails closed.
+    pub fn token_revoked(&self, token_hash: &str, now: u64) -> bool {
+        if self.revocation_floor.saturating_sub(now) > REVOCATION_GRACE_SECS {
+            return true;
+        }
+        self.revoked_tokens
+            .iter()
+            .any(|entry| entry.token_hash == token_hash && revocation_live(entry.expires_at, now))
+    }
+
+    /// Unions the locally accepted revocations with the reducer's materialized
+    /// set and drops entries whose token has expired. Ownership stays in the
+    /// reducer path; the deny overlay only needs one hash and expiry per token.
+    pub fn merge_revocations(&mut self, reducer_state: &AdminDocumentReducerState, now: u64) {
+        self.revocation_floor = self.revocation_floor.max(reducer_state.revocation_floor);
+        let index = reducer_state.revocation_index(now);
+        self.merge_revocation_index(&index, now);
+    }
+
+    /// Merges an existing revocation index without rebuilding reducer paths.
+    pub fn merge_revocation_index(&mut self, index: &RevocationIndex, now: u64) {
+        self.revocation_floor = self.revocation_floor.max(index.watermark()).max(now);
+        let effective_now = self.revocation_floor;
+        let mut merged: BTreeMap<String, u64> = self
+            .revoked_tokens
+            .drain(..)
+            .map(|entry| (entry.token_hash, entry.expires_at))
+            .collect();
+        for (token_hash, expires_at) in index.materialized() {
+            merged
+                .entry(token_hash)
+                .and_modify(|current| *current = (*current).max(expires_at))
+                .or_insert(expires_at);
+        }
+        // Retain one grace window past expiry so a node lagging inside the skew
+        // bound still sees the entry; per-entry checks stay `revocation_live`.
+        self.revoked_tokens = merged
+            .into_iter()
+            .filter(|(_, expires_at)| revocation_retained(*expires_at, effective_now))
+            .map(|(token_hash, expires_at)| TokenRevocation {
+                token_hash,
+                expires_at,
+            })
+            .collect();
     }
 
     pub fn has_node(&self, node_id: NodeId) -> bool {
@@ -711,10 +788,13 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 #[cfg(test)]
 mod test {
     use crate::NodeId;
+    use crate::admin_document_reducer::AdminDocumentReducerState;
+    use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+    use crate::auth::REVOCATION_GRACE_SECS;
     use crate::structs::{
         Actor, DynamicDiscoveryMethod, MetadataGroupReplicationOverride,
         MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, TokenRevocation,
         default_realm_discovery_config,
     };
     use ulid::Ulid;
@@ -765,6 +845,9 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
+            request_policies: Vec::new(),
+            revoked_tokens: Vec::new(),
+            revocation_floor: 0,
             description: "Example Realm".to_string(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
@@ -795,6 +878,149 @@ mod test {
 
         assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
         assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
+    }
+
+    #[test]
+    fn digest_ignores_revocations() {
+        // A revocation converges on its own; if it moved the digest, forwarded
+        // requests would be rejected between nodes until it replicated.
+        let config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 3);
+        let mut revoked = config.clone();
+        revoked.revoked_tokens.push(TokenRevocation {
+            token_hash: crate::auth::bearer_token_hash("token"),
+            expires_at: 2_000,
+        });
+        revoked.revocation_floor = 1_500;
+
+        assert!(revoked.token_revoked(&crate::auth::bearer_token_hash("token"), 1_000));
+        assert_eq!(config.digest().unwrap(), revoked.digest().unwrap());
+    }
+
+    #[test]
+    fn expired_revocation_ignored() {
+        // Past its token's expiry an entry denies nothing and is pruned, so the
+        // replicated set cannot grow without bound.
+        let realm_id = RealmId([6u8; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let token_hash = crate::auth::bearer_token_hash("token");
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: token_hash.clone(),
+            expires_at: 1_000,
+        });
+
+        assert!(config.token_revoked(&token_hash, 1_000));
+        assert!(!config.token_revoked(&token_hash, 1_001));
+
+        let reducer_state = AdminDocumentReducerState::new(
+            crate::admin_documents::AdminDocumentTarget::RealmConfig { realm_id },
+        );
+        // Retained for one grace window so a skewed peer still sees it, then pruned.
+        config.merge_revocations(&reducer_state, 1_001);
+        assert_eq!(config.revoked_tokens.len(), 1);
+        config.merge_revocations(&reducer_state, 1_001 + REVOCATION_GRACE_SECS + 1);
+        assert!(config.revoked_tokens.is_empty());
+    }
+
+    #[test]
+    fn floor_blocks_rollback() {
+        // A compacted hash must stay expired when the wall clock moves back.
+        let realm_id = RealmId([8u8; 32]);
+        let owner = crate::UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            user_id: owner,
+            realm_id,
+        };
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let token_hash = crate::auth::bearer_token_hash("rollback-token");
+        let mut reducer = AdminDocumentReducerState::new(target);
+        reducer
+            .apply_operation(
+                &actor,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at: 1_000,
+                    token_owner: owner,
+                },
+            )
+            .unwrap();
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let index = reducer.revocation_index(1_000);
+        config.merge_revocation_index(&index, 1_000);
+        assert!(config.token_revoked(&token_hash, 999));
+
+        reducer.compact_revocations(2_000);
+        let index = reducer.revocation_index(2_000);
+        config.merge_revocation_index(&index, 2_000);
+        assert!(config.revoked_tokens.is_empty());
+        assert_eq!(config.revocation_floor, 2_000);
+        assert!(config.token_revoked(&token_hash, 2_000 - REVOCATION_GRACE_SECS - 1));
+        assert!(!config.token_revoked(&token_hash, 2_000));
+    }
+
+    #[test]
+    fn floor_tolerates_skew() {
+        // The floor carries the merging node's clock, so a node a few seconds
+        // behind it must keep serving instead of denying every bearer token.
+        let realm_id = RealmId([9u8; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.revocation_floor = 2_000;
+
+        let token_hash = crate::auth::bearer_token_hash("skewed-token");
+        assert!(!config.token_revoked(&token_hash, 2_000 - REVOCATION_GRACE_SECS));
+        assert!(config.token_revoked(&token_hash, 2_000 - REVOCATION_GRACE_SECS - 1));
+    }
+
+    #[test]
+    fn owner_overlay_deduplicates() {
+        let realm_id = RealmId([7u8; 32]);
+        let owner_a = crate::UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
+        let owner_b = crate::UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let actor_a = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: owner_a,
+            realm_id,
+        };
+        let actor_b = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
+            user_id: owner_b,
+            realm_id,
+        };
+        let mut reducer =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let token_hash = crate::auth::bearer_token_hash("owner-overlay");
+        reducer
+            .apply_operation(
+                &actor_a,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at: 2_000,
+                    token_owner: owner_a,
+                },
+            )
+            .unwrap();
+        reducer
+            .apply_operation(
+                &actor_b,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at: 2_000,
+                    token_owner: owner_b,
+                },
+            )
+            .unwrap();
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.merge_revocations(&reducer, 1_000);
+
+        assert_eq!(
+            config.revoked_tokens,
+            vec![TokenRevocation {
+                token_hash,
+                expires_at: 2_000,
+            }]
+        );
     }
 
     #[test]
@@ -925,6 +1151,9 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
+            request_policies: Vec::new(),
+            revoked_tokens: Vec::new(),
+            revocation_floor: 0,
             description: String::new(),
             placement_map: Vec::new(),
             strategies: Vec::new(),

@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use aruna_core::DhtKeyId;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
+    GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_DESCRIPTION_PATH,
+    REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
+    REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH, RevocationIndex, USER_NAME_PATH,
     decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
     group_role_user_assignment_from_path, group_role_user_assignment_path,
     overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
@@ -19,6 +22,7 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
+use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncEvictedDocument,
     DocumentSyncNetEvent, DocumentSyncOutboxEvent, DocumentSyncPublish,
@@ -32,13 +36,14 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
+use aruna_core::permission_path::compile_permission_matcher;
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
@@ -52,7 +57,8 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
-    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
+    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
+    NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
     NodeUsageSnapshot, PlacementRef, PlacementScope, PoolAdmission, RealmAuthorizationDocument,
     RealmConfigDocument, RealmId, RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest,
     WatchSubscription, admit_band_pool, coordinator_spans, group_owner_index_key,
@@ -61,15 +67,14 @@ use aruna_core::structs::{
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::util::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
-use globset::Glob;
 use irokle_crate::Event as _;
 use irokle_crate::Storage as _;
 use irokle_crate::TopicControl;
 use irokle_crate::net::{decode_sync_message, encode_frame, encode_sync_message};
-use irokle_crate::oplog::{Oplog, topological_subset};
+use irokle_crate::oplog::Oplog;
 use irokle_crate::sync::{SyncData, SyncMessage, SyncRequest};
 use irokle_crate::{
     EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
@@ -90,9 +95,24 @@ const DOCUMENT_SYNC_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 // Matches irokle's 1024-topic wire batches; the worst-case data stream sends
 // three messages per topic, staying under the peer's 4096-message stream cap.
 pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
+const DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT: usize = 8;
+const DOCUMENT_SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
+const DOCUMENT_SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+// A frame is meaningful progress; a byte trickle cannot retain a permit forever.
+const DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+// Admission budgets: worst-case inbound cost is bounded before any stream is
+// drained, per pushing peer and for the node as a whole.
+const DOCUMENT_SYNC_INBOUND_PEER_STREAMS: usize = 8;
+const DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS: usize = 64;
+// Aggregate buffered-byte ceilings, well below 64 independent 256 MiB streams,
+// so concurrent streams cannot pin more memory than the node can absorb.
+const DOCUMENT_SYNC_INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
+const DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const DOCUMENT_SYNC_REPLAY_BATCH_LIMIT: usize = 1_024;
 const MAX_DEFERRED_TOPICS: usize = 1_024;
 const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
 /// Bounds concurrent co-holder genesis probes so a large holder set cannot open
@@ -106,6 +126,11 @@ struct PendingMetadataCreateApply {
     record: MetadataCreateEventRecord,
     bytes: Vec<u8>,
     lifecycle_revision: Option<DocumentSyncChange>,
+}
+
+struct DocumentEventBatch {
+    cursor: irokle_crate::ActorClock,
+    events: Vec<(DocumentSyncEvent, irokle_crate::ActorId, u64)>,
 }
 
 /// Placement fence outcome. The transactional read of the realm config is the
@@ -125,6 +150,13 @@ struct PublishEventsOutcome {
     published_indices: Vec<usize>,
     retry_indices: Vec<usize>,
     retry_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct PeerSelection {
+    peers: BTreeSet<PeerId>,
+    truncated: bool,
+    round: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -164,11 +196,128 @@ pub struct ShardGenesisProbe {
     pub unreachable: Vec<NodeId>,
 }
 
+/// Concurrent inbound sync stream counters. A stream takes its permit before
+/// any byte of the payload is read, so an abusive peer costs one table entry
+/// instead of a 256 MiB drain per stream.
+#[derive(Debug, Default)]
+struct InboundSyncBudget {
+    state: Mutex<InboundSyncCounters>,
+}
+
+#[derive(Debug, Default)]
+struct InboundSyncCounters {
+    global: usize,
+    per_peer: BTreeMap<PeerId, usize>,
+    global_bytes: usize,
+    per_peer_bytes: BTreeMap<PeerId, usize>,
+}
+
+impl InboundSyncBudget {
+    fn acquire(self: &Arc<Self>, peer: PeerId) -> Option<InboundSyncPermit> {
+        let mut state = self.state.lock();
+        let held = state.per_peer.get(&peer).copied().unwrap_or(0);
+        if state.global >= DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS
+            || held >= DOCUMENT_SYNC_INBOUND_PEER_STREAMS
+        {
+            return None;
+        }
+        state.global += 1;
+        *state.per_peer.entry(peer).or_insert(0) += 1;
+        Some(InboundSyncPermit {
+            budget: self.clone(),
+            peer,
+        })
+    }
+
+    // Reserves declared frame bytes against the per-peer and global ceilings
+    // before the payload is allocated; false leaves both counters untouched.
+    fn reserve_bytes(&self, peer: PeerId, bytes: usize) -> bool {
+        let mut state = self.state.lock();
+        let held = state.per_peer_bytes.get(&peer).copied().unwrap_or(0);
+        if state.global_bytes.saturating_add(bytes) > DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES
+            || held.saturating_add(bytes) > DOCUMENT_SYNC_INBOUND_PEER_BYTES
+        {
+            return false;
+        }
+        state.global_bytes = state.global_bytes.saturating_add(bytes);
+        *state.per_peer_bytes.entry(peer).or_insert(0) += bytes;
+        true
+    }
+
+    fn release_bytes(&self, peer: PeerId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.global_bytes = state.global_bytes.saturating_sub(bytes);
+        if let Some(held) = state.per_peer_bytes.get_mut(&peer) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                state.per_peer_bytes.remove(&peer);
+            }
+        }
+    }
+}
+
+struct InboundSyncPermit {
+    budget: Arc<InboundSyncBudget>,
+    peer: PeerId,
+}
+
+impl Drop for InboundSyncPermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock();
+        state.global = state.global.saturating_sub(1);
+        if let Some(held) = state.per_peer.get_mut(&self.peer) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                state.per_peer.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Holds a peer's buffered-byte reservation for the lifetime of one inbound
+/// stream, releasing it on success, decode failure, cancellation, or drop.
+struct InboundByteReservation {
+    budget: Arc<InboundSyncBudget>,
+    peer: PeerId,
+    reserved: usize,
+}
+
+impl InboundByteReservation {
+    fn new(budget: Arc<InboundSyncBudget>, peer: PeerId) -> Self {
+        Self {
+            budget,
+            peer,
+            reserved: 0,
+        }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        if !self.budget.reserve_bytes(self.peer, bytes) {
+            return Err(NetError::AdmissionRejected(format!(
+                "document sync byte budget exhausted for peer {}",
+                self.peer
+            )));
+        }
+        self.reserved = self.reserved.saturating_add(bytes);
+        Ok(())
+    }
+}
+
+impl Drop for InboundByteReservation {
+    fn drop(&mut self) {
+        self.budget.release_bytes(self.peer, self.reserved);
+    }
+}
+
 #[derive(Clone)]
 pub struct DocumentSyncService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: Arc<irokle_crate::net::IrohNet<irokle_crate::FjallStorage>>,
     db: fjall::OptimisticTxDatabase,
+    fanout_cursors: fjall::OptimisticTxKeyspace,
     persist_policy: FjallPersistPolicy,
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
@@ -184,6 +333,14 @@ pub struct DocumentSyncService {
     // Realm this service serves; shard-classed targets carry no realm id of
     // their own, so their topic derivation reads it from here.
     realm_id: RealmId,
+    inbound_budget: Arc<InboundSyncBudget>,
+    // Peers configured at open. They admit inbound sync only during the
+    // bootstrap window; once realm config materializes the current
+    // sync-eligible `default_peers` set is authoritative.
+    configured_peers: BTreeSet<PeerId>,
+    // Flips true on the first realm-config-driven peer refresh, after which
+    // `configured_peers` no longer grant admission.
+    realm_config_materialized: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -235,6 +392,12 @@ impl DocumentSyncService {
             .manual_journal_persist(true)
             .open()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let fanout_cursors = db
+            .keyspace(
+                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let node = irokle_crate::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
             .with_peer_whitelist(default_peers.clone())
@@ -260,15 +423,19 @@ impl DocumentSyncService {
             node,
             net,
             db,
+            fanout_cursors,
             persist_policy,
             storage,
-            default_peers: Arc::new(RwLock::new(default_peers)),
+            default_peers: Arc::new(RwLock::new(default_peers.clone())),
             shard_publishers: Arc::new(RwLock::new(BTreeMap::new())),
             storage_path,
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             eviction_tx,
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
             realm_id,
+            inbound_budget: Arc::new(InboundSyncBudget::default()),
+            configured_peers: default_peers,
+            realm_config_materialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -293,6 +460,10 @@ impl DocumentSyncService {
     /// reconcile skip arm), and ops not authored by the local node are rejected
     /// since an eviction is by construction the local node's own chain.
     pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
+        self.clear_cursor(eviction.topic_id);
+        if let Err(error) = self.flush_database() {
+            warn!(%error, topic_id = %eviction.topic_id, "Failed to persist document sync fan-out cursor reset");
+        }
         let local_peer = self.node.peer_id();
         let mut documents = Vec::new();
         for evicted in eviction.evicted {
@@ -441,10 +612,12 @@ impl DocumentSyncService {
         self.node
             .add_peers_to_whitelist(peers.iter().copied())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        // The underlying sync node exposes additive whitelist updates only; this
-        // refresh replaces the default fan-out set while retaining previously
-        // allowed peers until process restart.
+        // Realm config is now authoritative: replace the fan-out/admission set
+        // and stop honoring the bootstrap `configured_peers`. The transport
+        // whitelist is additive, but `admit_inbound` gates before any read.
         *self.default_peers.write() = peers;
+        self.realm_config_materialized
+            .store(true, Ordering::Release);
         self.flush_database()?;
         Ok(())
     }
@@ -461,10 +634,14 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        let sync_peers = self.sync_peers(peers);
-        self.allow_sync_peers(&sync_peers)?;
-        self.sync_topic(topic_id, sync_peers).await?;
-        self.flush_database()
+        let selection = self.sync_peer_selection(&peers, &topic_id)?;
+        self.log_peer_selection(topic_id, &selection);
+        self.allow_sync_peers(&selection.peers)?;
+        let round = selection.round;
+        let result = self.sync_topic(topic_id, selection).await;
+        self.advance_cursor(topic_id, round)?;
+        self.flush_database()?;
+        result
     }
 
     pub fn allow_document_sync_peers(
@@ -728,15 +905,46 @@ impl DocumentSyncService {
             .note_peer_reachable(node_id_to_peer_id(&connection.remote_id()));
     }
 
+    /// Admission for one inbound sync stream, decided before any payload byte
+    /// is read: the pusher must be a configured realm peer and within the
+    /// per-peer and global stream budgets.
+    fn admit_inbound(&self, peer: NodeId) -> Result<InboundSyncPermit> {
+        let peer_id = node_id_to_peer_id(&peer);
+        // The bootstrap peers admit only until realm config materializes; after
+        // that the current sync-eligible set is the sole authority, so a removed
+        // startup peer fails here without a restart.
+        let bootstrap_window = !self.realm_config_materialized.load(Ordering::Acquire);
+        let admitted = self.default_peers.read().contains(&peer_id)
+            || (bootstrap_window && self.configured_peers.contains(&peer_id));
+        if !admitted {
+            return Err(NetError::AdmissionRejected(format!(
+                "document sync peer {peer_id} is not a current realm peer"
+            )));
+        }
+        self.inbound_budget.acquire(peer_id).ok_or_else(|| {
+            NetError::AdmissionRejected(format!(
+                "document sync stream budget exhausted for peer {peer_id}"
+            ))
+        })
+    }
+
     pub async fn handle_inbound_stream(
         &self,
         stream: BiStream,
         peer: NodeId,
     ) -> Result<Vec<irokle_crate::TopicId>> {
         let stream_started = Instant::now();
+        let _permit = self.admit_inbound(peer)?;
         self.net.note_peer_reachable(node_id_to_peer_id(&peer));
         let BiStream(mut send, mut recv, _) = stream;
-        let (messages, touched_topics) = read_inbound_sync_messages(&mut recv).await?;
+        let mut byte_reservation =
+            InboundByteReservation::new(self.inbound_budget.clone(), node_id_to_peer_id(&peer));
+        let (messages, touched_topics) = timeout(
+            DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT,
+            read_inbound_sync_messages(&mut recv, &mut byte_reservation),
+        )
+        .await
+        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT))??;
         let read_elapsed = stream_started.elapsed();
         let message_count = messages.len();
         let handle_started = Instant::now();
@@ -830,16 +1038,39 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> DocumentSyncNetEvent {
-        let sync_peers = self.sync_peers(peers);
-        if let Err(error) = self.allow_sync_peers(&sync_peers) {
-            return DocumentSyncNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            };
-        }
         match self.has_topic(topic_id) {
             Ok(true) => {
-                if let Err(error) = self.sync_topic(topic_id, sync_peers).await {
+                let selection = match self.sync_peer_selection(&peers, &topic_id) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        return DocumentSyncNetEvent::Error {
+                            target: None,
+                            error: error.to_string(),
+                        };
+                    }
+                };
+                self.log_peer_selection(topic_id, &selection);
+                if let Err(error) = self.allow_sync_peers(&selection.peers) {
+                    return DocumentSyncNetEvent::Error {
+                        target: None,
+                        error: error.to_string(),
+                    };
+                }
+                let round = selection.round;
+                let result = self.sync_topic(topic_id, selection).await;
+                if let Err(error) = self.advance_cursor(topic_id, round) {
+                    return DocumentSyncNetEvent::Error {
+                        target: None,
+                        error: error.to_string(),
+                    };
+                }
+                if let Err(error) = result {
+                    if let Err(persist_error) = self.flush_database() {
+                        return DocumentSyncNetEvent::Error {
+                            target: None,
+                            error: persist_error.to_string(),
+                        };
+                    }
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -847,7 +1078,10 @@ impl DocumentSyncService {
                 }
             }
             Ok(false) => {
-                if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
+                if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &peers).await {
+                    if let Err(persist_error) = self.flush_database() {
+                        warn!(%persist_error, %topic_id, "Failed to persist document sync bootstrap cleanup");
+                    }
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -888,16 +1122,10 @@ impl DocumentSyncService {
     ) -> DocumentSyncNetEvent {
         let sync_started = Instant::now();
         let target_count = topic_ids.len();
-        let sync_peers = self.sync_peers(peers);
-        if let Err(error) = self.allow_sync_peers(&sync_peers) {
-            return DocumentSyncNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            };
-        }
 
         let mut seen_topics = BTreeSet::new();
         let mut topic_ids_out: Vec<irokle_crate::TopicId> = Vec::new();
+        let mut bootstrap_cursor_dirty = false;
         for topic_id in topic_ids {
             if !seen_topics.insert(topic_id) {
                 continue;
@@ -905,11 +1133,12 @@ impl DocumentSyncService {
             match self.has_topic(topic_id) {
                 Ok(true) => topic_ids_out.push(topic_id),
                 Ok(false) => {
+                    bootstrap_cursor_dirty = true;
                     // Join-only: an unknown topic whose genesis is nowhere to be
                     // found yet (e.g. an empty shard whose rank-0 holder has not
                     // created it) is skipped, not fatal — it arrives via gossip
                     // or a later anti-entropy pass.
-                    match self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
+                    match self.bootstrap_topic_from_peers(topic_id, &peers).await {
                         Ok(()) => topic_ids_out.push(topic_id),
                         Err(error) => {
                             debug!(%topic_id, error = %error, "skipping unbootstrappable document sync topic");
@@ -925,10 +1154,17 @@ impl DocumentSyncService {
             }
         }
 
+        if bootstrap_cursor_dirty && let Err(error) = self.flush_database() {
+            return DocumentSyncNetEvent::Error {
+                target: None,
+                error: error.to_string(),
+            };
+        }
+
         let bootstrap_elapsed = sync_started.elapsed();
         let topic_ids = topic_ids_out;
         let peer_sync_started = Instant::now();
-        if let Err(error) = self.sync_topics(topic_ids.clone(), sync_peers).await {
+        if let Err(error) = self.sync_topics(topic_ids.clone(), &peers).await {
             return DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
@@ -1312,6 +1548,60 @@ impl DocumentSyncService {
         sync_peers
     }
 
+    fn next_sync_round(&self, topic_id: irokle_crate::TopicId) -> Result<u64> {
+        current_cursor(&self.fanout_cursors, topic_id)
+    }
+
+    fn advance_cursor(&self, topic_id: irokle_crate::TopicId, round: u64) -> Result<()> {
+        advance_cursor(&self.fanout_cursors, topic_id, round)
+    }
+
+    fn clear_cursor(&self, topic_id: irokle_crate::TopicId) {
+        if let Err(error) = remove_cursor(&self.fanout_cursors, topic_id) {
+            warn!(%error, %topic_id, "Failed to clear document sync fan-out cursor");
+        }
+    }
+
+    fn sync_peer_selection(
+        &self,
+        peers: &[NodeId],
+        topic_id: &irokle_crate::TopicId,
+    ) -> Result<PeerSelection> {
+        let round = self.next_sync_round(*topic_id)?;
+        let mut subject = [0u8; 64];
+        subject[..32].copy_from_slice(topic_id.as_ref());
+        subject[32..].copy_from_slice(self.node.peer_id().as_bytes());
+        if peers.is_empty() {
+            let defaults = self.default_peers.read();
+            Ok(select_sync_peers(
+                defaults.iter().copied(),
+                self.node.peer_id(),
+                &subject,
+                round,
+            ))
+        } else {
+            Ok(select_sync_peers(
+                peers
+                    .iter()
+                    .copied()
+                    .map(|node_id| node_id_to_peer_id(&node_id)),
+                self.node.peer_id(),
+                &subject,
+                round,
+            ))
+        }
+    }
+
+    fn log_peer_selection(&self, topic_id: irokle_crate::TopicId, selection: &PeerSelection) {
+        if selection.truncated {
+            debug!(
+                %topic_id,
+                selected = selection.peers.len(),
+                "Document sync fan-out bounded; omitted peers remain anti-entropy work"
+            );
+        }
+    }
+
     fn allow_sync_peers(&self, peers: &BTreeSet<PeerId>) -> Result<()> {
         self.node
             .add_peers_to_whitelist(peers.iter().copied())
@@ -1319,7 +1609,7 @@ impl DocumentSyncService {
     }
 
     async fn fan_out_peer_syncs<F, Fut>(
-        peers: BTreeSet<PeerId>,
+        selection: PeerSelection,
         context: String,
         run: F,
     ) -> Result<()>
@@ -1327,14 +1617,15 @@ impl DocumentSyncService {
         F: Fn(PeerId) -> Fut,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        let attempted = peers.len();
+        let omitted = selection.truncated;
+        let attempted = selection.peers.len();
         if attempted == 0 {
             return Ok(());
         }
 
         let fanout_started = Instant::now();
         let mut syncs = JoinSet::new();
-        for peer in peers {
+        for peer in selection.peers {
             let future = run(peer);
             syncs.spawn(async move {
                 let peer_started = Instant::now();
@@ -1379,6 +1670,7 @@ impl DocumentSyncService {
             event = "pipeline.fanout.summary",
             context = %context,
             peers = attempted,
+            omitted,
             ok = successes,
             failed = attempted - successes,
             total_ms = duration_ms(fanout_started.elapsed()),
@@ -1397,11 +1689,11 @@ impl DocumentSyncService {
     async fn sync_topic(
         &self,
         topic_id: irokle_crate::TopicId,
-        peers: BTreeSet<PeerId>,
+        selection: PeerSelection,
     ) -> Result<()> {
         let net = self.net.clone();
         Self::fan_out_peer_syncs(
-            peers,
+            selection,
             format!("document sync topic {topic_id}"),
             move |peer| {
                 let net = net.clone();
@@ -1425,13 +1717,43 @@ impl DocumentSyncService {
     async fn sync_topics(
         &self,
         topic_ids: Vec<irokle_crate::TopicId>,
-        peers: BTreeSet<PeerId>,
+        peers: &[NodeId],
     ) -> Result<()> {
-        if topic_ids.is_empty() || peers.is_empty() {
+        if topic_ids.is_empty() {
             return Ok(());
         }
+        type SyncGroups =
+            BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<(irokle_crate::TopicId, u64)>)>;
         for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
-            self.sync_topic_batch(chunk, peers.clone()).await?;
+            let mut groups: SyncGroups = BTreeMap::new();
+            for topic_id in chunk.iter().copied() {
+                let selection = self.sync_peer_selection(peers, &topic_id)?;
+                let round = selection.round;
+                let selected = selection.peers.clone();
+                if let Some((group, topics)) = groups.get_mut(&selected) {
+                    group.truncated |= selection.truncated;
+                    topics.push((topic_id, round));
+                } else {
+                    groups.insert(selected, (selection, vec![(topic_id, round)]));
+                }
+            }
+            for (_, (selection, topics)) in groups {
+                let Some((topic_id, _)) = topics.first() else {
+                    continue;
+                };
+                self.log_peer_selection(*topic_id, &selection);
+                self.allow_sync_peers(&selection.peers)?;
+                let topic_ids = topics
+                    .iter()
+                    .map(|(topic_id, _)| *topic_id)
+                    .collect::<Vec<_>>();
+                let result = self.sync_topic_batch(&topic_ids, selection).await;
+                for (topic_id, round) in topics {
+                    self.advance_cursor(topic_id, round)?;
+                }
+                self.flush_database()?;
+                result?;
+            }
         }
         Ok(())
     }
@@ -1439,7 +1761,7 @@ impl DocumentSyncService {
     async fn sync_topic_batch(
         &self,
         topic_ids: &[irokle_crate::TopicId],
-        peers: BTreeSet<PeerId>,
+        selection: PeerSelection,
     ) -> Result<()> {
         if topic_ids.is_empty() {
             return Ok(());
@@ -1447,7 +1769,7 @@ impl DocumentSyncService {
         let service = self.clone();
         let topic_ids = topic_ids.to_vec();
         Self::fan_out_peer_syncs(
-            peers,
+            selection,
             format!("document sync topic batch of {} topics", topic_ids.len()),
             move |peer| {
                 let service = service.clone();
@@ -1596,12 +1918,33 @@ impl DocumentSyncService {
     async fn bootstrap_topic_from_peers(
         &self,
         topic_id: irokle_crate::TopicId,
-        peers: &BTreeSet<PeerId>,
+        peers: &[NodeId],
     ) -> Result<()> {
+        let selection = self.sync_peer_selection(peers, &topic_id)?;
+        self.log_peer_selection(topic_id, &selection);
+        self.allow_sync_peers(&selection.peers)?;
         let mut first_error = None;
-        for peer in peers {
-            match self.bootstrap_topic_from_peer(topic_id, *peer).await {
-                Ok(()) => return Ok(()),
+        for peer in selection.peers {
+            match self.bootstrap_topic_from_peer(topic_id, peer).await {
+                Ok(()) => match self.has_topic(topic_id) {
+                    Ok(true) => {
+                        self.advance_cursor(topic_id, selection.round)?;
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        let error = NetError::TopicNotReady(topic_id.to_string());
+                        warn!(%peer, %topic_id, "Document sync bootstrap peer has no topic");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%peer, %topic_id, error = %error, "Document sync bootstrap topic check failed");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                },
                 Err(error) => {
                     warn!(%peer, %topic_id, error = %error, "Document sync bootstrap attempt failed");
                     if first_error.is_none() {
@@ -1610,6 +1953,8 @@ impl DocumentSyncService {
                 }
             }
         }
+        // Advance after attempted peers so omitted candidates rotate into the next retry.
+        self.advance_cursor(topic_id, selection.round)?;
         Err(first_error.unwrap_or_else(|| {
             NetError::Bootstrap(format!(
                 "no peers available to bootstrap document sync topic {topic_id}"
@@ -1884,24 +2229,18 @@ impl DocumentSyncService {
                 Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
                 None => irokle_crate::ActorClock::default(),
             };
-            let topic_clock = self
-                .node
-                .storage()
-                .actor_clock(&topic_id)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if cursor.dominates(&topic_clock) {
+            let batch =
+                self.document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?;
+            if batch.cursor == cursor {
                 continue;
             }
-            let events = self.document_events_after(topic_id, &cursor)?;
-            // Every admitted op counted in `topic_clock` is either one of
-            // `events`, an already-applied event, or a control op, so the
-            // merged clock is the new applied watermark.
-            cursor.merge(&topic_clock);
+            // Persist only this causal batch; anti-entropy will revisit the topic.
+            cursor = batch.cursor;
             let mut deferred_creates = false;
             let mut deferred_admin_events = Vec::new();
             let mut satisfied_admin_dependencies = BTreeSet::new();
             let mut cross_topic_dependencies = BTreeSet::new();
-            for (event, actor_id, actor_seq) in events {
+            for (event, actor_id, actor_seq) in batch.events {
                 if self
                     .shard_publishers
                     .read()
@@ -2030,7 +2369,7 @@ impl DocumentSyncService {
                             );
                             continue;
                         }
-                        if let Err(reason) = validate_watch_interest_upsert(&target, &bytes) {
+                        if let Err(reason) = validate_watch_interest(&target, &bytes) {
                             warn!(
                                 %topic_id,
                                 realm_id = %realm_id,
@@ -2491,52 +2830,185 @@ impl DocumentSyncService {
         })
     }
 
-    /// Returns authenticated document events above a component-wise cursor.
-    /// Actor ranges keep covered DAG heads from hiding unapplied dependencies.
+    /// Returns one bounded causal batch above a component-wise cursor.
+    fn document_event_batch(
+        &self,
+        topic_id: irokle_crate::TopicId,
+        cursor: &irokle_crate::ActorClock,
+        byte_limit: usize,
+    ) -> Result<DocumentEventBatch> {
+        let storage = self.node.storage();
+        let topic_clock = storage
+            .actor_clock(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let mut working_cursor = cursor.clone();
+        let mut queued = BTreeSet::new();
+        for (actor_id, actor_tip) in topic_clock.iter() {
+            if working_cursor.get(actor_id) < *actor_tip {
+                queued.insert(*actor_id);
+            }
+        }
+
+        // A candidate can wait on a dependency actor's next contiguous op. Wake
+        // it only after that actor reaches the required sequence.
+        let mut blocked_by: BTreeMap<
+            irokle_crate::ActorId,
+            BTreeMap<u64, BTreeSet<irokle_crate::ActorId>>,
+        > = BTreeMap::new();
+        let mut events = Vec::with_capacity(DOCUMENT_SYNC_REPLAY_BATCH_LIMIT);
+        let mut processed = 0usize;
+        let mut batch_bytes = 0usize;
+        while processed < DOCUMENT_SYNC_REPLAY_BATCH_LIMIT {
+            let Some(actor_id) = queued.pop_first() else {
+                break;
+            };
+            let actor_seq = working_cursor
+                .get(&actor_id)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    NetError::Bootstrap("document sync actor sequence overflow".into())
+                })?;
+            if actor_seq > topic_clock.get(&actor_id) {
+                continue;
+            }
+            let op_id = storage
+                .actor_index(&topic_id, &actor_id, actor_seq)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .ok_or_else(|| {
+                    NetError::Bootstrap(format!(
+                        "missing document sync op for actor {actor_id} sequence {actor_seq}"
+                    ))
+                })?;
+            let meta = storage
+                .get_meta(&op_id)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .ok_or_else(|| {
+                    NetError::Bootstrap(format!("missing document sync op meta {op_id}"))
+                })?;
+            if meta.topic_id != topic_id || meta.actor_id != actor_id || meta.actor_seq != actor_seq
+            {
+                return Err(NetError::Bootstrap(format!(
+                    "document sync actor index mismatch for actor {actor_id} sequence {actor_seq}"
+                )));
+            }
+
+            let mut missing = BTreeMap::new();
+            for dependency in &meta.deps {
+                let dependency_meta = storage
+                    .get_meta(dependency)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                    .ok_or_else(|| {
+                        NetError::Bootstrap(format!(
+                            "missing document sync dependency meta {dependency}"
+                        ))
+                    })?;
+                if dependency_meta.topic_id != topic_id {
+                    return Err(NetError::Bootstrap(
+                        "document sync dependency belongs to another topic".into(),
+                    ));
+                }
+                if dependency_meta.actor_seq > working_cursor.get(&dependency_meta.actor_id) {
+                    missing
+                        .entry(dependency_meta.actor_id)
+                        .and_modify(|sequence: &mut u64| {
+                            *sequence = (*sequence).max(dependency_meta.actor_seq)
+                        })
+                        .or_insert(dependency_meta.actor_seq);
+                }
+            }
+            if !missing.is_empty() {
+                for (dependency_actor, dependency_seq) in missing {
+                    blocked_by
+                        .entry(dependency_actor)
+                        .or_default()
+                        .entry(dependency_seq)
+                        .or_default()
+                        .insert(actor_id);
+                }
+                continue;
+            }
+
+            let op = storage
+                .get_op(&op_id)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .ok_or_else(|| NetError::Bootstrap(format!("missing document sync op {op_id}")))?;
+            let op_bytes = postcard::experimental::serialized_size(&op)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if op_bytes > DOCUMENT_SYNC_FRAME_LEN_LIMIT {
+                return Err(NetError::Bootstrap(
+                    "document sync operation exceeds replay frame limit".into(),
+                ));
+            }
+            if processed > 0 && batch_bytes.saturating_add(op_bytes) > byte_limit {
+                break;
+            }
+            let actor_id = op.signed.body.actor_id;
+            let actor_seq = op.signed.body.actor_seq;
+            match op.signed.body.payload {
+                TopicPayload::Event(envelope) => events.push((
+                    envelope
+                        .decode_event::<DocumentSyncEvent>()
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                    actor_id,
+                    actor_seq,
+                )),
+                TopicPayload::Genesis(_) | TopicPayload::Control(_) => {}
+            }
+            working_cursor.observe(actor_id, actor_seq);
+            processed += 1;
+            batch_bytes = batch_bytes.saturating_add(op_bytes);
+
+            let mut wake = BTreeSet::new();
+            if let Some(waiters) = blocked_by.get_mut(&actor_id) {
+                let ready = waiters
+                    .range(..=actor_seq)
+                    .map(|(sequence, _)| *sequence)
+                    .collect::<Vec<_>>();
+                for sequence in ready {
+                    if let Some(waiters) = waiters.remove(&sequence) {
+                        wake.extend(waiters);
+                    }
+                }
+            }
+            if blocked_by
+                .get(&actor_id)
+                .is_some_and(|waiters| waiters.is_empty())
+            {
+                blocked_by.remove(&actor_id);
+            }
+            queued.extend(wake);
+            if working_cursor.get(&actor_id) < topic_clock.get(&actor_id) {
+                queued.insert(actor_id);
+            }
+        }
+
+        if processed == 0 {
+            if !cursor.dominates(&topic_clock) {
+                return Err(NetError::Bootstrap(
+                    "document sync causal replay made no progress".into(),
+                ));
+            }
+            return Ok(DocumentEventBatch {
+                cursor: working_cursor,
+                events: Vec::new(),
+            });
+        }
+
+        Ok(DocumentEventBatch {
+            cursor: working_cursor,
+            events,
+        })
+    }
+
+    #[cfg(test)]
     fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
     ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId, u64)>> {
-        let storage = self.node.storage();
-        let topic_clock = storage
-            .actor_clock(&topic_id)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        let mut op_ids = BTreeSet::new();
-        for (actor_id, actor_tip) in topic_clock.iter() {
-            let Some(first_unapplied) = cursor.get(actor_id).checked_add(1) else {
-                continue;
-            };
-            for actor_seq in first_unapplied..=*actor_tip {
-                let op_id = storage
-                    .actor_index(&topic_id, actor_id, actor_seq)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                    .ok_or_else(|| {
-                        NetError::Bootstrap(format!(
-                            "missing document sync op for actor {actor_id} sequence {actor_seq}"
-                        ))
-                    })?;
-                op_ids.insert(op_id);
-            }
-        }
-        let ops = topological_subset(storage, &op_ids)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        let mut events = Vec::new();
-        for op in ops {
-            let actor_id = op.signed.body.actor_id;
-            let actor_seq = op.signed.body.actor_seq;
-            let TopicPayload::Event(envelope) = op.signed.body.payload else {
-                continue;
-            };
-            events.push((
-                envelope
-                    .decode_event::<DocumentSyncEvent>()
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                actor_id,
-                actor_seq,
-            ));
-        }
-        Ok(events)
+        Ok(self
+            .document_event_batch(topic_id, cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?
+            .events)
     }
 
     fn pending_metadata_create_apply(
@@ -2600,20 +3072,8 @@ impl DocumentSyncService {
                 );
                 continue;
             }
-            if self.metadata_create_fenced(&apply.record).await? {
-                continue;
-            }
             let mut entries = Vec::new();
             if let Some(revision) = &apply.lifecycle_revision {
-                if incoming_metadata_document_lifecycle_stale_or_equal(
-                    &self.storage,
-                    &apply.target,
-                    revision,
-                )
-                .await?
-                {
-                    continue;
-                }
                 entries.push(
                     document_sync_revision_write_entry(&apply.target, revision)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -2647,6 +3107,36 @@ impl DocumentSyncService {
         let mut create_acceptances: BTreeMap<Ulid, MetadataCreateEventRecord> = BTreeMap::new();
         let mut deferred_cursor_topics = BTreeSet::new();
         for (apply, entries) in candidates {
+            let fenced = match create_fence_txn(&self.storage, &apply.record, txn_id).await {
+                Ok(fenced) => fenced,
+                Err(error) => {
+                    let _ = self
+                        .storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if fenced {
+                continue;
+            }
+            if let Some(revision) = &apply.lifecycle_revision {
+                let stale =
+                    match lifecycle_stale_txn(&self.storage, &apply.target, revision, txn_id).await
+                    {
+                        Ok(stale) => stale,
+                        Err(error) => {
+                            let _ = self
+                                .storage
+                                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                if stale {
+                    continue;
+                }
+            }
             match metadata_placement_fence_in_transaction(
                 &self.storage,
                 &apply.record.record,
@@ -2765,13 +3255,21 @@ impl DocumentSyncService {
                 create_acceptances
                     .entry(document_id)
                     .or_insert_with(|| apply.record.clone());
-            } else if accepted_create.as_ref().is_none_or(|accepted| {
+            } else if accepted_create.is_none() {
+                warn!(
+                    topic_id = %apply.topic_id,
+                    %document_id,
+                    "Deferring replicated metadata update until its create is accepted"
+                );
+                deferred_cursor_topics.insert(apply.topic_id);
+                continue;
+            } else if accepted_create.as_ref().is_some_and(|accepted| {
                 !registry_identity_matches(&accepted.record, &apply.record.record)
             }) {
                 warn!(
                     topic_id = %apply.topic_id,
                     %document_id,
-                    "Rejecting replicated metadata update without a matching accepted create"
+                    "Rejecting replicated metadata update with mismatched accepted create"
                 );
                 continue;
             }
@@ -2844,25 +3342,16 @@ impl DocumentSyncService {
                 )));
             }
             validate_metadata_event(&record)?;
-            if self.metadata_create_fenced(&record).await? {
-                return Ok(());
-            }
-            return self
-                .storage_write(
-                    DocumentSyncTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id,
-                    }
-                    .storage_keyspace()
-                    .to_string(),
-                    DocumentSyncTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id,
-                    }
-                    .storage_key(),
-                    bytes.into(),
-                )
-                .await;
+            return apply_create_event(
+                &self.storage,
+                &record,
+                DocumentSyncTarget::MetadataCreateEvent {
+                    document_id,
+                    event_id,
+                },
+                bytes,
+            )
+            .await;
         }
         if let DocumentSyncTarget::MetadataDocumentLifecycle { document_id } = target {
             let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&bytes)
@@ -2920,18 +3409,13 @@ impl DocumentSyncService {
             // reconcile loop already validated the signed publisher and this
             // payload, but re-check the digest's self-consistency here so the
             // generic storage write below can never persist an unvalidated digest.
-            validate_watch_interest_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+            validate_watch_interest(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
         if let DocumentSyncTarget::NodeInfo { .. } = target {
             // Structural guard for the shared node-info keyspace, mirroring the
             // node-usage guard above so the generic storage write can never
             // persist an unvalidated node info document.
             validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
-        }
-        if let DocumentSyncTarget::UserAccess { .. } = target {
-            // Structural guard for the shared user-access keyspace so a replicated
-            // credential's key always matches the storage key it lands under.
-            validate_user_access_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
         self.storage_write(
             target.storage_keyspace().to_string(),
@@ -2974,10 +3458,6 @@ impl DocumentSyncService {
         apply_metadata_graph_lifecycle_to_storage(&self.storage, &record, primary_bytes).await
     }
 
-    async fn metadata_create_fenced(&self, event: &MetadataCreateEventRecord) -> Result<bool> {
-        metadata_create_fenced_in_storage(&self.storage, event).await
-    }
-
     async fn apply_delete(
         &self,
         target: DocumentSyncTarget,
@@ -2999,8 +3479,7 @@ impl DocumentSyncService {
             document_id,
         } = target
         {
-            return apply_metadata_registry_delete_to_storage(&self.storage, group_id, document_id)
-                .await;
+            return delete_registry_record(&self.storage, group_id, document_id).await;
         }
         if admin_document_target_for_reduced_document(&target).is_some() {
             return Err(NetError::Bootstrap(
@@ -3047,6 +3526,58 @@ fn target_write_entry(target: DocumentSyncTarget, value: Value) -> (String, Byte
         target.storage_key(),
         value,
     )
+}
+
+async fn apply_create_event(
+    storage: &StorageHandle,
+    event: &MetadataCreateEventRecord,
+    target: DocumentSyncTarget,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        match create_fence_txn(storage, event, txn_id).await {
+            Ok(true) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+        let writes = vec![(
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+            ByteView::from(bytes.clone()),
+        )];
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), writes)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "metadata create admission conflicted twice".to_string(),
+    ))
 }
 
 fn overlay_group_reducer_materialization(
@@ -3230,6 +3761,8 @@ fn overlay_realm_authorization_assignment_reducer_materialization(
 fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
+    now: u64,
+    revocation_index: Option<&RevocationIndex>,
 ) {
     if !reducer_state
         .conflicts
@@ -3262,6 +3795,22 @@ fn overlay_realm_config_reducer_materialization(
         && let Some(quota) = reducer_state.materialized_realm_config_quota()
     {
         config.quota = quota;
+    }
+
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_POLICIES_PATH)
+        && let Some(request_policies) = reducer_state.materialized_realm_policies()
+    {
+        config.request_policies = request_policies;
+    }
+
+    config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
+    // Without an index, the existing set remains fail-closed until each entry's expiry.
+    if let Some(revocation_index) = revocation_index {
+        // Union, so a locally accepted revocation is never dropped because the
+        // replicated set has not carried it yet.
+        config.merge_revocation_index(revocation_index, now);
     }
 
     for path in reducer_state.conflicts.keys() {
@@ -3305,6 +3854,8 @@ fn overlay_realm_config_reducer_materialization(
 fn realm_config_from_reducer_materialization(
     realm_id: RealmId,
     reducer_state: &AdminDocumentReducerState,
+    now: u64,
+    revocation_index: Option<&RevocationIndex>,
 ) -> Option<RealmConfigDocument> {
     let metadata_replication = reducer_state.materialized_realm_config_metadata_replication()?;
     let discovery = reducer_state.materialized_realm_config_discovery()?;
@@ -3317,6 +3868,9 @@ fn realm_config_from_reducer_materialization(
         quota: reducer_state
             .materialized_realm_config_quota()
             .unwrap_or_default(),
+        request_policies: reducer_state
+            .materialized_realm_policies()
+            .unwrap_or_default(),
         description: String::new(),
         placement_map: Vec::new(),
         strategies: Vec::new(),
@@ -3326,9 +3880,20 @@ fn realm_config_from_reducer_materialization(
         placement_bindings: Vec::new(),
         placement_handle_ranges: Vec::new(),
         band_pools: Vec::new(),
+        revoked_tokens: Vec::new(),
+        revocation_floor: reducer_state.revocation_floor,
     };
-    overlay_realm_config_reducer_materialization(&mut config, reducer_state);
+    overlay_realm_config_reducer_materialization(&mut config, reducer_state, now, revocation_index);
     Some(config)
+}
+
+fn needs_revocation_index(
+    is_revocation: bool,
+    config_present: bool,
+    reducer_state: &AdminDocumentReducerState,
+    now: u64,
+) -> bool {
+    is_revocation || !config_present || reducer_state.revocation_compaction_due(now)
 }
 
 fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
@@ -3373,15 +3938,6 @@ async fn apply_metadata_registry_upsert_to_storage(
     if !registry_identity_valid(&record) {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    if metadata_graph_deleted_in_storage(storage, &record.graph_iri).await? {
-        storage_batch_delete_to(
-            storage,
-            metadata_registry_delete_entries(record.group_id, record.document_id),
-        )
-        .await?;
-        return Ok(MetadataPlacementOutcome::Accepted(()));
-    }
-
     let mut base_entries = metadata_registry_write_entries(&record)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     if let Some((_, _, value)) = base_entries.first_mut() {
@@ -3393,6 +3949,51 @@ async fn apply_metadata_registry_upsert_to_storage(
     };
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
+        let delete_present = match delete_record_txn(storage, record.document_id, txn_id).await {
+            Ok(delete) => delete.is_some(),
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        match record_fenced_txn(storage, &record, txn_id).await {
+            Ok(true) => {
+                let deletes = metadata_registry_delete_entries(record.group_id, record.document_id);
+                match storage_batch_delete_and_write_in_transaction(
+                    storage,
+                    txn_id,
+                    deletes,
+                    Vec::new(),
+                )
+                .await
+                {
+                    Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
+                    Err(NetError::Dht(message))
+                        if message == StorageError::TransactionConflict.to_string() =>
+                    {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
         match metadata_placement_fence_in_transaction(storage, &record, txn_id).await {
             Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence)) => {}
             Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
@@ -3451,14 +4052,48 @@ async fn apply_metadata_registry_upsert_to_storage(
                 .await;
             return Ok(MetadataPlacementOutcome::Rejected);
         }
-        if existing
-            .as_ref()
-            .is_some_and(|existing| incoming_metadata_registry_stale_or_equal(existing, &record))
-        {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Ok(MetadataPlacementOutcome::Accepted(()));
+        if let Some(existing) = existing.as_ref().filter(|existing| {
+            delete_present || incoming_metadata_registry_stale_or_equal(existing, &record)
+        }) {
+            let repairs = match registry_sidecar_repairs(storage, existing, txn_id).await {
+                Ok(repairs) => repairs,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if repairs.is_empty() {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Accepted(()));
+            }
+            match storage_batch_delete_and_write_in_transaction(
+                storage,
+                txn_id,
+                Vec::new(),
+                repairs,
+            )
+            .await
+            {
+                Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
+                Err(NetError::Dht(message))
+                    if message == StorageError::TransactionConflict.to_string() =>
+                {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            }
         }
 
         let entries = base_entries.clone();
@@ -3491,18 +4126,74 @@ async fn apply_metadata_graph_lifecycle_to_storage(
     record: &MetadataGraphLifecycleRecord,
     primary_bytes: Vec<u8>,
 ) -> Result<bool> {
-    if record.is_deleted() && !metadata_graph_lifecycle_delete_current(storage, record).await? {
+    if !record.is_deleted() {
         return Ok(false);
     }
-
     let (key_space, key, _) = metadata_graph_lifecycle_write_entry(record)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    storage_batch_write_to(storage, vec![(key_space, key, primary_bytes.into())]).await?;
-    if record.is_deleted() {
-        apply_metadata_registry_delete_to_storage(storage, record.group_id, record.document_id)
-            .await?;
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let delete = match delete_record_txn(storage, record.document_id, txn_id).await {
+            Ok(delete) => delete,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let Some(delete) = delete else {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(false);
+        };
+        let registry_live = match registry_live_txn(
+            storage,
+            record.group_id,
+            record.document_id,
+            &delete,
+            txn_id,
+        )
+        .await
+        {
+            Ok(live) => live,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        if !metadata_document_delete_matches_graph_lifecycle(&delete, record) || registry_live {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(false);
+        }
+        let deletes = metadata_registry_delete_entries(record.group_id, record.document_id);
+        let writes = vec![(key_space.clone(), key.clone(), primary_bytes.clone().into())];
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
+        {
+            Ok(()) => return Ok(true),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-    Ok(true)
+    Err(NetError::Dht(
+        "metadata graph lifecycle conflicted twice".to_string(),
+    ))
 }
 
 async fn apply_metadata_document_lifecycle_to_storage(
@@ -3510,60 +4201,157 @@ async fn apply_metadata_document_lifecycle_to_storage(
     record: &MetadataDocumentLifecycleRecord,
     change: DocumentSyncChange,
 ) -> Result<bool> {
-    let Some(writes) =
-        metadata_document_lifecycle_write_entries_if_current(storage, record, &change).await?
-    else {
-        return Ok(false);
-    };
-    storage_batch_write_to(storage, writes).await?;
-    if let MetadataDocumentLifecycleRecord::Delete { event } = record
-        && event.tombstone.is_deleted()
-    {
-        apply_metadata_registry_delete_to_storage(
-            storage,
-            event.tombstone.group_id,
-            event.tombstone.document_id,
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let writes = match metadata_document_lifecycle_write_entries_if_current(
+            storage, record, &change, txn_id,
         )
-        .await?;
+        .await
+        {
+            Ok(writes) => writes,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let cleanup_delete = if let MetadataDocumentLifecycleRecord::Delete { event } = record
+            && event.tombstone.is_deleted()
+        {
+            let current = match delete_record_txn(storage, record.document_id(), txn_id).await {
+                Ok(current) => current,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if writes.is_some() {
+                Some(event.clone())
+            } else {
+                current
+            }
+        } else {
+            None
+        };
+        let deletes = if let Some(delete) = cleanup_delete.as_ref() {
+            match registry_cleanup_txn(
+                storage,
+                delete.tombstone.group_id,
+                delete.tombstone.document_id,
+                delete,
+                txn_id,
+            )
+            .await
+            {
+                Ok(deletes) => deletes,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if writes.is_none() && deletes.is_empty() {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(false);
+        }
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            deletes,
+            writes.unwrap_or_default(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(true),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-    Ok(true)
+    Err(NetError::Dht(
+        "metadata document lifecycle conflicted twice".to_string(),
+    ))
 }
 
-async fn apply_metadata_registry_delete_to_storage(
+async fn delete_registry_record(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,
 ) -> Result<()> {
-    let Some(delete) = metadata_document_delete_in_storage(storage, document_id).await? else {
-        return Ok(());
-    };
-    if metadata_document_delete_matches_registry(&delete, group_id, document_id)
-        && !metadata_registry_live_after_delete(storage, group_id, document_id, &delete).await?
-    {
-        storage_batch_delete_to(
-            storage,
-            metadata_registry_delete_entries(group_id, document_id),
-        )
-        .await?;
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let delete = match delete_record_txn(storage, document_id, txn_id).await {
+            Ok(delete) => delete,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let Some(delete) = delete else {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        };
+        let deletes =
+            match registry_cleanup_txn(storage, group_id, document_id, &delete, txn_id).await {
+                Ok(deletes) => deletes,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+        if deletes.is_empty() {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        }
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, Vec::new())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-    Ok(())
-}
-
-async fn metadata_graph_lifecycle_delete_current(
-    storage: &StorageHandle,
-    record: &MetadataGraphLifecycleRecord,
-) -> Result<bool> {
-    let Some(delete) = metadata_document_delete_in_storage(storage, record.document_id).await?
-    else {
-        return Ok(false);
-    };
-    if !metadata_document_delete_matches_graph_lifecycle(&delete, record) {
-        return Ok(false);
-    }
-    Ok(
-        !metadata_registry_live_after_delete(storage, record.group_id, record.document_id, &delete)
-            .await?,
-    )
+    Err(NetError::Dht(
+        "metadata registry cleanup conflicted twice".to_string(),
+    ))
 }
 
 fn metadata_document_delete_matches_graph_lifecycle(
@@ -3583,31 +4371,6 @@ fn metadata_document_delete_matches_registry(
     delete.tombstone.is_deleted()
         && delete.tombstone.group_id == group_id
         && delete.tombstone.document_id == document_id
-}
-
-async fn metadata_registry_live_after_delete(
-    storage: &StorageHandle,
-    group_id: Ulid,
-    document_id: Ulid,
-    delete: &MetadataDocumentDeleteRecord,
-) -> Result<bool> {
-    let target = DocumentSyncTarget::MetadataRegistry {
-        group_id,
-        document_id,
-    };
-    let Some(value) = storage_read_from(
-        storage,
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-    )
-    .await?
-    else {
-        return Ok(false);
-    };
-    let record: MetadataRegistryRecord =
-        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    Ok(record.updated_at_ms > delete.tombstone.updated_at_ms
-        || record.last_event_id > delete.deleted_after_event_id)
 }
 
 async fn apply_admin_document_operation_to_storage(
@@ -3653,7 +4416,7 @@ async fn persist_stale_admin_document_event(
     match apply_status {
         AdminDocumentApplyStatus::Applied => Ok(false),
         AdminDocumentApplyStatus::Duplicate => Ok(true),
-        AdminDocumentApplyStatus::StaleOriginSequence => {
+        AdminDocumentApplyStatus::Redundant | AdminDocumentApplyStatus::StaleOriginSequence => {
             storage_batch_write_to(
                 storage,
                 vec![
@@ -3664,6 +4427,34 @@ async fn persist_stale_admin_document_event(
             .await?;
             Ok(true)
         }
+    }
+}
+
+async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<()> {
+    match storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted })
+            if aborted == txn_id =>
+        {
+            Ok(())
+        }
+        // A conflicted commit consumes the transaction; the abort's goal is met.
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionNotFound,
+        }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while aborting transaction: {other:?}"
+        ))),
+    }
+}
+
+async fn abort_error(storage: &StorageHandle, txn_id: TxnId, error: NetError) -> NetError {
+    match abort_txn(storage, txn_id).await {
+        Ok(()) => error,
+        Err(abort) => NetError::Dht(format!("{error}; transaction abort failed: {abort}")),
     }
 }
 
@@ -3933,9 +4724,10 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
             | AdminDocumentOperation::GroupRoleRemoved { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
+            | AdminDocumentOperation::GroupPoliciesSet { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "group admin operation sync only supports group creation, role seeds, role creation/removal, and role user assignment updates"
+            "group admin operation sync only supports group creation, role seeds, role creation/removal, role user assignment updates, and policy updates"
                 .to_string(),
         ));
     }
@@ -3971,8 +4763,9 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
     let mut auth_doc = previous_auth_doc.unwrap_or_else(|| GroupAuthorizationDocument {
         group_id,
         roles: Default::default(),
+        policies: Default::default(),
     });
-    materialize_group_authorization_admin_document_operation(&mut auth_doc, &reducer_state, &event);
+    materialize_group_authorization(&mut auth_doc, &reducer_state, &event);
     let group_writes = group_write_entries_from_reducer(storage, group_id, &reducer_state).await?;
 
     let mut writes = vec![
@@ -4134,86 +4927,280 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
             | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
             | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+            | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+            | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, policy updates, and token revocations"
                 .to_string(),
         ));
     }
 
-    let previous_state = storage_read_from(
-        storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-        admin_document_reducer_state_key(&event.target),
-    )
-    .await?
-    .map(|bytes| decode_admin_document_reducer_state(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut reducer_state = previous_state
-        .clone()
-        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-    let apply_status = reducer_state
-        .apply(&event)
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
-        return Ok(());
-    }
-
-    let previous_config = storage_read_from(
-        storage,
-        document_target.storage_keyspace().to_string(),
-        document_target.storage_key(),
-    )
-    .await?
-    .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut writes = Vec::new();
-    let config = match previous_config {
-        Some(mut config) => {
-            if config.realm_id != realm_id {
-                return Err(NetError::Bootstrap(format!(
-                    "stored realm config document id {realm_id} does not match payload realm id {}",
-                    config.realm_id
-                )));
-            }
-            overlay_realm_config_reducer_materialization(&mut config, &reducer_state);
-            Some(config)
-        }
-        None => realm_config_from_reducer_materialization(realm_id, &reducer_state),
-    };
-    if let Some(config) = config {
-        writes.push((
-            document_target.storage_keyspace().to_string(),
-            document_target.storage_key(),
-            config
-                .to_bytes(&event.actor)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .into(),
+    let is_revocation = matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    );
+    if event.origin_node_id != event.actor.node_id
+        || event.actor.realm_id != realm_id
+        || event.actor.user_id.realm_id != realm_id
+    {
+        return Err(NetError::Bootstrap(
+            "realm config event actor and origin do not match the target realm".to_string(),
         ));
     }
-    writes.push(
-        admin_document_reducer_state_write_entry(&reducer_state)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    );
-    writes.extend(
-        admin_document_conflict_write_entries(&reducer_state)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    );
 
-    let stale_conflict_deletes =
-        stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
-    storage_batch_delete_and_write_transactionally(storage, stale_conflict_deletes, writes).await
+    for _ in 0..3 {
+        let raw_now = unix_timestamp_secs();
+        let txn_id = start_storage_transaction(storage).await?;
+        let previous_state = match storage_read_from_transaction(
+            storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            admin_document_reducer_state_key(&event.target),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| decode_admin_document_reducer_state(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        let previous_config = match storage_read_from_transaction(
+            storage,
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+
+        if is_revocation {
+            let valid = revocation_origin_known(
+                previous_config.as_ref(),
+                previous_state.as_ref(),
+                &event,
+                realm_id,
+            );
+            if !valid {
+                return Err(
+                    abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(
+                            "revocation origin is not an onboarded realm node in the transaction snapshot"
+                                .to_string(),
+                        ),
+                    )
+                    .await,
+                );
+            }
+            if let AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash,
+                expires_at,
+                token_owner,
+            } = &event.op
+                && (!aruna_core::auth::valid_token_hash(token_hash)
+                    || !valid_revocation_expiry(*expires_at, raw_now)
+                    || token_owner.is_nil()
+                    || token_owner.realm_id != realm_id)
+            {
+                return Err(abort_error(
+                    storage,
+                    txn_id,
+                    NetError::Bootstrap(
+                        "replicated revocation has invalid hash, expiry, or owner".to_string(),
+                    ),
+                )
+                .await);
+            }
+        }
+
+        let effective_now = previous_state
+            .as_ref()
+            .map_or(raw_now, |state| state.revocation_floor.max(raw_now));
+        let mut reducer_state = previous_state
+            .clone()
+            .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+        let needs_index = needs_revocation_index(
+            is_revocation,
+            previous_config.is_some(),
+            &reducer_state,
+            effective_now,
+        );
+        let mut revocation_index =
+            needs_index.then(|| reducer_state.revocation_index(effective_now));
+        if is_revocation {
+            let Some(index) = revocation_index.as_mut() else {
+                return Err(abort_error(
+                    storage,
+                    txn_id,
+                    NetError::Bootstrap("revocation index was not admitted".to_string()),
+                )
+                .await);
+            };
+            if let Err(error) = reducer_state.apply_revocation_event(&event, index) {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        } else if let Err(error) = reducer_state.apply(&event) {
+            return Err(abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await);
+        }
+        reducer_state.advance_revocation_floor(effective_now);
+        if let Some(index) = revocation_index.as_mut() {
+            index.compact(&mut reducer_state);
+        }
+
+        let (config, config_changed) = match previous_config {
+            Some(mut config) => {
+                if config.realm_id != realm_id {
+                    return Err(
+                        abort_error(
+                            storage,
+                            txn_id,
+                            NetError::Bootstrap(format!(
+                                "stored realm config document id {realm_id} does not match payload realm id {}",
+                                config.realm_id
+                            )),
+                        )
+                        .await,
+                    );
+                }
+                let before = config.clone();
+                overlay_realm_config_reducer_materialization(
+                    &mut config,
+                    &reducer_state,
+                    effective_now,
+                    revocation_index.as_ref(),
+                );
+                let changed = config != before;
+                (Some(config), changed)
+            }
+            None => {
+                let config = realm_config_from_reducer_materialization(
+                    realm_id,
+                    &reducer_state,
+                    effective_now,
+                    revocation_index.as_ref(),
+                );
+                let changed = config.is_some();
+                (config, changed)
+            }
+        };
+        if previous_state
+            .as_ref()
+            .is_some_and(|previous| previous == &reducer_state)
+            && !config_changed
+        {
+            abort_txn(storage, txn_id).await?;
+            return Ok(());
+        }
+
+        let mut writes = Vec::new();
+        if config_changed && let Some(config) = config {
+            let bytes = match config.to_bytes(&event.actor) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.push((
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+                bytes.into(),
+            ));
+        }
+        let reducer_write = match admin_document_reducer_state_write_entry(&reducer_state) {
+            Ok(write) => write,
+            Err(error) => {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        };
+        writes.push(reducer_write);
+        if previous_state
+            .as_ref()
+            .is_none_or(|previous| previous.conflicts != reducer_state.conflicts)
+        {
+            let conflict_writes = match admin_document_conflict_write_entries(&reducer_state) {
+                Ok(writes) => writes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.extend(conflict_writes);
+        }
+
+        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
+            previous_state.as_ref(),
+            Some(&reducer_state),
+        );
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            stale_conflict_deletes,
+            writes,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                abort_txn(storage, txn_id).await?;
+            }
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+    }
+    Err(NetError::Dht(
+        "realm config admin operation conflicted three times".to_string(),
+    ))
 }
 
-fn materialize_group_authorization_admin_document_operation(
+fn materialize_group_authorization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
 ) {
+    if let AdminDocumentOperation::GroupPoliciesSet { .. } = &event.op {
+        if !reducer_state
+            .conflicts
+            .contains_key(aruna_core::admin_document_reducer::GROUP_POLICIES_PATH)
+            && let Some(policies) = reducer_state.materialized_group_policies()
+        {
+            auth_doc.policies = policies;
+        }
+        return;
+    }
+
     if let AdminDocumentOperation::GroupRoleCreated { role } = &event.op {
-        materialize_group_authorization_role(auth_doc, reducer_state, role);
+        materialize_group_role(auth_doc, reducer_state, role);
         return;
     }
 
@@ -4252,7 +5239,7 @@ fn materialize_group_authorization_admin_document_operation(
     }
 }
 
-fn materialize_group_authorization_role(
+fn materialize_group_role(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     role: &AdminDocumentRoleDefinition,
@@ -4443,16 +5430,50 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     storage: &StorageHandle,
     record: &MetadataDocumentLifecycleRecord,
     change: &DocumentSyncChange,
+    txn_id: TxnId,
 ) -> Result<Option<Vec<(String, ByteView, Value)>>> {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
-    if incoming_metadata_document_lifecycle_stale_or_equal(storage, &target, change).await? {
+    if lifecycle_stale_txn(storage, &target, change, txn_id).await? {
         return Ok(None);
     }
+    let mut acceptance_to_write = None;
     if let MetadataDocumentLifecycleRecord::Upsert { event } = record {
         validate_metadata_event(event)?;
-        if metadata_create_fenced_in_storage(storage, event).await? {
+        if create_fence_txn(storage, event, txn_id).await? {
+            return Ok(None);
+        }
+
+        let accepted = storage_read_from_transaction(
+            storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+            metadata_create_acceptance_key(event.record.document_id),
+            Some(txn_id),
+        )
+        .await?
+        .map(|value| {
+            postcard::from_bytes::<MetadataCreateEventRecord>(&value)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+        })
+        .transpose()?;
+        if let Some(accepted) = accepted.as_ref() {
+            validate_metadata_event(accepted)?;
+        }
+        if event_is_create(event) {
+            if accepted
+                .as_ref()
+                .is_some_and(|accepted| !same_create_event(accepted, event))
+            {
+                return Ok(None);
+            }
+            if accepted.is_none() {
+                acceptance_to_write = Some(event.as_ref());
+            }
+        } else if accepted.as_ref().is_none_or(|accepted| {
+            !event_is_create(accepted)
+                || !registry_identity_matches(&accepted.record, &event.record)
+        }) {
             return Ok(None);
         }
     }
@@ -4466,6 +5487,12 @@ async fn metadata_document_lifecycle_write_entries_if_current(
             metadata_document_delete_write_entries(event)?
         }
     };
+    if let Some(event) = acceptance_to_write {
+        entries.push(
+            metadata_create_acceptance_write_entry(event)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+    }
     entries.push(
         document_sync_revision_write_entry(&target, change)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -4478,15 +5505,17 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     Ok(Some(entries))
 }
 
-async fn incoming_metadata_document_lifecycle_stale_or_equal(
+async fn lifecycle_stale_txn(
     storage: &StorageHandle,
     target: &DocumentSyncTarget,
     incoming: &DocumentSyncChange,
+    txn_id: TxnId,
 ) -> Result<bool> {
-    let value = storage_read_from(
+    let value = storage_read_from_transaction(
         storage,
         DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
         document_sync_revision_key(target),
+        Some(txn_id),
     )
     .await?;
     let Some(value) = value else {
@@ -4572,32 +5601,55 @@ fn metadata_registry_freshness(record: &MetadataRegistryRecord) -> (u64, Ulid) {
     (record.updated_at_ms, record.last_event_id)
 }
 
-async fn metadata_graph_deleted_in_storage(
+async fn registry_sidecar_repairs(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    let entries = metadata_registry_write_entries(record)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut repairs = Vec::new();
+    for (key_space, key, value) in entries.into_iter().skip(1) {
+        let current =
+            storage_read_from_transaction(storage, key_space.clone(), key.clone(), Some(txn_id))
+                .await?;
+        if current.as_ref() != Some(&value) {
+            repairs.push((key_space, key, value));
+        }
+    }
+    Ok(repairs)
+}
+
+async fn graph_record_txn(
     storage: &StorageHandle,
     graph_iri: &str,
-) -> Result<bool> {
-    let value = storage_read_from(
+    txn_id: TxnId,
+) -> Result<Option<MetadataGraphLifecycleRecord>> {
+    let value = storage_read_from_transaction(
         storage,
-        aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         metadata_graph_lifecycle_key(graph_iri),
+        Some(txn_id),
     )
     .await?;
     let Some(value) = value else {
-        return Ok(false);
+        return Ok(None);
     };
     let record: MetadataGraphLifecycleRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    Ok(record.is_deleted())
+    Ok(Some(record))
 }
 
-async fn metadata_document_delete_in_storage(
+async fn delete_record_txn(
     storage: &StorageHandle,
     document_id: Ulid,
+    txn_id: TxnId,
 ) -> Result<Option<MetadataDocumentDeleteRecord>> {
-    let value = storage_read_from(
+    let value = storage_read_from_transaction(
         storage,
         METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
         metadata_document_lifecycle_key(document_id),
+        Some(txn_id),
     )
     .await?;
     let Some(value) = value else {
@@ -4611,16 +5663,100 @@ async fn metadata_document_delete_in_storage(
     }
 }
 
-async fn metadata_create_fenced_in_storage(
+async fn create_fence_txn(
     storage: &StorageHandle,
     event: &MetadataCreateEventRecord,
+    txn_id: TxnId,
 ) -> Result<bool> {
-    if let Some(delete) =
-        metadata_document_delete_in_storage(storage, event.record.document_id).await?
-    {
+    if let Some(delete) = delete_record_txn(storage, event.record.document_id, txn_id).await? {
         return Ok(event.event_id <= delete.deleted_after_event_id);
     }
-    metadata_graph_deleted_in_storage(storage, &event.record.graph_iri).await
+    Ok(graph_record_txn(storage, &event.record.graph_iri, txn_id)
+        .await?
+        .is_some_and(|record| record.is_deleted()))
+}
+
+async fn record_fenced_txn(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<bool> {
+    if let Some(delete) = delete_record_txn(storage, record.document_id, txn_id).await? {
+        return Ok(!registry_live_txn(
+            storage,
+            record.group_id,
+            record.document_id,
+            &delete,
+            txn_id,
+        )
+        .await?);
+    }
+    Ok(graph_record_txn(storage, &record.graph_iri, txn_id)
+        .await?
+        .is_some_and(|record| record.is_deleted()))
+}
+
+async fn registry_live_txn(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+    delete: &MetadataDocumentDeleteRecord,
+    txn_id: TxnId,
+) -> Result<bool> {
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    };
+    let Some(value) = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let record: MetadataRegistryRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok(record.updated_at_ms > delete.tombstone.updated_at_ms
+        || record.last_event_id > delete.deleted_after_event_id)
+}
+
+async fn registry_cleanup_txn(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+    delete: &MetadataDocumentDeleteRecord,
+    txn_id: TxnId,
+) -> Result<Vec<(String, ByteView)>> {
+    if !metadata_document_delete_matches_registry(delete, group_id, document_id) {
+        return Ok(Vec::new());
+    }
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    };
+    // A missing registry row means cleanup already ran; an equal delete
+    // replay must stay a no-op.
+    let Some(value) = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let record: MetadataRegistryRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if record.updated_at_ms > delete.tombstone.updated_at_ms
+        || record.last_event_id > delete.deleted_after_event_id
+    {
+        return Ok(Vec::new());
+    }
+    Ok(metadata_registry_delete_entries(group_id, document_id))
 }
 
 async fn metadata_placement_fence_in_transaction(
@@ -4960,6 +6096,7 @@ async fn storage_batch_delete_and_write_in_transaction(
     }
 }
 
+#[cfg(test)]
 async fn storage_batch_delete_to(
     storage: &StorageHandle,
     deletes: Vec<(String, ByteView)>,
@@ -5006,6 +6143,73 @@ fn metadata_document_delete_write_entries(
 
 fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
+}
+
+#[cfg(test)]
+fn group_sync_topics<F>(
+    topic_ids: &[irokle_crate::TopicId],
+    mut select: F,
+) -> BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<irokle_crate::TopicId>)>
+where
+    F: FnMut(irokle_crate::TopicId) -> PeerSelection,
+{
+    let mut groups: BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<irokle_crate::TopicId>)> =
+        BTreeMap::new();
+    for topic_id in topic_ids.iter().copied() {
+        let selection = select(topic_id);
+        let selected = selection.peers.clone();
+        if let Some((group, topics)) = groups.get_mut(&selected) {
+            group.truncated |= selection.truncated;
+            topics.push(topic_id);
+        } else {
+            groups.insert(selected, (selection, vec![topic_id]));
+        }
+    }
+    groups
+}
+
+fn select_sync_peers(
+    candidates: impl IntoIterator<Item = PeerId>,
+    local_peer: PeerId,
+    subject: &[u8],
+    round: u64,
+) -> PeerSelection {
+    let mut ranked = candidates
+        .into_iter()
+        .filter(|peer| *peer != local_peer)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|peer| (peer, peer_score(subject, peer)))
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|(left_peer, left_score), (right_peer, right_score)| {
+        left_score
+            .cmp(right_score)
+            .then_with(|| left_peer.as_bytes().cmp(right_peer.as_bytes()))
+    });
+    let candidate_count = ranked.len();
+    let selected = DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT.min(candidate_count);
+    let start = if candidate_count == 0 {
+        0
+    } else {
+        ((round as u128 * DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128)
+            as usize
+    };
+    let peers = (0..selected)
+        .map(|offset| ranked[(start + offset) % candidate_count].0)
+        .collect();
+    PeerSelection {
+        peers,
+        truncated: candidate_count > selected,
+        round,
+    }
+}
+
+fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
+    let mut input = Vec::with_capacity(DOCUMENT_SYNC_FANOUT_DOMAIN.len() + subject.len() + 32);
+    input.extend_from_slice(DOCUMENT_SYNC_FANOUT_DOMAIN);
+    input.extend_from_slice(subject);
+    input.extend_from_slice(peer.as_bytes());
+    *DhtKeyId::from_data(&input).as_bytes()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5175,7 +6379,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
         | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
-        | AdminDocumentOperation::GroupCreated { .. } => AdminOperationFamily::Group,
+        | AdminDocumentOperation::GroupCreated { .. }
+        | AdminDocumentOperation::GroupPoliciesSet { .. } => AdminOperationFamily::Group,
         AdminDocumentOperation::RealmRoleAdded { .. }
         | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
@@ -5204,7 +6409,9 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
         | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. } => {
+        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+        | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+        | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5284,8 +6491,21 @@ async fn validate_replicated_admin_event(
                 return reject("role assignment user belongs to a different realm");
             }
         }
+        AdminDocumentOperation::GroupRoleCreated { role } => {
+            // Distributed events must enforce the same subtree confinement as
+            // local issuance; the publisher is not trusted to have done so.
+            let AdminDocumentTarget::Group { group_id } = &event.target else {
+                return reject("group role event target must be a group");
+            };
+            let subtree_root =
+                aruna_core::permission_path::role_subtree_root(event.actor.realm_id, group_id);
+            if role.permissions.keys().any(|pattern| {
+                !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
+            }) {
+                return reject("group role grants outside its group subtree");
+            }
+        }
         AdminDocumentOperation::GroupRoleAdded { .. }
-        | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
         | AdminDocumentOperation::RealmRoleAdded { .. }
         | AdminDocumentOperation::RealmRoleCreated { .. }
@@ -5323,6 +6543,28 @@ async fn validate_replicated_admin_event(
             return reject("placement strategy replica count must be greater than zero");
         }
         AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. } => {}
+        AdminDocumentOperation::RealmConfigPoliciesSet { policies }
+        | AdminDocumentOperation::GroupPoliciesSet { policies } => {
+            if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
+                return reject(&format!("invalid policy set: {error}"));
+            }
+        }
+        AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash,
+            expires_at,
+            token_owner,
+            ..
+        } => {
+            if !aruna_core::auth::valid_token_hash(token_hash) {
+                return reject("revoked bearer token hash is malformed");
+            }
+            if !valid_revocation_expiry(*expires_at, unix_timestamp_secs()) {
+                return reject("revoked bearer token expiry exceeds the admission window");
+            }
+            if token_owner.is_nil() || token_owner.realm_id != event.actor.realm_id {
+                return reject("revoked bearer token owner is malformed");
+            }
+        }
     }
 
     let previous_state = read_admin_reducer_state(storage, &event.target).await?;
@@ -5343,11 +6585,21 @@ async fn validate_replicated_admin_event(
         return Ok(authorized);
     }
 
-    let mut reducer_state =
-        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-    if reducer_state.target != event.target {
+    if previous_state
+        .as_ref()
+        .is_some_and(|state| state.target != event.target)
+    {
         return reject("stored admin reducer state has the wrong target");
     }
+    if let AdminDocumentOperation::RealmConfigTokenRevoked { token_hash, .. } = &event.op {
+        if revocation_origin_full(previous_state.as_ref(), event, token_hash) {
+            return reject("revocation origin reached its live revocation cap");
+        }
+        return Ok(AdminEventValidation::Accepted);
+    }
+
+    let mut reducer_state =
+        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
     if let Err(error) = reducer_state.apply(event) {
         return Ok(AdminEventValidation::Rejected(format!(
             "admin operation is malformed: {error}"
@@ -5406,6 +6658,50 @@ async fn read_admin_realm_authorization(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
+/// Whether this origin already holds the per-origin bound a local mint obeys.
+/// Replacing its own entry stays allowed; the flooding origin is rejected rather
+/// than trimmed, so a valid revocation is never discarded to make room.
+fn revocation_origin_full(
+    state: Option<&AdminDocumentReducerState>,
+    event: &AdminDocumentEvent,
+    token_hash: &str,
+) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    let index = state.revocation_index(state.revocation_floor.max(unix_timestamp_secs()));
+    index.origin(token_hash) != Some(event.origin_node_id)
+        && index.count(&event.origin_node_id) >= MAX_LIVE_REVOCATIONS_PER_ORIGIN
+}
+
+fn revocation_origin_known(
+    config: Option<&RealmConfigDocument>,
+    state: Option<&AdminDocumentReducerState>,
+    event: &AdminDocumentEvent,
+    realm_id: RealmId,
+) -> bool {
+    if config
+        .is_some_and(|config| config.realm_id == realm_id && config.has_node(event.origin_node_id))
+    {
+        return true;
+    }
+
+    let Some(state) = state else {
+        return false;
+    };
+    let path = realm_config_node_path(&event.origin_node_id);
+    state
+        .user_subject_ids
+        .get(&path)
+        .is_some_and(|version| event.observed.observes(&version.dot))
+        || state.conflicts.get(&path).is_some_and(|conflict| {
+            conflict
+                .values
+                .iter()
+                .any(|value| event.observed.observes(&value.dot))
+        })
+}
+
 fn configured_node_kind<'a>(
     config: &'a RealmConfigDocument,
     node_id: &NodeId,
@@ -5436,6 +6732,23 @@ async fn validate_realm_config_admin_authority(
         return Ok(AdminEventValidation::Rejected(
             "stored realm config has the wrong realm".to_string(),
         ));
+    }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    ) {
+        if !revocation_origin_known(current_config.as_ref(), previous_state, event, realm_id) {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
+                reason: if current_config.is_some() {
+                    "revocation event origin onboarding is not yet materialized"
+                } else {
+                    "current realm config is unavailable"
+                }
+                .to_string(),
+            });
+        }
+        return Ok(AdminEventValidation::Accepted);
     }
     // Placement reducer state precedes full config materialization at bootstrap.
     let mut placement_config = current_config
@@ -5731,6 +7044,9 @@ async fn validate_group_admin_authority(
         | AdminDocumentOperation::GroupRoleRemoved { .. } => {
             format!("/{realm_id}/g/{group_id}/admin")
         }
+        AdminDocumentOperation::GroupPoliciesSet { .. } => {
+            format!("/{realm_id}/g/{group_id}/admin/config")
+        }
         AdminDocumentOperation::GroupCreated { .. } => unreachable!(),
         _ => unreachable!("group authority only receives group operations"),
     };
@@ -5845,10 +7161,10 @@ fn has_current_write_permission<'a>(
             continue;
         }
         for (pattern, permission) in &role.permissions {
-            let Ok(glob) = Glob::new(pattern) else {
+            let Ok(glob) = compile_permission_matcher(pattern) else {
                 return false;
             };
-            if !glob.compile_matcher().is_match(path) {
+            if !glob.is_match(path) {
                 continue;
             }
             match permission {
@@ -5895,15 +7211,27 @@ fn validate_node_usage_upsert(
 /// its sync target. Does not check the publisher's identity (the caller enforces
 /// that against the signed actor). Empty digests are valid: they clear a node's
 /// interest for the realm while preserving single-writer ownership.
-fn validate_watch_interest_upsert(
+fn validate_watch_interest(
     target: &DocumentSyncTarget,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
+    if bytes.len() > NOTIFICATION_WATCH_INTEREST_BYTES_CAP {
+        return Err(format!(
+            "watch interest digest exceeds serialized byte cap {}",
+            NOTIFICATION_WATCH_INTEREST_BYTES_CAP
+        ));
+    }
     let DocumentSyncTarget::WatchInterest { realm_id, node_id } = target else {
         return Err("target is not a watch interest digest".to_string());
     };
     let digest = WatchInterestDigest::from_bytes(bytes)
         .map_err(|error| format!("undecodable watch interest digest: {error}"))?;
+    if digest.entries.len() > NOTIFICATION_WATCH_INTEREST_ENTRY_CAP {
+        return Err(format!(
+            "watch interest digest exceeds entry cap {}",
+            NOTIFICATION_WATCH_INTEREST_ENTRY_CAP
+        ));
+    }
     if digest.node_id != *node_id {
         return Err(format!(
             "digest node id {} does not match target node id {node_id}",
@@ -5949,7 +7277,10 @@ fn validate_watch_subscription_upsert(
     {
         return Err("watch subscription path prefix is invalid".to_string());
     }
-    let known_mask = WatchEventMask::METADATA_CREATED | WatchEventMask::DATA_UPLOADED;
+    let known_mask = WatchEventMask::METADATA_CREATED
+        | WatchEventMask::DATA_UPLOADED
+        | WatchEventMask::SYNC_COMPLETED
+        | WatchEventMask::SYNC_FAILED;
     if subscription.event_mask.is_empty() || subscription.event_mask.bits() & !known_mask != 0 {
         return Err("watch subscription event mask is invalid".to_string());
     }
@@ -6007,28 +7338,63 @@ fn validate_node_info_upsert(
     Ok(())
 }
 
-fn validate_user_access_upsert(
-    target: &DocumentSyncTarget,
-    bytes: &[u8],
-) -> std::result::Result<(), String> {
-    let DocumentSyncTarget::UserAccess { access_key, .. } = target else {
-        return Err("target is not a user access document".to_string());
-    };
-    let document = aruna_core::structs::UserAccess::from_bytes(bytes)
-        .map_err(|error| format!("undecodable user access document: {error}"))?;
-    if document.access_key != *access_key {
-        return Err(format!(
-            "user access document key {} does not match target key {access_key}",
-            document.access_key
-        ));
-    }
-    Ok(())
-}
-
 fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     let mut key = b"topic-cursor/".to_vec();
     key.extend_from_slice(topic_id.as_bytes());
     ByteView::from(key)
+}
+
+fn current_cursor(
+    cursors: &fjall::OptimisticTxKeyspace,
+    topic_id: irokle_crate::TopicId,
+) -> Result<u64> {
+    let Some(value) = cursors
+        .get(topic_cursor_key(topic_id))
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+    else {
+        return Ok(0);
+    };
+    if value.len() != std::mem::size_of::<u64>() {
+        return Ok(0);
+    }
+    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+    bytes.copy_from_slice(value.as_ref());
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn advance_cursor(
+    cursors: &fjall::OptimisticTxKeyspace,
+    topic_id: irokle_crate::TopicId,
+    round: u64,
+) -> Result<()> {
+    cursors
+        .update_fetch(topic_cursor_key(topic_id), |value| {
+            let stored = value
+                .filter(|value| value.len() == std::mem::size_of::<u64>())
+                .map(|value| {
+                    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+                    bytes.copy_from_slice(value.as_ref());
+                    u64::from_be_bytes(bytes)
+                })
+                .unwrap_or_default();
+            if stored == round {
+                Some(fjall::Slice::from(round.wrapping_add(1).to_be_bytes()))
+            } else {
+                value.cloned()
+            }
+        })
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    // Advance only after network attempts; a crash before persistence safely repeats them.
+    Ok(())
+}
+
+fn remove_cursor(
+    cursors: &fjall::OptimisticTxKeyspace,
+    topic_id: irokle_crate::TopicId,
+) -> Result<()> {
+    cursors
+        .remove(topic_cursor_key(topic_id))
+        .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
 fn deferred_topics_key() -> ByteView {
@@ -6038,12 +7404,19 @@ fn deferred_topics_key() -> ByteView {
 
 async fn read_inbound_sync_messages(
     recv: &mut iroh::endpoint::RecvStream,
+    reservation: &mut InboundByteReservation,
 ) -> Result<(Vec<SyncMessage>, Vec<irokle_crate::TopicId>)> {
     let mut messages = Vec::new();
     let mut topics = BTreeSet::new();
     let mut bytes_read = 0usize;
     let mut frame_index = 0usize;
-    while let Some(frame) = read_next_inbound_sync_frame(recv, &mut bytes_read).await? {
+    while let Some(frame) = timeout(
+        DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT,
+        read_next_inbound_sync_frame(recv, &mut bytes_read, reservation),
+    )
+    .await
+    .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT))??
+    {
         frame_index = frame_index.saturating_add(1);
         if messages.len() >= DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT {
             return Err(NetError::Stream(format!(
@@ -6065,6 +7438,7 @@ async fn read_inbound_sync_messages(
 async fn read_next_inbound_sync_frame(
     recv: &mut iroh::endpoint::RecvStream,
     bytes_read: &mut usize,
+    reservation: &mut InboundByteReservation,
 ) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     let Some(first_read) = read_some_inbound_sync(recv, &mut len_buf[..1]).await? else {
@@ -6101,6 +7475,7 @@ async fn read_next_inbound_sync_frame(
             "document sync stream exceeded {DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES} bytes"
         )));
     }
+    reservation.reserve(len)?;
 
     let mut payload = vec![0u8; len];
     let mut payload_read = 0usize;
@@ -6425,6 +7800,7 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use aruna_core::alpn::Alpn;
+    use aruna_core::auth::{MAX_BEARER_TOKEN_LIFETIME_SECS, REVOCATION_GRACE_SECS};
     use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
@@ -6461,6 +7837,484 @@ mod tests {
 
     fn peer(seed: u8) -> PeerId {
         node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
+    }
+
+    #[test]
+    fn budget_caps_streams() {
+        // Per-peer and global caps hold, and dropping a permit restores both.
+        let budget = Arc::new(InboundSyncBudget::default());
+        let mut held = Vec::new();
+        for _ in 0..DOCUMENT_SYNC_INBOUND_PEER_STREAMS {
+            held.push(budget.acquire(peer(1)).expect("within per-peer budget"));
+        }
+        assert!(budget.acquire(peer(1)).is_none());
+        assert!(budget.acquire(peer(2)).is_some());
+
+        held.pop();
+        assert!(budget.acquire(peer(1)).is_some());
+
+        let mut fill = Vec::new();
+        for seed in 10..u8::MAX {
+            match budget.acquire(peer(seed)) {
+                Some(permit) => fill.push(permit),
+                None => break,
+            }
+        }
+        assert!(budget.acquire(peer(3)).is_none());
+        fill.clear();
+        assert!(budget.acquire(peer(3)).is_some());
+    }
+
+    #[test]
+    fn inbound_timeout_order() {
+        assert!(DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT < DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT);
+    }
+
+    #[test]
+    fn sync_peers_bounded() {
+        let selection =
+            select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 0);
+
+        assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+        assert!(selection.truncated);
+        assert!(!selection.peers.contains(&peer(0)));
+    }
+
+    #[test]
+    fn sync_peers_dedup() {
+        let candidates = (1u8..=9).map(peer).collect::<Vec<_>>();
+        let selection = select_sync_peers(
+            candidates.iter().copied().chain(candidates.iter().copied()),
+            peer(0),
+            b"document-sync-subject",
+            0,
+        );
+
+        assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+        assert!(selection.truncated);
+    }
+
+    #[test]
+    fn sync_peers_cover() {
+        let candidates = (1u8..=17).map(peer).collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        let rounds = candidates.len().div_ceil(DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+        for round in 0..rounds as u64 {
+            seen.extend(
+                select_sync_peers(
+                    candidates.iter().copied(),
+                    peer(0),
+                    b"document-sync-subject",
+                    round,
+                )
+                .peers,
+            );
+        }
+
+        assert_eq!(seen, candidates);
+    }
+
+    #[test]
+    fn fanout_cursor_restart() {
+        let root = TempDir::new().expect("fanout cursor tempdir");
+        let topic_id = topic(42);
+        {
+            let db = fjall::OptimisticTxDatabase::builder(root.path())
+                .manual_journal_persist(true)
+                .open()
+                .expect("fanout cursor database");
+            let cursors = db
+                .keyspace(
+                    DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                    fjall::KeyspaceCreateOptions::default,
+                )
+                .expect("fanout cursor keyspace");
+            assert_eq!(current_cursor(&cursors, topic_id).expect("first cursor"), 0);
+            advance_cursor(&cursors, topic_id, 0).expect("advance cursor");
+            db.persist(fjall::PersistMode::SyncAll)
+                .expect("persist fanout cursor");
+        }
+        let db = fjall::OptimisticTxDatabase::builder(root.path())
+            .manual_journal_persist(true)
+            .open()
+            .expect("reopen fanout cursor database");
+        let cursors = db
+            .keyspace(
+                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .expect("reopen fanout cursor keyspace");
+        assert_eq!(
+            current_cursor(&cursors, topic_id).expect("restarted cursor"),
+            1
+        );
+    }
+
+    #[test]
+    fn fanout_cursor_clear() {
+        // A topic reset can remove stale fan-out progress before re-emission.
+        let selection = select_sync_peers((1u8..=9).map(peer), peer(0), b"missing-topic", 0);
+        assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+        assert!(selection.truncated);
+        let root = TempDir::new().expect("fanout cursor clear tempdir");
+        let topic_id = topic(43);
+        {
+            let db = fjall::OptimisticTxDatabase::builder(root.path())
+                .manual_journal_persist(true)
+                .open()
+                .expect("fanout cursor clear database");
+            let cursors = db
+                .keyspace(
+                    DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                    fjall::KeyspaceCreateOptions::default,
+                )
+                .expect("fanout cursor clear keyspace");
+            advance_cursor(&cursors, topic_id, 0).expect("create fanout cursor");
+            assert!(
+                cursors
+                    .contains_key(topic_cursor_key(topic_id))
+                    .expect("find fanout cursor")
+            );
+            remove_cursor(&cursors, topic_id).expect("clear fanout cursor");
+            db.persist(fjall::PersistMode::SyncAll)
+                .expect("persist cleared fanout cursor");
+        }
+        let db = fjall::OptimisticTxDatabase::builder(root.path())
+            .manual_journal_persist(true)
+            .open()
+            .expect("reopen fanout cursor clear database");
+        let cursors = db
+            .keyspace(
+                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .expect("reopen fanout cursor clear keyspace");
+        assert!(
+            !cursors
+                .contains_key(topic_cursor_key(topic_id))
+                .expect("find cleared fanout cursor")
+        );
+    }
+
+    #[test]
+    fn sync_peers_permutation() {
+        let forward = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 0);
+        let reverse = select_sync_peers(
+            (1u8..=32).rev().map(peer),
+            peer(0),
+            b"document-sync-subject",
+            0,
+        );
+
+        assert_eq!(forward.peers, reverse.peers);
+        assert_ne!(forward.peers, (1u8..=8).map(peer).collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    fn sync_peers_rotate() {
+        let first = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 0);
+        let second = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 1);
+
+        assert!(second.peers.iter().any(|peer| !first.peers.contains(peer)));
+    }
+
+    #[test]
+    fn sync_topics_grouped() {
+        let topics = [topic(1), topic(2), topic(3)];
+        let groups = group_sync_topics(&topics, |topic_id| {
+            let selected = if topic_id == topics[1] {
+                peer(2)
+            } else {
+                peer(1)
+            };
+            PeerSelection {
+                peers: BTreeSet::from([selected]),
+                truncated: false,
+                round: 0,
+            }
+        });
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .values()
+                .map(|(_, topics)| topics.len())
+                .sum::<usize>(),
+            topics.len()
+        );
+        assert!(
+            groups
+                .values()
+                .any(|(_, grouped)| grouped == &vec![topics[1]])
+        );
+        assert!(
+            groups
+                .values()
+                .any(|(_, grouped)| grouped == &vec![topics[0], topics[2]])
+        );
+    }
+
+    #[test]
+    fn write_permission_scope() {
+        let realm_id = RealmId::from_bytes([74; 32]);
+        let group_id = Ulid::from_parts(1_700, 1);
+        let user_id = UserId::local(Ulid::from_parts(1_701, 1), realm_id);
+        let role = Role {
+            role_id: Ulid::from_parts(1_702, 1),
+            name: "group-admin".to_string(),
+            permissions: HashMap::from([(
+                format!("/{realm_id}/g/{group_id}/*"),
+                Permission::WRITE,
+            )]),
+            assigned_users: HashSet::from([user_id]),
+        };
+
+        assert!(has_current_write_permission(
+            user_id,
+            &format!("/{realm_id}/g/{group_id}/admin"),
+            [&role],
+        ));
+        assert!(!has_current_write_permission(
+            user_id,
+            &format!("/{realm_id}/g/{group_id}/admin/config"),
+            [&role],
+        ));
+    }
+
+    #[test]
+    fn revocation_expiry_bound() {
+        // The shared admission window bounds replicated reducer retention.
+        let now = 1_000;
+        let bound = now + MAX_BEARER_TOKEN_LIFETIME_SECS + REVOCATION_GRACE_SECS;
+
+        assert!(valid_revocation_expiry(bound, now));
+        assert!(!valid_revocation_expiry(bound + 1, now));
+        assert!(!valid_revocation_expiry(u64::MAX, now));
+    }
+
+    #[test]
+    fn index_skip_expiry() {
+        let realm_id = RealmId::from_bytes([76; 32]);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let actor = test_actor(
+            45,
+            UserId::local(Ulid::from_parts(1_810, 1), realm_id),
+            realm_id,
+        );
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        state
+            .apply(&test_admin_event(
+                Ulid::from_parts(1_811, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: aruna_core::auth::bearer_token_hash("scheduled"),
+                    expires_at: 2_000,
+                    token_owner: actor.user_id,
+                },
+            ))
+            .expect("revocation applies");
+
+        assert!(!needs_revocation_index(false, true, &state, 2_000));
+        assert!(needs_revocation_index(
+            false,
+            true,
+            &state,
+            2_000 + REVOCATION_GRACE_SECS + 1
+        ));
+        assert!(needs_revocation_index(true, true, &state, 2_000));
+        assert!(needs_revocation_index(false, false, &state, 2_000));
+    }
+
+    #[test]
+    fn floor_stays_monotonic() {
+        // A clock rollback must not resurrect compacted revocation paths.
+        let realm_id = RealmId::from_bytes([75; 32]);
+        let actor = test_actor(
+            44,
+            UserId::local(Ulid::from_parts(1_800, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let token_hash = aruna_core::auth::bearer_token_hash("floor-token");
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        state
+            .apply(&test_admin_event(
+                Ulid::from_parts(1_801, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at: 10_000,
+                    token_owner: actor.user_id,
+                },
+            ))
+            .expect("revocation applies");
+
+        state.compact_revocations(10_000);
+        state.compact_revocations(9_999);
+
+        assert_eq!(state.revocation_floor, 10_000);
+        assert!(
+            state
+                .materialized_revoked_tokens()
+                .contains_key(&token_hash)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_state_aborts() {
+        // A decode failure after transaction start must release the snapshot.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([76; 32]);
+        let actor = test_actor(
+            45,
+            UserId::local(Ulid::from_parts(1_810, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                admin_document_reducer_state_key(&target),
+                vec![0xff].into(),
+            )],
+        )
+        .await
+        .expect("malformed state writes");
+
+        assert!(
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(1_811, 1),
+                    target.clone(),
+                    &actor,
+                    1,
+                    AdminDocumentOperation::RealmConfigSettingsSet {
+                        metadata_replication: MetadataReplicationConfig::new(3),
+                        discovery: test_discovery(27, "https://abort.example:443"),
+                    },
+                ),
+            )
+            .await
+            .is_err()
+        );
+        storage_batch_delete_to(
+            &storage,
+            vec![(
+                ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                admin_document_reducer_state_key(&target),
+            )],
+        )
+        .await
+        .expect("malformed state deletes");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(1_812, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(27, "https://abort.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("valid state applies after abort");
+    }
+
+    #[tokio::test]
+    async fn admits_known_peers() {
+        // An inbound sync stream is refused before any read unless the pusher
+        // is a configured realm peer.
+        let root = TempDir::new().expect("tempdir");
+        let service = open_restart_service(root.path(), "storage").await;
+        let stranger = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
+
+        assert!(service.admit_inbound(stranger).is_err());
+        service
+            .add_potential_peer_node(stranger)
+            .expect("peer added");
+        let permit = service.admit_inbound(stranger);
+        assert!(permit.is_ok());
+    }
+
+    #[test]
+    fn budget_caps_bytes() {
+        // Per-peer and global byte ceilings hold, and release restores both.
+        let budget = Arc::new(InboundSyncBudget::default());
+        assert!(budget.reserve_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+        assert!(!budget.reserve_bytes(peer(1), 1));
+        budget.release_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES);
+        assert!(budget.reserve_bytes(peer(1), 1));
+        budget.release_bytes(peer(1), 1);
+
+        let mut reserved = 0usize;
+        for seed in 10..u8::MAX {
+            if budget.reserve_bytes(peer(seed), DOCUMENT_SYNC_INBOUND_PEER_BYTES) {
+                reserved = reserved.saturating_add(DOCUMENT_SYNC_INBOUND_PEER_BYTES);
+            } else {
+                break;
+            }
+        }
+        assert!(reserved <= DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES);
+        assert!(!budget.reserve_bytes(peer(9), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+    }
+
+    #[test]
+    fn drop_releases_reservation() {
+        // A stream's reservation is returned to the budget when it drops.
+        let budget = Arc::new(InboundSyncBudget::default());
+        {
+            let mut reservation = InboundByteReservation::new(budget.clone(), peer(1));
+            reservation
+                .reserve(DOCUMENT_SYNC_INBOUND_PEER_BYTES)
+                .expect("first reservation fits");
+            assert!(reservation.reserve(1).is_err());
+        }
+        assert!(budget.reserve_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+    }
+
+    #[tokio::test]
+    async fn removed_peer_denied() {
+        // A startup peer admits during bootstrap, then loses admission once
+        // realm config materializes without it, with no restart.
+        let root = TempDir::new().expect("tempdir");
+        let startup = node(51);
+        let current = node(52);
+        let service = DocumentSyncService::open_with_persist_policy(
+            restart_endpoint().await,
+            storage_at(&root.path().join("storage")),
+            root.path().join("document-sync"),
+            &[startup],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            restart_realm(),
+        )
+        .expect("service opens");
+
+        assert!(service.admit_inbound(startup).is_ok());
+
+        service
+            .refresh_potential_peer_nodes([current])
+            .expect("refresh applies");
+
+        assert!(matches!(
+            service.admit_inbound(startup),
+            Err(NetError::AdmissionRejected(_))
+        ));
+        assert!(service.admit_inbound(current).is_ok());
     }
 
     fn topic(seed: u8) -> irokle_crate::TopicId {
@@ -7327,7 +9181,9 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.default_strategy_id = Some(prior_default);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state);
+        let now = unix_timestamp_secs();
+        let index = state.revocation_index(now);
+        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -7360,7 +9216,8 @@ mod tests {
         );
         assert_eq!(state.materialized_realm_config_default_strategy(), None);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state);
+        let index = state.revocation_index(now);
+        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
         assert_eq!(config.default_strategy_id, None);
     }
 
@@ -7550,7 +9407,855 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_survives_reducer_materialization_without_existing_config_doc() {
+    async fn realm_policies_replicate() {
+        // S2: a policy event replicated from another node must pass the
+        // realm-config storage-apply whitelist and materialize here.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([57; 32]);
+        let actor = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(1_610, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_611, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(24, "https://policies.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("settings bootstrap the config doc");
+
+        let policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([2; 16]),
+            name: "no-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_612, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigPoliciesSet {
+                    policies: policies.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("policy event replicates and applies");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.request_policies, policies);
+    }
+
+    #[tokio::test]
+    async fn replicated_revocation_applies() {
+        // A revocation replicated from another node must pass the realm-config
+        // storage-apply whitelist and deny the token on this node.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([59; 32]);
+        let actor = test_actor(
+            11,
+            UserId::local(Ulid::from_parts(1_630, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_631, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(25, "https://revocation.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("settings bootstrap the config doc");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_631, 2),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: actor.node_id,
+                    kind: RealmNodeKind::Server,
+                },
+            ),
+        )
+        .await
+        .expect("realm node bootstraps revocation authority");
+
+        let token_hash = aruna_core::auth::bearer_token_hash("replicated-token");
+        let expires_at = unix_timestamp_secs() + 600;
+        for (index, seq) in [(1_632u64, 3u64), (1_633, 4)] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(index, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    AdminDocumentOperation::RealmConfigTokenRevoked {
+                        token_hash: token_hash.clone(),
+                        expires_at,
+                        token_owner: actor.user_id,
+                    },
+                ),
+            )
+            .await
+            .expect("revocation replicates and applies");
+        }
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(config.token_revoked(&token_hash, unix_timestamp_secs()));
+        assert_eq!(config.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepts_user_origin() {
+        // Onboarded node kind changes must not make event arrival order diverge.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let attacker = test_actor(
+            13,
+            UserId::local(Ulid::from_parts(1_650, 1), realm_id),
+            realm_id,
+        );
+        let token_owner = UserId::local(Ulid::from_parts(1_651, 1), realm_id);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(attacker.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&attacker)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let event = test_admin_event(
+            Ulid::from_parts(1_652, 1),
+            admin_target,
+            &attacker,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("observed-token"),
+                expires_at: unix_timestamp_secs() + 600,
+                token_owner,
+            },
+        );
+        let publisher = irokle_crate::actor_id_for(topic, node_id_to_peer_id(&attacker.node_id));
+
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("validation runs"),
+            AdminEventValidation::Accepted
+        );
+
+        config.nodes.clear();
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&attacker)
+                    .expect("unonboarded config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("unonboarded config writes");
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("unonboarded origin validation runs"),
+            AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(id)),
+                ..
+            } if id == realm_id
+        ));
+
+        config.ensure_node(attacker.node_id, RealmNodeKind::User);
+        let long_event = test_admin_event(
+            Ulid::from_parts(1_654, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &attacker,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("long-token"),
+                expires_at: unix_timestamp_secs()
+                    + MAX_BEARER_TOKEN_LIFETIME_SECS
+                    + REVOCATION_GRACE_SECS
+                    + 1,
+                token_owner: attacker.user_id,
+            },
+        );
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &long_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("long expiry validation runs"),
+            AdminEventValidation::Rejected(reason)
+                if reason == "revoked bearer token expiry exceeds the admission window"
+        ));
+
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&attacker)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("updated config writes");
+        let user_event = test_admin_event(
+            Ulid::from_parts(1_653, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &attacker,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("owned-token"),
+                expires_at: unix_timestamp_secs() + 600,
+                token_owner: attacker.user_id,
+            },
+        );
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &user_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("onboarded user origin validation runs"),
+            AdminEventValidation::Accepted
+        );
+        apply_admin_document_operation_to_storage(&storage, config_target.clone(), user_event)
+            .await
+            .expect("onboarded user revocation applies");
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(config.token_revoked(
+            &aruna_core::auth::bearer_token_hash("owned-token"),
+            unix_timestamp_secs()
+        ));
+    }
+
+    #[tokio::test]
+    async fn caps_flooding_origin() {
+        // Past its per-origin bound the flooding node is rejected, while another
+        // origin's revocation still applies instead of being trimmed away.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([65; 32]);
+        let flooder = test_actor(
+            22,
+            UserId::local(Ulid::from_parts(1_670, 1), realm_id),
+            realm_id,
+        );
+        let neighbour = test_actor(
+            23,
+            UserId::local(Ulid::from_parts(1_671, 1), realm_id),
+            realm_id,
+        );
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(flooder.node_id, RealmNodeKind::Server);
+        config.ensure_node(neighbour.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config.to_bytes(&flooder).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        let expires_at = unix_timestamp_secs() + 600;
+        let mut state = AdminDocumentReducerState::new(admin_target.clone());
+        let mut index = state.revocation_index(expires_at);
+        for seed in 0..MAX_LIVE_REVOCATIONS_PER_ORIGIN {
+            state
+                .apply_revocation_operation(
+                    &flooder,
+                    AdminDocumentOperation::RealmConfigTokenRevoked {
+                        token_hash: aruna_core::auth::bearer_token_hash(&format!("flood-{seed}")),
+                        expires_at,
+                        token_owner: flooder.user_id,
+                    },
+                    &mut index,
+                )
+                .expect("seeded revocation applies");
+        }
+        storage_batch_write_to(
+            &storage,
+            vec![admin_document_reducer_state_write_entry(&state).expect("state serializes")],
+        )
+        .await
+        .expect("reducer state writes");
+
+        let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let flood_event = test_admin_event(
+            Ulid::from_parts(1_672, 1),
+            admin_target.clone(),
+            &flooder,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("flood-extra"),
+                expires_at,
+                token_owner: flooder.user_id,
+            },
+        );
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                irokle_crate::actor_id_for(topic, node_id_to_peer_id(&flooder.node_id)),
+                &config_target,
+                &flood_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("flood validation runs"),
+            AdminEventValidation::Rejected(reason)
+                if reason == "revocation origin reached its live revocation cap"
+        ));
+
+        let neighbour_event = test_admin_event(
+            Ulid::from_parts(1_673, 1),
+            admin_target,
+            &neighbour,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("neighbour-token"),
+                expires_at,
+                token_owner: neighbour.user_id,
+            },
+        );
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                irokle_crate::actor_id_for(topic, node_id_to_peer_id(&neighbour.node_id)),
+                &config_target,
+                &neighbour_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("neighbour validation runs"),
+            AdminEventValidation::Accepted
+        );
+    }
+
+    #[test]
+    fn accepts_historical_origin() {
+        let realm_id = RealmId::from_bytes([62; 32]);
+        let origin = test_actor(
+            14,
+            UserId::local(Ulid::from_parts(1_660, 1), realm_id),
+            realm_id,
+        );
+        let other = test_actor(
+            15,
+            UserId::local(Ulid::from_parts(1_661, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let ensure = test_admin_event(
+            Ulid::from_parts(1_662, 1),
+            target.clone(),
+            &origin,
+            1,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: origin.node_id,
+                kind: RealmNodeKind::Server,
+            },
+        );
+        let conflict = test_admin_event(
+            Ulid::from_parts(1_663, 1),
+            target.clone(),
+            &other,
+            1,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: origin.node_id,
+                kind: RealmNodeKind::User,
+            },
+        );
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        state.apply(&ensure).expect("onboarding applies");
+        state
+            .apply(&conflict)
+            .expect("conflicting onboarding applies");
+        assert!(
+            state
+                .conflicts
+                .contains_key(&realm_config_node_path(&origin.node_id))
+        );
+
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(1_664, 1),
+            target,
+            origin_node_id: origin.node_id,
+            origin_seq: 2,
+            observed: AdminDocumentClock::default().with_observed(origin.node_id, 1),
+            actor: origin,
+            op: AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("historical-token"),
+                expires_at: unix_timestamp_secs() + 600,
+                token_owner: other.user_id,
+            },
+        };
+        assert!(revocation_origin_known(
+            None,
+            Some(&state),
+            &event,
+            realm_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn replicated_revocation_compacts() {
+        // A replicated revocation whose token has expired must leave no entry
+        // behind in the receiving node's reducer state.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([60; 32]);
+        let actor = test_actor(
+            12,
+            UserId::local(Ulid::from_parts(1_640, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_641, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(26, "https://compaction.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("settings bootstrap the config doc");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_641, 2),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: actor.node_id,
+                    kind: RealmNodeKind::Server,
+                },
+            ),
+        )
+        .await
+        .expect("realm node bootstraps revocation authority");
+
+        let expired = aruna_core::auth::bearer_token_hash("expired-token");
+        let live = aruna_core::auth::bearer_token_hash("live-token");
+        let now = unix_timestamp_secs();
+        for (index, seq, token_hash, expires_at) in [
+            (1_642u64, 3u64, expired.clone(), now - 1),
+            (1_643, 4, live.clone(), now + 600),
+        ] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(index, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    AdminDocumentOperation::RealmConfigTokenRevoked {
+                        token_hash,
+                        expires_at,
+                        token_owner: actor.user_id,
+                    },
+                ),
+            )
+            .await
+            .expect("revocation replicates and applies");
+        }
+
+        let mut state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert!(state.materialized_revoked_tokens().contains_key(&live));
+        assert!(
+            state
+                .user_subject_ids
+                .keys()
+                .any(|path| path.contains(&expired))
+        );
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(!config.token_revoked(&expired, now));
+        assert_eq!(config.revoked_tokens.len(), 1);
+
+        let future = now + REVOCATION_GRACE_SECS + 1;
+        state.compact_revocations(future);
+        assert!(
+            !state
+                .user_subject_ids
+                .keys()
+                .any(|path| path.contains(&expired))
+        );
+        let mut future_config = config;
+        let index = state.revocation_index(future);
+        overlay_realm_config_reducer_materialization(
+            &mut future_config,
+            &state,
+            future,
+            Some(&index),
+        );
+        assert_eq!(future_config.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redundant_persists_clock() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([64; 32]);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let actor_a = test_actor(
+            18,
+            UserId::local(Ulid::from_parts(1_690, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            19,
+            UserId::local(Ulid::from_parts(1_691, 1), realm_id),
+            realm_id,
+        );
+        let token_hash = aruna_core::auth::bearer_token_hash("redundant-token");
+        let expires_at = unix_timestamp_secs() + 600;
+        let mut seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        seed_config.ensure_node(actor_a.node_id, RealmNodeKind::Server);
+        seed_config.ensure_node(actor_b.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor_a)
+                    .expect("seed config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed config writes");
+        let first = test_admin_event(
+            Ulid::from_parts(1_692, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: token_hash.clone(),
+                expires_at,
+                token_owner: actor_a.user_id,
+            },
+        );
+        apply_admin_document_operation_to_storage(&storage, document_target.clone(), first.clone())
+            .await
+            .expect("first revocation applies");
+        let config_key = document_target.storage_key();
+        let before = read_storage_value(
+            &storage,
+            document_target.storage_keyspace(),
+            config_key.clone(),
+        )
+        .await
+        .expect("config exists after first revocation");
+        apply_admin_document_operation_to_storage(&storage, document_target.clone(), first)
+            .await
+            .expect("duplicate revocation applies");
+        assert_eq!(
+            before,
+            read_storage_value(
+                &storage,
+                document_target.storage_keyspace(),
+                document_target.storage_key(),
+            )
+            .await
+            .expect("config exists after duplicate revocation")
+        );
+
+        let second = test_admin_event(
+            Ulid::from_parts(1_691, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: token_hash.clone(),
+                expires_at,
+                token_owner: actor_b.user_id,
+            },
+        );
+        apply_admin_document_operation_to_storage(&storage, document_target.clone(), second)
+            .await
+            .expect("redundant revocation applies");
+
+        let after = read_storage_value(&storage, document_target.storage_keyspace(), config_key)
+            .await
+            .expect("config remains after redundant revocation");
+        assert_eq!(before, after);
+        let state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert_eq!(state.clock.sequence_for(&actor_a.node_id), 1);
+        assert_eq!(state.clock.sequence_for(&actor_b.node_id), 1);
+        assert_eq!(state.applied_event_ids.len(), 1);
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            BTreeMap::from([(token_hash, expires_at)])
+        );
+    }
+
+    #[tokio::test]
+    async fn group_policies_replicate() {
+        // GroupPoliciesSet must pass the group storage-apply whitelist and land
+        // on the receiving node's group authorization document.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([58; 32]);
+        let group_id = Ulid::from_parts(1_620, 1);
+        let owner = UserId::local(Ulid::from_parts(1_621, 1), realm_id);
+        let actor = test_actor(10, owner, realm_id);
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_622, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Engineering".to_string(),
+                    owner,
+                },
+            ),
+        )
+        .await
+        .expect("group creation bootstraps the auth doc");
+
+        let policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([3; 16]),
+            name: "no-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_623, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::GroupPoliciesSet {
+                    policies: policies.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("group policy event replicates and applies");
+
+        let auth_doc = read_group_auth_doc(&storage, group_id).await;
+        assert_eq!(auth_doc.policies, policies);
+    }
+
+    #[tokio::test]
+    async fn policies_authority_gate() {
+        // GroupPoliciesSet must reach the config-path check, not the unreachable
+        // arm: a non-owner config admin is accepted, one without config write is
+        // rejected, and neither path panics.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([59; 32]);
+        let group_id = Ulid::from_parts(1_630, 1);
+        let owner = UserId::local(Ulid::from_parts(1_631, 1), realm_id);
+        let admin_user = UserId::local(Ulid::from_parts(1_632, 1), realm_id);
+        let role_id = Ulid::from_parts(1_633, 1);
+        let actor = test_actor(11, admin_user, realm_id);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let group = Group {
+            display_name: "Engineering".to_string(),
+            group_id,
+            realm_id,
+            owner,
+            roles: HashSet::from([role_id]),
+        };
+        let realm_auth = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::new(),
+            operation_restrictions: Default::default(),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![
+                target_write_entry(
+                    DocumentSyncTarget::RealmConfig { realm_id },
+                    config.to_bytes(&actor).expect("config serializes").into(),
+                ),
+                target_write_entry(
+                    DocumentSyncTarget::RealmAuthorization { realm_id },
+                    realm_auth
+                        .to_bytes(&actor)
+                        .expect("realm auth serializes")
+                        .into(),
+                ),
+                (
+                    GROUP_KEYSPACE.to_string(),
+                    group_id.to_bytes().into(),
+                    group.to_bytes(&actor).expect("group serializes").into(),
+                ),
+            ],
+        )
+        .await
+        .expect("realm and group state writes");
+
+        let config_path = format!("/{realm_id}/g/{group_id}/admin/config");
+        let policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([7; 16]),
+            name: "deny-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        let event = test_admin_event(
+            Ulid::from_parts(1_634, 1),
+            AdminDocumentTarget::Group { group_id },
+            &actor,
+            1,
+            AdminDocumentOperation::GroupPoliciesSet { policies },
+        );
+
+        for (permission, expect_accept) in [(Permission::WRITE, true), (Permission::READ, false)] {
+            let auth_doc = GroupAuthorizationDocument {
+                group_id,
+                policies: Vec::new(),
+                roles: HashMap::from([(
+                    role_id,
+                    Role {
+                        role_id,
+                        name: "config_admin".to_string(),
+                        permissions: HashMap::from([(config_path.clone(), permission)]),
+                        assigned_users: HashSet::from([admin_user]),
+                    },
+                )]),
+            };
+            storage_batch_write_to(
+                &storage,
+                vec![target_write_entry(
+                    DocumentSyncTarget::GroupAuthorization { group_id },
+                    auth_doc
+                        .to_bytes(&actor)
+                        .expect("auth doc serializes")
+                        .into(),
+                )],
+            )
+            .await
+            .expect("group auth doc writes");
+
+            let validation = validate_group_admin_authority(&storage, &event)
+                .await
+                .expect("validation runs without panic");
+            assert_eq!(
+                matches!(validation, AdminEventValidation::Accepted),
+                expect_accept
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_survives_materialization() {
+        // Quota remains when the reducer materializes without a stored config.
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([61; 32]);
         let actor = test_actor(
@@ -7802,6 +10507,151 @@ mod tests {
             )
             .await
             .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_config_conflict() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([52; 32]);
+        let actor_a = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_410, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(1_411, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor_a)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        let first = test_admin_event(
+            Ulid::from_parts(1_412, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "first".to_string(),
+            },
+        );
+        let second = test_admin_event(
+            Ulid::from_parts(1_413, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "second".to_string(),
+            },
+        );
+        let (first_result, second_result) = tokio::join!(
+            apply_admin_document_operation_to_storage(&storage, document_target.clone(), first),
+            apply_admin_document_operation_to_storage(&storage, document_target.clone(), second),
+        );
+        first_result.expect("first concurrent config operation applies");
+        second_result.expect("second concurrent config operation retries");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        let state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert!(matches!(config.description.as_str(), "first" | "second"));
+        let path = REALM_CONFIG_DESCRIPTION_PATH;
+        assert!(state.conflicts.contains_key(path));
+        assert_eq!(
+            state
+                .conflicts
+                .get(path)
+                .expect("description conflict exists")
+                .values
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_stale_config() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([53; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_420, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_421, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigDescriptionSet {
+                    description: "new".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("new config operation applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_422, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigDescriptionSet {
+                    description: "stale".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("stale config operation persists clock");
+
+        assert_eq!(
+            read_realm_config_doc(&storage, realm_id).await.description,
+            "new"
+        );
+        let state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert_eq!(state.clock.sequence_for(&actor.node_id), 2);
+        assert_eq!(
+            state.materialized_realm_config_description().as_deref(),
+            Some("new")
         );
     }
 
@@ -8314,6 +11164,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replicated_role_confined() {
+        // An allowed publisher cannot replicate a role granting outside its group.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let group_id = Ulid::from_parts(210, 1);
+        let role_id = Ulid::from_parts(211, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(212, 1), realm_id),
+            realm_id,
+        );
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let placement = admin_test_placement();
+        let topic_id = document_target.sync_topic_id(realm_id, &placement);
+        let actor_id = irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id));
+
+        let event = test_admin_event(
+            Ulid::from_parts(213, 1),
+            AdminDocumentTarget::Group { group_id },
+            &actor,
+            1,
+            AdminDocumentOperation::GroupRoleCreated {
+                role: test_admin_role_definition(role_id, "escalated", "/**", Permission::WRITE),
+            },
+        );
+
+        let outcome = validate_replicated_admin_event(
+            &storage,
+            topic_id,
+            actor_id,
+            &document_target,
+            &event,
+            realm_id,
+            &placement,
+        )
+        .await
+        .expect("validation runs");
+        assert!(matches!(outcome, AdminEventValidation::Rejected(_)));
+    }
+
+    #[tokio::test]
     async fn group_role_create_admin_operation_updates_existing_group_roles() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([27; 32]);
@@ -8493,6 +11384,7 @@ mod tests {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -8947,6 +11839,7 @@ mod tests {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -9196,6 +12089,7 @@ mod tests {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -9854,10 +12748,14 @@ mod tests {
     async fn fan_out_peer_syncs_fails_when_any_peer_failed() {
         let ok_peer = peer(1);
         let failed_peer = peer(2);
-        let peers = BTreeSet::from([ok_peer, failed_peer]);
+        let selection = PeerSelection {
+            peers: BTreeSet::from([ok_peer, failed_peer]),
+            truncated: false,
+            round: 0,
+        };
 
         let error = DocumentSyncService::fan_out_peer_syncs(
-            peers,
+            selection,
             "test document sync".to_string(),
             move |peer| async move {
                 if peer == ok_peer {
@@ -9969,6 +12867,148 @@ mod tests {
         assert_eq!(primary, local);
         assert_eq!(document_index, local);
         assert_eq!(holders, local.holder_node_ids);
+    }
+
+    #[tokio::test]
+    async fn registry_replay_repairs() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let group_id = Ulid::from_parts(2_110, 1);
+        let actor = test_actor(1, UserId::nil(realm_id), realm_id);
+        let strategy_id = Ulid::from_parts(2_113, 1);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.default_strategy_id = Some(strategy_id);
+        config.strategies.push(PlacementStrategy {
+            strategy_id,
+            name: "test".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        });
+        config.placement_bindings.push(PlacementBinding {
+            handle: PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
+        let placement = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 4,
+        };
+        let document_id = MetaResourceId::from_parts(
+            2_111,
+            PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            BucketId::new(placement.shard as u16).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
+        let mut record = registry_record(
+            group_id,
+            document_id,
+            "datasets/replay-repair",
+            100,
+            Ulid::from_parts(2_112, 1),
+        );
+        record.placement = placement;
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                DocumentSyncTarget::RealmConfig { realm_id }
+                    .storage_keyspace()
+                    .to_string(),
+                DocumentSyncTarget::RealmConfig { realm_id }.storage_key(),
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+        let mut entries = metadata_registry_write_entries(&record).expect("registry entries build");
+        let primary = entries.remove(0);
+        storage_batch_write_to(&storage, vec![primary])
+            .await
+            .expect("registry primary writes");
+
+        apply_metadata_registry_upsert_to_storage(
+            &storage,
+            record.clone(),
+            postcard::to_allocvec(&record).expect("registry serializes"),
+        )
+        .await
+        .expect("equal registry replay repairs sidecars");
+
+        assert_registry_record_present(&storage, &record).await;
+    }
+
+    #[tokio::test]
+    async fn registry_fence_ulid() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(2_120, 1);
+        let document_id = Ulid::from_parts(2_121, 1);
+        let boundary = Ulid::from_parts(2_122, 1);
+        let delete = metadata_delete_lifecycle(
+            group_id,
+            document_id,
+            200,
+            Ulid::from_parts(2_123, 1),
+            boundary,
+        );
+        write_document_lifecycle_record(&storage, &delete).await;
+        let record = registry_record(
+            group_id,
+            document_id,
+            "datasets/post-delete",
+            100,
+            Ulid::from_parts(2_124, 1),
+        );
+        let txn_id = start_storage_transaction(&storage)
+            .await
+            .expect("fence transaction starts");
+        assert!(
+            record_fenced_txn(&storage, &record, txn_id)
+                .await
+                .expect("newer ULID fence checks")
+        );
+        match storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
+            other => panic!("unexpected fence transaction result: {other:?}"),
+        }
+
+        let live = registry_record(group_id, document_id, "datasets/post-delete", 300, boundary);
+        write_registry_record(&storage, &live).await;
+        let stale = registry_record(
+            group_id,
+            document_id,
+            "datasets/post-delete",
+            100,
+            Ulid::from_parts(2_124, 1),
+        );
+        let txn_id = start_storage_transaction(&storage)
+            .await
+            .expect("stale fence transaction starts");
+        assert!(
+            !record_fenced_txn(&storage, &stale, txn_id)
+                .await
+                .expect("stale registry fence checks live primary")
+        );
+        match storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
+            other => panic!("unexpected stale fence transaction result: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -10472,6 +13512,19 @@ mod tests {
             document_id,
             event_id: create_event_id,
         };
+        let update_event_id = Ulid::from_parts(2_118, 1);
+        let mut update = create.clone();
+        update.event_id = update_event_id;
+        update.record.updated_at_ms = 200;
+        update.record.last_event_id = update_event_id;
+        update.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        update.occurred_at_ms = 200;
+        let update_target = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id: update_event_id,
+        };
         let metadata_topic = registry_target.sync_topic_id(realm_id, &placement);
         service
             .ensure_document_sync_topics(&[metadata_topic], Vec::new())
@@ -10495,6 +13548,13 @@ mod tests {
                         target: registry_target.clone(),
                         bytes: postcard::to_allocvec(&record).expect("registry serializes"),
                         change: change(Ulid::from_parts(2_115, 1)),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(2_117, 1),
+                        target: update_target.clone(),
+                        bytes: postcard::to_allocvec(&update).expect("update serializes"),
+                        change: change(Ulid::from_parts(2_117, 1)),
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::Upsert {
@@ -10585,7 +13645,7 @@ mod tests {
 
         let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let strategy_event = test_admin_event(
-            Ulid::from_parts(2_117, 1),
+            Ulid::from_parts(2_120, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
             &actor,
             1,
@@ -10661,49 +13721,24 @@ mod tests {
             .expect("applied cursor is stored"),
         )
         .expect("cursor decodes");
-        assert!(applied_cursor.dominates(&metadata_clock));
-        assert!(
-            service
-                .reconcile_document_topics([metadata_topic])
-                .await
-                .expect("accepted metadata is idempotent")
-                .metadata_create_events
-                .is_empty()
-        );
-
-        let update_event_id = Ulid::from_parts(2_118, 1);
-        let mut update = create.clone();
-        update.event_id = update_event_id;
-        update.record.updated_at_ms = 200;
-        update.record.last_event_id = update_event_id;
-        update.payload = MetadataCreateEventPayload::ReplaceRoCrate {
-            jsonld: "{}".to_string(),
-        };
-        update.occurred_at_ms = 200;
-        let update_target = DocumentSyncTarget::MetadataCreateEvent {
-            document_id,
-            event_id: update_event_id,
-        };
-        let published = service
-            .publish_documents(
-                vec![DocumentSyncPublish::Upsert {
-                    event_id: update_event_id,
-                    target: update_target,
-                    bytes: postcard::to_allocvec(&update).expect("update serializes"),
-                    change: change(update_event_id),
-                    allow_genesis: true,
-                }],
-                Vec::new(),
-            )
-            .await;
-        assert!(matches!(
-            published,
-            DocumentSyncNetEvent::DocumentsPublished { .. }
-        ));
-        service
+        assert!(!applied_cursor.dominates(&metadata_clock));
+        let replayed = service
             .reconcile_document_topics([metadata_topic])
             .await
             .expect("metadata update reconciles");
+        assert!(replayed.targets.contains(&update_target));
+        assert!(replayed.metadata_create_events.contains(&update));
+        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                topic_cursor_key(metadata_topic),
+            )
+            .await
+            .expect("replayed cursor is stored"),
+        )
+        .expect("cursor decodes");
+        assert!(applied_cursor.dominates(&metadata_clock));
         let acceptance = read_storage_value(
             &storage,
             METADATA_CREATE_ACCEPTANCE_KEYSPACE,
@@ -10799,7 +13834,7 @@ mod tests {
         );
         write_document_lifecycle_record(&storage, &stale_delete).await;
 
-        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
+        delete_registry_record(&storage, group_id, document_id)
             .await
             .expect("stale registry delete is fenced");
 
@@ -10811,13 +13846,14 @@ mod tests {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1_570, 1);
         let document_id = Ulid::from_parts(1_571, 1);
-        let stale_event_id = Ulid::from_parts(1_572, 1);
+        let deleted_after_event_id = Ulid::from_parts(1_572, 1);
+        let newer_event_id = Ulid::from_parts(1_574, 1);
         let delete_lifecycle = metadata_delete_lifecycle(
             group_id,
             document_id,
             200,
             Ulid::from_parts(1_573, 1),
-            stale_event_id,
+            deleted_after_event_id,
         );
         assert!(
             apply_metadata_document_lifecycle_to_storage(
@@ -10833,16 +13869,17 @@ mod tests {
             document_id,
             "datasets/stale-after-tombstone",
             100,
-            stale_event_id,
+            newer_event_id,
         );
 
-        apply_metadata_registry_upsert_to_storage(
+        let outcome = apply_metadata_registry_upsert_to_storage(
             &storage,
             stale.clone(),
             postcard::to_allocvec(&stale).expect("stale registry serializes"),
         )
         .await
         .expect("late registry upsert is fenced by tombstone");
+        assert!(matches!(outcome, MetadataPlacementOutcome::Accepted(())));
 
         assert_registry_record_deleted(&storage, group_id, document_id).await;
         assert_eq!(
@@ -11042,7 +14079,7 @@ mod tests {
         );
         write_registry_record(&storage, &record).await;
 
-        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
+        delete_registry_record(&storage, group_id, document_id)
             .await
             .expect("registry delete skips without tombstone");
 
@@ -11118,6 +14155,119 @@ mod tests {
         );
         let revision = read_lifecycle_revision(&storage, document_id).await;
         assert_eq!(revision, change);
+        let acceptance = read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(document_id),
+        )
+        .await
+        .expect("create acceptance exists");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_acceptance_fence() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(11, 1);
+        let document_id = Ulid::from_parts(12, 1);
+        let event_id = Ulid::from_parts(13, 1);
+        let accepted = metadata_create_event(group_id, document_id, 100, event_id, 7);
+        let accepted_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(accepted.clone()),
+        };
+        assert!(
+            apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &accepted_lifecycle,
+                metadata_lifecycle_change(&accepted_lifecycle, node(8)),
+            )
+            .await
+            .expect("accepted lifecycle create applies")
+        );
+
+        let mut divergent = accepted.clone();
+        divergent.event_id = Ulid::from_parts(14, 1);
+        divergent.record.establishing_event_id = divergent.event_id;
+        divergent.record.last_event_id = divergent.event_id;
+        let divergent_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(divergent),
+        };
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &divergent_lifecycle,
+                metadata_lifecycle_change(&divergent_lifecycle, node(8)),
+            )
+            .await
+            .expect("divergent lifecycle create is fenced")
+        );
+        let acceptance = read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(document_id),
+        )
+        .await
+        .expect("create acceptance remains");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+            accepted
+        );
+
+        let orphan_id = Ulid::from_parts(15, 1);
+        let mut orphan = metadata_create_event(group_id, orphan_id, 200, orphan_id, 7);
+        orphan.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        let orphan_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(orphan),
+        };
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &orphan_lifecycle,
+                metadata_lifecycle_change(&orphan_lifecycle, node(8)),
+            )
+            .await
+            .expect("lifecycle update without acceptance is fenced")
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+                metadata_create_acceptance_key(orphan_id),
+            )
+            .await
+            .is_none()
+        );
+
+        let mut mismatched = accepted.clone();
+        mismatched.event_id = Ulid::from_parts(16, 1);
+        mismatched.record.updated_at_ms = 200;
+        mismatched.record.last_event_id = mismatched.event_id;
+        mismatched.record.placement = PlacementRef {
+            strategy_id: Ulid::from_parts(17, 1),
+            epoch: 1,
+            shard: 1,
+        };
+        mismatched.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        mismatched.occurred_at_ms = 200;
+        let mismatched_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(mismatched),
+        };
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &mismatched_lifecycle,
+                metadata_lifecycle_change(&mismatched_lifecycle, node(8)),
+            )
+            .await
+            .expect("mismatched lifecycle update is fenced")
+        );
     }
 
     #[tokio::test]
@@ -12910,7 +16060,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_watch_interest_upsert_accepts_owner_and_rejects_forgeries() {
+    fn watch_interest_validation() {
         use aruna_core::structs::{WatchEventKind, WatchEventMask};
 
         let node_id = node(7);
@@ -12926,14 +16076,29 @@ mod tests {
             )],
         );
         let owned_bytes = owned.to_bytes().unwrap();
-        assert!(validate_watch_interest_upsert(&target, &owned_bytes).is_ok());
+        assert!(validate_watch_interest(&target, &owned_bytes).is_ok());
 
         // Empty digests are legitimate upserts that clear a node's interest.
         let empty = WatchInterestDigest {
             node_id,
             entries: Vec::new(),
         };
-        assert!(validate_watch_interest_upsert(&target, &empty.to_bytes().unwrap()).is_ok());
+        assert!(validate_watch_interest(&target, &empty.to_bytes().unwrap()).is_ok());
+
+        let too_many = WatchInterestDigest::from_subscriptions(
+            node_id,
+            (0..=NOTIFICATION_WATCH_INTEREST_ENTRY_CAP).map(|index| {
+                (
+                    format!("/entry/{index}"),
+                    WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+                )
+            }),
+        );
+        assert!(validate_watch_interest(&target, &too_many.to_bytes().unwrap()).is_err());
+        assert!(
+            validate_watch_interest(&target, &vec![0; NOTIFICATION_WATCH_INTEREST_BYTES_CAP + 1],)
+                .is_err()
+        );
 
         // A digest whose embedded node id is a different node is rejected.
         let misattributed = WatchInterestDigest::from_subscriptions(
@@ -12943,19 +16108,115 @@ mod tests {
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             )],
         );
-        assert!(
-            validate_watch_interest_upsert(&target, &misattributed.to_bytes().unwrap()).is_err()
-        );
+        assert!(validate_watch_interest(&target, &misattributed.to_bytes().unwrap()).is_err());
 
         // Undecodable payloads and non watch-interest targets are rejected.
-        assert!(validate_watch_interest_upsert(&target, b"not-a-digest").is_err());
+        assert!(validate_watch_interest(&target, b"not-a-digest").is_err());
         assert!(
-            validate_watch_interest_upsert(
-                &DocumentSyncTarget::RealmConfig { realm_id },
-                &owned_bytes,
-            )
-            .is_err()
+            validate_watch_interest(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes,)
+                .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn watch_origins_converge() {
+        // Independent origins must not lose a replica to arrival-order admission.
+        use aruna_core::structs::{WatchEventKind, WatchEventMask};
+
+        let (_left_dir, left) = test_storage();
+        let (_right_dir, right) = test_storage();
+        let realm_id = RealmId::from_bytes([57u8; 32]);
+        let make = |seed: u8, event_mask: WatchEventMask| {
+            let owner = UserId::local(Ulid::from_parts(seed as u64, 1), realm_id);
+            let watch_id = Ulid::from_parts(seed as u64, 2);
+            let mut subscription =
+                WatchSubscription::new(owner, format!("watch/{seed}"), event_mask, 1);
+            subscription.watch_id = watch_id;
+            let change = DocumentSyncChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: 1,
+                    event_id: Ulid::from_parts(seed as u64, 3),
+                    actor: node(seed),
+                    updated_at_ms: 1,
+                },
+                kind: DocumentSyncChangeKind::Upsert,
+                placement: PlacementRef::NIL,
+            };
+            (
+                DocumentSyncTarget::WatchSubscription { owner, watch_id },
+                subscription.to_bytes().expect("subscription serializes"),
+                change,
+            )
+        };
+        let first = make(
+            1,
+            WatchEventMask::from_kinds([WatchEventKind::SyncCompleted]),
+        );
+        let second = make(2, WatchEventMask::from_kinds([WatchEventKind::SyncFailed]));
+
+        assert!(validate_watch_subscription_upsert(&first.0, &first.1, &first.2).is_ok());
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &left,
+                first.0.clone(),
+                Some(first.1.clone()),
+                first.2,
+            )
+            .await
+            .expect("first origin applies")
+        );
+        assert!(validate_watch_subscription_upsert(&second.0, &second.1, &second.2).is_ok());
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &left,
+                second.0.clone(),
+                Some(second.1.clone()),
+                second.2,
+            )
+            .await
+            .expect("second origin applies")
+        );
+        assert!(validate_watch_subscription_upsert(&second.0, &second.1, &second.2).is_ok());
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &right,
+                second.0.clone(),
+                Some(second.1.clone()),
+                second.2,
+            )
+            .await
+            .expect("second origin applies in reverse order")
+        );
+        assert!(validate_watch_subscription_upsert(&first.0, &first.1, &first.2).is_ok());
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &right,
+                first.0.clone(),
+                Some(first.1.clone()),
+                first.2,
+            )
+            .await
+            .expect("first origin applies in reverse order")
+        );
+
+        for storage in [&left, &right] {
+            assert!(
+                read_storage_value(storage, first.0.storage_keyspace(), first.0.storage_key(),)
+                    .await
+                    .is_some()
+            );
+            assert!(
+                read_storage_value(storage, second.0.storage_keyspace(), second.0.storage_key(),)
+                    .await
+                    .is_some()
+            );
+        }
+        let unknown_mask: WatchEventMask =
+            postcard::from_bytes(&postcard::to_allocvec(&16u32).expect("unknown mask serializes"))
+                .expect("unknown mask decodes");
+        let (target, bytes, change) = make(3, unknown_mask);
+        assert!(validate_watch_subscription_upsert(&target, &bytes, &change).is_err());
     }
 
     #[test]
@@ -13599,6 +16860,98 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(event_ids, vec![remote_event_id]);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_backlog() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let service = open_restart_service(root.path(), "replay-batch-storage").await;
+        let topic_id = restart_topic();
+        let target = restart_target();
+        service
+            .ensure_document_sync_topics(&[topic_id], Vec::new())
+            .expect("shard topic exists");
+
+        let documents = (0..(DOCUMENT_SYNC_REPLAY_BATCH_LIMIT + 1))
+            .map(|index| {
+                let event_id = Ulid::from_parts(1_800_000_000_000 + index as u64, 1);
+                DocumentSyncPublish::Upsert {
+                    event_id,
+                    target: target.clone(),
+                    bytes: restart_payload(),
+                    change: DocumentSyncChange {
+                        base: None,
+                        current: DocumentSyncRevision {
+                            generation: 1,
+                            event_id,
+                            actor: service.local_node_id().expect("local node id"),
+                            updated_at_ms: 1_800_000_000_000 + index as u64,
+                        },
+                        kind: DocumentSyncChangeKind::Upsert,
+                        placement: restart_placement(),
+                    },
+                    allow_genesis: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            service.publish_documents(documents, Vec::new()).await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        let cursor = irokle_crate::ActorClock::default();
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                postcard::to_allocvec(&cursor)
+                    .expect("cursor serializes")
+                    .into(),
+            )
+            .await
+            .expect("cursor resets");
+
+        let first = service
+            .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+            .expect("first replay batch");
+        assert_eq!(
+            first.events.len(),
+            DOCUMENT_SYNC_REPLAY_BATCH_LIMIT - 1,
+            "genesis consumes one bounded replay slot"
+        );
+        let actor = irokle_crate::actor_id_for(topic_id, service.node().peer_id());
+        assert_eq!(
+            first.cursor.get(&actor),
+            DOCUMENT_SYNC_REPLAY_BATCH_LIMIT as u64
+        );
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(!first.cursor.dominates(&topic_clock));
+
+        // An interrupted run before the cursor write retries the same batch.
+        let retry = service
+            .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+            .expect("retry replay batch");
+        assert_eq!(retry.cursor, first.cursor);
+        let remaining = service
+            .document_event_batch(topic_id, &first.cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+            .expect("remaining replay batch");
+        assert!(remaining.cursor.dominates(&topic_clock));
+
+        let byte_first = service
+            .document_event_batch(topic_id, &cursor, 0)
+            .expect("single operation byte batch");
+        assert_eq!(byte_first.cursor.get(&actor), 1);
+        let byte_second = service
+            .document_event_batch(topic_id, &byte_first.cursor, 0)
+            .expect("second operation byte batch");
+        assert_eq!(byte_second.cursor.get(&actor), 2);
+        assert!(!byte_second.cursor.dominates(&topic_clock));
 
         service.shutdown().await;
     }

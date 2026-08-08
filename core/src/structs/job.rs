@@ -10,7 +10,7 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
-use crate::structs::{AuthContext, BackendLocation, StagingStrategy};
+use crate::structs::{AuthContext, BackendLocation, HiddenBlobKey, StagingStrategy};
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
@@ -484,6 +484,23 @@ pub struct RoCrateUploadRecord {
     pub media_type: RoCrateMediaType,
     pub expires_at_ms: u64,
     pub claimed_by: Option<JobId>,
+}
+
+/// Durable compensation for a hidden upload whose record cleanup was ambiguous.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoCrateUploadCleanup {
+    pub upload_id: Ulid,
+    pub hidden_key: HiddenBlobKey,
+}
+
+impl RoCrateUploadCleanup {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

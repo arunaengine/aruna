@@ -150,7 +150,10 @@ async fn metadata_creation_replicates_to_all_three_holders()
     .await?
     .record;
 
-    assert_eq!(created.holder_node_ids, vec![nodes[0].net.node_id()]);
+    // Holder expansion may race ahead of the create response on fast machines,
+    // so only the creator's membership is stable; convergence below checks the
+    // full holder set.
+    assert!(created.holder_node_ids.contains(&nodes[0].net.node_id()));
     // Replay is idempotent: it projects the logged create event unless the
     // async drain (and the holders' expansion round trip) already did, so the
     // stable invariant is the logged event itself, not the projection count.

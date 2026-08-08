@@ -8,10 +8,20 @@ use aruna_core::structs::{
     SourceMetadata, VersionSourceBinding, VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
 
 const VERSION_REPLICATION_MAGIC: &[u8; 4] = b"vrp1";
+
+pub const MAX_REPLICATION_PARTS: usize = 10_000;
+pub const MAX_REPLICATION_SOURCES: usize = 4;
+pub const MAX_REPLICATION_METADATA: usize = 128;
+pub const MAX_REPLICATION_HASHES: usize = 7;
+pub const MAX_REPLICATION_KEY_BYTES: usize = 128;
+pub const MAX_REPLICATION_VALUE_BYTES: usize = 4 * 1024;
+pub const MAX_REPLICATION_HASH_BYTES: usize = 64;
+pub const MAX_REPLICATION_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_REPLICATION_MANIFEST_WORK: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VersionReplicationManifest {
@@ -34,6 +44,98 @@ pub struct VersionReplicationManifest {
     pub writer_auth_context: Option<AuthContext>,
     pub reference_metadata: Option<SourceMetadata>,
     pub metadata: HashMap<String, String>,
+}
+
+impl VersionReplicationManifest {
+    pub(crate) fn validate(&self) -> Result<(), ConversionError> {
+        let mut budget = ManifestBudget::default();
+        check_text(&mut budget, &self.bucket, MAX_REPLICATION_VALUE_BYTES)?;
+        check_text(&mut budget, &self.key, MAX_REPLICATION_VALUE_BYTES)?;
+        check_map(&mut budget, &self.metadata)?;
+
+        if self.upstream_sources.len() > MAX_REPLICATION_SOURCES {
+            return Err(ConversionError::FromStrError(
+                "replication manifest source count exceeded".to_string(),
+            ));
+        }
+        for source in &self.upstream_sources {
+            check_text(&mut budget, &source.path, MAX_REPLICATION_VALUE_BYTES)?;
+        }
+
+        if let Some(source) = &self.source {
+            let descriptor = &source.descriptor;
+            if descriptor.public_config.len() > MAX_REPLICATION_METADATA
+                || descriptor.capabilities.len() > MAX_REPLICATION_METADATA
+            {
+                return Err(ConversionError::FromStrError(
+                    "replication manifest source count exceeded".to_string(),
+                ));
+            }
+            check_map(&mut budget, &descriptor.public_config)?;
+            check_text(
+                &mut budget,
+                &descriptor.source_path,
+                MAX_REPLICATION_VALUE_BYTES,
+            )?;
+            if let Some(selector) = &descriptor.version_selector {
+                check_text(&mut budget, selector, MAX_REPLICATION_VALUE_BYTES)?;
+            }
+            for capability in &descriptor.capabilities {
+                check_text(&mut budget, capability, MAX_REPLICATION_VALUE_BYTES)?;
+            }
+        }
+
+        if let Some(reference) = &self.reference_metadata {
+            if let Some(content_type) = &reference.content_type {
+                check_text(&mut budget, content_type, MAX_REPLICATION_VALUE_BYTES)?;
+            }
+            if let Some(etag) = &reference.etag {
+                check_text(&mut budget, etag, MAX_REPLICATION_VALUE_BYTES)?;
+            }
+        }
+
+        if let Some(blob) = &self.blob {
+            check_location(&mut budget, &blob.location)?;
+        }
+
+        if let Some(multipart) = &self.multipart {
+            if multipart.parts.len() > MAX_REPLICATION_PARTS
+                || multipart.summary.part_count != multipart.parts.len()
+            {
+                return Err(ConversionError::FromStrError(
+                    "replication manifest part count is invalid".to_string(),
+                ));
+            }
+            if multipart.summary.composite_hashes.len() > MAX_REPLICATION_HASHES - 1 {
+                return Err(ConversionError::FromStrError(
+                    "replication manifest hash count exceeded".to_string(),
+                ));
+            }
+            for (name, digest) in &multipart.summary.composite_hashes {
+                check_hash(&mut budget, name, digest)?;
+            }
+
+            let mut part_numbers = HashSet::with_capacity(multipart.parts.len());
+            for part in &multipart.parts {
+                if !part_numbers.insert(part.part_number) {
+                    return Err(ConversionError::FromStrError(
+                        "replication manifest part number is duplicated".to_string(),
+                    ));
+                }
+                budget.add(0, 1)?;
+                if part.hashes.len() > MAX_REPLICATION_HASHES {
+                    return Err(ConversionError::FromStrError(
+                        "replication manifest hash count exceeded".to_string(),
+                    ));
+                }
+                for (name, digest) in &part.hashes {
+                    check_hash(&mut budget, name, digest)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -95,14 +197,127 @@ impl<'de> Deserialize<'de> for MultipartObjectReplicationMetadata {
             checksum_type: MultipartChecksumType,
         }
 
-        let mut metadata = WireMetadata::deserialize(deserializer)?;
-        metadata.summary.composite_hashes = hashes_from_parts(&metadata.parts);
+        let metadata = WireMetadata::deserialize(deserializer)?;
         Ok(Self {
             summary: metadata.summary,
             parts: metadata.parts,
             checksum_type: metadata.checksum_type,
         })
     }
+}
+
+#[derive(Default)]
+struct ManifestBudget {
+    bytes: usize,
+    work: usize,
+}
+
+impl ManifestBudget {
+    fn add(&mut self, bytes: usize, work: usize) -> Result<(), ConversionError> {
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
+            ConversionError::FromStrError("replication manifest byte budget overflow".to_string())
+        })?;
+        self.work = self.work.checked_add(work).ok_or_else(|| {
+            ConversionError::FromStrError("replication manifest work budget overflow".to_string())
+        })?;
+        if self.bytes > MAX_REPLICATION_MANIFEST_BYTES || self.work > MAX_REPLICATION_MANIFEST_WORK
+        {
+            return Err(ConversionError::FromStrError(
+                "replication manifest budget exceeded".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn check_text(
+    budget: &mut ManifestBudget,
+    value: &str,
+    limit: usize,
+) -> Result<(), ConversionError> {
+    if value.len() > limit {
+        return Err(ConversionError::FromStrError(
+            "replication manifest entry is too large".to_string(),
+        ));
+    }
+    let work = value.len().checked_add(1).ok_or_else(|| {
+        ConversionError::FromStrError("replication manifest work budget overflow".to_string())
+    })?;
+    budget.add(value.len(), work)
+}
+
+fn check_map(
+    budget: &mut ManifestBudget,
+    map: &HashMap<String, String>,
+) -> Result<(), ConversionError> {
+    if map.len() > MAX_REPLICATION_METADATA {
+        return Err(ConversionError::FromStrError(
+            "replication manifest metadata count exceeded".to_string(),
+        ));
+    }
+    for (key, value) in map {
+        check_text(budget, key, MAX_REPLICATION_KEY_BYTES)?;
+        check_text(budget, value, MAX_REPLICATION_VALUE_BYTES)?;
+    }
+    Ok(())
+}
+
+fn check_hash(
+    budget: &mut ManifestBudget,
+    name: &str,
+    digest: &[u8],
+) -> Result<(), ConversionError> {
+    let expected = match name {
+        aruna_core::structs::checksum::HASH_BLAKE3 => 32,
+        aruna_core::structs::checksum::HASH_MD5 => 16,
+        aruna_core::structs::checksum::HASH_SHA1 => 20,
+        aruna_core::structs::checksum::HASH_SHA256 => 32,
+        aruna_core::structs::checksum::HASH_CRC32 | aruna_core::structs::checksum::HASH_CRC32C => 4,
+        aruna_core::structs::checksum::HASH_CRC64NVME => 8,
+        _ => {
+            return Err(ConversionError::FromStrError(
+                "replication manifest hash algorithm is unsupported".to_string(),
+            ));
+        }
+    };
+    if digest.len() != expected || digest.len() > MAX_REPLICATION_HASH_BYTES {
+        return Err(ConversionError::FromStrError(
+            "replication manifest hash length is invalid".to_string(),
+        ));
+    }
+    check_text(budget, name, MAX_REPLICATION_KEY_BYTES)?;
+    budget.add(digest.len(), digest.len())
+}
+
+fn check_location(
+    budget: &mut ManifestBudget,
+    location: &BackendLocation,
+) -> Result<(), ConversionError> {
+    match &location.backend {
+        aruna_core::structs::BackendRef::Node(name) => {
+            check_text(budget, name, MAX_REPLICATION_VALUE_BYTES)?;
+        }
+        aruna_core::structs::BackendRef::Group(_) => {}
+    }
+    if let Some(storage_class) = &location.storage_class {
+        check_text(budget, storage_class, MAX_REPLICATION_VALUE_BYTES)?;
+    }
+    check_text(budget, &location.root, MAX_REPLICATION_VALUE_BYTES)?;
+    check_text(
+        budget,
+        &location.storage_bucket,
+        MAX_REPLICATION_VALUE_BYTES,
+    )?;
+    check_text(budget, &location.backend_path, MAX_REPLICATION_VALUE_BYTES)?;
+    if location.hashes.len() > MAX_REPLICATION_HASHES {
+        return Err(ConversionError::FromStrError(
+            "replication manifest hash count exceeded".to_string(),
+        ));
+    }
+    for (name, digest) in &location.hashes {
+        check_hash(budget, name, digest)?;
+    }
+    Ok(())
 }
 
 fn hashes_from_parts(parts: &[MultipartObjectPart]) -> HashMap<String, Vec<u8>> {
@@ -221,59 +436,14 @@ impl VersionReplicationMessage {
                     "invalid version replication message prefix".to_string(),
                 )
             })?;
-        match postcard::from_bytes(payload) {
-            Ok(message) => Ok(message),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                let empty_metadata = postcard::to_allocvec(&HashMap::<String, String>::new())?;
-                let mut current = payload.to_vec();
-                current.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&current) {
-                    return Ok(message);
-                }
-                let reference_none = postcard::to_allocvec(&Option::<SourceMetadata>::None)?;
-                let mut current = payload.to_vec();
-                current.extend_from_slice(&reference_none);
-                current.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&current) {
-                    return Ok(message);
-                }
-                let writer_none = postcard::to_allocvec(&Option::<AuthContext>::None)?;
-                let mut current = payload.to_vec();
-                current.extend_from_slice(&writer_none);
-                current.extend_from_slice(&reference_none);
-                current.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&current) {
-                    return Ok(message);
-                }
-                let empty_sources = postcard::to_allocvec(&Vec::<ArunaArn>::new())?;
-                let mut origin_only = payload.to_vec();
-                origin_only.extend_from_slice(&empty_sources);
-                origin_only.extend_from_slice(&writer_none);
-                origin_only.extend_from_slice(&reference_none);
-                origin_only.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&origin_only) {
-                    return Ok(message);
-                }
-                let mut previous = payload.to_vec();
-                previous.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
-                previous.extend_from_slice(&empty_sources);
-                previous.extend_from_slice(&writer_none);
-                previous.extend_from_slice(&reference_none);
-                previous.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&previous) {
-                    return Ok(message);
-                }
-                let mut legacy = payload.to_vec();
-                legacy.extend(postcard::to_allocvec(&false)?);
-                legacy.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
-                legacy.extend_from_slice(&empty_sources);
-                legacy.extend_from_slice(&writer_none);
-                legacy.extend_from_slice(&reference_none);
-                legacy.extend_from_slice(&empty_metadata);
-                Ok(postcard::from_bytes(&legacy)?)
+        let mut message: Self = postcard::from_bytes(payload)?;
+        if let Self::VersionManifest(manifest) = &mut message {
+            manifest.validate()?;
+            if let Some(multipart) = manifest.multipart.as_mut() {
+                multipart.summary.composite_hashes = hashes_from_parts(&multipart.parts);
             }
-            Err(error) => Err(error.into()),
         }
+        Ok(message)
     }
 }
 
@@ -297,9 +467,10 @@ pub struct VersionReplicationRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaoReadRefusal, BaoReadRequest, BaoReadTarget, MaterializedBlobInfo,
-        MultipartObjectReplicationMetadata, SyncOrigin, VERSION_REPLICATION_MAGIC,
-        VersionReplicationManifest, VersionReplicationMessage,
+        BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_REPLICATION_HASH_BYTES,
+        MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES, MAX_REPLICATION_VALUE_BYTES,
+        MultipartObjectReplicationMetadata, SyncOrigin, VersionReplicationManifest,
+        VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
@@ -307,47 +478,11 @@ mod tests {
     use aruna_core::structs::checksum::HASH_SHA256;
     use aruna_core::structs::{
         ArunaArn, AuthContext, MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
-        RealmId, ReplicationItemKind, VersionSourceBinding,
+        RealmId, ReplicationItemKind,
     };
-    use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
-
-    #[derive(Serialize, Deserialize)]
-    enum LegacyVersionReplicationMessage {
-        VersionManifest(LegacyVersionReplicationManifest),
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct LegacyVersionReplicationManifest {
-        bucket: String,
-        key: String,
-        version_id: Ulid,
-        group_id: aruna_core::types::GroupId,
-        kind: ReplicationItemKind,
-        created_at: SystemTime,
-        created_by: UserId,
-        current_version: bool,
-        current_version_generation: Option<u64>,
-        auth_context: AuthContext,
-        blob: Option<MaterializedBlobInfo>,
-        source: Option<VersionSourceBinding>,
-        multipart: Option<LegacyMultipartObjectReplicationMetadata>,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct LegacyMultipartObjectReplicationMetadata {
-        summary: LegacyMultipartObjectSummary,
-        parts: Vec<MultipartObjectPart>,
-        checksum_type: MultipartChecksumType,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct LegacyMultipartObjectSummary {
-        checksum_type: MultipartChecksumType,
-        part_count: usize,
-    }
 
     fn test_realm_id() -> RealmId {
         RealmId::from_bytes([7u8; 32])
@@ -459,37 +594,94 @@ mod tests {
     }
 
     #[test]
-    fn decodes_previous_manifest() {
+    fn rejects_truncated_manifest() {
+        let mut bytes = VersionReplicationMessage::VersionManifest(make_manifest())
+            .to_bytes()
+            .unwrap();
+        bytes.pop();
+        assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_source_count() {
+        let source = ArunaArn::s3_bucket(
+            test_realm_id(),
+            iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            "source",
+        )
+        .unwrap();
         let mut manifest = make_manifest();
-        manifest.reference_intent = true;
-        manifest.origin = Some(SyncOrigin {
-            relationship_id: Ulid::from(8u128),
-            hop_count: 2,
+        manifest.upstream_sources = vec![source; MAX_REPLICATION_SOURCES + 1];
+        let bytes = VersionReplicationMessage::VersionManifest(manifest)
+            .to_bytes()
+            .unwrap();
+
+        assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_metadata_size() {
+        let mut manifest = make_manifest();
+        manifest.metadata.insert(
+            "metadata".to_string(),
+            "x".repeat(MAX_REPLICATION_VALUE_BYTES + 1),
+        );
+        let bytes = VersionReplicationMessage::VersionManifest(manifest)
+            .to_bytes()
+            .unwrap();
+
+        assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_part_count() {
+        let part = MultipartObjectPart {
+            part_number: 1,
+            size: 5,
+            hashes: HashMap::from([(HASH_SHA256.to_string(), vec![1u8; 32])]),
+        };
+        let mut manifest = make_manifest();
+        manifest.multipart = Some(MultipartObjectReplicationMetadata {
+            summary: MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: MAX_REPLICATION_PARTS + 1,
+                composite_hashes: HashMap::new(),
+            },
+            parts: vec![part; MAX_REPLICATION_PARTS + 1],
+            checksum_type: MultipartChecksumType::Composite,
         });
-        let mut bytes = VersionReplicationMessage::VersionManifest(manifest.clone())
+        let bytes = VersionReplicationMessage::VersionManifest(manifest)
             .to_bytes()
             .unwrap();
-        assert_eq!(bytes.pop(), Some(0));
 
-        let decoded = VersionReplicationMessage::from_bytes(&bytes).unwrap();
+        assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
+    }
 
-        assert_eq!(
-            decoded,
-            VersionReplicationMessage::VersionManifest(manifest)
-        );
-
-        let mut intermediate = make_manifest();
-        intermediate.reference_intent = true;
-        let mut bytes = VersionReplicationMessage::VersionManifest(intermediate.clone())
+    #[test]
+    fn rejects_hash_size() {
+        let part = MultipartObjectPart {
+            part_number: 1,
+            size: 5,
+            hashes: HashMap::from([(
+                HASH_SHA256.to_string(),
+                vec![1u8; MAX_REPLICATION_HASH_BYTES + 1],
+            )]),
+        };
+        let mut manifest = make_manifest();
+        manifest.multipart = Some(MultipartObjectReplicationMetadata {
+            summary: MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: 1,
+                composite_hashes: HashMap::new(),
+            },
+            parts: vec![part],
+            checksum_type: MultipartChecksumType::Composite,
+        });
+        let bytes = VersionReplicationMessage::VersionManifest(manifest)
             .to_bytes()
             .unwrap();
-        assert_eq!(bytes.pop(), Some(0));
-        assert_eq!(bytes.pop(), Some(0));
-        assert_eq!(bytes.pop(), Some(0));
-        assert_eq!(
-            VersionReplicationMessage::from_bytes(&bytes).unwrap(),
-            VersionReplicationMessage::VersionManifest(intermediate)
-        );
+
+        assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
     }
 
     #[test]
@@ -523,17 +715,8 @@ mod tests {
         let bytes = VersionReplicationMessage::VersionManifest(manifest)
             .to_bytes()
             .unwrap();
-        let legacy: LegacyVersionReplicationMessage =
-            postcard::from_bytes(bytes.strip_prefix(VERSION_REPLICATION_MAGIC).unwrap()).unwrap();
-        let LegacyVersionReplicationMessage::VersionManifest(legacy_manifest) = &legacy;
-        let legacy_multipart = legacy_manifest.multipart.as_ref().unwrap();
-        assert_eq!(legacy_multipart.summary.part_count, 2);
-        assert_eq!(legacy_multipart.parts.len(), 2);
-
-        let mut legacy_bytes = VERSION_REPLICATION_MAGIC.to_vec();
-        legacy_bytes.extend(postcard::to_allocvec(&legacy).unwrap());
         let VersionReplicationMessage::VersionManifest(decoded) =
-            VersionReplicationMessage::from_bytes(&legacy_bytes).unwrap()
+            VersionReplicationMessage::from_bytes(&bytes).unwrap()
         else {
             panic!("expected version manifest")
         };
@@ -547,7 +730,5 @@ mod tests {
             Some(&composite_sha256)
         );
         assert!(!decoded.reference_intent);
-        assert!(decoded.origin.is_none());
-        assert!(decoded.upstream_sources.is_empty());
     }
 }

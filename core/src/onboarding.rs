@@ -17,12 +17,22 @@ pub enum OnboardingMode {
     Local,
 }
 
+/// Distinguishes what a secret may be redeemed for. An initial-administrator
+/// token must never be interchangeable with a node-enrollment secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnboardingPurpose {
+    NodeEnrollment,
+    InitialAdministrator,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingSecret {
     pub seed_url: String,
     pub enrollment_id: Ulid,
     pub secret: [u8; 32],
     pub mode: OnboardingMode,
+    pub realm_id: RealmId,
+    pub purpose: OnboardingPurpose,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +40,7 @@ pub struct OnboardingSecretRecord {
     pub enrollment_id: Ulid,
     pub secret_hash: String,
     pub mode: OnboardingMode,
+    pub purpose: OnboardingPurpose,
     pub expires_at: u64,
     pub claimed_node_id: Option<String>,
 }
@@ -241,7 +252,9 @@ pub fn bootstrap_issuer_proof_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket, credential_hash};
+    use super::{
+        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket, credential_hash,
+    };
     use crate::document::DocumentSyncTarget;
     use crate::structs::RealmId;
     use ed25519_dalek::SigningKey;
@@ -254,6 +267,8 @@ mod tests {
             enrollment_id: Ulid::generate(),
             secret: [7u8; 32],
             mode: OnboardingMode::Server,
+            realm_id: RealmId::from_bytes([5u8; 32]),
+            purpose: OnboardingPurpose::NodeEnrollment,
         };
 
         let encoded = secret.encode().unwrap();
@@ -268,6 +283,8 @@ mod tests {
             enrollment_id: Ulid::generate(),
             secret: [7u8; 32],
             mode: OnboardingMode::Server,
+            realm_id: RealmId::from_bytes([5u8; 32]),
+            purpose: OnboardingPurpose::NodeEnrollment,
         };
 
         assert_eq!(secret.secret_hash(), credential_hash(secret.secret));

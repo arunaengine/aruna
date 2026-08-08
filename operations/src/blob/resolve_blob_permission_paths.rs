@@ -1,13 +1,15 @@
-use crate::blob::blob_keyspace_helper::iter_hash_path_index_effect;
+use crate::blob::blob_keyspace_helper::iter_hash_page;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::HashPathIndexKey;
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
+
+pub const MAX_HASH_ALIASES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ResolveBlobPermissionPathsState {
@@ -27,6 +29,8 @@ pub enum ResolveBlobPermissionPathsError {
     ConversionError(#[from] ConversionError),
     #[error("No transaction found")]
     NoTransactionFound,
+    #[error("hash alias limit exceeded")]
+    TooManyAliases,
     #[error("ResolveBlobPermissionPaths did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -56,17 +60,22 @@ impl ResolveBlobPermissionPathsOperation {
     }
 
     fn emit_read_hash_aliases(&mut self) -> Result<Effects, ResolveBlobPermissionPathsError> {
-        Ok(smallvec![iter_hash_path_index_effect(
+        Ok(smallvec![iter_hash_page(
             &self.blake3_hash,
             None,
             self.txn_id,
+            MAX_HASH_ALIASES.saturating_add(1),
         )?])
     }
 
     fn parse_hash_aliases(
         &mut self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
+        next_start_after: Option<Key>,
     ) -> Result<Effects, ResolveBlobPermissionPathsError> {
+        if next_start_after.is_some() || values.len() > MAX_HASH_ALIASES {
+            return Err(ResolveBlobPermissionPathsError::TooManyAliases);
+        }
         let mut candidates = values
             .into_iter()
             .map(|(key, _)| HashPathIndexKey::from_bytes(key.as_ref()))
@@ -146,7 +155,11 @@ impl ResolveBlobPermissionPathsOperation {
 
     fn handle_read_hash_aliases(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
             return self.unexpected_event(
                 ResolveBlobPermissionPathsState::ReadHashAliases,
                 "Event::Storage(StorageEvent::IterResult)",
@@ -154,12 +167,15 @@ impl ResolveBlobPermissionPathsOperation {
             );
         };
 
-        match self.parse_hash_aliases(values) {
+        match self.parse_hash_aliases(values, next_start_after) {
             Ok(effects) => {
                 self.state = ResolveBlobPermissionPathsState::CommitTransaction;
                 effects
             }
-            Err(err) => self.fail(err),
+            Err(err) => {
+                let cleanup = self.abort();
+                self.fail_with_cleanup(err, cleanup)
+            }
         }
     }
 
@@ -233,7 +249,10 @@ impl Operation for ResolveBlobPermissionPathsOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolveBlobPermissionPathsOperation, ResolveBlobPermissionPathsState};
+    use super::{
+        MAX_HASH_ALIASES, ResolveBlobPermissionPathsError, ResolveBlobPermissionPathsOperation,
+        ResolveBlobPermissionPathsState,
+    };
     use crate::blob::blob_keyspace_helper::add_hash_path_index_effect;
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::{Effect, StorageEffect};
@@ -276,8 +295,14 @@ mod tests {
         assert_eq!(op.state, ResolveBlobPermissionPathsState::ReadHashAliases);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, txn_id: iter_txn_id, .. })]
-                if key_space == HASH_PATHS_INDEX_KEYSPACE && *iter_txn_id == Some(txn_id)
+            [Effect::Storage(StorageEffect::Iter {
+                key_space,
+                txn_id: iter_txn_id,
+                limit,
+                ..
+            })] if key_space == HASH_PATHS_INDEX_KEYSPACE
+                && *iter_txn_id == Some(txn_id)
+                && *limit == MAX_HASH_ALIASES + 1
         ));
     }
 
@@ -353,6 +378,32 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(op.state, ResolveBlobPermissionPathsState::Finish);
         assert_eq!(op.finalize().unwrap(), vec![alias_b, alias_b_dupe, alias_a]);
+    }
+
+    #[test]
+    fn rejects_alias_overflow() {
+        let mut op = ResolveBlobPermissionPathsOperation::new([10u8; 32]);
+        op.start();
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+        let values = (0..=MAX_HASH_ALIASES)
+            .map(|_| (Vec::<u8>::new().into(), Vec::<u8>::new().into()))
+            .collect();
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(matches!(
+            op.finalize(),
+            Err(ResolveBlobPermissionPathsError::TooManyAliases)
+        ));
     }
 
     #[tokio::test]

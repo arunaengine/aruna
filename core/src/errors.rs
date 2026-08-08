@@ -1,4 +1,4 @@
-use crate::structs::SourceConnectorKind;
+use crate::structs::{BackendLocation, SourceConnectorKind};
 use std::array::TryFromSliceError;
 use thiserror::Error;
 
@@ -10,6 +10,8 @@ pub enum AuthorizationError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     GlobError(#[from] globset::Error),
+    #[error(transparent)]
+    RestrictionLimit(#[from] crate::permission_path::RestrictionLimitError),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Invalid realm id")]
@@ -31,9 +33,12 @@ pub enum AuthorizationError {
 }
 
 #[derive(Debug, Error, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum BlobError {
     #[error("Channel closed")]
     ChannelClosed,
+    #[error("Cleanup is unsupported by the backend")]
+    CleanupUnsupported,
     #[error("Failed to send message")]
     SendError,
     #[error("Invalid effect type")]
@@ -59,6 +64,12 @@ pub enum BlobError {
     /// Client-sourced body stream fault; the request, not the node, is at fault.
     #[error("Stream failed: {0}")]
     StreamFailed(String),
+    /// The output location must be handed to durable cleanup before releasing capacity.
+    #[error("Write cleanup failed for {location:?}: {message}")]
+    WriteCleanup {
+        location: BackendLocation,
+        message: String,
+    },
     #[error("Blob exceeds the {limit} byte limit")]
     SizeLimitExceeded { limit: u64 },
     #[error("Read error: {0}")]

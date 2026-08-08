@@ -198,6 +198,19 @@ pub enum AdminDocumentOperation {
     RealmConfigBandPoolAssigned {
         pool: BandPool,
     },
+    RealmConfigPoliciesSet {
+        policies: Vec<crate::request_policy::RequestPolicy>,
+    },
+    /// Revokes one token hash until expiry. The trusted origin attests its owner;
+    /// receivers recheck owner or admin authority without replicating the token.
+    RealmConfigTokenRevoked {
+        token_hash: String,
+        expires_at: u64,
+        token_owner: UserId,
+    },
+    GroupPoliciesSet {
+        policies: Vec<crate::request_policy::RequestPolicy>,
+    },
 }
 
 #[cfg(test)]
@@ -236,6 +249,17 @@ mod tests {
             role_id,
             name: "admin".to_string(),
             permissions: BTreeMap::from([("/dataset/**".to_string(), Permission::READ)]),
+        }
+    }
+
+    fn request_policy(expression: &str) -> crate::request_policy::RequestPolicy {
+        crate::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([2; 16]),
+            name: "test".to_string(),
+            kind: crate::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
         }
     }
 
@@ -386,6 +410,17 @@ mod tests {
                     start: 3,
                     end: 1027,
                 },
+            },
+            AdminDocumentOperation::RealmConfigPoliciesSet {
+                policies: vec![request_policy("permission == 'write'")],
+            },
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: blake3::hash(b"bearer-token").to_string(),
+                expires_at: 1_900_000_000,
+                token_owner: user_id(8),
+            },
+            AdminDocumentOperation::GroupPoliciesSet {
+                policies: vec![request_policy("anonymous")],
             },
         ];
 

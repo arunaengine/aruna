@@ -7,12 +7,13 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
-    MetadataCreateCrateRequest, MetadataCreateEventPayload, MetadataCreateEventRecord,
-    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
+    METADATA_RAW_BYTES_LIMIT, MetadataCreateCrateRequest, MetadataCreateEventPayload,
+    MetadataCreateEventRecord, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
+    MetadataRequestDurability, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    metadata_create_acceptance_key, metadata_create_acceptance_write_entry,
+    metadata_create_acceptance_key, metadata_create_acceptance_write_entry, raw_budget_entry,
 };
 use aruna_core::structs::{
     Actor, BindingError, DocumentClass, MetadataRegistryRecord, PlacementRef, PlacementScope,
@@ -34,8 +35,9 @@ use crate::metadata::repository::{
 };
 use crate::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
-    strategy_for_target,
+    resolve_shard_holders, strategy_for_target,
 };
+use crate::sync_placement::sort_node_ids;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentConfig {
@@ -130,6 +132,10 @@ pub enum CreateMetadataDocumentError {
     ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("operation did not finish")]
+    NotFinished,
+    #[error("metadata raw update budget exceeded")]
+    RawLimit,
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -206,8 +212,22 @@ impl CreateMetadataDocumentOperation {
         u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
     }
 
-    fn holder_node_ids(&self) -> Vec<NodeId> {
-        vec![self.config.actor.node_id]
+    fn holder_node_ids(
+        &self,
+        config: Option<&RealmConfigDocument>,
+        placement: &PlacementRef,
+    ) -> Result<Vec<NodeId>, CreateMetadataDocumentError> {
+        let Some(config) = config else {
+            return Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
+                "realm config unavailable".to_string(),
+            ));
+        };
+        let mut holders = resolve_shard_holders(config, placement);
+        sort_node_ids(&mut holders);
+        if !holders.contains(&self.config.actor.node_id) {
+            return Err(CreateMetadataDocumentError::OriginHoldsNoBucket);
+        }
+        Ok(holders)
     }
 
     /// Resolves placement from the minted id, never from current path policy.
@@ -418,22 +438,52 @@ impl CreateMetadataDocumentOperation {
             None => None,
         };
         match self.placement_from_id(config.as_ref()) {
-            Ok(placement) => self.append_create_event_effect(placement),
+            Ok(placement) => match self.holder_node_ids(config.as_ref(), &placement) {
+                Ok(holders) => self.append_create_event(placement, holders),
+                Err(error) => self.fail(error),
+            },
             Err(error) => self.fail(error),
         }
     }
 
-    fn append_create_event_effect(&mut self, placement: PlacementRef) -> Effects {
+    fn append_create_event(&mut self, placement: PlacementRef, holders: Vec<NodeId>) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(CreateMetadataDocumentError::MissingTransaction);
         };
-        let record = self.build_record(self.holder_node_ids(), placement);
+        let record = self.build_record(holders, placement);
         let create_event = self.create_event_record(&record);
         self.create_event = Some(create_event.clone());
         self.record = Some(create_event.record.clone());
         self.state = CreateMetadataDocumentState::AppendCreateEvent;
+        let encoded_bytes = match postcard::experimental::serialized_size(&create_event) {
+            Ok(size) => size,
+            Err(error) => {
+                return self.fail(CreateMetadataDocumentError::ConversionError(error.into()));
+            }
+        };
+        let encoded_bytes = match u64::try_from(encoded_bytes) {
+            Ok(size) => size,
+            Err(_) => return self.fail(CreateMetadataDocumentError::RawLimit),
+        };
+        if encoded_bytes > METADATA_RAW_BYTES_LIMIT {
+            return self.fail(CreateMetadataDocumentError::RawLimit);
+        }
+        let Some(raw_budget) = raw_quotas(
+            create_event.record.document_id,
+            &create_event.record.holder_node_ids,
+            create_event.node_id,
+            encoded_bytes,
+        )
+        .and_then(|budgets| {
+            budgets
+                .into_iter()
+                .find(|budget| budget.node_id == create_event.node_id)
+        }) else {
+            return self.fail(CreateMetadataDocumentError::RawLimit);
+        };
         let writes = metadata_create_event_and_pending_projection_write_entries(&create_event)
             .and_then(|mut writes| {
+                writes.push(raw_budget_entry(&raw_budget)?);
                 writes.push(metadata_create_acceptance_write_entry(&create_event)?);
                 Ok(writes)
             });
@@ -892,7 +942,7 @@ impl Operation for CreateMetadataDocumentOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .expect("metadata create operation must set output")
+            .unwrap_or(Err(CreateMetadataDocumentError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -918,11 +968,12 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_EVENT_LOG_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+        METADATA_RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::metadata::{
         MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataError,
-        MetadataEvent, MetadataRequestDurability,
+        MetadataEvent, MetadataRawOriginBudget, MetadataRequestDurability,
     };
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::{
@@ -1239,7 +1290,7 @@ mod tests {
             panic!("expected metadata create event append");
         };
         assert!(txn_id.is_some());
-        assert_eq!(writes.len(), 3);
+        assert_eq!(writes.len(), 4);
         let (_, key, value) = writes
             .iter()
             .find(|(key_space, _, _)| key_space == METADATA_EVENT_LOG_KEYSPACE)
@@ -1252,7 +1303,14 @@ mod tests {
         let event: MetadataCreateEventRecord =
             postcard::from_bytes(value.as_ref()).expect("create event decodes");
         assert_eq!(event.record.document_id, document_id);
-        assert_eq!(event.record.holder_node_ids, vec![actor.node_id]);
+        assert!(event.record.holder_node_ids.contains(&actor.node_id));
+        assert!(
+            event
+                .record
+                .holder_node_ids
+                .windows(2)
+                .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+        );
         assert_eq!(event.user_id, actor.user_id);
         assert_eq!(event.node_id, actor.node_id);
         assert!(matches!(
@@ -1281,6 +1339,23 @@ mod tests {
             &metadata_pending_projection_key(document_id, event.event_id)
         );
         assert!(marker_value.as_ref().is_empty());
+
+        assert!(
+            writes
+                .iter()
+                .any(|(key_space, _, _)| key_space == METADATA_RAW_BUDGET_KEYSPACE)
+        );
+        let (_, _, budget_value) = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == METADATA_RAW_BUDGET_KEYSPACE)
+            .expect("raw origin budget write exists");
+        let budget: MetadataRawOriginBudget =
+            postcard::from_bytes(budget_value).expect("raw origin budget decodes");
+        assert_eq!(budget.document_id, document_id);
+        assert_eq!(budget.node_id, actor.node_id);
+        assert_eq!(budget.events, 1);
+        assert!(budget.event_limit >= budget.events);
+        assert!(budget.byte_limit >= budget.encoded_bytes);
 
         key.clone()
     }
@@ -1423,13 +1498,13 @@ mod tests {
         assert_fence_read(effects.as_slice());
         let effects = operation.step(create_fence_read(&actor, document_id, Some(&realm_config)));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
-        assert_eq!(
-            operation
-                .record
-                .as_ref()
-                .map(|record| &record.holder_node_ids),
-            Some(&vec![actor.node_id])
-        );
+        assert!(operation.record.as_ref().is_some_and(|record| {
+            record.holder_node_ids.contains(&actor.node_id)
+                && record
+                    .holder_node_ids
+                    .windows(2)
+                    .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+        }));
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],

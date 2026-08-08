@@ -109,6 +109,7 @@ async fn cleanup_temporary_workspace(ctx: &JobContext, for_job: JobId) -> Result
                 realm_id: parent.created_by.realm_id,
                 node_id: parent.owner_node_id,
                 deleted_by: parent.created_by,
+                restrictions: None,
             },
         )
         .await;
@@ -570,7 +571,7 @@ mod tests {
             access_key: access_key.to_string(),
             user_identity: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
             group_id: Ulid::from_bytes([3; 16]),
-            secret: "secret".to_string(),
+            secret: aruna_core::credential_seal::SealedS3Secret::empty(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: [4; 32],
@@ -661,10 +662,8 @@ mod tests {
         }
         let stored = drive(GetUserAccessOperation::new(access.access_key), &ctx.driver)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
-        assert_eq!(stored.revoked_at, Some(revoked_at));
+        assert!(stored.is_none());
     }
 
     #[tokio::test]

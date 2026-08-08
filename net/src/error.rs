@@ -16,6 +16,12 @@ pub enum NetError {
     #[error("Stream error: {0}")]
     Stream(String),
 
+    /// Inbound sync stream refused before any payload byte was read (unknown
+    /// peer or exhausted admission budget). No local state can have changed, so
+    /// callers must drop it without a full-topic reconcile.
+    #[error("Admission rejected: {0}")]
+    AdmissionRejected(String),
+
     #[error("Timeout after {0:?}")]
     Timeout(Duration),
 
@@ -33,6 +39,14 @@ pub enum NetError {
 
     #[error("Channel closed")]
     ChannelClosed,
+}
+
+impl NetError {
+    /// Whether this rejection happened before any payload processing, so no
+    /// partial local state can exist to reconcile.
+    pub fn is_admission_rejection(&self) -> bool {
+        matches!(self, NetError::AdmissionRejected(_))
+    }
 }
 
 impl From<std::io::Error> for NetError {

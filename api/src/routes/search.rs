@@ -7,7 +7,7 @@ use crate::routes::metadata::{
 use crate::routes::users::MIN_SEARCH_QUERY_CHARS;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
@@ -125,6 +125,9 @@ pub struct GroupsSection {
     pub hits: Vec<GroupHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// True when the visibility scan stopped at the round cap with more raw
+    /// matches pending before a visible page was filled.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -315,8 +318,15 @@ pub async fn unified_search(
             params.mode.clone(),
         ),
         run_buckets(&state, &auth, types.buckets, &q, bearer, limit),
-        run_groups(&state, types.groups, &q, limit, params.cursor.clone()),
-        run_users(&state, types.users, &q, limit, params.cursor.clone()),
+        run_groups(
+            &state,
+            &auth,
+            types.groups,
+            &q,
+            limit,
+            params.cursor.clone()
+        ),
+        run_users(&state, &auth, types.users, &q, limit, params.cursor.clone()),
     );
 
     Ok((
@@ -438,6 +448,7 @@ fn map_documents_section(result: MetadataSearchExecution) -> DocumentsSection {
 
 async fn run_groups(
     state: &ServerState,
+    auth: &AuthContext,
     requested: bool,
     query: &str,
     limit: usize,
@@ -446,37 +457,82 @@ async fn run_groups(
     if !requested {
         return Ok(None);
     }
-    let output = drive(
-        SearchGroupsOperation::new(SearchGroupsInput {
-            query: query.to_string(),
-            limit,
-            start_after: cursor,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let realm_id = state.get_realm_id();
+    let mut hits: Vec<GroupHit> = Vec::new();
+    let mut next_cursor: Option<String> = None;
+    let mut scan_cursor = cursor;
+    let mut truncated = false;
+    // Fill the page across raw scans so a hidden first match cannot become an
+    // empty page; the continuation cursor is only ever a visible group's id.
+    'fill: for round in 0..MAX_GROUP_SCAN_ROUNDS {
+        let output = drive(
+            SearchGroupsOperation::new(SearchGroupsInput {
+                query: query.to_string(),
+                limit,
+                start_after: scan_cursor.clone(),
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        let raw_next = output.next_start_after;
+        let total = output.groups.len();
+        for (index, group) in output.groups.into_iter().enumerate() {
+            // Per-result visibility: only disclose a group the caller can read,
+            // mirroring document search (READ on the group's data root).
+            let path = format!("/{realm_id}/g/{}/data/**", group.group_id);
+            if crate::auth::ensure_permission(state, auth, path, Permission::READ)
+                .await
+                .is_ok()
+            {
+                let group_id = group.group_id.to_string();
+                hits.push(GroupHit {
+                    group_id: group_id.clone(),
+                    display_name: group.display_name,
+                });
+                if hits.len() >= limit {
+                    let more = index + 1 < total || raw_next.is_some();
+                    next_cursor = more.then_some(group_id);
+                    break 'fill;
+                }
+            }
+        }
+        match raw_next {
+            Some(key) => scan_cursor = Some(key),
+            None => break 'fill,
+        }
+        // The round cap stopped the scan while raw matches remain and the page
+        // is not yet full: report truncation instead of a false completion.
+        if round + 1 == MAX_GROUP_SCAN_ROUNDS {
+            truncated = true;
+        }
+    }
     Ok(Some(GroupsSection {
-        hits: output
-            .groups
-            .into_iter()
-            .map(|group| GroupHit {
-                group_id: group.group_id.to_string(),
-                display_name: group.display_name,
-            })
-            .collect(),
-        next_cursor: output.next_start_after,
+        hits,
+        next_cursor,
+        truncated,
     }))
 }
 
+/// Bounds the visibility fill loop so a realm of hidden matches cannot make one
+/// request scan without limit; the operation already batches storage internally.
+const MAX_GROUP_SCAN_ROUNDS: usize = 64;
+
 async fn run_users(
     state: &ServerState,
+    auth: &AuthContext,
     requested: bool,
     query: &str,
     limit: usize,
     cursor: Option<String>,
 ) -> ServerResult<Option<UsersSection>> {
     if !requested {
+        return Ok(None);
+    }
+    // The user directory is an admin-scoped read, so a caller without it gets no
+    // user section instead of a failed search.
+    let path = format!("/{}/admin/u/**", state.get_realm_id());
+    if !crate::auth::permission_granted(state, auth, path, Permission::READ).await? {
         return Ok(None);
     }
     let output = drive(
@@ -518,6 +574,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
     };
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, User,
@@ -541,6 +598,7 @@ mod tests {
         _metadata_dir: TempDir,
         state: Arc<ServerState>,
         auth: AuthContext,
+        actor: Actor,
         realm_id: RealmId,
         groups: [Ulid; 2],
         users: [UserId; 2],
@@ -571,10 +629,17 @@ mod tests {
         ));
     }
 
-    async fn seed_group(state: &ServerState, actor: &Actor, group_id: Ulid, name: &str) {
+    async fn seed_group(
+        state: &ServerState,
+        actor: &Actor,
+        group_id: Ulid,
+        name: &str,
+        policies: Vec<RequestPolicy>,
+    ) {
         let realm = actor.realm_id;
-        let auth_doc =
+        let mut auth_doc =
             GroupAuthorizationDocument::new_default_group_doc(actor.user_id, realm, group_id);
+        auth_doc.policies = policies;
         let group = Group {
             display_name: name.to_string(),
             group_id,
@@ -596,6 +661,53 @@ mod tests {
             auth_doc.to_bytes(actor).unwrap(),
         )
         .await;
+    }
+
+    async fn seed_bucket(state: &ServerState, actor: &Actor, bucket: &str, group_id: Ulid) {
+        write_bytes(
+            state,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec(),
+            BucketInfo {
+                group_id,
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: actor.user_id,
+                cors_configuration: None,
+                replication: None,
+                storage_routing: Vec::new(),
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+    }
+
+    /// Rewrites the realm config with the given realm-scoped request policies,
+    /// keeping the placement and node entries the fan-out needs.
+    async fn seed_policies(state: &ServerState, actor: &Actor, policies: Vec<RequestPolicy>) {
+        let realm = actor.realm_id;
+        let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        config.request_policies = policies;
+        write_bytes(
+            state,
+            REALM_CONFIG_KEYSPACE,
+            realm.as_bytes().to_vec(),
+            config.to_bytes(actor).unwrap(),
+        )
+        .await;
+    }
+
+    fn deny_policy(expression: &str) -> RequestPolicy {
+        RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "hide-bucket".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
+        }
     }
 
     async fn seed_user(state: &ServerState, actor: &Actor, user_id: UserId, name: &str) {
@@ -658,46 +770,26 @@ mod tests {
             .await,
         );
 
+        // The fixture user holds every realm role so the user directory section
+        // of a unified search is authorized.
+        let mut realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm);
+        for role in realm_doc.roles.values_mut() {
+            role.assigned_users.insert(user_id);
+        }
         write_bytes(
             &state,
             AUTH_KEYSPACE,
             realm.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm)
-                .to_bytes(&actor)
-                .unwrap(),
+            realm_doc.to_bytes(&actor).unwrap(),
         )
         .await;
 
-        let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
-        config.seed_default_placement();
-        config.ensure_node(node_id, RealmNodeKind::Server);
-        write_bytes(
-            &state,
-            REALM_CONFIG_KEYSPACE,
-            realm.as_bytes().to_vec(),
-            config.to_bytes(&actor).unwrap(),
-        )
-        .await;
+        seed_policies(&state, &actor, Vec::new()).await;
 
         let groups = [Ulid::from_bytes([1u8; 16]), Ulid::from_bytes([2u8; 16])];
-        seed_group(&state, &actor, groups[0], "alpha-team").await;
-        seed_group(&state, &actor, groups[1], "alpha-squad").await;
-        write_bytes(
-            &state,
-            S3_BUCKET_KEYSPACE,
-            b"alpha-bucket".to_vec(),
-            BucketInfo {
-                group_id: groups[0],
-                created_at: SystemTime::UNIX_EPOCH,
-                created_by: user_id,
-                cors_configuration: None,
-                replication: None,
-                storage_routing: Vec::new(),
-            }
-            .to_bytes()
-            .unwrap(),
-        )
-        .await;
+        seed_group(&state, &actor, groups[0], "alpha-team", Vec::new()).await;
+        seed_group(&state, &actor, groups[1], "alpha-squad", Vec::new()).await;
+        seed_bucket(&state, &actor, "alpha-bucket", groups[0]).await;
 
         let users = [
             UserId::local(Ulid::from_bytes([1u8; 16]), realm),
@@ -715,6 +807,7 @@ mod tests {
                 realm_id: realm,
                 path_restrictions: None,
             },
+            actor,
             realm_id: realm,
             groups,
             users,
@@ -801,6 +894,87 @@ mod tests {
         assert!(resp.users.is_some());
     }
 
+    async fn bucket_hits(fx: &Fixture, query: &str, limit: usize) -> Vec<String> {
+        let (_, Json(section)) = bucket_search(
+            State(fx.state.clone()),
+            Extension(Some(fx.auth.clone())),
+            Extension(None),
+            Query(BucketSearchParams {
+                q: query.to_string(),
+                limit: Some(limit),
+            }),
+        )
+        .await
+        .unwrap();
+        section.hits.into_iter().map(|hit| hit.bucket).collect()
+    }
+
+    #[tokio::test]
+    async fn policy_hides_bucket() {
+        // A realm deny policy must hide the bucket from the dedicated route and
+        // from the buckets section of the unified search alike.
+        let fx = setup().await;
+        seed_bucket(&fx.state, &fx.actor, "beta-bucket", fx.groups[1]).await;
+        seed_policies(
+            &fx.state,
+            &fx.actor,
+            vec![deny_policy("path.endsWith('/alpha-bucket')")],
+        )
+        .await;
+
+        assert_eq!(bucket_hits(&fx, "bucket", 10).await, ["beta-bucket"]);
+
+        let unified = search(
+            &fx,
+            SearchParams {
+                types: Some("buckets".to_string()),
+                ..params("bucket")
+            },
+        )
+        .await
+        .unwrap();
+        let hits = unified.buckets.unwrap().hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bucket, "beta-bucket");
+    }
+
+    #[tokio::test]
+    async fn group_hides_bucket() {
+        // A group-scoped deny policy hides that group's bucket only.
+        let fx = setup().await;
+        seed_bucket(&fx.state, &fx.actor, "beta-bucket", fx.groups[1]).await;
+        seed_group(
+            &fx.state,
+            &fx.actor,
+            fx.groups[0],
+            "alpha-team",
+            vec![deny_policy("path.endsWith('/alpha-bucket')")],
+        )
+        .await;
+
+        assert_eq!(bucket_hits(&fx, "bucket", 10).await, ["beta-bucket"]);
+    }
+
+    #[tokio::test]
+    async fn policy_fills_page() {
+        // A hidden first match must not shorten a page that later matches can
+        // still fill.
+        let fx = setup().await;
+        seed_bucket(&fx.state, &fx.actor, "beta-bucket", fx.groups[1]).await;
+        seed_bucket(&fx.state, &fx.actor, "gamma-bucket", fx.groups[1]).await;
+        seed_policies(
+            &fx.state,
+            &fx.actor,
+            vec![deny_policy("path.endsWith('/alpha-bucket')")],
+        )
+        .await;
+
+        assert_eq!(
+            bucket_hits(&fx, "bucket", 2).await,
+            ["beta-bucket", "gamma-bucket"]
+        );
+    }
+
     #[tokio::test]
     async fn searches_buckets() {
         let fx = setup().await;
@@ -832,6 +1006,41 @@ mod tests {
         assert_eq!(unified.buckets.unwrap().hits.len(), 1);
         assert!(unified.groups.is_none());
         assert!(unified.users.is_none());
+    }
+
+    #[tokio::test]
+    async fn filters_group_hits() {
+        // A same-realm caller who is not a group member sees no group hits,
+        // while a member still sees both matching groups.
+        let fx = setup().await;
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::from_bytes([77u8; 16]), fx.realm_id),
+            realm_id: fx.realm_id,
+            path_restrictions: None,
+        };
+        let (_, Json(resp)) = unified_search(
+            State(fx.state.clone()),
+            Extension(Some(stranger)),
+            Extension(None),
+            Query(SearchParams {
+                types: Some("groups".to_string()),
+                ..params("alpha")
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(resp.groups.unwrap().hits.is_empty());
+
+        let member = search(
+            &fx,
+            SearchParams {
+                types: Some("groups".to_string()),
+                ..params("alpha")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(member.groups.unwrap().hits.len(), 2);
     }
 
     #[tokio::test]
@@ -936,6 +1145,98 @@ mod tests {
         assert_eq!(second.hits.len(), 1);
         assert_eq!(second.hits[0].group_id, fx.groups[1].to_string());
         assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn skips_hidden_group() {
+        // A hidden first match at limit 1 must not yield an empty page whose
+        // cursor exposes the hidden group's id.
+        let fx = setup().await;
+        let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        let hidden_owner = UserId::local(Ulid::from_bytes([240u8; 16]), fx.realm_id);
+        let viewer = UserId::local(Ulid::from_bytes([241u8; 16]), fx.realm_id);
+        let hidden_actor = Actor {
+            node_id,
+            user_id: hidden_owner,
+            realm_id: fx.realm_id,
+        };
+        let viewer_actor = Actor {
+            node_id,
+            user_id: viewer,
+            realm_id: fx.realm_id,
+        };
+        seed_group(
+            &fx.state,
+            &hidden_actor,
+            fx.groups[0],
+            "alpha-hidden",
+            Vec::new(),
+        )
+        .await;
+        seed_group(
+            &fx.state,
+            &viewer_actor,
+            fx.groups[1],
+            "alpha-visible",
+            Vec::new(),
+        )
+        .await;
+
+        let viewer_auth = AuthContext {
+            user_id: viewer,
+            realm_id: fx.realm_id,
+            path_restrictions: None,
+        };
+        let section = run_groups(&fx.state, &viewer_auth, true, "alpha", 1, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(section.hits.len(), 1);
+        assert_eq!(section.hits[0].group_id, fx.groups[1].to_string());
+        assert_ne!(
+            section.next_cursor.as_deref(),
+            Some(fx.groups[0].to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn caps_report_truncation() {
+        // More hidden matches than the scan cap must report truncation instead of
+        // a false completion with an empty page and no cursor.
+        let fx = setup().await;
+        let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        let hidden_owner = UserId::local(Ulid::from_bytes([230u8; 16]), fx.realm_id);
+        let viewer = UserId::local(Ulid::from_bytes([231u8; 16]), fx.realm_id);
+        let hidden_actor = Actor {
+            node_id,
+            user_id: hidden_owner,
+            realm_id: fx.realm_id,
+        };
+        for index in 0..=MAX_GROUP_SCAN_ROUNDS as u8 {
+            let mut bytes = [16u8; 16];
+            bytes[15] = index;
+            seed_group(
+                &fx.state,
+                &hidden_actor,
+                Ulid::from_bytes(bytes),
+                &format!("alpha-hidden-{index}"),
+                Vec::new(),
+            )
+            .await;
+        }
+
+        let viewer_auth = AuthContext {
+            user_id: viewer,
+            realm_id: fx.realm_id,
+            path_restrictions: None,
+        };
+        let section = run_groups(&fx.state, &viewer_auth, true, "alpha", 1, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(section.hits.is_empty());
+        assert!(section.next_cursor.is_none());
+        assert!(section.truncated);
     }
 
     #[tokio::test]

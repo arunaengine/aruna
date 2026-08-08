@@ -1,10 +1,10 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth,
+    ValidatedArunaBearerTokenCarrier, ensure_permission_with, parse_group_id, require_realm_auth,
     require_unrestricted_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::{AuthorizationError, StorageError};
+use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
@@ -14,11 +14,11 @@ use aruna_core::structs::{
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{MetaResourceId, StructuredId};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, mint_forward_document, mint_local_document,
 };
+#[cfg(test)]
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
 use aruna_operations::jobs::service::submit_export_job;
@@ -30,8 +30,8 @@ use aruna_operations::metadata::api::{
     MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     forwarded_bearer, list_visible_metadata_documents as run_list_visible_metadata_documents,
-    lookup_metadata_path as run_lookup_metadata_path, query_metadata as run_query_metadata,
-    query_metadata_document as run_query_metadata_document,
+    load_realm_config, lookup_metadata_path as run_lookup_metadata_path,
+    query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
     references_metadata as run_references_metadata, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::forward::{
@@ -43,6 +43,7 @@ use aruna_operations::metadata::forward::{
     update_metadata_document_routed as run_update_metadata_document,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
@@ -636,26 +637,58 @@ pub async fn create_metadata_document(
             },
         ),
     };
-    if MetadataRegistryRecord::normalize_document_path(&path).is_empty() {
+    let path = MetadataRegistryRecord::normalize_document_path(&path);
+    if path.is_empty() {
         return Err(ServerError::BadRequest);
     }
     let ctx = state.get_ctx();
-    if !is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
+    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
         .await
-        .map_err(map_metadata_api_error)?
-    {
+        .map_err(map_metadata_api_error)?;
+    let realm_config = load_realm_config(ctx.as_ref(), state.get_realm_id())
+        .await
+        .ok_or(ServerError::ServiceUnavailable)?;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: state.get_realm_id(),
+    };
+    let document_id = if user_origin {
+        mint_forward_document(&realm_config, &actor, group_id, &path)
+            .map_err(map_create_error)?
+            .as_ulid()
+    } else {
+        match mint_local_document(&realm_config, &actor, group_id, &path) {
+            Ok(document_id) => document_id.as_ulid(),
+            Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
+                mint_forward_document(&realm_config, &actor, group_id, &path)
+                    .map_err(map_create_error)?
+                    .as_ulid()
+            }
+            Err(error) => return Err(map_create_error(error)),
+        }
+    };
+    if !user_origin {
         ensure_metadata_write_scope(&state, &auth, group_id).await?;
+        ensure_permission(
+            &state,
+            auth.clone(),
+            MetadataRegistryRecord::permission_path_for(
+                &auth.realm_id,
+                group_id,
+                &path,
+                document_id,
+            ),
+            Permission::WRITE,
+        )
+        .await?;
     }
     let created = run_create_metadata_document(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
             CreateMetadataDocumentConfig {
-                actor: Actor {
-                    node_id: state.get_node_id(),
-                    user_id: auth.user_id,
-                    realm_id: state.get_realm_id(),
-                },
+                actor,
                 group_id,
-                document_id: Ulid::nil(),
+                document_id,
                 document_path: path,
                 public,
                 payload,
@@ -1002,11 +1035,12 @@ pub async fn submit_rocrate_export(
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_permission(
+    ensure_permission_with(
         &state,
-        auth.clone(),
+        &auth,
         record.permission_path,
         Permission::READ,
+        PolicyRequestExtras::operation("metadata.read"),
     )
     .await?;
     let result = submit_export_job(
@@ -1713,6 +1747,7 @@ pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerErro
         CreateMetadataDocumentError::ClockHealth(_) => {
             ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
         }
+        CreateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1720,6 +1755,7 @@ pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerErro
 fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
     match error {
         UpdateMetadataDocumentError::DocumentNotFound => ServerError::NotFound,
+        UpdateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
         UpdateMetadataDocumentError::MetadataError(metadata_error) => {
             map_metadata_error(metadata_error)
         }
@@ -1835,30 +1871,9 @@ async fn ensure_permission(
     if auth.realm_id != state.get_realm_id() {
         return Err(ServerError::Forbidden);
     }
-    let allowed = aruna_core::telemetry::time_stage(
-        "permission",
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth,
-                path,
-                required_permission,
-            }),
-            &state.get_ctx(),
-        ),
-    )
-    .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(err.to_string()),
-    })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
-    }
+    // Route metadata writes through the single authorization boundary so realm
+    // and group request policies apply here as on every other REST path.
+    crate::auth::ensure_permission(state, &auth, path, required_permission).await
 }
 
 async fn load_metadata_record_by_document(
@@ -2971,7 +2986,77 @@ mod tests {
             Query(MetadataRoCrateExportParams::default()),
         )
         .await;
-        assert!(matches!(result, Err(ServerError::Unauthorized)));
+        assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn hides_document_existence() {
+        // Present-but-unreadable and truly-absent both answer NotFound so a
+        // caller cannot probe document existence by id.
+        let test = setup_state().await;
+        let realm_id = test.auth.realm_id;
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/secret".to_string(),
+                    name: "Secret".to_string(),
+                    description: "Secret metadata".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                    public: false,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let document_id = created.summary.document_id.clone();
+
+        let owner = get_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Path(document_id.clone()),
+        )
+        .await;
+        assert!(owner.is_ok());
+
+        let stranger = AuthContext {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        let stranger_result = get_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(stranger)),
+            Extension(None),
+            Path(document_id.clone()),
+        )
+        .await;
+        assert!(matches!(stranger_result, Err(ServerError::NotFound)));
+
+        let anonymous_result = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Path(document_id),
+        )
+        .await;
+        assert!(matches!(anonymous_result, Err(ServerError::NotFound)));
+
+        let absent = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Path(Ulid::generate().to_string()),
+        )
+        .await;
+        assert!(matches!(absent, Err(ServerError::NotFound)));
     }
 
     #[tokio::test]
