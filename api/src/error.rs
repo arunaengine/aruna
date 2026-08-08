@@ -66,6 +66,8 @@ pub enum TokenError {
     PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
     #[error("Token expired")]
     Expired,
+    #[error("Token lifetime exceeds the revocable maximum")]
+    LifetimeTooLong,
     #[error("Invalid server token")]
     InvalidServerToken,
     #[error("Error decoding AuthContext")]
@@ -89,6 +91,7 @@ impl From<ArunaBearerTokenError> for TokenError {
             ArunaBearerTokenError::TokenRevoked => Self::TokenBlacklisted,
             ArunaBearerTokenError::InvalidIssuerKey => Self::InvalidIssuerKey,
             ArunaBearerTokenError::Expired => Self::Expired,
+            ArunaBearerTokenError::LifetimeTooLong => Self::LifetimeTooLong,
             ArunaBearerTokenError::InvalidServerToken => Self::InvalidServerToken,
             ArunaBearerTokenError::AuthContextConversion(error) => {
                 Self::AuthContextConversion(error)

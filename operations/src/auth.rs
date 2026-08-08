@@ -45,6 +45,8 @@ pub enum ArunaBearerTokenError {
     InvalidIssuerKey,
     #[error("Token expired")]
     Expired,
+    #[error("Token lifetime exceeds the revocable maximum")]
+    LifetimeTooLong,
     #[error("Invalid server token")]
     InvalidServerToken,
     #[error(transparent)]
@@ -176,6 +178,11 @@ where
     if now > claims.exp {
         return Err(ArunaBearerTokenError::Expired);
     }
+    // A token living past this bound could never enter the replicated
+    // revocation set (`valid_revocation_expiry`), so it must not validate.
+    if claims.exp.saturating_sub(now) > aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS {
+        return Err(ArunaBearerTokenError::LifetimeTooLong);
+    }
 
     validate_issuer_trust(state, claims).await
 }
@@ -280,9 +287,9 @@ impl IssuerKeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::Actor;
-    use aruna_core::UserId;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
 
