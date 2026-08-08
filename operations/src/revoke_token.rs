@@ -145,6 +145,8 @@ pub enum RevokeTokenError {
     CapacityReached,
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -889,7 +891,7 @@ impl Operation for RevokeTokenOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.expect("revoke token operation must set output")
+        self.output.unwrap_or(Err(RevokeTokenError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {

@@ -107,6 +107,8 @@ pub enum UpdateMetadataDocumentError {
     DocumentNotFound,
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("metadata raw update budget exceeded")]
     RawLimit,
     #[error("topic announcement failed: {0}")]
@@ -807,7 +809,7 @@ impl Operation for UpdateMetadataDocumentOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .expect("metadata update operation must set output")
+            .unwrap_or(Err(UpdateMetadataDocumentError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {

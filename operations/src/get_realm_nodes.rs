@@ -37,6 +37,8 @@ enum GetRealmNodesState {
 pub enum GetRealmNodesError {
     #[error(transparent)]
     DhtError(#[from] DhtError),
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -107,8 +109,7 @@ impl Operation for GetRealmNodesOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .expect("realm nodes get operation must set output")
+        self.output.unwrap_or(Err(GetRealmNodesError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {

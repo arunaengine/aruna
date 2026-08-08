@@ -48,6 +48,8 @@ pub enum GetMetadataDocumentError {
     MetadataError(#[from] MetadataError),
     #[error("document not found")]
     DocumentNotFound,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -199,7 +201,8 @@ impl Operation for GetMetadataDocumentOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.expect("metadata get operation must set output")
+        self.output
+            .unwrap_or(Err(GetMetadataDocumentError::NotFinished))
     }
 
     // A read of a document that does not exist yet, or whose graph has not

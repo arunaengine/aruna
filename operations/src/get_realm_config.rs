@@ -34,6 +34,8 @@ pub enum GetRealmConfigError {
     ConversionError(#[from] ConversionError),
     #[error("document not found")]
     DocumentNotFound,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -125,8 +127,7 @@ impl Operation for GetRealmConfigOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .expect("realm config get operation must set output")
+        self.output.unwrap_or(Err(GetRealmConfigError::NotFinished))
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
@@ -134,5 +135,21 @@ impl Operation for GetRealmConfigOperation {
             return smallvec![];
         }
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_finalize_errors() {
+        // A deadline can finalize an operation that never reached a terminal
+        // state; that must report an error instead of panicking.
+        let mut operation = GetRealmConfigOperation::new(RealmId::from_bytes([7; 32]));
+        operation.start();
+
+        assert!(!operation.is_complete());
+        assert_eq!(operation.finalize(), Err(GetRealmConfigError::NotFinished));
     }
 }

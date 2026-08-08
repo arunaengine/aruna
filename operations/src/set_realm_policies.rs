@@ -83,6 +83,8 @@ pub enum SetRealmPoliciesError {
     InvalidPolicies { reason: String },
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -359,7 +361,7 @@ impl Operation for SetRealmPoliciesOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .expect("set realm policies operation must set output")
+            .unwrap_or(Err(SetRealmPoliciesError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {

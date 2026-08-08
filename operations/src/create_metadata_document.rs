@@ -132,6 +132,8 @@ pub enum CreateMetadataDocumentError {
     ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("metadata raw update budget exceeded")]
     RawLimit,
     #[error("topic announcement failed: {0}")]
@@ -940,7 +942,7 @@ impl Operation for CreateMetadataDocumentOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .expect("metadata create operation must set output")
+            .unwrap_or(Err(CreateMetadataDocumentError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {

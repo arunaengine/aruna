@@ -329,6 +329,8 @@ pub enum MutateRealmPlacementError {
     StrategyReferenced { strategy_id: Ulid },
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -816,7 +818,7 @@ impl Operation for MutateRealmPlacementOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .expect("realm placement mutation operation must set output")
+            .unwrap_or(Err(MutateRealmPlacementError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
