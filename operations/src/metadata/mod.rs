@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audit;
 pub mod forward;
 mod handle;
 mod iri_index;

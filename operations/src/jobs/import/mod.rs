@@ -523,6 +523,7 @@ async fn spool_source(
             name: "input".to_string(),
             created_by,
             max_bytes: Some(limit),
+            deadline: None,
             blob,
         })
         .await;
@@ -872,7 +873,8 @@ async fn write_next(
             routing,
         })
         .with_bucket_guard(bucket_info)
-        .with_rocrate_limits(spec.limits.clone()),
+        .with_rocrate_limits(spec.limits.clone())
+        .with_restrictions(spec.auth_context.path_restrictions.clone()),
         &ctx.driver,
     )
     .await
@@ -1124,6 +1126,7 @@ async fn rollback_writes(
             realm_id: spec.auth_context.realm_id,
             node_id: ctx.owner_node_id,
             deleted_by: spec.auth_context.user_id,
+            restrictions: spec.auth_context.path_restrictions.clone(),
         },
     )
     .await;
@@ -1976,6 +1979,7 @@ mod tests {
                 name: "input".to_string(),
                 created_by: owner,
                 max_bytes: Some(1),
+                deadline: None,
                 blob: BackendStream::new(stream::iter([Ok::<Bytes, io::Error>(
                     Bytes::from_static(b"x"),
                 )])),
@@ -2079,9 +2083,10 @@ mod tests {
         assert!(matches!(
             blob.send_blob_effect(BlobEffect::ListHidden {
                 namespace: Some(upload_id),
+                cursor: None,
             })
             .await,
-            Event::Blob(BlobEvent::HiddenListed { entries }) if entries.is_empty()
+            Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty()
         ));
     }
 }

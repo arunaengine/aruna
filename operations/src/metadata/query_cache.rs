@@ -56,21 +56,17 @@ pub(super) fn graphs_digest(graph_iris: &[String]) -> [u8; 32] {
     digest.finish()
 }
 
-/// Fingerprint of the caller's credential. The bearer token is only ever
-/// hashed here; neither the token nor this digest is logged or stored.
+/// Anonymous queries use a fixed digest; authenticated queries bypass caching.
 pub(super) fn credential_digest(
     auth: Option<&AuthContext>,
     bearer_token: Option<&str>,
 ) -> Option<[u8; 32]> {
+    if auth.is_some() || bearer_token.is_some() {
+        return None;
+    }
     let mut hasher = blake3::Hasher::new();
-    match auth {
-        Some(auth) => push_bytes(&mut hasher, &serde_json::to_vec(auth).ok()?),
-        None => push_bytes(&mut hasher, NO_CREDENTIAL),
-    }
-    match bearer_token {
-        Some(token) => push_bytes(&mut hasher, token.as_bytes()),
-        None => push_bytes(&mut hasher, NO_CREDENTIAL),
-    }
+    push_bytes(&mut hasher, NO_CREDENTIAL);
+    push_bytes(&mut hasher, NO_CREDENTIAL);
     Some(*hasher.finalize().as_bytes())
 }
 
@@ -462,6 +458,15 @@ mod tests {
         // fan-out entries apart.
         assert_ne!(remote(RealmId([1u8; 32])), remote(RealmId([2u8; 32])));
         assert_eq!(remote(RealmId([1u8; 32])), remote(RealmId([1u8; 32])));
+    }
+
+    #[test]
+    fn auth_skips_cache() {
+        let auth = AuthContext::anonymous(RealmId([1u8; 32]));
+        assert!(credential_digest(None, None).is_some());
+        assert!(credential_digest(Some(&auth), None).is_none());
+        assert!(credential_digest(None, Some("token")).is_none());
+        assert!(credential_digest(Some(&auth), Some("token")).is_none());
     }
 
     #[test]

@@ -19,15 +19,16 @@ use crate::keyspaces::{
     METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
-    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
-    NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-    SHARD_MANIFEST_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_RAW_BUDGET_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
+    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
     MetadataGraphPruneJobRecord, MetadataIriReferenceIndexRecord,
     MetadataMaterializationDeadLetterRecord, MetadataMaterializationJobRecord,
-    MetadataMaterializationStatusRecord,
+    MetadataMaterializationStatusRecord, MetadataRawOriginBudget,
 };
 use crate::structs::{
     MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
@@ -197,6 +198,13 @@ pub fn raw_revision_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
+pub fn raw_budget_key(document_id: Ulid, node_id: NodeId) -> Key {
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(node_id.as_bytes());
+    ByteView::from(bytes)
+}
+
 pub fn metadata_materialization_document_job_prefix(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
@@ -281,6 +289,16 @@ pub fn metadata_create_event_write_entry(
         METADATA_EVENT_LOG_KEYSPACE.to_string(),
         metadata_event_log_key(event.record.document_id, event.event_id),
         postcard::to_allocvec(event)?.into(),
+    ))
+}
+
+pub fn raw_budget_entry(
+    budget: &MetadataRawOriginBudget,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_RAW_BUDGET_KEYSPACE.to_string(),
+        raw_budget_key(budget.document_id, budget.node_id),
+        postcard::to_allocvec(budget)?.into(),
     ))
 }
 
@@ -451,6 +469,28 @@ pub fn metadata_document_lifecycle_revision_change(
             kind: DocumentSyncChangeKind::Delete,
             placement,
         },
+    }
+}
+
+/// Build the revision carried by a graph lifecycle outbox event. Graph
+/// lifecycle records do not own an event id, so the sync event id is supplied
+/// by the outbox publisher and becomes the deterministic tie-breaker.
+pub fn graph_revision_change(
+    record: &MetadataGraphLifecycleRecord,
+    event_id: Ulid,
+    actor: NodeId,
+    placement: PlacementRef,
+) -> DocumentSyncChange {
+    DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: record.updated_at_ms,
+            event_id,
+            actor,
+            updated_at_ms: record.updated_at_ms,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement,
     }
 }
 
@@ -758,7 +798,7 @@ mod tests {
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
         admin_document_reducer_state_write_entry, document_sync_conflict_key,
         document_sync_conflict_write_entry, document_sync_revision_key,
-        document_sync_revision_write_entry, metadata_iri_reference_key,
+        document_sync_revision_write_entry, graph_revision_change, metadata_iri_reference_key,
         metadata_iri_reference_prefix, metadata_iri_reference_write_entry, shard_manifest_key,
         shard_manifest_prefix, shard_manifest_write_entry,
         stale_admin_document_conflict_delete_entries,
@@ -778,7 +818,7 @@ mod tests {
         DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
         METADATA_IRI_REFERENCE_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     };
-    use crate::metadata::MetadataIriReferenceIndexRecord;
+    use crate::metadata::{MetadataGraphLifecycleRecord, MetadataIriReferenceIndexRecord};
     use crate::structs::{PlacementRef, RealmId};
     use crate::{NodeId, UserId};
 
@@ -908,6 +948,8 @@ mod tests {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -938,6 +980,8 @@ mod tests {
                 },
             )]),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -967,6 +1011,38 @@ mod tests {
         assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
         assert_eq!(key, document_sync_revision_key(&target));
         assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn graph_revision_order() {
+        let graph_iri = "urn:graph:revision".to_string();
+        let target = DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: graph_iri.clone(),
+        };
+        let record = MetadataGraphLifecycleRecord::deleted(
+            graph_iri,
+            realm_id(2),
+            Ulid::from_bytes([3; 16]),
+            Ulid::from_bytes([4; 16]),
+            7,
+        );
+        let placement = shard_placement(3);
+        let older = graph_revision_change(&record, Ulid::from_bytes([5; 16]), node(5), placement);
+        let newer = graph_revision_change(&record, Ulid::from_bytes([6; 16]), node(6), placement);
+
+        assert!(older.current < newer.current);
+        let (keyspace, key, value) = document_sync_revision_write_entry(&target, &newer).unwrap();
+        let decoded: DocumentSyncChange = postcard::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
+        assert_eq!(key, document_sync_revision_key(&target));
+        assert_eq!(decoded, newer);
+
+        let (_, manifest_key, manifest_value) = shard_manifest_write_entry(&target, &newer)
+            .unwrap()
+            .unwrap();
+        let manifest: ShardManifestEntry = postcard::from_bytes(manifest_value.as_ref()).unwrap();
+        assert_eq!(manifest_key, shard_manifest_key(&placement, &target));
+        assert_eq!(manifest.revision, newer.current);
     }
 
     fn shard_placement(shard: u32) -> PlacementRef {
@@ -1170,6 +1246,8 @@ mod tests {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
         };
 
         let entries = admin_document_conflict_write_entries(&state).unwrap();
@@ -1236,6 +1314,8 @@ mod tests {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
         };
         let current = AdminDocumentReducerState {
             conflicts: BTreeMap::from([(

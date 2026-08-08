@@ -5,6 +5,7 @@ use axum::Router;
 use axum::middleware::from_fn_with_state;
 use std::sync::Arc;
 
+pub mod audit;
 pub mod blobs;
 pub mod connectors;
 pub mod credentials;
@@ -16,16 +17,19 @@ pub mod jobs;
 pub mod metadata;
 pub mod notifications;
 pub mod onboarding;
+pub mod policies;
 pub mod rocrate_import;
 pub mod search;
 pub mod staging;
 pub mod storage_routing;
 pub mod sync;
 pub mod tes;
+pub mod tokens;
 pub mod users;
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .merge(audit::router())
         .merge(info::router())
         .merge(onboarding::router())
         .merge(blobs::router())
@@ -41,9 +45,15 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(metadata::router())
         .merge(rocrate_import::router())
         .merge(notifications::router())
+        .merge(policies::router())
         .merge(search::router())
         .merge(tes::router())
+        .merge(tokens::router())
         .merge(users::router())
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::rate_limit::principal_middleware,
+        ))
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .layer(from_fn_with_state(
             state.clone(),

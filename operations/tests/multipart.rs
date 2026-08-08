@@ -659,6 +659,8 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
     .unwrap();
 
     assert_ne!(first.location.backend_path, second.location.backend_path);
+    // The overwrite defers the replaced blob to the cleanup queue.
+    drain_cleanup(&context).await;
     assert!(!exists(first.location.get_full_path().unwrap()).unwrap());
     assert!(exists(second.location.get_full_path().unwrap()).unwrap());
 }

@@ -3,6 +3,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::types::TxnId;
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -11,6 +12,8 @@ use crate::document_repository::read_effect;
 #[derive(Debug, PartialEq)]
 pub struct GetRealmConfigOperation {
     document: DocumentSyncTarget,
+    txn_id: Option<TxnId>,
+    external_txn: bool,
     state: GetRealmConfigState,
     output: Option<Result<RealmConfigDocument, GetRealmConfigError>>,
 }
@@ -31,6 +34,8 @@ pub enum GetRealmConfigError {
     ConversionError(#[from] ConversionError),
     #[error("document not found")]
     DocumentNotFound,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -43,6 +48,18 @@ impl GetRealmConfigOperation {
     pub fn new(realm_id: RealmId) -> Self {
         Self {
             document: DocumentSyncTarget::RealmConfig { realm_id },
+            txn_id: None,
+            external_txn: false,
+            state: GetRealmConfigState::Init,
+            output: None,
+        }
+    }
+
+    pub fn new_with_txn(realm_id: RealmId, txn_id: TxnId) -> Self {
+        Self {
+            document: DocumentSyncTarget::RealmConfig { realm_id },
+            txn_id: Some(txn_id),
+            external_txn: true,
             state: GetRealmConfigState::Init,
             output: None,
         }
@@ -74,7 +91,7 @@ impl Operation for GetRealmConfigOperation {
 
     fn start(&mut self) -> aruna_core::types::Effects {
         self.state = GetRealmConfigState::ReadDocument;
-        smallvec![read_effect(&self.document, None)]
+        smallvec![read_effect(&self.document, self.txn_id)]
     }
 
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
@@ -110,11 +127,29 @@ impl Operation for GetRealmConfigOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .expect("realm config get operation must set output")
+        self.output.unwrap_or(Err(GetRealmConfigError::NotFinished))
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
+        if self.external_txn {
+            return smallvec![];
+        }
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_finalize_errors() {
+        // A deadline can finalize an operation that never reached a terminal
+        // state; that must report an error instead of panicking.
+        let mut operation = GetRealmConfigOperation::new(RealmId::from_bytes([7; 32]));
+        operation.start();
+
+        assert!(!operation.is_complete());
+        assert_eq!(operation.finalize(), Err(GetRealmConfigError::NotFinished));
     }
 }

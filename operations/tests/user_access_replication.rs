@@ -21,9 +21,6 @@ use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-mod convergence;
-use convergence::wait_for_convergence;
-
 struct TestNode {
     _temp_dir: TempDir,
     net: NetHandle,
@@ -31,7 +28,9 @@ struct TestNode {
 }
 
 #[tokio::test]
-async fn access_key_replicates_realm_wide() -> Result<(), Box<dyn std::error::Error>> {
+async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
+    // Issuer-local by design: a credential minted on node 0 must never appear
+    // on node 1, even after a full explicit sync of the shared realm topic.
     let realm_id = RealmId([41u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
 
@@ -46,45 +45,35 @@ async fn access_key_replicates_realm_wide() -> Result<(), Box<dyn std::error::Er
         path_restrictions: Some(restrictions.clone()),
         issued_by: *nodes[0].net.node_id().as_bytes(),
     };
-    let (access_key, expected) = drive(
-        CreateUserAccessOperation::new(config),
+    let seal_key = aruna_core::credential_seal::CredentialSealKey::random();
+    let (access_key, _, _) = drive(
+        CreateUserAccessOperation::new(config, seal_key),
         nodes[0].context.as_ref(),
     )
     .await??;
 
-    // The key created on node 0 must land on node 1 with every field intact,
-    // so it authenticates there against the same realm-replicated checks.
-    wait_for_access(&nodes[1], &access_key, |access| {
-        access.secret == expected.secret
-            && access.group_id == expected.group_id
-            && access.issued_by == expected.issued_by
-            && access.path_restrictions == Some(restrictions.clone())
-            && access.revoked_at.is_none()
-    })
+    let local = drive(
+        GetUserAccessOperation::new(access_key.clone()),
+        nodes[0].context.as_ref(),
+    )
     .await?;
+    assert!(matches!(local, Some(Ok(_))));
 
-    shutdown_nodes(nodes).await;
-    Ok(())
-}
+    // Positive control: pull the whole shared realm topic from the issuer, so
+    // absence afterwards proves non-replication rather than sync lag.
+    let topic = aruna_core::document::DocumentSyncTarget::RealmAuthorization { realm_id }
+        .sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+    nodes[1]
+        .net
+        .sync_document_topics(vec![topic], vec![nodes[0].net.node_id()])
+        .await;
 
-#[tokio::test]
-async fn revocation_propagates_realm_wide() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([43u8; 32]);
-    let nodes = build_realm_nodes(&realm_id, 2).await?;
-
-    let config = CreateUserAccessConfig {
-        user_identity: UserId::local(Ulid::generate(), realm_id),
-        group_id: Ulid::generate(),
-        expiry: SystemTime::now() + Duration::from_secs(3600),
-        path_restrictions: None,
-        issued_by: *nodes[0].net.node_id().as_bytes(),
-    };
-    let (access_key, _) = drive(
-        CreateUserAccessOperation::new(config),
-        nodes[0].context.as_ref(),
+    let remote = drive(
+        GetUserAccessOperation::new(access_key.clone()),
+        nodes[1].context.as_ref(),
     )
-    .await??;
-    wait_for_access(&nodes[1], &access_key, |access| access.revoked_at.is_none()).await?;
+    .await?;
+    assert!(remote.is_none());
 
     drive(
         RevokeUserAccessOperation::new(access_key.clone()),
@@ -94,31 +83,15 @@ async fn revocation_propagates_realm_wide() -> Result<(), Box<dyn std::error::Er
     .expect("credential present")
     .expect("revoke succeeds");
 
-    // The revocation must reach node 1, where the key would otherwise still pass.
-    wait_for_access(&nodes[1], &access_key, |access| access.revoked_at.is_some()).await?;
+    let revoked = drive(
+        GetUserAccessOperation::new(access_key),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    assert!(revoked.is_none());
 
     shutdown_nodes(nodes).await;
     Ok(())
-}
-
-async fn wait_for_access(
-    node: &TestNode,
-    access_key: &str,
-    predicate: impl Fn(&aruna_core::structs::UserAccess) -> bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_convergence("user access did not converge before timeout", || async {
-        if let Ok(Some(Ok(access))) = drive(
-            GetUserAccessOperation::new(access_key.to_string()),
-            node.context.as_ref(),
-        )
-        .await
-            && predicate(&access)
-        {
-            return Ok(0);
-        }
-        Ok(1)
-    })
-    .await
 }
 
 async fn build_realm_nodes(

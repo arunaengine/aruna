@@ -8,11 +8,11 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
     NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
+    Actor, Group, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
     NotificationKind, NotificationRecord, PlacementRef, RealmAuthorizationDocument,
     RealmConfigDocument, RealmId, RealmNodeKind, WatchAuthorizationBinding, WatchEvent,
     WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
@@ -905,21 +905,43 @@ async fn install_group_authorization(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
     let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    // Policy loading resolves the group record before group policies apply, and
+    // every node that evaluates the request needs it locally.
+    let group = Group {
+        display_name: "watch".to_string(),
+        group_id,
+        realm_id,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
     for node in nodes {
         let actor = Actor {
             node_id: node.net.node_id(),
             user_id: owner,
             realm_id,
         };
-        for (key, value) in [
-            (realm_id.as_bytes().to_vec(), realm_auth.to_bytes(&actor)?),
-            (group_id.to_bytes().to_vec(), group_auth.to_bytes(&actor)?),
+        for (key_space, key, value) in [
+            (
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor)?,
+            ),
+            (
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor)?,
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor)?,
+            ),
         ] {
             match node
                 .context
                 .storage_handle
                 .send_effect(Effect::Storage(StorageEffect::Write {
-                    key_space: AUTH_KEYSPACE.to_string(),
+                    key_space: key_space.to_string(),
                     key: key.into(),
                     value: value.into(),
                     txn_id: None,

@@ -18,10 +18,14 @@ use aruna_core::keyspaces::{
     SYNC_RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::structs::{
-    BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, SourceConnectorKind,
-    StagingStrategy, SyncRelationship, SyncState, UsageCounters, VersionKey, sync_relationship_key,
+    AuthContext, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, PathRestriction,
+    Permission, SourceConnectorKind, StagingStrategy, SyncRelationship, SyncState, UsageCounters,
+    VersionKey, blob_group_permission_path, sync_relationship_key,
 };
 use aruna_operations::driver::DriverContext;
+use aruna_operations::replication::queue::{
+    LiveReplicationObligationRecord, live_replication_obligation_key,
+};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -48,6 +52,16 @@ where
         .err()
         .and_then(|err| err.as_service_error().and_then(|inner| inner.code()))
         .map(ToOwned::to_owned)
+}
+
+/// HTTP status of a failed S3 call, so a test can tell an absent object (404)
+/// apart from a present but forbidden one (403).
+fn error_status<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<u16> {
+    result
+        .as_ref()
+        .err()
+        .and_then(|err| err.raw_response())
+        .map(|response| response.status().as_u16())
 }
 
 fn build_replication_configuration(
@@ -444,7 +458,11 @@ impl ReplicationHarness {
                 .key(key)
                 .send()
                 .await;
-            assert!(head_result.is_err());
+            assert_eq!(
+                error_status(&head_result),
+                Some(404),
+                "the object must be absent on the joiner, not merely forbidden"
+            );
             tokio::time::sleep(interval).await;
         }
         Ok(())
@@ -1586,6 +1604,102 @@ async fn creates_destination_bucket() -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn repair_honors_restrictions() -> TestResult<()> {
+    // A lost enqueue is replayed from the durable obligation, so that record
+    // must still carry the writer's scope or the write escalates to unscoped.
+    let harness = ReplicationHarness::new("replication-obligation-repair-group").await?;
+
+    let result = async {
+        let bucket = "replication-obligation-repair";
+        let scoped_key = "scoped/blocked.txt";
+
+        harness.create_buckets(bucket, true).await?;
+        harness
+            .configure_replication(bucket, "replication-obligation-repair", true)
+            .await?;
+
+        let scoped_client = harness
+            .create_seed_scoped_client(vec![CreateS3PathRestriction {
+                pattern: format!("{bucket}/scoped/**"),
+                permission: "WRITE".to_string(),
+            }])
+            .await?;
+        let put_output = scoped_client
+            .put_object()
+            .bucket(bucket)
+            .key(scoped_key)
+            .body(ByteStream::from_static(b"scoped stays local"))
+            .send()
+            .await?;
+        let version_id: Ulid = put_output
+            .version_id()
+            .ok_or_else(|| std::io::Error::other("scoped put did not return version id"))?
+            .parse()?;
+
+        let group_root = blob_group_permission_path(
+            harness.seed.realm_id,
+            harness.group_id.parse()?,
+            harness.seed.net.node_id(),
+        );
+        let record = LiveReplicationObligationRecord::new(
+            harness.seed.net.node_id(),
+            AuthContext {
+                user_id: harness.seed.user_id,
+                realm_id: harness.seed.realm_id,
+                path_restrictions: Some(vec![PathRestriction {
+                    pattern: format!("{group_root}/{bucket}/scoped/**"),
+                    permission: Permission::WRITE,
+                }]),
+            },
+            bucket.to_string(),
+            scoped_key.to_string(),
+            version_id,
+            false,
+        );
+        let obligation_key = live_replication_obligation_key(&record)?;
+        let Event::Storage(StorageEvent::WriteResult { .. }) = harness
+            .seed
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                key: obligation_key,
+                value: record.to_bytes()?.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            return Err(std::io::Error::other("obligation write failed").into());
+        };
+
+        wait_until(
+            "replication obligation repair",
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+            || async {
+                keyspace_empty(
+                    harness.seed.context.as_ref(),
+                    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                )
+                .await
+                    && keyspace_empty(harness.seed.context.as_ref(), BLOB_REPLICATION_JOB_KEYSPACE)
+                        .await
+            },
+        )
+        .await?;
+
+        harness
+            .assert_object_never_appears(bucket, scoped_key, 5, Duration::from_millis(200))
+            .await?;
+        Ok(())
+    }
+    .await;
+
+    harness.shutdown().await;
+    result
+}
+
+#[tokio::test]
 async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-scoped-credential-group").await?;
 
@@ -1651,7 +1765,11 @@ async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<
             .key(scoped_key)
             .send()
             .await;
-        assert!(scoped_destination_get.is_err());
+        assert_eq!(
+            error_status(&scoped_destination_get),
+            Some(404),
+            "the scoped object must be absent on the joiner, not merely forbidden"
+        );
         Ok(())
     }
     .await;

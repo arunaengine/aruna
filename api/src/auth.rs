@@ -5,9 +5,9 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
     AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
 };
-use aruna_operations::auth::{decode_aruna_bearer_token, validate_aruna_bearer_token_claims};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::drive;
+use aruna_operations::auth::{
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
+};
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -407,6 +407,13 @@ async fn extract_auth_context_and_bearer_token(
         Ok(auth_context) => auth_context,
         Err(_) => return (None, None),
     };
+    // Reject tokens whose restriction set exceeds the fail-closed size limits so
+    // an oversized delegation never reaches the permission evaluator.
+    if let Some(restrictions) = auth_context.path_restrictions.as_deref()
+        && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()
+    {
+        return (None, None);
+    }
     (
         Some(auth_context),
         Some(ValidatedArunaBearerTokenCarrier::new(
@@ -422,10 +429,40 @@ pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaim
         .map_err(Into::into)
 }
 
-pub async fn validate_claims(state: &ServerState, claims: &TokenClaims) -> Result<(), TokenError> {
-    validate_aruna_bearer_token_claims(state, claims)
+/// Fully verified claims of a token that may already be revoked, so revoking it
+/// again is authorized against the same subject as the first time.
+pub(crate) async fn claims_for_revocation(
+    state: &ServerState,
+    token: &str,
+) -> Result<TokenClaims, TokenError> {
+    decode_aruna_bearer_token(&RevocationBlindState(state), token)
         .await
         .map_err(Into::into)
+}
+
+/// Reports every token as unrevoked; every other check stays the server's.
+struct RevocationBlindState<'a>(&'a ServerState);
+
+#[async_trait::async_trait]
+impl ArunaBearerTokenValidationState for RevocationBlindState<'_> {
+    async fn is_token_revoked(
+        &self,
+        _realm_id: &aruna_core::structs::RealmId,
+        _token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        Ok(false)
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &aruna_core::structs::RealmId) -> bool {
+        self.0.is_trusted_realm(realm_id).await
+    }
+
+    async fn issuer_decoding_key(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        self.0.issuer_decoding_key(issuer_pubkey).await
+    }
 }
 
 pub async fn auth_middleware(
@@ -490,24 +527,59 @@ pub(crate) async fn ensure_permission(
     path: String,
     required_permission: Permission,
 ) -> ServerResult<()> {
-    let allowed = aruna_core::telemetry::time_stage(
+    ensure_permission_with(
+        state,
+        auth,
+        path,
+        required_permission,
+        aruna_operations::request_policy::PolicyRequestExtras::rest(),
+    )
+    .await
+}
+
+/// Single REST authorization choke point: ordinary RBAC and public visibility
+/// first, then the realm and group request policies, sharing the one
+/// operations-owned boundary with the S3 hook.
+pub(crate) async fn ensure_permission_with(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: String,
+    required_permission: Permission,
+    extras: aruna_operations::request_policy::PolicyRequestExtras,
+) -> ServerResult<()> {
+    aruna_core::telemetry::time_stage(
         "permission",
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth.clone(),
-                path,
-                required_permission,
-            }),
+        aruna_operations::request_authorization::authorize(
             &state.get_ctx(),
+            state.get_realm_id(),
+            auth,
+            &path,
+            &required_permission,
+            extras,
         ),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|error| match error {
+        aruna_operations::request_authorization::AuthorizeError::CheckFailed(message) => {
+            ServerError::InternalError(message)
+        }
+        _ => ServerError::Forbidden,
+    })
+}
 
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
+/// Boolean form of [`ensure_permission`] for the routes that grade a caller
+/// instead of rejecting it. Every denial, including one from a request policy,
+/// reads as not authorized; only a failed check stays an internal error.
+pub(crate) async fn permission_granted(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: String,
+    required_permission: Permission,
+) -> ServerResult<bool> {
+    match ensure_permission(state, auth, path, required_permission).await {
+        Ok(()) => Ok(true),
+        Err(ServerError::Forbidden) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -535,6 +607,7 @@ mod test {
     use crate::error::TokenError;
     use crate::server::ServerState;
     use aruna_core::UserId;
+    use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -550,6 +623,9 @@ mod test {
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::register_or_get_oidc_user::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
+    };
+    use aruna_operations::revoke_token::{
+        RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
     };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -803,6 +879,24 @@ mod test {
         }
     }
 
+    async fn revoke(driver_ctx: &Arc<DriverContext>, actor: Actor, token: &str) {
+        let now = aruna_core::util::unix_timestamp_secs();
+        let token_owner = actor.user_id;
+        drive(
+            RevokeTokenOperation::new(RevokeTokenConfig {
+                actor,
+                token_hash: bearer_token_hash(token),
+                expires_at: now + 600,
+                token_owner,
+                admission: RevokeTokenAdmission::SelfService,
+                now,
+            }),
+            driver_ctx,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn bearer_token_carrier_requires_valid_aruna_token() {
         let storage_dir = tempfile::tempdir().unwrap();
@@ -875,7 +969,16 @@ mod test {
         assert_eq!(auth.unwrap().user_id, user_id);
         assert_eq!(carrier.unwrap().as_str(), token);
 
-        state.add_token_to_blacklist(&token).await;
+        revoke(
+            &driver_ctx,
+            Actor {
+                node_id,
+                user_id,
+                realm_id,
+            },
+            &token,
+        )
+        .await;
         let (auth, carrier) =
             extract_auth_context_and_bearer_token(&state, &headers_for(&token)).await;
         assert!(auth.is_none());
@@ -1611,7 +1714,16 @@ mod test {
         assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
 
-        state.add_token_to_blacklist(&management_token).await;
+        revoke(
+            &driver_ctx,
+            Actor {
+                node_id,
+                user_id,
+                realm_id,
+            },
+            &management_token,
+        )
+        .await;
         assert!(matches!(
             handle_token(&state, &management_token).await,
             Err(TokenError::TokenBlacklisted)

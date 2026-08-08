@@ -424,9 +424,12 @@ async fn abort_prune_txn(storage: &StorageHandle, txn_id: TxnId) {
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+    };
     use aruna_core::structs::{
-        Actor, BucketReplicationTarget, GroupAuthorizationDocument, RealmAuthorizationDocument,
+        Actor, BucketReplicationTarget, Group, GroupAuthorizationDocument,
+        RealmAuthorizationDocument, RealmConfigDocument,
     };
     use aruna_storage::storage;
     use std::time::SystemTime;
@@ -481,6 +484,16 @@ mod tests {
             user_id: owner,
             realm_id,
         };
+        // Policy loading fails closed without the realm config document.
+        write_value(
+            &context.storage_handle,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
         write_value(
             &context.storage_handle,
             AUTH_KEYSPACE,
@@ -490,13 +503,29 @@ mod tests {
                 .unwrap(),
         )
         .await;
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
         write_value(
             &context.storage_handle,
             AUTH_KEYSPACE,
             group_id.to_bytes().to_vec(),
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id)
-                .to_bytes(&actor)
-                .unwrap(),
+            group_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        // Policy loading resolves the group record before group policies apply.
+        write_value(
+            &context.storage_handle,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            Group {
+                display_name: "migration-group".to_string(),
+                group_id,
+                realm_id,
+                roles: group_auth.roles.keys().copied().collect(),
+                owner,
+            }
+            .to_bytes(&actor)
+            .unwrap(),
         )
         .await;
         let target_arn = ArunaArn::s3_bucket(realm_id, target_node, "target-bucket").unwrap();

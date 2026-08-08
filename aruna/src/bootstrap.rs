@@ -7,7 +7,9 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
-use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
+use aruna_core::onboarding::{
+    OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket,
+};
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -22,7 +24,12 @@ use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
 use byteview::ByteView;
+use crypto_box::{
+    SalsaBox, SecretKey as BoxSecretKey,
+    aead::{Aead, AeadCore, OsRng as CryptoOsRng},
+};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
@@ -316,15 +323,36 @@ async fn sync_topic_from_peer(
     }
 }
 
+/// Persisted onboarding secret, encrypted at rest under the node key.
+#[derive(Serialize, Deserialize)]
+struct SealedOnboardingSecret {
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
+}
+
+fn onboarding_secret_box(net_secret_key: &[u8; 32]) -> SalsaBox {
+    let secret = BoxSecretKey::from(*net_secret_key);
+    let public = secret.public_key();
+    SalsaBox::new(&public, &secret)
+}
+
 pub async fn ensure_initial_local_onboarding_secret(
     driver_ctx: &DriverContext,
     seed_url: String,
+    net_secret_key: &[u8; 32],
+    realm_id: aruna_core::structs::RealmId,
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
-    if let Some(secret) =
-        load_persisted_state::<OnboardingSecret>(driver_ctx, INITIAL_LOCAL_ONBOARDING_SECRET_KEY)
-            .await
+    if let Some(sealed) = load_persisted_state::<SealedOnboardingSecret>(
+        driver_ctx,
+        INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
+    )
+    .await
     {
-        return Ok(secret);
+        let nonce = crypto_box::Nonce::from(sealed.nonce);
+        let plaintext = onboarding_secret_box(net_secret_key)
+            .decrypt(&nonce, sealed.ciphertext.as_ref())
+            .map_err(|_| "failed to decrypt persisted onboarding secret")?;
+        return Ok(postcard::from_bytes(&plaintext)?);
     }
 
     let mut secret_bytes = [0u8; 32];
@@ -334,11 +362,14 @@ pub async fn ensure_initial_local_onboarding_secret(
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
         mode: OnboardingMode::Local,
+        realm_id,
+        purpose: OnboardingPurpose::InitialAdministrator,
     };
     let record = aruna_core::onboarding::OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
         mode: OnboardingMode::Local,
+        purpose: OnboardingPurpose::InitialAdministrator,
         expires_at: u64::MAX,
         claimed_node_id: None,
     };
@@ -348,10 +379,21 @@ pub async fn ensure_initial_local_onboarding_secret(
         driver_ctx,
     )
     .await?;
+
+    let plaintext = postcard::to_allocvec(&onboarding_secret)?;
+    let nonce = SalsaBox::generate_nonce(&mut CryptoOsRng);
+    let ciphertext = onboarding_secret_box(net_secret_key)
+        .encrypt(&nonce, plaintext.as_ref())
+        .map_err(|_| "failed to encrypt onboarding secret")?;
+    let mut nonce_bytes = [0u8; 24];
+    nonce_bytes.copy_from_slice(nonce.as_slice());
     persist_state(
         driver_ctx,
         INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
-        &onboarding_secret,
+        &SealedOnboardingSecret {
+            nonce: nonce_bytes,
+            ciphertext,
+        },
     )
     .await;
     Ok(onboarding_secret)

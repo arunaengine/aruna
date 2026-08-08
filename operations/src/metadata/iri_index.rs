@@ -22,6 +22,8 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
+use super::handle::METADATA_REGISTRY_CANDIDATE_LIMIT;
+
 const IRI_INDEX_PAGE_SIZE: usize = 128;
 const IRI_INDEX_WRITE_BATCH_SIZE: usize = 128;
 
@@ -89,9 +91,12 @@ pub(crate) async fn lookup_metadata_iri_references(
 ) -> Result<BTreeMap<Ulid, Vec<String>>, MetadataError> {
     let prefix = metadata_iri_reference_prefix(predicate_iri, object_iri);
     let records = scan_iri_reference_records(storage, Some(prefix)).await?;
+    let registry_records = super::api::filter_live_records(storage, registry_records)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
     Ok(collect_matching_iri_references(
         records,
-        registry_records,
+        &registry_records,
         predicate_iri,
         object_iri,
     ))
@@ -146,6 +151,11 @@ async fn scan_iri_reference_records(
                 values,
                 next_start_after,
             }) => {
+                if records.len().saturating_add(values.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+                    return Err(MetadataIriIndexError::UnexpectedEvent(
+                        "metadata IRI reference candidate limit exceeded".to_string(),
+                    ));
+                }
                 for (_, value) in values {
                     records.push(
                         postcard::from_bytes::<MetadataIriReferenceIndexRecord>(&value)
@@ -174,6 +184,10 @@ pub(crate) async fn rebuild_metadata_iri_reference_index(
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     let registry_records = metadata_handle.list_cached_registry_records().await?;
+    let registry_records =
+        super::api::filter_live_records(&context.storage_handle, registry_records.as_ref())
+            .await
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let mut written = 0usize;
     let mut reprojected: HashMap<Ulid, Ulid> = HashMap::new();
 
@@ -206,7 +220,12 @@ pub(crate) async fn rebuild_metadata_iri_reference_index(
     let registered = metadata_handle
         .list_cached_registry_records()
         .await?
-        .iter()
+        .as_ref()
+        .to_vec();
+    let registered = super::api::filter_live_records(&context.storage_handle, &registered)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?
+        .into_iter()
         .map(|record| (record.document_id, record.last_event_id))
         .collect::<HashMap<_, _>>();
     let stale =

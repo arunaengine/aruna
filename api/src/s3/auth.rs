@@ -1,19 +1,23 @@
 use super::s3_server::S3OpLabel;
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
+use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
+use aruna_core::credential_seal::{CredentialSealKey, SealedS3Secret};
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path,
 };
 use aruna_core::{NodeId, UserId};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -44,13 +48,30 @@ pub struct AuthProvider {
     pub(crate) driver_ctx: Arc<DriverContext>,
     pub(crate) realm_id: RealmId,
     pub(crate) node_id: NodeId,
+    pub(crate) seal_key: CredentialSealKey,
+    pub(crate) rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
 
 #[async_trait::async_trait]
 impl S3Auth for AuthProvider {
     async fn get_secret_key(&self, access_key_id: &str) -> S3Result<SecretKey> {
         let user_access = self.query_user_access(access_key_id).await?;
-        Ok(SecretKey::from(user_access.secret))
+        // Secrets seal at rest with an issuer-local key, so only the issuing
+        // node can recover the plaintext s3s needs to verify a signature. A
+        // record copied to another node, or with a rebound field, never opens.
+        if user_access.issued_by != *self.node_id.as_bytes() {
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            ));
+        }
+        let secret = user_access.open_secret(&self.seal_key).map_err(|_| {
+            s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            )
+        })?;
+        Ok(SecretKey::from(secret))
     }
 }
 
@@ -69,30 +90,33 @@ impl S3Access for AuthProvider {
 
         // Unsigned requests are checked as the Everyone principal, but only for
         // the public object-byte read surface.
-        let access_key_id = match cx.credentials() {
-            Some(credentials) => credentials.access_key.clone(),
+        let access_key_id = match cx
+            .credentials()
+            .map(|credentials| credentials.access_key.clone())
+        {
+            Some(access_key_id) => access_key_id,
             None => return self.check_anonymous(cx, action).await,
         };
 
         // Fetch user access -> GetUserAccess state machine
         let user_access = self.query_user_access(&access_key_id).await?;
+        let permit = self.admit_credential(&user_access)?;
+        let lease = cx
+            .extensions_mut()
+            .get::<LocalLease>()
+            .cloned()
+            .unwrap_or_default();
+        lease.replace(permit);
+        cx.extensions_mut().insert(lease);
 
-        // Realm-valid credentials: accept any key issued by a configured realm
-        // node, so a key created on one node authenticates on every node. Every
-        // other check below validates against realm-replicated state.
+        // Credentials are issuer-local and sealed at rest: s3s only had a secret
+        // to verify this signature because `get_secret_key` unsealed it on the
+        // issuing node. Confirm that node is still a member of this realm.
         if !self.issuer_in_realm(&user_access.issued_by).await? {
             return Err(s3_error!(
                 InvalidAccessKeyId,
                 "Credential issuer not in realm"
             ));
-        }
-
-        if user_access.is_revoked() {
-            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
-        }
-
-        if user_access.is_expired(SystemTime::now()) {
-            return Err(s3_error!(AccessDenied, "Credential has expired"));
         }
 
         let required_permission = match &action {
@@ -104,32 +128,75 @@ impl S3Access for AuthProvider {
             .build_authorization_path(cx, &user_access, &action)
             .await?;
 
-        // DeleteObjects lists its target keys in the request body rather than the
-        // URL, so the path resolves to the bucket and a bucket-level check would
-        // deny prefix-scoped tokens outright. Defer object authorization to the
-        // handler, which checks each entry individually. Credentials, issuer,
-        // expiry, revocation and bucket ownership are already validated above, so
-        // anonymous and cross-group requests still fail closed here.
+        // The policy request context is built once: ordinary authorization uses a
+        // clone and the original is stashed so per-object and secondary-resource
+        // handlers evaluate against the real query and allowlisted headers.
+        let extras = request_extras(cx, &operation_name);
+
+        // DeleteObjects keys live in the body, so per-object RBAC/policy checks stay in
+        // the handler against one loaded policy set. Prior credential, issuer, expiry,
+        // revocation, and ownership checks keep anonymous/cross-group requests fail-closed.
         if cx.s3_op().name() != "DeleteObjects" {
-            let allowed = drive(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context,
-                    path,
-                    required_permission,
-                }),
+            authorize(
                 self.driver_ctx.as_ref(),
+                self.realm_id,
+                &auth_context,
+                &path,
+                &required_permission,
+                extras.clone(),
             )
             .await
-            .map_err(|_| s3_error!(InternalError, "Failed to check permissions"))?;
-
-            if !allowed {
-                return Err(s3_error!(AccessDenied, "Permission denied"));
-            }
+            .map_err(map_authorize_error)?;
         }
 
+        cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(user_access);
         Ok(())
     }
+}
+
+/// Maps an authorization failure to an S3 error, keeping RBAC and policy denials
+/// indistinguishable and control-plane failures fail-closed.
+pub(super) fn map_authorize_error(error: AuthorizeError) -> s3s::S3Error {
+    match error {
+        AuthorizeError::CheckFailed(_) => s3_error!(InternalError, "Failed to check permissions"),
+        _ => s3_error!(AccessDenied, "Permission denied"),
+    }
+}
+
+/// Threads the S3 operation, query parameters (last value wins), and an
+/// allowlisted, lowercased header subset into the policy context. Object bytes
+/// are never buffered, so the body stays absent.
+fn request_extras(cx: &S3AccessContext<'_>, operation_name: &str) -> PolicyRequestExtras {
+    let mut params = BTreeMap::new();
+    if let Some(query) = cx.uri().query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            params.insert(key.into_owned(), value.into_owned());
+        }
+    }
+    let mut headers = BTreeMap::new();
+    for (name, value) in cx.headers() {
+        let name = name.as_str().to_ascii_lowercase();
+        if header_allowed(&name)
+            && let Ok(value) = value.to_str()
+        {
+            headers.insert(name, value.to_string());
+        }
+    }
+    PolicyRequestExtras {
+        operation: format!("s3.{operation_name}"),
+        params,
+        headers,
+        body: None,
+    }
+}
+
+/// Header allowlist for policy context; authorization and cookies never appear.
+fn header_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "content-type" | "content-length" | "x-amz-tagging" | "x-amz-acl"
+    ) || name.starts_with("x-amz-meta-")
 }
 
 impl AuthProvider {
@@ -164,37 +231,59 @@ impl AuthProvider {
         let path =
             blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
 
-        let allowed = drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext::anonymous(self.realm_id),
-                path,
-                required_permission: Permission::READ,
-            }),
+        let extras = request_extras(cx, cx.s3_op().name());
+        authorize(
             self.driver_ctx.as_ref(),
+            self.realm_id,
+            &AuthContext::anonymous(self.realm_id),
+            &path,
+            &Permission::READ,
+            extras.clone(),
         )
         .await
-        .map_err(|_| s3_error!(InternalError, "Failed to check permissions"))?;
-
-        if !allowed {
-            return Err(s3_error!(AccessDenied, "Permission denied"));
-        }
+        .map_err(map_authorize_error)?;
 
         // Handlers read UserAccess/BucketInfo from the request extensions;
         // hand them the Everyone principal scoped to the bucket's group. The
         // key/secret fields are blank — nothing downstream signs with them —
         // and expiry is irrelevant because this access was just checked.
+        cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(bucket_info);
         cx.extensions_mut().insert(UserAccess {
             access_key: String::new(),
             user_identity: UserId::nil(self.realm_id),
             group_id,
-            secret: String::new(),
+            secret: SealedS3Secret::empty(),
             expiry: SystemTime::now(),
             path_restrictions: None,
             issued_by: *self.node_id.as_bytes(),
             revoked_at: None,
         });
         Ok(())
+    }
+
+    /// Rejects an unusable credential before any budget is spent: a revoked or
+    /// expired credential must not drain the owner's shared request rate or
+    /// take one of the owner's admission permits.
+    fn admit_credential(&self, user_access: &UserAccess) -> S3Result<LocalPermit> {
+        if user_access.is_revoked() {
+            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
+        }
+        if user_access.is_expired(SystemTime::now()) {
+            return Err(s3_error!(AccessDenied, "Credential has expired"));
+        }
+        // Charge the stable identity after lookup so credential rotation cannot
+        // multiply the authenticated request budget.
+        if self
+            .rate_limits
+            .check_principal(user_access.user_identity)
+            .is_err()
+        {
+            return Err(s3_error!(SlowDown, "Reduce your request rate"));
+        }
+        self.rate_limits
+            .try_acquire_local(LocalKey::User(user_access.user_identity))
+            .ok_or_else(|| s3_error!(SlowDown, "Reduce your request rate"))
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -222,8 +311,9 @@ impl AuthProvider {
     }
 
     /// Whether `issued_by` is a node configured in this realm. Credentials are
-    /// replicated realm-wide, so the issuer only has to be a realm member rather
-    /// than the serving node.
+    /// issuer-local and sealed with an issuer-local key, so a verified signature
+    /// already proves this serving node issued them; this only confirms the
+    /// issuing node is still a realm member.
     async fn issuer_in_realm(&self, issued_by: &[u8; 32]) -> S3Result<bool> {
         let config = drive(
             GetRealmConfigOperation::new(self.realm_id),
@@ -332,7 +422,42 @@ mod tests {
             driver_ctx,
             realm_id: RealmId([1u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            seal_key: CredentialSealKey::derive(&[7u8; 32]),
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
         }
+    }
+
+    async fn store_access(provider: &AuthProvider, access: &UserAccess) {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
+        provider
+            .driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: access.access_key.as_bytes().into(),
+                value: access.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    fn sealed_access(provider: &AuthProvider, issued_by: [u8; 32]) -> UserAccess {
+        use ulid::Ulid;
+        let mut access = UserAccess {
+            access_key: UserAccess::build_access_key(&Ulid::generate().to_string()).unwrap(),
+            user_identity: UserId::local(Ulid::generate(), provider.realm_id),
+            group_id: Ulid::generate(),
+            secret: SealedS3Secret::empty(),
+            expiry: SystemTime::now() + std::time::Duration::from_secs(3600),
+            path_restrictions: None,
+            issued_by,
+            revoked_at: None,
+        };
+        access
+            .seal_secret(&CredentialSealKey::derive(&[7u8; 32]), "unsealed-secret")
+            .unwrap();
+        access
     }
 
     #[tokio::test]
@@ -342,6 +467,47 @@ mod tests {
         let provider = provider(dir.path().to_str().unwrap());
         let legacy = "01ARZ3NDEKTSV4RRFFQ69G5FAV@01ARZ3NDEKTSV4RRFFQ69G5FAW:workspace-01ARZ3";
         let error = provider.get_secret_key(legacy).await.unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
+    }
+
+    #[tokio::test]
+    async fn revoked_spends_nothing() {
+        // A revoked credential must be rejected before it charges the owner's
+        // shared rate budget, so a replayed revoked key cannot starve the owner.
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = provider(dir.path().to_str().unwrap());
+        provider.rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::for_test(1));
+
+        let live = sealed_access(&provider, *provider.node_id.as_bytes());
+        let revoked = UserAccess {
+            revoked_at: Some(SystemTime::now()),
+            ..live.clone()
+        };
+        let Err(error) = provider.admit_credential(&revoked) else {
+            panic!("revoked credential admitted");
+        };
+        assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+
+        assert!(provider.admit_credential(&live).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unseals_on_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+
+        let local = sealed_access(&provider, *provider.node_id.as_bytes());
+        store_access(&provider, &local).await;
+        let secret = provider.get_secret_key(&local.access_key).await.unwrap();
+        assert_eq!(secret.expose(), "unsealed-secret");
+
+        // A record issued by another node (a copied DB) yields no usable secret.
+        let foreign = sealed_access(&provider, [9u8; 32]);
+        store_access(&provider, &foreign).await;
+        let error = provider
+            .get_secret_key(&foreign.access_key)
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
     }
 }

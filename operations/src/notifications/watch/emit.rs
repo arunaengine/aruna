@@ -8,7 +8,9 @@ use crate::notifications::client::deliver_watch_events_remote;
 use crate::notifications::placement::filter_locally_held_watch_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::mark_watch_interest_dirty;
-use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
+use crate::notifications::watch::subscriptions::{
+    WatchSubscriptionError, list_realm_watch_subscriptions,
+};
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the event
 /// against the in-memory realm interest table plus local durable subscriptions
@@ -94,12 +96,22 @@ async fn include_local_holder_from_subscriptions(
     local_node_id: aruna_core::NodeId,
     holders: &mut Vec<aruna_core::NodeId>,
 ) -> Result<aruna_core::structs::RealmConfigDocument, String> {
-    let subscriptions = list_realm_watch_subscriptions(&context.storage_handle, event.realm_id)
-        .await
-        .map_err(|error| error.to_string())?;
     let realm_config = drive(GetRealmConfigOperation::new(event.realm_id), context)
         .await
         .map_err(|error| error.to_string())?;
+    let subscriptions =
+        match list_realm_watch_subscriptions(&context.storage_handle, event.realm_id).await {
+            Ok(subscriptions) => subscriptions,
+            Err(WatchSubscriptionError::Storage(error))
+                if error.contains("subscription scan cap reached") =>
+            {
+                if !holders.contains(&local_node_id) {
+                    holders.push(local_node_id);
+                }
+                return Ok(realm_config);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
     let (subscriptions, found_stale) =
         filter_locally_held_watch_subscriptions(subscriptions, &realm_config, local_node_id)
             .map_err(|error| error.to_string())?;
@@ -123,10 +135,10 @@ mod tests {
     use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
     use aruna_core::metrics::NodeMetrics;
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, NotificationRecord, RealmAuthorizationDocument,
+        Actor, Group, GroupAuthorizationDocument, NotificationRecord, RealmAuthorizationDocument,
         RealmConfigDocument, RealmId, RealmNodeKind, WatchEventDetail, WatchEventKind,
         WatchEventMask, WatchInterestEntry, WatchInterestTable, data_watch_resource_path,
         parse_data_watch_resource_path,
@@ -175,21 +187,36 @@ mod tests {
         };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm);
         let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm, group_id);
-        for (key, value) in [
+        // Policy loading resolves the group record before group policies apply.
+        let group = Group {
+            display_name: "watch".to_string(),
+            group_id,
+            realm_id: realm,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        for (key_space, key, value) in [
             (
+                AUTH_KEYSPACE,
                 realm.as_bytes().to_vec(),
                 realm_auth.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 group_id.to_bytes().to_vec(),
                 group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
             ),
         ] {
             assert!(matches!(
                 context
                     .storage_handle
                     .send_storage_effect(StorageEffect::Write {
-                        key_space: AUTH_KEYSPACE.to_string(),
+                        key_space: key_space.to_string(),
                         key: key.into(),
                         value: value.into(),
                         txn_id: None,

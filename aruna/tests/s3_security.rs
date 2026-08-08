@@ -104,8 +104,8 @@ async fn revoked_credentials_rejected() -> TestResult<()> {
         let revoked = client(&seed, &credentials)?.list_buckets().send().await;
         assert_eq!(
             service_error_code(&revoked).as_deref(),
-            Some("AccessDenied"),
-            "revoked credential must be denied"
+            Some("InvalidAccessKeyId"),
+            "deleted credential must be denied"
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }

@@ -100,6 +100,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         | BlobEffect::ReadHiddenRange { location, .. }
         | BlobEffect::Replicate { location, .. }
         | BlobEffect::ServeRead { location, .. } => push(&mut ids, &location.backend),
+        BlobEffect::ReleaseReservation { .. } => {}
         BlobEffect::DeleteHidden { key } => push(&mut ids, &key.backend),
         BlobEffect::SpoolHidden { .. }
         | BlobEffect::ListHidden { .. }
@@ -412,6 +413,12 @@ mod tests {
         };
 
         assert_eq!(group_ids(&effect), vec![backend_id]);
-        assert!(group_ids(&BlobEffect::ListHidden { namespace: None }).is_empty());
+        assert!(
+            group_ids(&BlobEffect::ListHidden {
+                namespace: None,
+                cursor: None,
+            })
+            .is_empty()
+        );
     }
 }

@@ -29,7 +29,9 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::structs::{
     Actor, DocumentClass, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
     PlacementBinding, PlacementRef, PlacementScope, RealmAuthorizationDocument,
@@ -243,9 +245,13 @@ impl Topology {
         wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
             "the seeded group never reached every sync-eligible node",
             || async {
+                // Policy loading needs the group record as well as its auth
+                // document, and the two replicate independently.
                 let mut pending = 0;
                 for node in self.nodes.iter().filter(|node| node.is_sync_eligible()) {
-                    if read_group_auth(node, group.group_id).await?.is_none() {
+                    if read_group_auth(node, group.group_id).await?.is_none()
+                        || read_group_record(node, group.group_id).await?.is_none()
+                    {
                         pending += 1;
                     }
                 }
@@ -616,6 +622,24 @@ async fn read_group_auth(node: &TestNode, group_id: Ulid) -> TestResult<Option<V
             Ok(value.map(|bytes| bytes.to_vec()))
         }
         other => Err(format!("unexpected group auth read event: {other:?}").into()),
+    }
+}
+
+async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Option<Vec<u8>>> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: GROUP_KEYSPACE.to_string(),
+            key: group_id.to_bytes().into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|bytes| bytes.to_vec()))
+        }
+        other => Err(format!("unexpected group record read event: {other:?}").into()),
     }
 }
 

@@ -35,6 +35,8 @@ pub enum RefreshBlobHoldersError {
     Storage(#[from] StorageError),
     #[error("failed to schedule blob holder refresh: {0}")]
     Schedule(String),
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -183,7 +185,7 @@ impl Operation for RefreshBlobHoldersOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .expect("blob holder refresh operation must set output")
+            .unwrap_or(Err(RefreshBlobHoldersError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {

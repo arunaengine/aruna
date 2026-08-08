@@ -3,15 +3,18 @@ use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use crate::driver::{DriverContext, drive};
 use crate::group_backends::{RecordReadError, parse_read};
 use crate::group_routing::load_group_inputs;
+use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReplicationMode, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
+use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -21,23 +24,125 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, Permission,
     PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
     ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
     SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
-    sync_state_key,
+    blob_object_permission_path, sync_state_key,
 };
 use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 use thiserror::Error;
 use tracing::debug;
 use ulid::Ulid;
 
 const ITER_PAGE_SIZE: usize = 512;
+const MAX_SCOPE_VERSIONS: usize = 1024;
+
+#[derive(Debug, Error, PartialEq)]
+pub(super) enum SourceAuthorizationError {
+    #[error("source access denied")]
+    Denied,
+    #[error("source authorization unavailable: {0}")]
+    Unavailable(String),
+}
+
+pub(super) struct SourceAuthorization {
+    group_id: GroupId,
+    source_node_id: NodeId,
+    auth_context: AuthContext,
+    permissions: PermissionRules,
+    policies: PolicyEvaluator,
+}
+
+// Compiled rules and evaluators are derived state; identity fields decide equality.
+impl PartialEq for SourceAuthorization {
+    fn eq(&self, other: &Self) -> bool {
+        self.group_id == other.group_id
+            && self.source_node_id == other.source_node_id
+            && self.auth_context == other.auth_context
+    }
+}
+
+impl std::fmt::Debug for SourceAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceAuthorization")
+            .field("group_id", &self.group_id)
+            .field("source_node_id", &self.source_node_id)
+            .field("auth_context", &self.auth_context)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SourceAuthorization {
+    pub(super) async fn load(
+        context: &DriverContext,
+        auth_context: AuthContext,
+        group_id: GroupId,
+        source_node_id: NodeId,
+    ) -> Result<Self, SourceAuthorizationError> {
+        let permissions = drive(
+            PermissionRulesOperation::new(PermissionRulesConfig {
+                auth_context: auth_context.clone(),
+                path: format!("/{}/g/{group_id}", auth_context.realm_id),
+            }),
+            context,
+        )
+        .await
+        .map_err(permission_error)?;
+        let policies = PolicyEvaluator::load(context, auth_context.realm_id, Some(group_id))
+            .await
+            .map_err(|error| SourceAuthorizationError::Unavailable(error.to_string()))?;
+        Ok(Self {
+            group_id,
+            source_node_id,
+            auth_context,
+            permissions,
+            policies,
+        })
+    }
+
+    pub(super) fn group_id(&self) -> GroupId {
+        self.group_id
+    }
+
+    fn allows(&self, bucket: &str, key: &str) -> Result<(), SourceAuthorizationError> {
+        let path = blob_object_permission_path(
+            self.auth_context.realm_id,
+            self.group_id,
+            self.source_node_id,
+            bucket,
+            key,
+        );
+        if !self.permissions.allows(&path, &Permission::READ) {
+            return Err(SourceAuthorizationError::Denied);
+        }
+        let request = policy_request_with(
+            &path,
+            &Permission::READ,
+            Some(&self.auth_context.user_id),
+            PolicyRequestExtras::operation("s3.GetObject"),
+        );
+        self.policies
+            .evaluate(&request)
+            .map_err(|_| SourceAuthorizationError::Denied)
+    }
+}
+
+fn permission_error(error: AuthorizationError) -> SourceAuthorizationError {
+    match error {
+        AuthorizationError::AuthDocNotFound
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::InvalidRealmId => SourceAuthorizationError::Denied,
+        other => SourceAuthorizationError::Unavailable(other.to_string()),
+    }
+}
 
 #[derive(Serialize)]
 struct ReferenceFingerprint<'a> {
@@ -156,6 +261,8 @@ pub enum ReplicateScopeError {
     ReplicateObjectVersionError(#[from] ReplicateObjectVersionError),
     #[error("Source bucket not found")]
     BucketNotFound,
+    #[error("replication scope exceeds {limit} versions")]
+    ScopeLimit { limit: usize },
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -186,6 +293,10 @@ pub struct ReplicateScopeOperation {
     source_group_id: Option<GroupId>,
     sync: Option<SyncTransferContext>,
     pending_versions: Vec<VersionReplicationRequest>,
+    pending_keys: BTreeSet<(String, String, Ulid)>,
+    examined_versions: usize,
+    source_authorization: Option<SourceAuthorization>,
+    writer_auth_context: Option<AuthContext>,
     routing: NodeRouting,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
@@ -202,6 +313,10 @@ impl ReplicateScopeOperation {
             source_group_id: None,
             sync: None,
             pending_versions: Vec::new(),
+            pending_keys: BTreeSet::new(),
+            examined_versions: 0,
+            source_authorization: None,
+            writer_auth_context: None,
             routing: NodeRouting::default(),
             result: ReplicateScopeResult {
                 replicated: 0,
@@ -220,6 +335,16 @@ impl ReplicateScopeOperation {
         self
     }
 
+    pub(super) fn with_source_authorization(mut self, authorization: SourceAuthorization) -> Self {
+        self.source_authorization = Some(authorization);
+        self
+    }
+
+    pub(super) fn with_writer_auth(mut self, auth_context: AuthContext) -> Self {
+        self.writer_auth_context = Some(auth_context);
+        self
+    }
+
     pub fn with_relationship(
         mut self,
         relationship: SyncRelationship,
@@ -227,6 +352,7 @@ impl ReplicateScopeOperation {
         mut upstream_sources: Vec<ArunaArn>,
         writer_auth_context: Option<AuthContext>,
     ) -> Self {
+        self.writer_auth_context = writer_auth_context.clone();
         if !upstream_sources
             .iter()
             .any(|source| source == &relationship.source)
@@ -364,7 +490,10 @@ impl ReplicateScopeOperation {
         })]
     }
 
-    fn enqueue_version_request(&mut self, version_key: VersionKey) {
+    fn enqueue_version_request(
+        &mut self,
+        version_key: VersionKey,
+    ) -> Result<(), ReplicateScopeError> {
         if self.sync.as_ref().is_some_and(|sync| {
             map_sync_key(
                 &version_key.key,
@@ -373,13 +502,14 @@ impl ReplicateScopeOperation {
             )
             .is_none()
         }) {
-            return;
+            return Ok(());
         }
-        if self.pending_versions.iter().any(|request| {
-            request.bucket == version_key.bucket
-                && request.key == version_key.key
-                && request.version_id == version_key.version_id
-        }) {
+        let identity = (
+            version_key.bucket.clone(),
+            version_key.key.clone(),
+            version_key.version_id,
+        );
+        if self.pending_keys.contains(&identity) {
             debug!(
                 bucket = %version_key.bucket,
                 key = %version_key.key,
@@ -387,9 +517,24 @@ impl ReplicateScopeOperation {
                 target_node = %self.input.target_node_id,
                 "Skipping duplicate replication queue entry"
             );
-            return;
+            return Ok(());
         }
 
+        if let Some(authorization) = self.source_authorization.as_ref()
+            && let Err(error) = authorization.allows(&version_key.bucket, &version_key.key)
+        {
+            self.result.failed = self.result.failed.saturating_add(1);
+            self.result.last_error = Some(error.to_string());
+            return Ok(());
+        }
+
+        if self.pending_versions.len() >= MAX_SCOPE_VERSIONS {
+            return Err(ReplicateScopeError::ScopeLimit {
+                limit: MAX_SCOPE_VERSIONS,
+            });
+        }
+
+        self.pending_keys.insert(identity);
         debug!(
             bucket = %version_key.bucket,
             key = %version_key.key,
@@ -407,6 +552,7 @@ impl ReplicateScopeOperation {
             auth_context: self.input.auth_context.clone(),
             mode: self.input.mode,
         });
+        Ok(())
     }
 
     fn should_enqueue_version(&self, is_deleted: bool) -> bool {
@@ -440,6 +586,7 @@ impl ReplicateScopeOperation {
             "Starting version replication suboperation"
         );
         self.state = ReplicateScopeState::RunVersionReplication;
+        let writer_auth_context = self.writer_auth_context.clone();
         let operation = match self.sync.clone() {
             Some(mut sync) => {
                 let Some(target_key) = map_sync_key(
@@ -458,6 +605,10 @@ impl ReplicateScopeOperation {
             None => {
                 ReplicateObjectVersionOperation::new(request).with_routing(self.routing.clone())
             }
+        };
+        let operation = match writer_auth_context {
+            Some(auth_context) => operation.with_writer_auth(auth_context),
+            None => operation,
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
             operation,
@@ -583,7 +734,9 @@ impl Operation for ReplicateScopeOperation {
                         "Loaded single version for replication"
                     );
                     if self.should_enqueue_version(version.is_deleted()) {
-                        self.enqueue_version_request(version_key);
+                        if let Err(error) = self.enqueue_version_request(version_key) {
+                            return self.fail(error);
+                        }
                     } else {
                         debug!(
                             bucket = %version_key.bucket,
@@ -611,6 +764,13 @@ impl Operation for ReplicateScopeOperation {
                 };
 
                 let page_len = values.len();
+                let examined = self.examined_versions.saturating_add(page_len);
+                if examined > MAX_SCOPE_VERSIONS {
+                    return self.fail(ReplicateScopeError::ScopeLimit {
+                        limit: MAX_SCOPE_VERSIONS,
+                    });
+                }
+                self.examined_versions = examined;
                 let pending_before = self.pending_versions.len();
 
                 for (key, value) in values {
@@ -639,7 +799,9 @@ impl Operation for ReplicateScopeOperation {
                         continue;
                     }
 
-                    self.enqueue_version_request(version_key);
+                    if let Err(error) = self.enqueue_version_request(version_key) {
+                        return self.fail(error);
+                    }
                 }
 
                 debug!(
@@ -800,6 +962,7 @@ pub struct ReplicateObjectVersionOperation {
     group_inputs: GroupRoutingInputs,
     bucket_rules: Vec<StorageRoutingRule>,
     sync: Option<SyncTransferContext>,
+    writer_auth_context: Option<AuthContext>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
@@ -824,6 +987,7 @@ impl ReplicateObjectVersionOperation {
             group_inputs: GroupRoutingInputs::default(),
             bucket_rules: Vec::new(),
             sync: None,
+            writer_auth_context: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
@@ -836,6 +1000,11 @@ impl ReplicateObjectVersionOperation {
 
     fn with_sync(mut self, sync: SyncTransferContext) -> Self {
         self.sync = Some(sync);
+        self
+    }
+
+    fn with_writer_auth(mut self, auth_context: AuthContext) -> Self {
+        self.writer_auth_context = Some(auth_context);
         self
     }
 
@@ -1338,6 +1507,10 @@ impl ReplicateObjectVersionOperation {
                 });
                 self.read_current_lookup()
             }
+            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
+                self.cleanup_reference_blob = Some(location);
+                self.fail(ReplicationError::ReplicationFailed.into())
+            }
             Event::Blob(BlobEvent::Error(_)) => {
                 self.fail(ReplicationError::ReplicationFailed.into())
             }
@@ -1490,10 +1663,11 @@ impl ReplicateObjectVersionOperation {
                 .sync
                 .as_ref()
                 .map_or_else(Vec::new, |sync| sync.upstream_sources.clone()),
-            writer_auth_context: self
-                .sync
-                .as_ref()
-                .and_then(|sync| sync.writer_auth_context.clone()),
+            writer_auth_context: self.writer_auth_context.clone().or_else(|| {
+                self.sync
+                    .as_ref()
+                    .and_then(|sync| sync.writer_auth_context.clone())
+            }),
             reference_metadata: reference,
             metadata,
         });
@@ -1659,6 +1833,7 @@ impl Operation for ReplicateObjectVersionOperation {
                     created_by,
                     state,
                     metadata,
+                    published_by: _,
                 } = version;
 
                 match state {
@@ -2095,33 +2270,42 @@ impl Operation for ReplicateObjectVersionOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicateObjectVersionError, ReplicateObjectVersionOperation, ReplicateScopeInput,
-        ReplicateScopeOperation, ReplicateScopeTarget, ReplicationVersion, SyncTransferContext,
+        MAX_SCOPE_VERSIONS, ReplicateObjectVersionError, ReplicateObjectVersionOperation,
+        ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
+        ReplicationVersion, SourceAuthorization, SyncTransferContext,
     };
+    use crate::driver::DriverContext;
     use crate::replication::protocol::{
         ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
     };
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
+    use aruna_core::errors::BlobError;
     use aruna_core::events::{
         BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent,
     };
-    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SYNC_REFERENCE_STATE_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        SYNC_REFERENCE_STATE_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        GroupRoutingInputs, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, PortableSourceDescriptor, RealmId, ReferenceHandling,
-        ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
-        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
+        CurrentVersionPointer, Group, GroupAuthorizationDocument, GroupRoutingInputs,
+        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+        MultipartObjectSummary, PortableSourceDescriptor, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, ReferenceHandling, ReplicationItemKind,
+        ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_core::types::Effects;
+    use aruna_storage::FjallStorage;
     use bytes::Bytes;
     use futures_util::stream;
     use std::collections::HashMap;
     use std::time::SystemTime;
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     /// Replays the routing loader and bucket-rules read the reference path adds.
@@ -2187,6 +2371,97 @@ mod tests {
             replicate_delete_markers: true,
             mode: ReplicationMode::Live,
         }
+    }
+
+    async fn source_auth(
+        input: &ReplicateScopeInput,
+        allow: bool,
+    ) -> (TempDir, SourceAuthorization) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = input.auth_context.realm_id;
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let actor = Actor {
+            node_id: input.target_node_id,
+            user_id: input.auth_context.user_id,
+            realm_id,
+        };
+        let realm = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::new(),
+            operation_restrictions: HashMap::new(),
+        };
+        let group = if allow {
+            GroupAuthorizationDocument::new_default_group_doc(actor.user_id, realm_id, group_id)
+        } else {
+            GroupAuthorizationDocument {
+                group_id,
+                roles: HashMap::new(),
+                policies: Vec::new(),
+            }
+        };
+        let event = storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: vec![
+                    // Policy loading fails closed without the realm config document.
+                    (
+                        REALM_CONFIG_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                            .to_bytes(&actor)
+                            .unwrap()
+                            .into(),
+                    ),
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        realm.to_bytes(&actor).unwrap().into(),
+                    ),
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        group_id.to_bytes().into(),
+                        group.to_bytes(&actor).unwrap().into(),
+                    ),
+                    // Policy loading resolves the group record before group policies apply.
+                    (
+                        GROUP_KEYSPACE.to_string(),
+                        group_id.to_bytes().into(),
+                        Group {
+                            display_name: "replication-group".to_string(),
+                            group_id,
+                            realm_id,
+                            roles: group.roles.keys().copied().collect(),
+                            owner: actor.user_id,
+                        }
+                        .to_bytes(&actor)
+                        .unwrap()
+                        .into(),
+                    ),
+                ],
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        let authorization = SourceAuthorization::load(
+            &context,
+            input.auth_context.clone(),
+            group_id,
+            input.target_node_id,
+        )
+        .await
+        .unwrap();
+        (directory, authorization)
     }
 
     fn version_entry(
@@ -2363,6 +2638,164 @@ mod tests {
             panic!("expected only matching object version to be enqueued")
         };
         assert_eq!(op.pending_versions.len(), 0);
+    }
+
+    #[test]
+    fn scope_dedups_versions() {
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::IterateVersions;
+        let version_id = Ulid::from_bytes([1u8; 16]);
+        let cursor: aruna_core::types::Key = vec![9u8].into();
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/file.txt", version_id); 2],
+            next_start_after: Some(cursor),
+        }));
+
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Iter { .. })
+        ));
+        assert_eq!(op.pending_versions.len(), 1);
+        assert_eq!(op.pending_keys.len(), 1);
+    }
+
+    #[test]
+    fn scope_rejects_overflow() {
+        // A page pushing the examined total past the budget is rejected before
+        // any of its versions are enqueued.
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::IterateVersions;
+        let values = (0..=MAX_SCOPE_VERSIONS)
+            .map(|index| {
+                version_entry(
+                    &format!("key-{index}"),
+                    Ulid::from_bytes((index as u128 + 1).to_be_bytes()),
+                )
+            })
+            .collect();
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert!(op.pending_versions.is_empty());
+        assert_eq!(
+            op.output,
+            Some(Err(ReplicateScopeError::ScopeLimit {
+                limit: MAX_SCOPE_VERSIONS,
+            }))
+        );
+    }
+
+    #[test]
+    fn scope_paginates_cursor() {
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::IterateVersions;
+        let cursor: aruna_core::types::Key = vec![9u8].into();
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/first", Ulid::from_bytes([1u8; 16]))],
+            next_start_after: Some(cursor.clone()),
+        }));
+        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+            panic!("expected next scope page")
+        };
+        assert_eq!(start, &Some(IterStart::After(cursor)));
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/second", Ulid::from_bytes([2u8; 16]))],
+            next_start_after: None,
+        }));
+        assert!(matches!(effects[0], Effect::SubOperation(_)));
+        assert_eq!(op.pending_versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scope_caps_denied() {
+        // Authorization-denied pages must consume the same finite scan budget.
+        let input = scope_input(ReplicateScopeTarget::Bucket);
+        let (_directory, authorization) = source_auth(&input, false).await;
+        let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
+        op.state = super::ReplicateScopeState::IterateVersions;
+
+        let first = (0..512)
+            .map(|index| {
+                version_entry(
+                    &format!("key-{index}"),
+                    Ulid::from_bytes((index as u128 + 1).to_be_bytes()),
+                )
+            })
+            .collect();
+        let cursor = vec![1u8].into();
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: first,
+            next_start_after: Some(cursor),
+        }));
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Iter { .. })
+        ));
+
+        let second = (512..1024)
+            .map(|index| {
+                version_entry(
+                    &format!("key-{index}"),
+                    Ulid::from_bytes((index as u128 + 1).to_be_bytes()),
+                )
+            })
+            .collect();
+        let cursor = vec![2u8].into();
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: second,
+            next_start_after: Some(cursor),
+        }));
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Iter { .. })
+        ));
+        assert_eq!(op.examined_versions, MAX_SCOPE_VERSIONS);
+        assert!(op.pending_versions.is_empty());
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry(
+                "key-1024",
+                Ulid::from_bytes((MAX_SCOPE_VERSIONS as u128 + 1).to_be_bytes()),
+            )],
+            next_start_after: None,
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert_eq!(
+            op.output,
+            Some(Err(ReplicateScopeError::ScopeLimit {
+                limit: MAX_SCOPE_VERSIONS,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_admits_permitted() {
+        // The source gate must admit a permitted read; a gate that denied every
+        // version would silently stop all replication. Roles bind to a real
+        // user, so the nil principal of the default context cannot be used.
+        let mut input = scope_input(ReplicateScopeTarget::Bucket);
+        input.auth_context.user_id = UserId::local(Ulid::from_bytes([4u8; 16]), test_realm_id());
+        let (_directory, authorization) = source_auth(&input, true).await;
+        let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
+        op.state = super::ReplicateScopeState::IterateVersions;
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/file.txt", Ulid::from_bytes([1u8; 16]))],
+            next_start_after: None,
+        }));
+
+        assert_eq!(op.result.last_error, None);
+        assert_eq!(op.result.failed, 0);
+        assert!(matches!(effects[0], Effect::SubOperation(_)));
     }
 
     #[test]
@@ -2564,6 +2997,22 @@ mod tests {
         let manifest = op.manifest.expect("manifest built");
         assert!(manifest.current_version);
         assert_eq!(manifest.current_version_generation, Some(generation));
+    }
+
+    #[test]
+    fn manifest_writer_auth() {
+        let version_id = Ulid::generate();
+        let writer = auth_context();
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id))
+            .with_writer_auth(writer.clone());
+        op.replication_version = Some(ReplicationVersion::Deleted {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+        });
+
+        op.build_manifest(None).unwrap();
+
+        assert_eq!(op.manifest.unwrap().writer_auth_context, Some(writer));
     }
 
     #[test]
@@ -2940,6 +3389,63 @@ mod tests {
 
         op.build_manifest(None).unwrap();
         assert_eq!(op.manifest.as_ref().unwrap().source, original_source);
+    }
+
+    #[test]
+    fn cleanup_deletes_blob() {
+        // A materialization that fails after the backend wrote data must still
+        // surrender that location, or the partial blob leaks.
+        let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
+            Ulid::generate(),
+            ReplicationMode::OnDemand,
+        ));
+
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+        op.step(Event::SubOperation(
+            SubOperationEvent::VersionSourceAccessResolved {
+                result: Ok(ResolvedSourceAccess::OpenDal {
+                    kind: SourceConnectorKind::Http,
+                    config: HashMap::from([(
+                        "endpoint".to_string(),
+                        "https://example.org".to_string(),
+                    )]),
+                    path: "ref/file.txt".to_string(),
+                    version: None,
+                }),
+            },
+        ));
+        load_routing(&mut op);
+        op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata: SourceMetadata {
+                content_length: 3,
+                content_type: Some("text/plain".to_string()),
+                etag: Some("etag-2".to_string()),
+                last_modified: None,
+                source_version: None,
+            },
+            stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                Bytes::from_static(b"abc"),
+            )])),
+        }));
+
+        let temp_location = materialized_location();
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
+            location: temp_location.clone(),
+            message: "backend writer failed".to_string(),
+        })));
+
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete {
+                location: temp_location
+            })]
+        );
+        assert!(op.is_complete());
+        assert!(op.finalize().is_err());
     }
 
     #[test]

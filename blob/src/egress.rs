@@ -158,6 +158,13 @@ impl EgressGuard {
     }
 }
 
+/// A hop may never weaken the transport the caller chose: once the original
+/// request was HTTPS, an HTTP target is refused. reqwest keeps sensitive
+/// headers on same-host-and-port hops, so a downgrade would leak credentials.
+fn scheme_downgraded(previous: &[Url], next: &Url) -> bool {
+    previous.first().is_some_and(|url| url.scheme() == "https") && next.scheme() != "https"
+}
+
 fn guarded_client(
     policy: EgressPolicy,
     lookup: Lookup,
@@ -170,6 +177,10 @@ fn guarded_client(
         Some(hops) => redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= hops {
                 return attempt.stop();
+            }
+            if scheme_downgraded(attempt.previous(), attempt.url()) {
+                let target = attempt.url().to_string();
+                return attempt.error(EgressError::SchemeDowngrade(target));
             }
             let verdict = match attempt.url().host_str() {
                 Some(host) => screen_host(&screen_policy, host),
@@ -396,6 +407,29 @@ mod tests {
 
         assert!(denial(error).contains("not a public unicast destination"));
         assert_eq!(server.hits(), 1);
+    }
+
+    #[test]
+    fn refuses_scheme_downgrade() {
+        // Only the original scheme matters: an https start pins https hops.
+        let https = Url::parse("https://backend.test/start").unwrap();
+        let http = Url::parse("http://backend.test/start").unwrap();
+        assert!(scheme_downgraded(
+            std::slice::from_ref(&https),
+            &Url::parse("http://backend.test/next").unwrap()
+        ));
+        assert!(!scheme_downgraded(
+            std::slice::from_ref(&https),
+            &Url::parse("https://other.test/next").unwrap()
+        ));
+        assert!(!scheme_downgraded(
+            std::slice::from_ref(&http),
+            &Url::parse("http://backend.test/next").unwrap()
+        ));
+        assert!(!scheme_downgraded(
+            std::slice::from_ref(&http),
+            &Url::parse("https://backend.test/next").unwrap()
+        ));
     }
 
     #[tokio::test]

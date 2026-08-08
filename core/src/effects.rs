@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::alpn::Alpn;
+use crate::audit::AuditPageRequest;
 use crate::document::DocumentSyncEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
@@ -70,11 +71,15 @@ pub enum BlobEffect {
     Delete {
         location: BackendLocation,
     },
+    ReleaseReservation {
+        id: Ulid,
+    },
     SpoolHidden {
         namespace: Ulid,
         name: String,
         created_by: UserId,
         max_bytes: Option<u64>,
+        deadline: Option<Instant>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
     ReadHiddenRange {
@@ -86,6 +91,7 @@ pub enum BlobEffect {
     },
     ListHidden {
         namespace: Option<Ulid>,
+        cursor: Option<Vec<u8>>,
     },
     // ----- Replication -----
     OpenConnection {
@@ -241,6 +247,7 @@ pub enum NetEffect {
     DocumentSync(DocumentSyncEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
+    AuditPage(Box<AuditPageEffect>),
 }
 
 /// Discrete job-control request to a job's immutable owner. The adapter performs
@@ -249,6 +256,15 @@ pub enum NetEffect {
 pub struct JobControlEffect {
     pub owner: NodeId,
     pub request: JobRequest,
+}
+
+/// The audit fan-out: one page request asked of every listed node. The adapter
+/// performs the frame round-trips concurrently and answers with one aggregated
+/// event, so an unreachable node cannot delay the others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditPageEffect {
+    pub nodes: Vec<NodeId>,
+    pub request: AuditPageRequest,
 }
 
 #[derive(Debug, Clone, PartialEq)]

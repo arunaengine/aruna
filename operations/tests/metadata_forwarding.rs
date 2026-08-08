@@ -1,5 +1,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+mod convergence;
+
 use aruna_core::keys::generate_signing_key;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -8,7 +10,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::UserId;
-use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
     DocumentSyncTarget,
@@ -18,10 +20,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::MetadataError;
+use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
 };
+use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
@@ -35,12 +39,15 @@ use aruna_operations::document_sync_outbox::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, update_metadata_document_routed,
+    MetadataWriteError, create_metadata_document_routed, forward_token_revoke,
+    update_metadata_document_routed,
 };
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
+use aruna_operations::set_realm_policies::{SetRealmPoliciesConfig, SetRealmPoliciesOperation};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -54,6 +61,8 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
+
+use convergence::wait_for_convergence;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine
 // hang. Convergence measures single-digit seconds, but a loaded CI runner can
@@ -117,6 +126,70 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
         }
         sleep(Duration::from_millis(50)).await;
     }
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let target = realm.bearer_string();
+
+    forward_token_revoke(
+        &user_node.context,
+        realm.realm_id,
+        realm.bearer_token(),
+        target.clone(),
+    )
+    .await?;
+
+    let hash = bearer_token_hash(&target);
+    wait_for_convergence("forwarded revocation did not converge", || async {
+        let mut pending = 0;
+        for node in nodes.iter().filter(|node| node.sync_eligible) {
+            let config = drive(
+                GetRealmConfigOperation::new(realm.realm_id),
+                node.context.as_ref(),
+            )
+            .await?;
+            if !config.token_revoked(&hash, unix_timestamp_secs()) {
+                pending += 1;
+            }
+        }
+        Ok::<usize, Box<dyn std::error::Error>>(pending)
+    })
+    .await?;
+
+    let user_config = drive(
+        GetRealmConfigOperation::new(realm.realm_id),
+        user_node.context.as_ref(),
+    )
+    .await?;
+    assert!(!user_config.token_revoked(&hash, unix_timestamp_secs()));
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarded_policy_denies() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let group_id = seed_group(&realm, &nodes).await?;
+    set_write_policy(&realm, &nodes).await?;
+    let document_id = forward_id(&config, &realm, user_node, group_id, "datasets/forwarded")?;
+
+    let error = drive_forwarded_create(&realm, user_node, group_id, document_id)
+        .await
+        .expect_err("a routed write denied by policy must not be accepted");
+    assert!(matches!(
+        error.downcast_ref::<MetadataWriteError>(),
+        Some(MetadataWriteError::Forbidden)
+    ));
 
     shutdown(nodes).await;
     Ok(())
@@ -526,6 +599,13 @@ impl Realm {
         .expect("token signs");
         MetadataAuthToken::bearer(token).expect("token is within the length bound")
     }
+
+    fn bearer_string(&self) -> String {
+        match self.bearer_token() {
+            MetadataAuthToken::Bearer(token) => token.as_str().to_string(),
+            MetadataAuthToken::Internal(_) => unreachable!(),
+        }
+    }
 }
 
 /// A group owned by the realm's user, replicated to every node. The holder of a
@@ -548,6 +628,36 @@ async fn seed_group(realm: &Realm, nodes: &[TestNode]) -> Result<Ulid, Box<dyn s
 
     wait_for_group(realm, nodes, group.group_id).await?;
     Ok(group.group_id)
+}
+
+async fn set_write_policy(
+    realm: &Realm,
+    nodes: &[TestNode],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = RequestPolicy {
+        policy_id: Ulid::from_bytes([42u8; 16]),
+        name: "deny-writes".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: "permission == 'write'".to_string(),
+        enabled: true,
+    };
+    for node in nodes {
+        drive(
+            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
+                actor: Actor {
+                    node_id: node.net.node_id(),
+                    user_id: realm.user_id,
+                    realm_id: realm.realm_id,
+                },
+                policies: vec![policy.clone()],
+                expected_hash: None,
+            }),
+            node.context.as_ref(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Waits until the group's owner holds WRITE on every sync-eligible node. The

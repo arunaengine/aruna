@@ -1,6 +1,11 @@
-use aruna_core::auth::bearer_token_hash;
+use aruna_core::auth::{REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime};
+use aruna_core::document::DocumentSyncTarget;
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, TokenClaims};
+use aruna_core::util::unix_timestamp_secs;
+use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use base64::Engine;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -15,13 +20,20 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 #[async_trait]
 pub trait ArunaBearerTokenValidationState: Sync {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool;
+    /// Revocation is owned by the realm that issued the token, never by the
+    /// serving node's realm, so `realm_id` comes from the verified claims.
+    async fn is_token_revoked(
+        &self,
+        realm_id: &RealmId,
+        token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError>;
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool;
 
-    async fn decoding_key_for_issuer(
+    async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
@@ -39,6 +51,10 @@ pub enum ArunaBearerTokenError {
     InvalidIssuerKey,
     #[error("Token expired")]
     Expired,
+    #[error("Token lifetime exceeds the revocable maximum")]
+    LifetimeTooLong,
+    #[error("Revocation state is unavailable")]
+    RevocationUnavailable,
     #[error("Invalid server token")]
     InvalidServerToken,
     #[error(transparent)]
@@ -53,6 +69,40 @@ pub enum ArunaBearerTokenError {
     JwtError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64Error(#[from] base64::DecodeError),
+}
+
+/// Whether the realm's replicated revocation set denies this token hash. This
+/// is the realm-wide authority; a node-local list is only a fast path. A realm
+/// without a config document denies; a failed read is reported as unavailable.
+pub async fn realm_token_revoked(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    token_hash: &str,
+) -> Result<bool, ArunaBearerTokenError> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => match RealmConfigDocument::from_bytes(&bytes) {
+            Ok(config) => Ok(config.token_revoked(token_hash, unix_timestamp_secs())),
+            Err(error) => {
+                warn!(error = %error, "Failed to decode realm config for token revocation");
+                Err(ArunaBearerTokenError::RevocationUnavailable)
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(true),
+        other => {
+            warn!(event = ?other, "Failed to read realm config for token revocation");
+            Err(ArunaBearerTokenError::RevocationUnavailable)
+        }
+    }
 }
 
 pub async fn validate_aruna_bearer_token<S>(
@@ -75,11 +125,6 @@ where
 {
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
 
-    let token_hash = bearer_token_hash(token);
-    if state.is_bearer_token_revoked(&token_hash).await {
-        return Err(ArunaBearerTokenError::TokenRevoked);
-    }
-
     let issuer = match (
         unvalidated_claims.claims.issuer_pubkey.as_deref(),
         unvalidated_claims.claims.delegation_signature.is_some(),
@@ -93,13 +138,23 @@ where
         .await
         .is_ok()
     {
-        state.decoding_key_for_issuer(issuer).await?
+        state.issuer_decoding_key(issuer).await?
     } else {
         decoding_key_from_base64_public_key(issuer)?
     };
     let claims = decode::<TokenClaims>(token, &decoding_key, &Validation::new(Algorithm::EdDSA))?;
 
     validate_aruna_bearer_token_claims(state, &claims.claims).await?;
+
+    // The issuing realm from the verified claims, so a foreign token is judged
+    // by its origin realm's revocation set and not by the serving node's.
+    let issuer_realm = RealmId::from_base64(&claims.claims.iss)
+        .map_err(|_| ArunaBearerTokenError::InvalidIssuerKey)?;
+    let token_hash = bearer_token_hash(token);
+    if state.is_token_revoked(&issuer_realm, &token_hash).await? {
+        return Err(ArunaBearerTokenError::TokenRevoked);
+    }
+
     Ok(claims.claims)
 }
 
@@ -134,6 +189,14 @@ where
     let now = chrono::Utc::now().timestamp() as u64;
     if now > claims.exp {
         return Err(ArunaBearerTokenError::Expired);
+    }
+    // The signed lifetime, not the remaining one: a token minted past the bound
+    // that the replicated revocation set can hold (`valid_revocation_expiry`)
+    // must never become acceptable merely by ageing. A future `iat` evades it.
+    if !valid_token_lifetime(claims.iat, claims.exp)
+        || claims.iat.saturating_sub(now) > REVOCATION_GRACE_SECS
+    {
+        return Err(ArunaBearerTokenError::LifetimeTooLong);
     }
 
     validate_issuer_trust(state, claims).await
@@ -239,7 +302,9 @@ impl IssuerKeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::structs::Actor;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
 
@@ -298,5 +363,151 @@ mod tests {
         let cache = IssuerKeyCache::new();
         assert!(cache.get_or_insert("not-base64!!").await.is_err());
         assert!(cache.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn missing_config_denies() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(
+            directory.path().to_str().expect("valid storage path"),
+        )
+        .unwrap();
+        let realm_id = RealmId::from_bytes([7; 32]);
+
+        assert!(
+            realm_token_revoked(&storage, realm_id, "token-hash")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_config_errors() {
+        // An undecodable document is a failed read, not an absent one: it must
+        // surface as unavailable instead of silently meaning "revoked".
+        let directory = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(
+            directory.path().to_str().expect("valid storage path"),
+        )
+        .unwrap();
+        let realm_id = RealmId::from_bytes([11; 32]);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: vec![0xff; 8].into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            realm_token_revoked(&storage, realm_id, "token-hash").await,
+            Err(ArunaBearerTokenError::RevocationUnavailable)
+        ));
+    }
+
+    #[derive(Default)]
+    struct SkewState;
+
+    #[async_trait]
+    impl ArunaBearerTokenValidationState for SkewState {
+        async fn is_token_revoked(
+            &self,
+            _realm_id: &RealmId,
+            _token_hash: &str,
+        ) -> Result<bool, ArunaBearerTokenError> {
+            Ok(false)
+        }
+
+        async fn is_trusted_realm(&self, _realm_id: &RealmId) -> bool {
+            true
+        }
+    }
+
+    fn lifetime_claims(iat: u64, exp: u64) -> TokenClaims {
+        TokenClaims {
+            sub: UserId::nil(RealmId::from_bytes([12; 32])).to_string(),
+            iss: RealmId::from_bytes([12; 32]).to_base64(),
+            iat,
+            exp,
+            jti: "token-id".to_string(),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_aged_token() {
+        // An overlong token must stay rejected as it ages: the bound is the
+        // signed lifetime, not the validity still remaining.
+        let now = unix_timestamp_secs();
+        let max = aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
+        let claims = lifetime_claims(now - max, now + 600);
+
+        assert!(matches!(
+            validate_aruna_bearer_token_claims(&SkewState, &claims).await,
+            Err(ArunaBearerTokenError::LifetimeTooLong)
+        ));
+        // A token signed within the bound still validates.
+        validate_aruna_bearer_token_claims(&SkewState, &lifetime_claims(now, now + 600))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_future_issuance() {
+        let now = unix_timestamp_secs();
+        let skewed = now + aruna_core::auth::REVOCATION_GRACE_SECS + 60;
+
+        assert!(matches!(
+            validate_aruna_bearer_token_claims(&SkewState, &lifetime_claims(skewed, skewed + 600))
+                .await,
+            Err(ArunaBearerTokenError::LifetimeTooLong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_recovery_allows() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(
+            directory.path().to_str().expect("valid storage path"),
+        )
+        .unwrap();
+        let realm_id = RealmId::from_bytes([8; 32]);
+        assert!(
+            realm_token_revoked(&storage, realm_id, "token-hash")
+                .await
+                .unwrap()
+        );
+
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let signing_key = SigningKey::from_bytes(&[9; 32]);
+        let actor = Actor {
+            node_id: iroh::PublicKey::from_bytes(signing_key.verifying_key().as_bytes()).unwrap(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let value = RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+            .to_bytes(&actor)
+            .unwrap();
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: target.storage_keyspace().to_string(),
+                    key: target.storage_key(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert!(
+            !realm_token_revoked(&storage, realm_id, "token-hash")
+                .await
+                .unwrap()
+        );
     }
 }

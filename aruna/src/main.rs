@@ -212,15 +212,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 match ensure_initial_local_onboarding_secret(
                     driver_ctx.as_ref(),
                     format!("http://{}", config.http_socket_addr),
+                    &config.node_state.net_secret_key,
+                    config.realm_id,
                 )
                 .await
                 {
-                    Ok(secret) => warn!(
-                        onboarding_secret = %secret
-                            .encode()
-                            .expect("initial onboarding secret encoding should succeed"),
-                        "Created initial local onboarding secret for first user registration"
-                    ),
+                    Ok(_) => {
+                        info!("Created initial local onboarding secret for first user registration")
+                    }
                     Err(error) => {
                         return Err(format!(
                             "failed to create initial local onboarding secret: {error}"
@@ -385,7 +384,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .with_metrics(metrics.clone())
         .with_rocrate_limits(config.rocrate_limits.clone())
-        .with_s3_mounts(s3_mounts_available),
+        .with_s3_mounts(s3_mounts_available)
+        .with_trusted_proxies(config.trusted_proxies.clone())
+        .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+            config.rate_limits.ip_per_minute,
+            config.rate_limits.ip_burst,
+            config.rate_limits.principal_per_minute,
+            config.rate_limits.principal_burst,
+        )),
     );
     portal::initialize(config.portal.clone(), state.clone()).await;
 
@@ -406,11 +412,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.clone(),
         config.realm_id,
         config.node_id,
+        aruna_core::credential_seal::CredentialSealKey::derive(&config.node_state.net_secret_key),
         config.rocrate_limits.clone(),
         cors,
         metrics.clone(),
     )
     .await
+    .unwrap()
+    .with_concurrency_limits(
+        config.rate_limits.s3_max_connections as usize,
+        config.rate_limits.s3_max_requests as usize,
+    )
+    .with_trusted_proxies(config.trusted_proxies.clone())
+    .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+        config.rate_limits.ip_per_minute,
+        config.rate_limits.ip_burst,
+        config.rate_limits.principal_per_minute,
+        config.rate_limits.principal_burst,
+    ))
     .unwrap();
 
     let s3_listener = TcpListener::bind(&config.s3_address).await.unwrap();

@@ -22,10 +22,11 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataAuthToken;
 use crate::queue_backoff::queue_retry_after_ms;
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::PolicyRequestExtras;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
@@ -235,13 +236,20 @@ pub async fn request_sync_mirror_create(
     auth_token: MetadataAuthToken,
     source_group_id: Ulid,
     relationship: SyncRelationship,
+    extras: PolicyRequestExtras,
 ) -> Result<(), MetadataError> {
     let metadata_handle = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     metadata_handle
-        .request_sync_create(target_node, Some(auth_token), source_group_id, relationship)
+        .request_sync_create(
+            target_node,
+            Some(auth_token),
+            source_group_id,
+            relationship,
+            extras,
+        )
         .await
 }
 
@@ -271,24 +279,6 @@ pub async fn ensure_sync_mirror(
             "sync mirror creation must run on the source node".to_string(),
         ));
     }
-    if relationship.target.node_id == local_node {
-        ensure_target_write(context, relationship).await?;
-        return drive(
-            StoreSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Incoming,
-            ),
-            context,
-        )
-        .await
-        .map(|_| ())
-        .map_err(Into::into);
-    }
-
-    let metadata_handle = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| SyncMirrorRepairError::Mirror("target unreachable".to_string()))?;
     let source_bucket = relationship
         .source
         .bucket()
@@ -308,6 +298,38 @@ pub async fn ensure_sync_mirror(
         }
         Err(error) => return Err(SyncMirrorRepairError::Mirror(error.to_string())),
     };
+    authorize_repair(
+        context,
+        relationship,
+        relationship.source.realm_id,
+        &blob_bucket_permission_path(
+            relationship.source.realm_id,
+            source_group_id,
+            relationship.source.node_id,
+            source_bucket,
+        ),
+        &Permission::READ,
+        "s3.GetObject",
+    )
+    .await?;
+    if relationship.target.node_id == local_node {
+        ensure_target_write(context, relationship).await?;
+        return drive(
+            StoreSyncRelationshipOperation::new(
+                relationship.clone(),
+                SyncRelationshipDirection::Incoming,
+            ),
+            context,
+        )
+        .await
+        .map(|_| ())
+        .map_err(Into::into);
+    }
+
+    let metadata_handle = context
+        .metadata_handle
+        .as_ref()
+        .ok_or_else(|| SyncMirrorRepairError::Mirror("target unreachable".to_string()))?;
     metadata_handle
         .request_sync_create(
             relationship.target.node_id,
@@ -318,6 +340,7 @@ pub async fn ensure_sync_mirror(
             })),
             source_group_id,
             relationship.clone(),
+            PolicyRequestExtras::operation("s3.PutBucketReplication"),
         )
         .await
         .map_err(|error| SyncMirrorRepairError::Mirror(error.to_string()))
@@ -356,6 +379,7 @@ pub async fn delete_sync_mirror(
                 path_restrictions: None,
             })),
             relationship.clone(),
+            PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
         )
         .await
     {
@@ -470,29 +494,50 @@ async fn ensure_target_write(
         }
         Err(error) => return Err(SyncMirrorRepairError::Mirror(error.to_string())),
     };
-    let permitted = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: relationship.created_by,
-                realm_id: relationship.created_by.realm_id,
-                path_restrictions: None,
-            },
-            path: blob_bucket_permission_path(
-                relationship.target.realm_id,
-                bucket_info.group_id,
-                relationship.target.node_id,
-                target_bucket,
-            ),
-            required_permission: Permission::WRITE,
-        }),
+    authorize_repair(
         context,
+        relationship,
+        relationship.target.realm_id,
+        &blob_bucket_permission_path(
+            relationship.target.realm_id,
+            bucket_info.group_id,
+            relationship.target.node_id,
+            target_bucket,
+        ),
+        &Permission::WRITE,
+        "s3.PutBucketReplication",
     )
     .await
-    .map_err(|error| SyncMirrorRepairError::Mirror(error.to_string()))?;
-    if permitted {
-        Ok(())
-    } else {
-        Err(SyncMirrorRepairError::Mirror("access_denied".to_string()))
+}
+
+async fn authorize_repair(
+    context: &DriverContext,
+    relationship: &SyncRelationship,
+    realm_id: aruna_core::structs::RealmId,
+    path: &str,
+    permission: &Permission,
+    operation: &'static str,
+) -> Result<(), SyncMirrorRepairError> {
+    let auth = AuthContext {
+        user_id: relationship.created_by,
+        realm_id: relationship.created_by.realm_id,
+        path_restrictions: None,
+    };
+    match authorize(
+        context,
+        realm_id,
+        &auth,
+        path,
+        permission,
+        PolicyRequestExtras::operation(operation),
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+            Err(SyncMirrorRepairError::Mirror("access_denied".to_string()))
+        }
+        Err(AuthorizeError::CheckFailed(error)) => Err(SyncMirrorRepairError::Mirror(error)),
     }
 }
 
@@ -892,8 +937,13 @@ async fn delete_repair_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
-        ArunaArn, RealmId, ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot,
+        Actor, ArunaArn, BucketInfo, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot,
     };
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
@@ -919,6 +969,107 @@ mod tests {
             state: SyncState::Enabled,
             status: SyncStatusSnapshot::default(),
         }
+    }
+
+    fn policy(expression: &str) -> RequestPolicy {
+        RequestPolicy {
+            policy_id: Ulid::from_bytes([7; 16]),
+            name: "mirror-test".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
+        }
+    }
+
+    async fn setup_auth(expression: Option<&str>) -> (tempfile::TempDir, DriverContext) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let relationship = relationship();
+        let realm_id = relationship.source.realm_id;
+        let group_id = Ulid::from_bytes([6; 16]);
+        let actor = Actor {
+            node_id: relationship.source.node_id,
+            user_id: relationship.created_by,
+            realm_id,
+        };
+        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+            relationship.created_by,
+            realm_id,
+            group_id,
+        );
+        let group = Group {
+            display_name: "mirror-test".to_string(),
+            group_id,
+            realm_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+            owner: relationship.created_by,
+        };
+        let mut realm = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        realm.request_policies = expression.map(policy).into_iter().collect();
+        let source_bucket = relationship.source.bucket().unwrap();
+        let bucket = relationship.target.bucket().unwrap();
+        let bucket_info = BucketInfo {
+            group_id,
+            created_at: relationship.created_at,
+            created_by: relationship.created_by,
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+        };
+        let event = storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        REALM_CONFIG_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        realm.to_bytes(&actor).unwrap().into(),
+                    ),
+                    (
+                        GROUP_KEYSPACE.to_string(),
+                        group_id.to_bytes().to_vec().into(),
+                        group.to_bytes(&actor).unwrap().into(),
+                    ),
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                            .to_bytes(&actor)
+                            .unwrap()
+                            .into(),
+                    ),
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        group_id.to_bytes().to_vec().into(),
+                        auth_doc.to_bytes(&actor).unwrap().into(),
+                    ),
+                    (
+                        S3_BUCKET_KEYSPACE.to_string(),
+                        source_bucket.as_bytes().into(),
+                        bucket_info.to_bytes().unwrap().into(),
+                    ),
+                    (
+                        S3_BUCKET_KEYSPACE.to_string(),
+                        bucket.as_bytes().into(),
+                        bucket_info.to_bytes().unwrap().into(),
+                    ),
+                ],
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        (tempdir, context)
     }
 
     #[test]
@@ -1214,16 +1365,9 @@ mod tests {
 
     #[tokio::test]
     async fn repair_backs_off() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+        // Authorized repair reaches the missing metadata handle and retries.
+        let (_tempdir, context) = setup_auth(None).await;
+        let storage = context.storage_handle.clone();
         let relationship = relationship();
         drive(
             StoreSyncRelationshipOperation::new(
@@ -1275,5 +1419,64 @@ mod tests {
             SyncMirrorRepairRecord::from_bytes(&relationship.id.to_bytes(), &value).unwrap();
         assert_eq!(record.attempts, 1);
         assert_eq!(record.last_error.as_deref(), Some("target unreachable"));
+    }
+
+    #[tokio::test]
+    async fn policy_denies_write() {
+        let (_tempdir, context) = setup_auth(Some("operation == 's3.PutBucketReplication'")).await;
+
+        let result = ensure_target_write(&context, &relationship()).await;
+
+        assert!(matches!(
+            result,
+            Err(SyncMirrorRepairError::Mirror(error)) if error == "access_denied"
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_allows_write() {
+        let (_tempdir, context) = setup_auth(Some("operation == 's3.GetObject'")).await;
+
+        assert!(ensure_target_write(&context, &relationship()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn policy_retry_survives() {
+        let (_tempdir, context) = setup_auth(Some("operation == 's3.PutBucketReplication'")).await;
+        let mut relationship = relationship();
+        relationship.target = ArunaArn::s3_bucket(
+            relationship.target.realm_id,
+            relationship.source.node_id,
+            "target",
+        )
+        .unwrap();
+        drive(
+            StoreSyncRelationshipOperation::new(
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+        let mut record =
+            SyncMirrorRepairRecord::new(relationship.clone(), SyncMirrorRepairIntent::Reconcile);
+        record.due_at_ms = 0;
+        store_repair_record(&context.storage_handle, record)
+            .await
+            .unwrap();
+
+        let result = process_mirror_repairs(&context, relationship.source.node_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.failed, 1);
+        assert_eq!(
+            read_repair_record(&context.storage_handle, &relationship.id.to_bytes(), None,)
+                .await
+                .unwrap()
+                .and_then(|record| record.last_error),
+            Some("access_denied".to_string())
+        );
     }
 }

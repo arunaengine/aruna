@@ -1,12 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
 use crate::driver::{DriverContext, drive, node_routing, quota_marked_routing};
+use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
@@ -16,6 +18,7 @@ use crate::metadata::projector::{
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
+use crate::permission_rules::GroupPermissionRules;
 use crate::process_placements::process_shard_placements;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::replication::bao_read::IncomingBaoReadOperation;
@@ -24,6 +27,11 @@ use crate::replication::incoming_version_replication::{
 };
 use crate::replication::location_summary::LocationSummaryOperation;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::{
+    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
+};
+use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
@@ -34,20 +42,22 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{
-    ReplicationItemKind, RoCrateLimits, WatchEvent, WatchEventDetail, WatchEventKind,
-    data_watch_resource_path,
+    AuthContext, HashPathIndexKey, Permission, RealmId, ReplicationItemKind, RoCrateLimits,
+    WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
+    blob_object_permission_path, data_watch_resource_path,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use ulid::Ulid;
 
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS: u64 = 15;
+const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -70,6 +80,30 @@ impl OperationsInboundHandler {
             document_sync_reconcile,
             rocrate_limits,
             jobs_runtime,
+        }
+    }
+
+    /// Blob replication is trusted only from realm nodes eligible to hold and
+    /// sync data; unknown or user-kind peers are rejected. Fails closed when
+    /// the realm config cannot be read.
+    async fn peer_sync_eligible(&self, realm_id: RealmId, peer: NodeId) -> bool {
+        match drive(
+            GetRealmConfigOperation::new(realm_id),
+            self.context.as_ref(),
+        )
+        .await
+        {
+            Ok(config) => match config.sync_eligible_node_ids() {
+                Ok(ids) => ids.contains(&peer),
+                Err(error) => {
+                    warn!(peer = %peer, error = %error, "Failed to resolve sync-eligible peers");
+                    false
+                }
+            },
+            Err(error) => {
+                warn!(peer = %peer, error = %error, "Failed to read realm config for replication gate");
+                false
+            }
         }
     }
 }
@@ -110,6 +144,199 @@ async fn emit_replication_watch(
         },
     )
     .await;
+}
+
+async fn allow_policy(
+    context: &DriverContext,
+    auth: &AuthContext,
+    path: &str,
+    permission: &Permission,
+    operation: &str,
+) -> Result<bool, String> {
+    match authorize(
+        context,
+        auth.realm_id,
+        auth,
+        path,
+        permission,
+        PolicyRequestExtras::operation(operation),
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(AuthorizeError::PermissionDenied)
+        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn auth_matches(auth: &AuthContext, realm_id: RealmId) -> bool {
+    auth.realm_id == realm_id && auth.user_id.realm_id == realm_id
+}
+
+async fn manifest_policy(
+    context: &DriverContext,
+    local_realm: RealmId,
+    local_node: NodeId,
+    manifest: &VersionReplicationManifest,
+) -> Result<(Option<String>, Option<String>), String> {
+    let group_id = match drive(
+        GetBucketInfoOperation::new(manifest.bucket.clone()),
+        context,
+    )
+    .await
+    {
+        Ok(Some(Ok(info))) => info.group_id,
+        Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => manifest.group_id,
+        Ok(Some(Err(error))) => return Err(error.to_string()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let path = if manifest.key.is_empty() {
+        blob_bucket_permission_path(local_realm, group_id, local_node, &manifest.bucket)
+    } else {
+        blob_object_permission_path(
+            local_realm,
+            group_id,
+            local_node,
+            &manifest.bucket,
+            &manifest.key,
+        )
+    };
+    let operation = if manifest.kind == ReplicationItemKind::DeleteMarker {
+        "s3.DeleteObject"
+    } else {
+        "s3.PutObject"
+    };
+    if !auth_matches(&manifest.auth_context, local_realm)
+        || !allow_policy(
+            context,
+            &manifest.auth_context,
+            &path,
+            &Permission::WRITE,
+            operation,
+        )
+        .await?
+    {
+        return Ok((None, None));
+    }
+    let manifest_path = Some(path.clone());
+    let writer_path = if let Some(auth) = manifest.writer_auth_context.as_ref()
+        && auth_matches(auth, local_realm)
+    {
+        if allow_policy(context, auth, &path, &Permission::WRITE, operation).await? {
+            Some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok((manifest_path, writer_path))
+}
+
+async fn bao_policy(
+    context: &DriverContext,
+    local_realm: RealmId,
+    local_node: NodeId,
+    request: &crate::replication::protocol::BaoReadRequest,
+) -> Result<(HashSet<String>, Vec<HashPathIndexKey>, bool), String> {
+    let mut paths = HashSet::new();
+    if request.realm_id != local_realm || !auth_matches(&request.auth_context, request.realm_id) {
+        return Ok((paths, Vec::new(), false));
+    }
+    match &request.target {
+        crate::replication::protocol::BaoReadTarget::ExactVersion(target) => {
+            if target.realm_id != request.realm_id || target.node_id != local_node {
+                return Ok((paths, Vec::new(), false));
+            }
+            let group_id =
+                match drive(GetBucketInfoOperation::new(target.bucket.clone()), context).await {
+                    Ok(Some(Ok(info))) => info.group_id,
+                    Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => {
+                        return Ok((paths, Vec::new(), false));
+                    }
+                    Ok(Some(Err(error))) => return Err(error.to_string()),
+                    Err(error) => return Err(error.to_string()),
+                };
+            let path = blob_object_permission_path(
+                request.realm_id,
+                group_id,
+                local_node,
+                &target.bucket,
+                &target.key,
+            );
+            if allow_policy(
+                context,
+                &request.auth_context,
+                &path,
+                &Permission::READ,
+                "s3.GetObject",
+            )
+            .await?
+            {
+                paths.insert(path);
+            }
+            Ok((paths, Vec::new(), false))
+        }
+        crate::replication::protocol::BaoReadTarget::Blake3(hash) => {
+            let candidates = drive(ResolveBlobPermissionPathsOperation::new(*hash), context)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut unique = BTreeMap::new();
+            for candidate in candidates {
+                if candidate.realm_id != request.realm_id
+                    || candidate.node_id != local_node
+                    || candidate.blake3_hash != *hash
+                {
+                    continue;
+                }
+                let key = candidate.to_bytes().map_err(|error| error.to_string())?;
+                unique.entry(key).or_insert(candidate);
+            }
+            let candidates = unique.into_values().collect::<Vec<_>>();
+            let evaluators = PolicyEvaluator::load_bulk(
+                context,
+                candidates
+                    .iter()
+                    .map(|candidate| (candidate.realm_id, candidate.group_id)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let permissions = GroupPermissionRules::collect(
+                context,
+                Some(&request.auth_context),
+                candidates.iter().map(|candidate| candidate.group_id),
+            )
+            .await;
+            let mut allowed = Vec::with_capacity(candidates.len());
+            let mut had_denial = false;
+            for candidate in candidates {
+                let path = candidate.permission_path();
+                if !permissions.allows(candidate.group_id, &path, &Permission::READ) {
+                    had_denial = true;
+                    continue;
+                }
+                let request = policy_request_with(
+                    &path,
+                    &Permission::READ,
+                    Some(&request.auth_context.user_id),
+                    PolicyRequestExtras::operation("s3.GetObject"),
+                );
+                let evaluator = evaluators
+                    .get(&(candidate.realm_id, candidate.group_id))
+                    .ok_or_else(|| "hash policy evaluator is unavailable".to_string())?;
+                match evaluator.evaluate(&request) {
+                    Ok(()) => {
+                        paths.insert(path);
+                        allowed.push(candidate);
+                    }
+                    Err(PolicyEnforcementError::Denied { .. }) => had_denial = true,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok((paths, allowed, had_denial))
+        }
+    }
 }
 
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all
@@ -321,21 +548,60 @@ impl InboundEventHandler for OperationsInboundHandler {
             match alpn {
                 Alpn::Bao => {
                     if let Some(blob_handle) = self.context.blob_handle.clone() {
-                        let stream_id = match blob_handle.store_connection(node_id, stream).await {
-                            Ok(stream_id) => stream_id,
-                            Err(err) => {
+                        let Some(net_handle) = self.context.net_handle.clone() else {
+                            error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
+                            return;
+                        };
+                        // #332: only an authenticated sync-eligible realm peer
+                        // may open the blob replication plane at all.
+                        let eligible = timeout(
+                            INBOUND_BAO_TIMEOUT,
+                            self.peer_sync_eligible(*net_handle.realm_id(), node_id),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        if !eligible {
+                            warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+                            close_bao_stream(stream);
+                            return;
+                        }
+                        let stream_id = match timeout(
+                            INBOUND_BAO_TIMEOUT,
+                            blob_handle.store_connection(node_id, stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream_id)) => stream_id,
+                            Ok(Err(err)) => {
                                 error!(peer = %node_id, error = ?err, "Failed to register inbound bao stream");
                                 return;
                             }
+                            Err(_) => {
+                                warn!(peer = %node_id, "Timed out registering inbound bao stream");
+                                return;
+                            }
                         };
-                        let Some(net_handle) = self.context.net_handle.as_ref() else {
-                            error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
+                        let eligible = timeout(
+                            INBOUND_BAO_TIMEOUT,
+                            self.peer_sync_eligible(*net_handle.realm_id(), node_id),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        if !eligible {
+                            warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
                             close_failed_bao(&blob_handle, stream_id).await;
                             return;
-                        };
+                        }
                         let first_event = blob_handle
-                            .send_blob_effect(BlobEffect::ReadMessage { stream_id })
-                            .await;
+                            .send_blob_effect(BlobEffect::ReadMessage { stream_id });
+                        let first_event = match timeout(INBOUND_BAO_TIMEOUT, first_event).await {
+                            Ok(event) => event,
+                            Err(_) => {
+                                warn!(peer = %node_id, stream_id = %stream_id, "Timed out reading inbound bao control message");
+                                close_failed_bao(&blob_handle, stream_id).await;
+                                return;
+                            }
+                        };
 
                         match first_event {
                             Event::Blob(BlobEvent::MessageReceived { payload, .. }) => {
@@ -368,6 +634,21 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         } else {
                                             node_routing(self.context.as_ref())
                                         };
+                                        let (manifest_path, writer_path) = match manifest_policy(
+                                            self.context.as_ref(),
+                                            *net_handle.realm_id(),
+                                            net_handle.node_id(),
+                                            &manifest,
+                                        )
+                                        .await
+                                        {
+                                            Ok(path) => path,
+                                            Err(error) => {
+                                                error!(peer = %node_id, stream_id = %stream_id, error = %error, "Refusing inbound replication with unavailable request policy");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
+                                        };
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),
@@ -375,7 +656,10 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             manifest,
                                         )
                                         .with_routing(routing)
-                                        .with_rocrate_limits(self.rocrate_limits.clone());
+                                        .with_rocrate_limits(self.rocrate_limits.clone())
+                                        .with_publisher_node(node_id)
+                                        .with_manifest_policy(manifest_path)
+                                        .with_writer_policy(writer_path);
                                         match drive(op, self.context.as_ref()).await {
                                             Ok(Ok(result)) => {
                                                 emit_replication_watch(
@@ -388,17 +672,37 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             }
                                             Ok(Err(err)) | Err(err) => {
                                                 error!(error = ?err, "Failed to process inbound version replication stream");
+                                                close_failed_bao(&blob_handle, stream_id).await;
                                             }
                                         }
                                     }
                                     Ok(VersionReplicationMessage::BaoReadRequest(request)) => {
+                                        let (policy_paths, policy_candidates, had_denial) =
+                                            match bao_policy(
+                                            self.context.as_ref(),
+                                            *net_handle.realm_id(),
+                                            net_handle.node_id(),
+                                            &request,
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(error) => {
+                                                error!(peer = %node_id, stream_id = %stream_id, error = %error, "Refusing inbound bao read with unavailable request policy");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
+                                        };
                                         let op = IncomingBaoReadOperation::new(
                                             node_id,
                                             net_handle.node_id(),
                                             *net_handle.realm_id(),
                                             stream_id,
                                             request,
-                                        );
+                                        )
+                                        .with_policy_paths(policy_paths)
+                                        .with_policy_candidates(policy_candidates, had_denial)
+                                        .with_snapshot();
                                         if let Err(error) =
                                             drive(op, self.context.as_ref()).await
                                         {
@@ -408,17 +712,25 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                 error = ?error,
                                                 "Failed to process inbound bao read"
                                             );
+                                            close_failed_bao(&blob_handle, stream_id).await;
                                         }
                                     }
                                     Ok(VersionReplicationMessage::LocationSummaryRequest(
                                         request,
                                     )) => {
+                                        let identity_allowed = request.realm_id
+                                            == *net_handle.realm_id()
+                                            && auth_matches(
+                                                &request.auth_context,
+                                                *net_handle.realm_id(),
+                                            );
                                         let op = LocationSummaryOperation::new_incoming(
                                             node_id,
                                             net_handle.node_id(),
                                             stream_id,
                                             request,
-                                        );
+                                        )
+                                        .with_policy(identity_allowed);
                                         if let Err(error) = drive(op, self.context.as_ref()).await {
                                             error!(
                                                 peer = %node_id,
@@ -426,6 +738,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                 error = ?error,
                                                 "Failed to answer inbound location summary"
                                             );
+                                            close_failed_bao(&blob_handle, stream_id).await;
                                         }
                                     }
                                     _ => {
@@ -460,6 +773,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                         Ok(touched_topics) => {
                             self.document_sync_reconcile
                                 .trigger(self.context.clone(), touched_topics);
+                        }
+                        Err(err) if err.is_admission_rejection() => {
+                            // Refused before any payload read, so no partial local
+                            // state exists; dropping avoids an all-topic reconcile.
+                            debug!(peer = %node_id, error = ?err, "Dropped inbound document sync stream at admission");
                         }
                         Err(err) => {
                             error!(error = ?err, "Failed to process inbound document sync stream");
@@ -542,6 +860,11 @@ async fn close_failed_bao(blob_handle: &aruna_blob::blob::BlobHandle, stream_id:
     if let Event::Blob(BlobEvent::Error(err)) = close_event {
         error!(error = ?err, "Failed to close rejected inbound bao stream");
     }
+}
+
+fn close_bao_stream(mut stream: BiStream) {
+    _ = stream.0.finish();
+    _ = stream.1.stop(0u32.into());
 }
 
 /// Re-enqueues the payloads recovered from a genesis tie-break eviction as
@@ -735,6 +1058,53 @@ mod tests {
         async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
             self.0.send((alpn, stream, node_id)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_foreign_peer() {
+        // The blob replication plane must refuse peers that are unknown or not
+        // sync-eligible before any manifest is read.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = aruna_core::structs::RealmId::from_bytes([3u8; 32]);
+        let server = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let user = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut config =
+            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
+        config.ensure_node(user, aruna_core::structs::RealmNodeKind::User);
+        let actor = aruna_core::structs::Actor {
+            node_id: server,
+            user_id: aruna_core::UserId::nil(realm_id),
+            realm_id,
+        };
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let handler = OperationsInboundHandler::new(
+            Arc::new(DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+            RoCrateLimits::default(),
+            JobsRuntime::new(),
+        );
+
+        assert!(handler.peer_sync_eligible(realm_id, server).await);
+        assert!(!handler.peer_sync_eligible(realm_id, user).await);
+        let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        assert!(!handler.peer_sync_eligible(realm_id, unknown).await);
     }
 
     #[tokio::test]

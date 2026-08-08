@@ -1,8 +1,11 @@
+use std::future::Future;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
@@ -11,12 +14,15 @@ use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
     RealmId, RealmNodeKind,
 };
+use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
+use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use thiserror::Error;
+use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentResult, accepted_create_matches, create_metadata_document,
@@ -31,12 +37,22 @@ use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     MetadataApiError, export_metadata_rocrate, get_visible_metadata_document,
 };
-use crate::metadata::handle::{MetadataRequestDelivery, MetadataWritePeerError};
+use crate::metadata::handle::{
+    MetadataRequestDelivery, MetadataRequestError, MetadataWritePeerError,
+};
 use crate::metadata::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
 };
-use crate::placement::{holds_placement, resolve_shard_holders};
+use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
+use crate::placement::{
+    MAX_READ_HOLDERS, holds_placement, resolve_holders_limit, resolve_shard_holders,
+};
 use crate::process_placements::load_realm_config;
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::PolicyRequestExtras;
+use crate::revoke_token::{
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+};
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document,
@@ -75,6 +91,13 @@ pub enum MetadataWriteError {
     #[error("metadata write is undeliverable: {0}")]
     Undeliverable(String),
 }
+
+const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
+const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
+const METADATA_READ_FANOUT_LIMIT: usize = 8;
+const METADATA_READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
 
 /// Route for a write against `placement`, from the local node's point of view.
 ///
@@ -121,6 +144,130 @@ pub async fn is_user_origin(
     Ok(node.kind == RealmNodeKind::User)
 }
 
+pub async fn forward_token_revoke(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    auth_token: MetadataAuthToken,
+    token: String,
+) -> Result<(), MetadataApiError> {
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return Err(MetadataApiError::ServiceUnavailable);
+    };
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return Err(MetadataApiError::ServiceUnavailable);
+    };
+    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut subject = bearer_token_hash(&token).into_bytes();
+    subject.extend_from_slice(&Ulid::generate().to_bytes());
+    let peers = rank_revoke_peers(
+        config
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    &node.kind,
+                    RealmNodeKind::Management | RealmNodeKind::Server
+                )
+            })
+            .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+            .filter(|peer| Some(*peer) != local_node_id),
+        &subject,
+    );
+    if peers.is_empty() {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+
+    let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
+    run_revoke(
+        &peers,
+        message,
+        Instant::now() + TOKEN_REVOKE_DEADLINE,
+        |peer, message| metadata.request_forwarded_write(peer, message),
+    )
+    .await
+}
+
+async fn run_revoke<F, Fut>(
+    peers: &[NodeId],
+    message: MetadataTransportMessage,
+    deadline: Instant,
+    mut request: F,
+) -> Result<(), MetadataApiError>
+where
+    F: FnMut(NodeId, MetadataTransportMessage) -> Fut,
+    Fut: Future<Output = Result<MetadataTransportMessage, MetadataRequestError>>,
+{
+    let mut seen = Vec::with_capacity(TOKEN_REVOKE_PEER_LIMIT);
+    for peer in peers.iter().copied() {
+        if seen.len() >= TOKEN_REVOKE_PEER_LIMIT {
+            break;
+        }
+        if seen.contains(&peer) {
+            continue;
+        }
+        seen.push(peer);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt = remaining.min(TOKEN_REVOKE_ATTEMPT_TIMEOUT);
+        match timeout(attempt, request(peer, message.clone())).await {
+            Err(_) => {
+                warn!(%peer, "Token revocation forwarding attempt timed out");
+                continue;
+            }
+            Ok(Ok(MetadataTransportMessage::ForwardedTokenRevoked)) => return Ok(()),
+            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Unauthorized,
+            })) => return Err(MetadataApiError::Unauthorized),
+            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Forbidden,
+            })) => return Err(MetadataApiError::Forbidden),
+            Ok(Ok(MetadataTransportMessage::ForwardedWriteUnavailable))
+            | Ok(Ok(MetadataTransportMessage::ForwardedTokenRevocationCapacity)) => continue,
+            Ok(Ok(MetadataTransportMessage::Reject(error))) => {
+                warn!(%peer, %error, "Peer rejected a forwarded token revocation");
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Ok(Ok(response)) => {
+                warn!(%peer, response = ?super::handle::transport_message_kind(&response), "Peer returned an unexpected token revocation response");
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Ok(Err(error)) => {
+                // Revocation is keyed by token hash, so an ambiguous write is safe to replay.
+                warn!(%peer, %error, "Failed to forward a token revocation");
+            }
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable)
+}
+
+fn rank_revoke_peers(peers: impl IntoIterator<Item = NodeId>, subject: &[u8]) -> Vec<NodeId> {
+    let mut ranked = Vec::with_capacity(TOKEN_REVOKE_PEER_LIMIT);
+    for peer in peers {
+        let score = neg_log2_q48(selector_hash(ROLE_NODE, subject, peer.as_bytes()));
+        insert_revoke_peer(&mut ranked, peer, score);
+    }
+    ranked.into_iter().map(|(peer, _)| peer).collect()
+}
+
+fn insert_revoke_peer(ranked: &mut Vec<(NodeId, u64)>, peer: NodeId, score: u64) {
+    if ranked.iter().any(|candidate| candidate.0 == peer) {
+        return;
+    }
+    let position = ranked.iter().position(|candidate| {
+        score < candidate.1 || (score == candidate.1 && peer.as_bytes() < candidate.0.as_bytes())
+    });
+    let Some(position) = position else {
+        if ranked.len() < TOKEN_REVOKE_PEER_LIMIT {
+            ranked.push((peer, score));
+        }
+        return;
+    };
+    ranked.insert(position, (peer, score));
+    ranked.truncate(TOKEN_REVOKE_PEER_LIMIT);
+}
+
 /// Whether the origin currently holds a structured metadata document's bucket.
 pub async fn origin_holds_document(
     context: &Arc<DriverContext>,
@@ -142,6 +289,37 @@ pub async fn origin_holds_document(
     Ok(holds_placement(&config, &placement, local_node_id))
 }
 
+async fn read_holders<T, F>(
+    holders: Vec<NodeId>,
+    request: F,
+) -> (Vec<(NodeId, Result<T, MetadataReadError>)>, bool)
+where
+    T: Send + 'static,
+    F: Fn(NodeId) -> BoxFuture<'static, Result<T, MetadataReadError>> + Send + Sync,
+{
+    let requests = futures_util::stream::iter(holders.into_iter().map(|holder| {
+        let request = request(holder);
+        async move {
+            let result = timeout(METADATA_READ_PEER_TIMEOUT, request)
+                .await
+                .unwrap_or(Err(MetadataReadError::Unavailable));
+            (holder, result)
+        }
+    }))
+    .buffer_unordered(METADATA_READ_FANOUT_LIMIT);
+    futures_util::pin_mut!(requests);
+
+    let deadline = Instant::now() + METADATA_READ_DEADLINE;
+    let mut results = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, requests.next()).await {
+            Ok(Some(result)) => results.push(result),
+            Ok(None) => return (results, false),
+            Err(_) => return (results, true),
+        }
+    }
+}
+
 pub async fn get_metadata_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -159,80 +337,94 @@ pub async fn get_metadata_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_shard_holders(&config, &placement);
+    let holders = resolve_holders_limit(&config, &placement, MAX_READ_HOLDERS);
     let holder_count = holders.len();
-    let mut not_found = 0usize;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if local_node.is_some_and(|node| holders.contains(&node)) {
-        match get_visible_metadata_document(context.as_ref(), realm_id, request.clone()).await {
-            Ok(record)
-                if routed_record_matches(
-                    &config,
-                    realm_id,
-                    request.document_id,
-                    &placement,
-                    &record,
-                ) =>
-            {
-                return Ok(record);
-            }
-            Ok(_) => {}
-            Err(MetadataApiError::NotFound) => not_found += 1,
-            Err(MetadataApiError::ServiceUnavailable) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    if holder_count > 0 && not_found == holder_count {
-        return Err(MetadataApiError::NotFound);
-    }
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    for holder in holders
-        .into_iter()
-        .filter(|holder| Some(*holder) != local_node)
-    {
-        let response = metadata
-            .request_forwarded_write(
-                holder,
-                MetadataTransportMessage::ForwardReadDocument {
-                    auth_token: auth_token.clone(),
-                    config_digest,
-                    document_id: request.document_id,
-                },
-            )
-            .await;
-        match response {
-            Ok(MetadataTransportMessage::ForwardedRead { result: Ok(record) }) => {
-                if routed_record_matches(
-                    &config,
-                    realm_id,
-                    request.document_id,
-                    &placement,
-                    &record,
-                ) {
-                    return Ok(*record);
+    let context = Arc::clone(context);
+    let config = Arc::new(config);
+    let metadata = context.metadata_handle.clone();
+    let request_template = request.clone();
+    let (responses, timed_out) = read_holders(holders, move |holder| {
+        let context = context.clone();
+        let config = config.clone();
+        let metadata = metadata.clone();
+        let request = request_template.clone();
+        let auth_token = auth_token.clone();
+        Box::pin(async move {
+            if Some(holder) == local_node {
+                let record = get_visible_metadata_document(context.as_ref(), realm_id, request)
+                    .await
+                    .map_err(read_error)?;
+                if routed_record_matches(&config, realm_id, record.document_id, &placement, &record)
+                {
+                    Ok(record)
+                } else {
+                    Err(MetadataReadError::Unavailable)
+                }
+            } else {
+                let Some(metadata) = metadata else {
+                    return Err(MetadataReadError::Unavailable);
+                };
+                match metadata
+                    .request_forwarded_write(
+                        holder,
+                        MetadataTransportMessage::ForwardReadDocument {
+                            auth_token,
+                            config_digest,
+                            document_id: request.document_id,
+                        },
+                    )
+                    .await
+                {
+                    Ok(MetadataTransportMessage::ForwardedRead { result }) => {
+                        let record = result?;
+                        if routed_record_matches(
+                            &config,
+                            realm_id,
+                            record.document_id,
+                            &placement,
+                            &record,
+                        ) {
+                            Ok(*record)
+                        } else {
+                            Err(MetadataReadError::Unavailable)
+                        }
+                    }
+                    _ => Err(MetadataReadError::Unavailable),
                 }
             }
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::Unauthorized),
-            }) => return Err(MetadataApiError::Unauthorized),
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::Forbidden),
-            }) => return Err(MetadataApiError::Forbidden),
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::NotFound),
-            }) => not_found += 1,
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::Unavailable),
-            })
-            | Ok(MetadataTransportMessage::Reject(_))
-            | Err(_) => {}
-            Ok(_) => {}
-        }
+        })
+    })
+    .await;
+    let mut not_found = 0usize;
+    let mut success = None;
+    let mut auth_error = None;
+    let mut unavailable = timed_out;
+    for (_, response) in responses {
+        match response {
+            Ok(record) => {
+                success.get_or_insert(record);
+            }
+            Err(MetadataReadError::Unauthorized) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
+            }
+            Err(MetadataReadError::Forbidden) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
+            }
+            Err(MetadataReadError::NotFound) => not_found += 1,
+            Err(MetadataReadError::Unavailable) => unavailable = true,
+        };
     }
-    if holder_count > 0 && not_found == holder_count {
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if success.is_some() && not_found > 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(record) = success {
+        return Ok(record);
+    }
+    if !unavailable && holder_count > 0 && not_found == holder_count {
         Err(MetadataApiError::NotFound)
     } else {
         Err(MetadataApiError::ServiceUnavailable)
@@ -261,58 +453,79 @@ pub async fn export_rocrate_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_shard_holders(&config, &placement);
+    let holders = resolve_holders_limit(&config, &placement, MAX_READ_HOLDERS);
     let holder_count = holders.len();
-    let mut not_found = 0usize;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if local_node.is_some_and(|node| holders.contains(&node)) {
-        match export_metadata_rocrate(context.as_ref(), realm_id, request.clone()).await {
-            Ok(result) => {
-                ensure_export_limit(&result, metadata_bytes)?;
-                return Ok(result);
+    let context = Arc::clone(context);
+    let metadata = context.metadata_handle.clone();
+    let request_template = request.clone();
+    let (responses, timed_out) = read_holders(holders, move |holder| {
+        let context = context.clone();
+        let metadata = metadata.clone();
+        let request = request_template.clone();
+        let forward_token = forward_token.clone();
+        Box::pin(async move {
+            if Some(holder) == local_node {
+                let export = export_metadata_rocrate(context.as_ref(), realm_id, request).await;
+                let export = export.map_err(read_error)?;
+                ensure_export_limit(&export, metadata_bytes).map_err(read_error)?;
+                Ok(export)
+            } else {
+                let Some(metadata) = metadata else {
+                    return Err(MetadataReadError::Unavailable);
+                };
+                match metadata
+                    .request_export(
+                        holder,
+                        MetadataTransportMessage::ForwardExportDocument {
+                            auth_token: forward_token,
+                            config_digest,
+                            document_id: request.document_id,
+                            view: request.view,
+                            metadata_bytes,
+                            limit: request.limit,
+                            offset: request.offset,
+                            after: request.after,
+                        },
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(MetadataReadError::Unavailable),
+                }
             }
-            Err(MetadataApiError::NotFound) => not_found += 1,
-            Err(MetadataApiError::ServiceUnavailable) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    if holder_count > 0 && not_found == holder_count {
-        return Err(MetadataApiError::NotFound);
-    }
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    for holder in holders
-        .into_iter()
-        .filter(|holder| Some(*holder) != local_node)
-    {
-        let response = metadata
-            .request_export(
-                holder,
-                MetadataTransportMessage::ForwardExportDocument {
-                    auth_token: forward_token.clone(),
-                    config_digest,
-                    document_id: request.document_id,
-                    view: request.view,
-                    metadata_bytes,
-                    limit: request.limit,
-                    offset: request.offset,
-                    after: request.after.clone(),
-                },
-            )
-            .await;
+        })
+    })
+    .await;
+    let mut not_found = 0usize;
+    let mut success = None;
+    let mut auth_error = None;
+    let mut unavailable = timed_out;
+    for (_, response) in responses {
         match response {
-            Ok(Ok(export)) => return Ok(export),
-            Ok(Err(MetadataReadError::Unauthorized)) => {
-                return Err(MetadataApiError::Unauthorized);
+            Ok(export) => {
+                success.get_or_insert(export);
             }
-            Ok(Err(MetadataReadError::Forbidden)) => return Err(MetadataApiError::Forbidden),
-            Ok(Err(MetadataReadError::NotFound)) => not_found += 1,
-            Ok(Err(MetadataReadError::Unavailable)) | Err(_) => {}
+            Err(MetadataReadError::Unauthorized) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
+            }
+            Err(MetadataReadError::Forbidden) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
+            }
+            Err(MetadataReadError::NotFound) => not_found += 1,
+            Err(MetadataReadError::Unavailable) => unavailable = true,
         }
     }
-    if holder_count > 0 && not_found == holder_count {
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if success.is_some() && not_found > 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(export) = success {
+        return Ok(export);
+    }
+    if !unavailable && holder_count > 0 && not_found == holder_count {
         Err(MetadataApiError::NotFound)
     } else {
         Err(MetadataApiError::ServiceUnavailable)
@@ -393,6 +606,7 @@ pub async fn create_metadata_document_routed(
             payload: config.payload.clone(),
         },
         None,
+        false,
     )
     .await?;
     match response {
@@ -443,23 +657,36 @@ pub async fn update_metadata_document_routed(
         ));
     }
     let local_node_id = actor.node_id;
-    let local_holds = holds_placement(&config, &placement, local_node_id);
+    let current_holders = resolve_shard_holders(&config, &placement);
+    let holders = record.map_or_else(
+        || current_holders.clone(),
+        |record| holder_intersection(&current_holders, &record.holder_node_ids),
+    );
+    if record.is_some() && holders.is_empty() {
+        return Err(MetadataWriteError::Undeliverable(
+            "metadata document has no active frozen holder with history capacity".to_string(),
+        ));
+    }
+    let local_holds = holders.contains(&local_node_id);
+    let mut local_capacity = false;
     if local_holds && let Some(record) = record {
-        return update_metadata_document(
+        match update_metadata_document(
             UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-                actor,
+                actor: actor.clone(),
                 group_id: record.group_id,
                 document_id,
                 public: public.unwrap_or(record.public),
-                mutation,
+                mutation: mutation.clone(),
             }),
             context.as_ref(),
         )
         .await
-        .map_err(Into::into);
+        {
+            Ok(record) => return Ok(record),
+            Err(UpdateMetadataDocumentError::RawLimit) => local_capacity = true,
+            Err(error) => return Err(error.into()),
+        }
     }
-    let holders = resolve_shard_holders(&config, &placement);
-
     let response = forward_to_holders(
         context,
         &holders,
@@ -471,6 +698,7 @@ pub async fn update_metadata_document_routed(
             mutation,
         },
         local_holds.then_some(local_node_id),
+        local_capacity,
     )
     .await?;
     match response {
@@ -527,7 +755,17 @@ pub async fn delete_metadata_document_routed(
         ));
     }
     let local_node_id = actor.node_id;
-    let local_holds = holds_placement(&config, &placement, local_node_id);
+    let current_holders = resolve_shard_holders(&config, &placement);
+    let holders = record.map_or_else(
+        || current_holders.clone(),
+        |record| holder_intersection(&current_holders, &record.holder_node_ids),
+    );
+    if record.is_some() && holders.is_empty() {
+        return Err(MetadataWriteError::Undeliverable(
+            "metadata document has no active frozen holder with history capacity".to_string(),
+        ));
+    }
+    let local_holds = holders.contains(&local_node_id);
     if local_holds && let Some(record) = record {
         return delete_metadata_document(
             DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
@@ -537,8 +775,6 @@ pub async fn delete_metadata_document_routed(
         .await
         .map_err(Into::into);
     }
-    let holders = resolve_shard_holders(&config, &placement);
-
     let response = forward_to_holders(
         context,
         &holders,
@@ -548,6 +784,7 @@ pub async fn delete_metadata_document_routed(
             document_id,
         },
         local_holds.then_some(local_node_id),
+        false,
     )
     .await?;
     match response {
@@ -838,6 +1075,9 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(record) => MetadataTransportMessage::ForwardedRecord {
                     record: Box::new(record),
                 },
+                Err(UpdateMetadataDocumentError::RawLimit) => {
+                    MetadataTransportMessage::ForwardedMetadataHistoryCapacity
+                }
                 Err(UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(
                     message,
                 ))) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
@@ -879,6 +1119,105 @@ pub(crate) async fn apply_forwarded_write(
             "unexpected forwarded metadata message: {}",
             super::handle::transport_message_kind(&other)
         )),
+    }
+}
+
+pub(crate) async fn apply_token_revoke(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let realm_id = *net_handle.realm_id();
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let local_node = config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == net_handle.node_id().to_string());
+    if !local_node.is_some_and(|node| {
+        matches!(
+            &node.kind,
+            RealmNodeKind::Management | RealmNodeKind::Server
+        )
+    }) {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    }
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } = &message else {
+        return reject("unexpected token revocation message");
+    };
+    if !matches!(auth_token, MetadataAuthToken::Bearer(_)) {
+        return MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Unauthorized,
+        };
+    }
+    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
+        Ok(auth) => auth,
+        Err(error) => return forward_auth_error(error),
+    };
+    let MetadataTransportMessage::ForwardTokenRevocation { token, .. } = message else {
+        return reject("unexpected token revocation message");
+    };
+    let claims = match metadata.claims_for_revocation(&token).await {
+        Ok(claims) => claims,
+        Err(error) => return reject(format!("invalid token revocation target: {error}")),
+    };
+    let expires_at = claims.exp;
+    let now = unix_timestamp_secs();
+    if !valid_revocation_expiry(expires_at, now) {
+        return reject("token revocation expiry is outside the supported window");
+    }
+    let subject: AuthContext = match claims.try_into() {
+        Ok(subject) => subject,
+        Err(error) => return reject(format!("invalid token revocation subject: {error}")),
+    };
+    if subject.realm_id != realm_id {
+        return MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Forbidden,
+        };
+    }
+    if auth.user_id != subject.user_id
+        && let Err(error) = authorize_write(
+            context,
+            auth.clone(),
+            format!("/{realm_id}/admin/u/{}", subject.user_id),
+        )
+        .await
+    {
+        return forward_auth_error(error);
+    }
+    match drive(
+        RevokeTokenOperation::new(RevokeTokenConfig {
+            actor: Actor {
+                node_id: net_handle.node_id(),
+                user_id: auth.user_id,
+                realm_id,
+            },
+            token_hash: bearer_token_hash(&token),
+            expires_at,
+            token_owner: subject.user_id,
+            admission: if auth.user_id == subject.user_id {
+                RevokeTokenAdmission::SelfService
+            } else {
+                RevokeTokenAdmission::Privileged
+            },
+            now,
+        }),
+        context.as_ref(),
+    )
+    .await
+    {
+        Ok(_) => MetadataTransportMessage::ForwardedTokenRevoked,
+        Err(RevokeTokenError::CapacityReached) => {
+            MetadataTransportMessage::ForwardedTokenRevocationCapacity
+        }
+        Err(error) => reject(format!("token revocation failed: {error}")),
     }
 }
 
@@ -1054,6 +1393,11 @@ async fn held_record(
             "metadata registry record does not match its structured placement".to_string(),
         ));
     }
+    if !record.holder_node_ids.contains(&local_node_id) {
+        return Err(HeldRecordError::Unavailable(
+            "node is not a frozen holder for this metadata document".to_string(),
+        ));
+    }
     Ok(record)
 }
 
@@ -1072,6 +1416,9 @@ async fn authorize_forwarded_caller(
         MetadataTransportMessage::ForwardCreateDocument { auth_token, .. }
         | MetadataTransportMessage::ForwardUpdateDocument { auth_token, .. }
         | MetadataTransportMessage::ForwardDeleteDocument { auth_token, .. } => auth_token.clone(),
+        MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } => {
+            Some(auth_token.clone())
+        }
         _ => None,
     };
     let auth = metadata_handle
@@ -1094,25 +1441,21 @@ async fn authorize_write(
     auth_context: AuthContext,
     path: String,
 ) -> Result<(), ForwardAuthError> {
-    match drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context,
-            path: path.clone(),
-            required_permission: Permission::WRITE,
-        }),
+    match authorize(
         context.as_ref(),
+        auth_context.realm_id,
+        &auth_context,
+        &path,
+        &Permission::WRITE,
+        PolicyRequestExtras::rest(),
     )
     .await
     {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ForwardAuthError::Forbidden),
-        Err(
-            AuthorizationError::InvalidRealmId
-            | AuthorizationError::InvalidGroupId
-            | AuthorizationError::GroupNotFound
-            | AuthorizationError::AuthDocNotFound,
-        ) => Err(ForwardAuthError::Forbidden),
-        Err(error) => Err(ForwardAuthError::Unavailable(error.to_string())),
+        Ok(()) => Ok(()),
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+            Err(ForwardAuthError::Forbidden)
+        }
+        Err(AuthorizeError::CheckFailed(error)) => Err(ForwardAuthError::Unavailable(error)),
     }
 }
 
@@ -1141,12 +1484,14 @@ async fn forward_to_holders(
     holders: &[NodeId],
     message: MetadataTransportMessage,
     local_miss: Option<NodeId>,
+    local_capacity: bool,
 ) -> Result<MetadataTransportMessage, MetadataWriteError> {
     let Some(metadata_handle) = context.metadata_handle.as_ref() else {
         return Err(MetadataWriteError::Undeliverable(
             "no metadata handle to forward with".to_string(),
         ));
     };
+    let holders = distinct_holders(holders);
     let local_node_id = local_miss.or_else(|| context.net_handle.as_ref().map(|net| net.node_id()));
     let tracks_not_found = matches!(
         &message,
@@ -1155,7 +1500,9 @@ async fn forward_to_holders(
     );
 
     let mut failures: Vec<String> = Vec::new();
-    let mut not_found = usize::from(local_miss.is_some());
+    let mut not_found = usize::from(local_miss.is_some_and(|local| holders.contains(&local)));
+    let mut capacity =
+        usize::from(local_capacity && local_miss.is_some_and(|local| holders.contains(&local)));
     for holder in holders
         .iter()
         .filter(|holder| Some(**holder) != local_node_id)
@@ -1181,6 +1528,19 @@ async fn forward_to_holders(
             Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => {
                 failures.push(format!("{holder}: holder placement view is unavailable"));
             }
+            Ok(MetadataTransportMessage::ForwardedMetadataHistoryCapacity)
+                if matches!(
+                    &message,
+                    MetadataTransportMessage::ForwardUpdateDocument { .. }
+                ) =>
+            {
+                capacity += 1;
+            }
+            Ok(MetadataTransportMessage::ForwardedMetadataHistoryCapacity) => {
+                failures.push(format!(
+                    "{holder}: holder returned metadata history capacity for a non-update"
+                ));
+            }
             Ok(MetadataTransportMessage::Reject(error)) => {
                 warn!(holder = %holder, error = %error, "Holder rejected a forwarded metadata write");
                 return Err(MetadataWriteError::Undeliverable(format!(
@@ -1200,6 +1560,12 @@ async fn forward_to_holders(
         }
     }
 
+    if !holders.is_empty() && capacity == holders.len() {
+        return Err(MetadataWriteError::Undeliverable(
+            "metadata history capacity reached on every holder".to_string(),
+        ));
+    }
+
     if tracks_not_found && !holders.is_empty() && not_found == holders.len() {
         return Err(MetadataWriteError::NotFound);
     }
@@ -1215,6 +1581,25 @@ async fn forward_to_holders(
         "Metadata write reached a non-holder and no holder accepted the forward"
     );
     Err(MetadataWriteError::Undeliverable(detail))
+}
+
+fn distinct_holders(holders: &[NodeId]) -> Vec<NodeId> {
+    let mut distinct = Vec::with_capacity(holders.len());
+    for holder in holders.iter().copied() {
+        if !distinct.contains(&holder) {
+            distinct.push(holder);
+        }
+    }
+    distinct
+}
+
+fn holder_intersection(current: &[NodeId], frozen: &[NodeId]) -> Vec<NodeId> {
+    let holders = current
+        .iter()
+        .copied()
+        .filter(|holder| frozen.contains(holder))
+        .collect::<Vec<_>>();
+    distinct_holders(&holders)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1250,7 +1635,8 @@ fn forwarded_unavailable(message: &MetadataTransportMessage) -> MetadataTranspor
         }
         MetadataTransportMessage::ForwardCreateDocument { .. }
         | MetadataTransportMessage::ForwardUpdateDocument { .. }
-        | MetadataTransportMessage::ForwardDeleteDocument { .. } => {
+        | MetadataTransportMessage::ForwardDeleteDocument { .. }
+        | MetadataTransportMessage::ForwardTokenRevocation { .. } => {
             MetadataTransportMessage::ForwardedWriteUnavailable
         }
         _ => reject("unexpected forwarded metadata message"),
@@ -1512,5 +1898,187 @@ mod tests {
         let mut changed = record.clone();
         changed.document_path = "docs/two".to_string();
         assert!(!update_record_matches(&record, &changed));
+    }
+
+    fn revoke_message() -> MetadataTransportMessage {
+        MetadataTransportMessage::ForwardTokenRevocation {
+            auth_token: MetadataAuthToken::bearer("caller-token").unwrap(),
+            token: "target-token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_then_success() {
+        let peers = [node(1), node(2)];
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
+        let mut calls = Vec::new();
+        let result = run_revoke(
+            &order,
+            revoke_message(),
+            Instant::now() + TOKEN_REVOKE_DEADLINE,
+            |peer, _| {
+                calls.push(peer);
+                std::future::ready(Ok(if peer == order[0] {
+                    MetadataTransportMessage::ForwardedTokenRevocationCapacity
+                } else {
+                    MetadataTransportMessage::ForwardedTokenRevoked
+                }))
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, order);
+    }
+
+    #[tokio::test]
+    async fn retries_possible_send() {
+        let peers = [node(1), node(2)];
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
+        let mut calls = Vec::new();
+        let result = run_revoke(
+            &order,
+            revoke_message(),
+            Instant::now() + TOKEN_REVOKE_DEADLINE,
+            |peer, _| {
+                calls.push(peer);
+                if peer == order[0] {
+                    std::future::ready(Err(MetadataRequestError::possibly_sent(
+                        MetadataError::HandleMissing,
+                    )))
+                } else {
+                    std::future::ready(Ok(MetadataTransportMessage::ForwardedTokenRevoked))
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, order);
+    }
+
+    #[tokio::test]
+    async fn all_capacity_unavailable() {
+        let peers = [node(1), node(2)];
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
+        let mut calls = Vec::new();
+        let result = run_revoke(
+            &order,
+            revoke_message(),
+            Instant::now() + TOKEN_REVOKE_DEADLINE,
+            |peer, _| {
+                calls.push(peer);
+                std::future::ready(Ok(
+                    MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+                ))
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+        assert_eq!(calls, order);
+    }
+
+    #[tokio::test]
+    async fn reject_stops_retry() {
+        let peers = [node(1), node(2)];
+        let order = rank_revoke_peers(
+            peers.iter().copied(),
+            bearer_token_hash("target-token").as_bytes(),
+        );
+        let mut calls = Vec::new();
+        let result = run_revoke(
+            &order,
+            revoke_message(),
+            Instant::now() + TOKEN_REVOKE_DEADLINE,
+            |peer, _| {
+                calls.push(peer);
+                std::future::ready(Ok(MetadataTransportMessage::Reject(
+                    "invalid token".to_string(),
+                )))
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+        assert_eq!(calls, vec![order[0]]);
+    }
+
+    #[tokio::test]
+    async fn no_retry_loop() {
+        let peer = node(1);
+        let peers = vec![peer, peer];
+        let mut calls = Vec::new();
+        let result = run_revoke(
+            &peers,
+            revoke_message(),
+            Instant::now() + TOKEN_REVOKE_DEADLINE,
+            |peer, _| {
+                calls.push(peer);
+                std::future::ready(Ok(
+                    MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+                ))
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+        assert_eq!(calls, vec![peer]);
+    }
+
+    #[test]
+    fn bounded_peer_order() {
+        let peers = (1..=16).map(node).collect::<Vec<_>>();
+        let reversed = peers.iter().copied().rev().collect::<Vec<_>>();
+        let subject = bearer_token_hash("target-token");
+        let first = rank_revoke_peers(peers.iter().copied(), subject.as_bytes());
+        let second = rank_revoke_peers(reversed.iter().copied(), subject.as_bytes());
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), TOKEN_REVOKE_PEER_LIMIT);
+        assert!(first.iter().all(|peer| peers.contains(peer)));
+    }
+
+    #[test]
+    fn holders_deduplicate() {
+        let first = node(1);
+        let second = node(2);
+
+        assert_eq!(
+            distinct_holders(&[first, second, first, second]),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn frozen_holders_intersect() {
+        let current = [node(1), node(2)];
+        let frozen = [node(2), node(3)];
+
+        assert_eq!(holder_intersection(&current, &frozen), vec![node(2)]);
+        assert!(holder_intersection(&[node(1)], &[node(2)]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deadline_stops_calls() {
+        let peers = vec![node(1), node(2)];
+        let mut calls = Vec::new();
+        let result = run_revoke(&peers, revoke_message(), Instant::now(), |peer, _| {
+            calls.push(peer);
+            std::future::ready(Ok(MetadataTransportMessage::ForwardedTokenRevoked))
+        })
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+        assert!(calls.is_empty());
     }
 }

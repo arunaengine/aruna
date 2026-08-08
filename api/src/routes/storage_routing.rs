@@ -1,11 +1,9 @@
 use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule, target_warnings,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::group_routing::{
     GetGroupRoutingOperation, GroupRoutingInputsOperation, PutGroupRoutingError,
@@ -216,27 +214,13 @@ pub(crate) async fn ensure_group_admin(
     auth: &AuthContext,
     group_id: Ulid,
 ) -> ServerResult<()> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: format!("/{}/g/{group_id}/admin/**", state.get_realm_id()),
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        format!("/{}/g/{group_id}/admin/**", state.get_realm_id()),
+        Permission::WRITE,
     )
     .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(err.to_string()),
-    })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
-    }
 }
 
 #[utoipa::path(
@@ -423,10 +407,12 @@ pub(crate) mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
     use aruna_core::structs::{
         Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmAuthorizationDocument, RealmId,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
@@ -672,6 +658,17 @@ pub(crate) mod tests {
             storage_routing: Vec::new(),
         };
 
+        // Request-policy loading fails closed without the realm config document.
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .unwrap()
+                .into(),
+        )
+        .await;
         write_doc(
             &driver_ctx,
             AUTH_KEYSPACE,

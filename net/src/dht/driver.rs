@@ -12,6 +12,7 @@ use aruna_core::keyspaces::DHT_KEYSPACE;
 use aruna_core::structs::RealmId;
 use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
+use aruna_storage::storage::TransactionOwner;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
 use iroh::Endpoint;
@@ -1372,15 +1373,24 @@ async fn start_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
-) -> Result<TxnId, TransactionFailure> {
-    let start = Effect::Storage(StorageEffect::StartTransaction { read: false });
-    match send_storage_effect_with_timeout(storage, start, op_id, stage, "start").await {
-        Ok(Event::Storage(StorageEvent::TransactionStarted { txn_id })) => Ok(txn_id),
-        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
-        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
-            "unexpected transaction start event: {other:?}"
-        )))),
-        Err(error) => Err(TransactionFailure::Failed(error)),
+) -> Result<TransactionOwner, TransactionFailure> {
+    let started = Instant::now();
+    match tokio::time::timeout(STORAGE_TIMEOUT, storage.start_transaction(false)).await {
+        Ok(Ok(owner)) => Ok(owner),
+        Ok(Err(error)) => Err(storage_transaction_error(error)),
+        Err(error) => {
+            warn!(
+                event = "dht.storage.timeout",
+                op_id,
+                stage = ?stage,
+                operation = "start",
+                duration_ms = duration_ms(started.elapsed()),
+                timeout_ms = duration_ms(STORAGE_TIMEOUT),
+                error = %error,
+                "DHT storage operation timed out"
+            );
+            Err(TransactionFailure::Failed(DhtIoError::Timeout))
+        }
     }
 }
 
@@ -1448,12 +1458,12 @@ async fn reserve_revision_block(
     stage: StorageStage,
 ) -> Result<std::ops::RangeInclusive<u64>, DhtIoError> {
     for _ in 0..STORAGE_MUTATION_RETRIES {
-        let txn_id = match start_storage_txn(storage, op_id, stage).await {
-            Ok(txn_id) => txn_id,
+        let mut owner = match start_storage_txn(storage, op_id, stage).await {
+            Ok(owner) => owner,
             Err(TransactionFailure::Conflict) => continue,
             Err(TransactionFailure::Failed(error)) => return Err(error),
         };
-        match reserve_revision_txn(storage, op_id, stage, txn_id).await {
+        match reserve_revision_txn(storage, op_id, stage, &mut owner).await {
             Ok(revisions) => return Ok(revisions),
             Err(TransactionFailure::Conflict) => continue,
             Err(TransactionFailure::Failed(error)) => return Err(error),
@@ -1468,8 +1478,13 @@ async fn reserve_revision_txn(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
-    txn_id: TxnId,
+    owner: &mut TransactionOwner,
 ) -> Result<std::ops::RangeInclusive<u64>, TransactionFailure> {
+    let Some(txn_id) = owner.id() else {
+        return Err(TransactionFailure::Failed(DhtIoError::storage(
+            "DHT transaction owner missing transaction",
+        )));
+    };
     let read = Effect::Storage(StorageEffect::Read {
         key_space: DHT_META_KEYSPACE.to_string(),
         key: ByteView::from(DHT_REVISION_KEY),
@@ -1487,27 +1502,27 @@ async fn reserve_revision_txn(
         Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => match decode_counter(value) {
             Ok(current) => current,
             Err(error) => {
-                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                abort_storage_txn(storage, op_id, stage, owner).await;
                 return Err(error);
             }
         },
         Ok(Event::Storage(StorageEvent::Error { error })) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            abort_storage_txn(storage, op_id, stage, owner).await;
             return Err(storage_transaction_error(error));
         }
         Ok(other) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            abort_storage_txn(storage, op_id, stage, owner).await;
             return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
                 "unexpected revision read event: {other:?}"
             ))));
         }
         Err(error) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            abort_storage_txn(storage, op_id, stage, owner).await;
             return Err(TransactionFailure::Failed(error));
         }
     };
     let Some(first) = current.checked_add(1) else {
-        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        abort_storage_txn(storage, op_id, stage, owner).await;
         return Err(TransactionFailure::Failed(DhtIoError::storage(
             "DHT revision counter exhausted",
         )));
@@ -1524,10 +1539,10 @@ async fn reserve_revision_txn(
     )
     .await
     {
-        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        abort_storage_txn(storage, op_id, stage, owner).await;
         return Err(error);
     }
-    commit_storage_txn(storage, op_id, stage, txn_id).await?;
+    commit_storage_txn(storage, op_id, stage, owner).await?;
     Ok(first..=last)
 }
 
@@ -1562,13 +1577,22 @@ async fn mutate_storage_with(
     clock: Option<&DhtClock>,
 ) -> Result<(), DhtIoError> {
     for _ in 0..STORAGE_MUTATION_RETRIES {
-        let txn_id = match start_storage_txn(storage, op_id, stage).await {
-            Ok(txn_id) => txn_id,
+        let mut owner = match start_storage_txn(storage, op_id, stage).await {
+            Ok(owner) => owner,
             Err(TransactionFailure::Conflict) => continue,
             Err(TransactionFailure::Failed(error)) => return Err(error),
         };
+        let Some(txn_id) = owner.id() else {
+            return Err(DhtIoError::storage(
+                "DHT transaction owner missing transaction",
+            ));
+        };
 
-        match run_storage_txn(storage, op_id, stage, key, txn_id, mutation, clock).await {
+        match run_storage_txn(
+            storage, op_id, stage, key, txn_id, &mut owner, mutation, clock,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(TransactionFailure::Conflict) => continue,
             Err(TransactionFailure::Failed(error)) => return Err(error),
@@ -1807,12 +1831,14 @@ async fn reserve_key_slot(
         .map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
     key: DhtKeyId,
     txn_id: TxnId,
+    owner: &mut TransactionOwner,
     mutation: &StorageMutation,
     clock: Option<&DhtClock>,
 ) -> Result<(), TransactionFailure> {
@@ -1824,17 +1850,17 @@ async fn run_storage_txn(
     let value = match send_storage_effect_with_timeout(storage, read, op_id, stage, "read").await {
         Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => value,
         Ok(Event::Storage(StorageEvent::Error { error })) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            abort_storage_txn(storage, op_id, stage, owner).await;
             return Err(storage_transaction_error(error));
         }
         Ok(other) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            abort_storage_txn(storage, op_id, stage, owner).await;
             return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
                 "unexpected transactional read event: {other:?}"
             ))));
         }
         Err(error) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            abort_storage_txn(storage, op_id, stage, owner).await;
             return Err(TransactionFailure::Failed(error));
         }
     };
@@ -1848,7 +1874,7 @@ async fn run_storage_txn(
                 (Vec::new(), true)
             }
             Err(error) => {
-                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                abort_storage_txn(storage, op_id, stage, owner).await;
                 return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
             }
         },
@@ -1859,7 +1885,7 @@ async fn run_storage_txn(
         Some(clock) => match clock.now_secs() {
             Ok(now_secs) => now_secs,
             Err(error) => {
-                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                abort_storage_txn(storage, op_id, stage, owner).await;
                 return Err(TransactionFailure::Failed(clock_error(error)));
             }
         },
@@ -1878,23 +1904,23 @@ async fn run_storage_txn(
             match merged {
                 Ok(entries) => entries,
                 Err(MergeError::Stale) => {
-                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    abort_storage_txn(storage, op_id, stage, owner).await;
                     return Err(TransactionFailure::Failed(DhtIoError::invalid_request(
                         "record version is stale or conflicting",
                     )));
                 }
                 Err(MergeError::Capacity) => {
-                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    abort_storage_txn(storage, op_id, stage, owner).await;
                     return Err(TransactionFailure::Failed(DhtIoError::StorageFull));
                 }
                 Err(MergeError::Encoding) => {
-                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    abort_storage_txn(storage, op_id, stage, owner).await;
                     return Err(TransactionFailure::Failed(DhtIoError::storage(
                         "serialize DHT entries failed",
                     )));
                 }
                 Err(MergeError::Invalid) => {
-                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    abort_storage_txn(storage, op_id, stage, owner).await;
                     return Err(TransactionFailure::Failed(DhtIoError::storage(
                         "stored DHT record set is invalid",
                     )));
@@ -1917,7 +1943,7 @@ async fn run_storage_txn(
         && !entries.is_empty()
         && entries == original_entries
     {
-        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        abort_storage_txn(storage, op_id, stage, owner).await;
         return Ok(());
     }
 
@@ -1938,7 +1964,7 @@ async fn run_storage_txn(
         None
     } else {
         let Some((index, entry)) = row_deadline(key, &entries, now_secs) else {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            abort_storage_txn(storage, op_id, stage, owner).await;
             return Err(TransactionFailure::Failed(DhtIoError::storage(
                 "DHT row has no retention deadline",
             )));
@@ -1955,7 +1981,7 @@ async fn run_storage_txn(
             let bytes = match encode_entries(&entries) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    abort_storage_txn(storage, op_id, stage, owner).await;
                     return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
                 }
             };
@@ -1971,7 +1997,7 @@ async fn run_storage_txn(
         match reserve_key_slot(storage, op_id, stage, txn_id, index, now_secs).await {
             Ok(reclaimed) => reclaimed,
             Err(error) => {
-                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                abort_storage_txn(storage, op_id, stage, owner).await;
                 return Err(error);
             }
         }
@@ -1983,7 +2009,7 @@ async fn run_storage_txn(
         && !preserve_row
         && let Err(error) = decrement_key_count(storage, op_id, stage, txn_id).await
     {
-        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        abort_storage_txn(storage, op_id, stage, owner).await;
         return Err(error);
     }
 
@@ -2017,15 +2043,15 @@ async fn run_storage_txn(
     }
 
     if let Err(error) = apply_batch_delete(storage, op_id, stage, txn_id, deletes).await {
-        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        abort_storage_txn(storage, op_id, stage, owner).await;
         return Err(error);
     }
     if let Err(error) = apply_batch_write(storage, op_id, stage, txn_id, writes).await {
-        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        abort_storage_txn(storage, op_id, stage, owner).await;
         return Err(error);
     }
 
-    commit_storage_txn(storage, op_id, stage, txn_id).await
+    commit_storage_txn(storage, op_id, stage, owner).await
 }
 
 async fn apply_batch_delete(
@@ -2188,21 +2214,54 @@ async fn commit_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
-    txn_id: TxnId,
+    owner: &mut TransactionOwner,
 ) -> Result<(), TransactionFailure> {
+    let Some(txn_id) = owner.id() else {
+        return Err(TransactionFailure::Failed(DhtIoError::storage(
+            "DHT transaction owner missing transaction",
+        )));
+    };
     let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
     match send_storage_effect_with_timeout(storage, commit, op_id, stage, "commit").await {
-        Ok(Event::Storage(StorageEvent::TransactionCommitted { .. })) => Ok(()),
+        Ok(Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }))
+            if committed == txn_id =>
+        {
+            owner.finish();
+            Ok(())
+        }
         Ok(Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
-        })) => Err(TransactionFailure::Conflict),
+        })) => {
+            owner.finish();
+            Err(TransactionFailure::Conflict)
+        }
+        Ok(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionNotFound,
+        })) => {
+            owner.finish();
+            Err(TransactionFailure::Failed(DhtIoError::storage(
+                StorageError::TransactionNotFound,
+            )))
+        }
+        Ok(Event::Storage(StorageEvent::Error {
+            error: StorageError::QueueFull,
+        })) => Err(TransactionFailure::Failed(DhtIoError::storage(
+            StorageError::QueueFull,
+        ))),
         Ok(Event::Storage(StorageEvent::Error { error })) => {
+            owner.unknown();
             Err(TransactionFailure::Failed(DhtIoError::storage(error)))
         }
-        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
-            "unexpected transaction commit event: {other:?}"
-        )))),
-        Err(error) => Err(TransactionFailure::Failed(error)),
+        Ok(other) => {
+            owner.unknown();
+            Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                "unexpected transaction commit event: {other:?}"
+            ))))
+        }
+        Err(error) => {
+            owner.unknown();
+            Err(TransactionFailure::Failed(error))
+        }
     }
 }
 
@@ -2210,10 +2269,23 @@ async fn abort_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
-    txn_id: TxnId,
+    owner: &mut TransactionOwner,
 ) {
+    let Some(txn_id) = owner.id() else {
+        return;
+    };
     let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id });
-    let _ = send_storage_effect_with_timeout(storage, abort, op_id, stage, "abort").await;
+    match send_storage_effect_with_timeout(storage, abort, op_id, stage, "abort").await {
+        Ok(Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted }))
+            if aborted == txn_id =>
+        {
+            owner.finish()
+        }
+        Ok(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionNotFound,
+        })) => owner.finish(),
+        _ => {}
+    }
 }
 
 fn storage_transaction_error(error: StorageError) -> TransactionFailure {

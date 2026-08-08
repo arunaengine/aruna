@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
@@ -23,12 +24,12 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
     AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
-    SyncRelationship, blob_bucket_permission_path,
+    SyncRelationship, TokenClaims, blob_bucket_permission_path,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::NetHandle;
-use aruna_net::streams::BiStream;
+use aruna_net::streams::{BiStream, RecvStream};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -47,32 +48,36 @@ use serde_json::Value;
 use spareval::{CancellationToken, QueryEvaluator};
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::{Query, SparqlParser};
-use tokio::time::{sleep, timeout};
+use tokio::io::AsyncRead;
+use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
+use super::materialization_queue::metadata_graph_fence;
 use super::protocol::{
-    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, read_message,
-    write_encoded_message, write_message,
+    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
+    read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
+    write_message,
 };
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
 };
-use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
+use super::repository::{iter_registry_effect, parse_registry_iter};
 use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title};
 use super::summary_cache::summary_cache;
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
-    validate_aruna_bearer_token,
+    decode_aruna_bearer_token, realm_token_revoked, validate_aruna_bearer_token,
 };
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::permission_rules::GroupPermissionRules;
 use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::PolicyRequestExtras;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
+use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 use crate::sync_mirror_repair::RECONCILE_GRACE;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
@@ -106,6 +111,7 @@ PREFIX fts: <urn:craqle:fts:>\n";
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
     LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
 const METADATA_VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(crate) const METADATA_REGISTRY_CANDIDATE_LIMIT: usize = 1024;
 
 fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id
@@ -195,7 +201,7 @@ impl MetadataRequestError {
         }
     }
 
-    fn possibly_sent(error: MetadataError) -> Self {
+    pub(super) fn possibly_sent(error: MetadataError) -> Self {
         Self {
             delivery: MetadataRequestDelivery::PossiblySent,
             error,
@@ -271,6 +277,7 @@ struct MetadataInner {
     query_cache: MetadataQueryCache,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
+    inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
 }
@@ -278,13 +285,17 @@ struct MetadataInner {
 #[derive(Clone)]
 struct MetadataAuthValidationState {
     storage_handle: StorageHandle,
+    /// Realm this node serves; without one there is no replicated revocation
+    /// set to consult, and this node serves no remote metadata peers either.
+    realm_id: Option<RealmId>,
     issuer_keys: Arc<IssuerKeyCache>,
 }
 
 impl MetadataAuthValidationState {
-    fn new(storage_handle: StorageHandle) -> Self {
+    fn new(storage_handle: StorageHandle, realm_id: Option<RealmId>) -> Self {
         Self {
             storage_handle,
+            realm_id,
             issuer_keys: Arc::new(IssuerKeyCache::new()),
         }
     }
@@ -292,18 +303,16 @@ impl MetadataAuthValidationState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
-        match load_metadata_auth_state::<HashSet<String>>(
-            &self.storage_handle,
-            TOKEN_REVOCATION_LIST_KEY,
-        )
-        .await
-        {
-            Ok(revoked) => revoked.contains(token_hash),
-            Err(error) => {
-                warn!(error = %error, "Failed to read metadata token revocation state");
-                true
-            }
+    async fn is_token_revoked(
+        &self,
+        realm_id: &RealmId,
+        token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        // Without realm state this node holds no revocation authority at all;
+        // once it has any, the token's own issuing realm answers.
+        match self.realm_id {
+            Some(_) => realm_token_revoked(&self.storage_handle, *realm_id, token_hash).await,
+            None => Ok(false),
         }
     }
 
@@ -322,11 +331,35 @@ impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
         }
     }
 
-    async fn decoding_key_for_issuer(
+    async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
         self.issuer_keys.get_or_insert(issuer_pubkey).await
+    }
+}
+
+struct RevocationBlindValidation<'a>(&'a MetadataAuthValidationState);
+
+#[async_trait]
+impl ArunaBearerTokenValidationState for RevocationBlindValidation<'_> {
+    async fn is_token_revoked(
+        &self,
+        _realm_id: &RealmId,
+        _token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        Ok(false)
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
+        self.0.is_trusted_realm(realm_id).await
+    }
+
+    async fn issuer_decoding_key(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        self.0.issuer_decoding_key(issuer_pubkey).await
     }
 }
 
@@ -345,25 +378,35 @@ struct RegistryCacheEntry {
 }
 
 impl RegistryCacheEntry {
-    fn snapshot(&mut self) -> Arc<Vec<MetadataRegistryRecord>> {
-        self.snapshot
-            .get_or_insert_with(|| Arc::new(self.records.values().cloned().collect()))
-            .clone()
+    fn snapshot(&mut self) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
+        if self.records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return None;
+        }
+        Some(
+            self.snapshot
+                .get_or_insert_with(|| Arc::new(self.records.values().cloned().collect()))
+                .clone(),
+        )
     }
 
-    fn group_snapshot(&mut self, group_id: GroupId) -> Arc<Vec<MetadataRegistryRecord>> {
+    fn group_snapshot(&mut self, group_id: GroupId) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
         if let Some(records) = self.group_snapshots.get(&group_id) {
-            return records.clone();
+            return (records.len() <= METADATA_REGISTRY_CANDIDATE_LIMIT).then(|| records.clone());
         }
-        let records = Arc::new(
-            self.records
-                .values()
-                .filter(|record| record.group_id == group_id)
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
+        let mut group_records = Vec::new();
+        for record in self
+            .records
+            .values()
+            .filter(|record| record.group_id == group_id)
+        {
+            if group_records.len() == METADATA_REGISTRY_CANDIDATE_LIMIT {
+                return None;
+            }
+            group_records.push(record.clone());
+        }
+        let records = Arc::new(group_records);
         self.group_snapshots.insert(group_id, records.clone());
-        records
+        Some(records)
     }
 }
 
@@ -416,9 +459,11 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
-        registry
-            .as_mut()
-            .map(|entry| (entry.snapshot(), entry.expires_at > now))
+        registry.as_mut().and_then(|entry| {
+            entry
+                .snapshot()
+                .map(|records| (records, entry.expires_at > now))
+        })
     }
 
     fn registry_records_for_group_any(
@@ -430,9 +475,11 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
-        registry
-            .as_mut()
-            .map(|entry| (entry.group_snapshot(group_id), entry.expires_at > now))
+        registry.as_mut().and_then(|entry| {
+            entry
+                .group_snapshot(group_id)
+                .map(|records| (records, entry.expires_at > now))
+        })
     }
 
     #[cfg(test)]
@@ -459,6 +506,11 @@ impl MetadataVisibilityCache {
         lifecycle_entries: Vec<(String, bool)>,
         fill_generation: u64,
     ) -> bool {
+        if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
+            || lifecycle_entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
+        {
+            return false;
+        }
         if self.current_generation() != fill_generation {
             return false;
         }
@@ -479,6 +531,11 @@ impl MetadataVisibilityCache {
         if self.current_generation() != fill_generation {
             return false;
         }
+        let protected = lifecycle_entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         for (graph_iri, deleted) in lifecycle_entries {
             lifecycle.insert(
                 graph_iri,
@@ -523,11 +580,14 @@ impl MetadataVisibilityCache {
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
         self.advance_generation();
+        let now = Instant::now();
+        let protected = HashSet::from([graph_iri.clone()]);
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         lifecycle.insert(
             graph_iri,
             LifecycleDeletedCacheEntry {
                 deleted,
-                expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
+                expires_at: now + METADATA_VISIBILITY_CACHE_TTL,
             },
         );
     }
@@ -537,12 +597,21 @@ impl MetadataVisibilityCache {
     // stays bounded.
     #[cfg(test)]
     fn refresh_lifecycle_deleted(&self, entries: impl IntoIterator<Item = (String, bool)>) {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return;
+        }
         let now = Instant::now();
         let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
         let mut lifecycle = self
             .lifecycle_deleted
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        let protected = entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         for (graph_iri, deleted) in entries {
             lifecycle.insert(
                 graph_iri,
@@ -555,6 +624,32 @@ impl MetadataVisibilityCache {
         lifecycle.retain(|_, entry| entry.expires_at > now);
     }
 
+    fn trim_lifecycle_deleted(
+        lifecycle: &mut HashMap<String, LifecycleDeletedCacheEntry>,
+        protected: &HashSet<String>,
+        now: Instant,
+    ) {
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+        let protected_count = lifecycle
+            .keys()
+            .filter(|graph_iri| protected.contains(*graph_iri))
+            .count();
+        let available = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(protected.len());
+        let remove_count = lifecycle
+            .len()
+            .saturating_sub(protected_count)
+            .saturating_sub(available);
+        let evicted = lifecycle
+            .keys()
+            .filter(|graph_iri| !protected.contains(*graph_iri))
+            .take(remove_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        for graph_iri in evicted {
+            lifecycle.remove(&graph_iri);
+        }
+    }
+
     fn refresh_lifecycle_deleted_if_current(
         &self,
         entries: impl IntoIterator<Item = (String, bool)>,
@@ -564,6 +659,9 @@ impl MetadataVisibilityCache {
             return false;
         }
         let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return false;
+        }
         let now = Instant::now();
         let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
         let mut lifecycle = self
@@ -573,6 +671,11 @@ impl MetadataVisibilityCache {
         if self.current_generation() != fill_generation {
             return false;
         }
+        let protected = entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         for (graph_iri, deleted) in entries {
             lifecycle.insert(
                 graph_iri,
@@ -590,6 +693,10 @@ impl MetadataVisibilityCache {
     // entries never outlive their fill TTL, so a missed update converges to
     // storage truth within one TTL via the periodic refill.
     fn upsert_registry_records(&self, updates: &[MetadataRegistryRecord]) {
+        self.upsert_at(updates, None);
+    }
+
+    fn upsert_at(&self, updates: &[MetadataRegistryRecord], expected_generation: Option<u64>) {
         if updates.is_empty() {
             return;
         }
@@ -597,10 +704,21 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        if expected_generation.is_some_and(|generation| self.current_generation() != generation) {
+            return;
+        }
         self.advance_generation();
         let Some(entry) = registry.as_mut() else {
             return;
         };
+        let new_records = updates
+            .iter()
+            .filter(|update| !entry.records.contains_key(&update.document_id))
+            .count();
+        if entry.records.len().saturating_add(new_records) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            *registry = None;
+            return;
+        }
         let mut touched_groups = HashSet::new();
         for update in updates {
             entry.records.insert(update.document_id, update.clone());
@@ -743,7 +861,10 @@ impl MetadataHandle {
         Ok(Self {
             inner: Arc::new(MetadataInner {
                 node: Arc::new(node),
-                auth_validation: MetadataAuthValidationState::new(storage_handle.clone()),
+                auth_validation: MetadataAuthValidationState::new(
+                    storage_handle.clone(),
+                    net_handle.as_ref().map(|net| *net.realm_id()),
+                ),
                 storage_handle,
                 net_handle,
                 document_sync_db,
@@ -752,6 +873,9 @@ impl MetadataHandle {
                 query_cache: MetadataQueryCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+                inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
+                    super::protocol::METADATA_INBOUND_FRAME_BYTES,
+                )),
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
             }),
@@ -784,6 +908,12 @@ impl MetadataHandle {
         self.inner.visibility_cache.upsert_registry_records(records);
     }
 
+    pub(crate) fn upsert_cached_at(&self, record: MetadataRegistryRecord, generation: u64) {
+        self.inner
+            .visibility_cache
+            .upsert_at(std::slice::from_ref(&record), Some(generation));
+    }
+
     pub fn remove_cached_registry_record(&self, document_id: Ulid) {
         self.inner
             .visibility_cache
@@ -801,6 +931,14 @@ impl MetadataHandle {
         group_id: GroupId,
     ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
         list_local_registry_records_for_group(self.inner.clone(), group_id).await
+    }
+
+    pub async fn list_group_records(
+        &self,
+        group_id: GroupId,
+        limit: usize,
+    ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+        list_group_records(self.inner.clone(), group_id, limit).await
     }
 
     pub(crate) async fn snapshot_iri_references(
@@ -836,7 +974,7 @@ impl MetadataHandle {
         &self.inner.query_cache
     }
 
-    pub(super) fn visibility_generation(&self) -> u64 {
+    pub(crate) fn visibility_generation(&self) -> u64 {
         self.inner.visibility_cache.current_generation()
     }
 
@@ -879,6 +1017,22 @@ impl MetadataHandle {
     async fn send_metadata_effect_inner(&self, effect: MetadataEffect) -> Event {
         let effect_name = metadata_effect_kind(&effect);
         let graph_iri = effect_graph_iri(&effect);
+        let _graph_fence = match graph_iri.as_deref() {
+            Some(graph_iri) if metadata_effect_mutates_graph(&effect) => {
+                match metadata_graph_fence(graph_iri).acquire().await {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        return Event::Metadata(MetadataEvent::Error {
+                            graph_iri: Some(graph_iri.to_string()),
+                            error: MetadataError::Backend(format!(
+                                "metadata graph fence unavailable: {error}"
+                            )),
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
         if let MetadataEffect::DeleteGraph { graph_iri } = &effect {
             self.inner
                 .visibility_cache
@@ -1027,9 +1181,8 @@ impl MetadataHandle {
                 };
                 record_elapsed_ms(&span, "elapsed_ms", started);
                 span.record("result", metadata_event_kind(&metadata_event));
-                // WAL-replayed applies skip the lifecycle read and never touch
-                // the visibility generation, so cached results are only
-                // invalidated by this counter.
+                // Successful mutations invalidate query results through this
+                // counter; lifecycle cache changes use their own generation.
                 if mutates_graph && !matches!(metadata_event, MetadataEvent::Error { .. }) {
                     self.inner.query_cache.bump_apply();
                 }
@@ -1057,6 +1210,12 @@ impl MetadataHandle {
     }
 
     pub async fn prune_graph_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
+        let _graph_fence = metadata_graph_fence(&graph_iri)
+            .acquire()
+            .await
+            .map_err(|error| {
+                MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
+            })?;
         if !graph_lifecycle_deleted(self.lifecycle_storage(), &graph_iri).await? {
             return Ok(false);
         }
@@ -1162,8 +1321,12 @@ impl MetadataHandle {
         metadata_bytes: u64,
     ) -> Result<(), MetadataError> {
         let total_started = Instant::now();
+        let audit_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(super::audit::AUDIT_DEADLINE_SECS);
         let read_started = Instant::now();
-        let message = read_transport_message(&mut stream).await?;
+        let (message, frame_budget) =
+            read_budget(&mut stream.1, &self.inner.inbound_frame_bytes).await?;
+        let is_audit = matches!(&message, MetadataTransportMessage::ForwardAuditPage { .. });
         let span = Span::current();
         record_elapsed_ms(&span, "read_ms", read_started);
         span.record("request", transport_message_kind(&message));
@@ -1175,25 +1338,20 @@ impl MetadataHandle {
                 auth_token,
                 graph_iris,
                 sparql,
-            } => match authorize_remote_metadata_peer(
-                &self.inner.auth_validation,
-                &self.inner.storage_handle,
-                peer,
-                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                auth_token,
-                false,
-            )
-            .await
-            {
+            } => match self.authorize_read_peer(peer, auth_token, false).await {
                 Ok(auth_context) => {
                     match query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql)
                         .await
                     {
-                        Ok(results) => MetadataTransportMessage::QueryResults { results },
-                        Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                        Ok(results) => MetadataTransportMessage::QueryResults {
+                            result: Ok(results),
+                        },
+                        Err(error) => MetadataTransportMessage::QueryResults {
+                            result: Err(metadata_read_error(error)),
+                        },
                     }
                 }
-                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                Err(error) => MetadataTransportMessage::QueryResults { result: Err(error) },
             },
             MetadataTransportMessage::SearchGraphs {
                 auth_token,
@@ -1201,16 +1359,7 @@ impl MetadataHandle {
                 query,
                 limit,
                 group_id,
-            } => match authorize_remote_metadata_peer(
-                &self.inner.auth_validation,
-                &self.inner.storage_handle,
-                peer,
-                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                auth_token,
-                false,
-            )
-            .await
-            {
+            } => match self.authorize_read_peer(peer, auth_token, false).await {
                 Ok(auth_context) => match search_local_graphs(
                     self.inner.clone(),
                     auth_context,
@@ -1222,10 +1371,12 @@ impl MetadataHandle {
                 )
                 .await
                 {
-                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
-                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                    Ok(hits) => MetadataTransportMessage::SearchResults { result: Ok(hits) },
+                    Err(error) => MetadataTransportMessage::SearchResults {
+                        result: Err(metadata_read_error(error)),
+                    },
                 },
-                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                Err(error) => MetadataTransportMessage::SearchResults { result: Err(error) },
             },
             MetadataTransportMessage::FilteredSearchGraphs {
                 auth_token,
@@ -1235,16 +1386,7 @@ impl MetadataHandle {
                 predicate_iri,
                 object_iri,
                 group_id,
-            } => match authorize_remote_metadata_peer(
-                &self.inner.auth_validation,
-                &self.inner.storage_handle,
-                peer,
-                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                auth_token,
-                false,
-            )
-            .await
-            {
+            } => match self.authorize_read_peer(peer, auth_token, false).await {
                 Ok(auth_context) => match search_local_graphs(
                     self.inner.clone(),
                     auth_context,
@@ -1256,10 +1398,12 @@ impl MetadataHandle {
                 )
                 .await
                 {
-                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
-                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                    Ok(hits) => MetadataTransportMessage::SearchResults { result: Ok(hits) },
+                    Err(error) => MetadataTransportMessage::SearchResults {
+                        result: Err(metadata_read_error(error)),
+                    },
                 },
-                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                Err(error) => MetadataTransportMessage::SearchResults { result: Err(error) },
             },
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
@@ -1274,32 +1418,38 @@ impl MetadataHandle {
             )
             .await
             {
-                Some(auth) => match self.inner.net_handle.as_ref() {
-                    Some(net_handle) => match drive(
-                        SearchBucketsOperation::new(SearchBucketsInput {
+                Ok(auth) => match self.inner.net_handle.as_ref() {
+                    Some(net_handle) => match search_local_buckets(
+                        context.as_ref(),
+                        SearchBucketsInput {
                             auth,
                             realm_id: *net_handle.realm_id(),
                             node_id: net_handle.node_id(),
                             query,
                             limit,
-                        }),
-                        context.as_ref(),
+                            start_after: None,
+                        },
                     )
                     .await
                     {
-                        Ok(hits) => MetadataTransportMessage::BucketSearchResults { hits },
-                        Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                        Ok(hits) => {
+                            MetadataTransportMessage::BucketSearchResults { result: Ok(hits) }
+                        }
+                        Err(_) => MetadataTransportMessage::BucketSearchResults {
+                            result: Err(MetadataReadError::Unavailable),
+                        },
                     },
-                    None => MetadataTransportMessage::Reject(
-                        "metadata network handle unavailable".to_string(),
-                    ),
+                    None => MetadataTransportMessage::BucketSearchResults {
+                        result: Err(MetadataReadError::Unavailable),
+                    },
                 },
-                None => MetadataTransportMessage::BucketSearchResults { hits: Vec::new() },
+                Err(error) => MetadataTransportMessage::BucketSearchResults { result: Err(error) },
             },
             MetadataTransportMessage::CreateSyncMirror {
                 auth_token,
                 source_group_id,
                 relationship,
+                extras,
             } => {
                 self.apply_sync_mirror(
                     context,
@@ -1308,14 +1458,16 @@ impl MetadataHandle {
                     *relationship,
                     Some(source_group_id),
                     false,
+                    extras,
                 )
                 .await
             }
             MetadataTransportMessage::DeleteSyncMirror {
                 auth_token,
                 relationship,
+                extras,
             } => {
-                self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true)
+                self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true, extras)
                     .await
             }
             query @ MetadataTransportMessage::QueryDocument { .. } => {
@@ -1380,7 +1532,7 @@ impl MetadataHandle {
                             {
                                 Err(MetadataReadError::Unavailable)
                             } else {
-                                let result = super::api::lookup_metadata_path(
+                                let result = super::api::resolve_local_path(
                                     context.as_ref(),
                                     realm_id,
                                     super::api::MetadataPathLookupRequest {
@@ -1388,7 +1540,6 @@ impl MetadataHandle {
                                         document_path,
                                         auth,
                                     },
-                                    None,
                                 )
                                 .await
                                 .map(|result| {
@@ -1446,6 +1597,12 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardReadDocument { .. }) => {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
+            MetadataTransportMessage::ForwardAuditPage { request } => {
+                super::audit::serve_local_audit(context, peer, request, audit_deadline).await
+            }
+            forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
+                super::forward::apply_token_revoke(context, peer, forward).await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
@@ -1462,6 +1619,10 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
             | MetadataTransportMessage::ForwardedExport { .. }
             | MetadataTransportMessage::DocumentQueryResults { .. }
+            | MetadataTransportMessage::ForwardedAuditPage { .. }
+            | MetadataTransportMessage::ForwardedTokenRevoked
+            | MetadataTransportMessage::ForwardedTokenRevocationCapacity
+            | MetadataTransportMessage::ForwardedMetadataHistoryCapacity
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -1469,24 +1630,49 @@ impl MetadataHandle {
         record_elapsed_ms(&span, "process_ms", process_started);
 
         let drain_started = Instant::now();
-        drain_request_stream(&mut stream).await?;
+        let drain_result = if is_audit {
+            drain_stream_at(&mut stream.1, audit_deadline).await
+        } else {
+            drain_request_stream(&mut stream).await
+        };
+        if let Err(error) = drain_result {
+            if is_audit {
+                close_stream_at(&mut stream, audit_deadline);
+            }
+            return Err(error);
+        }
         record_elapsed_ms(&span, "drain_ms", drain_started);
 
         let write_started = Instant::now();
-        if write_transport_message(&mut stream, &response)
-            .await
-            .is_ok()
-            && let Some(body) = response_body
-        {
-            let _ = write_stream_body(&mut stream, &body).await;
+        let response_written = if is_audit {
+            write_message_at(&mut stream, &response, audit_deadline)
+                .await
+                .is_ok()
+        } else {
+            write_transport_message(&mut stream, &response)
+                .await
+                .is_ok()
+        };
+        if response_written && let Some(body) = response_body {
+            if is_audit {
+                let _ = write_body_at(&mut stream, &body, audit_deadline).await;
+            } else {
+                let _ = write_stream_body(&mut stream, &body).await;
+            }
         }
         record_elapsed_ms(&span, "write_ms", write_started);
-        close_stream(&mut stream).await;
+        if is_audit {
+            close_stream_at(&mut stream, audit_deadline);
+        } else {
+            close_stream(&mut stream).await;
+        }
+        drop(frame_budget);
         record_elapsed_ms(&span, "elapsed_ms", total_started);
         span.record("response", transport_message_kind(&response));
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_sync_mirror(
         &self,
         context: &Arc<DriverContext>,
@@ -1495,6 +1681,7 @@ impl MetadataHandle {
         relationship: SyncRelationship,
         source_group_id: Option<GroupId>,
         delete: bool,
+        extras: PolicyRequestExtras,
     ) -> MetadataTransportMessage {
         let Some(net_handle) = self.inner.net_handle.as_ref() else {
             return MetadataTransportMessage::Reject("mirror_internal".to_string());
@@ -1564,6 +1751,45 @@ impl MetadataHandle {
             if !sync_identity_matches(&stored, &relationship) {
                 return MetadataTransportMessage::Reject("invalid_relationship".to_string());
             }
+            // A still-present bucket must pass the same RBAC and policy boundary
+            // the origin ran; a gone bucket leaves nothing to authorize against.
+            match drive(
+                GetBucketInfoOperation::new(local_bucket.to_string()),
+                context.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(Ok(bucket_info))) => {
+                    let path = blob_bucket_permission_path(
+                        *net_handle.realm_id(),
+                        bucket_info.group_id,
+                        local_node,
+                        local_bucket,
+                    );
+                    match authorize(
+                        context.as_ref(),
+                        *net_handle.realm_id(),
+                        &auth,
+                        &path,
+                        &Permission::WRITE,
+                        extras,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(AuthorizeError::CheckFailed(_)) => {
+                            return MetadataTransportMessage::Reject("mirror_internal".to_string());
+                        }
+                        Err(_) => {
+                            return MetadataTransportMessage::Reject("access_denied".to_string());
+                        }
+                    }
+                }
+                Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => {}
+                Ok(Some(Err(_))) | Err(_) => {
+                    return MetadataTransportMessage::Reject("mirror_internal".to_string());
+                }
+            }
             // Outgoing reference relationships are detached instead of
             // deleted so the peer's retained reference records stay readable.
             let removed = match direction {
@@ -1602,26 +1828,27 @@ impl MetadataHandle {
             }
             Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
         };
-        let permitted = match drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth,
-                path: blob_bucket_permission_path(
-                    *net_handle.realm_id(),
-                    group_id,
-                    net_handle.node_id(),
-                    local_bucket,
-                ),
-                required_permission: Permission::WRITE,
-            }),
+        let path = blob_bucket_permission_path(
+            *net_handle.realm_id(),
+            group_id,
+            net_handle.node_id(),
+            local_bucket,
+        );
+        match authorize(
             context.as_ref(),
+            *net_handle.realm_id(),
+            &auth,
+            &path,
+            &Permission::WRITE,
+            extras,
         )
         .await
         {
-            Ok(permitted) => permitted,
-            Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
-        };
-        if !permitted {
-            return MetadataTransportMessage::Reject("access_denied".to_string());
+            Ok(()) => {}
+            Err(AuthorizeError::CheckFailed(_)) => {
+                return MetadataTransportMessage::Reject("mirror_internal".to_string());
+            }
+            Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
         }
         if create_bucket
             && create_sync_bucket(context.as_ref(), local_bucket, group_id, &relationship)
@@ -1741,6 +1968,17 @@ impl MetadataHandle {
             .map_err(MetadataWritePeerError::Unavailable)?;
         }
         Ok(auth)
+    }
+
+    pub(crate) async fn claims_for_revocation(
+        &self,
+        token: &str,
+    ) -> Result<TokenClaims, ArunaBearerTokenError> {
+        decode_aruna_bearer_token(
+            &RevocationBlindValidation(&self.inner.auth_validation),
+            token,
+        )
+        .await
     }
 
     #[tracing::instrument(
@@ -1938,7 +2176,7 @@ impl MetadataHandle {
         auth_token: Option<MetadataAuthToken>,
         graph_iris: Option<Vec<String>>,
         sparql: String,
-    ) -> Result<MetadataQueryResults, MetadataError> {
+    ) -> Result<MetadataQueryResults, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let result = match send_remote_metadata_request(
@@ -1952,13 +2190,10 @@ impl MetadataHandle {
             },
         )
         .await
-        .map_err(MetadataRequestError::into_metadata_error)?
+        .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::QueryResults { results } => Ok(results),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected metadata query response: {other:?}"
-            ))),
+            MetadataTransportMessage::QueryResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
@@ -1966,7 +2201,7 @@ impl MetadataHandle {
                 span.record("result", results.kind());
                 record_metadata_query_result_counts(&span, results);
             }
-            Err(error) => record_error(&span, &error.to_string()),
+            Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
     }
@@ -1978,7 +2213,7 @@ impl MetadataHandle {
         config_digest: [u8; 32],
         document_id: Ulid,
         sparql: String,
-    ) -> Result<MetadataQueryResults, MetadataError> {
+    ) -> Result<MetadataQueryResults, MetadataReadError> {
         match send_remote_metadata_request(
             &self.inner,
             &Span::current(),
@@ -1991,18 +2226,10 @@ impl MetadataHandle {
             },
         )
         .await
-        .map_err(MetadataRequestError::into_metadata_error)?
+        .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::DocumentQueryResults {
-                result: Ok(results),
-            } => Ok(results),
-            MetadataTransportMessage::DocumentQueryResults { result: Err(error) } => Err(
-                MetadataError::Backend(format!("document query failed: {error:?}")),
-            ),
-            response => Err(MetadataError::Backend(format!(
-                "unexpected document query response: {}",
-                transport_message_kind(&response)
-            ))),
+            MetadataTransportMessage::DocumentQueryResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         }
     }
 
@@ -2029,7 +2256,7 @@ impl MetadataHandle {
         query: String,
         limit: usize,
         group_id: Option<GroupId>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
         self.request_remote_search_graphs_with_filter(
             node_id, auth_token, graph_iris, query, limit, group_id, None,
         )
@@ -2055,7 +2282,7 @@ impl MetadataHandle {
         auth_token: Option<MetadataAuthToken>,
         query: String,
         limit: usize,
-    ) -> Result<Vec<BucketSearchHit>, MetadataError> {
+    ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let result = match send_remote_metadata_request(
@@ -2069,13 +2296,10 @@ impl MetadataHandle {
             },
         )
         .await
-        .map_err(MetadataRequestError::into_metadata_error)?
+        .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::BucketSearchResults { hits } => Ok(hits),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected bucket search response: {other:?}"
-            ))),
+            MetadataTransportMessage::BucketSearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
@@ -2083,7 +2307,7 @@ impl MetadataHandle {
                 span.record("result", "ok");
                 span.record("hit_count", hits.len() as u64);
             }
-            Err(error) => record_error(&span, &error.to_string()),
+            Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
     }
@@ -2094,6 +2318,7 @@ impl MetadataHandle {
         auth_token: Option<MetadataAuthToken>,
         source_group_id: GroupId,
         relationship: SyncRelationship,
+        extras: PolicyRequestExtras,
     ) -> Result<(), MetadataError> {
         match with_sync_timeout(send_remote_metadata_request(
             &self.inner,
@@ -2103,6 +2328,7 @@ impl MetadataHandle {
                 auth_token,
                 source_group_id,
                 relationship: Box::new(relationship),
+                extras,
             },
         ))
         .await?
@@ -2120,6 +2346,7 @@ impl MetadataHandle {
         node_id: NodeId,
         auth_token: Option<MetadataAuthToken>,
         relationship: SyncRelationship,
+        extras: PolicyRequestExtras,
     ) -> Result<(), MetadataError> {
         match with_sync_timeout(send_remote_metadata_request(
             &self.inner,
@@ -2128,6 +2355,7 @@ impl MetadataHandle {
             MetadataTransportMessage::DeleteSyncMirror {
                 auth_token,
                 relationship: Box::new(relationship),
+                extras,
             },
         ))
         .await?
@@ -2151,7 +2379,7 @@ impl MetadataHandle {
         predicate_iri: String,
         object_iri: String,
         group_id: Option<GroupId>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
         self.request_remote_search_graphs_with_filter(
             node_id,
             auth_token,
@@ -2174,7 +2402,7 @@ impl MetadataHandle {
         limit: usize,
         group_id: Option<GroupId>,
         iri_filter: Option<(String, String)>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let message = match iri_filter {
@@ -2197,13 +2425,10 @@ impl MetadataHandle {
         };
         let result = match send_remote_metadata_request(&self.inner, &span, node_id, message)
             .await
-            .map_err(MetadataRequestError::into_metadata_error)?
+            .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::SearchResults { hits } => Ok(hits),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected metadata search response: {other:?}"
-            ))),
+            MetadataTransportMessage::SearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
@@ -2211,7 +2436,7 @@ impl MetadataHandle {
                 span.record("result", "ok");
                 span.record("hit_count", hits.len() as u64);
             }
-            Err(error) => record_error(&span, &error.to_string()),
+            Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
     }
@@ -2244,21 +2469,26 @@ async fn bucket_search_auth<S>(
     peer: NodeId,
     local_realm_id: Option<RealmId>,
     auth_token: Option<MetadataAuthToken>,
-) -> Option<AuthContext>
+) -> Result<AuthContext, MetadataReadError>
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let auth = authorize_remote_metadata_peer(
-        state,
-        storage_handle,
-        peer,
-        local_realm_id,
-        auth_token,
-        false,
-    )
-    .await
-    .ok()??;
-    (Some(auth.realm_id) == local_realm_id).then_some(auth)
+    let Some(MetadataAuthToken::Bearer(token)) = auth_token else {
+        return Err(MetadataReadError::Unauthorized);
+    };
+    let auth = validate_aruna_bearer_token(state, token.as_str())
+        .await
+        .map_err(|_| MetadataReadError::Unauthorized)?;
+    let Some(local_realm_id) = local_realm_id else {
+        return Err(MetadataReadError::Unavailable);
+    };
+    if auth.realm_id != local_realm_id {
+        return Err(MetadataReadError::Forbidden);
+    }
+    ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, auth.realm_id, false)
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    Ok(auth)
 }
 
 async fn authorize_remote_metadata_peer<S>(
@@ -3351,20 +3581,10 @@ fn metadata_effect_defers_persist(effect: &MetadataEffect) -> bool {
 }
 
 fn metadata_effect_skips_lifecycle_read(effect: &MetadataEffect) -> bool {
-    match effect {
-        MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => true,
-        MetadataEffect::CreateCrate { request } => {
-            request.durability == MetadataRequestDurability::WalAlreadyDurable
-        }
-        MetadataEffect::ApplyRoCrate { request } => {
-            request.durability == MetadataRequestDurability::WalAlreadyDurable
-        }
-        MetadataEffect::UpsertDataEntity { request }
-        | MetadataEffect::UpsertContextualEntity { request } => {
-            request.durability == MetadataRequestDurability::WalAlreadyDurable
-        }
-        _ => false,
-    }
+    matches!(
+        effect,
+        MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. }
+    )
 }
 
 fn schedule_deferred_metadata_persist(
@@ -4052,6 +4272,21 @@ fn claim_read_error(error: super::api::MetadataApiError) -> MetadataReadError {
     }
 }
 
+pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
+    match error {
+        MetadataError::GraphNotFound => MetadataReadError::NotFound,
+        MetadataError::InvalidInput(_)
+        | MetadataError::ChannelClosed
+        | MetadataError::InvalidEffect
+        | MetadataError::HandleMissing
+        | MetadataError::TaskJoin(_)
+        | MetadataError::Validation(_)
+        | MetadataError::Persist(_)
+        | MetadataError::Storage(_)
+        | MetadataError::Backend(_) => MetadataReadError::Unavailable,
+    }
+}
+
 async fn config_digest_matches(
     context: &DriverContext,
     realm_id: RealmId,
@@ -4098,6 +4333,16 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::Reject(_) => "reject",
         MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
             "forwarded_update_invalid_input"
+        }
+        MetadataTransportMessage::ForwardAuditPage { .. } => "forward_audit_page",
+        MetadataTransportMessage::ForwardedAuditPage { .. } => "forwarded_audit_page",
+        MetadataTransportMessage::ForwardTokenRevocation { .. } => "forward_token_revocation",
+        MetadataTransportMessage::ForwardedTokenRevoked => "forwarded_token_revoked",
+        MetadataTransportMessage::ForwardedTokenRevocationCapacity => {
+            "forwarded_token_revocation_capacity"
+        }
+        MetadataTransportMessage::ForwardedMetadataHistoryCapacity => {
+            "forwarded_metadata_history_capacity"
         }
     }
 }
@@ -4286,18 +4531,24 @@ async fn list_local_registry_records(
     let started = Instant::now();
     let span = Span::current();
     match inner.visibility_cache.registry_records_any() {
-        Some((records, fresh)) => {
-            if !fresh {
-                spawn_visibility_cache_refill(inner.clone());
-            }
+        Some((records, true)) => {
             span.record("cache_hit", true);
-            span.record("stale", !fresh);
+            span.record("stale", false);
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
+        Some((records, false)) => {
+            // Serve the expired snapshot and refresh in the background so an
+            // expiry never blocks reads on a refill.
+            span.record("cache_hit", true);
+            span.record("stale", true);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            spawn_visibility_refill(&inner);
+            Ok(records)
+        }
         None => {
-            // Cold start only: block until the first fill completes.
             let _fill = inner
                 .visibility_cache
                 .registry_fill
@@ -4343,14 +4594,21 @@ async fn list_local_registry_records_for_group(
         .visibility_cache
         .registry_records_for_group_any(group_id)
     {
-        Some((records, fresh)) => {
-            if !fresh {
-                spawn_visibility_cache_refill(inner.clone());
-            }
+        Some((records, true)) => {
             span.record("cache_hit", true);
-            span.record("stale", !fresh);
+            span.record("stale", false);
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+        Some((records, false)) => {
+            // Serve the expired snapshot and refresh in the background so an
+            // expiry never blocks reads on a refill.
+            span.record("cache_hit", true);
+            span.record("stale", true);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            spawn_visibility_refill(&inner);
             Ok(records)
         }
         None => {
@@ -4388,6 +4646,22 @@ async fn list_local_registry_records_for_group(
     }
 }
 
+fn spawn_visibility_refill(inner: &Arc<MetadataInner>) {
+    let fill_lock = inner.visibility_cache.registry_fill.clone();
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let Ok(_guard) = fill_lock.try_lock_owned() else {
+            return;
+        };
+        if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
+            return;
+        }
+        if let Err(error) = fill_visibility_caches(&inner).await {
+            warn!(error = %error, "Background visibility refill failed");
+        }
+    });
+}
+
 fn registry_records_for_group(
     records: &Arc<Vec<MetadataRegistryRecord>>,
     group_id: GroupId,
@@ -4401,30 +4675,50 @@ fn registry_records_for_group(
     )
 }
 
-// Single-flight background refill; readers keep being served the stale entry
-// until the new Arc is swapped in.
-fn spawn_visibility_cache_refill(inner: Arc<MetadataInner>) {
-    let Ok(guard) = inner
+async fn list_group_records(
+    inner: Arc<MetadataInner>,
+    group_id: GroupId,
+    limit: usize,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
+    if let Some((records, true)) = inner
         .visibility_cache
-        .registry_fill
-        .clone()
-        .try_lock_owned()
-    else {
-        return;
-    };
-    tokio::spawn(async move {
-        let _guard = guard;
-        if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
-            return;
+        .registry_records_for_group_any(group_id)
+        && records.len() <= limit
+    {
+        return Ok(records);
+    }
+
+    let mut records = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(iter_registry_effect(group_id, start_after, None))
+            .await;
+        let (page, next_start_after) = parse_registry_iter(event).map_err(|error| {
+            MetadataError::Backend(format!("metadata group iteration failed: {error:?}"))
+        })?;
+        if records.len().saturating_add(page.len()) > limit {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
         }
-        if let Err(error) = fill_visibility_caches(&inner).await {
-            warn!(
-                event = "metadata.visibility.refill_failed",
-                error = %error,
-                "Background metadata visibility cache refill failed; serving stale entries"
-            );
+        records.extend(page);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
         }
-    });
+    }
+
+    let (deleted_graphs, _) =
+        list_deleted_graph_iris(&inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    Ok(Arc::new(
+        records
+            .into_iter()
+            .filter(|record| !deleted_graphs.contains(&record.graph_iri))
+            .collect(),
+    ))
 }
 
 #[tracing::instrument(
@@ -4453,12 +4747,25 @@ async fn fill_visibility_caches(
     loop {
         let event = inner
             .storage_handle
-            .send_effect(iter_all_registry_effect(start_after, None))
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: METADATA_INDEX_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit: METADATA_REGISTRY_CANDIDATE_LIMIT
+                    .saturating_sub(records.len())
+                    .saturating_add(1),
+                txn_id: None,
+            }))
             .await;
         let (mut page, next_start_after) = parse_registry_iter(event).map_err(|error| {
             MetadataError::Backend(format!("metadata registry iteration failed: {error:?}"))
         })?;
         registry_pages += 1;
+        if records.len().saturating_add(page.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
+        }
         records.append(&mut page);
         match next_start_after {
             Some(cursor) => start_after = Some(cursor),
@@ -4474,7 +4781,8 @@ async fn fill_visibility_caches(
     // Lifecycle records are deletion tombstones, so one keyspace sweep
     // refreshes the deleted-state of every registry graph without per-graph
     // point reads.
-    let (deleted_graphs, lifecycle_pages) = list_deleted_graph_iris(inner).await?;
+    let (deleted_graphs, lifecycle_pages) =
+        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
     span.record("lifecycle_pages", lifecycle_pages as u64);
     span.record("deleted_count", deleted_graphs.len() as u64);
 
@@ -4505,6 +4813,7 @@ async fn fill_visibility_caches(
 
 async fn list_deleted_graph_iris(
     inner: &Arc<MetadataInner>,
+    limit: usize,
 ) -> Result<(HashSet<String>, usize), MetadataError> {
     let mut deleted = HashSet::new();
     let mut start_after = None;
@@ -4516,7 +4825,7 @@ async fn list_deleted_graph_iris(
                 key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.map(IterStart::After),
-                limit: REGISTRY_FILL_PAGE_SIZE,
+                limit: limit.saturating_add(1),
                 txn_id: None,
             }))
             .await;
@@ -4535,6 +4844,11 @@ async fn list_deleted_graph_iris(
             }
         };
         pages += 1;
+        if deleted.len().saturating_add(values.len()) > limit {
+            return Err(MetadataError::Backend(
+                "metadata lifecycle candidate limit exceeded".to_string(),
+            ));
+        }
         for (_, value) in values {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
@@ -4663,6 +4977,14 @@ async fn query_local_graphs(
     let span = Span::current();
     let total_started = Instant::now();
     let query = parse_metadata_query(&sparql)?;
+    if graph_iris
+        .as_ref()
+        .is_some_and(|graphs| graphs.len() > METADATA_REGISTRY_CANDIDATE_LIMIT)
+    {
+        return Err(MetadataError::Backend(
+            "metadata candidate limit exceeded".to_string(),
+        ));
+    }
     // Stamped before any read so a mutation racing this query invalidates the
     // entry it stores.
     let cache_stamp = inner
@@ -5153,6 +5475,15 @@ async fn search_local_graphs(
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let span = Span::current();
     let total_started = Instant::now();
+
+    if graph_iris
+        .as_ref()
+        .is_some_and(|graphs| graphs.len() > METADATA_REGISTRY_CANDIDATE_LIMIT)
+    {
+        return Err(MetadataError::Backend(
+            "metadata candidate limit exceeded".to_string(),
+        ));
+    }
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
     // Without a candidate filter the request spans the realm, so craqle
@@ -5647,22 +5978,17 @@ impl CraqleAuthorizer for ScopeAuthorizer<'_> {
 }
 
 async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, MetadataError> {
-    let graphs = tokio::task::spawn_blocking({
-        let inner = inner.clone();
-        move || inner.node.graphs()
-    })
-    .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-    .map_err(|error| MetadataError::Backend(error.to_string()))?;
-
-    let mut visible = Vec::with_capacity(graphs.len());
-    for graph in graphs {
-        let graph_iri = graph.as_str().to_string();
-        if !metadata_graph_deleted(inner.clone(), inner.storage_handle.clone(), &graph_iri).await? {
-            visible.push(graph_iri);
-        }
-    }
-    Ok(visible)
+    let records = inner
+        .visibility_cache
+        .registry_records_any()
+        .map(|(records, _)| records)
+        .ok_or_else(|| {
+            MetadataError::Backend("metadata registry snapshot unavailable".to_string())
+        })?;
+    let records = super::api::filter_live_records(&inner.storage_handle, records.as_ref())
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    Ok(records.into_iter().map(|record| record.graph_iri).collect())
 }
 
 async fn select_authorized_graphs(
@@ -5724,7 +6050,7 @@ async fn select_authorized_records(
     let evaluated = scope.records.len() as u64;
     // Lifecycle is resolved once per request, so the cache counters report how
     // the whole request was decided instead of per-record point reads.
-    let lifecycle_cached = matches!(scope.lifecycle_visibility, LifecycleVisibility::Cache);
+    let lifecycle_cached = matches!(&scope.lifecycle_visibility, LifecycleVisibility::Cache(_));
     span.record("visible_count", selection.visible.len() as u64);
     span.record("deleted_count", selection.deleted as u64);
     span.record("filtered_count", filtered_count as u64);
@@ -5819,7 +6145,7 @@ struct GraphVisibilityScope {
 }
 
 enum LifecycleVisibility {
-    Cache,
+    Cache(HashSet<String>),
     FreshDeletedGraphs(HashSet<String>),
 }
 
@@ -5837,8 +6163,8 @@ impl GraphVisibilityScope {
             return true;
         }
         match &self.lifecycle_visibility {
-            LifecycleVisibility::Cache => false,
-            LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
+            LifecycleVisibility::Cache(deleted_graphs)
+            | LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
                 deleted_graphs.contains(graph_iri)
             }
         }
@@ -5900,7 +6226,7 @@ async fn resolve_graph_visibility_scope(
 ) -> Result<GraphVisibilityScope, MetadataError> {
     let lifecycle_refresh = refresh_lifecycle_visibility_for_records(inner, &records).await?;
     let lifecycle_visibility = if lifecycle_refresh.store_accepted {
-        LifecycleVisibility::Cache
+        LifecycleVisibility::Cache(lifecycle_refresh.deleted_graphs)
     } else {
         LifecycleVisibility::FreshDeletedGraphs(lifecycle_refresh.deleted_graphs)
     };
@@ -5922,6 +6248,36 @@ async fn resolve_graph_visibility_scope(
             .map(|record| record.group_id),
     )
     .await;
+    // RBAC/public visibility is additionally constrained by the metadata.read
+    // request policies; a policy-denied record is dropped from the scope so the
+    // eager and lazy (SPARQL) paths both fail closed on it.
+    let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
+        &context,
+        records
+            .iter()
+            .map(|record| (record.realm_id, record.group_id)),
+    )
+    .await
+    .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let policy_user = auth_context.as_ref().map(|auth| auth.user_id);
+    let records = Arc::new(
+        records
+            .iter()
+            .filter(|record| {
+                evaluators
+                    .get(&(record.realm_id, record.group_id))
+                    .is_some_and(|evaluator| {
+                        evaluator
+                            .evaluate(&crate::metadata::api::metadata_read_request(
+                                &record.permission_path,
+                                policy_user.as_ref(),
+                            ))
+                            .is_ok()
+                    })
+            })
+            .cloned()
+            .collect(),
+    );
     Ok(GraphVisibilityScope {
         records,
         permissions,
@@ -5934,7 +6290,8 @@ async fn refresh_lifecycle_visibility_for_records(
     records: &[MetadataRegistryRecord],
 ) -> Result<LifecycleVisibilityRefresh, MetadataError> {
     let fill_generation = inner.visibility_cache.current_generation();
-    let (deleted_graphs, _) = list_deleted_graph_iris(inner).await?;
+    let (deleted_graphs, _) =
+        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
     let store_accepted = inner.visibility_cache.refresh_lifecycle_deleted_if_current(
         records.iter().map(|record| {
             (
@@ -5973,21 +6330,25 @@ async fn send_request(
 ) -> Result<MetadataTransportMessage, MetadataRequestError> {
     let span = Span::current();
     let total_started = Instant::now();
+    let max_response_size = response_cap(&message);
 
     let bytes = encode_message(&message)
         .map_err(MetadataError::Backend)
         .map_err(MetadataRequestError::definitely_not_sent)?;
 
     let open_started = Instant::now();
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Metadata)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))
-        .map_err(MetadataRequestError::definitely_not_sent)?;
+    let mut stream = timeout(
+        METADATA_IO_TIMEOUT,
+        net_handle.open_stream(node_id, Alpn::Metadata),
+    )
+    .await
+    .map_err(|_| MetadataError::Backend("timed out opening metadata stream".to_string()))
+    .and_then(|result| result.map_err(|error| MetadataError::Backend(error.to_string())))
+    .map_err(MetadataRequestError::definitely_not_sent)?;
     record_elapsed_ms(&span, "open_stream_ms", open_started);
 
     let write_started = Instant::now();
-    write_encoded_transport_message(&mut stream, &bytes)
+    write_encoded_transport_message(&mut stream, frame_class(&message), &bytes)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "write_ms", write_started);
@@ -6001,7 +6362,7 @@ async fn send_request(
     record_elapsed_ms(&span, "finish_ms", finish_started);
 
     let read_started = Instant::now();
-    let response = read_transport_message(&mut stream)
+    let response = read_transport_cap(&mut stream, max_response_size)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "read_ms", read_started);
@@ -6035,12 +6396,15 @@ async fn send_export_request(
         .net_handle
         .clone()
         .ok_or_else(|| MetadataRequestError::definitely_not_sent(MetadataError::HandleMissing))?;
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Metadata)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))
-        .map_err(MetadataRequestError::definitely_not_sent)?;
-    write_encoded_transport_message(&mut stream, &bytes)
+    let mut stream = timeout(
+        METADATA_IO_TIMEOUT,
+        net_handle.open_stream(node_id, Alpn::Metadata),
+    )
+    .await
+    .map_err(|_| MetadataError::Backend("timed out opening metadata stream".to_string()))
+    .and_then(|result| result.map_err(|error| MetadataError::Backend(error.to_string())))
+    .map_err(MetadataRequestError::definitely_not_sent)?;
+    write_encoded_transport_message(&mut stream, frame_class(&message), &bytes)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     stream
@@ -6093,10 +6457,14 @@ async fn write_transport_message(
 
 async fn write_encoded_transport_message(
     stream: &mut BiStream,
+    class: u8,
     bytes: &[u8],
 ) -> Result<(), MetadataError> {
-    let result: Result<Result<(), String>, tokio::time::error::Elapsed> =
-        timeout(METADATA_IO_TIMEOUT, write_encoded_message(stream, bytes)).await;
+    let result: Result<Result<(), String>, tokio::time::error::Elapsed> = timeout(
+        METADATA_IO_TIMEOUT,
+        write_encoded_message(stream, class, bytes),
+    )
+    .await;
     result
         .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
         .map_err(MetadataError::Backend)
@@ -6112,14 +6480,50 @@ async fn read_transport_message(
         .map_err(MetadataError::Backend)
 }
 
+async fn read_budget<R>(
+    reader: &mut R,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> Result<(MetadataTransportMessage, tokio::sync::OwnedSemaphorePermit), MetadataError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    timeout(
+        METADATA_IO_TIMEOUT,
+        read_message_budget(reader, super::protocol::MAX_MESSAGE_SIZE, budget),
+    )
+    .await
+    .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
+    .map_err(MetadataError::Backend)
+}
+
+async fn read_transport_cap(
+    stream: &mut BiStream,
+    max_size: usize,
+) -> Result<MetadataTransportMessage, MetadataError> {
+    let result: Result<Result<MetadataTransportMessage, String>, tokio::time::error::Elapsed> =
+        timeout(
+            METADATA_IO_TIMEOUT,
+            read_message_cap(&mut stream.1, max_size),
+        )
+        .await;
+    result
+        .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
+        .map_err(MetadataError::Backend)
+}
+
 async fn write_stream_body(stream: &mut BiStream, bytes: &[u8]) -> Result<(), MetadataError> {
-    for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
-        timeout(METADATA_IO_TIMEOUT, stream.0.write_all(chunk))
-            .await
-            .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    }
-    Ok(())
+    timeout(METADATA_IO_TIMEOUT, async {
+        for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
+            stream
+                .0
+                .write_all(chunk)
+                .await
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        }
+        Ok::<(), MetadataError>(())
+    })
+    .await
+    .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
 }
 
 fn metadata_body_limit(metadata_bytes: u64) -> u64 {
@@ -6134,18 +6538,73 @@ async fn read_stream_body(stream: &mut BiStream, length: u64) -> Result<Vec<u8>,
         .try_reserve_exact(length)
         .map_err(|_| MetadataError::Backend("metadata body allocation failed".to_string()))?;
     bytes.resize(length, 0);
-    for chunk in bytes.chunks_mut(METADATA_CHUNK_SIZE) {
-        timeout(METADATA_IO_TIMEOUT, stream.1.read_exact(chunk))
-            .await
-            .map_err(|_| MetadataError::Backend("timed out reading metadata body".to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    }
-    Ok(bytes)
+    timeout(METADATA_IO_TIMEOUT, async {
+        for chunk in bytes.chunks_mut(METADATA_CHUNK_SIZE) {
+            stream
+                .1
+                .read_exact(chunk)
+                .await
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        }
+        Ok::<Vec<u8>, MetadataError>(bytes)
+    })
+    .await
+    .map_err(|_| MetadataError::Backend("timed out reading metadata body".to_string()))?
 }
 
 async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
     let _ = stream.1.stop(0u32.into());
+}
+
+fn close_stream_at(stream: &mut BiStream, deadline: tokio::time::Instant) {
+    if tokio::time::Instant::now() < deadline {
+        let _ = stream.0.finish();
+    }
+    let _ = stream.1.stop(0u32.into());
+}
+
+async fn write_message_at(
+    stream: &mut BiStream,
+    message: &MetadataTransportMessage,
+    deadline: tokio::time::Instant,
+) -> Result<(), MetadataError> {
+    timeout_at(deadline, write_message(stream, message))
+        .await
+        .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
+        .map_err(MetadataError::Backend)
+}
+
+async fn write_body_at(
+    stream: &mut BiStream,
+    bytes: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<(), MetadataError> {
+    timeout_at(deadline, async {
+        for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
+            stream
+                .0
+                .write_all(chunk)
+                .await
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        }
+        Ok::<(), MetadataError>(())
+    })
+    .await
+    .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
+}
+
+async fn drain_stream_at(
+    reader: &mut RecvStream,
+    deadline: tokio::time::Instant,
+) -> Result<(), MetadataError> {
+    timeout_at(deadline, reader.read_to_end(1))
+        .await
+        .map_err(|_| {
+            MetadataError::Backend("timed out draining metadata request stream".to_string())
+        })?
+        .map(|_| ())
+        .map_err(|error| MetadataError::Backend(error.to_string()))
 }
 
 async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError> {
@@ -6162,12 +6621,12 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+    use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
         ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
-        SyncMode, SyncState, SyncStatusSnapshot, TokenClaims,
+        SyncMode, SyncState, SyncStatusSnapshot, TokenClaims, TokenRevocation,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;
@@ -6177,6 +6636,7 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn maps_violations() {
@@ -6304,6 +6764,38 @@ mod tests {
         ));
     }
 
+    async fn assert_timeout(frame: &[u8], held: bool) {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        writer.write_all(frame).await.unwrap();
+        let budget = Arc::new(tokio::sync::Semaphore::new(8));
+        let task_budget = budget.clone();
+        let task = tokio::spawn(async move {
+            let mut reader = reader;
+            read_budget(&mut reader, &task_budget).await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(budget.available_permits(), if held { 0 } else { 8 });
+
+        tokio::time::advance(METADATA_IO_TIMEOUT).await;
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            MetadataError::Backend(message)
+                if message == "timed out waiting for metadata message"
+        ));
+        assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_timeout() {
+        assert_timeout(&[0], false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_timeout() {
+        assert_timeout(&[0, 0, 0, 0, 8], true).await;
+    }
+
     #[test]
     fn metadata_query_validation_allows_common_prefixes_and_rejects_unsafe_forms() {
         parse_metadata_query("SELECT ?s WHERE { ?s a schema:Dataset }")
@@ -6332,6 +6824,18 @@ mod tests {
             parse_metadata_query(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)),
             Err(MetadataError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn read_error_mapping() {
+        assert_eq!(
+            metadata_read_error(MetadataError::GraphNotFound),
+            MetadataReadError::NotFound
+        );
+        assert_eq!(
+            metadata_read_error(MetadataError::Backend("storage".to_string())),
+            MetadataReadError::Unavailable
+        );
     }
 
     #[test]
@@ -6393,6 +6897,180 @@ mod tests {
             .expect("metadata persistence flushes");
     }
 
+    fn memory_handle(storage: StorageHandle) -> (TempDir, MetadataHandle) {
+        let metadata_dir = tempdir().expect("metadata dir");
+        let metadata_handle = MetadataHandle::new_with_options(
+            metadata_dir.path(),
+            node_id_from_seed(9),
+            storage,
+            None,
+            None,
+            None,
+            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+        )
+        .expect("metadata handle opens");
+        (metadata_dir, metadata_handle)
+    }
+
+    async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected batch write result: {other:?}"),
+        }
+    }
+
+    fn registry_entries(record: &MetadataRegistryRecord) -> Vec<(String, ByteView, ByteView)> {
+        aruna_core::storage_entries::metadata_registry_write_entries(record)
+            .expect("registry entries encode")
+    }
+
+    #[tokio::test]
+    async fn group_records_live() {
+        let (_storage_dir, storage) = auth_storage();
+        let group_id = Ulid::generate();
+        let live = group_record(group_id, "datasets/live");
+        let gone = group_record(group_id, "datasets/gone");
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            gone.graph_iri.clone(),
+            gone.realm_id,
+            gone.group_id,
+            gone.document_id,
+            2,
+        );
+        let mut writes = registry_entries(&live);
+        writes.extend(registry_entries(&gone));
+        writes.push(
+            aruna_core::storage_entries::metadata_graph_lifecycle_write_entry(&tombstone)
+                .expect("tombstone encodes"),
+        );
+        store_entries(&storage, writes).await;
+        let (_metadata_dir, handle) = memory_handle(storage);
+
+        let records = handle
+            .list_group_records(group_id, 16)
+            .await
+            .expect("group listing succeeds");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.document_id)
+                .collect::<Vec<_>>(),
+            vec![live.document_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn group_records_capped() {
+        // The scan must refuse to answer past its candidate budget instead of
+        // returning a silently truncated group listing.
+        let (_storage_dir, storage) = auth_storage();
+        let group_id = Ulid::generate();
+        let mut writes = registry_entries(&group_record(group_id, "datasets/one"));
+        writes.extend(registry_entries(&group_record(group_id, "datasets/two")));
+        store_entries(&storage, writes).await;
+        let (_metadata_dir, handle) = memory_handle(storage);
+
+        let within = handle
+            .list_group_records(group_id, 2)
+            .await
+            .expect("group listing succeeds");
+        let over = handle.list_group_records(group_id, 1).await;
+
+        assert_eq!(within.len(), 2);
+        assert!(matches!(
+            over,
+            Err(MetadataError::Backend(message)) if message.contains("candidate limit exceeded")
+        ));
+    }
+
+    #[tokio::test]
+    async fn tombstone_blocks_apply() {
+        let (_storage_dir, storage) = auth_storage();
+        let metadata_dir = tempdir().expect("metadata dir");
+        let metadata_handle = MetadataHandle::new_with_options(
+            metadata_dir.path(),
+            node_id_from_seed(3),
+            storage.clone(),
+            None,
+            None,
+            None,
+            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+        )
+        .expect("metadata handle opens");
+        let record = registry_record("datasets/fenced");
+        let held = metadata_graph_fence(&record.graph_iri)
+            .acquire()
+            .await
+            .expect("graph fence remains open");
+        let graph_iri = record.graph_iri.clone();
+        let task_handle = metadata_handle.clone();
+        let task = tokio::spawn(async move {
+            task_handle
+                .send_metadata_effect(MetadataEffect::CreateCrate {
+                    request: MetadataCreateCrateRequest {
+                        graph_iri,
+                        name: "fenced".to_string(),
+                        description: "fenced".to_string(),
+                        date_published: "2026-01-01".to_string(),
+                        license: None,
+                        policy: MetadataGraphPolicy {
+                            public: true,
+                            permission_paths: Vec::new(),
+                        },
+                        durability: MetadataRequestDurability::WalAlreadyDurable,
+                        deterministic_actor: None,
+                    },
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        let bytes = postcard::to_allocvec(&tombstone).expect("tombstone serializes");
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                key: metadata_graph_lifecycle_key(&record.graph_iri),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected lifecycle write result: {other:?}"),
+        }
+        drop(held);
+
+        let event = task.await.expect("materialization task joins");
+        assert!(matches!(
+            event,
+            Event::Metadata(MetadataEvent::Error {
+                error: MetadataError::InvalidInput(message),
+                ..
+            }) if message.contains("deleted")
+        ));
+        assert!(
+            !metadata_handle
+                .inner
+                .node
+                .contains_graph(&GraphId::new(&record.graph_iri))
+                .expect("graph probe succeeds")
+        );
+    }
+
     #[tokio::test]
     async fn flush_persistence_succeeds_with_configured_document_sync_database() {
         let (_storage_dir, storage) = auth_storage();
@@ -6444,7 +7122,7 @@ mod tests {
         )
         .await;
         persist_realm_config(&storage, realm_id, &[configured_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
 
         let auth = authorize_remote_metadata_peer(
             &state,
@@ -6480,7 +7158,7 @@ mod tests {
         persist_realm_config(&storage, realm_id, &[peer]).await;
 
         let auth = authorize_remote_metadata_peer(
-            &MetadataAuthValidationState::new(storage.clone()),
+            &MetadataAuthValidationState::new(storage.clone(), Some(realm_id)),
             &storage,
             peer,
             Some(realm_id),
@@ -6498,7 +7176,7 @@ mod tests {
         let (_dir, storage) = auth_storage();
         let realm_id = RealmId([17u8; 32]);
         let auth = bucket_search_auth(
-            &MetadataAuthValidationState::new(storage.clone()),
+            &MetadataAuthValidationState::new(storage.clone(), Some(realm_id)),
             &storage,
             node_id_from_seed(18),
             Some(realm_id),
@@ -6506,7 +7184,80 @@ mod tests {
         )
         .await;
 
-        assert!(auth.is_none());
+        assert_eq!(auth, Err(MetadataReadError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn bucket_realm_mismatch() {
+        // The same valid token authorizes its own realm and is denied for
+        // another one, so the denial is the realm boundary and not a bad token.
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+        let peer = node_id_from_seed(31);
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_realm_config(&storage, realm_id, &[peer]).await;
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
+        let auth_token = MetadataAuthToken::bearer(token).unwrap();
+
+        let allowed = bucket_search_auth(
+            &state,
+            &storage,
+            peer,
+            Some(realm_id),
+            Some(auth_token.clone()),
+        )
+        .await;
+        let denied = bucket_search_auth(
+            &state,
+            &storage,
+            peer,
+            Some(RealmId([21u8; 32])),
+            Some(auth_token),
+        )
+        .await;
+
+        assert_eq!(allowed.map(|auth| auth.realm_id), Ok(realm_id));
+        assert_eq!(denied, Err(MetadataReadError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn revocation_blind_decode() {
+        // Revoking a token must still decode its claims, while every other
+        // check the validator runs stays in force.
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_revoked_config(&storage, realm_id, &token).await;
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
+
+        assert!(matches!(
+            validate_aruna_bearer_token(&state, &token).await,
+            Err(ArunaBearerTokenError::TokenRevoked)
+        ));
+        let claims = decode_aruna_bearer_token(&RevocationBlindValidation(&state), &token)
+            .await
+            .expect("revoked token still decodes for revocation");
+        assert_eq!(claims.sub, user_id.to_string());
+
+        let (_untrusted_dir, untrusted_storage) = auth_storage();
+        let untrusted = MetadataAuthValidationState::new(untrusted_storage, Some(realm_id));
+        assert!(
+            decode_aruna_bearer_token(&RevocationBlindValidation(&untrusted), &token)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -6525,7 +7276,7 @@ mod tests {
         .await;
         persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
         persist_realm_config(&storage, realm_id, &[auth_realm_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
 
         let error = authorize_remote_metadata_peer(
             &state,
@@ -6552,7 +7303,7 @@ mod tests {
         let (_dir, storage) = auth_storage();
         let local_peer = node_id_from_seed(26);
         persist_realm_config(&storage, local_realm_id, &[local_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(local_realm_id));
 
         let auth = authorize_remote_metadata_peer(
             &state,
@@ -6575,7 +7326,7 @@ mod tests {
         let (_dir, storage) = auth_storage();
         let wrong_realm_peer = node_id_from_seed(29);
         persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(local_realm_id));
 
         let error = authorize_remote_metadata_peer(
             &state,
@@ -6601,13 +7352,15 @@ mod tests {
         let (realm_signing_key, realm_id, user_id) = realm_fixture();
         let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
         let (_dir, storage) = auth_storage();
+        // Revocation fails closed without the realm config revocation set.
+        persist_realm_config(&storage, realm_id, &[]).await;
         persist_auth_state(
             &storage,
             TRUSTED_REALMS_LIST_KEY,
             &HashSet::from([realm_id]),
         )
         .await;
-        let state = MetadataAuthValidationState::new(storage);
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
 
         let auth =
             remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
@@ -6630,13 +7383,15 @@ mod tests {
         claims.restrictions = Some(restrictions.clone());
         let token = sign_token(&realm_signing_key, &claims);
         let (_dir, storage) = auth_storage();
+        // Revocation fails closed without the realm config revocation set.
+        persist_realm_config(&storage, realm_id, &[]).await;
         persist_auth_state(
             &storage,
             TRUSTED_REALMS_LIST_KEY,
             &HashSet::from([realm_id]),
         )
         .await;
-        let state = MetadataAuthValidationState::new(storage);
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
 
         let auth =
             remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
@@ -6661,29 +7416,43 @@ mod tests {
             &HashSet::from([realm_id]),
         )
         .await;
-        persist_auth_state(
-            &revoked_storage,
-            TOKEN_REVOCATION_LIST_KEY,
-            &HashSet::from([bearer_token_hash(&token)]),
-        )
-        .await;
-        let revoked_state = MetadataAuthValidationState::new(revoked_storage);
+        persist_revoked_config(&revoked_storage, realm_id, &token).await;
+        let revoked_state = MetadataAuthValidationState::new(revoked_storage, Some(realm_id));
         assert_metadata_auth_rejected(&revoked_state, &token, "Token is revoked").await;
 
         let (_untrusted_dir, untrusted_storage) = auth_storage();
-        let untrusted_state = MetadataAuthValidationState::new(untrusted_storage);
+        let untrusted_state = MetadataAuthValidationState::new(untrusted_storage, Some(realm_id));
         assert_metadata_auth_rejected(&untrusted_state, &token, "Realm is not trusted").await;
 
         let (_invalid_dir, invalid_storage) = auth_storage();
-        let invalid_state = MetadataAuthValidationState::new(invalid_storage);
+        let invalid_state = MetadataAuthValidationState::new(invalid_storage, Some(realm_id));
         assert_metadata_auth_rejected(&invalid_state, "not-a-jwt", "invalid metadata auth token")
             .await;
     }
 
     #[tokio::test]
+    async fn replicated_revocation_rejects() {
+        // A revocation that arrived through the replicated realm config must
+        // deny the token on this node too.
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_revoked_config(&storage, realm_id, &token).await;
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
+
+        assert_metadata_auth_rejected(&state, &token, "Token is revoked").await;
+    }
+
+    #[tokio::test]
     async fn remote_metadata_auth_allows_missing_token_as_anonymous() {
         let (_dir, storage) = auth_storage();
-        let state = MetadataAuthValidationState::new(storage);
+        let state = MetadataAuthValidationState::new(storage, None);
 
         assert_eq!(
             remote_metadata_auth_context(&state, None)
@@ -6735,12 +7504,29 @@ mod tests {
         }
     }
 
+    async fn persist_revoked_config(storage: &StorageHandle, realm_id: RealmId, token: &str) {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: bearer_token_hash(token),
+            expires_at: aruna_core::util::unix_timestamp_secs() + 600,
+        });
+        write_realm_config(storage, realm_id, &config).await;
+    }
+
     async fn persist_realm_config(storage: &StorageHandle, realm_id: RealmId, node_ids: &[NodeId]) {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         for node_id in node_ids {
             config.ensure_node(*node_id, RealmNodeKind::Server);
         }
-        let bytes = postcard::to_allocvec(&config).expect("realm config serializes");
+        write_realm_config(storage, realm_id, &config).await;
+    }
+
+    async fn write_realm_config(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        config: &RealmConfigDocument,
+    ) {
+        let bytes = postcard::to_allocvec(config).expect("realm config serializes");
 
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -6879,10 +7665,38 @@ mod tests {
     }
 
     #[test]
+    fn upsert_discards_cache() {
+        let records = (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+            .map(|index| registry_record(&format!("datasets/{index}")))
+            .collect();
+        let cache = filled_cache(records);
+
+        cache.upsert_registry_records(&[registry_record("datasets/overflow")]);
+
+        assert!(cache.registry_records().is_none());
+    }
+
+    #[test]
     fn upsert_without_filled_cache_is_noop_until_refill() {
         let cache = MetadataVisibilityCache::new();
         cache.upsert_registry_records(&[registry_record("datasets/a")]);
         assert!(cache.registry_records().is_none());
+    }
+
+    #[test]
+    fn stale_cache_callback() {
+        let record = registry_record("datasets/race");
+        let cache = filled_cache(vec![record.clone()]);
+        let generation = cache.current_generation();
+
+        cache.remove_registry_record(record.document_id);
+        cache.upsert_at(std::slice::from_ref(&record), Some(generation));
+
+        assert!(
+            cache
+                .registry_records()
+                .is_some_and(|records| records.is_empty())
+        );
     }
 
     #[test]
@@ -6956,6 +7770,62 @@ mod tests {
 
         cache.remove_lifecycle_entry("urn:graph:a");
         assert_eq!(cache.lifecycle_deleted("urn:graph:a"), None);
+    }
+
+    #[test]
+    fn store_prunes_expired() {
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted("urn:graph:old".to_string(), false);
+        cache.expire_now();
+
+        cache.store_lifecycle_deleted("urn:graph:new".to_string(), false);
+
+        assert_eq!(cache.lifecycle_deleted_any("urn:graph:old"), None);
+        assert_eq!(cache.lifecycle_deleted("urn:graph:new"), Some(false));
+    }
+
+    #[test]
+    fn refresh_keeps_tombstone() {
+        let cache = MetadataVisibilityCache::new();
+        cache.refresh_lifecycle_deleted(
+            (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+                .map(|index| (format!("urn:graph:old:{index}"), false))
+                .collect::<Vec<_>>(),
+        );
+
+        cache.refresh_lifecycle_deleted(vec![("urn:graph:deleted".to_string(), true)]);
+
+        assert_eq!(cache.lifecycle_deleted("urn:graph:deleted"), Some(true));
+        assert_eq!(
+            cache.lifecycle_deleted.lock().unwrap().len(),
+            METADATA_REGISTRY_CANDIDATE_LIMIT
+        );
+    }
+
+    #[test]
+    fn eviction_keeps_tombstone() {
+        let deleted_record = registry_record("datasets/deleted");
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), true);
+        cache.refresh_lifecycle_deleted(
+            (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+                .map(|index| (format!("urn:graph:current:{index}"), false))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            cache
+                .lifecycle_deleted_any(&deleted_record.graph_iri)
+                .is_none()
+        );
+
+        let scope = GraphVisibilityScope {
+            records: Arc::new(vec![deleted_record.clone()]),
+            permissions: GroupPermissionRules::default(),
+            lifecycle_visibility: LifecycleVisibility::Cache(HashSet::from([deleted_record
+                .graph_iri
+                .clone()])),
+        };
+        assert!(!scope.graph_visible(&cache, &deleted_record.graph_iri));
     }
 
     #[test]
@@ -7120,7 +7990,7 @@ mod tests {
         let anonymous = GraphVisibilityScope {
             records: Arc::new(records.clone()),
             permissions: GroupPermissionRules::default(),
-            lifecycle_visibility: LifecycleVisibility::Cache,
+            lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
         };
         assert!(anonymous.graph_visible(&cache, &public_record.graph_iri));
         assert!(!anonymous.graph_visible(&cache, &private_record.graph_iri));
@@ -7137,7 +8007,7 @@ mod tests {
         let member = GraphVisibilityScope {
             records: Arc::new(records.clone()),
             permissions: GroupPermissionRules::from_groups(Some(realm), readable.clone()),
-            lifecycle_visibility: LifecycleVisibility::Cache,
+            lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
         };
         assert!(member.graph_visible(&cache, &public_record.graph_iri));
         assert!(member.graph_visible(&cache, &private_record.graph_iri));
@@ -7146,7 +8016,7 @@ mod tests {
         let wrong_realm = GraphVisibilityScope {
             records: Arc::new(records),
             permissions: GroupPermissionRules::from_groups(Some(RealmId([8u8; 32])), readable),
-            lifecycle_visibility: LifecycleVisibility::Cache,
+            lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
         };
         assert!(wrong_realm.graph_visible(&cache, &public_record.graph_iri));
         assert!(!wrong_realm.graph_visible(&cache, &private_record.graph_iri));
@@ -7175,7 +8045,7 @@ mod tests {
         let scope = GraphVisibilityScope {
             records: Arc::new(records),
             permissions: GroupPermissionRules::from_groups(Some(realm), rules),
-            lifecycle_visibility: LifecycleVisibility::Cache,
+            lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
         };
 
         let cache = MetadataVisibilityCache::new();
@@ -7200,7 +8070,7 @@ mod tests {
         let scope = GraphVisibilityScope {
             records: Arc::new(records),
             permissions: GroupPermissionRules::from_groups(Some(realm), rules),
-            lifecycle_visibility: LifecycleVisibility::Cache,
+            lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
         };
 
         let cache = MetadataVisibilityCache::new();
@@ -7390,7 +8260,7 @@ mod tests {
         GraphVisibilityScope {
             records: Arc::new(records),
             permissions,
-            lifecycle_visibility: LifecycleVisibility::Cache,
+            lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
         }
     }
 

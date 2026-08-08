@@ -366,8 +366,6 @@ mod tests {
     use tokio::sync::mpsc;
     use ulid::Ulid;
 
-    use crate::notifications::inbox::upsert_inbox_records;
-
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
     struct RecordingHandler {
@@ -419,10 +417,22 @@ mod tests {
         )
     }
 
+    /// Writes rows directly so fixtures can exceed the upsert-time transient cap.
     async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
-        upsert_inbox_records(storage, records)
+        let writes = records
+            .iter()
+            .flat_map(|record| notification_inbox_write_entries(record).expect("write entries"))
+            .collect();
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
             .await
-            .expect("seed upsert succeeds");
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected seed write event: {other:?}"),
+        }
     }
 
     async fn write_primary_only(storage: &StorageHandle, record: &NotificationRecord) {

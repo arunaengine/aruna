@@ -13,9 +13,9 @@ use aruna_core::storage_entries::{
     watch_subscription_write_entry,
 };
 use aruna_core::structs::{
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef, RealmId,
-    WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_subscription_key,
-    watch_subscription_prefix,
+    AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef,
+    RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    parse_watch_subscription_key, watch_subscription_prefix,
 };
 use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
@@ -26,14 +26,14 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::driver::DriverContext;
-use crate::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_authorization,
-};
+use crate::notifications::protocol::NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP;
+use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
 /// always covers a subscription set with a wide safety margin.
 const WATCH_SUBSCRIPTION_LIST_LIMIT: usize = 256;
+const WATCH_SUBSCRIPTION_PAGE_LIMIT: usize = 256;
 
 /// Stable reject reason for a cap-exceeded create; matched verbatim by the
 /// holder proxy to surface a 409 to the API layer.
@@ -43,11 +43,15 @@ pub const WATCH_SUBSCRIPTION_CAP_REACHED: &str = "notification watch subscriptio
 /// holder proxy to surface a 403 to the API layer.
 pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
     "watch subscription owner lacks READ on the watched path";
+pub const WATCH_SUBSCRIPTION_UNAVAILABLE: &str =
+    "watch subscription authorization is temporarily unavailable";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WatchSubscriptionError {
     #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
     Unauthorized(WatchAuthorizationMetricReason),
+    #[error("{WATCH_SUBSCRIPTION_UNAVAILABLE}: {0}")]
+    AuthorizationUnavailable(String),
     #[error("watch path prefix must not be empty")]
     EmptyPrefix,
     #[error("watch path prefix must not start with a slash")]
@@ -108,13 +112,16 @@ pub async fn create_replicated_watch_subscription(
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     let subscription =
         validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
-    match evaluate_watch_authorization(
+    match evaluate_watch_creation(
         context,
         owner.realm_id,
-        owner,
+        &AuthContext {
+            user_id: owner,
+            realm_id: owner.realm_id,
+            path_restrictions: None,
+        },
         &subscription.path_prefix,
         subscription.event_mask,
-        &subscription.authorization,
     )
     .await
     .map_err(WatchSubscriptionError::Storage)?
@@ -123,10 +130,8 @@ pub async fn create_replicated_watch_subscription(
         WatchAuthorization::Denied(reason) => {
             return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
         }
-        WatchAuthorization::Unavailable(_) => {
-            return Err(WatchSubscriptionError::Unauthorized(
-                WatchAuthorizationMetricReason::AuthorizationUnavailable,
-            ));
+        WatchAuthorization::Unavailable(error) => {
+            return Err(WatchSubscriptionError::AuthorizationUnavailable(error));
         }
     }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;
@@ -654,15 +659,19 @@ pub async fn list_realm_watch_subscriptions(
     realm_id: RealmId,
 ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
     let prefix = UserId::storage_prefix(realm_id);
-    let mut subscriptions = Vec::new();
+    let mut subscriptions = Vec::with_capacity(NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP);
     let mut start = None;
     loop {
+        let remaining = NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP - subscriptions.len();
+        let limit = remaining
+            .saturating_add(1)
+            .min(WATCH_SUBSCRIPTION_PAGE_LIMIT);
         let (values, next) = match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start.map(IterStart::After),
-                limit: 1_000,
+                limit,
                 txn_id: None,
             })
             .await
@@ -680,6 +689,11 @@ pub async fn list_realm_watch_subscriptions(
                 )));
             }
         };
+        if values.len() > remaining {
+            return Err(WatchSubscriptionError::Storage(
+                "notification watch subscription scan cap reached".to_string(),
+            ));
+        }
         for (key, value) in values {
             let subscription = decode_stored_subscription(&key, &value)?;
             if subscription.owner.realm_id != realm_id {
@@ -695,6 +709,55 @@ pub async fn list_realm_watch_subscriptions(
         }
     }
     Ok(subscriptions)
+}
+
+/// Reads one bounded realm page and returns the last key as its continuation.
+pub async fn list_watch_page(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    start: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
+    if limit == 0 || limit > NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP {
+        return Err(WatchSubscriptionError::Storage(
+            "notification watch subscription page cap exceeded".to_string(),
+        ));
+    }
+    let prefix = UserId::storage_prefix(realm_id);
+    let values = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            prefix: Some(prefix),
+            start: start.map(|key| IterStart::After(key.into())),
+            limit: limit.saturating_add(1),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(WatchSubscriptionError::Storage(error.to_string()));
+        }
+        other => {
+            return Err(WatchSubscriptionError::Storage(format!(
+                "unexpected watch subscription page event: {other:?}"
+            )));
+        }
+    };
+    let has_more = values.len() > limit;
+    let page: Vec<_> = values.into_iter().take(limit).collect();
+    let next = has_more.then(|| page.last().map(|(key, _)| key.to_vec()));
+    let mut subscriptions = Vec::with_capacity(page.len());
+    for (key, value) in page {
+        let subscription = decode_stored_subscription(&key, &value)?;
+        if subscription.owner.realm_id != realm_id {
+            return Err(WatchSubscriptionError::Storage(
+                "stored watch subscription belongs to a different realm".to_string(),
+            ));
+        }
+        subscriptions.push(subscription);
+    }
+    Ok((subscriptions, next.flatten()))
 }
 
 fn classify(error: StorageError) -> CreateFailure {
@@ -724,10 +787,10 @@ async fn abort_and_classify(
 mod tests {
     use super::*;
     use aruna_core::NodeId;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, WatchEventKind,
-        data_watch_resource_path,
+        Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
+        RealmId, WatchEventKind, data_watch_resource_path,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -784,19 +847,40 @@ mod tests {
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
-        for (key, value) in [
+        // Policy loading resolves the group record before group policies apply.
+        let group = Group {
+            display_name: "watch".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        for (key_space, key, value) in [
             (
+                AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
                 realm_auth.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 group_id.to_bytes().to_vec(),
                 group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_config.to_bytes(&actor).unwrap(),
             ),
         ] {
             match storage
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: AUTH_KEYSPACE.to_string(),
+                    key_space: key_space.to_string(),
                     key: key.into(),
                     value: value.into(),
                     txn_id: None,
@@ -890,8 +974,7 @@ mod tests {
     }
 
     // Revocation hides a watch but does not delete its replicated row. Those
-    // durable rows must keep occupying cap slots until explicit deletion, or a
-    // user can grow storage and fan-out without bound by churning permissions.
+    // durable rows keep occupying the owner's cap until explicit deletion.
     #[tokio::test]
     async fn revoked_rows_still_count_toward_cap() {
         let (_dir, storage) = temp_storage();
@@ -1002,6 +1085,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_cap() {
+        let (_dir, storage) = temp_storage();
+        let owner = user(1, 7);
+        for index in 0..NOTIFICATION_WATCH_PER_USER_CAP - 1 {
+            create_watch_subscription(&storage, owner, format!("p/{index}"), mask(), index as u64)
+                .await
+                .expect("prefill succeeds");
+        }
+        let (left, right) = tokio::join!(
+            create_watch_subscription(&storage, owner, "p/left".to_string(), mask(), 99),
+            create_watch_subscription(&storage, owner, "p/right".to_string(), mask(), 100),
+        );
+        assert_eq!(left.is_ok() as usize + right.is_ok() as usize, 1);
+        assert_eq!(
+            list_watch_subscriptions(&storage, owner)
+                .await
+                .expect("list succeeds")
+                .len(),
+            NOTIFICATION_WATCH_PER_USER_CAP
+        );
+    }
+
+    #[tokio::test]
     async fn delete_is_idempotent_and_owner_scoped() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
@@ -1057,6 +1163,50 @@ mod tests {
             .expect("other realm scan succeeds");
         assert_eq!(other_subs.len(), 1);
         assert_eq!(other_subs[0].owner, outsider);
+    }
+
+    #[tokio::test]
+    async fn realm_scan_caps() {
+        let (_dir, storage) = temp_storage();
+        let realm = RealmId([9u8; 32]);
+        // Owner and watch ids are offset by one: stored rows with nil identity
+        // are rejected at decode time.
+        let writes = (0..=NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP)
+            .map(|index| {
+                let owner = UserId::new(
+                    Ulid::from_bytes([(index / NOTIFICATION_WATCH_PER_USER_CAP + 1) as u8; 16]),
+                    realm,
+                );
+                let mut subscription =
+                    WatchSubscription::new(owner, format!("p/{index}"), mask(), index as u64);
+                subscription.watch_id = Ulid::from_bytes(((index + 1) as u128).to_be_bytes());
+                watch_subscription_write_entry(&subscription).expect("subscription encodes")
+            })
+            .collect();
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+
+        let (page, next) = list_watch_page(&storage, realm, None, WATCH_SUBSCRIPTION_PAGE_LIMIT)
+            .await
+            .expect("first page succeeds");
+        assert_eq!(page.len(), WATCH_SUBSCRIPTION_PAGE_LIMIT);
+        let (tail, _) = list_watch_page(&storage, realm, next, WATCH_SUBSCRIPTION_PAGE_LIMIT)
+            .await
+            .expect("continuation succeeds");
+        assert_eq!(tail.len(), WATCH_SUBSCRIPTION_PAGE_LIMIT);
+
+        assert!(matches!(
+            list_realm_watch_subscriptions(&storage, realm).await,
+                Err(WatchSubscriptionError::Storage(reason))
+                if reason.contains("subscription scan cap")
+        ));
     }
 
     #[test]

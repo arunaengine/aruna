@@ -102,6 +102,8 @@ pub enum ClaimInitialRealmAdminError {
     AuthDocNotFound,
     #[error("realm_admin role not found")]
     RealmAdminRoleNotFound,
+    #[error("initial realm administrator has already been claimed")]
+    InitialAdministratorAlreadyClaimed,
     #[error("claiming initial realm admin did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]

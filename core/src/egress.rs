@@ -17,6 +17,8 @@ pub enum EgressError {
     MissingHost(String),
     #[error("failed to resolve `{host}`: {reason}")]
     ResolveFailed { host: String, reason: String },
+    #[error("redirect to `{0}` downgrades the connection scheme")]
+    SchemeDowngrade(String),
 }
 
 /// IPv4 ranges that are never a legitimate tenant destination.

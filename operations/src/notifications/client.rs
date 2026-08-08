@@ -8,6 +8,7 @@ use aruna_core::structs::{
 use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
 use ulid::Ulid;
 
@@ -222,14 +223,62 @@ pub(crate) async fn read_message(
 }
 
 pub(crate) async fn drain_request_stream(stream: &mut BiStream) -> Result<(), String> {
-    timeout(NOTIFICATION_IO_TIMEOUT, stream.1.read_to_end(1))
-        .await
-        .map_err(|_| "timed out draining notification request stream".to_string())?
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    drain_reader(&mut stream.1).await
+}
+
+async fn drain_reader<R>(reader: &mut R) -> Result<(), String>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut trailing = [0u8; 1];
+    match timeout(NOTIFICATION_IO_TIMEOUT, reader.read(&mut trailing)).await {
+        Ok(Ok(0)) => Ok(()),
+        Ok(Ok(_)) => Err("notification request stream has trailing bytes".to_string()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("timed out draining notification request stream".to_string()),
+    }
 }
 
 pub(crate) async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
     let _ = stream.1.stop(0u32.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_reader;
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn drain_rejects_trailing() {
+        let (mut writer, mut reader) = duplex(1);
+        writer.write_all(&[1]).await.expect("write trailing byte");
+
+        let error = drain_reader(&mut reader)
+            .await
+            .expect_err("trailing byte must be rejected");
+        assert!(error.contains("trailing bytes"));
+    }
+
+    #[tokio::test]
+    async fn drain_accepts_eof() {
+        let (writer, mut reader) = duplex(1);
+        drop(writer);
+
+        drain_reader(&mut reader).await.expect("eof is clean");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_times_out() {
+        let (_writer, mut reader) = duplex(1);
+        let task = tokio::spawn(async move { drain_reader(&mut reader).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(super::NOTIFICATION_IO_TIMEOUT).await;
+
+        let error = task
+            .await
+            .expect("drain task completes")
+            .expect_err("pending drain must time out");
+        assert!(error.contains("timed out"));
+    }
 }

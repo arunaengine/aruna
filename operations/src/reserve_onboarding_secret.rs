@@ -361,7 +361,7 @@ mod tests {
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
     use crate::driver::{DriverContext, drive};
-    use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
+    use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -386,6 +386,7 @@ mod tests {
                     enrollment_id,
                     secret_hash: "abc".to_string(),
                     mode: OnboardingMode::Server,
+                    purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: 100,
                     claimed_node_id: None,
                 },
@@ -462,6 +463,7 @@ mod tests {
                     enrollment_id,
                     secret_hash: "abc".to_string(),
                     mode: OnboardingMode::Server,
+                    purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: 100,
                     claimed_node_id: None,
                 },

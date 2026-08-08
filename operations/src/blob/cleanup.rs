@@ -1,17 +1,17 @@
 use std::time::Duration;
 
-use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
+use crate::replication::util::dht_registration_effect;
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend,
-    MultipartUploadPart, MultipartUploadPartKey, WriteOwner,
+    MultipartUploadPart, MultipartUploadPartKey, RealmId, RoCrateLimits, WriteOwner,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
@@ -25,47 +25,75 @@ use crate::jobs::store::iter_prefix_page;
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
 const CLEANUP_PAGE_SIZE: usize = 128;
+const MAX_CLEANUP_RETRIES: u8 = 3;
 
 /// A cleanup row an operation has emitted but storage has not yet accepted.
 /// The row is the only durable record that the written object exists, so the
-/// work is held until the write succeeds and retried once when it does not.
+/// work is held until the write succeeds.
 #[derive(Debug, Default, PartialEq)]
 pub struct PendingCleanup {
     work: Option<BlobCleanupWork>,
-    retried: bool,
+    key: Option<Key>,
+    channel_closed: bool,
+    attempts: u8,
 }
 
 impl PendingCleanup {
     /// The write effect for one row. `None` means the row will never encode,
     /// leaving the caller with the failure it already carries.
     pub fn queue(&mut self, work: BlobCleanupWork) -> Option<Effect> {
-        let effect = cleanup_row_write(&work)?;
+        let key = cleanup_row_key(&work);
+        let effect = cleanup_row_write(&work, &key)?;
         self.work = Some(work);
+        self.key = Some(key);
+        self.channel_closed = false;
+        self.attempts = 0;
         Some(effect)
     }
 
     pub fn accepted(&mut self) {
         self.work = None;
+        self.key = None;
     }
 
-    /// One retry, then the object is logged: after that nothing but this line
-    /// names the bytes that were written.
+    /// Re-emit one write per temporary rejection; the caller remains queued.
+    /// The retries are bounded: an endless loop would pin the blob reservation
+    /// and never let the request finish.
     pub fn retry(&mut self, error: &StorageError) -> Option<Effect> {
-        let work = self.work.take()?;
-        if self.retried {
-            log_refused_row(&work, error);
+        if self.channel_closed {
             return None;
         }
-        self.retried = true;
-        self.queue(work)
+        if matches!(error, StorageError::ChannelClosed) {
+            self.channel_closed = true;
+            return None;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        if self.attempts > MAX_CLEANUP_RETRIES {
+            error!(error = %error, "Giving up on a rejected blob cleanup row");
+            return None;
+        }
+        cleanup_row_write(self.work.as_ref()?, self.key.as_ref()?)
     }
 }
 
-fn cleanup_row_write(work: &BlobCleanupWork) -> Option<Effect> {
+fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
+    match work {
+        BlobCleanupWork::ReconcileWrite { location, .. } => {
+            location.ulid.to_bytes().to_vec().into()
+        }
+        BlobCleanupWork::DeleteBlob { .. }
+        | BlobCleanupWork::RegisterDht { .. }
+        | BlobCleanupWork::ReconcileReservation { .. } => {
+            Ulid::generate().to_bytes().to_vec().into()
+        }
+    }
+}
+
+fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
     match work.to_bytes() {
         Ok(bytes) => Some(Effect::Storage(StorageEffect::Write {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
+            key: key.clone(),
             value: bytes.into(),
             txn_id: None,
         })),
@@ -74,22 +102,6 @@ fn cleanup_row_write(work: &BlobCleanupWork) -> Option<Effect> {
             None
         }
     }
-}
-
-fn log_refused_row(work: &BlobCleanupWork, error: &StorageError) {
-    let Some(location) = work.location() else {
-        warn!(error = %error, "Blob cleanup row could not be queued");
-        return;
-    };
-    error!(
-        event = "blob.cleanup.row_refused",
-        backend = %location.backend,
-        storage_bucket = %location.storage_bucket,
-        backend_path = %location.backend_path,
-        blob_size = location.blob_size,
-        error = %error,
-        "Cleanup row refused; the written object is named nowhere else"
-    );
 }
 
 pub fn schedule_blob_cleanup_effect() -> Effect {
@@ -214,31 +226,55 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
         BlobCleanupWork::ReconcileWrite { location, owner } => {
             match owns_write(context, &owner, &location).await {
                 None => false,
-                Some(true) => true,
+                Some(true) => {
+                    if let Some(blob_handle) = context.blob_handle.as_ref() {
+                        blob_handle.clear_reservation(location.ulid);
+                    }
+                    match owner {
+                        WriteOwner::Blob {
+                            blake3,
+                            realm_id,
+                            ttl_ms,
+                        } => register_dht(context, blake3, realm_id, ttl_ms).await,
+                        WriteOwner::UploadPart { .. } => true,
+                    }
+                }
                 Some(false) => delete_blob(context, location).await,
             }
+        }
+        BlobCleanupWork::ReconcileReservation { location } => {
+            reconcile_reservation(context, location).await
         }
         BlobCleanupWork::RegisterDht {
             blake3,
             realm_id,
             ttl_ms,
-        } => {
-            let Some(net_handle) = context.net_handle.as_ref() else {
-                return false;
-            };
-            let effect = Effect::Net(NetEffect::Dht(DhtEffect::Put {
-                key: DhtKeyId::from_bytes(blake3),
-                realm_id,
-                value: Vec::new(),
-                ttl: Duration::from_millis(ttl_ms),
-            }));
-            match net_handle.send_effect(effect).await {
-                Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => true,
-                event => {
-                    warn!(?event, "Deferred blob DHT registration failed");
-                    false
-                }
-            }
+        } => register_dht(context, blake3, realm_id, ttl_ms).await,
+    }
+}
+
+async fn register_dht(
+    context: &DriverContext,
+    blake3: [u8; 32],
+    realm_id: RealmId,
+    ttl_ms: u64,
+) -> bool {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return false;
+    };
+    let limits = RoCrateLimits {
+        holder_ttl_ms: ttl_ms,
+        ..RoCrateLimits::default()
+    };
+    let Ok(effect) = dht_registration_effect(&blake3, realm_id, net_handle.node_id(), &limits)
+    else {
+        return false;
+    };
+    match net_handle.send_effect(effect).await {
+        Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => true,
+        event => {
+            warn!(?event, "Deferred blob DHT registration failed");
+            false
         }
     }
 }
@@ -259,6 +295,19 @@ async fn delete_blob(context: &DriverContext, location: BackendLocation) -> bool
     }
 }
 
+async fn reconcile_reservation(context: &DriverContext, location: BackendLocation) -> bool {
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return false;
+    };
+    match blob_handle.reconcile_reservation(location).await {
+        Ok(done) => done,
+        Err(error) => {
+            warn!(%error, "Deferred bucket reservation reconciliation failed");
+            false
+        }
+    }
+}
+
 /// Whether committed metadata still names this exact physical copy. `None`
 /// means the record could not be read or decoded, so nothing is proven.
 async fn owns_write(
@@ -267,7 +316,7 @@ async fn owns_write(
     location: &BackendLocation,
 ) -> Option<bool> {
     let (key_space, key): (&str, Key) = match owner {
-        WriteOwner::Blob { blake3 } => (
+        WriteOwner::Blob { blake3, .. } => (
             BLOB_LOCATIONS_KEYSPACE,
             BlobLocationKey::new(*blake3, location.backend.clone())
                 .to_bytes()
@@ -308,14 +357,14 @@ async fn owns_write(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLEANUP_PAGE_SIZE, PendingCleanup, process_cleanup_batch};
+    use super::{CLEANUP_PAGE_SIZE, MAX_CLEANUP_RETRIES, PendingCleanup, process_cleanup_batch};
     use crate::driver::DriverContext;
     use crate::jobs::store::iter_prefix_page;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
     use aruna_core::structs::{
-        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, RoCrateLimits, WriteOwner,
     };
     use aruna_core::types::UserId;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
@@ -363,17 +412,16 @@ mod tests {
     }
 
     #[test]
-    fn retries_refused_row() {
-        // The row is the only durable record of the written bytes, so it is
-        // held until storage accepts it and retried once when it does not.
+    fn retains_refused_row() {
+        // A temporary storage rejection must not discard the only location.
         let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
         let error = aruna_core::errors::StorageError::QueueFull;
         let mut pending = PendingCleanup::default();
 
-        assert!(pending.queue(work).is_some());
-        assert!(pending.retry(&error).is_some());
-        assert!(pending.retry(&error).is_none());
-        assert!(pending.retry(&error).is_none());
+        let first = pending.queue(work).unwrap();
+        assert_eq!(pending.retry(&error), Some(first));
+        let first = pending.retry(&error).unwrap();
+        assert_eq!(pending.retry(&error), Some(first));
 
         let mut pending = PendingCleanup::default();
         assert!(
@@ -383,6 +431,39 @@ mod tests {
         );
         pending.accepted();
         assert!(pending.retry(&error).is_none());
+    }
+
+    #[test]
+    fn bounds_retry_attempts() {
+        // Endless rejection must surrender the row so the request can finish and
+        // release its blob reservation.
+        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
+        let error = aruna_core::errors::StorageError::QueueFull;
+        let mut pending = PendingCleanup::default();
+        assert!(pending.queue(work).is_some());
+
+        for _ in 0..MAX_CLEANUP_RETRIES {
+            assert!(pending.retry(&error).is_some());
+        }
+
+        assert!(pending.retry(&error).is_none());
+        assert!(pending.retry(&error).is_none());
+    }
+
+    #[test]
+    fn closed_retry_stops() {
+        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
+        let mut pending = PendingCleanup::default();
+        assert!(pending.queue(work).is_some());
+
+        assert_eq!(
+            pending.retry(&aruna_core::errors::StorageError::ChannelClosed),
+            None
+        );
+        assert_eq!(
+            pending.retry(&aruna_core::errors::StorageError::Timeout),
+            None
+        );
     }
 
     fn group_delete_work() -> Vec<u8> {
@@ -458,16 +539,19 @@ mod tests {
     fn reconcile_work(location: &BackendLocation) -> Vec<u8> {
         BlobCleanupWork::ReconcileWrite {
             location: location.clone(),
-            owner: WriteOwner::Blob { blake3: [7u8; 32] },
+            owner: WriteOwner::Blob {
+                blake3: [7u8; 32],
+                realm_id: location.created_by.realm_id,
+                ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+            },
         }
         .to_bytes()
         .unwrap()
     }
 
     #[tokio::test]
-    async fn owned_write_reconciles() {
-        // The location row proves the ambiguous commit landed, so the row is
-        // done without any delete being attempted.
+    async fn owned_write_waits() {
+        // The committed copy stays queued until its DHT holder is registered.
         let (_dir, storage, context) = setup_context();
         let BlobCleanupWork::DeleteBlob { location } =
             BlobCleanupWork::from_bytes(&delete_work()).unwrap()
@@ -492,9 +576,9 @@ mod tests {
 
         let outcome = process_cleanup_batch(&context).await.unwrap();
 
-        assert_eq!(outcome.processed, 1);
-        assert_eq!(outcome.failed, 0);
-        assert_eq!(remaining_rows(&storage).await, 0);
+        assert_eq!(outcome.processed, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(remaining_rows(&storage).await, 1);
     }
 
     #[tokio::test]

@@ -190,6 +190,64 @@ pub struct MetadataRawRevision {
     pub dataset_digest: Option<[u8; 32]>,
 }
 
+pub const METADATA_RAW_EVENT_LIMIT: u32 = 1024;
+pub const METADATA_RAW_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataRawOriginBudget {
+    pub document_id: Ulid,
+    pub node_id: NodeId,
+    pub event_limit: u32,
+    pub byte_limit: u64,
+    pub events: u32,
+    pub encoded_bytes: u64,
+}
+
+pub fn raw_quotas(
+    document_id: Ulid,
+    origins: &[NodeId],
+    creator: NodeId,
+    create_bytes: u64,
+) -> Option<Vec<MetadataRawOriginBudget>> {
+    if create_bytes > METADATA_RAW_BYTES_LIMIT || origins.is_empty() {
+        return None;
+    }
+    let mut origins = origins.to_vec();
+    origins.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    origins.dedup();
+    let creator_index = origins.iter().position(|origin| *origin == creator)?;
+    let origin_count = u32::try_from(origins.len()).ok()?;
+    let remaining_events = METADATA_RAW_EVENT_LIMIT.checked_sub(1)?;
+    let event_share = remaining_events / origin_count;
+    let event_remainder = remaining_events % origin_count;
+    let remaining_bytes = METADATA_RAW_BYTES_LIMIT.checked_sub(create_bytes)?;
+    let origin_count_bytes = u64::from(origin_count);
+    let byte_share = remaining_bytes / origin_count_bytes;
+    let byte_remainder = remaining_bytes % origin_count_bytes;
+
+    let quotas = origins
+        .into_iter()
+        .enumerate()
+        .map(|(index, node_id)| {
+            let index = u64::try_from(index).ok()?;
+            let creator = usize::try_from(index).ok()? == creator_index;
+            let event_limit =
+                event_share + u32::from(index < u64::from(event_remainder)) + u32::from(creator);
+            let byte_limit =
+                byte_share + u64::from(index < byte_remainder) + u64::from(creator) * create_bytes;
+            Some(MetadataRawOriginBudget {
+                document_id,
+                node_id,
+                event_limit,
+                byte_limit,
+                events: u32::from(creator),
+                encoded_bytes: if creator { create_bytes } else { 0 },
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(quotas)
+}
+
 #[derive(Deserialize)]
 struct MetadataRawContext<'a> {
     #[serde(borrow, rename = "@context")]
@@ -965,10 +1023,10 @@ pub struct MetadataValidationViolation {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
-        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-        MetadataGraphLifecycleRecord, MetadataQueryResults, apply_raw_upsert,
-        compare_metadata_clocks, resolve_raw_revision,
+        METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataClockRelation,
+        MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
+        MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord, MetadataQueryResults,
+        apply_raw_upsert, compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
@@ -1066,6 +1124,61 @@ mod tests {
         event.occurred_at_ms = updated_at_ms;
         event.payload = payload;
         event
+    }
+
+    #[test]
+    fn raw_quotas_sum() {
+        let document_id = Ulid::generate();
+        let create = create_event(document_id, Ulid::from_parts(1, 1));
+        let create_bytes = u64::try_from(postcard::to_allocvec(&create).unwrap().len()).unwrap();
+        let budgets = raw_quotas(
+            document_id,
+            &[node(2), node(1), node(2)],
+            node(2),
+            create_bytes,
+        )
+        .unwrap();
+
+        let mut expected = [node(1), node(2)];
+        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        assert_eq!(budgets.len(), 2);
+        assert_eq!(budgets[0].node_id, expected[0]);
+        assert_eq!(budgets[1].node_id, expected[1]);
+        assert_eq!(
+            budgets.iter().map(|budget| budget.event_limit).sum::<u32>(),
+            METADATA_RAW_EVENT_LIMIT
+        );
+        assert_eq!(
+            budgets.iter().map(|budget| budget.byte_limit).sum::<u64>(),
+            METADATA_RAW_BYTES_LIMIT
+        );
+        let creator = budgets
+            .iter()
+            .find(|budget| budget.node_id == node(2))
+            .unwrap();
+        assert_eq!(creator.events, 1);
+        assert_eq!(creator.encoded_bytes, create_bytes);
+        assert!(
+            budgets
+                .iter()
+                .all(|budget| budget.events <= budget.event_limit)
+        );
+    }
+
+    #[test]
+    fn raw_quotas_reject() {
+        let document_id = Ulid::generate();
+        assert!(raw_quotas(document_id, &[], node(1), 0).is_none());
+        assert!(raw_quotas(document_id, &[node(1)], node(2), 0).is_none());
+        assert!(
+            raw_quotas(
+                document_id,
+                &[node(1)],
+                node(1),
+                METADATA_RAW_BYTES_LIMIT + 1,
+            )
+            .is_none()
+        );
     }
 
     #[test]

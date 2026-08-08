@@ -6,8 +6,8 @@ use crate::driver::DriverContext;
 /// Realm-wide number of live metadata documents, not filtered by what any
 /// caller may read.
 ///
-/// The count comes from the cached registry snapshot, so it costs one cached
-/// read and excludes lifecycle-deleted graphs. Returns `None` when the node
+/// The count comes from the cached registry snapshot plus one bounded lifecycle
+/// batch, and excludes lifecycle-deleted documents. Returns `None` when the node
 /// runs without a metadata subsystem, so an absent count stays distinguishable
 /// from zero documents.
 ///
@@ -26,6 +26,8 @@ pub async fn count_realm_documents(
         .list_cached_registry_records()
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+    let records =
+        super::api::filter_live_records(&context.storage_handle, records.as_ref()).await?;
     Ok(Some(
         records
             .iter()

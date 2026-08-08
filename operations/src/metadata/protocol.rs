@@ -1,19 +1,31 @@
+use std::sync::Arc;
+
+use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
 use crate::metadata::api::MetadataRoCrateExportView;
+use crate::request_policy::PolicyRequestExtras;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
 
-const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+const AUDIT_FRAME_OVERHEAD: usize = 256;
+pub(crate) const METADATA_INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const STANDARD_FRAME: u8 = 0;
+const AUDIT_FRAME: u8 = 1;
+const POSTCARD_VARIANT_BYTES: usize = 5;
+const AUDIT_REQUEST_VARIANT: u32 = 31;
+const AUDIT_RESPONSE_VARIANT: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataPathCandidate {
@@ -48,7 +60,7 @@ pub enum MetadataTransportMessage {
         sparql: String,
     },
     QueryResults {
-        results: MetadataQueryResults,
+        result: Result<MetadataQueryResults, MetadataReadError>,
     },
     SearchGraphs {
         auth_token: Option<MetadataAuthToken>,
@@ -58,7 +70,7 @@ pub enum MetadataTransportMessage {
         group_id: Option<GroupId>,
     },
     SearchResults {
-        hits: Vec<MetadataSearchHit>,
+        result: Result<Vec<MetadataSearchHit>, MetadataReadError>,
     },
     /// A metadata write that arrived at a node holding none of the document's
     /// bucket, forwarded to a holder. The payloads mirror the HTTP handlers'
@@ -112,16 +124,18 @@ pub enum MetadataTransportMessage {
         limit: usize,
     },
     BucketSearchResults {
-        hits: Vec<BucketSearchHit>,
+        result: Result<Vec<BucketSearchHit>, MetadataReadError>,
     },
     CreateSyncMirror {
         auth_token: Option<MetadataAuthToken>,
         source_group_id: GroupId,
         relationship: Box<SyncRelationship>,
+        extras: PolicyRequestExtras,
     },
     DeleteSyncMirror {
         auth_token: Option<MetadataAuthToken>,
         relationship: Box<SyncRelationship>,
+        extras: PolicyRequestExtras,
     },
     SyncMirrorCreated,
     SyncMirrorDeleted,
@@ -180,6 +194,23 @@ pub enum MetadataTransportMessage {
     DocumentQueryResults {
         result: Result<MetadataQueryResults, MetadataReadError>,
     },
+    /// A request for one node's local page of a group's audit trail. Appended
+    /// last so existing control-message discriminants stay stable.
+    ForwardAuditPage {
+        request: AuditPageRequest,
+    },
+    ForwardedAuditPage {
+        result: Result<AuditPageResponse, MetadataReadError>,
+    },
+    /// A User-kind node forwards a bearer-token revocation to a node that may
+    /// publish realm administration events.
+    ForwardTokenRevocation {
+        auth_token: MetadataAuthToken,
+        token: String,
+    },
+    ForwardedTokenRevoked,
+    ForwardedTokenRevocationCapacity,
+    ForwardedMetadataHistoryCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,10 +232,17 @@ pub async fn write_message(
     message: &MetadataTransportMessage,
 ) -> Result<(), String> {
     let bytes = encode_message(message)?;
-    write_encoded_message(stream, &bytes).await
+    write_encoded_message(stream, frame_class(message), &bytes).await
 }
 
 pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
+    if frame_class(message) == AUDIT_FRAME {
+        let size =
+            postcard::experimental::serialized_size(message).map_err(|err| err.to_string())?;
+        if size > audit_frame_cap() {
+            return Err("metadata message exceeds maximum size".to_string());
+        }
+    }
     let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
     if bytes.len() > MAX_MESSAGE_SIZE {
         return Err("metadata message exceeds maximum size".to_string());
@@ -215,8 +253,17 @@ pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u
 
 pub(crate) async fn write_encoded_message(
     stream: &mut BiStream,
+    class: u8,
     bytes: &[u8],
 ) -> Result<(), String> {
+    if class != STANDARD_FRAME && class != AUDIT_FRAME {
+        return Err("invalid metadata frame class".to_string());
+    }
+    stream
+        .0
+        .write_all(&[class])
+        .await
+        .map_err(|err| err.to_string())?;
     stream
         .0
         .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -232,32 +279,169 @@ pub(crate) async fn write_encoded_message(
 }
 
 pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMessage, String> {
+    read_message_cap(&mut stream.1, MAX_MESSAGE_SIZE).await
+}
+
+pub(crate) async fn read_message_budget<R>(
+    reader: &mut R,
+    max_size: usize,
+    byte_budget: &Arc<Semaphore>,
+) -> Result<(MetadataTransportMessage, OwnedSemaphorePermit), String>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let (message, permit) = read_message_inner(reader, max_size, Some(byte_budget)).await?;
+    permit
+        .ok_or_else(|| "metadata inbound frame budget missing".to_string())
+        .map(|permit| (message, permit))
+}
+
+pub(crate) async fn read_message_cap<R>(
+    reader: &mut R,
+    max_size: usize,
+) -> Result<MetadataTransportMessage, String>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    read_message_inner(reader, max_size, None)
+        .await
+        .map(|(message, _)| message)
+}
+
+async fn read_message_inner<R>(
+    reader: &mut R,
+    max_size: usize,
+    byte_budget: Option<&Arc<Semaphore>>,
+) -> Result<(MetadataTransportMessage, Option<OwnedSemaphorePermit>), String>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut class_buf = [0u8; 1];
+    reader
+        .read_exact(&mut class_buf)
+        .await
+        .map_err(|err| err.to_string())?;
+    let class = class_buf[0];
+    if class != STANDARD_FRAME && class != AUDIT_FRAME {
+        return Err("invalid metadata frame class".to_string());
+    }
+
     let mut len_buf = [0u8; 4];
-    stream
-        .1
+    reader
         .read_exact(&mut len_buf)
         .await
         .map_err(|err| err.to_string())?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_MESSAGE_SIZE {
+    if len > max_size.min(MAX_MESSAGE_SIZE) {
         return Err("metadata frame exceeds maximum size".to_string());
+    }
+    if class == AUDIT_FRAME && len > audit_frame_cap() {
+        return Err("metadata audit frame exceeds maximum size".to_string());
+    }
+
+    let permit = match byte_budget {
+        Some(byte_budget) => {
+            let permits = u32::try_from(len)
+                .map_err(|_| "metadata frame length is unsupported".to_string())?;
+            Some(
+                byte_budget
+                    .clone()
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| "metadata inbound frame budget unavailable".to_string())?,
+            )
+        }
+        None => None,
+    };
+
+    let mut variant = [0u8; POSTCARD_VARIANT_BYTES];
+    let variant_len = len.min(POSTCARD_VARIANT_BYTES);
+    let mut prefix_len = 0;
+    if variant_len > 0 {
+        reader
+            .read_exact(&mut variant[..1])
+            .await
+            .map_err(|err| err.to_string())?;
+        prefix_len = 1;
+        while prefix_len < variant_len && variant[prefix_len - 1] & 0x80 != 0 {
+            reader
+                .read_exact(&mut variant[prefix_len..prefix_len + 1])
+                .await
+                .map_err(|err| err.to_string())?;
+            prefix_len += 1;
+        }
+        let variant = parse_variant(&variant[..prefix_len])
+            .map_err(|_| "metadata frame variant is invalid".to_string())?;
+        if len > audit_frame_cap() && variant.is_some_and(is_audit_variant) {
+            return Err("metadata audit frame exceeds maximum size".to_string());
+        }
     }
 
     let mut bytes = vec![0u8; len];
-    stream
-        .1
-        .read_exact(&mut bytes)
+    bytes[..prefix_len].copy_from_slice(&variant[..prefix_len]);
+    reader
+        .read_exact(&mut bytes[prefix_len..])
         .await
         .map_err(|err| err.to_string())?;
-    postcard::from_bytes(&bytes).map_err(|err| err.to_string())
+    let message = postcard::from_bytes(&bytes).map_err(|err| err.to_string())?;
+    let decoded_class = frame_class(&message);
+    if decoded_class != class {
+        return Err("metadata frame class does not match message".to_string());
+    }
+    if decoded_class == AUDIT_FRAME && len > audit_frame_cap() {
+        return Err("metadata audit frame exceeds maximum size".to_string());
+    }
+    Ok((message, permit))
+}
+
+fn audit_frame_cap() -> usize {
+    MAX_AUDIT_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
+}
+
+fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
+    let Some(&last) = prefix.last() else {
+        return Ok(None);
+    };
+    if last & 0x80 != 0 || (prefix.len() == POSTCARD_VARIANT_BYTES && last > 0x0f) {
+        return Err(());
+    }
+    postcard::from_bytes::<u32>(prefix)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+fn is_audit_variant(variant: u32) -> bool {
+    variant == AUDIT_REQUEST_VARIANT || variant == AUDIT_RESPONSE_VARIANT
+}
+
+pub(crate) fn response_cap(message: &MetadataTransportMessage) -> usize {
+    match message {
+        MetadataTransportMessage::ForwardAuditPage { .. } => audit_frame_cap(),
+        _ => MAX_MESSAGE_SIZE,
+    }
+}
+
+pub(crate) fn frame_class(message: &MetadataTransportMessage) -> u8 {
+    match message {
+        MetadataTransportMessage::ForwardAuditPage { .. }
+        | MetadataTransportMessage::ForwardedAuditPage { .. } => AUDIT_FRAME,
+        _ => STANDARD_FRAME,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
+    use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
-    use aruna_core::structs::{AuthContext, PathRestriction, Permission, RealmId};
+    use aruna_core::structs::{
+        AuthContext, MetadataAuditOperation, MetadataAuditRecord, PathRestriction, Permission,
+        RealmId,
+    };
     use aruna_core::types::UserId;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn transport_messages_use_auth_token_fields() {
@@ -329,6 +513,10 @@ mod tests {
             offset: None,
             after: None,
         });
+        assert_has_auth_token_field(MetadataTransportMessage::ForwardTokenRevocation {
+            auth_token: MetadataAuthToken::bearer("revoke-token").unwrap(),
+            token: "target-token".to_string(),
+        });
     }
 
     #[test]
@@ -347,6 +535,32 @@ mod tests {
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+
+        assert_eq!(
+            postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn token_revoke_roundtrip() {
+        for response in [
+            MetadataTransportMessage::ForwardedTokenRevoked,
+            MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+        ] {
+            let bytes = postcard::to_allocvec(&response).unwrap();
+
+            assert_eq!(
+                postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn history_capacity_roundtrip() {
+        let message = MetadataTransportMessage::ForwardedMetadataHistoryCapacity;
         let bytes = postcard::to_allocvec(&message).unwrap();
 
         assert_eq!(
@@ -388,6 +602,28 @@ mod tests {
     }
 
     #[test]
+    fn read_errors_roundtrip() {
+        for error in [
+            MetadataReadError::Unauthorized,
+            MetadataReadError::Forbidden,
+            MetadataReadError::NotFound,
+            MetadataReadError::Unavailable,
+        ] {
+            let query = MetadataTransportMessage::QueryResults { result: Err(error) };
+            let search = MetadataTransportMessage::SearchResults { result: Err(error) };
+            let buckets = MetadataTransportMessage::BucketSearchResults { result: Err(error) };
+
+            for message in [query, search, buckets] {
+                let bytes = postcard::to_allocvec(&message).unwrap();
+                assert_eq!(
+                    postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+                    message
+                );
+            }
+        }
+    }
+
+    #[test]
     fn legacy_reject_stable() {
         assert_eq!(
             postcard::to_allocvec(&MetadataTransportMessage::Reject(String::new())).unwrap(),
@@ -416,6 +652,280 @@ mod tests {
         let oversized = "x".repeat(MAX_METADATA_BEARER_TOKEN_LEN + 1);
 
         assert!(MetadataAuthToken::bearer(oversized).is_err());
+    }
+
+    #[tokio::test]
+    async fn audit_frame_rejects() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+
+        let error = read_message_cap(&mut reader, audit_frame_cap())
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata frame exceeds maximum size");
+    }
+
+    #[tokio::test]
+    async fn audit_rejects_early() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+        let budget = Arc::new(Semaphore::new(1));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata audit frame exceeds maximum size");
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_wire_cap() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+        writer
+            .write_all(&[AUDIT_REQUEST_VARIANT as u8])
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata audit frame exceeds maximum size");
+        assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+    }
+
+    #[test]
+    fn audit_variants_match() {
+        let messages = [
+            (
+                MetadataTransportMessage::ForwardAuditPage {
+                    request: AuditPageRequest {
+                        auth_token: None,
+                        config_digest: [0; 32],
+                        realm_id: RealmId([0; 32]),
+                        group_id: Ulid::nil(),
+                        document_id: None,
+                        start_after: None,
+                        limit: 1,
+                    },
+                },
+                AUDIT_REQUEST_VARIANT,
+            ),
+            (
+                MetadataTransportMessage::ForwardedAuditPage {
+                    result: Ok(AuditPageResponse {
+                        records: Vec::new(),
+                        next_start_after: None,
+                    }),
+                },
+                AUDIT_RESPONSE_VARIANT,
+            ),
+        ];
+
+        for (message, expected) in messages {
+            let bytes = postcard::to_allocvec(&message).unwrap();
+            assert_eq!(postcard::from_bytes::<u32>(&bytes).unwrap(), expected);
+            assert_eq!(frame_class(&message), AUDIT_FRAME);
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_wire_varint() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+        writer.write_all(&[0x9f, 0]).await.unwrap();
+        let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata audit frame exceeds maximum size");
+        assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn audit_variant_limit() {
+        for prefix in [
+            vec![0x80; POSTCARD_VARIANT_BYTES],
+            vec![0x9f, 0x80, 0x80, 0x80, 0x80, 0],
+        ] {
+            let (mut writer, mut reader) = tokio::io::duplex(16);
+            let length = (audit_frame_cap() + 1) as u32;
+            writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+            writer.write_all(&length.to_be_bytes()).await.unwrap();
+            writer.write_all(&prefix).await.unwrap();
+            let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+
+            let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "metadata frame variant is invalid");
+            assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_releases() {
+        let message = MetadataTransportMessage::Reject(String::new());
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+        let budget = Arc::new(Semaphore::new(32));
+
+        let (decoded, permit) = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap();
+        assert_eq!(decoded, message);
+        assert_eq!(budget.available_permits(), 32 - bytes.len());
+        drop(permit);
+        assert_eq!(budget.available_permits(), 32);
+    }
+
+    #[tokio::test]
+    async fn budget_rejects() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&[STANDARD_FRAME, 0, 0, 0, 8])
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(4));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata inbound frame budget unavailable");
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn budget_cancels() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&[STANDARD_FRAME, 0, 0, 0, 8])
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(8));
+        let task_budget = budget.clone();
+        let task = tokio::spawn(async move {
+            let mut reader = reader;
+            read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &task_budget).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() == 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn audit_frame_reads() {
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: Vec::new(),
+                next_start_after: None,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        assert!(bytes.len() <= audit_frame_cap());
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
+        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+
+        assert_eq!(
+            read_message_cap(&mut reader, audit_frame_cap())
+                .await
+                .unwrap(),
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_cap_decoded() {
+        let realm_id = RealmId([1u8; 32]);
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: vec![AuditPageEntry {
+                    key: vec![0u8; aruna_core::audit::AUDIT_KEY_BYTES],
+                    record: MetadataAuditRecord {
+                        realm_id,
+                        group_id: Ulid::from_bytes([2u8; 16]),
+                        document_id: Ulid::from_bytes([3u8; 16]),
+                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
+                        user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
+                        node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+                        operation: MetadataAuditOperation::Create,
+                        occurred_at_ms: 0,
+                        details: None,
+                    },
+                }],
+                next_start_after: None,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        assert!(bytes.len() > audit_frame_cap());
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+
+        assert_eq!(
+            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap_err(),
+            "metadata audit frame exceeds maximum size"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_class_matches() {
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: Vec::new(),
+                next_start_after: None,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+
+        assert_eq!(
+            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap_err(),
+            "metadata frame class does not match message"
+        );
     }
 
     #[test]
@@ -478,6 +988,31 @@ mod tests {
         .unwrap();
 
         assert!(postcard::from_bytes::<MetadataTransportMessage>(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_large_audit() {
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: vec![AuditPageEntry {
+                    key: vec![0u8; aruna_core::audit::AUDIT_KEY_BYTES],
+                    record: MetadataAuditRecord {
+                        realm_id: RealmId([1u8; 32]),
+                        group_id: Ulid::from_bytes([2u8; 16]),
+                        document_id: Ulid::from_bytes([3u8; 16]),
+                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
+                        user_id: UserId::local(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32])),
+                        node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+                        operation: MetadataAuditOperation::Create,
+                        occurred_at_ms: 0,
+                        details: None,
+                    },
+                }],
+                next_start_after: None,
+            }),
+        };
+
+        assert!(encode_message(&message).is_err());
     }
 
     fn assert_has_auth_token_field(message: MetadataTransportMessage) {

@@ -9,17 +9,24 @@ use futures::TryStreamExt;
 use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
 use opendal::{Builder, EntryMode, Operator, services};
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::timeout;
 
 pub(crate) async fn abort_partial_writer(
     writer: &mut opendal::Writer,
-    operator: &Operator,
-    storage_path: &str,
-) {
-    if let Err(err) = writer.abort().await {
-        tracing::warn!(error = %err, "failed to abort partial blob writer; deleting output");
-        if let Err(delete_err) = operator.delete(storage_path).await {
-            tracing::warn!(error = %delete_err, "failed to delete partial blob output");
+    timeout_duration: Duration,
+) -> Result<(), BlobError> {
+    match timeout(timeout_duration, writer.abort()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "failed to abort partial blob writer");
+            Err(BlobError::DeleteError(format!(
+                "partial blob cleanup is uncertain: {err}"
+            )))
         }
+        Err(_) => Err(BlobError::DeleteError(
+            "partial blob cleanup is uncertain: timed out aborting partial blob writer".to_string(),
+        )),
     }
 }
 

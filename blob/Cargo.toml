@@ -15,6 +15,7 @@ aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 bao-tree = { workspace = true }
 blake3 = { workspace = true }
+byteview = { workspace = true }
 bytes = { workspace = true }
 crc-fast = { workspace = true }
 futures = { workspace = true }

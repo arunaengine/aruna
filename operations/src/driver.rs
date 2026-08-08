@@ -1,7 +1,10 @@
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
-use aruna_core::effects::{Effect, JobControlEffect, NetEffect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
+use aruna_core::effects::{
+    AuditPageEffect, BlobEffect, Effect, JobControlEffect, NetEffect, StorageEffect,
+};
+use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{
     BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
 };
@@ -12,14 +15,16 @@ use aruna_core::structs::{
     BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot,
     StorageRoutingRule, UsageCounters, usage_backend_keys,
 };
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, NodeId, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use futures_util::{StreamExt, stream};
 use std::any::{type_name, type_name_of_val};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
@@ -228,6 +233,11 @@ impl std::fmt::Debug for DriverContext {
 }
 
 const MAX_SUBOP_DEPTH: usize = 32;
+const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const AUDIT_FANOUT_CONCURRENCY: usize = 8;
+const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
+const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
+const REALM_PEER_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -236,6 +246,15 @@ const MAX_SUBOP_DEPTH: usize = 32;
     fields(depth, effect = effect_kind(&effect))
 )]
 async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
+    dispatch_effect_until(effect, context, depth, None).await
+}
+
+async fn dispatch_effect_until(
+    effect: Effect,
+    context: &DriverContext,
+    depth: usize,
+    deadline: Option<tokio::time::Instant>,
+) -> Event {
     let effect_name = effect_kind(&effect);
     if depth == 0 {
         tracing::debug!(
@@ -292,10 +311,22 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                         Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }),
                         Some(bytes),
                     ) => {
-                        if let Err(error) =
-                            Box::pin(net_handle.refresh_realm_peers_from_bytes(&bytes)).await
+                        match tokio::time::timeout(
+                            REALM_PEER_REFRESH_TIMEOUT,
+                            net_handle.refresh_realm_peers_from_bytes(&bytes),
+                        )
+                        .await
                         {
-                            warn!(error = %error, "Failed to refresh realm peers from written realm config");
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                warn!(error = %error, "Failed to refresh realm peers from written realm config");
+                            }
+                            Err(_) => {
+                                warn!(
+                                    timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
+                                    "Timed out refreshing realm peers from written realm config"
+                                );
+                            }
                         }
                     }
                     (
@@ -304,8 +335,22 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                         }),
                         _,
                     ) if refresh_after_commit => {
-                        if let Err(error) = Box::pin(net_handle.reload_realm_peers()).await {
-                            warn!(error = %error, "Failed to refresh realm peers after storage commit");
+                        match tokio::time::timeout(
+                            REALM_PEER_REFRESH_TIMEOUT,
+                            net_handle.reload_realm_peers(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                warn!(error = %error, "Failed to refresh realm peers after storage commit");
+                            }
+                            Err(_) => {
+                                warn!(
+                                    timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
+                                    "Timed out refreshing realm peers after storage commit"
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -317,6 +362,10 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
         // the context; the net crate never sees this effect.
         Effect::Net(NetEffect::JobControl(job_control)) => {
             Box::pin(dispatch_job_control(*job_control, context)).await
+        }
+        // Audit fan-out runs its frame I/O here for the same reason.
+        Effect::Net(NetEffect::AuditPage(audit)) => {
+            Box::pin(dispatch_audit_page(*audit, context, deadline)).await
         }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
@@ -353,12 +402,8 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                     max_depth: MAX_SUBOP_DEPTH,
                 })
             } else {
-                let context = context.clone();
-                tokio::spawn(
-                    async move { drive_suboperation(sub_operation, &context, depth + 1).await },
-                )
-                .await
-                .expect("suboperation task panicked or was cancelled")
+                // Keep the child owned by this future so cancellation cannot detach it.
+                drive_suboperation(sub_operation, context, depth + 1, deadline).await
             }
         }
         Effect::Task(task_effect) => {
@@ -425,6 +470,89 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
     Event::Net(NetEvent::JobControl(event))
 }
 
+fn audit_nodes(nodes: Vec<NodeId>, batch: &mut AuditPageBatch) -> BTreeSet<NodeId> {
+    let mut queried: BTreeSet<NodeId> = nodes.into_iter().collect();
+    // Every node past the fan-out cap is reported missing; querying none of them
+    // would render an empty page as an almost complete audit trail.
+    while queried.len() > MAX_AUDIT_PEERS {
+        if let Some(node) = queried.pop_last() {
+            batch.mark_missing(node);
+        }
+    }
+    queried
+}
+
+/// Requests every node's local audit page over the metadata control transport,
+/// concurrently so one unreachable node cannot spend the whole request deadline.
+/// An unreachable or denied node is reported so the aggregator records it missing.
+async fn dispatch_audit_page(
+    effect: AuditPageEffect,
+    context: &DriverContext,
+    operation_deadline: Option<tokio::time::Instant>,
+) -> Event {
+    let AuditPageEffect {
+        nodes: input_nodes,
+        request,
+    } = effect;
+    let mut batch = AuditPageBatch::with_limit(request.limit);
+    let nodes = audit_nodes(input_nodes, &mut batch);
+    let mut remaining = nodes.clone();
+    if remaining.is_empty() {
+        return Event::Net(NetEvent::AuditPages(batch));
+    }
+
+    let deadline =
+        operation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE);
+    let requests = stream::iter(nodes.into_iter().map(|node| {
+        let request = request.clone();
+        async move {
+            let peer_deadline = tokio::time::Instant::now() + AUDIT_PEER_DEADLINE;
+            let peer_deadline = if peer_deadline < deadline {
+                peer_deadline
+            } else {
+                deadline
+            };
+            let result = tokio::time::timeout_at(
+                peer_deadline,
+                crate::metadata::audit::send_audit_request(context, node, request),
+            )
+            .await;
+            (node, result)
+        }
+    }))
+    .buffer_unordered(AUDIT_FANOUT_CONCURRENCY);
+    futures_util::pin_mut!(requests);
+    loop {
+        let next = match tokio::time::timeout_at(deadline, requests.next()).await {
+            Ok(next) => next,
+            Err(_) => break,
+        };
+        let Some((node, result)) = next else {
+            break;
+        };
+        remaining.remove(&node);
+        match result {
+            Ok(Ok(response)) => {
+                if let Err(error) = batch.add_page(node, response, &request) {
+                    trace!(?node, ?error, "Rejected audit page");
+                }
+            }
+            Ok(Err(error)) => {
+                trace!(?node, ?error, "Audit page unavailable");
+                batch.mark_missing(node);
+            }
+            Err(_) => {
+                trace!(?node, "Audit page request timed out");
+                batch.mark_missing(node);
+            }
+        }
+    }
+    for node in remaining {
+        batch.mark_missing(node);
+    }
+    Event::Net(NetEvent::AuditPages(batch))
+}
+
 /// Reserves every tenant backend an effect names for the rest of the operation.
 /// The bytes land inside one effect, but the transaction naming them commits
 /// after it returns, and that commit's rollback runs later still.
@@ -447,10 +575,232 @@ fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
     }
 }
 
+const MAX_TRACKED_TRANSACTIONS: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionState {
+    Open,
+    CommitUnknown,
+    AbortFailed,
+}
+
+#[derive(Clone, Copy)]
+enum TransactionEffect {
+    Start,
+    Commit(TxnId),
+    Abort(TxnId),
+}
+
+fn transaction_effect(effect: &Effect) -> Option<TransactionEffect> {
+    let Effect::Storage(storage_effect) = effect else {
+        return None;
+    };
+    match storage_effect {
+        StorageEffect::StartTransaction { .. } => Some(TransactionEffect::Start),
+        StorageEffect::CommitTransaction { txn_id } => Some(TransactionEffect::Commit(*txn_id)),
+        StorageEffect::AbortTransaction { txn_id } => Some(TransactionEffect::Abort(*txn_id)),
+        _ => None,
+    }
+}
+
+fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
+    matches!(
+        (transaction, event),
+        (
+            Some(TransactionEffect::Commit(txn_id)),
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+        ) if txn_id == *committed
+    )
+}
+
+fn managed_effect(effect: &Effect) -> bool {
+    match effect {
+        Effect::Blob(BlobEffect::ReleaseReservation { .. }) => true,
+        Effect::Blob(BlobEffect::SpoolHidden {
+            deadline: Some(_), ..
+        }) => true,
+        Effect::Storage(StorageEffect::CommitTransaction { .. }) => true,
+        Effect::Storage(StorageEffect::Write {
+            key_space,
+            txn_id: None,
+            ..
+        }) => key_space == REALM_CONFIG_KEYSPACE,
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct TransactionTracker {
+    states: BTreeMap<TxnId, TransactionState>,
+    owner: Option<storage::StorageHandle>,
+}
+
+impl TransactionTracker {
+    fn new(owner: storage::StorageHandle) -> Self {
+        Self {
+            states: BTreeMap::new(),
+            owner: Some(owner),
+        }
+    }
+
+    fn reject_start(&self, effect: Option<TransactionEffect>) -> bool {
+        matches!(effect, Some(TransactionEffect::Start))
+            && self.states.len() >= MAX_TRACKED_TRANSACTIONS
+    }
+
+    fn observe(&mut self, effect: Option<TransactionEffect>, event: &Event) {
+        match (effect, event) {
+            (
+                Some(TransactionEffect::Start),
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+            ) => {
+                if self.states.len() < MAX_TRACKED_TRANSACTIONS {
+                    self.states.insert(*txn_id, TransactionState::Open);
+                } else {
+                    warn!(%txn_id, "Transaction tracker observed an unexpected start");
+                }
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }),
+            ) if txn_id == *committed => {
+                self.states.remove(&txn_id);
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict | StorageError::TransactionNotFound,
+                }),
+            ) => {
+                self.states.remove(&txn_id);
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::QueueFull,
+                }),
+            ) => {
+                if self.states.contains_key(&txn_id) {
+                    self.states.insert(txn_id, TransactionState::Open);
+                }
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::Error { .. }),
+            ) => {
+                if self.states.contains_key(&txn_id) {
+                    self.states.insert(txn_id, TransactionState::CommitUnknown);
+                }
+            }
+            (
+                Some(TransactionEffect::Abort(txn_id)),
+                Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted }),
+            ) if txn_id == *aborted => {
+                self.states.remove(&txn_id);
+            }
+            (
+                Some(TransactionEffect::Abort(txn_id)),
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionNotFound,
+                }),
+            ) => {
+                self.states.remove(&txn_id);
+            }
+            (
+                Some(TransactionEffect::Abort(txn_id)),
+                Event::Storage(StorageEvent::Error { .. }),
+            ) if self.states.contains_key(&txn_id) => {
+                self.states.insert(txn_id, TransactionState::AbortFailed);
+            }
+            _ => {}
+        }
+    }
+
+    fn pending(&self) -> Vec<(TxnId, TransactionState)> {
+        self.states
+            .iter()
+            .filter_map(|(txn_id, state)| {
+                (!self.blocked_abort(*txn_id)).then_some((*txn_id, *state))
+            })
+            .collect()
+    }
+
+    fn blocked_abort(&self, txn_id: TxnId) -> bool {
+        matches!(
+            self.states.get(&txn_id),
+            Some(TransactionState::CommitUnknown)
+        ) || self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.commit_unknown(txn_id))
+    }
+
+    fn retain(&self, txn_id: TxnId, state: TransactionState) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        let commit_unknown = matches!(state, TransactionState::CommitUnknown);
+        if !owner.retain_transaction(txn_id, commit_unknown) {
+            error!(%txn_id, commit_unknown, "Transaction cleanup handoff capacity reached");
+        }
+    }
+}
+
+impl Drop for TransactionTracker {
+    fn drop(&mut self) {
+        for (txn_id, state) in self.states.iter() {
+            self.retain(*txn_id, *state);
+        }
+    }
+}
+
+async fn abort_leaked_transaction(
+    tracker: &mut TransactionTracker,
+    context: &DriverContext,
+    depth: usize,
+    deadline: Option<tokio::time::Instant>,
+) {
+    let cleanup_deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+    for (txn_id, state) in tracker.pending() {
+        let attempts = match state {
+            TransactionState::Open => 2,
+            TransactionState::AbortFailed => 1,
+            TransactionState::CommitUnknown => 0,
+        };
+        for attempt in 0..attempts {
+            if tokio::time::Instant::now() >= cleanup_deadline {
+                warn!(%txn_id, "Transaction cleanup deadline expired");
+                break;
+            }
+            let effect = Effect::Storage(StorageEffect::AbortTransaction { txn_id });
+            let Ok(event) =
+                tokio::time::timeout_at(cleanup_deadline, dispatch_effect(effect, context, depth))
+                    .await
+            else {
+                warn!(%txn_id, "Transaction cleanup deadline expired");
+                break;
+            };
+            tracker.observe(Some(TransactionEffect::Abort(txn_id)), &event);
+            if !tracker.states.contains_key(&txn_id) {
+                break;
+            }
+            if attempt + 1 < attempts {
+                warn!(%txn_id, "Retrying failed transaction cleanup");
+            }
+        }
+        if let Some(state) = tracker.states.get(&txn_id).copied() {
+            warn!(%txn_id, ?state, "Transaction cleanup handed off");
+            tracker.retain(txn_id, state);
+        }
+    }
+}
+
 fn drive_suboperation<'a>(
     mut operation: Box<dyn SubOperation>,
     context: &'a DriverContext,
     depth: usize,
+    deadline: Option<tokio::time::Instant>,
 ) -> Pin<Box<dyn Future<Output = Event> + Send + 'a>> {
     let operation_name = type_name_of_val(&*operation).to_string();
     Box::pin(async move {
@@ -464,22 +814,133 @@ fn drive_suboperation<'a>(
             );
             let mut queue: VecDeque<_> = operation.start().into_iter().collect();
             let mut holds = Vec::new();
+            let mut tracker = TransactionTracker::new(context.storage_handle.clone());
+            let mut expired = false;
+            let mut committed = false;
+            let mut cleanup_deadline = None;
 
             while !operation.is_complete() {
                 while let Some(effect) = queue.pop_front() {
+                    let transaction = transaction_effect(&effect);
+                    if let Some(TransactionEffect::Abort(txn_id)) = transaction
+                        && tracker.blocked_abort(txn_id)
+                    {
+                        warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                        continue;
+                    }
+                    if let Some(deadline) = deadline
+                        && deadline <= tokio::time::Instant::now()
+                        && !managed_effect(&effect)
+                    {
+                        expired = true;
+                        cleanup_deadline =
+                            Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+                        queue.clear();
+                        if !committed {
+                            queue.extend(operation.abort().into_iter().filter(|effect| {
+                                !matches!(
+                                    transaction_effect(effect),
+                                    Some(TransactionEffect::Abort(txn_id))
+                                        if tracker.blocked_abort(txn_id)
+                                )
+                            }));
+                        }
+                        continue;
+                    }
                     hold_backends(context, &effect, &mut holds);
-                    let event = dispatch_effect(effect, context, depth).await;
-                    queue.extend(operation.step(event));
+                    let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
+                    let event = if tracker.reject_start(transaction) {
+                        warn!("Transaction tracker capacity reached");
+                        Event::Storage(StorageEvent::Error {
+                            error: StorageError::TransactionConflict,
+                        })
+                    } else if expired {
+                        let Some(deadline) = cleanup_deadline else {
+                            break;
+                        };
+                        let Ok(event) = tokio::time::timeout_at(
+                            deadline,
+                            dispatch_effect(effect, context, depth),
+                        )
+                        .await
+                        else {
+                            queue.clear();
+                            break;
+                        };
+                        event
+                    } else if let Some(deadline) = deadline {
+                        let managed = managed_effect(&effect);
+                        let dispatch = Box::pin(dispatch_effect_until(
+                            effect,
+                            context,
+                            depth,
+                            Some(deadline),
+                        ));
+                        if managed {
+                            dispatch.await
+                        } else {
+                            match tokio::time::timeout_at(deadline, dispatch).await {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    expired = true;
+                                    cleanup_deadline =
+                                        Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+                                    queue.clear();
+                                    if commit {
+                                        Event::Storage(StorageEvent::Error {
+                                            error: StorageError::CommitFailed,
+                                        })
+                                    } else {
+                                        if !committed {
+                                            queue.extend(operation.abort().into_iter().filter(
+                                                |effect| {
+                                                    !matches!(
+                                                        transaction_effect(effect),
+                                                        Some(TransactionEffect::Abort(txn_id))
+                                                            if tracker.blocked_abort(txn_id)
+                                                    )
+                                                },
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        dispatch_effect(effect, context, depth).await
+                    };
+                    tracker.observe(transaction, &event);
+                    committed |= commit_done(transaction, &event);
+                    if !operation.is_complete() {
+                        queue.extend(operation.step(event).into_iter().filter(|effect| {
+                            !matches!(
+                                transaction_effect(effect),
+                                Some(TransactionEffect::Abort(txn_id))
+                                    if tracker.blocked_abort(txn_id)
+                            )
+                        }));
+                    }
                 }
 
                 if queue.is_empty() && !operation.is_complete() {
-                    queue.extend(operation.abort());
+                    if expired {
+                        break;
+                    }
+                    queue.extend(operation.abort().into_iter().filter(|effect| {
+                        !matches!(
+                            transaction_effect(effect),
+                            Some(TransactionEffect::Abort(txn_id))
+                                if tracker.blocked_abort(txn_id)
+                        )
+                    }));
                     if queue.is_empty() {
                         break;
                     }
                 }
             }
 
+            abort_leaked_transaction(&mut tracker, context, depth, cleanup_deadline).await;
             trace!(
                 event = "suboperation.completed",
                 operation = %operation_name,
@@ -493,9 +954,8 @@ fn drive_suboperation<'a>(
     })
 }
 
-/// Drives an operation under one wall-clock deadline. On expiry the operation's
-/// own `abort` runs and its cleanup effects are dispatched unbounded; racing a
-/// timeout against `drive` instead drops the future and strands what it holds.
+/// Drives an operation under one wall-clock deadline. Cleanup after expiry is
+/// bounded and unresolved transaction ownership is handed to storage.
 #[tracing::instrument(
     name = "operation",
     level = "debug",
@@ -509,16 +969,66 @@ pub async fn drive_until<O: Operation>(
 ) -> Result<O::Output, O::Error> {
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut expired = false;
+    let mut committed = false;
+    let mut cleanup_deadline = None;
     let mut holds = Vec::new();
+    let mut tracker = TransactionTracker::new(context.storage_handle.clone());
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
+            let transaction = transaction_effect(&effect);
+            if let Some(TransactionEffect::Abort(txn_id)) = transaction
+                && tracker.blocked_abort(txn_id)
+            {
+                warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                continue;
+            }
+            if !expired && deadline <= tokio::time::Instant::now() && !managed_effect(&effect) {
+                expired = true;
+                cleanup_deadline = Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+                queue.clear();
+                // A committed transaction must not be rolled back, so its abort
+                // effects stay suppressed; backend reservations are released by
+                // dropping `holds`, never by this path.
+                if !committed {
+                    queue.extend(operation.abort().into_iter().filter(|effect| {
+                        !matches!(
+                            transaction_effect(effect),
+                            Some(TransactionEffect::Abort(txn_id))
+                                if tracker.blocked_abort(txn_id)
+                        )
+                    }));
+                }
+                continue;
+            }
             hold_backends(context, &effect, &mut holds);
-            let dispatch = Box::pin(dispatch_effect(effect, context, 0));
-            let event = if expired {
-                dispatch.await
+            let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
+            let event = if tracker.reject_start(transaction) {
+                warn!("Transaction tracker capacity reached");
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                })
+            } else if expired {
+                let Some(cleanup_deadline) = cleanup_deadline else {
+                    break;
+                };
+                let Ok(event) =
+                    tokio::time::timeout_at(cleanup_deadline, dispatch_effect(effect, context, 0))
+                        .await
+                else {
+                    queue.clear();
+                    break;
+                };
+                event
             } else {
-                match tokio::time::timeout_at(deadline, dispatch).await {
+                let managed = managed_effect(&effect);
+                // Managed effects own their timeout and must not be canceled here.
+                let dispatch = Box::pin(dispatch_effect_until(effect, context, 0, Some(deadline)));
+                match if managed {
+                    Ok(dispatch.await)
+                } else {
+                    tokio::time::timeout_at(deadline, dispatch).await
+                } {
                     Ok(event) => event,
                     Err(_) => {
                         expired = true;
@@ -526,22 +1036,69 @@ pub async fn drive_until<O: Operation>(
                             operation = %type_name::<O>(),
                             "Operation deadline expired; running its abort path"
                         );
+                        cleanup_deadline =
+                            Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
                         queue.clear();
-                        queue.extend(operation.abort());
-                        continue;
+                        if commit {
+                            Event::Storage(StorageEvent::Error {
+                                error: StorageError::CommitFailed,
+                            })
+                        } else {
+                            if !committed {
+                                queue.extend(operation.abort().into_iter().filter(|effect| {
+                                    !matches!(
+                                        transaction_effect(effect),
+                                        Some(TransactionEffect::Abort(txn_id))
+                                            if tracker.blocked_abort(txn_id)
+                                    )
+                                }));
+                            }
+                            continue;
+                        }
                     }
                 }
             };
-            queue.extend(operation.step(event));
+            tracker.observe(transaction, &event);
+            committed |= commit_done(transaction, &event);
+            if !operation.is_complete() {
+                queue.extend(operation.step(event).into_iter().filter(|effect| {
+                    !matches!(
+                        transaction_effect(effect),
+                        Some(TransactionEffect::Abort(txn_id))
+                            if tracker.blocked_abort(txn_id)
+                    )
+                }));
+            }
         }
 
         if queue.is_empty() && !operation.is_complete() {
-            queue.extend(operation.abort());
+            if expired {
+                break;
+            }
+            queue.extend(operation.abort().into_iter().filter(|effect| {
+                !matches!(
+                    transaction_effect(effect),
+                    Some(TransactionEffect::Abort(txn_id)) if tracker.blocked_abort(txn_id)
+                )
+            }));
             if queue.is_empty() {
                 break;
             }
         }
     }
+    if !operation.is_complete() {
+        // finalize() is only defined on a terminal operation, so the deadline
+        // path takes its abort here. The cleanup window is over, so the effects
+        // are dropped and the tracker below owns any transaction they name.
+        let _ = operation.abort();
+    }
+    abort_leaked_transaction(
+        &mut tracker,
+        context,
+        0,
+        Some(cleanup_deadline.unwrap_or(deadline)),
+    )
+    .await;
     operation.finalize()
 }
 
@@ -565,21 +1122,51 @@ pub async fn drive<O: Operation>(
 
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut holds = Vec::new();
+    let mut tracker = TransactionTracker::new(context.storage_handle.clone());
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
+            let transaction = transaction_effect(&effect);
+            if let Some(TransactionEffect::Abort(txn_id)) = transaction
+                && tracker.blocked_abort(txn_id)
+            {
+                warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                continue;
+            }
             hold_backends(context, &effect, &mut holds);
-            let event = Box::pin(dispatch_effect(effect, context, 0)).await;
-            queue.extend(operation.step(event));
+            let event = if tracker.reject_start(transaction) {
+                warn!("Transaction tracker capacity reached");
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                })
+            } else {
+                Box::pin(dispatch_effect(effect, context, 0)).await
+            };
+            tracker.observe(transaction, &event);
+            if !operation.is_complete() {
+                queue.extend(operation.step(event).into_iter().filter(|effect| {
+                    !matches!(
+                        transaction_effect(effect),
+                        Some(TransactionEffect::Abort(txn_id))
+                            if tracker.blocked_abort(txn_id)
+                    )
+                }));
+            }
         }
 
         if queue.is_empty() && !operation.is_complete() {
-            queue.extend(operation.abort());
+            queue.extend(operation.abort().into_iter().filter(|effect| {
+                !matches!(
+                    transaction_effect(effect),
+                    Some(TransactionEffect::Abort(txn_id)) if tracker.blocked_abort(txn_id)
+                )
+            }));
             if queue.is_empty() {
                 break;
             }
         }
     }
+    abort_leaked_transaction(&mut tracker, context, 0, None).await;
     let result = operation.finalize();
     match &result {
         Ok(_) => trace!(
@@ -633,18 +1220,50 @@ fn event_kind(event: &Event) -> &'static str {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{
+        DriverContext, MAX_TRACKED_TRANSACTIONS, TransactionEffect, TransactionState,
+        TransactionTracker, audit_nodes, drive, managed_effect,
+    };
     use aruna_core::{
-        effects::{Effect, StagingSourceEffect, StorageEffect},
+        audit::{AuditPageBatch, MAX_AUDIT_PEERS},
+        effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect},
+        errors::StorageError,
         events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
+        keyspaces::REALM_CONFIG_KEYSPACE,
         operation::{Operation, boxed_suboperation},
         structs::{ResolvedSourceAccess, SourceConnectorKind},
         task::{TaskEffect, TaskKey},
+        types::TxnId,
     };
     use aruna_storage::storage;
     use byteview::ByteView;
     use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn caps_audit_peers() {
+        // Over the cap the fan-out still asks MAX_AUDIT_PEERS nodes and reports
+        // the rest as missing instead of returning an empty page.
+        let nodes = (1..=(MAX_AUDIT_PEERS as u8 + 2))
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect::<Vec<_>>();
+        let mut batch = AuditPageBatch::new();
+
+        let queried = audit_nodes(nodes, &mut batch);
+
+        assert_eq!(queried.len(), MAX_AUDIT_PEERS);
+        assert_eq!(batch.missing_nodes.len(), 2);
+        assert_eq!(batch.missing_overflow, 0);
+        assert!(batch.completed_nodes.is_empty());
+        assert!(
+            batch
+                .missing_nodes
+                .iter()
+                .all(|node| !queried.contains(node))
+        );
+    }
 
     #[tokio::test]
     async fn snapshot_reads_rules() {
@@ -915,6 +1534,1040 @@ mod test {
         fn abort(&mut self) -> aruna_core::types::Effects {
             smallvec::smallvec![]
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct MarkerAbortOperation {
+        state: u8,
+        fail: bool,
+        txn_id: Option<TxnId>,
+    }
+
+    impl Operation for MarkerAbortOperation {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.txn_id = Some(txn_id);
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: "default".to_string(),
+                        key: ByteView::from(*b"staged-marker"),
+                        value: ByteView::from(*b"staged"),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) if self.fail => {
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
+                    self.state = 3;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: self.txn_id.expect("transaction id recorded")
+                    })]
+                }
+                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 4
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.fail { Err(()) } else { Ok(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"abort-marker"),
+                value: ByteView::from(*b"ran"),
+                txn_id: None,
+            })]
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CommitOutcome {
+        state: u8,
+        failed: bool,
+        txn_id: Option<TxnId>,
+    }
+
+    impl Operation for CommitOutcome {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.txn_id = Some(txn_id);
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: "default".to_string(),
+                        key: ByteView::from(*b"commit-outcome"),
+                        value: ByteView::from(*b"committed"),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
+                    self.state = 3;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: self.txn_id.expect("transaction id recorded"),
+                    })]
+                }
+                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                (Event::Storage(StorageEvent::Error { .. }), 3) => {
+                    self.failed = true;
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 4
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.failed { Err(()) } else { Ok(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.failed = true;
+            self.state = 4;
+            smallvec::smallvec![]
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeadlineOperation {
+        state: u8,
+        txn_id: Option<TxnId>,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartialEq for DeadlineOperation {
+        fn eq(&self, other: &Self) -> bool {
+            self.state == other.state && self.txn_id == other.txn_id
+        }
+    }
+
+    impl Operation for DeadlineOperation {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.txn_id = Some(txn_id);
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: "default".to_string(),
+                        key: ByteView::from(*b"staged-marker"),
+                        value: ByteView::from(*b"staged"),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
+                    self.ready.notify_one();
+                    self.state = 3;
+                    smallvec::smallvec![Effect::Blob(BlobEffect::SpoolHidden {
+                        namespace: ulid::Ulid::from_bytes([7u8; 16]),
+                        name: "deadline".to_string(),
+                        created_by: aruna_core::UserId::default(),
+                        max_bytes: None,
+                        deadline: None,
+                        blob: aruna_core::stream::BackendStream::new(
+                            futures_util::stream::pending::<
+                                Result<bytes::Bytes, aruna_core::stream::StreamError>,
+                            >(),
+                        ),
+                    })]
+                }
+                (Event::Blob(_), 3) => {
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 4
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.state == 4)
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.state = 4;
+            smallvec::smallvec![]
+        }
+    }
+
+    async fn marker_absent(context: &DriverContext) -> bool {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"abort-marker"),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event");
+        };
+        value.is_none()
+    }
+
+    async fn staged_value(context: &DriverContext) -> Option<ByteView> {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"staged-marker"),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event");
+        };
+        value
+    }
+
+    async fn transaction_reopens(context: &DriverContext) -> bool {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            return false;
+        };
+        matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await,
+            Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted })
+                if aborted == txn_id
+        )
+    }
+
+    fn test_context() -> (tempfile::TempDir, DriverContext) {
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        (directory, context)
+    }
+
+    async fn blob_context() -> (tempfile::TempDir, DriverContext) {
+        let directory = tempdir().unwrap();
+        let root = directory.path().to_str().unwrap().to_string();
+        let blob_root = format!("{root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(&root).unwrap();
+        let net_handle =
+            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
+                .await
+                .unwrap();
+        let blob_handle = aruna_blob::blob::BlobHandler::new(
+            aruna_core::structs::BackendConfig {
+                backend_type: aruna_core::structs::Backend::FileSystem,
+                root: blob_root,
+                service_config: std::collections::HashMap::new(),
+                bucket_prefix: Some("aruna-test-".to_string()),
+                max_bucket_size: Some(1),
+                multipart_bucket: Some("uploaded-parts".to_string()),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle,
+        )
+        .await
+        .unwrap();
+        (
+            directory,
+            DriverContext {
+                storage_handle,
+                net_handle: None,
+                blob_handle: Some(blob_handle),
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            },
+        )
+    }
+
+    #[test]
+    fn commit_unknown_safe() {
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        });
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        tracker.observe(Some(TransactionEffect::Commit(id)), &failed);
+        assert_eq!(
+            tracker.states.get(&id),
+            Some(&TransactionState::CommitUnknown)
+        );
+        assert!(tracker.pending().is_empty());
+    }
+
+    #[test]
+    fn commit_failure_kept() {
+        let (handle, _receivers) = storage::StorageHandle::new();
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::new(handle.clone());
+        tracker.observe(
+            Some(TransactionEffect::Start),
+            &Event::Storage(StorageEvent::TransactionStarted { txn_id: id }),
+        );
+        tracker.observe(
+            Some(TransactionEffect::Commit(id)),
+            &Event::Storage(StorageEvent::Error {
+                error: StorageError::CommitFailed,
+            }),
+        );
+        assert_eq!(
+            tracker.states.get(&id),
+            Some(&TransactionState::CommitUnknown)
+        );
+        assert!(!handle.commit_unknown(id));
+    }
+
+    #[test]
+    fn commit_queue_kept() {
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        let queued = Event::Storage(StorageEvent::Error {
+            error: StorageError::QueueFull,
+        });
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        tracker.observe(Some(TransactionEffect::Commit(id)), &queued);
+        assert_eq!(tracker.states.get(&id), Some(&TransactionState::Open));
+    }
+
+    #[test]
+    fn abort_failure_kept() {
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError,
+        });
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        tracker.observe(Some(TransactionEffect::Abort(id)), &failed);
+        assert_eq!(
+            tracker.states.get(&id),
+            Some(&TransactionState::AbortFailed)
+        );
+        assert_eq!(tracker.pending(), vec![(id, TransactionState::AbortFailed)]);
+    }
+
+    #[test]
+    fn tracker_bounds() {
+        let mut tracker = TransactionTracker::default();
+        for _ in 0..MAX_TRACKED_TRANSACTIONS {
+            let id = ulid::Ulid::generate();
+            let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+            assert!(!tracker.reject_start(Some(TransactionEffect::Start)));
+            tracker.observe(Some(TransactionEffect::Start), &started);
+        }
+        let id = ulid::Ulid::generate();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        assert!(tracker.reject_start(Some(TransactionEffect::Start)));
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        assert_eq!(tracker.states.len(), MAX_TRACKED_TRANSACTIONS);
+    }
+
+    #[tokio::test]
+    async fn drive_commit_safe() {
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let result = drive(
+            MarkerAbortOperation {
+                state: 0,
+                fail: false,
+                txn_id: None,
+            },
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(marker_absent(&context).await);
+        assert_eq!(
+            staged_value(&context).await,
+            Some(ByteView::from(*b"staged"))
+        );
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test]
+    async fn drive_error_cleanup() {
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let result = drive(
+            MarkerAbortOperation {
+                state: 0,
+                fail: true,
+                txn_id: None,
+            },
+            &context,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(marker_absent(&context).await);
+        assert_eq!(staged_value(&context).await, None);
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test]
+    async fn deadline_commit_safe() {
+        let (_directory, context) = test_context();
+        let result = crate::driver::drive_until(
+            MarkerAbortOperation {
+                state: 0,
+                fail: false,
+                txn_id: None,
+            },
+            &context,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(marker_absent(&context).await);
+        assert_eq!(
+            staged_value(&context).await,
+            Some(ByteView::from(*b"staged"))
+        );
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test]
+    async fn commit_refresh_survives() {
+        // Real time: the proxy actor answers from an OS thread, and paused-time
+        // auto-advance would fire the storage request timeout before it can.
+        assert!(managed_effect(&Effect::Storage(
+            StorageEffect::CommitTransaction {
+                txn_id: ulid::Ulid::generate(),
+            },
+        )));
+        assert!(managed_effect(&Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(*b"realm"),
+            value: ByteView::from(*b"config"),
+            txn_id: None,
+        })));
+        let directory = tempdir().unwrap();
+        let direct = storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let (storage_handle, receivers) = storage::StorageHandle::new();
+        let receiver = receivers.foreground;
+        drop(receivers.bulk);
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_for_actor = committed.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let actor = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut started_tx = Some(started_tx);
+            let mut done_tx = Some(done_tx);
+            while let Ok((effect, response, _span, _queued, _in_flight)) = receiver.recv() {
+                let gated = committed_for_actor.load(Ordering::Acquire)
+                    && matches!(
+                        &effect,
+                        StorageEffect::Read { key_space, .. }
+                            if key_space == REALM_CONFIG_KEYSPACE
+                    );
+                if gated {
+                    if let Some(sender) = started_tx.take() {
+                        let _ = sender.send(());
+                    }
+                    release_rx.recv().unwrap();
+                    committed_for_actor.store(false, Ordering::Release);
+                }
+                let committed_effect = matches!(&effect, StorageEffect::CommitTransaction { .. });
+                let Event::Storage(event) = runtime.block_on(direct.send_storage_effect(effect))
+                else {
+                    unreachable!("storage proxy only handles storage events");
+                };
+                let committed_event =
+                    committed_effect && matches!(&event, StorageEvent::TransactionCommitted { .. });
+                let _ = response.send(event);
+                if committed_event {
+                    committed_for_actor.store(true, Ordering::Release);
+                }
+                if gated && let Some(sender) = done_tx.take() {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        let net_handle = aruna_net::NetHandle::new(
+            aruna_net::NetConfig {
+                discovery_method: aruna_net::DiscoveryMethod::None,
+                relay_method: aruna_net::RelayMethod::None,
+                ..aruna_net::NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let context = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: Some(net_handle.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(
+                CommitOutcome {
+                    state: 0,
+                    failed: false,
+                    txn_id: None,
+                },
+                &task_context,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            )
+            .await
+        });
+
+        started_rx.await.unwrap();
+        assert!(task.await.unwrap().is_ok());
+
+        committed.store(false, Ordering::Release);
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        net_handle.shutdown().await;
+        drop(context);
+        drop(net_handle);
+        drop(storage_handle);
+        actor.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_drive_aborts() {
+        let (_directory, context) = blob_context().await;
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let task_ready = ready.clone();
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            drive(
+                DeadlineOperation {
+                    state: 0,
+                    txn_id: None,
+                    ready: task_ready,
+                },
+                &task_context,
+            )
+            .await
+        });
+
+        // The transaction is open while the blob effect is waiting.
+        // Cancellation must transfer it to storage rather than strand it.
+        ready.notified().await;
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(staged_value(&context).await, None);
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_rollback() {
+        let temp_dir = tempdir().unwrap();
+        let temp_root = temp_dir.path().to_str().unwrap().to_string();
+        let blob_root = format!("{temp_root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+        let net_handle =
+            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
+                .await
+                .unwrap();
+        let blob_handle = aruna_blob::blob::BlobHandler::new(
+            aruna_core::structs::BackendConfig {
+                backend_type: aruna_core::structs::Backend::FileSystem,
+                root: blob_root,
+                service_config: std::collections::HashMap::new(),
+                bucket_prefix: Some("aruna-test-".to_string()),
+                max_bucket_size: Some(1),
+                multipart_bucket: Some("uploaded-parts".to_string()),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle,
+        )
+        .await
+        .unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: Some(blob_handle),
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let operation = DeadlineOperation {
+            state: 0,
+            txn_id: None,
+            ready: ready.clone(),
+        };
+        // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
+        // fire the drive deadline, never a tied storage request timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(operation, &task_context, deadline).await
+        });
+
+        ready.notified().await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert!(task.await.unwrap().unwrap());
+        // Real time again: auto-advance would fire the request timeouts of the
+        // storage roundtrips below before the worker thread can answer.
+        tokio::time::resume();
+        assert_eq!(staged_value(&context).await, None);
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CommitDeadline {
+        state: u8,
+        txn_id: TxnId,
+        output: Option<Result<(), u8>>,
+    }
+
+    impl Operation for CommitDeadline {
+        type Output = ();
+        type Error = u8;
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: self.txn_id,
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            if matches!(
+                event,
+                Event::Storage(StorageEvent::TransactionCommitted { .. })
+            ) {
+                self.state = 2;
+                return smallvec::smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: "default".to_string(),
+                    key: ByteView::from(*b"after-commit"),
+                    txn_id: None,
+                })];
+            }
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.output.is_some()
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            // Mirrors the operations whose finalize assumes a terminal state.
+            self.output.expect("operation must set output")
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.output.get_or_insert(Err(self.state));
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_after_commit() {
+        // The commit suppresses the abort effects, so the driver still has to
+        // hand finalize a terminal operation instead of an unset output.
+        let (_directory, context) = test_context();
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("transaction starts");
+        };
+
+        let result = crate::driver::drive_until(
+            CommitDeadline {
+                state: 0,
+                txn_id,
+                output: None,
+            },
+            &context,
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+        assert_eq!(result, Err(2));
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct NestedTransactionOperation {
+        done: bool,
+    }
+
+    impl Operation for NestedTransactionOperation {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::SubOperation(boxed_suboperation(
+                MarkerAbortOperation {
+                    state: 0,
+                    fail: true,
+                    txn_id: None,
+                },
+                |_| Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth: 0 }),
+            ))]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.done = true;
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.done
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    fn pending_blob() -> Effect {
+        Effect::Blob(BlobEffect::SpoolHidden {
+            namespace: ulid::Ulid::from_bytes([9u8; 16]),
+            name: "nested-deadline".to_string(),
+            created_by: aruna_core::UserId::default(),
+            max_bytes: None,
+            deadline: None,
+            blob: aruna_core::stream::BackendStream::new(futures_util::stream::pending::<
+                Result<bytes::Bytes, aruna_core::stream::StreamError>,
+            >()),
+        })
+    }
+
+    #[derive(Debug)]
+    struct PendingTxn {
+        state: u8,
+        txn_id: Option<TxnId>,
+        commit: bool,
+        seen: Arc<Mutex<Option<TxnId>>>,
+        aborted: Arc<std::sync::atomic::AtomicBool>,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartialEq for PendingTxn {
+        fn eq(&self, other: &Self) -> bool {
+            self.state == other.state && self.txn_id == other.txn_id && self.commit == other.commit
+        }
+    }
+
+    impl Operation for PendingTxn {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.txn_id = Some(txn_id);
+                    *self.seen.lock().unwrap() = Some(txn_id);
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: "default".to_string(),
+                        key: ByteView::from(*b"nested-staged"),
+                        value: ByteView::from(*b"staged"),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) if self.commit => {
+                    self.state = 3;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: self.txn_id.expect("transaction id recorded"),
+                    })]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
+                    self.ready.notify_one();
+                    self.state = 4;
+                    smallvec::smallvec![pending_blob()]
+                }
+                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
+                    self.ready.notify_one();
+                    self.state = 4;
+                    smallvec::smallvec![pending_blob()]
+                }
+                (Event::Blob(_), 4) => {
+                    self.state = 5;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 5
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.state == 5)
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.state = 5;
+            smallvec::smallvec![]
+        }
+    }
+
+    #[derive(Debug)]
+    struct NestedDeadline {
+        commit: bool,
+        done: bool,
+        seen: Arc<Mutex<Option<TxnId>>>,
+        aborted: Arc<std::sync::atomic::AtomicBool>,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartialEq for NestedDeadline {
+        fn eq(&self, other: &Self) -> bool {
+            self.commit == other.commit && self.done == other.done
+        }
+    }
+
+    impl Operation for NestedDeadline {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::SubOperation(boxed_suboperation(
+                PendingTxn {
+                    state: 0,
+                    txn_id: None,
+                    commit: self.commit,
+                    seen: self.seen.clone(),
+                    aborted: self.aborted.clone(),
+                    ready: self.ready.clone(),
+                },
+                |_| Event::SubOperation(SubOperationEvent::NotificationsEmitted),
+            ))]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.done = true;
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.done
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.done = true;
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn subop_error_cleanup() {
+        let (_directory, context) = test_context();
+        let result = drive(NestedTransactionOperation { done: false }, &context).await;
+
+        assert!(result.is_ok());
+        assert!(marker_absent(&context).await);
+        assert_eq!(staged_value(&context).await, None);
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nested_deadline_cleanup() {
+        let (_directory, context) = blob_context().await;
+        let seen = Arc::new(Mutex::new(None));
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let operation = NestedDeadline {
+            commit: false,
+            done: false,
+            seen: seen.clone(),
+            aborted: aborted.clone(),
+            ready: ready.clone(),
+        };
+        // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
+        // fire the drive deadline, never a tied storage request timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(operation, &task_context, deadline).await
+        });
+
+        ready.notified().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert!(task.await.unwrap().is_ok());
+        // Real time again: auto-advance would fire the request timeouts of the
+        // storage roundtrips below before the worker thread can answer.
+        tokio::time::resume();
+        assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
+
+        let txn_id = seen.lock().unwrap().expect("child transaction recorded");
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionNotFound
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nested_commit_survives() {
+        let (_directory, context) = blob_context().await;
+        let seen = Arc::new(Mutex::new(None));
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let operation = NestedDeadline {
+            commit: true,
+            done: false,
+            seen: seen.clone(),
+            aborted: aborted.clone(),
+            ready: ready.clone(),
+        };
+        // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
+        // fire the drive deadline, never a tied storage request timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(operation, &task_context, deadline).await
+        });
+
+        ready.notified().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert!(task.await.unwrap().is_ok());
+        // Real time again: auto-advance would fire the request timeouts of the
+        // storage roundtrips below before the worker thread can answer.
+        tokio::time::resume();
+        assert!(!aborted.load(std::sync::atomic::Ordering::SeqCst));
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"nested-staged"),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event");
+        };
+        assert_eq!(value, Some(ByteView::from(*b"staged")));
+
+        let txn_id = seen.lock().unwrap().expect("child transaction recorded");
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionNotFound
+            })
+        ));
     }
 
     /// Never finishes on its own, so only the deadline can end it. The step cap
@@ -1236,29 +2889,44 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_suboperation_depth_limit_is_enforced() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+    #[test]
+    fn test_suboperation_depth_limit_is_enforced() {
+        // Driving to the depth limit nests deep futures; the default test
+        // thread stack overflows, so the drive runs on a dedicated big stack.
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let random_path = tempdir().unwrap();
+                    let storage_handle =
+                        storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+                    let context = DriverContext {
+                        storage_handle,
+                        net_handle: None,
+                        blob_handle: None,
+                        metadata_handle: None,
+                        task_handle: None,
+                        compute_handle: None,
+                    };
 
-        let event = drive(RecursiveSubOperation::new(), &context)
-            .await
-            .expect("recursive suboperation should resolve to depth-limit event");
+                    let event = drive(RecursiveSubOperation::new(), &context)
+                        .await
+                        .expect("recursive suboperation should resolve to depth-limit event");
 
-        assert!(matches!(
-            event,
-            Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth })
-                if max_depth == super::MAX_SUBOP_DEPTH
-        ));
+                    assert!(matches!(
+                        event,
+                        Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth })
+                            if max_depth == super::MAX_SUBOP_DEPTH
+                    ));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 

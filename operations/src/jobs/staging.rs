@@ -330,6 +330,7 @@ async fn stage_item(
                     quota_ceiling,
                     retry_key: Some(ctx.job_id.to_string()),
                     expected_bucket,
+                    restrictions: spec.auth_context.path_restrictions.clone(),
                 },
             )
             .await

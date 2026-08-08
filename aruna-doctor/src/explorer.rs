@@ -1,20 +1,21 @@
 use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
-use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
-    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
-    GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
+    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+    GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
     SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+    USER_ACCESS_OWNER_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
@@ -207,9 +208,6 @@ enum DecodedValue {
     },
     MultipartObjectPart {
         data: MultipartObjectPart,
-    },
-    ApiTokenRevocationList {
-        data: HashSet<String>,
     },
     ApiTrustedRealmsList {
         data: Vec<String>,
@@ -965,13 +963,14 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 31] {
+fn defined_keyspaces() -> [&'static str; 33] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
         BLOB_HEAD_KEYSPACE,
+        BLOB_HIDDEN_RESERVATION_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
         BLOB_VERSIONS_KEYSPACE,
         BUCKET_STATS_DB,
@@ -998,6 +997,7 @@ fn defined_keyspaces() -> [&'static str; 31] {
         SOURCE_CONNECTOR_SECRET_KEYSPACE,
         SYNC_PLACEMENT_KEYSPACE,
         USER_ACCESS_KEYSPACE,
+        USER_ACCESS_OWNER_KEYSPACE,
     ]
 }
 
@@ -1362,9 +1362,6 @@ fn decode_auth_value(value: &[u8]) -> DecodedValue {
 
 fn decode_api_state_value(key: &[u8], value: &[u8]) -> DecodedValue {
     match key {
-        TOKEN_REVOCATION_LIST_KEY => postcard::from_bytes::<HashSet<String>>(value)
-            .map(|data| DecodedValue::ApiTokenRevocationList { data })
-            .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
         TRUSTED_REALMS_LIST_KEY => postcard::from_bytes::<HashSet<RealmId>>(value)
             .map(|data| {
                 let mut data = data
@@ -1487,16 +1484,18 @@ mod tests {
     use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
-        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        BUCKET_STATS_DB, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
-        GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, DHT_KEYSPACE,
+        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
+        ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+        USER_ACCESS_OWNER_KEYSPACE,
     };
-    use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
+    use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         BucketReplicationConfig, BucketReplicationTarget, Group, HashPathIndexKey,
@@ -1647,6 +1646,7 @@ mod tests {
             API_STATE_KEYSPACE.to_string(),
             AUTH_KEYSPACE.to_string(),
             BLOB_HEAD_KEYSPACE.to_string(),
+            BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
             BLOB_LOCATIONS_KEYSPACE.to_string(),
             BLOB_VERSIONS_KEYSPACE.to_string(),
             BUCKET_STATS_DB.to_string(),
@@ -1672,6 +1672,7 @@ mod tests {
             SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
             SYNC_PLACEMENT_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
+            USER_ACCESS_OWNER_KEYSPACE.to_string(),
         ];
         expected_missing.sort();
         assert_eq!(missing, expected_missing);
@@ -1831,6 +1832,7 @@ mod tests {
             enrollment_id: Ulid::generate(),
             secret_hash: "hash123".to_string(),
             mode: OnboardingMode::Server,
+            purpose: OnboardingPurpose::NodeEnrollment,
             expires_at: 1234,
             claimed_node_id: None,
         };

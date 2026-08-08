@@ -41,6 +41,10 @@ pub fn group_owner_index_prefix(owner: UserId) -> Vec<u8> {
 pub struct GroupAuthorizationDocument {
     pub group_id: GroupId,
     pub roles: HashMap<RoleId, Role>,
+    /// Deny-only CEL request policies scoped to this group, evaluated after the
+    /// realm set. Either scope may deny; neither may grant.
+    #[serde(default)]
+    pub policies: Vec<crate::request_policy::RequestPolicy>,
 }
 
 impl GroupAuthorizationDocument {
@@ -103,7 +107,11 @@ impl GroupAuthorizationDocument {
                 ]),
             },
         );
-        GroupAuthorizationDocument { group_id, roles }
+        GroupAuthorizationDocument {
+            group_id,
+            roles,
+            policies: Vec::new(),
+        }
     }
 
     pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {

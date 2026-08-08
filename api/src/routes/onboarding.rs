@@ -3,15 +3,15 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
-    CreateOnboardingSecretResponse, OnboardingMode, OnboardingSecret, OnboardingSecretRecord,
-    OnboardingSecretState, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+    CreateOnboardingSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
+    OnboardingSecretRecord, OnboardingSecretState, bootstrap_issuer_proof_message,
+    bootstrap_node_proof_message,
 };
 use aruna_core::structs::{AuthContext, NodeCapabilities, Permission};
 use aruna_operations::bootstrap_onboarding_finalize::{
     BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
     bootstrap_onboarding_finalize,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::consume_onboarding_secret::ConsumeOnboardingSecretError;
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -146,19 +146,15 @@ async fn authorize_onboarding_admin(
         return Err(ServerError::Forbidden);
     }
 
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: format!("/{realm_id}/admin/onboarding"),
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    // Route through the single authorization boundary so realm and group
+    // request policies also constrain onboarding administration.
+    crate::auth::ensure_permission(
+        state,
+        &auth,
+        format!("/{realm_id}/admin/onboarding"),
+        Permission::WRITE,
     )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
+    .await?;
 
     Ok(auth)
 }
@@ -221,6 +217,8 @@ pub async fn create_onboarding_secret(
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
         mode: request.mode,
+        realm_id: state.get_realm_id(),
+        purpose: OnboardingPurpose::NodeEnrollment,
     };
     let encoded_secret = onboarding_secret
         .encode()
@@ -229,6 +227,7 @@ pub async fn create_onboarding_secret(
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
         mode: onboarding_secret.mode,
+        purpose: OnboardingPurpose::NodeEnrollment,
         expires_at,
         claimed_node_id: None,
     };
@@ -350,6 +349,12 @@ pub async fn bootstrap_onboarding(
     )
     .await
     .map_err(map_inspect_error)?;
+
+    // Only node-enrollment secrets may bootstrap a node; an initial-admin
+    // secret is rejected here before any reserve or consume.
+    if record.purpose != OnboardingPurpose::NodeEnrollment {
+        return Err(ServerError::Forbidden);
+    }
 
     match record.mode {
         OnboardingMode::Server => {
@@ -602,7 +607,8 @@ mod tests {
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
-        OnboardingSecretRecord, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+        OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord, OnboardingSecretState,
+        bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{
@@ -844,6 +850,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_rejects_secret() {
+        // An initial-administrator secret must not onboard a node or be consumed.
+        let (state, realm_id, _seed, _user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+
+        let enrollment_id = Ulid::generate();
+        let secret = OnboardingSecret {
+            seed_url: "http://127.0.0.1:3000".to_string(),
+            enrollment_id,
+            secret: [11u8; 32],
+            mode: OnboardingMode::Local,
+            realm_id,
+            purpose: OnboardingPurpose::InitialAdministrator,
+        };
+        drive(
+            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+                record: OnboardingSecretRecord {
+                    enrollment_id,
+                    secret_hash: secret.secret_hash(),
+                    mode: OnboardingMode::Local,
+                    purpose: OnboardingPurpose::InitialAdministrator,
+                    expires_at: u64::MAX,
+                    claimed_node_id: None,
+                },
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let encoded = secret.encode().unwrap();
+        let node_proof = SigningKey::from_bytes(&[9u8; 32]);
+        let bootstrap_node_id = iroh::SecretKey::from_bytes(&node_proof.to_bytes()).public();
+        let node_id = bootstrap_node_id.to_string();
+        let node_signature = node_proof
+            .sign(&bootstrap_node_proof_message(&encoded, &node_id, None))
+            .to_string();
+
+        let result = bootstrap_onboarding(
+            State(state.clone()),
+            Json(BootstrapOnboardingRequest {
+                onboarding_secret: encoded,
+                node_id,
+                node_proof: node_signature,
+                transport_public_key: None,
+                issuer_public_key: None,
+                issuer_proof: None,
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+
+        let entries = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+            .await
+            .unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.record.enrollment_id == enrollment_id)
+            .expect("secret still present");
+        assert!(matches!(entry.state, OnboardingSecretState::Available));
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn list_and_revoke_onboarding_secrets() {
         let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
@@ -914,6 +988,7 @@ mod tests {
                     enrollment_id: finalizing_id,
                     secret_hash: "finalizing".to_string(),
                     mode: OnboardingMode::Server,
+                    purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: 1,
                     claimed_node_id: None,
                 },
@@ -943,6 +1018,7 @@ mod tests {
                     enrollment_id: stale_id,
                     secret_hash: "stale".to_string(),
                     mode: OnboardingMode::Local,
+                    purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: 1,
                     claimed_node_id: None,
                 },

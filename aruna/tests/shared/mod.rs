@@ -956,12 +956,18 @@ async fn spawn_s3_server(
     let bind_addr = listener.local_addr()?;
     let address = bind_addr.to_string();
     let host = format!("localhost:{}", bind_addr.port());
+    let seal_key = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.credential_seal_key())
+        .unwrap_or_else(aruna_core::credential_seal::CredentialSealKey::random);
     let s3_server = S3Server::new(
         address.as_str(),
         host.clone(),
         context,
         realm_id,
         node_id,
+        seal_key,
         Default::default(),
         test_cors_config(),
         metrics,

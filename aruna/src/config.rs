@@ -85,7 +85,9 @@ pub struct Config {
     pub s3_host: String,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
+    pub rate_limits: RateLimitSettings,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
@@ -96,6 +98,31 @@ pub struct Config {
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
+}
+
+/// Operator-configurable request admission limits for the REST and S3 planes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimitSettings {
+    pub ip_per_minute: u32,
+    pub ip_burst: u32,
+    pub principal_per_minute: u32,
+    pub principal_burst: u32,
+    pub s3_max_connections: u32,
+    pub s3_max_requests: u32,
+}
+
+impl Default for RateLimitSettings {
+    fn default() -> Self {
+        // Mirrors the api-layer defaults: generous and identical for every caller.
+        Self {
+            ip_per_minute: 6_000,
+            ip_burst: 1_000,
+            principal_per_minute: 3_000,
+            principal_burst: 500,
+            s3_max_connections: 1_024,
+            s3_max_requests: 512,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,7 +403,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let s3_host = dotenvy::var("S3_HOST")?;
     let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
     let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
+    let trusted_proxies = trusted_proxies_env()?;
     let rocrate_limits = rocrate_limits_env()?;
+    let rate_limits = rate_limits_env()?;
     let s3_address = dotenvy::var("S3_ADDRESS")?;
     SocketAddr::from_str(&s3_address)?;
     let node_labels = parse_node_labels_env()?;
@@ -515,7 +544,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             s3_host,
             api_public_url,
             s3_public_url,
+            trusted_proxies,
             rocrate_limits,
+            rate_limits,
             s3_address,
             onboarding_secret,
             oidc_providers,
@@ -656,6 +687,21 @@ fn rocrate_limits_env() -> Result<RoCrateLimits, SetupError> {
     Ok(limits)
 }
 
+fn rate_limits_env() -> Result<RateLimitSettings, SetupError> {
+    let defaults = RateLimitSettings::default();
+    Ok(RateLimitSettings {
+        ip_per_minute: positive_u32_env("RATE_LIMIT_IP_PER_MINUTE", defaults.ip_per_minute)?,
+        ip_burst: positive_u32_env("RATE_LIMIT_IP_BURST", defaults.ip_burst)?,
+        principal_per_minute: positive_u32_env(
+            "RATE_LIMIT_PRINCIPAL_PER_MINUTE",
+            defaults.principal_per_minute,
+        )?,
+        principal_burst: positive_u32_env("RATE_LIMIT_PRINCIPAL_BURST", defaults.principal_burst)?,
+        s3_max_connections: positive_u32_env("S3_MAX_CONNECTIONS", defaults.s3_max_connections)?,
+        s3_max_requests: positive_u32_env("S3_MAX_CONCURRENT_REQUESTS", defaults.s3_max_requests)?,
+    })
+}
+
 fn portal_config_env() -> Result<PortalConfig, SetupError> {
     const MODE_KEY: &str = "PORTAL_MODE";
     let Some(mode) = dotenvy::var(MODE_KEY).ok() else {
@@ -704,6 +750,25 @@ fn required_nonempty_env(key: &'static str) -> Result<String, SetupError> {
         Ok(value) => Err(invalid_config_value(key, value, "must not be empty")),
         Err(_) => Err(SetupError::MissingConfigValue(key)),
     }
+}
+
+/// `TRUSTED_PROXIES` is a comma-separated list of CIDR networks or bare IPs
+/// whose `x-forwarded-*` headers the node honors. Empty trusts no proxy.
+fn trusted_proxies_env() -> Result<Vec<ipnet::IpNet>, SetupError> {
+    let Some(value) = optional_nonempty_env("TRUSTED_PROXIES")? else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .map_err(|error| invalid_config_value("TRUSTED_PROXIES", entry, error))
+        })
+        .collect()
 }
 
 fn optional_public_url_env(key: &'static str) -> Result<Option<String>, SetupError> {

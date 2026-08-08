@@ -1,28 +1,39 @@
-use crate::replicate_documents::replicate_documents_effect;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::UserId;
+use aruna_core::compute::Secret;
+use aruna_core::credential_seal::{CredentialSealKey, SealError, SealedS3Secret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::{PathRestriction, UserAccess};
 use aruna_core::types::{Effects, GroupId};
-use aruna_core::{NodeId, UserId};
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
 use smallvec::smallvec;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
+
+use super::access_index::{MAX_ACTIVE_CREDENTIALS, decode_index, encode_index, owner_key};
 
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateUserAccessState {
     Init,
-    CreateUserAccess(UserAccess),
-    ReplicateAccess,
+    StartTransaction,
+    ReadOwnerIndex,
+    ReadCredentials {
+        index: std::collections::BTreeSet<String>,
+        replace: bool,
+    },
+    DeleteStale {
+        index: std::collections::BTreeSet<String>,
+    },
+    WriteCredentials,
+    CommitTransaction,
     Finish,
     Error,
 }
@@ -33,6 +44,10 @@ pub enum CreateUserAccessError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    RestrictionLimit(#[from] RestrictionLimitError),
+    #[error(transparent)]
+    Seal(#[from] SealError),
     #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
     InvalidState {
         current: CreateUserAccessState,
@@ -46,6 +61,10 @@ pub enum CreateUserAccessError {
     },
     #[error("No user access found")]
     NotFound,
+    #[error("active credential limit reached")]
+    LimitReached,
+    #[error("credential owner index is inconsistent")]
+    IndexInconsistent,
     #[error("User access creation not finished")]
     NotFinished,
     #[error("User access creation failed")]
@@ -67,115 +86,302 @@ pub struct CreateUserAccessConfig {
 pub struct CreateUserAccessOperation {
     config: CreateUserAccessConfig,
     key_id: String,
+    seal_key: CredentialSealKey,
+    pending_secret: Option<Secret>,
+    access: Option<UserAccess>,
+    txn_id: Option<ulid::Ulid>,
     state: CreateUserAccessState,
-    output: Result<(String, UserAccess), CreateUserAccessError>,
+    output: Result<(String, Secret, UserAccess), CreateUserAccessError>,
 }
 
 impl CreateUserAccessOperation {
-    pub fn new(config: CreateUserAccessConfig) -> Self {
-        Self::new_with_key(config, Ulid::generate().to_string())
+    pub fn new(config: CreateUserAccessConfig, seal_key: CredentialSealKey) -> Self {
+        Self::new_with_key(config, Ulid::generate().to_string(), seal_key)
     }
 
-    pub fn new_with_key(config: CreateUserAccessConfig, key_id: String) -> Self {
+    pub fn new_with_key(
+        config: CreateUserAccessConfig,
+        key_id: String,
+        seal_key: CredentialSealKey,
+    ) -> Self {
         Self {
             config,
             key_id,
+            seal_key,
+            pending_secret: None,
+            access: None,
+            txn_id: None,
             state: CreateUserAccessState::Init,
             output: Err(CreateUserAccessError::NotFinished),
         }
     }
 
     fn handle_init(&mut self) -> Effects {
-        if let CreateUserAccessState::Init = self.state {
-            let access_key = match UserAccess::build_access_key(&self.key_id) {
-                Ok(access_key) => access_key,
-                Err(err) => return self.handle_error(err.into()),
-            };
-            let access = UserAccess {
-                access_key: access_key.clone(),
-                user_identity: self.config.user_identity,
-                group_id: self.config.group_id,
-                secret: rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(30)
-                    .map(char::from)
-                    .collect::<String>(),
-                expiry: self.config.expiry,
-                path_restrictions: self.config.path_restrictions.clone(),
-                issued_by: self.config.issued_by,
-                revoked_at: None,
-            };
-            let bytes = match access.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.handle_error(err.into()),
-            };
-
-            self.state = CreateUserAccessState::CreateUserAccess(access);
-            smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: USER_ACCESS_KEYSPACE.to_string(),
-                key: access_key.as_bytes().into(),
-                value: bytes.into(),
-                txn_id: None,
-            })]
-        } else {
-            self.abort()
+        if !matches!(self.state, CreateUserAccessState::Init) {
+            return self.abort();
         }
+        if let Some(restrictions) = self.config.path_restrictions.as_deref()
+            && let Err(err) = validate_restriction_limits(restrictions)
+        {
+            return self.handle_error(err.into());
+        }
+        let access_key = match UserAccess::build_access_key(&self.key_id) {
+            Ok(access_key) => access_key,
+            Err(err) => return self.handle_error(err.into()),
+        };
+        let plaintext = rng()
+            .sample_iter(&Alphanumeric)
+            .take(30)
+            .map(char::from)
+            .collect::<String>();
+        let mut access = UserAccess {
+            access_key,
+            user_identity: self.config.user_identity,
+            group_id: self.config.group_id,
+            secret: SealedS3Secret::empty(),
+            expiry: self.config.expiry,
+            path_restrictions: self.config.path_restrictions.clone(),
+            issued_by: self.config.issued_by,
+            revoked_at: None,
+        };
+        if let Err(err) = access.seal_secret(&self.seal_key, &plaintext) {
+            return self.handle_error(err.into());
+        }
+
+        self.pending_secret = Some(Secret::new(plaintext));
+        self.access = Some(access);
+        self.state = CreateUserAccessState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false,
+        })]
     }
 
-    fn handle_user_access_created(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { key }) = event else {
+    fn handle_started(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.handle_error(CreateUserAccessError::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
+                expected: "Event::Storage(StorageEvent::TransactionStarted)",
+                received: event,
+            });
+        };
+        self.txn_id = Some(txn_id);
+        self.state = CreateUserAccessState::ReadOwnerIndex;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
+            key: owner_key(self.config.user_identity),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_index(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.handle_error(CreateUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let index = match decode_index(value.as_ref()) {
+            Ok(index) => index,
+            Err(error) => return self.handle_error(error.into()),
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+        };
+        let Some(new_access) = self.access.as_ref() else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+        };
+        let replace = index.contains(&new_access.access_key);
+        let mut reads: Vec<_> = index
+            .iter()
+            .map(|access_key| {
+                (
+                    USER_ACCESS_KEYSPACE.to_string(),
+                    access_key.as_bytes().into(),
+                )
+            })
+            .collect();
+        if !replace {
+            reads.push((
+                USER_ACCESS_KEYSPACE.to_string(),
+                new_access.access_key.as_bytes().into(),
+            ));
+        }
+        self.state = CreateUserAccessState::ReadCredentials { index, replace };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_credentials(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+        replace: bool,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.handle_error(CreateUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        if values.len() != index.len() + usize::from(!replace) {
+            return self.handle_error(CreateUserAccessError::IndexInconsistent);
+        }
+
+        let Some(new_access) = self.access.as_ref() else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+        };
+        let now = SystemTime::now();
+        let mut active = std::collections::BTreeSet::new();
+        let mut stale = Vec::new();
+        for (key, value) in values {
+            if !replace && key.as_ref() == new_access.access_key.as_bytes() {
+                if value.is_some() {
+                    return self.handle_error(CreateUserAccessError::IndexInconsistent);
+                }
+                continue;
+            }
+            let Some(value) = value else {
+                return self.handle_error(CreateUserAccessError::IndexInconsistent);
+            };
+            let access = match UserAccess::from_bytes(value.as_ref()) {
+                Ok(access) => access,
+                Err(error) => return self.handle_error(error.into()),
+            };
+            if access.user_identity != self.config.user_identity
+                || access.access_key.as_bytes() != key.as_ref()
+                || !index.contains(&access.access_key)
+            {
+                return self.handle_error(CreateUserAccessError::IndexInconsistent);
+            }
+            let stale_record = access.is_revoked() || access.is_expired(now);
+            if replace && access.access_key == new_access.access_key && !stale_record {
+                return self.handle_error(CreateUserAccessError::IndexInconsistent);
+            }
+            if !stale_record {
+                active.insert(access.access_key);
+            } else {
+                stale.push(access.access_key);
+            }
+        }
+        if active.len() >= MAX_ACTIVE_CREDENTIALS {
+            return self.handle_error(CreateUserAccessError::LimitReached);
+        }
+        active.insert(new_access.access_key.clone());
+        if !stale.is_empty() {
+            let Some(txn_id) = self.txn_id else {
+                return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+            };
+            self.state = CreateUserAccessState::DeleteStale { index: active };
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes: stale
+                    .into_iter()
+                    .map(|access_key| {
+                        (
+                            USER_ACCESS_KEYSPACE.to_string(),
+                            access_key.as_bytes().into(),
+                        )
+                    })
+                    .collect(),
+                txn_id: Some(txn_id),
+            })];
+        }
+        self.write_credentials(active)
+    }
+
+    fn handle_stale_deleted(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.handle_error(CreateUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                received: event,
+            });
+        };
+        self.write_credentials(index)
+    }
+
+    fn write_credentials(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+        };
+        let Some(access) = self.access.as_ref() else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+        };
+        let bytes = match access.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => return self.handle_error(err.into()),
+        };
+        let index_value = match encode_index(&index) {
+            Ok(value) => value,
+            Err(err) => return self.handle_error(err.into()),
+        };
+        self.state = CreateUserAccessState::WriteCredentials;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![
+                (
+                    USER_ACCESS_KEYSPACE.to_string(),
+                    access.access_key.as_bytes().into(),
+                    bytes.into(),
+                ),
+                (
+                    USER_ACCESS_OWNER_KEYSPACE.to_string(),
+                    owner_key(self.config.user_identity),
+                    index_value,
+                ),
+            ],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.handle_error(CreateUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
                 received: event,
             });
         };
 
-        let CreateUserAccessState::CreateUserAccess(access) = &self.state else {
-            return self.handle_error(CreateUserAccessError::InvalidState {
-                current: self.state.clone(),
-                expected: "CreateUserAccessState::CreateUserAccess(..)".to_string(),
-            });
+        let Some(access) = self.access.clone() else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
         };
+        let Some(secret) = self.pending_secret.take() else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+        };
+        self.output = Ok((access.access_key.clone(), secret, access));
+        let Some(txn_id) = self.txn_id else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+        };
+        self.state = CreateUserAccessState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
 
-        let access_key = match String::from_utf8(key.to_vec()) {
-            Ok(access_key) => access_key,
-            Err(err) => {
-                return self.handle_error(CreateUserAccessError::ConversionError(err.into()));
+    fn handle_committed(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                self.txn_id = None;
+                self.state = CreateUserAccessState::Finish;
+                smallvec![]
             }
-        };
-        self.output = Ok((access_key.clone(), access.clone()));
-        self.replicate_access(access_key)
-    }
-
-    /// Queues realm-wide replication of the committed credential so the same
-    /// access key authenticates on every realm node. A malformed issuer id
-    /// (never produced by a real node) skips replication rather than panicking.
-    fn replicate_access(&mut self, access_key: String) -> Effects {
-        let realm_id = self.config.user_identity.realm_id;
-        let Ok(local_node_id) = NodeId::from_bytes(&self.config.issued_by) else {
-            self.state = CreateUserAccessState::Finish;
-            return smallvec![];
-        };
-        self.state = CreateUserAccessState::ReplicateAccess;
-        smallvec![replicate_documents_effect(
-            realm_id,
-            local_node_id,
-            vec![DocumentSyncTarget::UserAccess {
-                realm_id,
-                access_key,
-            }],
-        )]
-    }
-
-    fn handle_access_replicated(&mut self, event: Event) -> Effects {
-        if let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event
-            && let Err(error) = result
-        {
-            warn!(%error, "user access replication failed; credential stored locally");
+            Event::Storage(StorageEvent::Error { error }) => {
+                if !matches!(&error, &StorageError::QueueFull) {
+                    self.txn_id = None;
+                }
+                self.handle_error(error.into())
+            }
+            other => self.handle_error(CreateUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
+                received: other,
+            }),
         }
-        self.state = CreateUserAccessState::Finish;
-        smallvec![]
     }
 
     pub fn handle_error(&mut self, error: CreateUserAccessError) -> Effects {
@@ -186,7 +392,7 @@ impl CreateUserAccessOperation {
 }
 
 impl Operation for CreateUserAccessOperation {
-    type Output = Result<(String, UserAccess), CreateUserAccessError>;
+    type Output = Result<(String, Secret, UserAccess), CreateUserAccessError>;
     type Error = CreateUserAccessError;
 
     fn start(&mut self) -> Effects {
@@ -196,8 +402,16 @@ impl Operation for CreateUserAccessOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CreateUserAccessState::Init => self.handle_init(),
-            CreateUserAccessState::CreateUserAccess(_) => self.handle_user_access_created(event),
-            CreateUserAccessState::ReplicateAccess => self.handle_access_replicated(event),
+            CreateUserAccessState::StartTransaction => self.handle_started(event),
+            CreateUserAccessState::ReadOwnerIndex => self.handle_index(event),
+            CreateUserAccessState::ReadCredentials { ref index, replace } => {
+                self.handle_credentials(event, index.clone(), replace)
+            }
+            CreateUserAccessState::DeleteStale { ref index } => {
+                self.handle_stale_deleted(event, index.clone())
+            }
+            CreateUserAccessState::WriteCredentials => self.handle_written(event),
+            CreateUserAccessState::CommitTransaction => self.handle_committed(event),
             CreateUserAccessState::Finish => smallvec![],
             CreateUserAccessState::Error => self.abort(),
         }
@@ -219,26 +433,25 @@ impl Operation for CreateUserAccessOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        let Ok((access_key, _)) = self.output.as_ref() else {
-            return smallvec![];
-        };
-        let access_key = access_key.clone();
-
-        self.output = Err(CreateUserAccessError::CreateUserAccessAborted);
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: USER_ACCESS_KEYSPACE.to_string(),
-            key: access_key.as_bytes().into(),
-            txn_id: None,
-        })]
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::access_index::owner_key;
 
     fn test_issuer() -> [u8; 32] {
         *iroh::SecretKey::from_bytes(&[9u8; 32]).public().as_bytes()
+    }
+
+    fn test_seal_key() -> CredentialSealKey {
+        CredentialSealKey::derive(&[9u8; 32])
     }
 
     fn make_config(user_identity: UserId, group_id: GroupId) -> CreateUserAccessConfig {
@@ -259,87 +472,268 @@ mod tests {
     fn test_create_user_access_happy_path() {
         let user_identity = make_user_identity();
         let group_id = Ulid::generate();
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
+        let mut op =
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
 
-        // 1. Start -> Should transition to CreateUserAccess and emit Storage::Write
+        // Start opens the transaction before the owner index is checked.
         let effects = op.start();
         assert_eq!(effects.len(), 1);
+        assert_eq!(op.state, CreateUserAccessState::StartTransaction);
         assert!(matches!(
-            op.state,
-            CreateUserAccessState::CreateUserAccess(_)
+            effects[0],
+            Effect::Storage(StorageEffect::StartTransaction { read: false })
         ));
 
-        let Effect::Storage(StorageEffect::Write {
+        let txn_id = Ulid::generate();
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let Effect::Storage(StorageEffect::Read {
             key_space,
-            key,
-            value: _,
-            txn_id: None,
+            txn_id: Some(read_txn),
+            ..
         }) = &effects[0]
         else {
-            panic!("Expected Storage::Write effect");
+            panic!("Expected owner index read");
         };
-        assert_eq!(key_space, USER_ACCESS_KEYSPACE);
+        assert_eq!(key_space, aruna_core::keyspaces::USER_ACCESS_OWNER_KEYSPACE);
+        assert_eq!(*read_txn, txn_id);
 
-        // Verify the stored access matches the user identity and group
-        let CreateUserAccessState::CreateUserAccess(ref access) = op.state else {
-            panic!("Expected CreateUserAccess state");
+        let Some(access) = op.access.as_ref() else {
+            panic!("Expected generated access");
         };
         assert_eq!(access.user_identity, user_identity);
         assert_eq!(access.group_id, group_id);
-        assert_eq!(access.secret.len(), 30);
+        assert_eq!(access.open_secret(&test_seal_key()).unwrap().len(), 30);
         assert_eq!(access.path_restrictions, None);
         assert_eq!(access.issued_by, test_issuer());
         assert_eq!(access.revoked_at, None);
 
-        // 2. Feed WriteResult -> replicates the credential realm-wide
-        let write_key = key.clone();
-        let event = Event::Storage(StorageEvent::WriteResult { key: write_key });
-        let effects = op.step(event);
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(effects[0], Effect::SubOperation(_)));
-        assert_eq!(op.state, CreateUserAccessState::ReplicateAccess);
-
-        // 3. Replication result -> Finish
-        let effects = op.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-            result: Ok(()),
+        // An empty index still probes the fresh key for a collision in the txn.
+        let access_key = access.access_key.clone();
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: owner_key(user_identity),
+            value: None,
         }));
-        assert_eq!(effects.len(), 0);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(id), .. })] if *id == txn_id
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(access_key.as_bytes().into(), None)],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })] if *id == txn_id
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(effects.is_empty());
         assert_eq!(op.state, CreateUserAccessState::Finish);
         assert!(op.is_complete());
 
-        // 4. Finalize -> Should return Ok with (String, UserAccess)
+        // 4. Finalize -> Should return Ok with (access_key, plaintext, UserAccess)
         let result = op.finalize();
         assert!(result.is_ok());
         let inner = result.unwrap();
         assert!(inner.is_ok());
-        let (access_key, returned_access) = inner.unwrap();
+        let (access_key, plaintext, returned_access) = inner.unwrap();
         assert_eq!(returned_access.user_identity, user_identity);
         assert_eq!(returned_access.group_id, group_id);
         assert_eq!(returned_access.access_key, access_key);
+        // The one-time plaintext opens the stored ciphertext on the issuing key.
+        assert_eq!(
+            returned_access.open_secret(&test_seal_key()).unwrap(),
+            plaintext.expose()
+        );
     }
 
     #[test]
-    fn test_create_user_access_invalid_steps() {
+    fn replaces_stale() {
+        let user_identity = make_user_identity();
+        let stale_key = "newkey".to_string();
+        let mut op = CreateUserAccessOperation::new_with_key(
+            make_config(user_identity, Ulid::generate()),
+            "newkey".to_string(),
+            test_seal_key(),
+        );
+        op.start();
+        let txn_id = Ulid::generate();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: owner_key(user_identity),
+            value: Some(
+                encode_index(&std::collections::BTreeSet::from([stale_key.clone()])).unwrap(),
+            ),
+        }));
+        let stale = UserAccess {
+            access_key: stale_key.clone(),
+            user_identity,
+            group_id: Ulid::generate(),
+            secret: SealedS3Secret::empty(),
+            expiry: SystemTime::UNIX_EPOCH,
+            path_restrictions: None,
+            issued_by: test_issuer(),
+            revoked_at: None,
+        };
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(
+                stale_key.clone().into(),
+                Some(stale.to_bytes().unwrap().into()),
+            )],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id: Some(id) })]
+                if *id == txn_id && deletes.len() == 1
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })]
+                if *id == txn_id
+        ));
+    }
+
+    #[test]
+    fn rejects_active_collision() {
+        let user_identity = make_user_identity();
+        let mut op = CreateUserAccessOperation::new_with_key(
+            make_config(user_identity, Ulid::generate()),
+            "newkey".to_string(),
+            test_seal_key(),
+        );
+        op.start();
+        let txn_id = Ulid::generate();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: owner_key(user_identity),
+            value: Some(
+                encode_index(&std::collections::BTreeSet::from(["newkey".to_string()])).unwrap(),
+            ),
+        }));
+        let access = UserAccess {
+            access_key: "newkey".to_string(),
+            user_identity,
+            group_id: Ulid::generate(),
+            secret: SealedS3Secret::empty(),
+            expiry: SystemTime::now() + Duration::from_secs(60),
+            path_restrictions: None,
+            issued_by: test_issuer(),
+            revoked_at: None,
+        };
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(
+                "newkey".to_string().into(),
+                Some(access.to_bytes().unwrap().into()),
+            )],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })]
+                if *id == txn_id
+        ));
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            CreateUserAccessError::IndexInconsistent
+        ));
+    }
+
+    #[test]
+    fn rejects_full_index() {
+        let user_identity = make_user_identity();
+        let keys = (0..MAX_ACTIVE_CREDENTIALS)
+            .map(|index| format!("key{index}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut op = CreateUserAccessOperation::new_with_key(
+            make_config(user_identity, Ulid::generate()),
+            "newkey".to_string(),
+            test_seal_key(),
+        );
+        op.start();
+        let txn_id = Ulid::generate();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: owner_key(user_identity),
+            value: Some(encode_index(&keys).unwrap()),
+        }));
+        let mut values = keys
+            .iter()
+            .map(|key| {
+                let access = UserAccess {
+                    access_key: key.clone(),
+                    user_identity,
+                    group_id: Ulid::generate(),
+                    secret: SealedS3Secret::empty(),
+                    expiry: SystemTime::now() + Duration::from_secs(60),
+                    path_restrictions: None,
+                    issued_by: test_issuer(),
+                    revoked_at: None,
+                };
+                (key.clone().into(), Some(access.to_bytes().unwrap().into()))
+            })
+            .collect::<Vec<_>>();
+        values.push(("newkey".to_string().into(), None));
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+        ));
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            CreateUserAccessError::LimitReached
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_restrictions() {
+        // Over the cap the operation fails with no storage write emitted.
+        use aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS;
+        use aruna_core::structs::Permission;
+        let restrictions = (0..=MAX_TOKEN_RESTRICTIONS)
+            .map(|index| PathRestriction {
+                pattern: format!("/r/{index}/**"),
+                permission: Permission::READ,
+            })
+            .collect::<Vec<_>>();
+        let mut config = make_config(make_user_identity(), Ulid::generate());
+        config.path_restrictions = Some(restrictions);
+        let mut op = CreateUserAccessOperation::new(config, test_seal_key());
+
+        let effects = op.start();
+        assert!(effects.is_empty());
+        assert_eq!(op.state, CreateUserAccessState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            CreateUserAccessError::RestrictionLimit(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_steps() {
         let user_identity = make_user_identity();
         let group_id = Ulid::generate();
 
-        // 1. Invalid state: start twice -> second start calls abort since state is not Init
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
+        // Starting twice does not bypass the transaction state.
+        let mut op =
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
         op.start();
-        // State is now CreateUserAccess; calling start again calls handle_init which calls abort.
-        // abort returns empty effects (output is still Err since WriteResult not yet received).
         let effects = op.start();
         assert!(effects.is_empty());
-        // State remains CreateUserAccess (abort only transitions to Error when output is Ok)
-        assert!(matches!(
-            op.state,
-            CreateUserAccessState::CreateUserAccess(_)
-        ));
+        assert_eq!(op.state, CreateUserAccessState::StartTransaction);
 
-        // 2. Invalid event at CreateUserAccess state (wrong event type)
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
+        // A wrong event aborts the open transaction and fails closed.
+        let mut op =
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
         op.start();
-        // Feed a ReadResult instead of WriteResult
         let key = Ulid::generate().to_bytes().into();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key,

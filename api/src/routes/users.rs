@@ -1,10 +1,11 @@
-use crate::auth::{OidcIdentity, bearer_token};
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
-use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
+use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, Role, User,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
+    Role, User,
 };
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
@@ -462,6 +463,9 @@ async fn register_admin(
 ) -> Result<User, ServerError> {
     let onboarding_secret =
         OnboardingSecret::decode(&onboarding_secret).map_err(|_| ServerError::Unauthorized)?;
+    if onboarding_secret.realm_id != state.get_realm_id() {
+        return Err(ServerError::Unauthorized);
+    }
     let secret_hash = onboarding_secret.secret_hash();
     let inspected = drive(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
@@ -474,7 +478,7 @@ async fn register_admin(
     )
     .await
     .map_err(map_inspect_onboarding_error)?;
-    if inspected.mode != OnboardingMode::Local {
+    if inspected.purpose != OnboardingPurpose::InitialAdministrator {
         return Err(ServerError::Forbidden);
     }
 
@@ -737,6 +741,14 @@ async fn list_users(
         .limit
         .unwrap_or(DEFAULT_LIST_USERS_LIMIT)
         .clamp(1, MAX_LIST_USERS_LIMIT);
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/**"),
+        Permission::READ,
+    )
+    .await?;
+
     let output = drive(
         ListUsersOperation::new(ListUsersInput {
             auth_context: auth,
@@ -777,7 +789,8 @@ async fn list_users(
     responses(
         (status = 200, description = "Matching users", body = SearchUsersResponse),
         (status = 400, description = "Query too short", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -802,6 +815,13 @@ async fn search_users(
     if let Some(start_after) = &query.start_after {
         UserId::from_string(start_after).map_err(|_| ServerError::BadRequest)?;
     }
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/**"),
+        Permission::READ,
+    )
+    .await?;
 
     let output = drive(
         SearchUsersOperation::new(SearchUsersInput {
@@ -862,6 +882,13 @@ async fn resolve_users(
         .iter()
         .map(|user_id| UserId::from_string(user_id).map_err(|_| ServerError::BadRequest))
         .collect::<ServerResult<Vec<_>>>()?;
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/**"),
+        Permission::READ,
+    )
+    .await?;
 
     let output = drive(
         ResolveUsersOperation::new(ResolveUsersInput { realm_id, user_ids }),
@@ -911,6 +938,14 @@ async fn get_user(
         // TODO: Forwarding for foreign realm users
         return Err(ServerError::Unimplemented);
     }
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/{user_id}"),
+        Permission::READ,
+    )
+    .await?;
+
     let user = drive(
         GetUserOperation::new(GetUserInput {
             auth_context: auth,
@@ -954,6 +989,19 @@ async fn update_user(
     let realm_id = state.get_realm_id();
     if auth.realm_id != realm_id {
         return Err(ServerError::Forbidden);
+    }
+
+    // A non-self update is a privileged write; run the realm policy and RBAC
+    // boundary at the route before the operation repeats it as defense in depth.
+    let target_user_id = UserId::from_string(&user_id).map_err(|_| ServerError::BadRequest)?;
+    if auth.user_id != target_user_id {
+        ensure_permission(
+            &state,
+            &auth,
+            format!("/{realm_id}/admin/u/{target_user_id}"),
+            Permission::WRITE,
+        )
+        .await?;
     }
 
     let user = drive(
@@ -1006,7 +1054,9 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
-    use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSecretRecord};
+    use aruna_core::onboarding::{
+        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
+    };
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission,
         RealmConfigDocument, RealmId, TokenClaims, User, oidc_subject_key,
@@ -1402,6 +1452,8 @@ mod tests {
             enrollment_id: Ulid::generate(),
             secret: [7u8; 32],
             mode: OnboardingMode::Local,
+            realm_id: node.realm_id,
+            purpose: OnboardingPurpose::InitialAdministrator,
         };
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
@@ -1409,6 +1461,7 @@ mod tests {
                     enrollment_id: onboarding_secret.enrollment_id,
                     secret_hash: onboarding_secret.secret_hash(),
                     mode: OnboardingMode::Local,
+                    purpose: OnboardingPurpose::InitialAdministrator,
                     expires_at: u64::MAX,
                     claimed_node_id: None,
                 },
@@ -1570,6 +1623,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_denies_update() {
+        // A realm deny-writes policy must block a non-self update at the route,
+        // even though the admin holds the RBAC write the operation would accept.
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+
+        let (target, _target_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-target",
+            "Target Bob",
+            None,
+        )
+        .await;
+        let admin = aruna_core::structs::AuthContext {
+            user_id: node.realm_admin_id,
+            realm_id: node.realm_id,
+            path_restrictions: None,
+        };
+
+        let rename = |name: &str| super::UpdateUserRequest {
+            name: Some(name.to_string()),
+            set_attributes: Default::default(),
+            remove_attributes: Default::default(),
+        };
+
+        let allowed = super::update_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+            axum::Json(rename("FirstRename")),
+        )
+        .await;
+        assert!(matches!(allowed, Ok((StatusCode::OK, _))));
+
+        install_deny_policy(&node, "permission == 'write'").await;
+
+        let denied = super::update_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+            axum::Json(rename("SecondRename")),
+        )
+        .await;
+        assert!(matches!(denied, Err(crate::error::ServerError::Forbidden)));
+
+        let fetched = super::get_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin)),
+            axum::extract::Path(target.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.1.0.name, "FirstRename");
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    async fn install_deny_policy(node: &TestNode, expression: &str) {
+        let mut config = read_realm_config(node.context.as_ref(), &node.realm_id).await;
+        config
+            .request_policies
+            .push(aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "deny".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: expression.to_string(),
+                enabled: true,
+            });
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: node.realm_admin_id,
+            realm_id: node.realm_id,
+        };
+        let bytes = config.to_bytes(&actor).unwrap();
+        let _ = node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(node.realm_id.as_bytes().to_vec()),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn policy_denies_reads() {
+        // A realm deny-reads policy must block both admin user reads at the
+        // route, though RBAC alone would let the realm admin through.
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+
+        let (target, _target_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-read",
+            "Target Bob",
+            None,
+        )
+        .await;
+        let admin = aruna_core::structs::AuthContext {
+            user_id: node.realm_admin_id,
+            realm_id: node.realm_id,
+            path_restrictions: None,
+        };
+        let query = || {
+            axum::extract::Query(super::ListUsersQuery {
+                limit: None,
+                start_after: None,
+            })
+        };
+
+        let fetched = super::get_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+        )
+        .await
+        .expect("the realm admin may read a user");
+        assert_eq!(fetched.1.0.name, "Target Bob");
+        let listed = super::list_users(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            query(),
+        )
+        .await
+        .expect("the realm admin may list users");
+        assert!(!listed.1.0.users.is_empty());
+
+        install_deny_policy(&node, "permission == 'read'").await;
+
+        let denied_get = super::get_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+        )
+        .await;
+        assert!(matches!(
+            denied_get,
+            Err(crate::error::ServerError::Forbidden)
+        ));
+        let denied_list = super::list_users(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin)),
+            query(),
+        )
+        .await;
+        assert!(matches!(
+            denied_list,
+            Err(crate::error::ServerError::Forbidden)
+        ));
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
     async fn get_user_requires_authentication() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
@@ -1634,6 +1860,30 @@ mod tests {
         {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected foreign user write result: {other:?}"),
+        }
+        // Revocation lookup is fail-closed against the issuing realm, so the
+        // foreign config must exist for the request to reach the route.
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(foreign_realm_id.as_bytes().to_vec()),
+                value: ByteView::from(
+                    RealmConfigDocument::default_for_realm(foreign_realm_id, Vec::new())
+                        .to_bytes(&Actor {
+                            node_id: node.net.node_id(),
+                            user_id: foreign_user_id,
+                            realm_id: foreign_realm_id,
+                        })
+                        .unwrap(),
+                ),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected foreign realm config write result: {other:?}"),
         }
         let token = drive(
             CreateTokenOperation::new(CreateTokenConfig {
@@ -1866,6 +2116,20 @@ mod resolve_tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn requires_directory_read() {
+        // A realm member without the admin user directory grant may not resolve.
+        let (state, _tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let result = resolve_users(
+            State(state),
+            Extension(Some(realm_auth(realm_id))),
+            Json(ResolveUsersRequest { user_ids: vec![] }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
     }
 
     #[tokio::test]
