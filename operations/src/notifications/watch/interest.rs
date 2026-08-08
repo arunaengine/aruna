@@ -751,10 +751,10 @@ async fn iter_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, RealmNodeKind,
-        WatchEventKind, WatchEventMask, WatchInterestEntry,
+        Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId,
+        RealmNodeKind, WatchEventKind, WatchEventMask, WatchInterestEntry,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -861,20 +861,35 @@ mod tests {
             .unwrap()
             .assigned_users
             .extend(readers.iter().copied());
-        for (key, value) in [
+        // Policy loading resolves the group record before group policies apply.
+        let group = Group {
+            display_name: "watch".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        for (key_space, key, value) in [
             (
+                AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
                 realm_auth.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 group_id.to_bytes().to_vec(),
                 group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
             ),
         ] {
             assert!(matches!(
                 ctx.storage_handle
                     .send_storage_effect(StorageEffect::Write {
-                        key_space: AUTH_KEYSPACE.to_string(),
+                        key_space: key_space.to_string(),
                         key: key.into(),
                         value: value.into(),
                         txn_id: None,

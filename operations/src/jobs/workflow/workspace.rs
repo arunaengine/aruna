@@ -1090,9 +1090,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_ACCESS_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
+    };
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, JobId, JobPayload, RealmAuthorizationDocument, RealmId,
+        Actor, Group, GroupAuthorizationDocument, JobId, JobPayload, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -1201,19 +1204,40 @@ mod tests {
         let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         let group_doc =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, spec.group_id);
-        for (key, value) in [
+        // Policy loading fails closed without the realm config and group record.
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        let group = Group {
+            display_name: "workspace".to_string(),
+            group_id: spec.group_id,
+            realm_id,
+            roles: group_doc.roles.keys().copied().collect(),
+            owner: user_id,
+        };
+        for (key_space, key, value) in [
             (
+                AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
                 realm_doc.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 spec.group_id.to_bytes().to_vec(),
                 group_doc.to_bytes(&actor).unwrap(),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_config.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                spec.group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
             ),
         ] {
             let _ = storage
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: AUTH_KEYSPACE.to_string(),
+                    key_space: key_space.to_string(),
                     key: key.into(),
                     value: value.into(),
                     txn_id: None,

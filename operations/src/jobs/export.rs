@@ -2915,7 +2915,8 @@ mod tests {
     use aruna_blob::blob::{BlobHandle, BlobHandler};
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, AuthContext, Backend, BackendConfig, BackendRef, BlobLocationKey,
@@ -3060,6 +3061,14 @@ mod tests {
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        // Policy loading resolves the group record before group policies apply.
+        let group = aruna_core::structs::Group {
+            display_name: "export".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
         let bucket = BucketInfo {
             group_id,
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -3092,6 +3101,11 @@ mod tests {
                 AUTH_KEYSPACE.to_string(),
                 group_id.to_bytes().to_vec().into(),
                 group_auth.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                GROUP_KEYSPACE.to_string(),
+                group_id.to_bytes().to_vec().into(),
+                group.to_bytes(&actor).unwrap().into(),
             ),
             (
                 S3_BUCKET_KEYSPACE.to_string(),

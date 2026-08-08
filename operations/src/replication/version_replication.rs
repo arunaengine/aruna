@@ -2283,17 +2283,20 @@ mod tests {
     use aruna_core::events::{
         BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent,
     };
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, SYNC_REFERENCE_STATE_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        SYNC_REFERENCE_STATE_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
-        CurrentVersionPointer, GroupAuthorizationDocument, GroupRoutingInputs,
+        CurrentVersionPointer, Group, GroupAuthorizationDocument, GroupRoutingInputs,
         MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, PortableSourceDescriptor, RealmAuthorizationDocument, RealmId,
-        ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
-        ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, VersionKey, VersionSourceBinding,
+        MultipartObjectSummary, PortableSourceDescriptor, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, ReferenceHandling, ReplicationItemKind,
+        ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_core::types::Effects;
     use aruna_storage::FjallStorage;
@@ -2400,6 +2403,15 @@ mod tests {
         let event = storage
             .send_storage_effect(StorageEffect::BatchWrite {
                 writes: vec![
+                    // Policy loading fails closed without the realm config document.
+                    (
+                        REALM_CONFIG_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                            .to_bytes(&actor)
+                            .unwrap()
+                            .into(),
+                    ),
                     (
                         AUTH_KEYSPACE.to_string(),
                         realm_id.as_bytes().to_vec().into(),
@@ -2409,6 +2421,21 @@ mod tests {
                         AUTH_KEYSPACE.to_string(),
                         group_id.to_bytes().into(),
                         group.to_bytes(&actor).unwrap().into(),
+                    ),
+                    // Policy loading resolves the group record before group policies apply.
+                    (
+                        GROUP_KEYSPACE.to_string(),
+                        group_id.to_bytes().into(),
+                        Group {
+                            display_name: "replication-group".to_string(),
+                            group_id,
+                            realm_id,
+                            roles: group.roles.keys().copied().collect(),
+                            owner: actor.user_id,
+                        }
+                        .to_bytes(&actor)
+                        .unwrap()
+                        .into(),
                     ),
                 ],
                 txn_id: None,

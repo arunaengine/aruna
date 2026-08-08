@@ -785,14 +785,16 @@ mod tests {
         WATCH_SUBSCRIPTION_UNAUTHORIZED, create_watch_subscription, list_watch_subscriptions,
     };
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-        PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind, TokenRevocation,
-        WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
-        blob_object_permission_path, data_watch_resource_path, watch_interest_dirty_key,
+        Actor, Group, GroupAuthorizationDocument, NotificationClass, NotificationKind,
+        NotificationRecord, PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind,
+        TokenRevocation, WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind,
+        WatchEventMask, blob_object_permission_path, data_watch_resource_path,
+        watch_interest_dirty_key,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -943,21 +945,36 @@ mod tests {
             .unwrap()
             .assigned_users
             .extend(readers.iter().copied());
-        for (key, value) in [
+        // Policy loading resolves the group record before group policies apply.
+        let group = Group {
+            display_name: "watch".to_string(),
+            group_id: data_group_id(),
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        for (key_space, key, value) in [
             (
+                AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
                 realm_auth.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 data_group_id().to_bytes().to_vec(),
                 group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                data_group_id().to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
             ),
         ] {
             assert!(matches!(
                 node.context
                     .storage_handle
                     .send_storage_effect(StorageEffect::Write {
-                        key_space: AUTH_KEYSPACE.to_string(),
+                        key_space: key_space.to_string(),
                         key: key.into(),
                         value: value.into(),
                         txn_id: None,

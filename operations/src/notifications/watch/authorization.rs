@@ -721,9 +721,9 @@ mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
+        Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
         RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
     };
     use aruna_storage::FjallStorage;
@@ -761,19 +761,41 @@ mod tests {
             .expect("viewer role")
             .assigned_users
             .insert(UserId::nil(realm_id));
-        for (key, value) in [
+        // Policy loading resolves the group record before group policies apply.
+        let group = Group {
+            display_name: "watch".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        realm_config.ensure_node(node_id, RealmNodeKind::Server);
+        for (key_space, key, value) in [
             (
+                AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
                 realm_auth.to_bytes(&actor).unwrap(),
             ),
             (
+                AUTH_KEYSPACE,
                 group_id.to_bytes().to_vec(),
                 group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_config.to_bytes(&actor).unwrap(),
             ),
         ] {
             match storage
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: AUTH_KEYSPACE.to_string(),
+                    key_space: key_space.to_string(),
                     key: key.into(),
                     value: value.into(),
                     txn_id: None,

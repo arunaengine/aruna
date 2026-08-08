@@ -920,12 +920,12 @@ mod tests {
     use aruna_core::audit::{AuditPageBatch, AuditPageRequest};
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::metadata::MetadataAuthToken;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
-        RealmNodeKind,
+        RealmConfigDocument, RealmNodeKind,
     };
     use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, RealmId};
     use aruna_storage::storage::FjallStorage;
@@ -1733,6 +1733,15 @@ mod tests {
             owner: user_id,
         };
         for (key_space, key, value) in [
+            // Policy loading fails closed without the realm config document, so
+            // the denial below must come from the group policy, not absent state.
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                    .to_bytes(&actor)
+                    .unwrap(),
+            ),
             (
                 AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
