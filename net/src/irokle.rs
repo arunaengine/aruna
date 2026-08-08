@@ -1153,13 +1153,11 @@ impl DocumentSyncService {
             }
         }
 
-        if bootstrap_cursor_dirty {
-            if let Err(error) = self.flush_database() {
-                return DocumentSyncNetEvent::Error {
-                    target: None,
-                    error: error.to_string(),
-                };
-            }
+        if bootstrap_cursor_dirty && let Err(error) = self.flush_database() {
+            return DocumentSyncNetEvent::Error {
+                target: None,
+                error: error.to_string(),
+            };
         }
 
         let bootstrap_elapsed = sync_started.elapsed();
@@ -1723,11 +1721,10 @@ impl DocumentSyncService {
         if topic_ids.is_empty() {
             return Ok(());
         }
+        type SyncGroups =
+            BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<(irokle_crate::TopicId, u64)>)>;
         for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
-            let mut groups: BTreeMap<
-                BTreeSet<PeerId>,
-                (PeerSelection, Vec<(irokle_crate::TopicId, u64)>),
-            > = BTreeMap::new();
+            let mut groups: SyncGroups = BTreeMap::new();
             for topic_id in chunk.iter().copied() {
                 let selection = self.sync_peer_selection(peers, &topic_id)?;
                 let round = selection.round;
@@ -2231,11 +2228,8 @@ impl DocumentSyncService {
                 Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
                 None => irokle_crate::ActorClock::default(),
             };
-            let batch = self.document_event_batch(
-                topic_id,
-                &cursor,
-                DOCUMENT_SYNC_FRAME_LEN_LIMIT,
-            )?;
+            let batch =
+                self.document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?;
             if batch.cursor == cursor {
                 continue;
             }
@@ -2870,7 +2864,9 @@ impl DocumentSyncService {
             let actor_seq = working_cursor
                 .get(&actor_id)
                 .checked_add(1)
-                .ok_or_else(|| NetError::Bootstrap("document sync actor sequence overflow".into()))?;
+                .ok_or_else(|| {
+                    NetError::Bootstrap("document sync actor sequence overflow".into())
+                })?;
             if actor_seq > topic_clock.get(&actor_id) {
                 continue;
             }
@@ -2885,10 +2881,10 @@ impl DocumentSyncService {
             let meta = storage
                 .get_meta(&op_id)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .ok_or_else(|| NetError::Bootstrap(format!("missing document sync op meta {op_id}")))?;
-            if meta.topic_id != topic_id
-                || meta.actor_id != actor_id
-                || meta.actor_seq != actor_seq
+                .ok_or_else(|| {
+                    NetError::Bootstrap(format!("missing document sync op meta {op_id}"))
+                })?;
+            if meta.topic_id != topic_id || meta.actor_id != actor_id || meta.actor_seq != actor_seq
             {
                 return Err(NetError::Bootstrap(format!(
                     "document sync actor index mismatch for actor {actor_id} sequence {actor_seq}"
@@ -2913,7 +2909,9 @@ impl DocumentSyncService {
                 if dependency_meta.actor_seq > working_cursor.get(&dependency_meta.actor_id) {
                     missing
                         .entry(dependency_meta.actor_id)
-                        .and_modify(|sequence| *sequence = (*sequence).max(dependency_meta.actor_seq))
+                        .and_modify(|sequence: &mut u64| {
+                            *sequence = (*sequence).max(dependency_meta.actor_seq)
+                        })
                         .or_insert(dependency_meta.actor_seq);
                 }
             }
@@ -2933,16 +2931,14 @@ impl DocumentSyncService {
                 .get_op(&op_id)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 .ok_or_else(|| NetError::Bootstrap(format!("missing document sync op {op_id}")))?;
-            let op_bytes = postcard::serialized_size(&op)
+            let op_bytes = postcard::experimental::serialized_size(&op)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             if op_bytes > DOCUMENT_SYNC_FRAME_LEN_LIMIT {
                 return Err(NetError::Bootstrap(
                     "document sync operation exceeds replay frame limit".into(),
                 ));
             }
-            if processed > 0
-                && batch_bytes.saturating_add(op_bytes) > byte_limit
-            {
+            if processed > 0 && batch_bytes.saturating_add(op_bytes) > byte_limit {
                 break;
             }
             let actor_id = op.signed.body.actor_id;
@@ -3003,6 +2999,7 @@ impl DocumentSyncService {
         })
     }
 
+    #[cfg(test)]
     fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
@@ -4231,7 +4228,7 @@ async fn apply_metadata_document_lifecycle_to_storage(
                 }
             };
             if writes.is_some() {
-                Some(event.as_ref().clone())
+                Some(event.clone())
             } else {
                 current
             }
@@ -4442,6 +4439,10 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<()> {
         {
             Ok(())
         }
+        // A conflicted commit consumes the transaction; the abort's goal is met.
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionNotFound,
+        }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while aborting transaction: {other:?}"
@@ -5064,8 +5065,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             index.compact(&mut reducer_state);
         }
 
-        let mut config_changed = false;
-        let config = match previous_config {
+        let (config, config_changed) = match previous_config {
             Some(mut config) => {
                 if config.realm_id != realm_id {
                     return Err(
@@ -5087,8 +5087,8 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     effective_now,
                     revocation_index.as_ref(),
                 );
-                config_changed = config != before;
-                Some(config)
+                let changed = config != before;
+                (Some(config), changed)
             }
             None => {
                 let config = realm_config_from_reducer_materialization(
@@ -5097,8 +5097,8 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     effective_now,
                     revocation_index.as_ref(),
                 );
-                config_changed = config.is_some();
-                config
+                let changed = config.is_some();
+                (config, changed)
             }
         };
         if previous_state
@@ -5111,25 +5111,23 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         }
 
         let mut writes = Vec::new();
-        if config_changed {
-            if let Some(config) = config {
-                let bytes = match config.to_bytes(&event.actor) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        return Err(abort_error(
-                            storage,
-                            txn_id,
-                            NetError::Bootstrap(error.to_string()),
-                        )
-                        .await);
-                    }
-                };
-                writes.push((
-                    document_target.storage_keyspace().to_string(),
-                    document_target.storage_key(),
-                    bytes.into(),
-                ));
-            }
+        if config_changed && let Some(config) = config {
+            let bytes = match config.to_bytes(&event.actor) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.push((
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+                bytes.into(),
+            ));
         }
         let reducer_write = match admin_document_reducer_state_write_entry(&reducer_state) {
             Ok(write) => write,
@@ -5731,8 +5729,29 @@ async fn registry_cleanup_txn(
     delete: &MetadataDocumentDeleteRecord,
     txn_id: TxnId,
 ) -> Result<Vec<(String, ByteView)>> {
-    if !metadata_document_delete_matches_registry(delete, group_id, document_id)
-        || registry_live_txn(storage, group_id, document_id, delete, txn_id).await?
+    if !metadata_document_delete_matches_registry(delete, group_id, document_id) {
+        return Ok(Vec::new());
+    }
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    };
+    // A missing registry row means cleanup already ran; an equal delete
+    // replay must stay a no-op.
+    let Some(value) = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let record: MetadataRegistryRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if record.updated_at_ms > delete.tombstone.updated_at_ms
+        || record.last_event_id > delete.deleted_after_event_id
     {
         return Ok(Vec::new());
     }
@@ -6076,6 +6095,7 @@ async fn storage_batch_delete_and_write_in_transaction(
     }
 }
 
+#[cfg(test)]
 async fn storage_batch_delete_to(
     storage: &StorageHandle,
     deletes: Vec<(String, ByteView)>,
@@ -6132,7 +6152,8 @@ fn group_sync_topics<F>(
 where
     F: FnMut(irokle_crate::TopicId) -> PeerSelection,
 {
-    let mut groups = BTreeMap::new();
+    let mut groups: BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<irokle_crate::TopicId>)> =
+        BTreeMap::new();
     for topic_id in topic_ids.iter().copied() {
         let selection = select(topic_id);
         let selected = selection.peers.clone();
@@ -6642,9 +6663,9 @@ fn revocation_origin_known(
     event: &AdminDocumentEvent,
     realm_id: RealmId,
 ) -> bool {
-    if config.is_some_and(|config| {
-        config.realm_id == realm_id && config.has_node(event.origin_node_id)
-    }) {
+    if config
+        .is_some_and(|config| config.realm_id == realm_id && config.has_node(event.origin_node_id))
+    {
         return true;
     }
 
@@ -7860,8 +7881,7 @@ mod tests {
     fn sync_peers_cover() {
         let candidates = (1u8..=17).map(peer).collect::<BTreeSet<_>>();
         let mut seen = BTreeSet::new();
-        let rounds = (candidates.len() + DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT - 1)
-            / DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT;
+        let rounds = candidates.len().div_ceil(DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
         for round in 0..rounds as u64 {
             seen.extend(
                 select_sync_peers(
@@ -9705,8 +9725,14 @@ mod tests {
         );
         let mut state = AdminDocumentReducerState::new(target.clone());
         state.apply(&ensure).expect("onboarding applies");
-        state.apply(&conflict).expect("conflicting onboarding applies");
-        assert!(state.conflicts.contains_key(&realm_config_node_path(&origin.node_id)));
+        state
+            .apply(&conflict)
+            .expect("conflicting onboarding applies");
+        assert!(
+            state
+                .conflicts
+                .contains_key(&realm_config_node_path(&origin.node_id))
+        );
 
         let event = AdminDocumentEvent {
             event_id: Ulid::from_parts(1_664, 1),
@@ -9721,7 +9747,12 @@ mod tests {
                 token_owner: other.user_id,
             },
         };
-        assert!(revocation_origin_known(None, Some(&state), &event, realm_id));
+        assert!(revocation_origin_known(
+            None,
+            Some(&state),
+            &event,
+            realm_id
+        ));
     }
 
     #[tokio::test]
@@ -9798,7 +9829,7 @@ mod tests {
             .expect("revocation replicates and applies");
         }
 
-        let state = read_admin_reducer_state(&storage, &target)
+        let mut state = read_admin_reducer_state(&storage, &target)
             .await
             .expect("reducer state reads")
             .expect("reducer state exists");
@@ -16782,11 +16813,7 @@ mod tests {
             .expect("retry replay batch");
         assert_eq!(retry.cursor, first.cursor);
         let remaining = service
-            .document_event_batch(
-                topic_id,
-                &first.cursor,
-                DOCUMENT_SYNC_FRAME_LEN_LIMIT,
-            )
+            .document_event_batch(topic_id, &first.cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
             .expect("remaining replay batch");
         assert!(remaining.cursor.dominates(&topic_clock));
 
