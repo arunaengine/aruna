@@ -1365,16 +1365,9 @@ mod tests {
 
     #[tokio::test]
     async fn repair_backs_off() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+        // Authorized repair reaches the missing metadata handle and retries.
+        let (_tempdir, context) = setup_auth(None).await;
+        let storage = context.storage_handle.clone();
         let relationship = relationship();
         drive(
             StoreSyncRelationshipOperation::new(

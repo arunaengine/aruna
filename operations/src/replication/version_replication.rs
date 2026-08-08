@@ -59,6 +59,15 @@ pub(super) struct SourceAuthorization {
     policies: PolicyEvaluator,
 }
 
+// Compiled rules and evaluators are derived state; identity fields decide equality.
+impl PartialEq for SourceAuthorization {
+    fn eq(&self, other: &Self) -> bool {
+        self.group_id == other.group_id
+            && self.source_node_id == other.source_node_id
+            && self.auth_context == other.auth_context
+    }
+}
+
 impl std::fmt::Debug for SourceAuthorization {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -110,10 +119,7 @@ impl SourceAuthorization {
             bucket,
             key,
         );
-        if !self
-            .permissions
-            .allows(self.group_id, &path, &Permission::READ)
-        {
+        if !self.permissions.allows(&path, &Permission::READ) {
             return Err(SourceAuthorizationError::Denied);
         }
         let request = policy_request_with(
@@ -277,7 +283,7 @@ enum ReplicateScopeState {
     Error,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ReplicateScopeOperation {
     input: ReplicateScopeInput,
     state: ReplicateScopeState,
@@ -2621,6 +2627,8 @@ mod tests {
 
     #[test]
     fn scope_rejects_overflow() {
+        // A page pushing the examined total past the budget is rejected before
+        // any of its versions are enqueued.
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
         op.state = super::ReplicateScopeState::IterateVersions;
         let values = (0..=MAX_SCOPE_VERSIONS)
@@ -2639,7 +2647,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(op.state, super::ReplicateScopeState::Error);
-        assert_eq!(op.pending_versions.len(), MAX_SCOPE_VERSIONS);
+        assert!(op.pending_versions.is_empty());
         assert_eq!(
             op.output,
             Some(Err(ReplicateScopeError::ScopeLimit {

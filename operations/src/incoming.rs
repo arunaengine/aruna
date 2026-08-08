@@ -37,7 +37,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
 };
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
@@ -252,7 +252,9 @@ async fn bao_policy(
             let group_id =
                 match drive(GetBucketInfoOperation::new(target.bucket.clone()), context).await {
                     Ok(Some(Ok(info))) => info.group_id,
-                    Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => return Ok(paths),
+                    Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => {
+                        return Ok((paths, Vec::new(), false));
+                    }
                     Ok(Some(Err(error))) => return Err(error.to_string()),
                     Err(error) => return Err(error.to_string()),
                 };
@@ -274,7 +276,7 @@ async fn bao_policy(
             {
                 paths.insert(path);
             }
-            return Ok((paths, Vec::new(), false));
+            Ok((paths, Vec::new(), false))
         }
         crate::replication::protocol::BaoReadTarget::Blake3(hash) => {
             let candidates = drive(ResolveBlobPermissionPathsOperation::new(*hash), context)
@@ -332,10 +334,9 @@ async fn bao_policy(
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            return Ok((paths, allowed, had_denial));
+            Ok((paths, allowed, had_denial))
         }
     }
-    Ok((paths, Vec::new(), false))
 }
 
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all

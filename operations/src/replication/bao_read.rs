@@ -562,15 +562,12 @@ impl IncomingBaoReadOperation {
     }
 
     fn next_candidate(&mut self) -> Effects {
-        let candidate = loop {
-            let Some(candidate) = self.candidates.pop_front() else {
-                return self.send_refusal(if self.had_denial {
-                    BaoReadRefusal::ReadDenied
-                } else {
-                    BaoReadRefusal::NotFound
-                });
-            };
-            break candidate;
+        let Some(candidate) = self.candidates.pop_front() else {
+            return self.send_refusal(if self.had_denial {
+                BaoReadRefusal::ReadDenied
+            } else {
+                BaoReadRefusal::NotFound
+            });
         };
         let path = candidate.permission_path();
         let group_id = candidate.group_id;
@@ -980,12 +977,12 @@ mod tests {
 
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, HashPathIndexKey,
-        RealmConfigDocument, RealmId, RealmNodeKind, VersionedObjectArn,
+        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, RealmConfigDocument,
+        RealmId, RealmNodeKind, VersionedObjectArn,
     };
     use aruna_core::types::Effects;
     use ulid::Ulid;

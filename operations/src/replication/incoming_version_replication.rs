@@ -1190,7 +1190,7 @@ impl IncomingVersionReplicationOperation {
             },
         };
         self.cleanup_key = Some(Self::cleanup_key(location));
-        self.cleanup_value = Some(work.to_bytes().map_err(ConversionError::from)?);
+        self.cleanup_value = Some(work.to_bytes()?);
         Ok(())
     }
 
@@ -2362,6 +2362,7 @@ mod tests {
         IncomingVersionReplicationError, IncomingVersionReplicationOperation,
         IncomingVersionReplicationState,
     };
+
     use crate::replication::protocol::{
         MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, SyncOrigin, VersionReplicationManifest,
         VersionReplicationMessage,
@@ -2372,9 +2373,9 @@ mod tests {
     use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
-        BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+        BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
@@ -4395,12 +4396,12 @@ mod tests {
             BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
             BlobCleanupWork::ReconcileWrite {
                 owner: WriteOwner::Blob {
-                    blake3: [1u8; 32],
+                    blake3,
                     realm_id,
                     ..
                 },
                 ..
-            } if realm_id == test_realm_id()
+            } if blake3 == [1u8; 32] && realm_id == test_realm_id()
         ));
 
         let effects = op.step(Event::Storage(StorageEvent::WriteResult {
@@ -4421,8 +4422,8 @@ mod tests {
         assert_eq!(op.txn_id, None);
         assert_eq!(op.cleanup_blob_location, None);
         assert_eq!(
-            effects,
-            smallvec![Effect::Blob(BlobEffect::ReleaseReservation {
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation {
                 id: release_id
             })]
         );

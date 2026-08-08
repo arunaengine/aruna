@@ -14,8 +14,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, BucketReplicationTarget, SyncMode,
     SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
-    blob_object_permission_path, data_watch_resource_path, sync_relationship_key,
-    sync_relationship_prefix,
+    data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -730,11 +729,9 @@ impl Operation for QueueLiveVersionReplicationOperation {
             },
             QueueLiveVersionReplicationState::CommitObligation => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.schedule_drain(),
-                Event::Storage(StorageEvent::Error { error })
-                    if matches!(error, StorageError::TransactionConflict) =>
-                {
-                    self.schedule_drain()
-                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
                     "{other:?}"
@@ -904,46 +901,11 @@ fn validate_sync_key(
     Ok(())
 }
 
-fn live_replication_jobs_from_config(
-    local_node_id: NodeId,
-    auth_context: &AuthContext,
-    bucket: &str,
-    key: &str,
-    version_id: Ulid,
-    delete_marker: bool,
-    config: BucketReplicationConfig,
-) -> Vec<BlobReplicationJobRecord> {
-    let now_ms = unix_timestamp_millis();
-    config
-        .targets
-        .into_iter()
-        .filter(|target| target.node_id != local_node_id)
-        .filter(|target| !delete_marker || target.replicate_delete_markers)
-        .map(|target| {
-            BlobReplicationJobRecord::new(
-                ReplicateScopeInput {
-                    bucket: bucket.to_string(),
-                    target: ReplicateScopeTarget::Version {
-                        key: key.to_string(),
-                        version_id,
-                    },
-                    target_node_id: target.node_id,
-                    auth_context: auth_context.clone(),
-                    replicate_delete_markers: target.replicate_delete_markers,
-                    mode: ReplicationMode::Live,
-                },
-                Some(delete_marker),
-                now_ms,
-            )
-            .with_writer_auth(auth_context.clone())
-        })
-        .collect()
-}
-
 fn target_key(target: &BucketReplicationTarget) -> Result<Vec<u8>, ConversionError> {
     Ok(postcard::to_allocvec(target)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn config_jobs_page(
     local_node_id: NodeId,
     auth_context: &AuthContext,
@@ -965,15 +927,15 @@ fn config_jobs_page(
     let now_ms = unix_timestamp_millis();
     let mut jobs = Vec::with_capacity(limit);
     let mut last_key = None;
-    for (key, target) in targets {
-        if start.is_some_and(|after| key.as_slice() <= after) {
+    for (cursor_key, target) in targets {
+        if start.is_some_and(|after| cursor_key.as_slice() <= after) {
             continue;
         }
         if target.node_id == local_node_id || (delete_marker && !target.replicate_delete_markers) {
             continue;
         }
         if jobs.len() == limit {
-            return Ok((jobs, Some(last_key.unwrap_or(key))));
+            return Ok((jobs, Some(last_key.unwrap_or(cursor_key))));
         }
         jobs.push(
             BlobReplicationJobRecord::new(
@@ -993,7 +955,7 @@ fn config_jobs_page(
             )
             .with_writer_auth(auth_context.clone()),
         );
-        last_key = Some(key);
+        last_key = Some(cursor_key);
     }
     Ok((jobs, None))
 }
@@ -1414,7 +1376,7 @@ async fn process_blob_replication_job(
                 mark_failure(&mut relationship, "access_denied");
                 let stored = store_relationship(context, relationship.clone()).await?;
                 cache_relationship(relationships, job, &relationship, stored);
-                if stored {
+                if stored && let Some(group_id) = group_id {
                     emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
                         .await;
                 }
@@ -1431,12 +1393,14 @@ async fn process_blob_replication_job(
                 return Err(error);
             }
         };
+        // The durable job pins the original writer's scope; the relationship
+        // creator only authorizes the source-side read.
         operation = operation
             .with_relationship(
                 relationship.clone(),
                 job.origin.clone(),
                 job.upstream_sources.clone(),
-                Some(creator),
+                job.writer_auth_context.clone().or(Some(creator)),
             )
             .with_source_authorization(source_authorization);
         Some(relationship)
@@ -1895,46 +1859,6 @@ async fn write_live_obligation(
     }
 }
 
-async fn read_relationships(
-    storage: &StorageHandle,
-    bucket: &str,
-) -> Result<Vec<SyncRelationship>, BlobReplicationQueueError> {
-    let mut start_after = None;
-    let mut relationships = Vec::new();
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
-                prefix: Some(sync_relationship_prefix(bucket).into()),
-                start: start_after.take().map(IterStart::After),
-                limit: REPLICATION_SCAN_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        };
-        for (key, value) in values {
-            let relationship = SyncRelationship::from_bytes(&value)?;
-            validate_sync_key(bucket, &key, &relationship)?;
-            relationships.push(relationship);
-        }
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(relationships),
-        }
-    }
-}
-
 async fn read_relationships_limit(
     storage: &StorageHandle,
     bucket: &str,
@@ -2118,7 +2042,7 @@ async fn write_live_jobs(
         )?;
         relationship_jobs.extend(legacy);
         if let Some(next_config) = next_config {
-            cursor.config_after = next_config;
+            cursor.config_after = Some(next_config);
             continuation = Some(cursor);
         } else {
             cursor.config_after = None;
@@ -2435,7 +2359,7 @@ async fn advance_replication_cursor(
             ))),
         }
     } else {
-        let value = postcard::to_allocvec(&merged)?;
+        let value = postcard::to_allocvec(&merged).map_err(ConversionError::from)?;
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: NODE_STATE_KEYSPACE.to_string(),
@@ -2484,7 +2408,7 @@ async fn scan_due_jobs(
         .send_storage_effect(StorageEffect::Iter {
             key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
-            start: start_after.map(IterStart::After),
+            start: start_after.map(|key| IterStart::After(ByteView::from(key))),
             limit: REPLICATION_SCAN_PAGE_SIZE,
             txn_id: None,
         })
@@ -2501,7 +2425,7 @@ async fn scan_due_jobs(
             )));
         }
     };
-    let mut last_key = None;
+    let mut last_key;
     let page_empty = values.is_empty();
 
     for (key, value) in values {
@@ -2531,12 +2455,11 @@ async fn scan_due_jobs(
                 jobs.retain(|(existing_key, _)| existing_key != &canonical_key);
             }
             key = canonical_key;
-        } else if canonical_changed {
-            if let Some(existing) =
+        } else if canonical_changed
+            && let Some(existing) =
                 read_blob_replication_job_at_key(storage, &canonical_key).await?
-            {
-                job = existing;
-            }
+        {
+            job = existing;
         }
         if job.due_at_ms > now_ms {
             next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
@@ -2716,16 +2639,95 @@ fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
 }
 
 #[cfg(test)]
+fn live_replication_jobs_from_config(
+    local_node_id: NodeId,
+    auth_context: &AuthContext,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+    delete_marker: bool,
+    config: BucketReplicationConfig,
+) -> Vec<BlobReplicationJobRecord> {
+    let now_ms = unix_timestamp_millis();
+    config
+        .targets
+        .into_iter()
+        .filter(|target| target.node_id != local_node_id)
+        .filter(|target| !delete_marker || target.replicate_delete_markers)
+        .map(|target| {
+            BlobReplicationJobRecord::new(
+                ReplicateScopeInput {
+                    bucket: bucket.to_string(),
+                    target: ReplicateScopeTarget::Version {
+                        key: key.to_string(),
+                        version_id,
+                    },
+                    target_node_id: target.node_id,
+                    auth_context: auth_context.clone(),
+                    replicate_delete_markers: target.replicate_delete_markers,
+                    mode: ReplicationMode::Live,
+                },
+                Some(delete_marker),
+                now_ms,
+            )
+            .with_writer_auth(auth_context.clone())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+async fn read_relationships(
+    storage: &StorageHandle,
+    bucket: &str,
+) -> Result<Vec<SyncRelationship>, BlobReplicationQueueError> {
+    let mut start_after = None;
+    let mut relationships = Vec::new();
+    loop {
+        let event = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                prefix: Some(sync_relationship_prefix(bucket).into()),
+                start: start_after.take().map(IterStart::After),
+                limit: REPLICATION_SCAN_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        };
+        for (key, value) in values {
+            let relationship = SyncRelationship::from_bytes(&value)?;
+            validate_sync_key(bucket, &key, &relationship)?;
+            relationships.push(relationship);
+        }
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => return Ok(relationships),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
-        Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget,
+        Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget, Group,
         GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, ReferenceHandling,
-        SyncStatusSnapshot, VersionKey, sync_relationship_key,
+        SyncStatusSnapshot, VersionKey, blob_object_permission_path, sync_relationship_key,
     };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -2873,6 +2875,30 @@ mod tests {
             GroupAuthorizationDocument::new_default_group_doc(user(), realm(), group_id)
                 .to_bytes(&actor)
                 .unwrap(),
+        )
+        .await;
+    }
+
+    // Policy loading resolves the group record before group policies apply.
+    async fn write_group(storage: &StorageHandle, group_id: Ulid) {
+        let actor = Actor {
+            node_id: node(1),
+            user_id: user(),
+            realm_id: realm(),
+        };
+        let auth = GroupAuthorizationDocument::new_default_group_doc(user(), realm(), group_id);
+        let group = Group {
+            display_name: "replication-group".to_string(),
+            group_id,
+            realm_id: realm(),
+            roles: auth.roles.keys().copied().collect(),
+            owner: user(),
+        };
+        write_raw_queue_record(
+            storage,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
         )
         .await;
     }
@@ -3262,8 +3288,10 @@ mod tests {
         let group_id = Ulid::from_parts(2, 2);
         write_bucket(&storage, "bucket").await;
         write_auth_docs(&storage, group_id).await;
+        write_group(&storage, group_id).await;
         let path = blob_object_permission_path(realm(), group_id, node(1), "bucket", "key");
         write_group_policy(&storage, group_id, &format!("path == '{path}'")).await;
+        write_materialized_version(&storage, "bucket", "key", Ulid::from_parts(5, 5)).await;
         let relationship = relationship(79, 2, None, true);
         write_relationship(&storage, &relationship).await;
         let context = DriverContext {
@@ -4309,7 +4337,7 @@ mod tests {
         assert_eq!(scan.jobs[0].1.attempts, 1);
         assert_eq!(
             scan.jobs[0].0,
-            blob_replication_job_key(&preferred).unwrap()
+            blob_replication_job_key(&preferred).unwrap().as_ref()
         );
     }
 
@@ -4544,13 +4572,26 @@ mod tests {
 
     #[tokio::test]
     async fn successful_empty_scope_drain_deletes_job() {
+        // Standalone jobs revalidate the writer against the local node.
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         write_bucket(&storage, "bucket").await;
+        write_auth_docs(&storage, Ulid::from_parts(2, 2)).await;
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle starts");
         let context = DriverContext {
             storage_handle: storage.clone(),
-            net_handle: None,
+            net_handle: Some(net_handle),
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,

@@ -469,8 +469,8 @@ mod tests {
     use super::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_REPLICATION_HASH_BYTES,
         MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES, MAX_REPLICATION_VALUE_BYTES,
-        MaterializedBlobInfo, MultipartObjectReplicationMetadata, SyncOrigin,
-        VERSION_REPLICATION_MAGIC, VersionReplicationManifest, VersionReplicationMessage,
+        MultipartObjectReplicationMetadata, SyncOrigin, VersionReplicationManifest,
+        VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
@@ -478,7 +478,7 @@ mod tests {
     use aruna_core::structs::checksum::HASH_SHA256;
     use aruna_core::structs::{
         ArunaArn, AuthContext, MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
-        RealmId, ReplicationItemKind, VersionSourceBinding,
+        RealmId, ReplicationItemKind,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
