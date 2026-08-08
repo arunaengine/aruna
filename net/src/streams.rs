@@ -33,6 +33,7 @@ const INBOUND_CONNECTION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 #[derive(Clone, Debug)]
 pub struct InboundAdmission {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    admitted_peers: Arc<RwLock<Vec<NodeId>>>,
     bootstrap_peers: Arc<RwLock<BTreeSet<NodeId>>>,
     realm_config_materialized: Arc<AtomicBool>,
     materialized_signal: watch::Sender<bool>,
@@ -48,6 +49,7 @@ impl InboundAdmission {
         let (membership_signal, _) = watch::channel(0);
         Self {
             realm_peers,
+            admitted_peers: Arc::new(RwLock::new(Vec::new())),
             bootstrap_peers: Arc::new(RwLock::new(bootstrap_peers.into_iter().collect())),
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
             materialized_signal,
@@ -55,13 +57,18 @@ impl InboundAdmission {
         }
     }
 
+    /// Every registered realm node, User kind included: user nodes forward
+    /// metadata and job-control requests. Sync trust stays with `realm_peers`.
+    pub(crate) fn set_admitted(&self, peers: Vec<NodeId>) {
+        *self.admitted_peers.write() = peers;
+    }
+
     fn allows_peer(&self, peer: NodeId) -> bool {
-        let realm_peers = self.realm_peers.read();
-        if self.realm_config_materialized.load(Ordering::Acquire) {
-            realm_peers.contains(&peer)
-        } else {
-            realm_peers.contains(&peer) || self.bootstrap_peers.read().contains(&peer)
+        if self.realm_peers.read().contains(&peer) || self.admitted_peers.read().contains(&peer) {
+            return true;
         }
+        !self.realm_config_materialized.load(Ordering::Acquire)
+            && self.bootstrap_peers.read().contains(&peer)
     }
 
     pub(crate) fn add_bootstrap(&self, peer: NodeId) {
@@ -160,12 +167,12 @@ impl Drop for InboundConnectionPermit {
     fn drop(&mut self) {
         let mut state = self.budget.state.lock();
         state.global = state.global.saturating_sub(1);
-        if let Some(peer) = self.peer.take() {
-            if let Some(held) = state.per_peer.get_mut(&peer) {
-                *held = held.saturating_sub(1);
-                if *held == 0 {
-                    state.per_peer.remove(&peer);
-                }
+        if let Some(peer) = self.peer.take()
+            && let Some(held) = state.per_peer.get_mut(&peer)
+        {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                state.per_peer.remove(&peer);
             }
         }
     }
@@ -559,6 +566,141 @@ async fn run_admitted(
     }
 }
 
+async fn run_dht_connection(
+    conn: Connection,
+    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    peer_id: NodeId,
+) {
+    let mut timers = ConnectionTimers::new();
+    let mut received_bytes = conn.stats().udp_rx.bytes;
+    loop {
+        tokio::select! {
+            _ = &mut timers.lifetime => {
+                conn.close(0u32.into(), b"inbound lifetime");
+                return;
+            }
+            _ = &mut timers.idle => {
+                // Data on an already-accepted stream counts as activity, so a
+                // long transfer is not cut down as an idle connection.
+                let received = conn.stats().udp_rx.bytes;
+                if received > received_bytes {
+                    received_bytes = received;
+                    timers.activity();
+                    continue;
+                }
+                conn.close(0u32.into(), b"inbound idle");
+                return;
+            }
+            incoming = conn.accept_bi() => match incoming {
+                Ok((send, recv)) => match dht_handler.try_send((send, recv, peer_id)) {
+                    Ok(()) => timers.activity(),
+                    Err(TrySendError::Full((mut send, mut recv, _))) => {
+                        warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue full");
+                        let _ = send.finish();
+                        let _ = recv.stop(0u32.into());
+                    }
+                    Err(TrySendError::Closed((mut send, mut recv, _))) => {
+                        warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue closed");
+                        let _ = send.finish();
+                        let _ = recv.stop(0u32.into());
+                        return;
+                    }
+                },
+                Err(err) => {
+                    trace!(
+                        node_id = %peer_id,
+                        error = %err,
+                        "Inbound DHT connection stopped accepting streams"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn run_connection(
+    conn: Connection,
+    alpn: Alpn,
+    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    document_sync: std::sync::Arc<DocumentSyncService>,
+    peer_id: NodeId,
+) {
+    match alpn {
+        Alpn::Dht => run_dht_connection(conn, dht_handler, peer_id).await,
+        alpn @ (Alpn::Bao
+        | Alpn::DocumentSync
+        | Alpn::Metadata
+        | Alpn::NativeReference
+        | Alpn::Notification
+        | Alpn::Shard
+        | Alpn::JobControl) => {
+            if alpn == Alpn::DocumentSync {
+                document_sync.register_inbound_connection(&conn);
+            }
+            run_app_connection(conn, alpn, stream_handler, peer_id).await;
+        }
+    }
+}
+
+async fn run_app_connection(
+    conn: Connection,
+    alpn: Alpn,
+    stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    peer_id: NodeId,
+) {
+    let mut timers = ConnectionTimers::new();
+    let mut received_bytes = conn.stats().udp_rx.bytes;
+    loop {
+        tokio::select! {
+            _ = &mut timers.lifetime => {
+                conn.close(0u32.into(), b"inbound lifetime");
+                return;
+            }
+            _ = &mut timers.idle => {
+                // Data on an already-accepted stream counts as activity, so a
+                // long transfer is not cut down as an idle connection.
+                let received = conn.stats().udp_rx.bytes;
+                if received > received_bytes {
+                    received_bytes = received;
+                    timers.activity();
+                    continue;
+                }
+                conn.close(0u32.into(), b"inbound idle");
+                return;
+            }
+            incoming = conn.accept_bi() => match incoming {
+                Ok((send, recv)) => {
+                    match stream_handler.try_send((alpn, BiStream(send, recv, None), peer_id)) {
+                        Ok(()) => timers.activity(),
+                        Err(TrySendError::Full((_, mut stream, _))) => {
+                            warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue full");
+                            let _ = stream.0.finish();
+                            let _ = stream.1.stop(0u32.into());
+                        }
+                        Err(TrySendError::Closed((_, mut stream, _))) => {
+                            warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue closed");
+                            let _ = stream.0.finish();
+                            let _ = stream.1.stop(0u32.into());
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    trace!(
+                        node_id = %peer_id,
+                        alpn = %alpn,
+                        error = %err,
+                        "Inbound app connection stopped accepting streams"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,7 +826,7 @@ mod tests {
         let realm_peers = Arc::new(RwLock::new(vec![peer(1)]));
         let admission = InboundAdmission::new(realm_peers.clone(), []);
         admission.mark_materialized();
-        let mut changes = admission.membership_watch();
+        let changes = admission.membership_watch();
 
         *realm_peers.write() = vec![peer(1), peer(2)];
         admission.mark_materialized();
@@ -698,7 +840,7 @@ mod tests {
         let realm_peers = Arc::new(RwLock::new(vec![peer(1), peer(2)]));
         let admission = InboundAdmission::new(realm_peers.clone(), []);
         admission.mark_materialized();
-        let mut changes = admission.membership_watch();
+        let changes = admission.membership_watch();
 
         *realm_peers.write() = vec![peer(2)];
         admission.mark_materialized();
@@ -720,126 +862,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn lifetime_ignores_activity() {
+        // `is_elapsed` needs a poll; the biased ready-race polls without waiting.
         let mut timers = ConnectionTimers::new();
         timers.activity();
         tokio::time::advance(INBOUND_CONNECTION_LIFETIME).await;
-        assert!(timers.lifetime.is_elapsed());
-    }
-}
-
-async fn run_dht_connection(
-    conn: Connection,
-    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
-    peer_id: NodeId,
-) {
-    let mut timers = ConnectionTimers::new();
-    loop {
         tokio::select! {
-            _ = &mut timers.lifetime => {
-                conn.close(0u32.into(), b"inbound lifetime");
-                return;
-            }
-            _ = &mut timers.idle => {
-                conn.close(0u32.into(), b"inbound idle");
-                return;
-            }
-            incoming = conn.accept_bi() => match incoming {
-                Ok((send, recv)) => match dht_handler.try_send((send, recv, peer_id)) {
-                    Ok(()) => timers.activity(),
-                    Err(TrySendError::Full((mut send, mut recv, _))) => {
-                        warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue full");
-                        let _ = send.finish();
-                        let _ = recv.stop(0u32.into());
-                    }
-                    Err(TrySendError::Closed((mut send, mut recv, _))) => {
-                        warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue closed");
-                        let _ = send.finish();
-                        let _ = recv.stop(0u32.into());
-                        return;
-                    }
-                },
-                Err(err) => {
-                    trace!(
-                        node_id = %peer_id,
-                        error = %err,
-                        "Inbound DHT connection stopped accepting streams"
-                    );
-                    return;
-                }
-            }
-        }
-    }
-}
-
-async fn run_connection(
-    conn: Connection,
-    alpn: Alpn,
-    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
-    stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
-    document_sync: std::sync::Arc<DocumentSyncService>,
-    peer_id: NodeId,
-) {
-    match alpn {
-        Alpn::Dht => run_dht_connection(conn, dht_handler, peer_id).await,
-        alpn @ (Alpn::Bao
-        | Alpn::DocumentSync
-        | Alpn::Metadata
-        | Alpn::NativeReference
-        | Alpn::Notification
-        | Alpn::Shard
-        | Alpn::JobControl) => {
-            if alpn == Alpn::DocumentSync {
-                document_sync.register_inbound_connection(&conn);
-            }
-            run_app_connection(conn, alpn, stream_handler, peer_id).await;
-        }
-    }
-}
-
-async fn run_app_connection(
-    conn: Connection,
-    alpn: Alpn,
-    stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
-    peer_id: NodeId,
-) {
-    let mut timers = ConnectionTimers::new();
-    loop {
-        tokio::select! {
-            _ = &mut timers.lifetime => {
-                conn.close(0u32.into(), b"inbound lifetime");
-                return;
-            }
-            _ = &mut timers.idle => {
-                conn.close(0u32.into(), b"inbound idle");
-                return;
-            }
-            incoming = conn.accept_bi() => match incoming {
-                Ok((send, recv)) => {
-                    match stream_handler.try_send((alpn, BiStream(send, recv, None), peer_id)) {
-                        Ok(()) => timers.activity(),
-                        Err(TrySendError::Full((_, mut stream, _))) => {
-                            warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue full");
-                            let _ = stream.0.finish();
-                            let _ = stream.1.stop(0u32.into());
-                        }
-                        Err(TrySendError::Closed((_, mut stream, _))) => {
-                            warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue closed");
-                            let _ = stream.0.finish();
-                            let _ = stream.1.stop(0u32.into());
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    trace!(
-                        node_id = %peer_id,
-                        alpn = %alpn,
-                        error = %err,
-                        "Inbound app connection stopped accepting streams"
-                    );
-                    return;
-                }
-            }
+            biased;
+            _ = &mut timers.lifetime => {}
+            _ = std::future::ready(()) => panic!("lifetime must fire despite activity"),
         }
     }
 }

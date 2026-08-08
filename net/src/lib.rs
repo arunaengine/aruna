@@ -1031,6 +1031,16 @@ impl NetHandle {
                 document.realm_id, self.inner.realm_id
             )));
         }
+        // Connection admission covers every registered realm node, User kind
+        // included: user nodes forward metadata and job-control requests.
+        let admitted = unique_peer_nodes(
+            document
+                .node_ids()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            self.inner.node_id,
+        );
+        self.inner.inbound_admission.set_admitted(admitted);
+        // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
         let peers = unique_peer_nodes(
             document
                 .sync_eligible_node_ids()
