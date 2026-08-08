@@ -61,8 +61,10 @@ async fn manifest_request_rejected_from_non_realm_peer() -> Result<(), Box<dyn s
     let error = fetch_shard_manifest(&outsider.net, nodes[0].net.node_id(), realm_id, placement)
         .await
         .expect_err("non-realm peer must be rejected");
+    // Inbound admission drops unregistered peers before the manifest protocol
+    // can answer, so the client usually observes a closed connection.
     assert!(
-        error.contains("not a sync-eligible node"),
+        error.contains("connection lost") || error.contains("not a sync-eligible node"),
         "unexpected reject: {error}"
     );
 
