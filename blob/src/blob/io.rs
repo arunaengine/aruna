@@ -18,7 +18,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::UserId;
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1464,16 +1464,20 @@ impl BlobHandler {
             .bucket_operator(backend, bucket, &self.egress)?;
         let storage_prefix = format!("{bucket}/{}", hidden_prefix(namespace));
         let mut request = operator
-            .list_with(&storage_prefix)
+            .lister_with(&storage_prefix)
             .recursive(true)
             .limit(HIDDEN_LIST_PAGE);
         if let Some(start_after) = start_after {
             request = request.start_after(start_after);
         }
-        tokio::time::timeout(self.control_plane_io_timeout(), request)
-            .await
-            .map_err(|_| BlobError::ListError("timed out listing hidden blobs".to_string()))?
-            .map_err(|error| BlobError::ListError(error.to_string()))
+        tokio::time::timeout(self.control_plane_io_timeout(), async move {
+            let lister = request
+                .await
+                .map_err(|error| BlobError::ListError(error.to_string()))?;
+            take_page(lister).await
+        })
+        .await
+        .map_err(|_| BlobError::ListError("timed out listing hidden blobs".to_string()))?
     }
 
     async fn list_reservation_page(
@@ -1597,6 +1601,16 @@ impl BlobHandler {
     }
 }
 
+/// OpenDAL's list limit is only a per-request hint, so one page is bounded
+/// here instead of buffering every entry the bucket holds.
+async fn take_page(lister: opendal::Lister) -> Result<Vec<opendal::Entry>, BlobError> {
+    lister
+        .take(HIDDEN_LIST_PAGE)
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| BlobError::ListError(error.to_string()))
+}
+
 fn hidden_prefix(namespace: Option<Ulid>) -> String {
     match namespace {
         Some(namespace) => format!("{HIDDEN_BLOB_PREFIX}/{namespace}/"),
@@ -1620,7 +1634,7 @@ fn hidden_timestamp(path: &str) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use super::next_chunk;
+    use super::{HIDDEN_LIST_PAGE, next_chunk, take_page};
     use aruna_core::errors::BlobError;
     use aruna_core::stream::BackendStream;
     use bytes::Bytes;
@@ -1640,5 +1654,41 @@ mod tests {
             task.await.unwrap(),
             Err(BlobError::ReadError(message)) if message == "blob read idle timeout"
         ));
+    }
+
+    #[tokio::test]
+    async fn page_stays_bounded() {
+        // A bucket holding more than one page must not be buffered whole: the
+        // opendal list limit is only a per-request hint.
+        let dir = tempfile::tempdir().unwrap();
+        let operator =
+            opendal::Operator::from_iter::<opendal::services::Fs>(std::collections::HashMap::from(
+                [("root".to_string(), dir.path().to_str().unwrap().to_string())],
+            ))
+            .unwrap()
+            .finish();
+        for index in 0..HIDDEN_LIST_PAGE + 5 {
+            operator
+                .write(&format!("hidden/blob-{index:04}"), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+
+        let listed = operator
+            .list_with("hidden/")
+            .recursive(true)
+            .limit(HIDDEN_LIST_PAGE)
+            .await
+            .unwrap();
+        assert!(listed.len() > HIDDEN_LIST_PAGE);
+
+        let lister = operator
+            .lister_with("hidden/")
+            .recursive(true)
+            .limit(HIDDEN_LIST_PAGE)
+            .await
+            .unwrap();
+
+        assert_eq!(take_page(lister).await.unwrap().len(), HIDDEN_LIST_PAGE);
     }
 }

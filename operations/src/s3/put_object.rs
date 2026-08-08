@@ -1024,7 +1024,7 @@ impl PutObjectOperation {
             Event::Storage(StorageEvent::Error { error }) => {
                 match self.pending_cleanup.retry(&error) {
                     Some(effect) => smallvec![effect],
-                    None => self.emit_pending_error(),
+                    None => self.finish_or_error(),
                 }
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
@@ -1033,14 +1033,49 @@ impl PutObjectOperation {
 
     fn release_or_error(&mut self) -> Effects {
         let Some(id) = self.release_id else {
-            return self.emit_pending_error();
+            return self.finish_or_error();
         };
         self.state = PutObjectState::ReleaseReservation;
         smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
     }
 
+    /// Only a request that already carries an error fails here: a durable
+    /// commit whose reservation release was deferred still succeeds.
+    fn finish_or_error(&mut self) -> Effects {
+        if self.pending_error.is_some() {
+            return self.emit_pending_error();
+        }
+        self.continue_after_dht_registration()
+    }
+
+    /// The commit is durable, so a refused release must not fail the request.
+    /// The reconciliation row clears the reservation and registers the blob;
+    /// a duplicate copy is deleted by the cleanup the commit already planned.
+    fn defer_release(&mut self) -> Effects {
+        let Some(id) = self.release_id.take() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        warn!(
+            event = "put_object.release_deferred",
+            release_id = %id,
+            "Queuing the blob reservation for reconciliation"
+        );
+        let Some(work) = self
+            .get_output()
+            .filter(|location| location.ulid == id)
+            .cloned()
+            .and_then(|location| self.reconcile_work(location).ok())
+        else {
+            return self.continue_after_dht_registration();
+        };
+        self.queue_cleanup_work(work)
+    }
+
     fn handle_release(&mut self, event: Event) -> Effects {
         let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
+            if self.pending_error.is_none() {
+                return self.defer_release();
+            }
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
         if self.release_id != Some(id) {
@@ -1909,6 +1944,60 @@ mod test {
             op.step(Event::Blob(BlobEvent::ReservationReleased { id }))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn release_failure_succeeds() {
+        // A refused release after a durable commit hands the reservation to the
+        // cleanup queue; the client must not be told its committed write failed.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+        ));
+        let mut location = test_location(op.config.user_id);
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![7u8; 32],
+        );
+        let id = location.ulid;
+        op.version_id = Some(Ulid::generate());
+        op.state = PutObjectState::CommitTransaction;
+        op.written_location = Some(location.clone());
+        op.output = Some(Ok(location.clone()));
+
+        op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::generate(),
+        }));
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+            "release refused".to_string(),
+        ))));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a reconciliation row, got {effects:?}")
+        };
+        assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+        assert!(matches!(
+            super::BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+            super::BlobCleanupWork::ReconcileWrite { location: observed, .. }
+                if observed.ulid == id
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"k".to_vec().into(),
+        }));
+        assert_eq!(effects.len(), 1);
+        assert_eq!(op.state, PutObjectState::Finish);
+        assert!(matches!(
+            op.finalize(),
+            Ok(Some(Ok(result))) if result.location == location
+        ));
     }
 
     #[test]

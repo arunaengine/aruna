@@ -318,8 +318,30 @@ impl UploadPartOperation {
         smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
     }
 
+    /// The part is durably committed, so a refused release must not fail the
+    /// request: the reconciliation row that committed with the part record
+    /// clears this reservation on the next cleanup drain.
+    fn defer_release(&mut self) -> Effects {
+        let Some(id) = self.release_id.take() else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
+        };
+        warn!(
+            event = "upload_part.release_deferred",
+            release_id = %id,
+            "Deferring the part reservation to reconciliation"
+        );
+        if matches!(self.output, Some(Ok(_))) {
+            self.state = UploadPartState::Finish;
+            return smallvec![];
+        }
+        self.emit_pending_error()
+    }
+
     fn handle_release(&mut self, event: Event) -> Effects {
         let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
+            if self.pending_error.is_none() {
+                return self.defer_release();
+            }
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
         if self.release_id != Some(id) {
@@ -1127,6 +1149,36 @@ mod test {
             panic!("expected successful replacement")
         };
         assert_eq!(result.location, new);
+    }
+
+    #[test]
+    fn release_failure_succeeds() {
+        // A refused release runs after the part is durably committed, so it must
+        // not report the committed part as failed; the reconciliation row that
+        // committed with it clears the reservation.
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        let location = op.written_location.clone().unwrap();
+        op.state = UploadPartState::CommitTransaction;
+        op.txn_id = Some(TxnId::from_bytes([3u8; 16]));
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::from_bytes([3u8; 16]),
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation {
+                id: location.ulid
+            })]
+        );
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::HandleMissing)));
+
+        assert!(effects.is_empty());
+        assert_eq!(op.state, UploadPartState::Finish);
+        let Some(Ok(result)) = op.finalize().unwrap() else {
+            panic!("expected the committed part to succeed")
+        };
+        assert_eq!(result.location, location);
     }
 
     #[test]
