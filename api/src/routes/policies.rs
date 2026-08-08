@@ -609,6 +609,14 @@ pub async fn dry_run_policy(
     Json(request): Json<DryRunRequest>,
 ) -> ServerResult<(StatusCode, Json<DryRunResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    // Dry runs compile caller-supplied CEL; restrict them to policy authors.
+    match request.group_id.as_deref() {
+        Some(group_id) => {
+            let group_id = parse_group_id(group_id)?;
+            require_group_admin(&state, &auth, group_id).await?;
+        }
+        None => require_config_read(&state, &auth).await?,
+    }
 
     let policy_request = PolicyRequest {
         path: request.path.clone(),

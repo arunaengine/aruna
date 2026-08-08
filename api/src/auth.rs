@@ -7,7 +7,6 @@ use aruna_core::structs::{
 };
 use aruna_operations::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
-    validate_aruna_bearer_token_claims,
 };
 use axum::extract::Request;
 use axum::middleware::Next;
@@ -460,12 +459,6 @@ impl ArunaBearerTokenValidationState for RevocationBlindState<'_> {
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
         self.0.issuer_decoding_key(issuer_pubkey).await
     }
-}
-
-pub async fn validate_claims(state: &ServerState, claims: &TokenClaims) -> Result<(), TokenError> {
-    validate_aruna_bearer_token_claims(state, claims)
-        .await
-        .map_err(Into::into)
 }
 
 pub async fn auth_middleware(
