@@ -26,9 +26,13 @@ struct TestAuthState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for TestAuthState {
-    async fn is_token_revoked(&self, token_hash: &str) -> bool {
+    async fn is_token_revoked(
+        &self,
+        _realm_id: &RealmId,
+        token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
         self.revocation_reads.fetch_add(1, Ordering::Relaxed);
-        self.revoked_hashes.contains(token_hash)
+        Ok(self.revoked_hashes.contains(token_hash))
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

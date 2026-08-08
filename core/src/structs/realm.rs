@@ -1,6 +1,6 @@
 use crate::NodeId;
 use crate::admin_document_reducer::{AdminDocumentReducerState, RevocationIndex};
-use crate::auth::revocation_live;
+use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
@@ -518,9 +518,10 @@ impl RealmConfigDocument {
     }
 
     /// Whether the realm-wide revocation set denies this bearer token hash.
-    /// A clock below the persisted floor fails closed until it catches up.
+    /// The floor is stamped by whichever node merged last, so only a clock more
+    /// than the skew grace below it counts as a rollback and fails closed.
     pub fn token_revoked(&self, token_hash: &str, now: u64) -> bool {
-        if now < self.revocation_floor {
+        if self.revocation_floor.saturating_sub(now) > REVOCATION_GRACE_SECS {
             return true;
         }
         self.revoked_tokens
@@ -552,9 +553,11 @@ impl RealmConfigDocument {
                 .and_modify(|current| *current = (*current).max(expires_at))
                 .or_insert(expires_at);
         }
+        // Retain one grace window past expiry so a node lagging inside the skew
+        // bound still sees the entry; per-entry checks stay `revocation_live`.
         self.revoked_tokens = merged
             .into_iter()
-            .filter(|(_, expires_at)| revocation_live(*expires_at, effective_now))
+            .filter(|(_, expires_at)| revocation_retained(*expires_at, effective_now))
             .map(|(token_hash, expires_at)| TokenRevocation {
                 token_hash,
                 expires_at,
@@ -787,6 +790,7 @@ mod test {
     use crate::NodeId;
     use crate::admin_document_reducer::AdminDocumentReducerState;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+    use crate::auth::REVOCATION_GRACE_SECS;
     use crate::structs::{
         Actor, DynamicDiscoveryMethod, MetadataGroupReplicationOverride,
         MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
@@ -910,7 +914,10 @@ mod test {
         let reducer_state = AdminDocumentReducerState::new(
             crate::admin_documents::AdminDocumentTarget::RealmConfig { realm_id },
         );
+        // Retained for one grace window so a skewed peer still sees it, then pruned.
         config.merge_revocations(&reducer_state, 1_001);
+        assert_eq!(config.revoked_tokens.len(), 1);
+        config.merge_revocations(&reducer_state, 1_001 + REVOCATION_GRACE_SECS + 1);
         assert!(config.revoked_tokens.is_empty());
     }
 
@@ -948,8 +955,21 @@ mod test {
         config.merge_revocation_index(&index, 2_000);
         assert!(config.revoked_tokens.is_empty());
         assert_eq!(config.revocation_floor, 2_000);
-        assert!(config.token_revoked(&token_hash, 1_999));
+        assert!(config.token_revoked(&token_hash, 2_000 - REVOCATION_GRACE_SECS - 1));
         assert!(!config.token_revoked(&token_hash, 2_000));
+    }
+
+    #[test]
+    fn floor_tolerates_skew() {
+        // The floor carries the merging node's clock, so a node a few seconds
+        // behind it must keep serving instead of denying every bearer token.
+        let realm_id = RealmId([9u8; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.revocation_floor = 2_000;
+
+        let token_hash = crate::auth::bearer_token_hash("skewed-token");
+        assert!(!config.token_revoked(&token_hash, 2_000 - REVOCATION_GRACE_SECS));
+        assert!(config.token_revoked(&token_hash, 2_000 - REVOCATION_GRACE_SECS - 1));
     }
 
     #[test]

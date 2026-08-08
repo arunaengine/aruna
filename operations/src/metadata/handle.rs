@@ -303,10 +303,16 @@ impl MetadataAuthValidationState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
-    async fn is_token_revoked(&self, token_hash: &str) -> bool {
+    async fn is_token_revoked(
+        &self,
+        realm_id: &RealmId,
+        token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        // Without realm state this node holds no revocation authority at all;
+        // once it has any, the token's own issuing realm answers.
         match self.realm_id {
-            Some(realm_id) => realm_token_revoked(&self.storage_handle, realm_id, token_hash).await,
-            None => false,
+            Some(_) => realm_token_revoked(&self.storage_handle, *realm_id, token_hash).await,
+            None => Ok(false),
         }
     }
 
@@ -337,8 +343,12 @@ struct RevocationBlindValidation<'a>(&'a MetadataAuthValidationState);
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for RevocationBlindValidation<'_> {
-    async fn is_token_revoked(&self, _token_hash: &str) -> bool {
-        false
+    async fn is_token_revoked(
+        &self,
+        _realm_id: &RealmId,
+        _token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        Ok(false)
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

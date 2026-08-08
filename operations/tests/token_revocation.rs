@@ -57,8 +57,12 @@ struct PeerAuthState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for PeerAuthState {
-    async fn is_token_revoked(&self, token_hash: &str) -> bool {
-        realm_token_revoked(&self.storage, self.realm_id, token_hash).await
+    async fn is_token_revoked(
+        &self,
+        realm_id: &RealmId,
+        token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        realm_token_revoked(&self.storage, *realm_id, token_hash).await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
@@ -103,7 +107,8 @@ async fn peer_denies_token() -> TestResult<()> {
         "the revocation never reached the peer node",
         || async {
             Ok(usize::from(
-                !realm_token_revoked(&nodes[1].context.storage_handle, realm_id, &token_hash).await,
+                !realm_token_revoked(&nodes[1].context.storage_handle, realm_id, &token_hash)
+                    .await?,
             ))
         },
     )

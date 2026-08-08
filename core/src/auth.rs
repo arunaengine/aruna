@@ -4,7 +4,9 @@ pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 /// 366 days covers every 12-calendar-month token, including leap years.
 pub const MAX_BEARER_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
 
-/// Bounded grace for revocation retention across pairwise clock skew.
+/// Bounded grace for revocation retention across pairwise clock skew. Also the
+/// only skew a replicated timestamp may be ahead of the local clock before it
+/// is treated as a rollback rather than as skew.
 pub const REVOCATION_GRACE_SECS: u64 = 5 * 60;
 
 pub fn credential_hash(value: impl AsRef<[u8]>) -> String {
@@ -35,6 +37,14 @@ pub fn revocation_retained(expires_at: u64, now: u64) -> bool {
 pub fn valid_revocation_expiry(expires_at: u64, now: u64) -> bool {
     expires_at.saturating_sub(now)
         <= MAX_BEARER_TOKEN_LIFETIME_SECS.saturating_add(REVOCATION_GRACE_SECS)
+}
+
+/// Whether the signed lifetime of a token stays revocable. Issuance and
+/// validation share it so a minted token can never outlive what the replicated
+/// revocation set is able to hold.
+pub fn valid_token_lifetime(iat: u64, exp: u64) -> bool {
+    exp.checked_sub(iat)
+        .is_some_and(|lifetime| lifetime <= MAX_BEARER_TOKEN_LIFETIME_SECS)
 }
 
 #[cfg(test)]

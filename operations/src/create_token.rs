@@ -1,3 +1,4 @@
+use aruna_core::auth::valid_token_lifetime;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{NodeCapabilities, RealmId, TokenClaims};
 use aruna_core::types::UserId;
@@ -39,6 +40,8 @@ pub enum CreateTokenError {
     NotFinished,
     #[error("Invalid timestamp")]
     InvalidTimestamp,
+    #[error("Token lifetime exceeds the revocable maximum")]
+    LifetimeTooLong,
     #[error(transparent)]
     EncodingError(#[from] jsonwebtoken::errors::Error),
 }
@@ -74,6 +77,11 @@ impl CreateTokenOperation {
                 new.timestamp() as u64
             }
         };
+        // Minting must not exceed what validation accepts, or the token would
+        // be issued already unusable and unrevocable.
+        if !valid_token_lifetime(iat, exp) {
+            return Err(CreateTokenError::LifetimeTooLong);
+        }
 
         match &self.config.node_capabilities {
             NodeCapabilities::Management {
@@ -168,7 +176,7 @@ impl Operation for CreateTokenOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use crate::create_token::{CreateTokenConfig, CreateTokenError, CreateTokenOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
@@ -208,5 +216,26 @@ mod test {
 
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         drive(token_operation, &context).await.unwrap();
+    }
+
+    #[test]
+    fn rejects_overlong_expiry() {
+        // Minting must not hand out an expiry that validation rejects.
+        let signing_key: SigningKey = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let time = 1_000_000;
+        let mut operation = CreateTokenOperation::new(CreateTokenConfig {
+            time,
+            expiry: Some(time + aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS + 1),
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+            node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            operation.emit_token(),
+            Err(CreateTokenError::LifetimeTooLong)
+        );
     }
 }

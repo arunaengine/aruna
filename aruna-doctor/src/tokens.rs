@@ -8,7 +8,9 @@ use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
 use aruna_core::structs::{Actor, OidcProviderConfig, RealmId, TokenClaims};
-use aruna_operations::auth::{ArunaBearerTokenValidationState, decode_aruna_bearer_token};
+use aruna_operations::auth::{
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
+};
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
@@ -453,8 +455,12 @@ impl DoctorTokenValidationState {
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for DoctorTokenValidationState {
-    async fn is_token_revoked(&self, token_hash: &str) -> bool {
-        self.revoked_token_hashes.contains(token_hash)
+    async fn is_token_revoked(
+        &self,
+        _realm_id: &RealmId,
+        token_hash: &str,
+    ) -> Result<bool, ArunaBearerTokenError> {
+        Ok(self.revoked_token_hashes.contains(token_hash))
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
