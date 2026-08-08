@@ -2280,6 +2280,7 @@ mod tests {
     };
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
+    use aruna_core::errors::BlobError;
     use aruna_core::events::{
         BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent,
     };
@@ -2372,7 +2373,10 @@ mod tests {
         }
     }
 
-    async fn denied_auth(input: &ReplicateScopeInput) -> (TempDir, SourceAuthorization) {
+    async fn source_auth(
+        input: &ReplicateScopeInput,
+        allow: bool,
+    ) -> (TempDir, SourceAuthorization) {
         let directory = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
@@ -2395,10 +2399,14 @@ mod tests {
             roles: HashMap::new(),
             operation_restrictions: HashMap::new(),
         };
-        let group = GroupAuthorizationDocument {
-            group_id,
-            roles: HashMap::new(),
-            policies: Vec::new(),
+        let group = if allow {
+            GroupAuthorizationDocument::new_default_group_doc(actor.user_id, realm_id, group_id)
+        } else {
+            GroupAuthorizationDocument {
+                group_id,
+                roles: HashMap::new(),
+                policies: Vec::new(),
+            }
         };
         let event = storage
             .send_storage_effect(StorageEffect::BatchWrite {
@@ -2710,7 +2718,7 @@ mod tests {
     async fn scope_caps_denied() {
         // Authorization-denied pages must consume the same finite scan budget.
         let input = scope_input(ReplicateScopeTarget::Bucket);
-        let (_directory, authorization) = denied_auth(&input).await;
+        let (_directory, authorization) = source_auth(&input, false).await;
         let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
         op.state = super::ReplicateScopeState::IterateVersions;
 
@@ -2767,6 +2775,27 @@ mod tests {
                 limit: MAX_SCOPE_VERSIONS,
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn scope_admits_permitted() {
+        // The source gate must admit a permitted read; a gate that denied every
+        // version would silently stop all replication. Roles bind to a real
+        // user, so the nil principal of the default context cannot be used.
+        let mut input = scope_input(ReplicateScopeTarget::Bucket);
+        input.auth_context.user_id = UserId::local(Ulid::from_bytes([4u8; 16]), test_realm_id());
+        let (_directory, authorization) = source_auth(&input, true).await;
+        let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
+        op.state = super::ReplicateScopeState::IterateVersions;
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/file.txt", Ulid::from_bytes([1u8; 16]))],
+            next_start_after: None,
+        }));
+
+        assert_eq!(op.result.last_error, None);
+        assert_eq!(op.result.failed, 0);
+        assert!(matches!(effects[0], Effect::SubOperation(_)));
     }
 
     #[test]
@@ -3360,6 +3389,63 @@ mod tests {
 
         op.build_manifest(None).unwrap();
         assert_eq!(op.manifest.as_ref().unwrap().source, original_source);
+    }
+
+    #[test]
+    fn cleanup_deletes_blob() {
+        // A materialization that fails after the backend wrote data must still
+        // surrender that location, or the partial blob leaks.
+        let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
+            Ulid::generate(),
+            ReplicationMode::OnDemand,
+        ));
+
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+        op.step(Event::SubOperation(
+            SubOperationEvent::VersionSourceAccessResolved {
+                result: Ok(ResolvedSourceAccess::OpenDal {
+                    kind: SourceConnectorKind::Http,
+                    config: HashMap::from([(
+                        "endpoint".to_string(),
+                        "https://example.org".to_string(),
+                    )]),
+                    path: "ref/file.txt".to_string(),
+                    version: None,
+                }),
+            },
+        ));
+        load_routing(&mut op);
+        op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata: SourceMetadata {
+                content_length: 3,
+                content_type: Some("text/plain".to_string()),
+                etag: Some("etag-2".to_string()),
+                last_modified: None,
+                source_version: None,
+            },
+            stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                Bytes::from_static(b"abc"),
+            )])),
+        }));
+
+        let temp_location = materialized_location();
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
+            location: temp_location.clone(),
+            message: "backend writer failed".to_string(),
+        })));
+
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete {
+                location: temp_location
+            })]
+        );
+        assert!(op.is_complete());
+        assert!(op.finalize().is_err());
     }
 
     #[test]

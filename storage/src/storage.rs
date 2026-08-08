@@ -3828,6 +3828,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_full_aborts() {
+        // A commit the queue rejected never reached storage, so it must stay
+        // abortable instead of being fenced as possibly committed.
+        let (handle, receivers) = small_handle(1);
+        let txn_id = Ulid::from_parts(1, 9);
+        handle.transaction_cleanup.lock().unwrap().insert(
+            txn_id,
+            super::CleanupEntry {
+                kind: super::CleanupKind::Open,
+                attempts: 0,
+                queued: false,
+            },
+        );
+        let filler = StorageEffect::Read {
+            key_space: "commit_full".to_string(),
+            key: b"filler".to_vec().into(),
+            txn_id: None,
+        };
+        let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
+        let filler_span = super::storage_effect_span(&filler);
+        let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+        handle
+            .write_channel
+            .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
+            .expect("fill queue");
+
+        let event = handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::QueueFull
+            })
+        ));
+        assert!(!handle.commit_unknown(txn_id));
+        assert_eq!(handle.pending_transactions(), 1);
+        drop(receivers);
+    }
+
+    #[test]
+    fn dropped_commit_unknown() {
+        // A commit already handed to the worker must be retained for
+        // reconciliation, never converted into an abort.
+        let (handle, receivers) = StorageHandle::new();
+        let txn_id = Ulid::from_parts(1, 10);
+        handle.transaction_cleanup.lock().unwrap().insert(
+            txn_id,
+            super::CleanupEntry {
+                kind: super::CleanupKind::CommitQueued,
+                attempts: 0,
+                queued: true,
+            },
+        );
+
+        drop(super::ResponseToken::new(
+            &handle,
+            &StorageEffect::CommitTransaction { txn_id },
+        ));
+
+        assert!(handle.commit_unknown(txn_id));
+        assert!(receivers.foreground.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_entry_frees() {
+        // An owner dropped after storage committed must release its cleanup slot
+        // instead of aborting a transaction that already landed.
+        let (handle, receivers) = StorageHandle::new();
+        let txn_id = Ulid::from_parts(1, 11);
+        handle.transaction_cleanup.lock().unwrap().insert(
+            txn_id,
+            super::CleanupEntry {
+                kind: super::CleanupKind::Committed,
+                attempts: 0,
+                queued: false,
+            },
+        );
+
+        assert!(handle.retain_transaction(txn_id, false));
+
+        assert_eq!(handle.pending_transactions(), 0);
+        assert!(receivers.foreground.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn transaction_cap() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();

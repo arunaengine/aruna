@@ -4563,6 +4563,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_keeps_requeued() {
+        // A repair pass must not delete an obligation a concurrent writer
+        // re-enqueued: the newer version would never replicate.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let mut record = LiveReplicationObligationRecord::new(
+            node(1),
+            auth_context(),
+            "bucket".to_string(),
+            "key".to_string(),
+            Ulid::from_parts(7, 7),
+            false,
+        );
+        record.continuation = Some(LiveReplicationContinuation::default());
+        super::write_live_obligation(&storage, &record)
+            .await
+            .expect("obligation persists");
+        let key = live_replication_obligation_key(&record)
+            .expect("obligation key builds")
+            .to_vec();
+        let observed = LiveReplicationContinuation {
+            relationship_after: Some(vec![1]),
+            relationships_complete: false,
+            config_after: None,
+        };
+
+        delete_live_obligation(&storage, key.clone(), Some(&observed))
+            .await
+            .expect("stale delete is a no-op");
+        assert_eq!(read_obligations(&storage).await.len(), 1);
+
+        delete_live_obligation(&storage, key, record.continuation.as_ref())
+            .await
+            .expect("matching delete succeeds");
+        assert!(read_obligations(&storage).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_write_ignored() {
+        // Rewinding the stored scan position would re-queue work the drain
+        // already finished, so an older continuation must not win.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let mut record = LiveReplicationObligationRecord::new(
+            node(1),
+            auth_context(),
+            "bucket".to_string(),
+            "key".to_string(),
+            Ulid::from_parts(8, 8),
+            false,
+        );
+        record.continuation = Some(LiveReplicationContinuation {
+            relationship_after: Some(vec![2]),
+            relationships_complete: false,
+            config_after: None,
+        });
+        super::write_live_obligation(&storage, &record)
+            .await
+            .expect("obligation persists");
+        let mut stale = record.clone();
+        stale.continuation = Some(LiveReplicationContinuation {
+            relationship_after: Some(vec![1]),
+            relationships_complete: false,
+            config_after: None,
+        });
+
+        super::write_live_obligation(&storage, &stale)
+            .await
+            .expect("stale write is a no-op");
+
+        let stored = read_obligations(&storage).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].continuation, record.continuation);
+    }
+
+    #[tokio::test]
+    async fn denied_standalone_drops() {
+        // A job without a relationship revalidates its own writer; a denied
+        // writer must retire the job instead of retrying it forever.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let group_id = Ulid::from_parts(2, 2);
+        write_bucket(&storage, "bucket").await;
+        write_auth_docs(&storage, group_id).await;
+        write_group(&storage, group_id).await;
+        write_materialized_version(&storage, "bucket", "key", Ulid::from_parts(5, 5)).await;
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle starts");
+        let path =
+            blob_object_permission_path(realm(), group_id, net_handle.node_id(), "bucket", "key");
+        write_group_policy(&storage, group_id, &format!("path == '{path}'")).await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        drive(
+            QueueBlobReplicationOperation::new(on_demand_input(), None),
+            &context,
+        )
+        .await
+        .expect("queue succeeds");
+
+        let result = process_blob_replication_batch(&context)
+            .await
+            .expect("denied writer is terminal");
+
+        assert_eq!(result.succeeded, 0);
+        assert_eq!(result.failed, 1);
+        assert!(read_jobs(&storage).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn live_replication_obligation_repairs_missing_jobs() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
