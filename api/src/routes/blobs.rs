@@ -1001,14 +1001,30 @@ mod tests {
             ),
         )
         .await;
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
         write_fixture(
             &state,
             AUTH_KEYSPACE,
             ByteView::from(group_id.to_bytes().to_vec()),
+            ByteView::from(group_auth.to_bytes(&actor).expect("group auth serializes")),
+        )
+        .await;
+        // Policy loading resolves the group record before group policies apply.
+        write_fixture(
+            &state,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            ByteView::from(group_id.to_bytes().to_vec()),
             ByteView::from(
-                GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id)
-                    .to_bytes(&actor)
-                    .expect("group auth serializes"),
+                aruna_core::structs::Group {
+                    display_name: "blob-group".to_string(),
+                    group_id,
+                    realm_id,
+                    roles: group_auth.roles.keys().copied().collect(),
+                    owner,
+                }
+                .to_bytes(&actor)
+                .expect("group serializes"),
             ),
         )
         .await;

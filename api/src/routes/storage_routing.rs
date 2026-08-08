@@ -407,10 +407,12 @@ pub(crate) mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
     use aruna_core::structs::{
         Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmAuthorizationDocument, RealmId,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
@@ -656,6 +658,17 @@ pub(crate) mod tests {
             storage_routing: Vec::new(),
         };
 
+        // Request-policy loading fails closed without the realm config document.
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .unwrap()
+                .into(),
+        )
+        .await;
         write_doc(
             &driver_ctx,
             AUTH_KEYSPACE,

@@ -784,9 +784,10 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        RealmConfigDocument,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
@@ -1148,6 +1149,17 @@ mod tests {
         };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
 
+        // Request-policy loading fails closed without the realm config document.
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .unwrap()
+                .into(),
+        )
+        .await;
         write_doc(
             &driver_ctx,
             AUTH_KEYSPACE,

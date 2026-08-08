@@ -1069,11 +1069,12 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE,
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        SYNC_MIRROR_REPAIR_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
-        RealmAuthorizationDocument, RealmId,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -1160,7 +1161,15 @@ mod tests {
             roles: group_auth.roles.keys().copied().collect(),
             owner: relationship.created_by,
         };
+        // Request-policy loading fails closed without the realm config document.
         for (key_space, key, value) in [
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                    .to_bytes(&actor)
+                    .unwrap(),
+            ),
             (
                 AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),

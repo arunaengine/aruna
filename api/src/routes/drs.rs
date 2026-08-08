@@ -833,12 +833,13 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
-        GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument, RealmId,
-        SourceMetadata, VersionKey, VersionedObjectArn,
+        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, SourceMetadata, VersionKey, VersionedObjectArn,
     };
     use aruna_core::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
@@ -945,6 +946,31 @@ mod tests {
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "drs-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        // Request-policy loading fails closed without the realm config, the group
+        // record, and the group auth document.
+        write_fixture(
+            state,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .expect("realm config serializes"),
+        )
+        .await;
+        write_fixture(
+            state,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).expect("group serializes"),
+        )
+        .await;
         write_fixture(
             state,
             AUTH_KEYSPACE,

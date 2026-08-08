@@ -1550,6 +1550,16 @@ mod tests {
                 .unwrap(),
         )
         .await;
+        // Policy loading fails closed without the realm config document.
+        store_bytes(
+            &state,
+            aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
 
         (state, tempdir)
     }

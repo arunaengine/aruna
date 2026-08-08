@@ -1262,6 +1262,21 @@ mod tests {
             ByteView::from(group_auth.to_bytes(&actor).expect("group auth serializes")),
         )
         .await;
+        // Policy loading resolves the group record before group policies apply.
+        let group = aruna_core::structs::Group {
+            display_name: "watch-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        write_fixture(
+            state,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            ByteView::from(group_id.to_bytes().to_vec()),
+            ByteView::from(group.to_bytes(&actor).expect("group serializes")),
+        )
+        .await;
     }
 
     async fn install_bucket(state: &ServerState, bucket: &str, group_id: Ulid, created_by: UserId) {

@@ -1861,6 +1861,30 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected foreign user write result: {other:?}"),
         }
+        // Revocation lookup is fail-closed against the issuing realm, so the
+        // foreign config must exist for the request to reach the route.
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(foreign_realm_id.as_bytes().to_vec()),
+                value: ByteView::from(
+                    RealmConfigDocument::default_for_realm(foreign_realm_id, Vec::new())
+                        .to_bytes(&Actor {
+                            node_id: node.net.node_id(),
+                            user_id: foreign_user_id,
+                            realm_id: foreign_realm_id,
+                        })
+                        .unwrap(),
+                ),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected foreign realm config write result: {other:?}"),
+        }
         let token = drive(
             CreateTokenOperation::new(CreateTokenConfig {
                 time: super::now_timestamp(),
