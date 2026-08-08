@@ -48,7 +48,7 @@ use serde_json::Value;
 use spareval::{CancellationToken, QueryEvaluator};
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::{Query, SparqlParser};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncRead;
 use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
@@ -201,7 +201,7 @@ impl MetadataRequestError {
         }
     }
 
-    fn possibly_sent(error: MetadataError) -> Self {
+    pub(super) fn possibly_sent(error: MetadataError) -> Self {
         Self {
             delivery: MetadataRequestDelivery::PossiblySent,
             error,
@@ -898,7 +898,7 @@ impl MetadataHandle {
         self.inner.visibility_cache.upsert_registry_records(records);
     }
 
-    pub(super) fn upsert_cached_at(&self, record: MetadataRegistryRecord, generation: u64) {
+    pub(crate) fn upsert_cached_at(&self, record: MetadataRegistryRecord, generation: u64) {
         self.inner
             .visibility_cache
             .upsert_at(std::slice::from_ref(&record), Some(generation));
@@ -964,7 +964,7 @@ impl MetadataHandle {
         &self.inner.query_cache
     }
 
-    pub(super) fn visibility_generation(&self) -> u64 {
+    pub(crate) fn visibility_generation(&self) -> u64 {
         self.inner.visibility_cache.current_generation()
     }
 
@@ -3571,10 +3571,10 @@ fn metadata_effect_defers_persist(effect: &MetadataEffect) -> bool {
 }
 
 fn metadata_effect_skips_lifecycle_read(effect: &MetadataEffect) -> bool {
-    match effect {
-        MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => true,
-        _ => false,
-    }
+    matches!(
+        effect,
+        MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. }
+    )
 }
 
 fn schedule_deferred_metadata_persist(
@@ -4528,7 +4528,17 @@ async fn list_local_registry_records(
             record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
-        Some((_, false)) | None => {
+        Some((records, false)) => {
+            // Serve the expired snapshot and refresh in the background so an
+            // expiry never blocks reads on a refill.
+            span.record("cache_hit", true);
+            span.record("stale", true);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            spawn_visibility_refill(&inner);
+            Ok(records)
+        }
+        None => {
             let _fill = inner
                 .visibility_cache
                 .registry_fill
@@ -4581,7 +4591,17 @@ async fn list_local_registry_records_for_group(
             record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
-        Some((_, false)) | None => {
+        Some((records, false)) => {
+            // Serve the expired snapshot and refresh in the background so an
+            // expiry never blocks reads on a refill.
+            span.record("cache_hit", true);
+            span.record("stale", true);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            spawn_visibility_refill(&inner);
+            Ok(records)
+        }
+        None => {
             let _fill = inner
                 .visibility_cache
                 .registry_fill
@@ -4616,6 +4636,22 @@ async fn list_local_registry_records_for_group(
     }
 }
 
+fn spawn_visibility_refill(inner: &Arc<MetadataInner>) {
+    let fill_lock = inner.visibility_cache.registry_fill.clone();
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let Ok(_guard) = fill_lock.try_lock_owned() else {
+            return;
+        };
+        if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
+            return;
+        }
+        if let Err(error) = fill_visibility_caches(&inner).await {
+            warn!(error = %error, "Background visibility refill failed");
+        }
+    });
+}
+
 fn registry_records_for_group(
     records: &Arc<Vec<MetadataRegistryRecord>>,
     group_id: GroupId,
@@ -4638,10 +4674,9 @@ async fn list_group_records(
     if let Some((records, true)) = inner
         .visibility_cache
         .registry_records_for_group_any(group_id)
+        && records.len() <= limit
     {
-        if records.len() <= limit {
-            return Ok(records);
-        }
+        return Ok(records);
     }
 
     let mut records = Vec::new();
@@ -4667,7 +4702,7 @@ async fn list_group_records(
     }
 
     let (deleted_graphs, _) =
-        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+        list_deleted_graph_iris(&inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
     Ok(Arc::new(
         records
             .into_iter()
@@ -6591,6 +6626,7 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn maps_violations() {
@@ -7140,6 +7176,8 @@ mod tests {
         let (realm_signing_key, realm_id, user_id) = realm_fixture();
         let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
         let (_dir, storage) = auth_storage();
+        // Revocation fails closed without the realm config revocation set.
+        persist_realm_config(&storage, realm_id, &[]).await;
         persist_auth_state(
             &storage,
             TRUSTED_REALMS_LIST_KEY,
@@ -7169,6 +7207,8 @@ mod tests {
         claims.restrictions = Some(restrictions.clone());
         let token = sign_token(&realm_signing_key, &claims);
         let (_dir, storage) = auth_storage();
+        // Revocation fails closed without the realm config revocation set.
+        persist_realm_config(&storage, realm_id, &[]).await;
         persist_auth_state(
             &storage,
             TRUSTED_REALMS_LIST_KEY,
