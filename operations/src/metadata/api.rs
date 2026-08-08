@@ -614,12 +614,15 @@ pub async fn lookup_metadata_path(
         let normalized = normalized.clone();
         async move {
             let result = if holder == local_node {
-                tokio::time::timeout_at(
+                match tokio::time::timeout_at(
                     deadline,
                     local_path_candidates(context, realm_id, group_id, &normalized, auth),
                 )
                 .await
-                .map_err(|_| MetadataApiError::ServiceUnavailable)?
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(MetadataApiError::ServiceUnavailable),
+                }
             } else {
                 load_path_holder(
                     context,
@@ -714,6 +717,7 @@ pub(crate) async fn resolve_local_path(
     reduce_path_candidates(candidates)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_path_holders(
     config: &RealmConfigDocument,
     realm_id: RealmId,
@@ -943,7 +947,7 @@ async fn forward_path_resolution(
     let mut divergent = false;
     let mut not_found = false;
     let mut unavailable = false;
-    let mut success = None;
+    let mut success: Option<MetadataPathLookupResult> = None;
     loop {
         let response = match tokio::time::timeout_at(deadline, requests.next()).await {
             Ok(response) => response,
@@ -1516,9 +1520,7 @@ pub async fn query_metadata_document(
         None => request.auth.clone().map(MetadataAuthToken::internal),
     };
     let mut fanout_stats = MetadataFanoutStats::default();
-    let mut success = None;
     let mut auth_error = None;
-    let mut not_found = false;
     for holder in holders {
         fanout_stats.nodes_queried += 1;
         let result: Result<MetadataQueryResults, MetadataReadError> = if holder == local_node_id {
@@ -1546,7 +1548,14 @@ pub async fn query_metadata_document(
         };
         match result {
             Ok(results) => {
-                success.get_or_insert(results);
+                // First replica success answers the query; a lagging replica's
+                // NotFound must not override an in-hand result.
+                fanout_stats.nodes_failed = 0;
+                fanout_stats.failed_partitions.clear();
+                return Ok(MetadataQueryExecution {
+                    results,
+                    fanout_stats,
+                });
             }
             Err(MetadataReadError::Unauthorized) => {
                 auth_error.get_or_insert(MetadataApiError::Unauthorized);
@@ -1554,7 +1563,7 @@ pub async fn query_metadata_document(
             Err(MetadataReadError::Forbidden) => {
                 auth_error.get_or_insert(MetadataApiError::Forbidden);
             }
-            Err(MetadataReadError::NotFound) => not_found = true,
+            Err(MetadataReadError::NotFound) => {}
             Err(MetadataReadError::Unavailable) => {
                 fanout_stats.nodes_failed += 1;
                 fanout_stats.failed_partitions.push(holder);
@@ -1564,17 +1573,6 @@ pub async fn query_metadata_document(
     }
     if let Some(error) = auth_error {
         return Err(error);
-    }
-    if success.is_some() && not_found {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    if let Some(results) = success {
-        fanout_stats.nodes_failed = 0;
-        fanout_stats.failed_partitions.clear();
-        return Ok(MetadataQueryExecution {
-            results,
-            fanout_stats,
-        });
     }
     Err(MetadataApiError::ServiceUnavailable)
 }
@@ -1645,10 +1643,17 @@ pub async fn search_metadata(
     let mut cursor_discovery = None;
     let (watermark, resume) = match request.cursor.as_deref() {
         Some(raw) => {
+            // Cursor signers are authorized against the full realm node set:
+            // the serving node's capped fan-out selection may exclude the node
+            // that legitimately signed the previous page.
             let signer_nodes = match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
                 MetadataApiQueryMode::Local => vec![local_node_id],
                 MetadataApiQueryMode::Distributed => match request.target_nodes.as_ref() {
-                    Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
+                    Some(nodes) => {
+                        let mut signers = nodes.clone();
+                        signers.push(local_node_id);
+                        signers
+                    }
                     None => {
                         let discovery = tokio::time::timeout_at(
                             deadline,
@@ -1659,12 +1664,14 @@ pub async fn search_metadata(
                             nodes: vec![local_node_id],
                             failed: true,
                         });
+                        let mut signers = discovery.nodes.clone();
+                        signers.push(local_node_id);
                         let nodes =
                             select_fanout_nodes(&discovery.nodes, local_node_id, &fingerprint);
                         let mut discovery = discovery;
-                        discovery.nodes = nodes.clone();
+                        discovery.nodes = nodes;
                         cursor_discovery = Some(discovery);
-                        nodes
+                        signers
                     }
                 },
             };
@@ -2093,7 +2100,7 @@ pub(crate) async fn filter_live_records(
     }
 
     let mut live = Vec::with_capacity(records.len());
-    for (record, pair) in records.iter().zip(values.chunks_exact(2)) {
+    for (record, pair) in records.iter().zip(values.as_chunks::<2>().0) {
         let (graph_key, graph_value) = &pair[0];
         if graph_key != &metadata_graph_lifecycle_key(&record.graph_iri) {
             return Err(MetadataApiError::Internal(
@@ -2149,14 +2156,20 @@ fn document_lifecycle_deleted(
     let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(value)
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     let matches = match &lifecycle {
-        MetadataDocumentLifecycleRecord::Upsert { event } => &event.record,
-        MetadataDocumentLifecycleRecord::Delete { event } => &event.tombstone,
+        MetadataDocumentLifecycleRecord::Upsert { event } => {
+            event.record.document_id == record.document_id
+                && event.record.graph_iri == record.graph_iri
+                && event.record.realm_id == record.realm_id
+                && event.record.group_id == record.group_id
+        }
+        MetadataDocumentLifecycleRecord::Delete { event } => {
+            event.tombstone.document_id == record.document_id
+                && event.tombstone.graph_iri == record.graph_iri
+                && event.tombstone.realm_id == record.realm_id
+                && event.tombstone.group_id == record.group_id
+        }
     };
-    if matches.document_id != record.document_id
-        || matches.graph_iri != record.graph_iri
-        || matches.realm_id != record.realm_id
-        || matches.group_id != record.group_id
-    {
+    if !matches {
         return Err(MetadataApiError::Internal(
             "metadata document lifecycle record mismatch".to_string(),
         ));
@@ -2325,12 +2338,10 @@ async fn load_pending_records(
 
     let pending = filter_live_records(&context.storage_handle, &pending).await?;
     let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
-    let mut count = 0usize;
-    for record in pending {
+    for (count, record) in pending.into_iter().enumerate() {
         if count >= limit {
             return Err(MetadataApiError::ServiceUnavailable);
         }
-        count += 1;
         records.entry(record.group_id).or_default().push(record);
     }
     Ok(records)
@@ -3121,6 +3132,7 @@ fn metadata_fanout_node_span(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_metadata_fanout_node<T>(
     operation: MetadataFanoutOperation,
     node_id: NodeId,
@@ -3262,7 +3274,7 @@ where
             if discovery_failed && !allow_partial {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
-            let mut failed_partitions = Vec::new();
+            let failed_partitions = Vec::new();
             let mut omitted_nodes = 0usize;
             if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
                 let mut subject = Vec::with_capacity(32 + operation.label().len() + 32 + 1);
@@ -3338,11 +3350,18 @@ where
                 outstanding.remove(&node_id);
                 match result {
                     Ok(result) => node_parts.push((node_index, node_id, result)),
-                    Err(error @ MetadataReadError::Unauthorized) => {
+                    // A rejected forwarded credential is a failed partition;
+                    // local authorization already vouched for the caller.
+                    Err(MetadataReadError::Unauthorized) => {
                         fanout_stats.nodes_failed += 1;
                         fanout_stats.failed_partitions.push(node_id);
-                        auth_error.get_or_insert(map_read_error(error));
+                        warn!(
+                            node_id = ?node_id,
+                            operation = operation.label(),
+                            "distributed metadata skipped unauthorized node result"
+                        );
                     }
+                    // An authenticated denial anywhere fails the whole query.
                     Err(error @ MetadataReadError::Forbidden) => {
                         fanout_stats.nodes_failed += 1;
                         fanout_stats.failed_partitions.push(node_id);
@@ -4008,6 +4027,7 @@ mod tests {
 
     // The visibility cache only accepts upserts once it has been filled.
     async fn seed_registry_cache(test: &MetadataTest, record: &MetadataRegistryRecord) {
+        seed_policy_docs(test, record.group_id).await;
         let handle = test
             .context
             .metadata_handle
@@ -4020,7 +4040,82 @@ mod tests {
         handle.upsert_cached_registry_record(record.clone());
     }
 
+    // Policy loading fails closed without realm config and group documents.
+    async fn seed_policy_docs(test: &MetadataTest, group_id: GroupId) {
+        let owner = UserId::nil(TEST_REALM_ID);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            user_id: owner,
+            realm_id: TEST_REALM_ID,
+        };
+        let config = RealmConfigDocument::default_for_realm(TEST_REALM_ID, Vec::new());
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(TEST_REALM_ID);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, TEST_REALM_ID, group_id);
+        let group = Group {
+            display_name: "policy-fixture".to_string(),
+            group_id,
+            realm_id: TEST_REALM_ID,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let writes = [
+            (
+                aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
+                ByteView::from(*TEST_REALM_ID.as_bytes()),
+                config.to_bytes(&actor).expect("config serializes"),
+            ),
+            (
+                AUTH_KEYSPACE,
+                ByteView::from(*TEST_REALM_ID.as_bytes()),
+                realm_auth.to_bytes(&actor).expect("realm auth serializes"),
+            ),
+            (
+                AUTH_KEYSPACE,
+                ByteView::from(group_id.to_bytes().to_vec()),
+                group_auth.to_bytes(&actor).expect("group auth serializes"),
+            ),
+            (
+                GROUP_KEYSPACE,
+                ByteView::from(group_id.to_bytes().to_vec()),
+                group.to_bytes(&actor).expect("group serializes"),
+            ),
+        ];
+        for (key_space, key, value) in writes {
+            let existing = test
+                .context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: key_space.to_string(),
+                    key: key.clone(),
+                    txn_id: None,
+                })
+                .await;
+            if matches!(
+                existing,
+                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+            ) {
+                continue;
+            }
+            let event = test
+                .context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key,
+                    value: ByteView::from(value),
+                    txn_id: None,
+                })
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+    }
+
     async fn write_pending_marker(test: &MetadataTest, record: &MetadataRegistryRecord) {
+        seed_policy_docs(test, record.group_id).await;
         let event = MetadataCreateEventRecord {
             event_id: record.last_event_id,
             record: record.clone(),
