@@ -1,5 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,15 +14,15 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     Actor, AuthContext, Backend, BackendConfig, BucketInfo, ExportRoCrateSpec,
-    FIRST_GRANTABLE_HANDLE, GroupAuthorizationDocument, ImportMetadataTarget, ImportReportRow,
-    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord,
-    JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
+    FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, ImportMetadataTarget,
+    ImportReportRow, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId,
+    JobPayload, JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
     RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind,
     VersionKey,
@@ -192,6 +193,9 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let exported = run_export_job(&export_context, &export).await;
     let JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) = exported else {
+        if let JobRunOutcome::Failed(error) = exported {
+            return Err(format!("RO-Crate export failed: {}", error.message).into());
+        }
         return Err("RO-Crate export did not succeed".into());
     };
     assert_eq!(result.included, 1);
@@ -1335,6 +1339,21 @@ async fn seed_auth(
         AUTH_KEYSPACE,
         group_id.to_bytes().to_vec(),
         group.to_bytes(actor)?,
+    )
+    .await?;
+    // Policy loading resolves the group itself and fails closed when missing.
+    let group_doc = Group {
+        display_name: "rocrate".to_string(),
+        group_id,
+        realm_id: actor.realm_id,
+        roles: HashSet::new(),
+        owner: actor.user_id,
+    };
+    write_value(
+        storage,
+        GROUP_KEYSPACE,
+        group_id.to_bytes().to_vec(),
+        group_doc.to_bytes(actor)?,
     )
     .await
 }

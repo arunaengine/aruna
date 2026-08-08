@@ -907,7 +907,9 @@ async fn bystander_writes_forward() -> TestResult<()> {
 async fn document_sparql_routes() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
 
-    let group_id = Ulid::from_bytes([61; 16]);
+    // Distributed queries bulk-load group policies, which fails closed unless
+    // the group document exists on the queried holders.
+    let group_id = realm.seed_group().await?;
     let path = "datasets/sparql-routes";
     let origin = realm.node(0);
     let document_id =
