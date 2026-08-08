@@ -406,6 +406,7 @@ pub async fn project_metadata_create_events(
     let mut outboxes = Vec::new();
     let mut pending_projection_delete_targets = BTreeSet::new();
     let mut pending_projection_retry_targets = BTreeSet::new();
+    let mut mint_retry_targets = BTreeSet::new();
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
@@ -497,7 +498,14 @@ pub async fn project_metadata_create_events(
         let needs_projection =
             !registry_exists || event_is_newer || holders_changed || needs_materialization;
 
-        if !needs_projection {
+        // A surviving marker on a locally authored event means its one-shot
+        // lifecycle mint was deferred; the skip path must re-attempt it.
+        let mint_pending = if !needs_projection && local_node_id == Some(event.node_id) {
+            pending_projection_marker(context, document_id, event.event_id).await?
+        } else {
+            false
+        };
+        if !needs_projection && !mint_pending {
             continue;
         }
 
@@ -505,7 +513,7 @@ pub async fn project_metadata_create_events(
             .get(&event.record.realm_id)
             .and_then(|config| config.as_ref());
         let authored_here = local_node_id == Some(event.node_id)
-            && (!registry_exists || needs_materialization || holders_changed);
+            && (!registry_exists || needs_materialization || holders_changed || mint_pending);
         let has_live_holders = realm_config.is_some_and(|config| {
             !resolve_shard_holders(config, &event.record.placement).is_empty()
         });
@@ -514,6 +522,12 @@ pub async fn project_metadata_create_events(
             // document's lifecycle sync topic and may mint its genesis.
             Some(create_event_outbox_record(&event, realm_config, true))
         } else {
+            if authored_here {
+                // No live holder can accept the genesis yet; keep the marker so
+                // a later placement change retries the lifecycle mint.
+                mint_retry_targets.insert((document_id, event.event_id));
+                pending_projection_delete_targets.remove(&(document_id, event.event_id));
+            }
             None
         };
         // The registry row rides its own everywhere-bound topic, so it goes out
@@ -612,7 +626,12 @@ pub async fn project_metadata_create_events(
         schedule_materialization_drain(context).await?;
     }
     write_pending_projection_markers(context, &pending_projection_retry_targets).await?;
+    write_pending_projection_markers(context, &mint_retry_targets).await?;
     delete_pending_projection_markers(context, pending_projection_delete_targets).await?;
+    if !mint_retry_targets.is_empty() {
+        schedule_pending_metadata_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER)
+            .await?;
+    }
 
     if !pending_projection_retry_targets.is_empty() {
         return Err(MetadataProjectionError::ClockSkewDeferred {
@@ -621,6 +640,28 @@ pub async fn project_metadata_create_events(
     }
 
     Ok(projected)
+}
+
+async fn pending_projection_marker(
+    context: &DriverContext,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<bool, MetadataProjectionError> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key: metadata_pending_projection_key(document_id, event_id),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
 }
 
 async fn abort_projection_transaction(
