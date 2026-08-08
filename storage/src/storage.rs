@@ -588,11 +588,14 @@ impl StorageHandle {
                 Ok(()) => Ok(()),
                 Err(TrySendError::Full(item)) => {
                     rollback_cleanup(&mut pending, admission);
+                    // The item's ResponseToken re-locks the cleanup mutex on drop.
+                    drop(pending);
                     drop(item);
                     Err(StorageError::QueueFull)
                 }
                 Err(TrySendError::Disconnected(item)) => {
                     rollback_cleanup(&mut pending, admission);
+                    drop(pending);
                     drop(item);
                     Err(StorageError::ChannelClosed)
                 }
@@ -636,13 +639,13 @@ impl StorageHandle {
                 self.observe_storage_event(event)
             }
             Err(error) => {
-                if let Some(txn_id) = active_txn_id {
-                    if !matches!(
+                if let Some(txn_id) = active_txn_id
+                    && !matches!(
                         cleanup,
                         Some((_, CleanupKind::CommitQueued | CleanupKind::CommitUnknown))
-                    ) {
-                        self.enqueue_abort_transaction(txn_id, "request_timeout");
-                    }
+                    )
+                {
+                    self.enqueue_abort_transaction(txn_id, "request_timeout");
                 }
                 warn!(
                     event = "storage.request.timeout",
@@ -859,11 +862,10 @@ fn reserve_cleanup(
         (CleanupKind::Abort, Some(CleanupKind::Open))
             | (CleanupKind::CommitQueued, Some(CleanupKind::Open))
             | (CleanupKind::CommitUnknown, Some(CleanupKind::CommitQueued))
-    ) {
-        if let Some(entry) = pending.get_mut(&txn_id) {
-            entry.kind = kind;
-            entry.attempts = 0;
-        }
+    ) && let Some(entry) = pending.get_mut(&txn_id)
+    {
+        entry.kind = kind;
+        entry.attempts = 0;
     }
 
     Ok(CleanupAdmission {
@@ -927,14 +929,12 @@ fn observe_cleanup(
             CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
             StorageEvent::TransactionCommitted { txn_id: committed },
         ) if txn_id == *committed => Some(CleanupKind::Committed),
-        (CleanupKind::CommitQueued | CleanupKind::CommitUnknown, StorageEvent::Error { error })
-            if matches!(
-                error,
-                StorageError::TransactionConflict | StorageError::TransactionNotFound
-            ) =>
-        {
-            Some(CleanupKind::Aborted)
-        }
+        (
+            CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
+            StorageEvent::Error {
+                error: StorageError::TransactionConflict | StorageError::TransactionNotFound,
+            },
+        ) => Some(CleanupKind::Aborted),
         _ => None,
     };
     if let Some(terminal_kind) = terminal_kind {
@@ -977,7 +977,7 @@ fn observe_cleanup(
             entry.attempts = 0;
         }
     } else if let Some(entry) = pending.get_mut(&txn_id)
-        && matches!(entry.kind, CleanupKind::Abort)
+        && matches!(entry.kind, CleanupKind::Abort | CleanupKind::CommitUnknown)
     {
         entry.attempts = entry.attempts.saturating_add(1);
     }
@@ -992,6 +992,7 @@ fn finish_cleanup(pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>, txn_id: Ul
 }
 
 impl ResponseToken {
+    #[cfg(test)]
     fn empty() -> Self {
         Self {
             handle: None,
@@ -1251,12 +1252,20 @@ impl FjallStorage {
             .expect("transaction cleanup mutex poisoned")
             .iter()
             .filter_map(|(txn_id, entry)| {
-                (matches!(entry.kind, CleanupKind::Abort) && entry.attempts < MAX_CLEANUP_ATTEMPTS)
+                // CommitUnknown probes with an abort: a still-open transaction
+                // aborts, a resolved one reports NotFound; both are terminal.
+                (matches!(entry.kind, CleanupKind::Abort | CleanupKind::CommitUnknown)
+                    && entry.attempts < MAX_CLEANUP_ATTEMPTS)
                     .then_some((*txn_id, entry.kind))
             })
             .collect::<Vec<_>>();
         for (txn_id, kind) in retry {
-            let event = self.abort_transaction(txn_id);
+            // A commit with an unknown outcome is re-issued, never aborted: the
+            // original commit may still sit in the queue behind this retry.
+            let event = match kind {
+                CleanupKind::CommitUnknown => self.commit_transaction(txn_id),
+                _ => self.abort_transaction(txn_id),
+            };
             if self.observe_cleanup(Some((txn_id, kind)), &event) {
                 finish_cleanup(&self.transaction_cleanup, txn_id);
             }
@@ -1374,7 +1383,7 @@ impl FjallStorage {
     }
 
     fn process_single(&mut self, item: EffectHandle, slow_queue: &mut SlowQueueAggregator) {
-        let (effect, response_tx, span, enqueued_at, in_flight) = item;
+        let (effect, mut response_tx, span, enqueued_at, in_flight) = item;
         let _guard = span.enter();
         let operation = storage_effect_kind(&effect);
         let key_space = storage_effect_key_space(&effect).map(str::to_string);
@@ -1714,7 +1723,7 @@ impl FjallStorage {
                 error: StorageError::TransactionConflict,
             };
         }
-        let event = match self.txns.remove(&txn_id) {
+        match self.txns.remove(&txn_id) {
             Some(Txn::Write(txn)) => {
                 txn.rollback();
                 StorageEvent::TransactionAborted { txn_id }
@@ -1723,8 +1732,7 @@ impl FjallStorage {
             None => StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             },
-        };
-        event
+        }
     }
 
     #[tracing::instrument(
