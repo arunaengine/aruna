@@ -3602,7 +3602,9 @@ mod tests {
         let rule = configuration.rules[0].clone();
         configuration.rules.push(ReplicationRule {
             delete_marker_replication: Some(DeleteMarkerReplication {
-                status: Some(DeleteMarkerReplicationStatus::ENABLED),
+                status: Some(DeleteMarkerReplicationStatus::from_static(
+                    DeleteMarkerReplicationStatus::ENABLED,
+                )),
             }),
             ..rule
         });

@@ -288,7 +288,7 @@ fn record_s3_request(
 
 fn control_capacity(max_requests: usize) -> usize {
     let max_requests = max_requests.max(1);
-    (max_requests / 4).max(1).min(CONTROL_REQUEST_LIMIT)
+    (max_requests / 4).clamp(1, CONTROL_REQUEST_LIMIT)
 }
 
 fn bulk_capacity(max_requests: usize) -> usize {
@@ -351,37 +351,36 @@ fn is_bulk_request(
     let root = parsed_path.as_ref().is_some_and(s3s::path::S3Path::is_root);
     match method.as_str() {
         "GET" => {
-            root
-                || (bucket
-                    && !query_has_any(
-                        uri,
-                        &[
-                            "analytics",
-                            "intelligent-tiering",
-                            "inventory",
-                            "metrics",
-                            "session",
-                            "accelerate",
-                            "acl",
-                            "cors",
-                            "encryption",
-                            "lifecycle",
-                            "location",
-                            "logging",
-                            "metadataTable",
-                            "notification",
-                            "ownershipControls",
-                            "policy",
-                            "policyStatus",
-                            "replication",
-                            "requestPayment",
-                            "tagging",
-                            "versioning",
-                            "website",
-                            "object-lock",
-                            "publicAccessBlock",
-                        ],
-                    ))
+            root || (bucket
+                && !query_has_any(
+                    uri,
+                    &[
+                        "analytics",
+                        "intelligent-tiering",
+                        "inventory",
+                        "metrics",
+                        "session",
+                        "accelerate",
+                        "acl",
+                        "cors",
+                        "encryption",
+                        "lifecycle",
+                        "location",
+                        "logging",
+                        "metadataTable",
+                        "notification",
+                        "ownershipControls",
+                        "policy",
+                        "policyStatus",
+                        "replication",
+                        "requestPayment",
+                        "tagging",
+                        "versioning",
+                        "website",
+                        "object-lock",
+                        "publicAccessBlock",
+                    ],
+                ))
                 || (object
                     && !query_has_any(
                         uri,
@@ -515,7 +514,7 @@ impl ConnectionActivity {
     fn end_request(&self) {
         let _previous = self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 Some(active.saturating_sub(1))
             });
         self.touch();
@@ -608,7 +607,7 @@ struct ResponseBody {
 impl ResponseBody {
     fn new(
         inner: s3s::Body,
-        permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
         activity: Arc<ConnectionActivity>,
         response_activity: Arc<ConnectionActivity>,
         active: ActiveRequestGuard,
@@ -624,7 +623,7 @@ impl ResponseBody {
         });
         Self {
             inner: Box::pin(inner),
-            permit: Some(permit),
+            permit,
             activity,
             response_activity,
             cancellation,
@@ -633,16 +632,16 @@ impl ResponseBody {
             ended: false,
         }
     }
-}
-
-impl hyper::body::Body for ResponseBody {
-    type Data = hyper::body::Bytes;
-    type Error = s3s::StdError;
 
     fn finish(&mut self) {
         self.active.take();
         self.lease.take();
     }
+}
+
+impl hyper::body::Body for ResponseBody {
+    type Data = hyper::body::Bytes;
+    type Error = s3s::StdError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -1121,7 +1120,7 @@ impl Service<Request<Incoming>> for WrappingService {
                 record_s3_request(&metrics, &method, code, "body_limited", started.elapsed());
                 return Ok(response);
             }
-            let mut local_lease = LocalLease::default();
+            let local_lease = LocalLease::default();
             if let Some(charged_ip) = charged_ip {
                 let permit = match rate_limits.try_acquire_local(LocalKey::Ip(charged_ip)) {
                     Some(permit) => permit,
@@ -1323,7 +1322,14 @@ impl Service<Request<Incoming>> for WrappingService {
             let mut result = match result {
                 Ok(response) => {
                     let egress_permit = match egress_limit.try_acquire_owned() {
-                        Ok(permit) => permit,
+                        Ok(permit) => Some(permit),
+                        Err(TryAcquireError::NoPermits | TryAcquireError::Closed)
+                            if method != Method::GET && method != Method::HEAD =>
+                        {
+                            // The handler already ran: a durable mutation's small
+                            // ack must not be dropped for a streaming permit.
+                            None
+                        }
                         Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
                             drop(response);
                             drop(request_permit);
@@ -1609,7 +1615,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stream_progress_survives() {
         let activity = Arc::new(ConnectionActivity::default());
-        let watcher = tokio::spawn(activity.clone().wait_idle());
+        let task_activity = activity.clone();
+        let watcher = tokio::spawn(async move { task_activity.wait_idle().await });
         tokio::task::yield_now().await;
         tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
         activity.touch();
@@ -1624,7 +1631,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn byte_trickle_closes() {
         let activity = Arc::new(ConnectionActivity::default());
-        let watcher = tokio::spawn(activity.clone().wait_idle());
+        let task_activity = activity.clone();
+        let watcher = tokio::spawn(async move { task_activity.wait_idle().await });
         tokio::task::yield_now().await;
         tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
         activity.record_progress(1);
@@ -1638,7 +1646,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn small_frames_progress() {
         let activity = Arc::new(ConnectionActivity::default());
-        let watcher = tokio::spawn(activity.clone().wait_idle());
+        let watcher = {
+            let task = activity.clone();
+            tokio::spawn(async move { task.wait_idle().await })
+        };
         tokio::task::yield_now().await;
         let half = STREAM_PROGRESS_BYTES / 2;
         activity.record_progress(half);
@@ -1655,7 +1666,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn large_frame_bound() {
         let activity = Arc::new(ConnectionActivity::default());
-        let watcher = tokio::spawn(activity.clone().wait_idle());
+        let watcher = {
+            let task = activity.clone();
+            tokio::spawn(async move { task.wait_idle().await })
+        };
         tokio::task::yield_now().await;
         activity.record_progress(STREAM_PROGRESS_BYTES * 2);
         tokio::task::yield_now().await;
@@ -1673,7 +1687,10 @@ mod tests {
         let activity = Arc::new(ConnectionActivity::default());
         activity.mark_request();
         activity.begin_request();
-        let watcher = tokio::spawn(activity.clone().wait_idle());
+        let watcher = {
+            let task = activity.clone();
+            tokio::spawn(async move { task.wait_idle().await })
+        };
         tokio::time::advance(CONNECTION_IDLE_TIMEOUT * 2).await;
         assert!(!activity.is_cancelled());
         activity.end_request();
@@ -1694,7 +1711,7 @@ mod tests {
         let active = ActiveRequestGuard::new(activity.clone(), deadline_activity);
         let body = ResponseBody::new(
             s3s::Body::empty(),
-            permit,
+            Some(permit),
             activity.clone(),
             response_activity.clone(),
             active,
@@ -1813,7 +1830,7 @@ mod tests {
         let active = ActiveRequestGuard::new(activity.clone(), deadline_activity.clone());
         let body = ResponseBody::new(
             s3s::Body::empty(),
-            permit,
+            Some(permit),
             activity.clone(),
             response_activity.clone(),
             active,
@@ -1880,10 +1897,7 @@ mod tests {
         let limit = Arc::new(Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().expect("permit");
         let local_limit = Arc::new(Semaphore::new(1));
-        let local_permit = local_limit
-            .clone()
-            .try_acquire_owned()
-            .expect("local permit");
+        let local_permit = crate::rate_limit::LocalPermit::test_permit(local_limit.clone());
         let lease = LocalLease::default();
         assert!(lease.hold(local_permit));
         let activity = Arc::new(ConnectionActivity::default());
@@ -1893,7 +1907,7 @@ mod tests {
         let stream_activity = Arc::new(ConnectionActivity::default());
         let body = ResponseBody::new(
             s3s::Body::empty(),
-            permit,
+            Some(permit),
             activity.clone(),
             stream_activity,
             active,
@@ -2187,7 +2201,10 @@ mod tests {
     async fn sibling_not_refresh() {
         let stalled = Arc::new(ConnectionActivity::default());
         let sibling = Arc::new(ConnectionActivity::default());
-        let stalled_task = tokio::spawn(stalled.clone().wait_idle());
+        let stalled_task = {
+            let task = stalled.clone();
+            tokio::spawn(async move { task.wait_idle().await })
+        };
         tokio::task::yield_now().await;
         sibling.touch();
         tokio::time::advance(CONNECTION_IDLE_TIMEOUT).await;
@@ -2204,7 +2221,7 @@ mod tests {
             .map(|_| limit.clone().try_acquire_owned().expect("capture permit"))
             .collect::<Vec<_>>();
         assert!(matches!(
-            limit.try_acquire_owned(),
+            limit.clone().try_acquire_owned(),
             Err(TryAcquireError::NoPermits)
         ));
         drop(permits);
