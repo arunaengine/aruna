@@ -1989,7 +1989,7 @@ mod tests {
                 location,
                 owner: WriteOwner::Blob {
                     blake3: [7u8; 32],
-                    realm_id: RealmId::from_bytes([4u8; 32]),
+                    realm_id: op.input.realm_id,
                     ttl_ms: RoCrateLimits::default().holder_ttl_ms,
                 },
             }
@@ -2037,15 +2037,19 @@ mod tests {
                 .is_some()
         );
 
-        assert!(matches!(
-            op.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            }))
-            .as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
-        let effects = op.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
+        // The row is retried until storage accepts it; only then is the
+        // reservation released.
+        for _ in 0..2 {
+            assert!(matches!(
+                op.step(Event::Storage(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                }))
+                .as_slice(),
+                [Effect::Storage(StorageEffect::Write { .. })]
+            ));
+        }
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"k".to_vec().into(),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -2074,8 +2078,8 @@ mod tests {
             message: "reservation finalization failed".to_string(),
         })));
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             })]
         );
@@ -2120,8 +2124,8 @@ mod tests {
             key: Vec::new().into(),
         }));
         assert_eq!(
-            effects,
-            smallvec![Effect::Blob(BlobEffect::ReleaseReservation {
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation {
                 id: release_id
             })]
         );
@@ -2178,8 +2182,8 @@ mod tests {
             key: Vec::new().into(),
         }));
         assert_eq!(
-            effects,
-            smallvec![Effect::Blob(BlobEffect::ReleaseReservation {
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation {
                 id: release_id
             })]
         );
@@ -2225,7 +2229,7 @@ mod tests {
     fn unknown_reset_reconciles() {
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         let location = composed_location(Ulid::from_bytes([5u8; 16]));
-        op.composed_location = Some(location);
+        op.composed_location = Some(location.clone());
         op.txn_id = Some(TxnId::from_bytes([3u8; 16]));
         op.pending_error = Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         op.state = CompleteMultipartUploadState::CommitResetTransaction;
@@ -2533,7 +2537,7 @@ mod tests {
             vec![7u8; 32],
         );
         op.final_location = Some(final_location.clone());
-        op.composed_location = Some(final_location);
+        op.composed_location = Some(final_location.clone());
         let txn_id = Ulid::generate();
         op.txn_id = Some(txn_id);
         op.version_id = Some(Ulid::generate());
@@ -2577,11 +2581,12 @@ mod tests {
             BlobCleanupWork::ReconcileWrite {
                 location,
                 owner: WriteOwner::Blob {
-                    blake3: [7u8; 32],
+                    blake3,
                     realm_id,
                     ttl_ms,
                 },
-            } if location.get_blake3() == Some(&[7u8; 32][..])
+            } if *blake3 == [7u8; 32]
+                && location.get_blake3() == Some(&[7u8; 32][..])
                 && *realm_id == op.input.realm_id
                 && *ttl_ms == op.rocrate_limits.holder_ttl_ms
         )));
@@ -2619,8 +2624,8 @@ mod tests {
         }));
 
         assert_eq!(
-            effects,
-            smallvec![Effect::Blob(BlobEffect::ReleaseReservation {
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation {
                 id: location.ulid
             })]
         );
@@ -2746,8 +2751,8 @@ mod tests {
         }));
 
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             })]
         );
@@ -2777,8 +2782,8 @@ mod tests {
         }));
 
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         );
         assert_eq!(operation.state, CompleteMultipartUploadState::Error);
         assert_eq!(operation.txn_id, None);

@@ -192,7 +192,7 @@ impl CreateUserAccessOperation {
             return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
         };
         let replace = index.contains(&new_access.access_key);
-        let mut reads = index
+        let mut reads: Vec<_> = index
             .iter()
             .map(|access_key| {
                 (
@@ -507,9 +507,18 @@ mod tests {
         assert_eq!(access.issued_by, test_issuer());
         assert_eq!(access.revoked_at, None);
 
+        // An empty index still probes the fresh key for a collision in the txn.
+        let access_key = access.access_key.clone();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: owner_key(user_identity),
             value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(id), .. })] if *id == txn_id
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(access_key.as_bytes().into(), None)],
         }));
         assert!(matches!(
             effects.as_slice(),

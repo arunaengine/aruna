@@ -1014,6 +1014,17 @@ mod tests {
         .await;
         write_fixture(
             &state,
+            REALM_CONFIG_KEYSPACE,
+            ByteView::from(realm_id.as_bytes().to_vec()),
+            ByteView::from(
+                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                    .to_bytes(&actor)
+                    .expect("realm config serializes"),
+            ),
+        )
+        .await;
+        write_fixture(
+            &state,
             S3_BUCKET_KEYSPACE,
             ByteView::from(TEST_BUCKET.as_bytes().to_vec()),
             ByteView::from(

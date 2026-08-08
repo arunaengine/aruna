@@ -481,7 +481,7 @@ mod tests {
     use super::*;
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::{BackendLocation, BackendRef};
-    use smallvec::smallvec;
+
     use std::collections::HashMap;
     use std::time::SystemTime;
 
@@ -523,8 +523,8 @@ mod tests {
         }));
 
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             })]
         );
@@ -551,8 +551,8 @@ mod tests {
         }));
 
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         );
         assert_eq!(operation.state, AbortMultipartUploadState::Error);
         assert_eq!(operation.txn_id, None);
@@ -612,8 +612,8 @@ mod tests {
             entries: Vec::new(),
         }));
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
         );
         assert_eq!(
             operation.state,

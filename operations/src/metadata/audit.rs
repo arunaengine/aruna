@@ -907,12 +907,12 @@ pub(crate) async fn send_audit_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT, AUDIT_OUTBOUND_ADMISSION,
-        AUDIT_OUTBOUND_LIMIT, AuditPageEntry, AuditPageResponse, Effect, Event, ListAuditError,
-        ListAuditOperation, ListAuditRequest, LocalAuditPageOperation, MAX_AUDIT_CURSOR_CHARS,
-        MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect, NetEvent, Operation,
-        StorageEvent, audit_member, audit_scope, authorize_admin, decode_cursor, drive_until,
-        encode_cursor, list_audit, select_peers,
+        AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
+        AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AuditPageEntry, AuditPageResponse, Effect,
+        Event, ListAuditError, ListAuditOperation, ListAuditRequest, LocalAuditPageOperation,
+        MAX_AUDIT_CURSOR_CHARS, MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect,
+        NetEvent, Operation, StorageEvent, audit_member, audit_scope, authorize_admin,
+        decode_cursor, drive_until, encode_cursor, list_audit, select_peers,
     };
     use crate::driver::DriverContext;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
@@ -1590,7 +1590,7 @@ mod tests {
     fn caps_missing_peers() {
         let realm_id = RealmId([1u8; 32]);
         let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let peers = (2u8..=u8::try_from(MAX_AUDIT_PEERS * 2 + 3).unwrap())
+        let peers: Vec<_> = (2u8..=u8::try_from(MAX_AUDIT_PEERS * 2 + 3).unwrap())
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
         let mut operation = ListAuditOperation::new(
@@ -1674,7 +1674,7 @@ mod tests {
     #[test]
     fn user_skips_local() {
         let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
-        let operation = ListAuditOperation::new(
+        let mut operation = ListAuditOperation::new(
             RealmId([9u8; 32]),
             node,
             false,

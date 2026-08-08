@@ -340,7 +340,8 @@ mod tests {
             compute_handle: None,
         };
 
-        let access_key = "test-access-key".to_string();
+        // Access keys are validated as strictly alphanumeric.
+        let access_key = "testaccesskey".to_string();
         let user_access = UserAccess {
             access_key: access_key.clone(),
             user_identity: Default::default(),

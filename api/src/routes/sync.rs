@@ -1068,7 +1068,9 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE,
+    };
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
         RealmAuthorizationDocument, RealmId,
@@ -1151,6 +1153,13 @@ mod tests {
             realm_id,
             group_id,
         );
+        let group = aruna_core::structs::Group {
+            display_name: "sync-test".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: relationship.created_by,
+        };
         for (key_space, key, value) in [
             (
                 AUTH_KEYSPACE,
@@ -1161,6 +1170,11 @@ mod tests {
                 AUTH_KEYSPACE,
                 group_id.to_bytes().to_vec(),
                 group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
             ),
         ] {
             storage

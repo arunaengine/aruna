@@ -260,10 +260,12 @@ mod tests {
         ));
         let txn_id = Ulid::generate();
         assert!(matches!(
-            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id })),
+            operation
+                .step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
+                .as_slice(),
             [Effect::Storage(StorageEffect::Read {
                 txn_id: Some(observed), ..
-            })] if observed == txn_id
+            })] if *observed == txn_id
         ));
         let index = encode_index(&keys).unwrap();
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -276,7 +278,7 @@ mod tests {
                 reads,
                 txn_id: Some(observed),
             })]
-                if observed == txn_id && reads.len() == MAX_ACTIVE_CREDENTIALS
+                if *observed == txn_id && reads.len() == MAX_ACTIVE_CREDENTIALS
         ));
         let values = keys
             .iter()
@@ -295,9 +297,11 @@ mod tests {
             })
             .collect();
         assert!(matches!(
-            operation.step(Event::Storage(StorageEvent::BatchReadResult { values })),
+            operation
+                .step(Event::Storage(StorageEvent::BatchReadResult { values }))
+                .as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id: observed })]
-                if observed == txn_id
+                if *observed == txn_id
         ));
         operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,

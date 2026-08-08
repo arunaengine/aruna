@@ -1433,6 +1433,7 @@ mod test {
     use crate::s3::put_object::{
         PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
     };
+
     use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::blob::{BackendRegistry, NodeBackend};
@@ -1865,8 +1866,8 @@ mod test {
             super::BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
             super::BlobCleanupWork::ReconcileWrite {
                 location: observed,
-                owner: super::WriteOwner::Blob { blake3: [7u8; 32], .. },
-            } if observed == location
+                owner: super::WriteOwner::Blob { blake3, .. },
+            } if blake3 == [7u8; 32] && observed == location
         ));
 
         let effects = op.step(Event::Storage(StorageEvent::WriteResult {
@@ -1896,8 +1897,8 @@ mod test {
             txn_id: Ulid::generate(),
         }));
         assert_eq!(
-            effects,
-            smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation { id })]
         );
         assert_eq!(op.state, PutObjectState::ReleaseReservation);
 
@@ -1940,15 +1941,19 @@ mod test {
                 .is_some()
         );
 
-        assert!(matches!(
-            op.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            }))
-            .as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
-        let effects = op.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
+        // The row is retried until storage accepts it; only then is the
+        // reservation released.
+        for _ in 0..2 {
+            assert!(matches!(
+                op.step(Event::Storage(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                }))
+                .as_slice(),
+                [Effect::Storage(StorageEffect::Write { .. })]
+            ));
+        }
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"k".to_vec().into(),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -2047,8 +2052,8 @@ mod test {
                 key: b"k".to_vec().into(),
             }));
             assert_eq!(
-                effects,
-                smallvec![Effect::Blob(BlobEffect::ReleaseReservation {
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::ReleaseReservation {
                     id: release_id
                 })]
             );

@@ -205,11 +205,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "sync.rs",
-        "delete_sync",
-        "self-scoped: ensure_creator limits it to the relationship creator",
-    ),
-    (
-        "sync.rs",
         "get_sync",
         "self-scoped: ensure_creator limits it to the relationship creator",
     ),

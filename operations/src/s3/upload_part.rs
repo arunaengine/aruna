@@ -807,8 +807,8 @@ mod test {
             message: "cleanup failed".to_string(),
         })));
         assert_eq!(
-            effects,
-            smallvec![Effect::Blob(BlobEffect::Delete {
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete {
                 location: location.clone()
             })]
         );
@@ -929,8 +929,8 @@ mod test {
     fn retries_row_failure() {
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let location = part_location(backend_id);
         let mut op = upload_part_op(backend_id);
+        let location = op.written_location.clone().unwrap();
         op.state = UploadPartState::WriteCleanupRow;
         op.txn_id = Some(txn_id);
 
@@ -938,8 +938,8 @@ mod test {
             error: StorageError::WriteError,
         }));
         assert_eq!(
-            effects,
-            smallvec![Effect::Blob(BlobEffect::Delete {
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete {
                 location: location.clone()
             })]
         );
@@ -959,8 +959,8 @@ mod test {
             key: b"cleanup".to_vec().into(),
         }));
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         );
     }
 
@@ -1103,8 +1103,8 @@ mod test {
             key: b"cleanup".to_vec().into(),
         }));
         assert_eq!(
-            effects,
-            smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction {
                 txn_id: TxnId::from_bytes([3u8; 16])
             })]
         );
@@ -1132,8 +1132,8 @@ mod test {
     #[test]
     fn abort_queues_delete() {
         let backend_id = Ulid::from_bytes([5u8; 16]);
-        let location = part_location(backend_id);
         let mut op = upload_part_op(backend_id);
+        let location = op.written_location.clone().unwrap();
         op.state = UploadPartState::StartTransaction;
 
         let effects = op.abort();

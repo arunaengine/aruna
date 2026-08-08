@@ -505,7 +505,6 @@ async fn dispatch_audit_page(
         operation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE);
     let requests = stream::iter(nodes.into_iter().map(|node| {
         let request = request.clone();
-        let deadline = deadline;
         async move {
             let peer_deadline = tokio::time::Instant::now() + AUDIT_PEER_DEADLINE;
             let peer_deadline = if peer_deadline < deadline {
@@ -669,12 +668,10 @@ impl TransactionTracker {
             }
             (
                 Some(TransactionEffect::Commit(txn_id)),
-                Event::Storage(StorageEvent::Error { error }),
-            ) if matches!(
-                error,
-                StorageError::TransactionConflict | StorageError::TransactionNotFound
-            ) =>
-            {
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict | StorageError::TransactionNotFound,
+                }),
+            ) => {
                 self.states.remove(&txn_id);
             }
             (
@@ -703,17 +700,17 @@ impl TransactionTracker {
             }
             (
                 Some(TransactionEffect::Abort(txn_id)),
-                Event::Storage(StorageEvent::Error { error }),
-            ) if matches!(error, StorageError::TransactionNotFound) => {
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionNotFound,
+                }),
+            ) => {
                 self.states.remove(&txn_id);
             }
             (
                 Some(TransactionEffect::Abort(txn_id)),
                 Event::Storage(StorageEvent::Error { .. }),
-            ) => {
-                if self.states.contains_key(&txn_id) {
-                    self.states.insert(txn_id, TransactionState::AbortFailed);
-                }
+            ) if self.states.contains_key(&txn_id) => {
+                self.states.insert(txn_id, TransactionState::AbortFailed);
             }
             _ => {}
         }
@@ -1214,7 +1211,10 @@ fn event_kind(event: &Event) -> &'static str {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, audit_nodes, drive};
+    use crate::driver::{
+        DriverContext, MAX_TRACKED_TRANSACTIONS, TransactionEffect, TransactionState,
+        TransactionTracker, audit_nodes, drive, managed_effect,
+    };
     use aruna_core::{
         audit::{AuditPageBatch, MAX_AUDIT_PEERS},
         effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect},
@@ -1995,8 +1995,10 @@ mod test {
         assert!(transaction_reopens(&context).await);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn commit_refresh_survives() {
+        // Real time: the proxy actor answers from an OS thread, and paused-time
+        // auto-advance would fire the storage request timeout before it can.
         assert!(managed_effect(&Effect::Storage(
             StorageEffect::CommitTransaction {
                 txn_id: ulid::Ulid::generate(),
@@ -2050,10 +2052,8 @@ mod test {
                 if committed_event {
                     committed_for_actor.store(true, Ordering::Release);
                 }
-                if gated {
-                    if let Some(sender) = done_tx.take() {
-                        let _ = sender.send(());
-                    }
+                if gated && let Some(sender) = done_tx.take() {
+                    let _ = sender.send(());
                 }
             }
         });
@@ -2090,7 +2090,6 @@ mod test {
         });
 
         started_rx.await.unwrap();
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
         assert!(task.await.unwrap().is_ok());
 
         committed.store(false, Ordering::Release);
@@ -2439,10 +2438,18 @@ mod test {
         tokio::time::advance(std::time::Duration::from_secs(10)).await;
         assert!(task.await.unwrap().is_ok());
         assert!(!aborted.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(
-            staged_value(&context).await,
-            Some(ByteView::from(*b"staged"))
-        );
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"nested-staged"),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event");
+        };
+        assert_eq!(value, Some(ByteView::from(*b"staged")));
 
         let txn_id = seen.lock().unwrap().expect("child transaction recorded");
         assert!(matches!(
@@ -2775,29 +2782,44 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_suboperation_depth_limit_is_enforced() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
+    #[test]
+    fn test_suboperation_depth_limit_is_enforced() {
+        // Driving to the depth limit nests deep futures; the default test
+        // thread stack overflows, so the drive runs on a dedicated big stack.
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let random_path = tempdir().unwrap();
+                    let storage_handle =
+                        storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+                    let context = DriverContext {
+                        storage_handle,
+                        net_handle: None,
+                        blob_handle: None,
+                        metadata_handle: None,
+                        task_handle: None,
+                        compute_handle: None,
+                    };
 
-        let event = drive(RecursiveSubOperation::new(), &context)
-            .await
-            .expect("recursive suboperation should resolve to depth-limit event");
+                    let event = drive(RecursiveSubOperation::new(), &context)
+                        .await
+                        .expect("recursive suboperation should resolve to depth-limit event");
 
-        assert!(matches!(
-            event,
-            Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth })
-                if max_depth == super::MAX_SUBOP_DEPTH
-        ));
+                    assert!(matches!(
+                        event,
+                        Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth })
+                            if max_depth == super::MAX_SUBOP_DEPTH
+                    ));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 

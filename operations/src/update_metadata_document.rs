@@ -325,7 +325,7 @@ impl UpdateMetadataDocumentOperation {
         if origins != original {
             return Err(UpdateMetadataDocumentError::RawLimit);
         }
-        let encoded_bytes = postcard::serialized_size(event)
+        let encoded_bytes = postcard::experimental::serialized_size(event)
             .map_err(|_| UpdateMetadataDocumentError::RawLimit)
             .and_then(|size| {
                 u64::try_from(size).map_err(|_| UpdateMetadataDocumentError::RawLimit)
@@ -441,8 +441,8 @@ impl UpdateMetadataDocumentOperation {
         if !self.valid_budget(budget, &quota) || budget.events >= budget.event_limit {
             return Err(UpdateMetadataDocumentError::RawLimit);
         }
-        let event_bytes =
-            postcard::serialized_size(event).map_err(aruna_core::errors::ConversionError::from)?;
+        let event_bytes = postcard::experimental::serialized_size(event)
+            .map_err(aruna_core::errors::ConversionError::from)?;
         let event_bytes =
             u64::try_from(event_bytes).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
         if history_bytes
@@ -948,7 +948,7 @@ mod tests {
         encoded_bytes: u64,
     ) -> MetadataRawOriginBudget {
         let create = create_event(record);
-        let create_bytes = postcard::serialized_size(&create).unwrap() as u64;
+        let create_bytes = postcard::experimental::serialized_size(&create).unwrap() as u64;
         let mut budget = raw_quotas(
             record.document_id,
             &record.holder_node_ids,
@@ -1158,7 +1158,7 @@ mod tests {
         operation.step(raw_budget_read(
             &record,
             1,
-            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+            postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         let effects = operation.step(raw_events(&record));
 
@@ -1189,14 +1189,9 @@ mod tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
-        assert_start_transaction(
-            operation
-                .step(Event::Metadata(MetadataEvent::ValidationResult {
-                    graph_iri: record.graph_iri.clone(),
-                }))
-                .as_slice(),
-        );
+        // Entity upserts validate synchronously, so the transaction starts
+        // straight from the realm config read.
+        assert_start_transaction(operation.step(realm_config_read(&record)).as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),
@@ -1210,7 +1205,7 @@ mod tests {
         operation.step(raw_budget_read(
             &record,
             1,
-            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+            postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         let event = assert_update_batch(
             operation.step(raw_events(&record)).as_slice(),
@@ -1241,7 +1236,7 @@ mod tests {
         operation.step(raw_budget_read(
             &record,
             1,
-            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+            postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         let values = (0..RAW_EVENT_LIMIT)
             .map(|index| (ByteView::from(vec![index as u8]), ByteView::from(vec![0])))
@@ -1283,7 +1278,7 @@ mod tests {
         operation.step(raw_budget_read(
             &record,
             1,
-            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+            postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         let effects = operation.step(raw_events(&record));
 
@@ -1350,7 +1345,7 @@ mod tests {
         assert_eq!(budget.events, 2);
         assert_eq!(
             budget.encoded_bytes,
-            create_len + postcard::serialized_size(&event).unwrap() as u64
+            create_len + postcard::experimental::serialized_size(&event).unwrap() as u64
         );
         assert_eq!(budget.node_id, actor.node_id);
         assert_eq!(event.record.document_id, record.document_id);
@@ -1408,14 +1403,17 @@ mod tests {
         operation.step(realm_config_read(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
-        operation.step(raw_budget_read(&record, METADATA_RAW_EVENT_LIMIT, 0));
-        let effects = operation.step(raw_events(&record));
+        // The exhausted budget is rejected at the sidecar fence read itself.
+        let effects = operation.step(raw_budget_read(&record, METADATA_RAW_EVENT_LIMIT, 0));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
-                if *abort_txn == txn_id
-        ));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
+                    if *abort_txn == txn_id
+            ),
+            "expected raw-limit abort, got {effects:?}"
+        );
         assert_eq!(
             operation.finalize(),
             Err(UpdateMetadataDocumentError::RawLimit)
@@ -1437,12 +1435,8 @@ mod tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
-        assert_start_transaction(
-            operation
-                .step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
-                .as_slice(),
-        );
+        assert_start_transaction(operation.step(realm_config_read(&record)).as_slice());
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: metadata_registry_key(record.group_id, record.document_id),
             value: None,
@@ -1493,7 +1487,7 @@ mod tests {
         let effects = operation.step(raw_budget_read(
             &record,
             1,
-            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+            postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(raw_events(&record));
@@ -1523,12 +1517,12 @@ mod tests {
         assert_no_graph_mutation_or_sync(effects.as_slice());
         assert_start_transaction(effects.as_slice());
 
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let _effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         operation.step(raw_budget_read(
             &record,
             1,
-            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+            postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         let effects = operation.step(raw_events(&record));
         let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
@@ -1556,7 +1550,7 @@ mod tests {
         let effects = operation.step(realm_config_read(&record));
         assert_start_transaction(effects.as_slice());
 
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let _effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         let effects = operation.step(raw_missing_budget(&record));
         assert!(matches!(
@@ -1599,7 +1593,7 @@ mod tests {
         let effects = operation.step(raw_budget_read(
             &record,
             1,
-            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+            postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(raw_events(&record));

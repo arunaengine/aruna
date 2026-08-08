@@ -237,7 +237,8 @@ pub async fn write_message(
 
 pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
     if frame_class(message) == AUDIT_FRAME {
-        let size = postcard::serialized_size(message).map_err(|err| err.to_string())?;
+        let size =
+            postcard::experimental::serialized_size(message).map_err(|err| err.to_string())?;
         if size > audit_frame_cap() {
             return Err("metadata message exceeds maximum size".to_string());
         }
@@ -562,7 +563,10 @@ mod tests {
         let message = MetadataTransportMessage::ForwardedMetadataHistoryCapacity;
         let bytes = postcard::to_allocvec(&message).unwrap();
 
-        assert_eq!(postcard::from_bytes(&bytes).unwrap(), message);
+        assert_eq!(
+            postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+            message
+        );
     }
 
     #[test]
@@ -611,7 +615,10 @@ mod tests {
 
             for message in [query, search, buckets] {
                 let bytes = postcard::to_allocvec(&message).unwrap();
-                assert_eq!(postcard::from_bytes(&bytes).unwrap(), message);
+                assert_eq!(
+                    postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+                    message
+                );
             }
         }
     }
@@ -867,7 +874,7 @@ mod tests {
                         realm_id,
                         group_id: Ulid::from_bytes([2u8; 16]),
                         document_id: Ulid::from_bytes([3u8; 16]),
-                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES),
+                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
                         user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
                         node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
                         operation: MetadataAuditOperation::Create,
@@ -993,7 +1000,7 @@ mod tests {
                         realm_id: RealmId([1u8; 32]),
                         group_id: Ulid::from_bytes([2u8; 16]),
                         document_id: Ulid::from_bytes([3u8; 16]),
-                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES),
+                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
                         user_id: UserId::local(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32])),
                         node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
                         operation: MetadataAuditOperation::Create,

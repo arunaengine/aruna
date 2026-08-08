@@ -435,10 +435,12 @@ mod tests {
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, Role,
+        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument, Role,
     };
     use aruna_core::{UserId, structs::BucketInfo};
     use aruna_storage::storage;
@@ -576,6 +578,16 @@ mod tests {
             user_id: owner,
             realm_id,
         };
+        // Bulk policy loading fails closed without the realm config document.
+        write_value(
+            &context,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
         write_value(
             &context,
             AUTH_KEYSPACE,
