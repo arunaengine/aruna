@@ -6,9 +6,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-};
+use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::storage_entries::{
     document_sync_revision_write_entry, watch_subscription_delete_entry,
@@ -1150,15 +1148,17 @@ mod tests {
     async fn realm_scan_caps() {
         let (_dir, storage) = temp_storage();
         let realm = RealmId([9u8; 32]);
+        // Owner and watch ids are offset by one: stored rows with nil identity
+        // are rejected at decode time.
         let writes = (0..=NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP)
             .map(|index| {
                 let owner = UserId::new(
-                    Ulid::from_bytes([(index / NOTIFICATION_WATCH_PER_USER_CAP) as u8; 16]),
+                    Ulid::from_bytes([(index / NOTIFICATION_WATCH_PER_USER_CAP + 1) as u8; 16]),
                     realm,
                 );
                 let mut subscription =
                     WatchSubscription::new(owner, format!("p/{index}"), mask(), index as u64);
-                subscription.watch_id = Ulid::from_bytes((index as u128).to_be_bytes());
+                subscription.watch_id = Ulid::from_bytes(((index + 1) as u128).to_be_bytes());
                 watch_subscription_write_entry(&subscription).expect("subscription encodes")
             })
             .collect();

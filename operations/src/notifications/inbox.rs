@@ -492,9 +492,11 @@ mod tests {
             .await
             .expect("initial transient records succeed");
 
+        let left = [transient_record()];
+        let right = [transient_record()];
         let (first, second) = tokio::join!(
-            upsert_inbox_records(&storage, &[transient_record()]),
-            upsert_inbox_records(&storage, &[transient_record()]),
+            upsert_inbox_records(&storage, &left),
+            upsert_inbox_records(&storage, &right),
         );
         assert!(first.is_ok() ^ second.is_ok());
         assert_eq!(

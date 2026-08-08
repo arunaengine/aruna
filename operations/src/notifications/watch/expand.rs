@@ -24,8 +24,7 @@ use crate::notifications::protocol::{
 };
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_authorization, evaluate_watch_delivery,
-    evaluate_watch_event_authorization,
+    WatchAuthorization, evaluate_watch_delivery, evaluate_watch_event_authorization,
 };
 use crate::notifications::watch::interest::{
     mark_watch_interest_dirty, schedule_watch_interest_publish, watch_interest_dirty_marker_write,
@@ -223,11 +222,11 @@ async fn expand_watch_events_once(
         (None, Some(_)) => unreachable!(),
     };
     let dropped = found_stale || denied;
-    if next.is_some() || dropped {
-        if let Err(error) = stage_dirty_marker(context, realm_id, txn_id).await {
-            abort_transaction(context, txn_id).await;
-            return Err(error);
-        }
+    if (next.is_some() || dropped)
+        && let Err(error) = stage_dirty_marker(context, realm_id, txn_id).await
+    {
+        abort_transaction(context, txn_id).await;
+        return Err(error);
     }
     if outcome.written == 0 && !queue_changed && !dropped {
         abort_transaction(context, txn_id).await;
@@ -829,8 +828,13 @@ mod tests {
 
     #[test]
     fn page_caps_work() {
+        // A full batch pages at the tightest cap so the in-loop candidate and
+        // record budgets can never abort a dense expansion mid-stream.
         assert_eq!(page_limit(1).expect("one event fits"), WATCH_PAGE_LIMIT);
-        assert_eq!(page_limit(NOTIFICATION_WATCH_EVENT_BATCH_SIZE).unwrap(), 32);
+        assert_eq!(
+            page_limit(NOTIFICATION_WATCH_EVENT_BATCH_SIZE).unwrap(),
+            NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP / NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+        );
         assert!(page_limit(usize::MAX).is_err());
     }
 

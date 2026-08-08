@@ -5,9 +5,9 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{
-    MetadataRegistryRecord, NotificationClass, NotificationKind, NotificationRecord,
-    RealmConfigDocument, RealmId, WatchEvent, WatchEventDetail, WatchEventKind,
-    data_watch_resource_path, parse_data_watch_resource_path,
+    MetadataRegistryRecord, NotificationKind, NotificationRecord, RealmConfigDocument, RealmId,
+    WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
+    parse_data_watch_resource_path,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -913,6 +913,15 @@ mod tests {
         }
     }
 
+    /// Registers the realm config with net admission, as production reloads do.
+    /// Without this, the first in-request reload closes provisional sessions.
+    async fn admit_peers(node: &Node, config: &RealmConfigDocument) {
+        node.net
+            .refresh_realm_peers_from_document(config)
+            .await
+            .expect("refresh realm peers");
+    }
+
     async fn install_watch_authorization(
         node: &Node,
         realm_id: RealmId,
@@ -1459,6 +1468,7 @@ mod tests {
         .await;
         let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
         install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        admit_peers(&b, &config).await;
         let direct = record(recipient, 1);
         let watch_two = watch_record(recipient, 2);
         let watch_three = watch_record(recipient, 3);
@@ -1550,6 +1560,7 @@ mod tests {
         .await;
         let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
         install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        admit_peers(&b, &config).await;
         let direct = record(recipient, 1);
         let watch = watch_record(recipient, 2);
         seed_inbox(&b, &[direct.clone(), watch.clone()]).await;
@@ -1824,6 +1835,7 @@ mod tests {
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         install_watch_authorization(&b, realm_id, owner, &[]).await;
+        admit_peers(&b, &config).await;
         let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
         let prefix = data_path("prefix");
         let created = create_watch_remote(
@@ -1937,6 +1949,7 @@ mod tests {
         // The watched group exists and is readable, just not by `owner`.
         install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[])
             .await;
+        admit_peers(&b, &config).await;
 
         let error = create_watch_remote(
             &a.net,
@@ -1978,6 +1991,7 @@ mod tests {
         .await;
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         install_watch_authorization(&b, realm_id, owner, &[]).await;
+        admit_peers(&b, &config).await;
         let existing_prefix = data_path("existing");
         let existing = create_watch_remote(
             &a.net,
@@ -2103,6 +2117,7 @@ mod tests {
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         install_watch_authorization(&b, realm_id, owner, &[]).await;
+        admit_peers(&b, &config).await;
         let created = create_watch_remote(
             &a.net,
             b.net.node_id(),
@@ -2297,6 +2312,7 @@ mod tests {
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         let actor = UserId::new(Ulid::generate(), realm_id);
         install_watch_authorization(&b, realm_id, owner, &[]).await;
+        admit_peers(&b, &config).await;
         create_watch_subscription(
             &b.context.storage_handle,
             owner,
@@ -2380,7 +2396,7 @@ mod tests {
             other => panic!("unexpected dirty marker delete result: {other:?}"),
         }
         // Adding node A re-ranks only `stale_owner` away from node B.
-        install_config(
+        let config = install_config(
             &b,
             realm_id,
             &[
@@ -2389,6 +2405,7 @@ mod tests {
             ],
         )
         .await;
+        admit_peers(&b, &config).await;
 
         let actor = UserId::new(Ulid::generate(), realm_id);
         let written = deliver_watch_events_remote(
