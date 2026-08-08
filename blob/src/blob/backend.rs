@@ -53,10 +53,10 @@ pub(super) struct ReservationGuard {
 
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
-        if self.remove_on_drop {
-            if let Ok(mut active) = self.active.lock() {
-                active.remove(&self.id);
-            }
+        if self.remove_on_drop
+            && let Ok(mut active) = self.active.lock()
+        {
+            active.remove(&self.id);
         }
     }
 }
@@ -1175,16 +1175,14 @@ impl BlobHandler {
                 "unexpected hidden bucket iteration event".to_string(),
             ));
         };
+        // Slice past the backend discriminator only: the stored name keeps its
+        // configured bucket prefix, and truncating it breaks backend listings.
+        let name_offset = stats_prefix(backend, None).len();
         values
             .first()
             .map(|(key, _)| {
-                String::from_utf8(
-                    key.as_ref()
-                        .get(prefix.len()..)
-                        .unwrap_or_default()
-                        .to_vec(),
-                )
-                .map_err(ConversionError::from)
+                String::from_utf8(key.as_ref().get(name_offset..).unwrap_or_default().to_vec())
+                    .map_err(ConversionError::from)
             })
             .transpose()
             .map_err(BlobError::ConversionError)
