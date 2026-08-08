@@ -1651,12 +1651,18 @@ async fn process_live_obligations(
 
     for (obligation_key, obligation) in obligations {
         let cursor = obligation.continuation.clone().unwrap_or_default();
+        // A hop-exhausted obligation is never scanned for relationships, so it
+        // must reach write_live_jobs to be retired instead of blocking the scan.
+        let hop_exhausted = obligation
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.hop_count >= 4);
         let relationships = if cursor.relationships_complete {
             None
         } else {
             relationship_cache.get(&obligation.bucket)
         };
-        if !cursor.relationships_complete && relationships.is_none() {
+        if !hop_exhausted && !cursor.relationships_complete && relationships.is_none() {
             result.has_more = true;
             continue;
         }
@@ -1930,6 +1936,12 @@ async fn write_live_jobs(
         .as_ref()
         .is_some_and(|origin| origin.hop_count >= 4)
     {
+        warn!(
+            bucket = %obligation.bucket,
+            key = %obligation.key,
+            version_id = %obligation.version_id,
+            "Retiring live replication obligation at the hop limit"
+        );
         return Ok(LiveRepairWrite {
             queued: 0,
             continuation: None,
@@ -2720,12 +2732,15 @@ async fn read_relationships(
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget, Group,
-        GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, ReferenceHandling,
-        SyncStatusSnapshot, VersionKey, blob_object_permission_path, sync_relationship_key,
+        GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        ReferenceHandling, SyncStatusSnapshot, VersionKey, blob_object_permission_path,
+        sync_relationship_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -2859,6 +2874,16 @@ mod tests {
             user_id: user(),
             realm_id: realm(),
         };
+        // Policy loading fails closed without the realm config document.
+        write_raw_queue_record(
+            storage,
+            REALM_CONFIG_KEYSPACE,
+            realm().as_bytes().to_vec(),
+            RealmConfigDocument::default_for_realm(realm(), Vec::new())
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
         write_raw_queue_record(
             storage,
             AUTH_KEYSPACE,
@@ -3346,6 +3371,7 @@ mod tests {
         let group_id = Ulid::from_parts(2, 2);
         write_bucket(&storage, "bucket").await;
         write_auth_docs(&storage, group_id).await;
+        write_group(&storage, group_id).await;
         let mut relationship = relationship(80, 2, None, true);
         relationship.status.last_error = Some("old error".to_string());
         relationship.status.counters.consecutive_failures = 2;
@@ -4509,6 +4535,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hop_limit_retires() {
+        // A hop-exhausted obligation is never scanned for relationships, so it
+        // must be deleted instead of blocking the head of the scan forever.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let record = LiveReplicationObligationRecord::new(
+            node(1),
+            auth_context(),
+            "bucket".to_string(),
+            "key".to_string(),
+            Ulid::from_parts(6, 6),
+            false,
+        )
+        .with_origin(Some(SyncOrigin {
+            relationship_id: Ulid::from(9u128),
+            hop_count: 4,
+        }));
+        super::write_live_obligation(&storage, &record)
+            .await
+            .expect("obligation persists");
+
+        repair_live(&storage).await;
+
+        assert!(read_obligations(&storage).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn live_replication_obligation_repairs_missing_jobs() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -4578,6 +4632,7 @@ mod tests {
             .expect("storage opens");
         write_bucket(&storage, "bucket").await;
         write_auth_docs(&storage, Ulid::from_parts(2, 2)).await;
+        write_group(&storage, Ulid::from_parts(2, 2)).await;
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("bind addr"),

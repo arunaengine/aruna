@@ -992,6 +992,13 @@ fn observe_cleanup(
                 CleanupKind::CommitQueued | CleanupKind::CommitUnknown
             )
         {
+            // A repeat on an already unknown commit re-ran nothing that could
+            // progress: the transaction is gone from the worker. It counts
+            // against the bound so the entry retires and frees its slot.
+            if matches!(entry.kind, CleanupKind::CommitUnknown) {
+                entry.attempts = entry.attempts.saturating_add(1);
+                return entry.attempts >= MAX_CLEANUP_ATTEMPTS;
+            }
             entry.kind = CleanupKind::CommitUnknown;
             entry.attempts = 0;
         }
@@ -3691,6 +3698,44 @@ mod tests {
         assert!(storage.txns.is_empty());
         assert!(storage.observe_cleanup(Some((txn_id, super::CleanupKind::CommitQueued)), &event));
         super::finish_cleanup(&storage.transaction_cleanup, txn_id);
+        assert!(storage.transaction_cleanup.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_commit_retires() {
+        // A re-commit whose transaction is gone can never progress, so it must
+        // count toward the bound instead of holding a cleanup slot forever.
+        let dir = tempdir().unwrap();
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .manual_journal_persist(true)
+            .open()
+            .unwrap();
+        let txn_id = Ulid::from_parts(3, 5);
+        let transaction_cleanup =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        transaction_cleanup.lock().unwrap().insert(
+            txn_id,
+            super::CleanupEntry {
+                kind: super::CleanupKind::CommitUnknown,
+                attempts: 0,
+                queued: false,
+            },
+        );
+        let mut storage = super::FjallStorage {
+            store: super::Store::new(db),
+            persist_policy: FjallPersistPolicy::default(),
+            txns: std::collections::HashMap::new(),
+            transaction_cleanup,
+            read_pool: Vec::new(),
+            next_reader: 0,
+            bulk_read_pool: Vec::new(),
+            next_bulk_reader: 0,
+        };
+
+        for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
+            storage.retry_cleanup();
+        }
+
         assert!(storage.transaction_cleanup.lock().unwrap().is_empty());
     }
 

@@ -25,6 +25,7 @@ use crate::jobs::store::iter_prefix_page;
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
 const CLEANUP_PAGE_SIZE: usize = 128;
+const MAX_CLEANUP_RETRIES: u8 = 3;
 
 /// A cleanup row an operation has emitted but storage has not yet accepted.
 /// The row is the only durable record that the written object exists, so the
@@ -34,6 +35,7 @@ pub struct PendingCleanup {
     work: Option<BlobCleanupWork>,
     key: Option<Key>,
     channel_closed: bool,
+    attempts: u8,
 }
 
 impl PendingCleanup {
@@ -45,6 +47,7 @@ impl PendingCleanup {
         self.work = Some(work);
         self.key = Some(key);
         self.channel_closed = false;
+        self.attempts = 0;
         Some(effect)
     }
 
@@ -54,12 +57,19 @@ impl PendingCleanup {
     }
 
     /// Re-emit one write per temporary rejection; the caller remains queued.
+    /// The retries are bounded: an endless loop would pin the blob reservation
+    /// and never let the request finish.
     pub fn retry(&mut self, error: &StorageError) -> Option<Effect> {
         if self.channel_closed {
             return None;
         }
         if matches!(error, StorageError::ChannelClosed) {
             self.channel_closed = true;
+            return None;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        if self.attempts > MAX_CLEANUP_RETRIES {
+            error!(error = %error, "Giving up on a rejected blob cleanup row");
             return None;
         }
         cleanup_row_write(self.work.as_ref()?, self.key.as_ref()?)
@@ -347,7 +357,7 @@ async fn owns_write(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLEANUP_PAGE_SIZE, PendingCleanup, process_cleanup_batch};
+    use super::{CLEANUP_PAGE_SIZE, MAX_CLEANUP_RETRIES, PendingCleanup, process_cleanup_batch};
     use crate::driver::DriverContext;
     use crate::jobs::store::iter_prefix_page;
     use aruna_core::effects::StorageEffect;
@@ -420,6 +430,23 @@ mod tests {
                 .is_some()
         );
         pending.accepted();
+        assert!(pending.retry(&error).is_none());
+    }
+
+    #[test]
+    fn bounds_retry_attempts() {
+        // Endless rejection must surrender the row so the request can finish and
+        // release its blob reservation.
+        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
+        let error = aruna_core::errors::StorageError::QueueFull;
+        let mut pending = PendingCleanup::default();
+        assert!(pending.queue(work).is_some());
+
+        for _ in 0..MAX_CLEANUP_RETRIES {
+            assert!(pending.retry(&error).is_some());
+        }
+
+        assert!(pending.retry(&error).is_none());
         assert!(pending.retry(&error).is_none());
     }
 
