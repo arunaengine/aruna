@@ -18,12 +18,13 @@ use crate::s3::util::{
     s3_checksum_type_from_multipart, validate_object_key,
 };
 use aruna_core::NodeId;
+use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, RealmId,
-    RoCrateLimits, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess,
-    WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
+    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, OBJECT_CONTENT_TYPE_KEY, PathRestriction,
+    Permission, RealmId, RoCrateLimits, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+    UserAccess, WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
     blob_object_permission_path, data_watch_resource_path,
 };
 use aruna_core::types::UserId;
@@ -229,6 +230,21 @@ fn parse_upload_id_marker(
         .transpose()
 }
 
+/// Whether a credential's restrictions leave any allowed scope at or below one
+/// bucket: either a restriction covers the bucket node itself, or it is scoped
+/// to a path inside that bucket. Unrestricted credentials reach every bucket.
+fn restrictions_reach(restrictions: Option<&[PathRestriction]>, bucket_path: &str) -> bool {
+    let Some(restrictions) = restrictions else {
+        return true;
+    };
+    let inside = format!("{bucket_path}/");
+    restrictions.iter().any(|restriction| {
+        restriction.permission != Permission::DENY
+            && (restriction.pattern.starts_with(&inside)
+                || permission_pattern_matches(&restriction.pattern, bucket_path))
+    })
+}
+
 #[derive(Clone)]
 pub struct ArunaS3Service {
     state: Arc<DriverContext>,
@@ -267,15 +283,23 @@ impl ArunaS3Service {
         bucket_info: &BucketInfo,
         extras: &PolicyRequestExtras,
     ) -> S3Result<bool> {
+        let bucket_path =
+            blob_bucket_permission_path(self.realm_id, bucket_info.group_id, self.node_id, bucket);
+        // A prefix-scoped credential still owns the bucket holding its scope, so
+        // visibility asks whether its scope lies in this bucket; the bucket node
+        // itself is then authorized unrestricted, object access separately.
+        if !restrictions_reach(user_access.path_restrictions.as_deref(), &bucket_path) {
+            return Ok(false);
+        }
         match authorize(
             &self.state,
             self.realm_id,
             &AuthContext {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
-                path_restrictions: user_access.path_restrictions.clone(),
+                path_restrictions: None,
             },
-            &blob_bucket_permission_path(self.realm_id, bucket_info.group_id, self.node_id, bucket),
+            &bucket_path,
             &Permission::READ,
             extras.clone(),
         )
@@ -3838,6 +3862,13 @@ mod tests {
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(watcher, realm_id, group_id);
+        let group = aruna_core::structs::Group {
+            display_name: "watched".to_string(),
+            group_id,
+            realm_id,
+            owner: watcher,
+            roles: group_auth.roles.keys().copied().collect(),
+        };
         write_storage_value(
             &context.storage_handle,
             AUTH_KEYSPACE,
@@ -3850,6 +3881,13 @@ mod tests {
             AUTH_KEYSPACE,
             group_id.to_bytes().to_vec(),
             group_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &context.storage_handle,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
         )
         .await;
     }
@@ -4176,6 +4214,23 @@ mod tests {
         ));
     }
 
+    /// Policy loading fails closed without the realm config document.
+    async fn write_realm_config(
+        storage: &storage::StorageHandle,
+        realm_id: RealmId,
+        actor: &Actor,
+    ) {
+        write_storage_value(
+            storage,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(actor)
+                .unwrap(),
+        )
+        .await;
+    }
+
     async fn read_storage_value(
         storage: &storage::StorageHandle,
         keyspace: &str,
@@ -4438,8 +4493,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn filters_bucket_scope() {
+    /// Names a credential restricted to the `allowed` bucket path plus `scope`
+    /// sees; the group also owns a `hidden` bucket outside that restriction.
+    async fn visible_buckets(scope: &str) -> Vec<String> {
         let realm_id = RealmId([43u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
         let (_storage_dir, service) = parser_service(realm_id, node_id);
@@ -4456,6 +4512,14 @@ mod tests {
             realm_id,
             group_id,
         );
+        let group = aruna_core::structs::Group {
+            display_name: "listing".to_string(),
+            group_id,
+            realm_id,
+            owner: user_access.user_identity,
+            roles: group_auth.roles.keys().copied().collect(),
+        };
+        write_realm_config(&service.state.storage_handle, realm_id, &actor).await;
         write_storage_value(
             &service.state.storage_handle,
             AUTH_KEYSPACE,
@@ -4470,6 +4534,13 @@ mod tests {
             group_auth.to_bytes(&actor).unwrap(),
         )
         .await;
+        write_storage_value(
+            &service.state.storage_handle,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
+        )
+        .await;
         for bucket in ["allowed", "hidden"] {
             write_storage_value(
                 &service.state.storage_handle,
@@ -4482,7 +4553,10 @@ mod tests {
             .await;
         }
         user_access.path_restrictions = Some(vec![PathRestriction {
-            pattern: blob_bucket_permission_path(realm_id, group_id, node_id, "allowed"),
+            pattern: format!(
+                "{}{scope}",
+                blob_bucket_permission_path(realm_id, group_id, node_id, "allowed")
+            ),
             permission: Permission::READ,
         }]);
 
@@ -4501,14 +4575,25 @@ mod tests {
             trailing_headers: None,
         };
         let response = service.list_buckets(request).await.unwrap();
-        let names = response
+        response
             .output
             .buckets
             .unwrap_or_default()
             .into_iter()
             .filter_map(|bucket| bucket.name)
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["allowed"]);
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn filters_bucket_scope() {
+        assert_eq!(visible_buckets("").await, vec!["allowed"]);
+    }
+
+    #[tokio::test]
+    async fn lists_prefix_scope() {
+        // A credential scoped to a prefix inside a bucket must still see that
+        // bucket, and only that one, in the listing.
+        assert_eq!(visible_buckets("/logs/**").await, vec!["allowed"]);
     }
 
     fn test_bucket_info(group_id: Ulid, created_by: UserId) -> BucketInfo {
@@ -4566,6 +4651,15 @@ mod tests {
                 .insert(UserId::nil(realm_id));
         }
 
+        let source_group = aruna_core::structs::Group {
+            display_name: "source".to_string(),
+            group_id: source_group_id,
+            realm_id,
+            owner: user_access.user_identity,
+            roles: source_auth.roles.keys().copied().collect(),
+        };
+
+        write_realm_config(&storage_handle, realm_id, &actor).await;
         write_storage_value(
             &storage_handle,
             AUTH_KEYSPACE,
@@ -4580,6 +4674,13 @@ mod tests {
             AUTH_KEYSPACE,
             source_group_id.to_bytes().to_vec(),
             source_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            source_group_id.to_bytes().to_vec(),
+            source_group.to_bytes(&actor).unwrap(),
         )
         .await;
         write_storage_value(
@@ -4645,8 +4746,10 @@ mod tests {
                 .copy_object(test_copy_request(input, user_access, bucket_info))
                 .await
                 .unwrap_err();
+            // Passing source authorization reaches the copy itself, which fails
+            // on the absent source object.
             let expected = if allowed {
-                S3ErrorCode::InternalError
+                S3ErrorCode::NoSuchKey
             } else {
                 S3ErrorCode::AccessDenied
             };
@@ -4736,6 +4839,7 @@ mod tests {
             owner: user_access.user_identity,
             roles: source_auth.roles.keys().copied().collect(),
         };
+        write_realm_config(&storage_handle, realm_id, &actor).await;
         write_storage_value(
             &storage_handle,
             AUTH_KEYSPACE,
@@ -4833,6 +4937,7 @@ mod tests {
             owner: user_access.user_identity,
             roles: auth_doc.roles.keys().copied().collect(),
         };
+        write_realm_config(&storage_handle, realm_id, &actor).await;
         write_storage_value(
             &storage_handle,
             AUTH_KEYSPACE,

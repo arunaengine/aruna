@@ -562,7 +562,8 @@ pub async fn effective_policies(
     request_body = ValidatePolicyRequest,
     responses(
         (status = 200, description = "Analysis result", body = ValidatePolicyResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -571,7 +572,9 @@ pub async fn validate_policy(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<ValidatePolicyRequest>,
 ) -> ServerResult<(StatusCode, Json<ValidatePolicyResponse>)> {
-    let _auth = require_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
+    // Validation compiles caller-supplied CEL; restrict it to policy authors.
+    require_config_read(&state, &auth).await?;
     let _ = parse_kind(&request.kind)?;
     let analysis = analyze_policy_source(
         request.when.as_deref(),
@@ -924,6 +927,29 @@ mod tests {
                 .contains(&"unknown_var".to_string())
         );
         assert!(result.unknown_functions.contains(&"mystery".to_string()));
+    }
+
+    #[tokio::test]
+    async fn validate_needs_admin() {
+        // Compiling caller-supplied CEL is gated like the dry run: a realm user
+        // without config read must not reach the compiler.
+        let fx = setup().await;
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::from_bytes([78; 16]), fx.realm_id),
+            realm_id: fx.realm_id,
+            path_restrictions: None,
+        };
+        let result = validate_policy(
+            State(fx.state.clone()),
+            Extension(Some(stranger)),
+            Json(ValidatePolicyRequest {
+                kind: "deny".to_string(),
+                when: None,
+                expression: "true".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
     }
 
     #[tokio::test]

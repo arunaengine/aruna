@@ -46,10 +46,16 @@ pub fn client_ip(trusted_proxies: &[IpNet], peer: IpAddr, headers: &HeaderMap) -
     if !peer_is_trusted(trusted_proxies, peer) {
         return peer;
     }
-    let Some(chain) = header_str(headers, "x-forwarded-for") else {
-        return peer;
-    };
-    for entry in chain.rsplit(',') {
+    // Several header lines are one chain in order, exactly as if the proxies had
+    // appended to a single comma-joined line.
+    let mut chain = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else {
+            return peer;
+        };
+        chain.extend(value.split(','));
+    }
+    for entry in chain.into_iter().rev() {
         match entry.trim().parse::<IpAddr>() {
             Ok(addr) if peer_is_trusted(trusted_proxies, addr) => continue,
             Ok(addr) => return addr,
@@ -184,11 +190,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_xff_duplicate() {
+    fn joins_xff_lines() {
+        // Separate header lines form one chain: hops peel across them instead of
+        // collapsing every client behind the proxy onto one attribution key.
         let mut headers = HeaderMap::new();
-        headers.append("x-forwarded-for", HeaderValue::from_static("192.0.2.1"));
-        headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("10.0.0.5"));
         let proxy = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            client_ip(&proxies(), proxy, &headers),
+            IpAddr::from_str("203.0.113.9").unwrap()
+        );
+
+        // A malformed line still falls back to the transport address.
+        headers.append("x-forwarded-for", HeaderValue::from_static("bogus"));
         assert_eq!(client_ip(&proxies(), proxy, &headers), proxy);
     }
 

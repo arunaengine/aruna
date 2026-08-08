@@ -1,6 +1,6 @@
 use super::s3_server::S3OpLabel;
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
-use crate::rate_limit::{LocalKey, LocalLease};
+use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use aruna_core::credential_seal::{CredentialSealKey, SealedS3Secret};
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
@@ -100,21 +100,7 @@ impl S3Access for AuthProvider {
 
         // Fetch user access -> GetUserAccess state machine
         let user_access = self.query_user_access(&access_key_id).await?;
-        // Charge the stable identity after lookup so credential rotation cannot
-        // multiply the authenticated request budget.
-        if self
-            .rate_limits
-            .check_principal(user_access.user_identity)
-            .is_err()
-        {
-            return Err(s3_error!(SlowDown, "Reduce your request rate"));
-        }
-        let Some(permit) = self
-            .rate_limits
-            .try_acquire_local(LocalKey::User(user_access.user_identity))
-        else {
-            return Err(s3_error!(SlowDown, "Reduce your request rate"));
-        };
+        let permit = self.admit_credential(&user_access)?;
         let lease = cx
             .extensions_mut()
             .get::<LocalLease>()
@@ -131,14 +117,6 @@ impl S3Access for AuthProvider {
                 InvalidAccessKeyId,
                 "Credential issuer not in realm"
             ));
-        }
-
-        if user_access.is_revoked() {
-            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
-        }
-
-        if user_access.is_expired(SystemTime::now()) {
-            return Err(s3_error!(AccessDenied, "Credential has expired"));
         }
 
         let required_permission = match &action {
@@ -282,6 +260,30 @@ impl AuthProvider {
             revoked_at: None,
         });
         Ok(())
+    }
+
+    /// Rejects an unusable credential before any budget is spent: a revoked or
+    /// expired credential must not drain the owner's shared request rate or
+    /// take one of the owner's admission permits.
+    fn admit_credential(&self, user_access: &UserAccess) -> S3Result<LocalPermit> {
+        if user_access.is_revoked() {
+            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
+        }
+        if user_access.is_expired(SystemTime::now()) {
+            return Err(s3_error!(AccessDenied, "Credential has expired"));
+        }
+        // Charge the stable identity after lookup so credential rotation cannot
+        // multiply the authenticated request budget.
+        if self
+            .rate_limits
+            .check_principal(user_access.user_identity)
+            .is_err()
+        {
+            return Err(s3_error!(SlowDown, "Reduce your request rate"));
+        }
+        self.rate_limits
+            .try_acquire_local(LocalKey::User(user_access.user_identity))
+            .ok_or_else(|| s3_error!(SlowDown, "Reduce your request rate"))
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -466,6 +468,27 @@ mod tests {
         let legacy = "01ARZ3NDEKTSV4RRFFQ69G5FAV@01ARZ3NDEKTSV4RRFFQ69G5FAW:workspace-01ARZ3";
         let error = provider.get_secret_key(legacy).await.unwrap_err();
         assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
+    }
+
+    #[tokio::test]
+    async fn revoked_spends_nothing() {
+        // A revoked credential must be rejected before it charges the owner's
+        // shared rate budget, so a replayed revoked key cannot starve the owner.
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = provider(dir.path().to_str().unwrap());
+        provider.rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::for_test(1));
+
+        let live = sealed_access(&provider, *provider.node_id.as_bytes());
+        let revoked = UserAccess {
+            revoked_at: Some(SystemTime::now()),
+            ..live.clone()
+        };
+        let Err(error) = provider.admit_credential(&revoked) else {
+            panic!("revoked credential admitted");
+        };
+        assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+
+        assert!(provider.admit_credential(&live).is_ok());
     }
 
     #[tokio::test]

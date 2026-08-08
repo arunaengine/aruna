@@ -339,7 +339,7 @@ pub async fn revoke_s3_credentials(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
 
     let credential = match drive(
         GetUserAccessOperation::new(access_key_id.clone()),
@@ -354,17 +354,22 @@ pub async fn revoke_s3_credentials(
         Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
     };
 
-    crate::auth::ensure_permission(
-        &state,
-        &auth,
-        blob_group_permission_path(
-            state.get_realm_id(),
-            credential.group_id,
-            state.get_node_id(),
-        ),
-        Permission::WRITE,
-    )
-    .await?;
+    // Credentials are user-owned like the list and create surfaces: write access
+    // to the group must not reach another member's credential, so revoking one
+    // needs either ownership or administrative authority over that user.
+    if credential.user_identity != auth.user_id {
+        crate::auth::ensure_permission(
+            &state,
+            &auth,
+            format!(
+                "/{}/admin/u/{}",
+                state.get_realm_id(),
+                credential.user_identity
+            ),
+            Permission::WRITE,
+        )
+        .await?;
+    }
 
     match drive(
         RevokeUserAccessOperation::new(access_key_id),
@@ -682,10 +687,13 @@ mod tests {
     use super::*;
     use crate::error::ServerError;
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::NodeCapabilities;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
-        AuthContext, PathRestriction, Permission, blob_group_permission_path,
+        Actor, AuthContext, Group, GroupAuthorizationDocument, PathRestriction, Permission,
+        RealmAuthorizationDocument, RealmConfigDocument, blob_group_permission_path,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -733,6 +741,106 @@ mod tests {
             realm_id,
             path_restrictions,
         }
+    }
+
+    /// State whose caller holds group write, plus a credential of another member.
+    async fn revoke_state() -> (TempDir, Arc<ServerState>, AuthContext, String) {
+        let (dir, state, auth) = test_state().await;
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: auth.user_id,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(auth.user_id, realm_id, group_id);
+        let group = Group {
+            display_name: "credential-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: auth.user_id,
+        };
+        for (key_space, key, value) in [
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                    .to_bytes(&actor)
+                    .unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            state
+                .get_ctx()
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+
+        let (access_key_id, _, _) = drive(
+            CreateUserAccessOperation::new(
+                CreateUserAccessConfig {
+                    user_identity: owner,
+                    group_id,
+                    expiry: SystemTime::now() + Duration::from_secs(3600),
+                    path_restrictions: None,
+                    issued_by: *node_id.as_bytes(),
+                },
+                state.credential_seal_key().clone(),
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        (dir, state, auth, access_key_id)
+    }
+
+    #[tokio::test]
+    async fn writer_cannot_revoke() {
+        // Group write must not reach the S3 credential of another member.
+        let (_dir, state, auth, access_key_id) = revoke_state().await;
+
+        let error = revoke_s3_credentials(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Path(access_key_id.clone()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::Forbidden));
+        let credential = drive(GetUserAccessOperation::new(access_key_id), &state.get_ctx())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!credential.is_revoked());
     }
 
     #[test]

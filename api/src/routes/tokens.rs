@@ -77,7 +77,12 @@ pub async fn revoke_token(
     if subject.realm_id != state.get_realm_id() {
         return Err(ServerError::BadRequest);
     }
-    if auth.user_id != subject.user_id && !user_origin {
+    // A path-restricted (delegated) token stays confined: it may retire itself,
+    // but revoking the subject's other sessions needs administrative authority.
+    let self_service = auth.user_id == subject.user_id
+        && (auth.path_restrictions.is_none()
+            || revokes_self(bearer_token.as_ref(), &request.token));
+    if !self_service && !user_origin {
         ensure_permission(
             &state,
             &auth,
@@ -113,7 +118,7 @@ pub async fn revoke_token(
             token_hash: bearer_token_hash(&request.token),
             expires_at,
             token_owner: subject.user_id,
-            admission: if auth.user_id == subject.user_id {
+            admission: if self_service {
                 RevokeTokenAdmission::SelfService
             } else {
                 RevokeTokenAdmission::Privileged
@@ -125,6 +130,11 @@ pub async fn revoke_token(
     .await
     .map_err(map_revoke_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether the caller presented the very token it asks to revoke.
+fn revokes_self(caller: Option<&ValidatedArunaBearerTokenCarrier>, token: &str) -> bool {
+    caller.is_some_and(|caller| bearer_token_hash(caller.as_str()) == bearer_token_hash(token))
 }
 
 fn map_revoke_error(error: RevokeTokenError) -> ServerError {
@@ -144,7 +154,7 @@ mod tests {
     use crate::error::TokenError;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{Actor, NodeCapabilities, RealmId, TokenRevocation};
+    use aruna_core::structs::{Actor, NodeCapabilities, PathRestriction, RealmId, TokenRevocation};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::DriverContext;
@@ -411,6 +421,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegate_cannot_revoke() {
+        // A path-restricted delegation of a user must not retire that user's
+        // unrestricted sessions, which its confinement does not cover.
+        let (_dir, state, realm_id, user_id, token) = state_with_token().await;
+        let delegate = Some(AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: format!("/{realm_id}/g/**"),
+                permission: Permission::READ,
+            }]),
+        });
+
+        let error = revoke_token(
+            State(state.clone()),
+            Extension(delegate),
+            Extension(None),
+            Json(RevokeTokenRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::Forbidden));
+        assert!(handle_token(&state, &token).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn admin_can_revoke() {
         // The realm admin gate that guards non-self user writes also permits
         // revoking another user's token.
@@ -458,6 +497,17 @@ mod tests {
         .await
         .unwrap();
         state.add_trusted_realm(foreign_realm_id).await;
+        // Revocation lookups fail closed, so a trusted realm's token is only
+        // usable here once that realm's replicated config is present.
+        write_realm_config(
+            state.get_ctx().as_ref(),
+            foreign_realm_id,
+            &aruna_core::structs::RealmConfigDocument::default_for_realm(
+                foreign_realm_id,
+                Vec::new(),
+            ),
+        )
+        .await;
 
         let admin = UserId::local(Ulid::generate(), realm_id);
         grant_realm_admin(state.get_ctx().as_ref(), realm_id, admin).await;

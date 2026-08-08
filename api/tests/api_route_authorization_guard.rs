@@ -178,11 +178,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "public enrollment gated by the onboarding secret and node proof",
     ),
     (
-        "policies.rs",
-        "validate_policy",
-        "analyses the request body only, reads no stored policy",
-    ),
-    (
         "rocrate_import.rs",
         "upload_rocrate",
         "self-scoped: spools a hidden blob owned by the caller",
