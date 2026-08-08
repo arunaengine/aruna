@@ -33,9 +33,12 @@ pub enum AuthorizationError {
 }
 
 #[derive(Debug, Error, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum BlobError {
     #[error("Channel closed")]
     ChannelClosed,
+    #[error("Cleanup is unsupported by the backend")]
+    CleanupUnsupported,
     #[error("Failed to send message")]
     SendError,
     #[error("Invalid effect type")]

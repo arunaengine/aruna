@@ -8,6 +8,7 @@ use crate::opendal::abort_partial_writer;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
@@ -171,13 +172,28 @@ impl HiddenReservation {
 
     async fn abort(&mut self) -> Result<(), BlobError> {
         let cleanup = if self.writer.is_some() {
-            let cleanup = {
+            let aborted = {
                 let Some(writer) = self.writer.as_mut() else {
                     return Err(BlobError::DeleteError(
                         "hidden writer is missing".to_string(),
                     ));
                 };
                 self.handler.abort_writer(writer).await
+            };
+            // Backends without writer abort (fs) leave the known-partial object
+            // at its final path; deleting it is the equivalent cleanup. Other
+            // abort failures stay uncertain and must not delete.
+            let cleanup = match aborted {
+                Ok(()) => Ok(()),
+                Err(BlobError::CleanupUnsupported) => {
+                    match (self.operator.as_ref(), self.storage_path.as_deref()) {
+                        (Some(operator), Some(path)) => {
+                            self.handler.delete_path(operator, path).await
+                        }
+                        _ => Err(BlobError::CleanupUnsupported),
+                    }
+                }
+                Err(error) => Err(error),
             };
             if cleanup.is_ok() {
                 self.writer = None;
@@ -529,6 +545,9 @@ impl BlobHandler {
     async fn abort_writer(&self, writer: &mut opendal::Writer) -> Result<(), BlobError> {
         match timeout(self.control_plane_io_timeout(), writer.abort()).await {
             Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.kind() == ErrorKind::Unsupported => {
+                Err(BlobError::CleanupUnsupported)
+            }
             Ok(Err(error)) => Err(BlobError::DeleteError(format!(
                 "partial blob cleanup is uncertain: {error}"
             ))),
@@ -1331,7 +1350,7 @@ impl BlobHandler {
                 let listed_path = entry.path();
                 let backend_path = Path::new(listed_path)
                     .strip_prefix(Path::new(&bucket_name))
-                    .ok_or_else(|| {
+                    .map_err(|_| {
                         BlobError::ListError("hidden blob path is outside bucket".to_string())
                     })?
                     .to_str()
@@ -1585,6 +1604,20 @@ fn hidden_prefix(namespace: Option<Ulid>) -> String {
     }
 }
 
+fn encode_cursor(cursor: HiddenCursor) -> Result<Vec<u8>, BlobError> {
+    postcard::to_allocvec(&cursor).map_err(|error| BlobError::ConversionError(error.into()))
+}
+
+fn next_backend(backends: &[BackendRef], current: &BackendRef) -> Option<BackendRef> {
+    backends.iter().find(|backend| *backend > current).cloned()
+}
+
+fn hidden_timestamp(path: &str) -> Option<SystemTime> {
+    let suffix = Path::new(path).file_name()?.to_str()?.rsplit_once('_')?.1;
+    let ulid = Ulid::from_string(suffix).ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_millis(ulid.timestamp_ms()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::next_chunk;
@@ -1608,18 +1641,4 @@ mod tests {
             Err(BlobError::ReadError(message)) if message == "blob read idle timeout"
         ));
     }
-}
-
-fn encode_cursor(cursor: HiddenCursor) -> Result<Vec<u8>, BlobError> {
-    postcard::to_allocvec(&cursor).map_err(|error| BlobError::ConversionError(error.into()))
-}
-
-fn next_backend(backends: &[BackendRef], current: &BackendRef) -> Option<BackendRef> {
-    backends.iter().find(|backend| *backend > current).cloned()
-}
-
-fn hidden_timestamp(path: &str) -> Option<SystemTime> {
-    let suffix = Path::new(path).file_name()?.to_str()?.rsplit_once('_')?.1;
-    let ulid = Ulid::from_string(suffix).ok()?;
-    UNIX_EPOCH.checked_add(Duration::from_millis(ulid.timestamp_ms()))
 }
