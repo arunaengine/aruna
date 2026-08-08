@@ -1,4 +1,4 @@
-use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
+use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{DhtEvent, JobControlEvent, NetEvent, StreamEvent};
@@ -45,12 +45,8 @@ pub async fn handle_net_effect(
 
 fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
     let mut batch = AuditPageBatch::with_limit(limit);
-    if nodes.len() > MAX_AUDIT_PEERS {
-        // An oversized effect violates the operation's peer-selection bound;
-        // do not enumerate an attacker-controlled list in the fallback.
-        batch.missing_overflow = nodes.len().saturating_sub(MAX_AUDIT_PEERS);
-        return batch;
-    }
+    // Every node of a fallback batch is missing; mark_missing bounds the set and
+    // rolls the excess into missing_overflow, so nothing is silently dropped.
     for node in nodes {
         batch.mark_missing(node);
     }
@@ -171,7 +167,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_overflow() {
+    fn bounds_overflow() {
+        // A fallback batch has no completed node, so an oversized list must
+        // report the bounded prefix as missing instead of an empty page.
         let nodes = (1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap())
             .map(make_node)
             .collect();
@@ -179,7 +177,7 @@ mod tests {
 
         assert!(batch.records.is_empty());
         assert!(batch.completed_nodes.is_empty());
-        assert!(batch.missing_nodes.is_empty());
+        assert_eq!(batch.missing_nodes.len(), MAX_AUDIT_PEERS);
         assert_eq!(batch.missing_overflow, 1);
     }
 

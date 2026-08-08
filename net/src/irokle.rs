@@ -9,10 +9,11 @@ use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH,
-    RevocationIndex, USER_NAME_PATH, decode_admin_document_reducer_state, group_role_id_from_path,
-    group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
+    GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_DESCRIPTION_PATH,
+    REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
+    REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH, RevocationIndex, USER_NAME_PATH,
+    decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
+    group_role_user_assignment_from_path, group_role_user_assignment_path,
     overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
     realm_config_node_path, realm_config_oidc_provider_id_from_path, realm_role_path,
     realm_role_user_assignment_from_path, realm_role_user_assignment_path, user_attribute_path,
@@ -6590,10 +6591,10 @@ async fn validate_replicated_admin_event(
     {
         return reject("stored admin reducer state has the wrong target");
     }
-    if matches!(
-        &event.op,
-        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
-    ) {
+    if let AdminDocumentOperation::RealmConfigTokenRevoked { token_hash, .. } = &event.op {
+        if revocation_origin_full(previous_state.as_ref(), event, token_hash) {
+            return reject("revocation origin reached its live revocation cap");
+        }
         return Ok(AdminEventValidation::Accepted);
     }
 
@@ -6655,6 +6656,22 @@ async fn read_admin_realm_authorization(
     .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))
+}
+
+/// Whether this origin already holds the per-origin bound a local mint obeys.
+/// Replacing its own entry stays allowed; the flooding origin is rejected rather
+/// than trimmed, so a valid revocation is never discarded to make room.
+fn revocation_origin_full(
+    state: Option<&AdminDocumentReducerState>,
+    event: &AdminDocumentEvent,
+    token_hash: &str,
+) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    let index = state.revocation_index(state.revocation_floor.max(unix_timestamp_secs()));
+    index.origin(token_hash) != Some(event.origin_node_id)
+        && index.count(&event.origin_node_id) >= MAX_LIVE_REVOCATIONS_PER_ORIGIN
 }
 
 fn revocation_origin_known(
@@ -9687,6 +9704,115 @@ mod tests {
             &aruna_core::auth::bearer_token_hash("owned-token"),
             unix_timestamp_secs()
         ));
+    }
+
+    #[tokio::test]
+    async fn caps_flooding_origin() {
+        // Past its per-origin bound the flooding node is rejected, while another
+        // origin's revocation still applies instead of being trimmed away.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([65; 32]);
+        let flooder = test_actor(
+            22,
+            UserId::local(Ulid::from_parts(1_670, 1), realm_id),
+            realm_id,
+        );
+        let neighbour = test_actor(
+            23,
+            UserId::local(Ulid::from_parts(1_671, 1), realm_id),
+            realm_id,
+        );
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(flooder.node_id, RealmNodeKind::Server);
+        config.ensure_node(neighbour.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config.to_bytes(&flooder).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        let expires_at = unix_timestamp_secs() + 600;
+        let mut state = AdminDocumentReducerState::new(admin_target.clone());
+        let mut index = state.revocation_index(expires_at);
+        for seed in 0..MAX_LIVE_REVOCATIONS_PER_ORIGIN {
+            state
+                .apply_revocation_operation(
+                    &flooder,
+                    AdminDocumentOperation::RealmConfigTokenRevoked {
+                        token_hash: aruna_core::auth::bearer_token_hash(&format!("flood-{seed}")),
+                        expires_at,
+                        token_owner: flooder.user_id,
+                    },
+                    &mut index,
+                )
+                .expect("seeded revocation applies");
+        }
+        storage_batch_write_to(
+            &storage,
+            vec![admin_document_reducer_state_write_entry(&state).expect("state serializes")],
+        )
+        .await
+        .expect("reducer state writes");
+
+        let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let flood_event = test_admin_event(
+            Ulid::from_parts(1_672, 1),
+            admin_target.clone(),
+            &flooder,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("flood-extra"),
+                expires_at,
+                token_owner: flooder.user_id,
+            },
+        );
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                irokle_crate::actor_id_for(topic, node_id_to_peer_id(&flooder.node_id)),
+                &config_target,
+                &flood_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("flood validation runs"),
+            AdminEventValidation::Rejected(reason)
+                if reason == "revocation origin reached its live revocation cap"
+        ));
+
+        let neighbour_event = test_admin_event(
+            Ulid::from_parts(1_673, 1),
+            admin_target,
+            &neighbour,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("neighbour-token"),
+                expires_at,
+                token_owner: neighbour.user_id,
+            },
+        );
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                irokle_crate::actor_id_for(topic, node_id_to_peer_id(&neighbour.node_id)),
+                &config_target,
+                &neighbour_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("neighbour validation runs"),
+            AdminEventValidation::Accepted
+        );
     }
 
     #[test]

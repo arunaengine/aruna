@@ -446,21 +446,25 @@ pub async fn run_accept_loop(
                         conn.close(0u32.into(), b"realm admission");
                         return;
                     }
-                    if known_peer {
-                        drop(handshake_permit);
-                        let Some(mut permit) = inbound_budget.acquire() else {
-                            warn!("Dropping inbound Iroh connection: connection limit reached");
-                            conn.close(0u32.into(), b"connection limit");
-                            return;
-                        };
-                        if !permit.admit(peer_id) {
-                            warn!(
-                                node_id = %peer_id,
-                                "Dropping inbound Iroh connection: peer limit reached"
-                            );
-                            return;
-                        }
+                    // A provisional session takes the same budget as an admitted
+                    // one, so one unknown identity cannot hold every handshake
+                    // permit and starve inbound admission for configured peers.
+                    drop(handshake_permit);
+                    let Some(mut permit) = inbound_budget.acquire() else {
+                        warn!("Dropping inbound Iroh connection: connection limit reached");
+                        conn.close(0u32.into(), b"connection limit");
+                        return;
+                    };
+                    if !permit.admit(peer_id) {
+                        warn!(
+                            node_id = %peer_id,
+                            "Dropping inbound Iroh connection: peer limit reached"
+                        );
+                        conn.close(0u32.into(), b"peer limit");
+                        return;
+                    }
 
+                    if known_peer {
                         run_admitted(
                             conn,
                             alpn,
@@ -471,56 +475,68 @@ pub async fn run_accept_loop(
                             inbound_admission,
                         )
                         .await;
-                    } else {
-                        warn!(
-                            node_id = %peer_id,
-                            alpn = %alpn,
-                            timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
-                            "Serving provisional inbound Iroh session"
-                        );
-                        let timeout_conn = conn.clone();
-                        let materialized_conn = conn.clone();
-                        let mut materialized = inbound_admission.materialized_watch();
-                        tokio::select! {
-                            result = tokio::time::timeout(
-                                STREAM_IO_TIMEOUT,
-                                run_connection(
-                                    conn,
-                                    alpn,
-                                    dht_handler,
-                                    stream_handler,
-                                    document_sync,
-                                    peer_id,
-                                ),
-                            ) => {
-                                if result.is_err() {
-                                    warn!(
-                                        node_id = %peer_id,
-                                        alpn = %alpn,
-                                        timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
-                                        "Timed out provisional inbound Iroh session"
-                                    );
-                                    timeout_conn.close(0u32.into(), b"provisional timeout");
-                                }
-                            }
-                            _ = async {
-                                loop {
-                                    if *materialized.borrow() {
-                                        break;
-                                    }
-                                    if materialized.changed().await.is_err() {
-                                        break;
-                                    }
-                                }
-                            } => {
+                        return;
+                    }
+
+                    warn!(
+                        node_id = %peer_id,
+                        alpn = %alpn,
+                        timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                        "Serving provisional inbound Iroh session"
+                    );
+                    let timeout_conn = conn.clone();
+                    let admitted_conn = conn.clone();
+                    let mut materialized = inbound_admission.materialized_watch();
+                    let mut provisional = Box::pin(tokio::time::timeout(
+                        STREAM_IO_TIMEOUT,
+                        run_connection(
+                            conn,
+                            alpn,
+                            dht_handler.clone(),
+                            stream_handler.clone(),
+                            document_sync.clone(),
+                            peer_id,
+                        ),
+                    ));
+                    let materialized_now = tokio::select! {
+                        result = &mut provisional => {
+                            if result.is_err() {
                                 warn!(
                                     node_id = %peer_id,
                                     alpn = %alpn,
-                                    "Closed provisional inbound Iroh session after realm admission"
+                                    timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                                    "Timed out provisional inbound Iroh session"
                                 );
-                                materialized_conn.close(0u32.into(), b"realm admission");
+                                timeout_conn.close(0u32.into(), b"provisional timeout");
                             }
+                            false
                         }
+                        _ = async {
+                            loop {
+                                if *materialized.borrow() {
+                                    break;
+                                }
+                                if materialized.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        } => true,
+                    };
+                    drop(provisional);
+                    if materialized_now {
+                        // The fresh config decides: an admitted peer keeps this
+                        // session instead of losing its in-flight requests, and
+                        // run_admitted closes the connection for everyone else.
+                        run_admitted(
+                            admitted_conn,
+                            alpn,
+                            dht_handler,
+                            stream_handler,
+                            document_sync,
+                            peer_id,
+                            inbound_admission,
+                        )
+                        .await;
                     }
                 });
             }
@@ -566,13 +582,21 @@ async fn run_admitted(
     }
 }
 
+/// Application stream frames in both directions. QUIC keepalive keeps arriving
+/// on an idle connection, so counting raw datagrams would pin it for its whole
+/// lifetime and hold an inbound permit with it.
+fn stream_frames(conn: &Connection) -> u64 {
+    let stats = conn.stats();
+    stats.frame_rx.stream.saturating_add(stats.frame_tx.stream)
+}
+
 async fn run_dht_connection(
     conn: Connection,
     dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
     peer_id: NodeId,
 ) {
     let mut timers = ConnectionTimers::new();
-    let mut received_bytes = conn.stats().udp_rx.bytes;
+    let mut seen_frames = stream_frames(&conn);
     loop {
         tokio::select! {
             _ = &mut timers.lifetime => {
@@ -582,9 +606,9 @@ async fn run_dht_connection(
             _ = &mut timers.idle => {
                 // Data on an already-accepted stream counts as activity, so a
                 // long transfer is not cut down as an idle connection.
-                let received = conn.stats().udp_rx.bytes;
-                if received > received_bytes {
-                    received_bytes = received;
+                let frames = stream_frames(&conn);
+                if frames > seen_frames {
+                    seen_frames = frames;
                     timers.activity();
                     continue;
                 }
@@ -651,7 +675,7 @@ async fn run_app_connection(
     peer_id: NodeId,
 ) {
     let mut timers = ConnectionTimers::new();
-    let mut received_bytes = conn.stats().udp_rx.bytes;
+    let mut seen_frames = stream_frames(&conn);
     loop {
         tokio::select! {
             _ = &mut timers.lifetime => {
@@ -661,9 +685,9 @@ async fn run_app_connection(
             _ = &mut timers.idle => {
                 // Data on an already-accepted stream counts as activity, so a
                 // long transfer is not cut down as an idle connection.
-                let received = conn.stats().udp_rx.bytes;
-                if received > received_bytes {
-                    received_bytes = received;
+                let frames = stream_frames(&conn);
+                if frames > seen_frames {
+                    seen_frames = frames;
                     timers.activity();
                     continue;
                 }

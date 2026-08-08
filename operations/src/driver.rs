@@ -470,14 +470,16 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
     Event::Net(NetEvent::JobControl(event))
 }
 
-fn audit_nodes(nodes: Vec<NodeId>, batch: &mut AuditPageBatch) -> Option<BTreeSet<NodeId>> {
-    if nodes.len() > MAX_AUDIT_PEERS {
-        batch.missing_overflow = batch
-            .missing_overflow
-            .saturating_add(nodes.len().saturating_sub(MAX_AUDIT_PEERS));
-        return None;
+fn audit_nodes(nodes: Vec<NodeId>, batch: &mut AuditPageBatch) -> BTreeSet<NodeId> {
+    let mut queried: BTreeSet<NodeId> = nodes.into_iter().collect();
+    // Every node past the fan-out cap is reported missing; querying none of them
+    // would render an empty page as an almost complete audit trail.
+    while queried.len() > MAX_AUDIT_PEERS {
+        if let Some(node) = queried.pop_last() {
+            batch.mark_missing(node);
+        }
     }
-    Some(nodes.into_iter().collect())
+    queried
 }
 
 /// Requests every node's local audit page over the metadata control transport,
@@ -493,9 +495,7 @@ async fn dispatch_audit_page(
         request,
     } = effect;
     let mut batch = AuditPageBatch::with_limit(request.limit);
-    let Some(nodes) = audit_nodes(input_nodes, &mut batch) else {
-        return Event::Net(NetEvent::AuditPages(batch));
-    };
+    let nodes = audit_nodes(input_nodes, &mut batch);
     let mut remaining = nodes.clone();
     if remaining.is_empty() {
         return Event::Net(NetEvent::AuditPages(batch));
@@ -987,6 +987,9 @@ pub async fn drive_until<O: Operation>(
                 expired = true;
                 cleanup_deadline = Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
                 queue.clear();
+                // A committed transaction must not be rolled back, so its abort
+                // effects stay suppressed; backend reservations are released by
+                // dropping `holds`, never by this path.
                 if !committed {
                     queue.extend(operation.abort().into_iter().filter(|effect| {
                         !matches!(
@@ -1082,6 +1085,12 @@ pub async fn drive_until<O: Operation>(
                 break;
             }
         }
+    }
+    if !operation.is_complete() {
+        // finalize() is only defined on a terminal operation, so the deadline
+        // path takes its abort here. The cleanup window is over, so the effects
+        // are dropped and the tracker below owns any transaction they name.
+        let _ = operation.abort();
     }
     abort_leaked_transaction(
         &mut tracker,
@@ -1234,18 +1243,26 @@ mod test {
     use tempfile::tempdir;
 
     #[test]
-    fn rejects_audit_overflow() {
+    fn caps_audit_peers() {
+        // Over the cap the fan-out still asks MAX_AUDIT_PEERS nodes and reports
+        // the rest as missing instead of returning an empty page.
         let nodes = (1..=(MAX_AUDIT_PEERS as u8 + 2))
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect::<Vec<_>>();
         let mut batch = AuditPageBatch::new();
 
-        let nodes = audit_nodes(nodes, &mut batch);
+        let queried = audit_nodes(nodes, &mut batch);
 
-        assert!(nodes.is_none());
-        assert_eq!(batch.missing_nodes.len(), 0);
-        assert_eq!(batch.missing_overflow, 2);
+        assert_eq!(queried.len(), MAX_AUDIT_PEERS);
+        assert_eq!(batch.missing_nodes.len(), 2);
+        assert_eq!(batch.missing_overflow, 0);
         assert!(batch.completed_nodes.is_empty());
+        assert!(
+            batch
+                .missing_nodes
+                .iter()
+                .all(|node| !queried.contains(node))
+        );
     }
 
     #[tokio::test]
@@ -2186,6 +2203,81 @@ mod test {
         tokio::time::resume();
         assert_eq!(staged_value(&context).await, None);
         assert!(transaction_reopens(&context).await);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CommitDeadline {
+        state: u8,
+        txn_id: TxnId,
+        output: Option<Result<(), u8>>,
+    }
+
+    impl Operation for CommitDeadline {
+        type Output = ();
+        type Error = u8;
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: self.txn_id,
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            if matches!(
+                event,
+                Event::Storage(StorageEvent::TransactionCommitted { .. })
+            ) {
+                self.state = 2;
+                return smallvec::smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: "default".to_string(),
+                    key: ByteView::from(*b"after-commit"),
+                    txn_id: None,
+                })];
+            }
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.output.is_some()
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            // Mirrors the operations whose finalize assumes a terminal state.
+            self.output.expect("operation must set output")
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.output.get_or_insert(Err(self.state));
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_after_commit() {
+        // The commit suppresses the abort effects, so the driver still has to
+        // hand finalize a terminal operation instead of an unset output.
+        let (_directory, context) = test_context();
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("transaction starts");
+        };
+
+        let result = crate::driver::drive_until(
+            CommitDeadline {
+                state: 0,
+                txn_id,
+                output: None,
+            },
+            &context,
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+        assert_eq!(result, Err(2));
     }
 
     #[derive(Debug, PartialEq)]
