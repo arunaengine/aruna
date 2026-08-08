@@ -2170,15 +2170,20 @@ mod test {
             txn_id: None,
             ready: ready.clone(),
         };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
+        // fire the drive deadline, never a tied storage request timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let task_context = context.clone();
         let task = tokio::spawn(async move {
             crate::driver::drive_until(operation, &task_context, deadline).await
         });
 
         ready.notified().await;
-        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
         assert!(task.await.unwrap().unwrap());
+        // Real time again: auto-advance would fire the request timeouts of the
+        // storage roundtrips below before the worker thread can answer.
+        tokio::time::resume();
         assert_eq!(staged_value(&context).await, None);
         assert!(transaction_reopens(&context).await);
     }
@@ -2390,7 +2395,9 @@ mod test {
             aborted: aborted.clone(),
             ready: ready.clone(),
         };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
+        // fire the drive deadline, never a tied storage request timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let task_context = context.clone();
         let task = tokio::spawn(async move {
             crate::driver::drive_until(operation, &task_context, deadline).await
@@ -2398,8 +2405,11 @@ mod test {
 
         ready.notified().await;
         tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
         assert!(task.await.unwrap().is_ok());
+        // Real time again: auto-advance would fire the request timeouts of the
+        // storage roundtrips below before the worker thread can answer.
+        tokio::time::resume();
         assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
 
         let txn_id = seen.lock().unwrap().expect("child transaction recorded");
@@ -2427,7 +2437,9 @@ mod test {
             aborted: aborted.clone(),
             ready: ready.clone(),
         };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
+        // fire the drive deadline, never a tied storage request timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let task_context = context.clone();
         let task = tokio::spawn(async move {
             crate::driver::drive_until(operation, &task_context, deadline).await
@@ -2435,8 +2447,11 @@ mod test {
 
         ready.notified().await;
         tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
         assert!(task.await.unwrap().is_ok());
+        // Real time again: auto-advance would fire the request timeouts of the
+        // storage roundtrips below before the worker thread can answer.
+        tokio::time::resume();
         assert!(!aborted.load(std::sync::atomic::Ordering::SeqCst));
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
