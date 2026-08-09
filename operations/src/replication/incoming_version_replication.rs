@@ -5,7 +5,9 @@ use crate::blob::blob_keyspace_helper::{
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
 use crate::replication::error::ReplicationError;
-use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
+use crate::replication::protocol::{
+    ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,
+};
 use crate::replication::queue::{
     LiveReplicationObligationRecord, live_obligation_effect, schedule_blob_replication_drain_effect,
 };
@@ -127,6 +129,8 @@ pub enum IncomingVersionReplicationError {
     MissingCurrentVersionGeneration,
     #[error("Destination current version not found")]
     CurrentVersionNotFound,
+    #[error("Invalid reference advance")]
+    InvalidReferenceAdvance,
     #[error("Materialized replication manifest is missing blob info")]
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
@@ -178,6 +182,7 @@ pub struct IncomingVersionReplicationOperation {
     usage_update: Option<UsageCounterUpdate>,
     existing_blob_location: Option<BackendLocation>,
     replaced_version: Option<BlobVersion>,
+    advance_version_exists: bool,
     received_blob_location: Option<BackendLocation>,
     existing_current_pointer: Option<CurrentVersionPointer>,
     object_delta: i128,
@@ -229,6 +234,7 @@ impl IncomingVersionReplicationOperation {
             usage_update: None,
             existing_blob_location: None,
             replaced_version: None,
+            advance_version_exists: false,
             received_blob_location: None,
             existing_current_pointer: None,
             object_delta: 0,
@@ -439,6 +445,73 @@ impl IncomingVersionReplicationOperation {
         self.manifest.reference_intent && self.manifest.kind == ReplicationItemKind::Materialized
     }
 
+    fn valid_advance_manifest(&self) -> bool {
+        let Some(advance) = self.manifest.reference_advance.as_ref() else {
+            return false;
+        };
+        advance.predecessor != self.manifest.version_id && self.manifest.validate().is_ok()
+    }
+
+    fn binding_continues(
+        previous: &aruna_core::structs::VersionSourceBinding,
+        incoming: &aruna_core::structs::VersionSourceBinding,
+        advance: &ReferenceAdvance,
+        version_id: Ulid,
+    ) -> bool {
+        if previous.descriptor.kind != aruna_core::structs::SourceConnectorKind::ArunaNative {
+            return previous == incoming;
+        }
+        let previous_selector = format!("version:{}", advance.predecessor);
+        let incoming_selector = format!("version:{version_id}");
+        if previous.descriptor.version_selector.as_deref() != Some(previous_selector.as_str())
+            || incoming.descriptor.version_selector.as_deref() != Some(incoming_selector.as_str())
+        {
+            return false;
+        }
+
+        let mut previous = previous.clone();
+        let mut incoming = incoming.clone();
+        previous.descriptor.version_selector = None;
+        incoming.descriptor.version_selector = None;
+        previous == incoming
+    }
+
+    fn validate_advance(
+        &self,
+        previous: &BlobVersion,
+    ) -> Result<(), IncomingVersionReplicationError> {
+        let Some(advance) = self.manifest.reference_advance.as_ref() else {
+            return Ok(());
+        };
+        let incoming = self.reference_version()?;
+        let (
+            BlobVersionState::Reference {
+                source: previous_source,
+                ..
+            },
+            BlobVersionState::Reference {
+                source: incoming_source,
+                ..
+            },
+        ) = (&previous.state, &incoming.state)
+        else {
+            return Err(IncomingVersionReplicationError::InvalidReferenceAdvance);
+        };
+        if previous.published_by != Some(self.publisher_node_id)
+            || previous.created_by != incoming.created_by
+            || previous.metadata != incoming.metadata
+            || !Self::binding_continues(
+                previous_source,
+                incoming_source,
+                advance,
+                self.manifest.version_id,
+            )
+        {
+            return Err(IncomingVersionReplicationError::InvalidReferenceAdvance);
+        }
+        Ok(())
+    }
+
     fn reference_version(&self) -> Result<BlobVersion, IncomingVersionReplicationError> {
         let source = self
             .manifest
@@ -561,7 +634,11 @@ impl IncomingVersionReplicationOperation {
             return self
                 .reject_negotiation(IncomingVersionReplicationError::ManifestPermissionDenied);
         }
-        if self.manifest.writer_auth_context.is_none() {
+        if self.manifest.reference_advance.is_some() {
+            if !self.valid_advance_manifest() {
+                return self
+                    .reject_negotiation(IncomingVersionReplicationError::InvalidReferenceAdvance);
+            }
             return self.read_existing_version();
         }
         match self.writer_policy.as_deref() {
@@ -989,6 +1066,41 @@ impl IncomingVersionReplicationOperation {
             Ok(pointer) => pointer,
             Err(err) => return self.fail(err.into()),
         };
+        if let Some(advance) = self.manifest.reference_advance.as_ref() {
+            let Some(previous_generation) = advance.generation.checked_sub(1) else {
+                return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
+            };
+            let Some(pointer) = existing_pointer else {
+                return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
+            };
+            if incoming_generation != advance.generation {
+                return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
+            }
+            if self.advance_version_exists
+                && ((pointer.generation == advance.generation
+                    && pointer.version_id == self.manifest.version_id)
+                    || pointer.generation > advance.generation)
+            {
+                self.existing_current_pointer = Some(pointer);
+                self.object_delta = 0;
+                self.pending_new_pointer = None;
+                self.pending_new_current_hash = None;
+                return self.write_live_obligation();
+            }
+            if pointer.generation != previous_generation
+                || pointer.version_id != advance.predecessor
+            {
+                return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
+            }
+
+            self.existing_current_pointer = Some(pointer.clone());
+            self.pending_new_pointer = Some(CurrentVersionPointer::new_with_generation(
+                self.manifest.version_id,
+                advance.generation,
+            ));
+            self.pending_new_current_hash = None;
+            return self.read_current(pointer.version_id);
+        }
         let should_write = match existing_pointer.as_ref() {
             Some(pointer)
                 if (incoming_generation, self.manifest.version_id)
@@ -1144,11 +1256,17 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn write_live_obligation(&mut self) -> Effects {
-        let Some(auth_context) = self.manifest.writer_auth_context.clone() else {
-            return self.start_commit_quota();
+        let auth_context = match self.manifest.reference_advance.as_ref() {
+            Some(_) => self.manifest.auth_context.clone(),
+            None => {
+                let Some(auth_context) = self.manifest.writer_auth_context.clone() else {
+                    return self.start_commit_quota();
+                };
+                auth_context
+            }
         };
         self.state = IncomingVersionReplicationState::WriteLiveObligation;
-        let record = LiveReplicationObligationRecord::new(
+        let mut record = LiveReplicationObligationRecord::new(
             self.local_node_id,
             auth_context,
             self.manifest.bucket.clone(),
@@ -1158,6 +1276,9 @@ impl IncomingVersionReplicationOperation {
         )
         .with_origin(self.manifest.origin.clone())
         .with_sources(self.manifest.upstream_sources.clone());
+        if let Some(advance) = self.manifest.reference_advance {
+            record = record.with_reference_advance(advance);
+        }
         match live_obligation_effect(record, self.txn_id) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error.into()),
@@ -1259,7 +1380,11 @@ impl IncomingVersionReplicationOperation {
             return self.start_usage_update();
         }
         if self.is_reference_item() {
-            self.usage_update = Some(UsageCounterUpdate::for_group(group_id, group_delta));
+            let update = UsageCounterUpdate::for_group(group_id, group_delta);
+            if self.manifest.reference_advance.is_some() && update.is_noop() {
+                return self.commit_or_cleanup();
+            }
+            self.usage_update = Some(update);
             return self.start_usage_update();
         }
         let Some(blob) = self.manifest.blob.as_ref() else {
@@ -1481,6 +1606,10 @@ impl Operation for IncomingVersionReplicationOperation {
         if let Err(error) = self.manifest.validate() {
             return self.reject_negotiation(error.into());
         }
+        if self.manifest.reference_advance.is_some() && !self.valid_advance_manifest() {
+            return self
+                .reject_negotiation(IncomingVersionReplicationError::InvalidReferenceAdvance);
+        }
         if self.is_reference_item()
             && let Err(error) = self.reference_version()
         {
@@ -1499,7 +1628,8 @@ impl Operation for IncomingVersionReplicationOperation {
         {
             return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
         }
-        if self.manifest.origin.is_none() && self.manifest.writer_auth_context.is_none() {
+        if self.manifest.writer_auth_context.is_none() && self.manifest.reference_advance.is_none()
+        {
             return self
                 .reject_negotiation(IncomingVersionReplicationError::WriterPermissionDenied);
         }
@@ -1531,6 +1661,11 @@ impl Operation for IncomingVersionReplicationOperation {
 
                 let Some(value) = value else {
                     if self.create_attempted {
+                        return self.reject_negotiation(
+                            IncomingVersionReplicationError::DestinationBucketNotFound,
+                        );
+                    }
+                    if self.manifest.reference_advance.is_some() {
                         return self.reject_negotiation(
                             IncomingVersionReplicationError::DestinationBucketNotFound,
                         );
@@ -1623,6 +1758,26 @@ impl Operation for IncomingVersionReplicationOperation {
                         Ok(existing) => existing,
                         Err(error) => return self.fail(error.into()),
                     };
+                    if self.manifest.reference_advance.is_some() {
+                        let incoming = match self.reference_version() {
+                            Ok(incoming) => incoming,
+                            Err(error) => return self.reject_negotiation(error),
+                        };
+                        if existing != incoming {
+                            return self.reject_negotiation(
+                                IncomingVersionReplicationError::InvalidReferenceAdvance,
+                            );
+                        }
+                        self.replaced_reference_bytes = self
+                            .manifest
+                            .reference_metadata
+                            .as_ref()
+                            .map_or(0, |metadata| metadata.content_length);
+                        self.replaced_version = Some(existing);
+                        self.advance_version_exists = true;
+                        return self
+                            .send_negotiation(ReplicationNegotiationResult::NeedVersionOnly);
+                    }
                     self.replaced_version = Some(existing.clone());
                     match &existing.state {
                         BlobVersionState::Reference {
@@ -1954,6 +2109,9 @@ impl Operation for IncomingVersionReplicationOperation {
                         StorageError::TransactionConflict,
                     ));
                 }
+                if self.advance_version_exists {
+                    return self.write_hash_lookup_or_continue();
+                }
                 self.read_replaced_metadata()
             }
             IncomingVersionReplicationState::ReadReplacedMetadata => {
@@ -2076,12 +2234,19 @@ impl Operation for IncomingVersionReplicationOperation {
                     });
                 };
                 let Some(value) = value else {
-                    return self.fail(IncomingVersionReplicationError::CurrentVersionNotFound);
+                    return self.fail(if self.manifest.reference_advance.is_some() {
+                        IncomingVersionReplicationError::InvalidReferenceAdvance
+                    } else {
+                        IncomingVersionReplicationError::CurrentVersionNotFound
+                    });
                 };
                 let version = match BlobVersion::from_bytes(value.as_ref()) {
                     Ok(version) => version,
                     Err(error) => return self.fail(error.into()),
                 };
+                if let Err(error) = self.validate_advance(&version) {
+                    return self.fail(error);
+                }
                 self.apply_liveness(!version.is_deleted())
             }
             IncomingVersionReplicationState::ApplyHeadTransition => match event {
@@ -2364,11 +2529,10 @@ mod tests {
     };
 
     use crate::replication::protocol::{
-        MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, SyncOrigin, VersionReplicationManifest,
-        VersionReplicationMessage,
+        MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
+        VersionReplicationManifest, VersionReplicationMessage,
     };
     use crate::replication::queue::LiveReplicationObligationRecord;
-    use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -2383,11 +2547,12 @@ mod tests {
         BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
         MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
         ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, StorageRoutingRule,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, StorageRoutingRule, UsageDelta,
         VersionSourceBinding, WriteOwner,
     };
+    use aruna_core::{NodeId, UserId};
     use std::collections::{BTreeSet, HashMap};
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
     use ulid::Ulid;
 
     fn test_realm_id() -> RealmId {
@@ -2477,6 +2642,7 @@ mod tests {
             }),
             reference_metadata: None,
             metadata: HashMap::new(),
+            reference_advance: None,
         }
     }
 
@@ -2515,6 +2681,70 @@ mod tests {
             source_version: None,
         });
         manifest
+    }
+
+    fn advance_fixture() -> (VersionReplicationManifest, BlobVersion, NodeId) {
+        let predecessor = Ulid::from_bytes([21u8; 16]);
+        let version_id = Ulid::from_bytes([22u8; 16]);
+        let publisher = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
+        let mut manifest = make_reference_manifest();
+        manifest.version_id = version_id;
+        manifest.created_at = SystemTime::UNIX_EPOCH;
+        manifest.current_version_generation = Some(8);
+        manifest.auth_context = AuthContext::anonymous(test_realm_id());
+        manifest.writer_auth_context = None;
+        manifest.metadata = HashMap::from([("s3-key".to_string(), "value".to_string())]);
+        manifest.reference_advance = Some(ReferenceAdvance {
+            generation: 8,
+            predecessor,
+        });
+        manifest
+            .source
+            .as_mut()
+            .unwrap()
+            .descriptor
+            .version_selector = Some(format!("version:{version_id}"));
+
+        let mut previous_source = manifest.source.clone().unwrap();
+        previous_source.descriptor.version_selector = Some(format!("version:{predecessor}"));
+        let mut previous_metadata = manifest.reference_metadata.clone().unwrap();
+        previous_metadata.content_length = 42;
+        let previous = BlobVersion::reference(
+            previous_source,
+            previous_metadata,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            manifest.created_by,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+        )
+        .with_metadata(manifest.metadata.clone())
+        .with_publisher(publisher);
+
+        (manifest, previous, publisher)
+    }
+
+    fn advance_operation(
+        manifest: VersionReplicationManifest,
+        publisher: NodeId,
+    ) -> IncomingVersionReplicationOperation {
+        IncomingVersionReplicationOperation::new(
+            Ulid::from_bytes([24u8; 16]),
+            iroh::SecretKey::from_bytes(&[25u8; 32]).public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_publisher_node(publisher)
+    }
+
+    fn assert_advance_invalid(
+        manifest: VersionReplicationManifest,
+        publisher: NodeId,
+        previous: BlobVersion,
+    ) {
+        let op = advance_operation(manifest, publisher);
+        assert_eq!(
+            op.validate_advance(&previous),
+            Err(IncomingVersionReplicationError::InvalidReferenceAdvance)
+        );
     }
 
     fn message_from_effect(effect: &Effect) -> VersionReplicationMessage {
@@ -2793,6 +3023,279 @@ mod tests {
         let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
         assert_eq!(version.published_by, Some(publisher));
         assert_eq!(version.created_by, forged);
+    }
+
+    #[test]
+    fn valid_advance() {
+        let (manifest, previous, publisher) = advance_fixture();
+        let advance = manifest.reference_advance.unwrap();
+        let version_id = manifest.version_id;
+        assert!(manifest.writer_auth_context.is_none());
+        let mut op = advance_operation(manifest, publisher);
+
+        advance_to_version_lookup(&mut op, test_group_id());
+        let existing = op.reference_version().unwrap();
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
+        let txn_id = start_apply_transaction(&mut op);
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                CurrentVersionPointer::new_with_generation(
+                    advance.predecessor,
+                    advance.generation - 1,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+            ),
+        }));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(previous.to_bytes().unwrap().into()),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id: write_txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected head advance write")
+        };
+        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+        assert_eq!(*write_txn_id, Some(txn_id));
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(version_id, advance.generation)
+        );
+        assert_eq!(op.usage_delta().unwrap(), UsageDelta::default());
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
+        let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
+            panic!("expected successor version write")
+        };
+        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+    }
+
+    #[test]
+    fn advance_needs_bucket() {
+        let (manifest, _, publisher) = advance_fixture();
+        let mut op = advance_operation(manifest, publisher);
+        op.manifest_policy = Some(op.target_authorization_path(test_group_id()));
+
+        op.start();
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(!op.create_attempted);
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::DestinationBucketNotFound
+                .to_string()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn advance_requires_predecessor() {
+        let (manifest, _, publisher) = advance_fixture();
+        let advance = manifest.reference_advance.unwrap();
+        let other = Ulid::from_bytes([33u8; 16]);
+        let pointers = [
+            None,
+            Some(CurrentVersionPointer::new_with_generation(
+                advance.predecessor,
+                advance.generation - 2,
+            )),
+            Some(CurrentVersionPointer::new_with_generation(
+                other,
+                advance.generation - 1,
+            )),
+            Some(CurrentVersionPointer::new_with_generation(
+                advance.predecessor,
+                advance.generation,
+            )),
+        ];
+
+        for pointer in pointers {
+            let mut op = advance_operation(manifest.clone(), publisher);
+            start_apply_transaction(&mut op);
+            op.step(Event::Storage(StorageEvent::ReadResult {
+                key: vec![0u8; 4].into(),
+                value: pointer.map(|pointer| pointer.to_bytes().unwrap().into()),
+            }));
+            assert!(matches!(
+                op.output,
+                Some(Err(
+                    IncomingVersionReplicationError::InvalidReferenceAdvance
+                ))
+            ));
+        }
+
+        let mut op = advance_operation(manifest, publisher);
+        start_apply_transaction(&mut op);
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                CurrentVersionPointer::new_with_generation(
+                    advance.predecessor,
+                    advance.generation - 1,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+            ),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert!(matches!(
+            op.output,
+            Some(Err(
+                IncomingVersionReplicationError::InvalidReferenceAdvance
+            ))
+        ));
+    }
+
+    #[test]
+    fn advance_checks_publisher() {
+        let (manifest, mut previous, publisher) = advance_fixture();
+        previous.published_by = Some(iroh::SecretKey::from_bytes(&[36u8; 32]).public());
+
+        assert_advance_invalid(manifest, publisher, previous);
+    }
+
+    #[test]
+    fn advance_preserves_identity() {
+        let (manifest, previous, publisher) = advance_fixture();
+
+        let mut changed_creator = previous.clone();
+        changed_creator.created_by = UserId::local(Ulid::from_bytes([37u8; 16]), test_realm_id());
+        assert_advance_invalid(manifest.clone(), publisher, changed_creator);
+
+        let mut changed_metadata = previous.clone();
+        changed_metadata
+            .metadata
+            .insert("s3-key".to_string(), "changed".to_string());
+        assert_advance_invalid(manifest.clone(), publisher, changed_metadata);
+
+        let mut changed_binding = previous.clone();
+        let BlobVersionState::Reference { source, .. } = &mut changed_binding.state else {
+            panic!("expected reference predecessor")
+        };
+        source.descriptor.source_path = "changed/path".to_string();
+        assert_advance_invalid(manifest.clone(), publisher, changed_binding);
+
+        let mut non_native_manifest = manifest;
+        non_native_manifest.source.as_mut().unwrap().descriptor.kind = SourceConnectorKind::Http;
+        let mut non_native_previous = previous;
+        let BlobVersionState::Reference { source, .. } = &mut non_native_previous.state else {
+            panic!("expected reference predecessor")
+        };
+        source.descriptor.kind = SourceConnectorKind::Http;
+        assert_advance_invalid(non_native_manifest, publisher, non_native_previous);
+    }
+
+    #[test]
+    fn advance_rejects_collision() {
+        let (manifest, _, publisher) = advance_fixture();
+        let mut op = advance_operation(manifest, publisher);
+        let mut collision = op.reference_version().unwrap();
+        collision
+            .metadata
+            .insert("collision".to_string(), "true".to_string());
+        advance_to_version_lookup(&mut op, test_group_id());
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(collision.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::InvalidReferenceAdvance
+                .to_string()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn later_head_noop() {
+        let (manifest, _, publisher) = advance_fixture();
+        let advance = manifest.reference_advance.unwrap();
+        let mut op = advance_operation(manifest, publisher);
+        let duplicate = op.reference_version().unwrap();
+        advance_to_version_lookup(&mut op, test_group_id());
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(duplicate.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
+        let txn_id = start_apply_transaction(&mut op);
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                CurrentVersionPointer::new_with_generation(
+                    Ulid::from_bytes([50u8; 16]),
+                    advance.generation + 1,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+            ),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id: write_txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected downstream obligation write")
+        };
+        assert_eq!(key_space, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE);
+        assert_eq!(*write_txn_id, Some(txn_id));
+        let obligation = LiveReplicationObligationRecord::from_bytes(value).unwrap();
+        assert_eq!(obligation.reference_advance, Some(advance));
+        assert_eq!(op.usage_delta().unwrap(), UsageDelta::default());
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
+                if *commit_txn == txn_id
+        ));
     }
 
     #[test]
@@ -3100,6 +3603,47 @@ mod tests {
         let obligation = LiveReplicationObligationRecord::from_bytes(value).unwrap();
         assert_eq!(obligation.origin, Some(origin));
         assert_eq!(obligation.upstream_sources, op.manifest.upstream_sources);
+    }
+
+    #[test]
+    fn obligation_keeps_lineage() {
+        let (mut manifest, _, publisher) = advance_fixture();
+        let reader = manifest.auth_context.clone();
+        let advance = manifest.reference_advance.unwrap();
+        let origin = SyncOrigin {
+            relationship_id: Ulid::from_bytes([44u8; 16]),
+            hop_count: 2,
+        };
+        let source = aruna_core::structs::ArunaArn::s3_bucket(
+            test_realm_id(),
+            iroh::SecretKey::from_bytes(&[45u8; 32]).public(),
+            "source",
+        )
+        .unwrap();
+        manifest.origin = Some(origin.clone());
+        manifest.upstream_sources = vec![source.clone()];
+        let txn_id = Ulid::from_bytes([47u8; 16]);
+        let mut op = advance_operation(manifest, publisher);
+        op.txn_id = Some(txn_id);
+
+        let effects = op.write_live_obligation();
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                value,
+                txn_id: write_txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected live replication obligation write")
+        };
+        assert_eq!(*write_txn_id, Some(txn_id));
+        let obligation = LiveReplicationObligationRecord::from_bytes(value).unwrap();
+        assert_eq!(obligation.auth_context, reader);
+        assert_eq!(obligation.reference_advance, Some(advance));
+        assert_eq!(obligation.origin, Some(origin));
+        assert_eq!(obligation.upstream_sources, vec![source]);
     }
 
     #[test]
@@ -4171,7 +4715,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_relationship_writer() {
+    fn rejects_relationship_writer() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.origin = Some(SyncOrigin {
             relationship_id: Ulid::generate(),
@@ -4185,11 +4729,14 @@ mod tests {
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let effects = op.start();
 
-        assert_eq!(
-            op.state,
-            IncomingVersionReplicationState::ReadExistingVersion
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::WriterPermissionDenied
+                .to_string()
+                .as_str(),
         );
     }
 

@@ -77,7 +77,7 @@ impl OperationsInboundHandler {
     ) -> Self {
         let document_sync_reconcile =
             Arc::new(DocumentSyncReconcileCoalescer::new(shutdown.clone()));
-        spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile), &shutdown);
+        spawn_queue_gauge(Arc::downgrade(&document_sync_reconcile), &shutdown);
         Self {
             context,
             document_sync_reconcile,
@@ -205,6 +205,14 @@ async fn manifest_policy(
             &manifest.key,
         )
     };
+    if manifest.reference_advance.is_some() {
+        // The sync-eligible publisher attests source READ for this advance.
+        return Ok(if auth_matches(&manifest.auth_context, local_realm) {
+            (Some(path), None)
+        } else {
+            (None, None)
+        });
+    }
     let operation = if manifest.kind == ReplicationItemKind::DeleteMarker {
         "s3.DeleteObject"
     } else {
@@ -436,10 +444,7 @@ impl DocumentSyncReconcileCoalescer {
 
 // Emits a `queue.lag` line every tick while the coalescer holds queued topics
 // or a reconcile run is in flight, plus one final line once it drains.
-fn spawn_reconcile_queue_gauge(
-    coalescer: Weak<DocumentSyncReconcileCoalescer>,
-    shutdown: &Shutdown,
-) {
+fn spawn_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>, shutdown: &Shutdown) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
@@ -637,7 +642,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                         match first_event {
                             Event::Blob(BlobEvent::MessageReceived { payload, .. }) => {
                                 match VersionReplicationMessage::from_bytes(&payload) {
-                                    Ok(VersionReplicationMessage::VersionManifest(manifest)) => {
+                                    Ok(VersionReplicationMessage::VersionManifest(manifest))
+                                    | Ok(VersionReplicationMessage::ReferenceAdvance {
+                                        manifest,
+                                        ..
+                                    }) => {
                                         debug!(
                                             peer = %node_id,
                                             stream_id = %stream_id,
@@ -1075,10 +1084,15 @@ async fn run_metadata_document_sync_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::protocol::ReferenceAdvance;
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::UserId;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
-    use aruna_core::structs::{Backend, BackendConfig};
+    use aruna_core::structs::{
+        Backend, BackendConfig, PathRestriction, PortableSourceDescriptor, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, VersionSourceBinding,
+    };
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -1144,6 +1158,121 @@ mod tests {
         assert!(!handler.peer_sync_eligible(realm_id, user).await);
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         assert!(!handler.peer_sync_eligible(realm_id, unknown).await);
+    }
+
+    #[tokio::test]
+    async fn checks_advance_policy() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let foreign_realm = RealmId::from_bytes([5u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
+        let path = blob_object_permission_path(realm_id, group_id, node_id, "bucket", "key");
+        let auth_context = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: "/source/**".to_string(),
+                permission: Permission::READ,
+            }]),
+        };
+        let mut manifest = VersionReplicationManifest {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::generate(),
+            group_id,
+            kind: ReplicationItemKind::Materialized,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user_id,
+            current_version: true,
+            current_version_generation: Some(2),
+            auth_context,
+            blob: None,
+            source: Some(VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::Http,
+                    public_config: HashMap::new(),
+                    source_path: "source".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: Some(Ulid::generate()),
+            }),
+            multipart: None,
+            reference_intent: true,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: None,
+            reference_metadata: Some(SourceMetadata {
+                content_length: 1,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            }),
+            metadata: HashMap::new(),
+            reference_advance: Some(ReferenceAdvance {
+                generation: 2,
+                predecessor: Ulid::generate(),
+            }),
+        };
+
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (Some(path.clone()), None)
+        );
+
+        manifest.auth_context = AuthContext::anonymous(realm_id);
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (Some(path), None)
+        );
+
+        manifest.auth_context = AuthContext {
+            user_id: UserId::nil(foreign_realm),
+            realm_id,
+            path_restrictions: None,
+        };
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (None, None)
+        );
+
+        manifest.auth_context = AuthContext::anonymous(foreign_realm);
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (None, None)
+        );
+
+        manifest.reference_advance = None;
+        manifest.auth_context = AuthContext::anonymous(realm_id);
+        manifest.writer_auth_context = Some(manifest.auth_context.clone());
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (None, None)
+        );
     }
 
     #[tokio::test]

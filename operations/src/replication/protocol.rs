@@ -23,6 +23,12 @@ pub const MAX_REPLICATION_HASH_BYTES: usize = 64;
 pub const MAX_REPLICATION_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REPLICATION_MANIFEST_WORK: usize = 4 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceAdvance {
+    pub generation: u64,
+    pub predecessor: Ulid,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VersionReplicationManifest {
     pub bucket: String,
@@ -44,6 +50,8 @@ pub struct VersionReplicationManifest {
     pub writer_auth_context: Option<AuthContext>,
     pub reference_metadata: Option<SourceMetadata>,
     pub metadata: HashMap<String, String>,
+    #[serde(skip)]
+    pub reference_advance: Option<ReferenceAdvance>,
 }
 
 impl VersionReplicationManifest {
@@ -132,6 +140,24 @@ impl VersionReplicationManifest {
                     check_hash(&mut budget, name, digest)?;
                 }
             }
+        }
+
+        if let Some(advance) = &self.reference_advance
+            && (!self.current_version
+                || self.current_version_generation != Some(advance.generation)
+                || advance.generation == 0
+                || advance.predecessor == self.version_id
+                || !self.reference_intent
+                || self.kind != ReplicationItemKind::Materialized
+                || self.blob.is_some()
+                || self.multipart.is_some()
+                || self.source.is_none()
+                || self.reference_metadata.is_none()
+                || self.writer_auth_context.is_some())
+        {
+            return Err(ConversionError::FromStrError(
+                "replication manifest reference advance is invalid".to_string(),
+            ));
         }
 
         Ok(())
@@ -373,6 +399,10 @@ pub enum VersionReplicationMessage {
     /// The asking user has no read access to the bucket this node holds the
     /// copy under, so the caller learns nothing except that it was refused.
     LocationSummaryDenied,
+    ReferenceAdvance {
+        manifest: VersionReplicationManifest,
+        advance: ReferenceAdvance,
+    },
 }
 
 /// Read-only question a node asks a peer: do you hold this version, and on
@@ -437,7 +467,15 @@ impl VersionReplicationMessage {
                 )
             })?;
         let mut message: Self = postcard::from_bytes(payload)?;
-        if let Self::VersionManifest(manifest) = &mut message {
+        let manifest = match &mut message {
+            Self::VersionManifest(manifest) => Some(manifest),
+            Self::ReferenceAdvance { manifest, advance } => {
+                manifest.reference_advance = Some(*advance);
+                Some(manifest)
+            }
+            _ => None,
+        };
+        if let Some(manifest) = manifest {
             manifest.validate()?;
             if let Some(multipart) = manifest.multipart.as_mut() {
                 multipart.summary.composite_hashes = hashes_from_parts(&multipart.parts);
@@ -469,16 +507,18 @@ mod tests {
     use super::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_REPLICATION_HASH_BYTES,
         MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES, MAX_REPLICATION_VALUE_BYTES,
-        MultipartObjectReplicationMetadata, SyncOrigin, VersionReplicationManifest,
-        VersionReplicationMessage,
+        MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReferenceAdvance, SyncOrigin,
+        VersionReplicationManifest, VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
     use aruna_core::errors::ConversionError;
     use aruna_core::structs::checksum::HASH_SHA256;
     use aruna_core::structs::{
-        ArunaArn, AuthContext, MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
-        RealmId, ReplicationItemKind,
+        ArunaArn, AuthContext, BackendLocation, BackendRef, MultipartChecksumType,
+        MultipartObjectPart, MultipartObjectSummary, PortableSourceDescriptor, RealmId,
+        ReplicationItemKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        VersionSourceBinding,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -517,6 +557,64 @@ mod tests {
             writer_auth_context: None,
             reference_metadata: None,
             metadata: HashMap::new(),
+            reference_advance: None,
+        }
+    }
+
+    fn make_advance() -> VersionReplicationManifest {
+        let mut manifest = make_manifest();
+        manifest.kind = ReplicationItemKind::Materialized;
+        manifest.current_version_generation = Some(2);
+        manifest.source = Some(VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "path/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        });
+        manifest.reference_intent = true;
+        manifest.reference_metadata = Some(SourceMetadata {
+            content_length: 42,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+        });
+        manifest.reference_advance = Some(ReferenceAdvance {
+            generation: 2,
+            predecessor: Ulid::from(1u128),
+        });
+        manifest
+    }
+
+    fn make_blob() -> MaterializedBlobInfo {
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "path/file.txt".to_string(),
+            ulid: Ulid::generate(),
+            compressed: false,
+            encrypted: false,
+            created_by: test_user_id(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 42,
+            hashes: HashMap::new(),
+        };
+        MaterializedBlobInfo {
+            hash: [1u8; 32],
+            size: 42,
+            compressed: false,
+            encrypted: false,
+            location,
         }
     }
 
@@ -594,12 +692,120 @@ mod tests {
     }
 
     #[test]
+    fn preserves_manifest_wire() {
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize)]
+        struct LegacyManifest {
+            bucket: String,
+            key: String,
+            version_id: Ulid,
+            group_id: aruna_core::types::GroupId,
+            kind: ReplicationItemKind,
+            created_at: SystemTime,
+            created_by: UserId,
+            current_version: bool,
+            current_version_generation: Option<u64>,
+            auth_context: AuthContext,
+            blob: Option<MaterializedBlobInfo>,
+            source: Option<VersionSourceBinding>,
+            multipart: Option<MultipartObjectReplicationMetadata>,
+            reference_intent: bool,
+            origin: Option<SyncOrigin>,
+            upstream_sources: Vec<ArunaArn>,
+            writer_auth_context: Option<AuthContext>,
+            reference_metadata: Option<SourceMetadata>,
+            metadata: HashMap<String, String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        enum LegacyMessage {
+            VersionManifest(LegacyManifest),
+        }
+
+        let manifest = make_manifest();
+        let bytes = VersionReplicationMessage::VersionManifest(manifest.clone())
+            .to_bytes()
+            .unwrap();
+        let payload = bytes
+            .strip_prefix(super::VERSION_REPLICATION_MAGIC)
+            .unwrap();
+        let (legacy, remainder) = postcard::take_from_bytes::<LegacyMessage>(payload).unwrap();
+        let LegacyMessage::VersionManifest(legacy) = legacy;
+
+        assert!(remainder.is_empty());
+        assert_eq!(legacy.bucket, manifest.bucket);
+    }
+
+    #[test]
     fn rejects_truncated_manifest() {
         let mut bytes = VersionReplicationMessage::VersionManifest(make_manifest())
             .to_bytes()
             .unwrap();
         bytes.pop();
+
         assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn advance_roundtrip() {
+        let manifest = make_advance();
+        let message = VersionReplicationMessage::ReferenceAdvance {
+            advance: manifest.reference_advance.unwrap(),
+            manifest,
+        };
+
+        assert_eq!(
+            VersionReplicationMessage::from_bytes(&message.to_bytes().unwrap()).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_advances() {
+        let invalidators: [fn(&mut VersionReplicationManifest); 11] = [
+            |manifest| manifest.current_version = false,
+            |manifest| manifest.current_version_generation = None,
+            |manifest| {
+                manifest.current_version_generation = Some(0);
+                manifest.reference_advance.as_mut().unwrap().generation = 0;
+            },
+            |manifest| {
+                let version_id = manifest.version_id;
+                manifest.reference_advance.as_mut().unwrap().predecessor = version_id;
+            },
+            |manifest| manifest.reference_intent = false,
+            |manifest| manifest.kind = ReplicationItemKind::DeleteMarker,
+            |manifest| manifest.blob = Some(make_blob()),
+            |manifest| {
+                manifest.multipart = Some(MultipartObjectReplicationMetadata {
+                    summary: MultipartObjectSummary {
+                        checksum_type: MultipartChecksumType::Composite,
+                        part_count: 0,
+                        composite_hashes: HashMap::new(),
+                    },
+                    parts: Vec::new(),
+                    checksum_type: MultipartChecksumType::Composite,
+                });
+            },
+            |manifest| manifest.source = None,
+            |manifest| manifest.reference_metadata = None,
+            |manifest| manifest.writer_auth_context = Some(manifest.auth_context.clone()),
+        ];
+
+        for invalidate in invalidators {
+            let mut manifest = make_advance();
+            invalidate(&mut manifest);
+            let message = VersionReplicationMessage::ReferenceAdvance {
+                advance: manifest.reference_advance.unwrap(),
+                manifest,
+            };
+            assert_eq!(
+                VersionReplicationMessage::from_bytes(&message.to_bytes().unwrap()).unwrap_err(),
+                ConversionError::FromStrError(
+                    "replication manifest reference advance is invalid".to_string()
+                )
+            );
+        }
     }
 
     #[test]

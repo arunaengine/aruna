@@ -9,8 +9,8 @@ use crate::group_routing::load_group_inputs;
 use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
-    MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReplicationMode, SyncOrigin,
-    VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
+    MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReferenceAdvance, ReplicationMode,
+    SyncOrigin, VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
 use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
@@ -297,6 +297,7 @@ pub struct ReplicateScopeOperation {
     examined_versions: usize,
     source_authorization: Option<SourceAuthorization>,
     writer_auth_context: Option<AuthContext>,
+    reference_advance: Option<ReferenceAdvance>,
     routing: NodeRouting,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
@@ -317,6 +318,7 @@ impl ReplicateScopeOperation {
             examined_versions: 0,
             source_authorization: None,
             writer_auth_context: None,
+            reference_advance: None,
             routing: NodeRouting::default(),
             result: ReplicateScopeResult {
                 replicated: 0,
@@ -342,6 +344,11 @@ impl ReplicateScopeOperation {
 
     pub(super) fn with_writer_auth(mut self, auth_context: AuthContext) -> Self {
         self.writer_auth_context = Some(auth_context);
+        self
+    }
+
+    pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
+        self.reference_advance = Some(advance);
         self
     }
 
@@ -560,6 +567,9 @@ impl ReplicateScopeOperation {
     }
 
     fn run_next_replication(&mut self) -> Effects {
+        if self.reference_advance.is_some() && self.pending_versions.len() > 1 {
+            return self.fail(ReplicateObjectVersionError::InvalidReferenceAdvance.into());
+        }
         let Some(request) = self.pending_versions.pop() else {
             debug!(
                 bucket = %self.input.bucket,
@@ -608,6 +618,10 @@ impl ReplicateScopeOperation {
         };
         let operation = match writer_auth_context {
             Some(auth_context) => operation.with_writer_auth(auth_context),
+            None => operation,
+        };
+        let operation = match self.reference_advance.take() {
+            Some(advance) => operation.with_reference_advance(advance),
             None => operation,
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -904,6 +918,8 @@ pub enum ReplicateObjectVersionError {
     VersionNotFound,
     #[error("Reference version must be materialized before manifest creation")]
     UnresolvedReferenceVersion,
+    #[error("Reference advance requires a preserved reference version")]
+    InvalidReferenceAdvance,
     #[error("Missing blob hash")]
     MissingBlobHash,
     #[error("Multipart metadata incomplete: expected {expected} parts, found {actual}")]
@@ -963,6 +979,7 @@ pub struct ReplicateObjectVersionOperation {
     bucket_rules: Vec<StorageRoutingRule>,
     sync: Option<SyncTransferContext>,
     writer_auth_context: Option<AuthContext>,
+    reference_advance: Option<ReferenceAdvance>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
@@ -988,6 +1005,7 @@ impl ReplicateObjectVersionOperation {
             bucket_rules: Vec::new(),
             sync: None,
             writer_auth_context: None,
+            reference_advance: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
@@ -1005,6 +1023,11 @@ impl ReplicateObjectVersionOperation {
 
     fn with_writer_auth(mut self, auth_context: AuthContext) -> Self {
         self.writer_auth_context = Some(auth_context);
+        self
+    }
+
+    fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
+        self.reference_advance = Some(advance);
         self
     }
 
@@ -1294,6 +1317,9 @@ impl ReplicateObjectVersionOperation {
                 received: event,
             });
         };
+        if self.reference_advance.is_some() {
+            return self.read_current_lookup();
+        }
         let current = self.reference_metadata.clone();
         let handling = if self.preserve_reference {
             ReferenceHandling::Preserve
@@ -1526,18 +1552,34 @@ impl ReplicateObjectVersionOperation {
         &mut self,
         current_lookup: Option<CurrentVersionPointer>,
     ) -> Result<(), ReplicateObjectVersionError> {
-        self.validate_multipart_parts_complete()?;
+        if self.reference_advance.is_none() {
+            self.validate_multipart_parts_complete()?;
+        }
 
         let version = self
             .replication_version
             .clone()
             .ok_or(ReplicateObjectVersionError::VersionNotFound)?;
+        let reference_intent =
+            self.sync.as_ref().is_some_and(|sync| sync.reference_intent) || self.preserve_reference;
+        if self.reference_advance.is_some()
+            && (!self.preserve_reference
+                || !reference_intent
+                || self.multipart_summary.is_some()
+                || !matches!(&version, ReplicationVersion::Reference { .. }))
+        {
+            return Err(ReplicateObjectVersionError::InvalidReferenceAdvance);
+        }
         let current_version_pointer = current_lookup
             .as_ref()
             .filter(|pointer| pointer.version_id == self.request.version_id);
-        let current_version = current_version_pointer.is_some();
-        let reference_intent =
-            self.sync.as_ref().is_some_and(|sync| sync.reference_intent) || self.preserve_reference;
+        let (current_version, current_version_generation) = match self.reference_advance.as_ref() {
+            Some(advance) => (true, Some(advance.generation)),
+            None => (
+                current_version_pointer.is_some(),
+                current_version_pointer.map(|pointer| pointer.generation),
+            ),
+        };
         let (kind, created_at, created_by, blob, source, reference, metadata) = match version {
             ReplicationVersion::Materialized {
                 created_at,
@@ -1551,10 +1593,9 @@ impl ReplicateObjectVersionOperation {
                         .sync
                         .as_ref()
                         .ok_or(ReplicateObjectVersionError::UnresolvedReferenceVersion)?;
-                    // Must equal what a live head of this native source reports,
-                    // or the target's first read sees drift and forks a
-                    // successor. The head reads the version, not the shared
-                    // (content-addressed, deduplicated) location row.
+                    // Must equal the live head of this native source, or the target's first read
+                    // sees drift and forks a successor. The head reads the version, not the shared
+                    // content-addressed, deduplicated location row.
                     let reference = SourceMetadata {
                         content_length: location.blob_size,
                         content_type: None,
@@ -1656,7 +1697,7 @@ impl ReplicateObjectVersionOperation {
             created_at,
             created_by,
             current_version,
-            current_version_generation: current_version_pointer.map(|pointer| pointer.generation),
+            current_version_generation,
             auth_context: self.request.auth_context.clone(),
             blob,
             source,
@@ -1667,13 +1708,18 @@ impl ReplicateObjectVersionOperation {
                 .sync
                 .as_ref()
                 .map_or_else(Vec::new, |sync| sync.upstream_sources.clone()),
-            writer_auth_context: self.writer_auth_context.clone().or_else(|| {
-                self.sync
-                    .as_ref()
-                    .and_then(|sync| sync.writer_auth_context.clone())
-            }),
+            writer_auth_context: if self.reference_advance.is_some() {
+                None
+            } else {
+                self.writer_auth_context.clone().or_else(|| {
+                    self.sync
+                        .as_ref()
+                        .and_then(|sync| sync.writer_auth_context.clone())
+                })
+            },
             reference_metadata: reference,
             metadata,
+            reference_advance: self.reference_advance,
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -1716,11 +1762,12 @@ impl ReplicateObjectVersionOperation {
         let Some(stream_id) = self.stream_id else {
             return self.fail(ReplicationError::ConnectionMissing.into());
         };
-        let payload = match VersionReplicationMessage::VersionManifest(
-            self.manifest.clone().expect("manifest available"),
-        )
-        .to_bytes()
-        {
+        let manifest = self.manifest.clone().expect("manifest available");
+        let message = match manifest.reference_advance {
+            Some(advance) => VersionReplicationMessage::ReferenceAdvance { manifest, advance },
+            None => VersionReplicationMessage::VersionManifest(manifest),
+        };
+        let payload = match message.to_bytes() {
             Ok(payload) => payload,
             Err(err) => return self.fail(err.into()),
         };
@@ -2280,7 +2327,7 @@ mod tests {
     };
     use crate::driver::DriverContext;
     use crate::replication::protocol::{
-        ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
+        ReferenceAdvance, ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
     };
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
@@ -2298,10 +2345,11 @@ mod tests {
         Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
         CurrentVersionPointer, Group, GroupAuthorizationDocument, GroupRoutingInputs,
         MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, PortableSourceDescriptor, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, ReferenceHandling, ReplicationItemKind,
-        ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+        MultipartObjectSummary, PathRestriction, Permission, PortableSourceDescriptor,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, ReferenceHandling,
+        ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
+        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
+        VersionSourceBinding,
     };
     use aruna_core::types::Effects;
     use aruna_storage::FjallStorage;
@@ -2855,6 +2903,47 @@ mod tests {
     }
 
     #[test]
+    fn advance_queue_cardinality() {
+        let advance = ReferenceAdvance {
+            generation: 2,
+            predecessor: Ulid::generate(),
+        };
+        let mut denied = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket))
+            .with_reference_advance(advance);
+        denied.result.failed = 1;
+        denied.result.last_error = Some("source access denied".to_string());
+
+        let effects = denied.run_next_replication();
+
+        assert!(effects.is_empty());
+        assert_eq!(denied.state, super::ReplicateScopeState::Finish);
+        assert_eq!(denied.result.failed, 1);
+        assert_eq!(
+            denied.result.last_error.as_deref(),
+            Some("source access denied")
+        );
+        assert_eq!(denied.output, Some(Ok(denied.result.clone())));
+
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket))
+            .with_reference_advance(advance);
+        op.pending_versions = vec![
+            version_request(Ulid::generate()),
+            version_request(Ulid::generate()),
+        ];
+
+        let effects = op.run_next_replication();
+
+        assert!(effects.is_empty());
+        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert_eq!(
+            op.output,
+            Some(Err(ReplicateScopeError::ReplicateObjectVersionError(
+                ReplicateObjectVersionError::InvalidReferenceAdvance,
+            )))
+        );
+    }
+
+    #[test]
     fn multipart_metadata_paginates_across_multiple_iter_pages() {
         let version_id = Ulid::generate();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
@@ -3001,6 +3090,149 @@ mod tests {
         let manifest = op.manifest.expect("manifest built");
         assert!(manifest.current_version);
         assert_eq!(manifest.current_version_generation, Some(generation));
+    }
+
+    #[test]
+    fn advance_scope_lineage() {
+        // A later head must not relabel the durable successor obligation.
+        let version_id = Ulid::generate();
+        let advance = ReferenceAdvance {
+            generation: 42,
+            predecessor: Ulid::generate(),
+        };
+        let mut input = scope_input(ReplicateScopeTarget::Version {
+            key: "dir/file.txt".to_string(),
+            version_id,
+        });
+        input.auth_context.path_restrictions = Some(vec![PathRestriction {
+            pattern: "/realm/g/group/bucket/dir/file.txt".to_string(),
+            permission: Permission::READ,
+        }]);
+        let scoped_auth = input.auth_context.clone();
+        let persisted = reference_cached_metadata();
+        let mut fresh = persisted.clone();
+        fresh.etag = Some("etag-2".to_string());
+        let mut scope = ReplicateScopeOperation::new(input).with_reference_advance(advance);
+        scope.source_group_id = Some(Ulid::generate());
+        scope.sync = Some(reference_sync());
+        scope
+            .enqueue_version_request(VersionKey::new("bucket", "dir/file.txt", version_id))
+            .unwrap();
+
+        let mut effects = scope.run_next_replication();
+        let Effect::SubOperation(mut operation) = effects.pop().expect("version suboperation")
+        else {
+            panic!("expected version suboperation")
+        };
+        assert!(scope.reference_advance.is_none());
+
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+        operation.step(Event::SubOperation(
+            SubOperationEvent::VersionSourceAccessResolved {
+                result: Ok(ResolvedSourceAccess::OpenDal {
+                    kind: SourceConnectorKind::Http,
+                    config: HashMap::new(),
+                    path: "ref/file.txt".to_string(),
+                    version: None,
+                }),
+            },
+        ));
+        operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: fresh.clone(),
+        }));
+        let fingerprint = super::reference_fingerprint(&fresh, ReferenceHandling::Preserve)
+            .unwrap()
+            .to_vec();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: Some(fingerprint.into()),
+        }));
+        let newer =
+            CurrentVersionPointer::new_with_generation(Ulid::generate(), advance.generation + 1);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![3u8].into(),
+            value: Some(newer.to_bytes().unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::OpenConnection { .. })]
+        ));
+
+        let effects = operation.step(Event::Blob(BlobEvent::ConnectionEstablished {
+            stream_id: Ulid::generate(),
+        }));
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected manifest message")
+        };
+        let VersionReplicationMessage::ReferenceAdvance {
+            manifest,
+            advance: wire_advance,
+        } = VersionReplicationMessage::from_bytes(payload).unwrap()
+        else {
+            panic!("expected reference advance")
+        };
+
+        assert!(manifest.current_version);
+        assert_eq!(
+            manifest.current_version_generation,
+            Some(advance.generation)
+        );
+        assert_eq!(manifest.auth_context, scoped_auth);
+        assert_eq!(manifest.writer_auth_context, None);
+        assert_eq!(manifest.reference_metadata, Some(persisted));
+        assert_eq!(wire_advance, advance);
+        assert_eq!(manifest.reference_advance, Some(advance));
+    }
+
+    #[test]
+    fn advance_rejects_nonreference() {
+        let advance = ReferenceAdvance {
+            generation: 2,
+            predecessor: Ulid::generate(),
+        };
+        let mut materialized =
+            ReplicateObjectVersionOperation::new(version_request(Ulid::generate()))
+                .with_sync(reference_sync())
+                .with_reference_advance(advance);
+        materialized.preserve_reference = true;
+        materialized.replication_version = Some(ReplicationVersion::Materialized {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+            location: materialized_location(),
+            source: None,
+            metadata: HashMap::new(),
+        });
+        assert_eq!(
+            materialized.build_manifest(None),
+            Err(ReplicateObjectVersionError::InvalidReferenceAdvance)
+        );
+
+        materialized.multipart_summary = Some(MultipartObjectSummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 0,
+            composite_hashes: HashMap::new(),
+        });
+        assert_eq!(
+            materialized.build_manifest(None),
+            Err(ReplicateObjectVersionError::InvalidReferenceAdvance)
+        );
+
+        let mut deleted = ReplicateObjectVersionOperation::new(version_request(Ulid::generate()))
+            .with_sync(reference_sync())
+            .with_reference_advance(advance);
+        deleted.preserve_reference = true;
+        deleted.replication_version = Some(ReplicationVersion::Deleted {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+        });
+        assert_eq!(
+            deleted.build_manifest(None),
+            Err(ReplicateObjectVersionError::InvalidReferenceAdvance)
+        );
     }
 
     #[test]

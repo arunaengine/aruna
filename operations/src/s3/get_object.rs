@@ -2,9 +2,10 @@ use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use crate::replication::protocol::ReferenceAdvance;
 use crate::replication::queue::{
     LiveReplicationObligationRecord, QueueLiveVersionReplicationInput,
-    QueueLiveVersionReplicationOperation, live_replication_obligation_write_entry,
+    QueueLiveVersionReplicationOperation, live_obligation_entry,
 };
 use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
@@ -33,9 +34,7 @@ use std::time::SystemTime;
 use thiserror::Error;
 use tracing::warn;
 
-/// Bounds successor creation on a genuinely still-changing source: after this
-/// many advance attempts a drifting current read serves the latest observation
-/// live rather than spinning on new successors.
+/// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ADVANCE_ATTEMPTS: u8 = 3;
 use ulid::Ulid;
 
@@ -90,7 +89,7 @@ pub enum GetObjectError {
     DeleteMarker,
     #[error("The requested range is not satisfiable.")]
     InvalidRange,
-    #[error("Reference source metadata changed during ranged read.")]
+    #[error("Reference source metadata changed during access.")]
     ReferenceSourceChanged,
     #[error("The historical reference version is no longer available.")]
     HistoricalReferenceUnavailable,
@@ -204,6 +203,10 @@ pub struct GetObjectOperation {
     drift_attempts: u8,
     /// Reader's scoped credential, carried onto the successor's obligation.
     restrictions: Option<Vec<PathRestriction>>,
+    /// Original creator retained as successor attribution.
+    reference_creator: Option<UserId>,
+    /// Publisher-attested predecessor lineage for the successor.
+    reference_advance: Option<ReferenceAdvance>,
     metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
@@ -233,6 +236,8 @@ impl GetObjectOperation {
             usage_update: None,
             drift_attempts: 0,
             restrictions: None,
+            reference_creator: None,
+            reference_advance: None,
             metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
@@ -417,6 +422,7 @@ impl GetObjectOperation {
                 self.reference_cached = Some(cached_metadata);
                 self.reference_last_refresh = Some(last_refresh);
                 self.reference_explicit = explicit_version_request;
+                self.reference_creator = Some(version.created_by);
                 self.location = None;
                 self.reference_access = None;
                 self.reference_stream = None;
@@ -605,14 +611,12 @@ impl GetObjectOperation {
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
-                    // Current-version drift records a same-binding successor. A
-                    // source that keeps changing falls through to serving the
-                    // latest observation live rather than spinning on successors.
+                    // Current drift records a same-binding successor, but repeated
+                    // change fails rather than serving mismatched bytes.
                     if self.drift_attempts < MAX_DRIFT_ADVANCE_ATTEMPTS {
                         return self.begin_reference_advance(metadata);
                     }
-                    self.last_refresh = Some(SystemTime::now());
-                    return self.serve_reference_source(metadata);
+                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
                 }
 
                 // Undrifted: serve the recorded observation unchanged.
@@ -665,7 +669,7 @@ impl GetObjectOperation {
         })]
     }
 
-    fn handle_advance_transaction_started(&mut self, event: Event) -> Effects {
+    fn handle_advance_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -686,7 +690,7 @@ impl GetObjectOperation {
         })]
     }
 
-    fn handle_advance_head_read(&mut self, event: Event) -> Effects {
+    fn handle_advance_head(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -706,9 +710,10 @@ impl GetObjectOperation {
         if Some(pointer.version_id) != self.resolved_version_id {
             return self.restart_after_conflict();
         }
-        let (Some(observation), Some(source_binding), Some(txn_id)) = (
+        let (Some(observation), Some(source_binding), Some(creator), Some(txn_id)) = (
             self.advance_observation.clone(),
             self.source_binding.clone(),
+            self.reference_creator,
             self.txn_id,
         ) else {
             return self.emit_error(GetObjectError::GetObjectFailed);
@@ -716,13 +721,8 @@ impl GetObjectOperation {
 
         let new_version_id = Ulid::generate();
         let now = SystemTime::now();
-        let successor = BlobVersion::reference(
-            source_binding,
-            observation,
-            now,
-            self.input.user_identity,
-            now,
-        );
+        let successor = BlobVersion::reference(source_binding, observation, now, creator, now)
+            .with_metadata(self.metadata.clone());
         let version_key =
             match VersionKey::new(&self.input.bucket, &self.input.key, new_version_id).to_bytes() {
                 Ok(key) => key.into(),
@@ -736,11 +736,15 @@ impl GetObjectOperation {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
-        let head_value =
-            match CurrentVersionPointer::next_for(Some(&pointer), new_version_id).to_bytes() {
-                Ok(value) => value.into(),
-                Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-            };
+        let next_pointer = CurrentVersionPointer::next_for(Some(&pointer), new_version_id);
+        let head_value = match next_pointer.to_bytes() {
+            Ok(value) => value.into(),
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        let reference_advance = ReferenceAdvance {
+            generation: next_pointer.generation,
+            predecessor: pointer.version_id,
+        };
 
         // The durable obligation rides the same transaction as the successor, so
         // a lost enqueue is still discoverable by the repair scanner.
@@ -751,13 +755,15 @@ impl GetObjectOperation {
             self.input.key.clone(),
             new_version_id,
             false,
-        );
-        let obligation_entry = match live_replication_obligation_write_entry(&obligation) {
+        )
+        .with_reference_advance(reference_advance);
+        let obligation_entry = match live_obligation_entry(&obligation) {
             Ok(entry) => entry,
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
         self.resolved_version_id = Some(new_version_id);
+        self.reference_advance = Some(reference_advance);
         self.state = GetObjectState::WriteSuccessor;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![
@@ -853,6 +859,9 @@ impl GetObjectOperation {
         let Some(version_id) = self.resolved_version_id else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
+        let Some(reference_advance) = self.reference_advance else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
         self.state = GetObjectState::QueueSuccessorReplication;
         smallvec![Effect::SubOperation(boxed_suboperation(
             QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
@@ -862,7 +871,8 @@ impl GetObjectOperation {
                 key: self.input.key.clone(),
                 version_id,
                 delete_marker: false,
-            }),
+            })
+            .with_reference_advance(reference_advance),
             |result| Event::SubOperation(SubOperationEvent::LiveReplicationQueued {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
             }),
@@ -919,14 +929,15 @@ impl GetObjectOperation {
         }
     }
 
-    /// Re-reads the reference from the current head so a restarted access
-    /// observes the winner's successor. The advance counter is preserved so a
-    /// still-drifting source eventually falls through to serving live.
+    /// Re-reads the current head after conflict. The preserved advance counter
+    /// makes repeated source drift terminate.
     fn restart_reference_read(&mut self) -> Effects {
         self.txn_id = None;
         self.reference_access = None;
         self.reference_cached = None;
         self.reference_last_refresh = None;
+        self.reference_creator = None;
+        self.reference_advance = None;
         self.source_metadata = None;
         self.advance_observation = None;
         self.usage_update = None;
@@ -971,24 +982,14 @@ impl GetObjectOperation {
     pub fn handle_received_reference_source(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
-                // A committed successor names one observation; bytes that drifted
-                // again between the head and this read must not be served under
-                // its VersionId. The advance counter bounds the retries.
-                if self
-                    .advance_observation
-                    .as_ref()
-                    .is_some_and(|observation| {
-                        observation.observation_fingerprint() != metadata.observation_fingerprint()
-                    })
-                {
+                let Some(head_metadata) = self.source_metadata.as_ref() else {
+                    return self.emit_error(GetObjectError::GetObjectFailed);
+                };
+                if head_metadata.observation_fingerprint() != metadata.observation_fingerprint() {
+                    if self.reference_explicit {
+                        return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                    }
                     return self.restart_after_conflict();
-                }
-                if self.resolved_range.is_some()
-                    && self.source_metadata.as_ref().is_some_and(|head_metadata| {
-                        head_metadata.content_length != metadata.content_length
-                    })
-                {
-                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
                 }
                 self.advance_observation = None;
                 // `last_refresh` was set by the head handler from the drift check.
@@ -1054,10 +1055,8 @@ impl Operation for GetObjectOperation {
             GetObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::HeadReferenceSource => self.handle_reference_source_head(event),
-            GetObjectState::StartAdvanceTransaction => {
-                self.handle_advance_transaction_started(event)
-            }
-            GetObjectState::ReadHeadForAdvance => self.handle_advance_head_read(event),
+            GetObjectState::StartAdvanceTransaction => self.handle_advance_started(event),
+            GetObjectState::ReadHeadForAdvance => self.handle_advance_head(event),
             GetObjectState::WriteSuccessor => self.handle_successor_written(event),
             GetObjectState::UpdateReferenceUsage => self.handle_advance_usage(event),
             GetObjectState::CommitAdvance => self.handle_advance_committed(event),
@@ -1094,9 +1093,11 @@ impl Operation for GetObjectOperation {
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
+    use crate::replication::protocol::ReferenceAdvance;
     use crate::replication::queue::LiveReplicationObligationRecord;
     use crate::s3::get_object::{
-        GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, ObjectRangeRequest,
+        GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState,
+        MAX_DRIFT_ADVANCE_ATTEMPTS, ObjectRangeRequest,
     };
     use crate::usage_stats::UsageCounterUpdate;
     use aruna_blob::blob::BlobHandler;
@@ -1313,7 +1314,7 @@ mod test {
     }
 
     #[test]
-    fn reference_range_read_errors_when_read_length_differs_from_head() {
+    fn range_drift_restarts() {
         let mut operation = GetObjectOperation::new(GetObjectInput {
             bucket: "s3test".to_string(),
             key: "range.txt".to_string(),
@@ -1353,11 +1354,13 @@ mod test {
             )])),
         }));
 
-        assert!(effects.is_empty());
-        assert_eq!(
-            operation.finalize(),
-            Err(GetObjectError::ReferenceSourceChanged)
-        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: true
+            })]
+        ));
+        assert_eq!(operation.state, GetObjectState::StartTransaction);
     }
 
     #[tokio::test]
@@ -1843,7 +1846,7 @@ mod test {
     // (spec REQ-S3-DATA-MODEL-001) rather than silently floating, and the prior
     // version stays immutable.
     #[tokio::test]
-    async fn reference_drift_creates_successor() {
+    async fn drift_creates_successor() {
         let endpoint = spawn_reference_server(b"hello reference").await;
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
@@ -2069,17 +2072,10 @@ mod test {
             version_id: None,
             range: None,
             group_id: Ulid::generate(),
-            user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId([0u8; 32])),
             node_id: test_node_id(),
         });
-        operation.advance_observation = Some(observation(9));
-        operation.reference_access = Some(ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::Http,
-            config: HashMap::new(),
-            path: "folder/file.txt".to_string(),
-            version: None,
-        });
-        operation.source_binding = Some(VersionSourceBinding {
+        let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
                 kind: SourceConnectorKind::Http,
@@ -2090,6 +2086,25 @@ mod test {
                 origin_node_id: None,
             },
             connector_id: Some(Ulid::generate()),
+        };
+        let version = BlobVersion::reference(
+            source,
+            observation(4),
+            SystemTime::UNIX_EPOCH,
+            UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_metadata(HashMap::from([(
+            "label".to_string(),
+            "preserved".to_string(),
+        )]));
+        let _ = operation.read_version(Ulid::generate(), version, false);
+        operation.advance_observation = Some(observation(9));
+        operation.reference_access = Some(ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::new(),
+            path: "folder/file.txt".to_string(),
+            version: None,
         });
         operation
     }
@@ -2120,7 +2135,7 @@ mod test {
     // already wrote the successor), this read must not write a second one — it
     // aborts and restarts against the winner.
     #[test]
-    fn advance_restarts_when_head_moved() {
+    fn advance_conflict_restarts() {
         let mut operation = drifted_operation();
         let txn_id = Ulid::generate();
         operation.resolved_version_id = Some(Ulid::generate());
@@ -2146,7 +2161,9 @@ mod test {
             pattern: "/realm/g/group/data/node/s3test/range.txt".to_string(),
             permission: Permission::READ,
         }];
-        let mut operation = drifted_operation().with_restrictions(Some(restrictions.clone()));
+        let mut operation = drifted_operation().with_restrictions(Some(restrictions));
+        let creator = operation.reference_creator.unwrap();
+        let reader_auth = operation.auth_context();
         let headed = Ulid::generate();
         operation.resolved_version_id = Some(headed);
         operation.txn_id = Some(Ulid::generate());
@@ -2157,16 +2174,36 @@ mod test {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected a single batch write, got {effects:?}")
         };
-        let [_, _, (key_space, _, value)] = writes.as_slice() else {
+        let [
+            (_, _, version_value),
+            (_, _, head_value),
+            (key_space, _, obligation_value),
+        ] = writes.as_slice()
+        else {
             panic!("expected version, head and obligation writes, got {writes:?}")
         };
+        let successor = BlobVersion::from_bytes(version_value.as_ref()).unwrap();
+        assert_eq!(successor.created_by, creator);
+        assert_ne!(successor.created_by, operation.input.user_identity);
+        assert_eq!(successor.metadata, operation.metadata);
+        let next_pointer = CurrentVersionPointer::from_bytes(head_value.as_ref()).unwrap();
         assert_eq!(key_space, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE);
-        let record = LiveReplicationObligationRecord::from_bytes(value.as_ref()).unwrap();
+        let record =
+            LiveReplicationObligationRecord::from_bytes(obligation_value.as_ref()).unwrap();
         assert_eq!(Some(record.version_id), operation.resolved_version_id);
         assert_ne!(record.version_id, headed);
+        assert_eq!(next_pointer.version_id, record.version_id);
+        assert_eq!(next_pointer.generation, 2);
         assert_eq!(record.local_node_id, test_node_id());
         assert!(!record.delete_marker);
-        assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
+        assert_eq!(record.auth_context, reader_auth);
+        assert_eq!(
+            record.reference_advance,
+            Some(ReferenceAdvance {
+                generation: next_pointer.generation,
+                predecessor: headed,
+            })
+        );
     }
 
     // A committed successor is enqueued for live replication before its bytes
@@ -2176,6 +2213,10 @@ mod test {
         let mut operation = drifted_operation();
         let txn_id = Ulid::generate();
         operation.resolved_version_id = Some(Ulid::generate());
+        operation.reference_advance = Some(ReferenceAdvance {
+            generation: 2,
+            predecessor: Ulid::generate(),
+        });
         operation.txn_id = Some(txn_id);
         operation.state = GetObjectState::CommitAdvance;
 
@@ -2225,15 +2266,36 @@ mod test {
         assert_eq!(operation.usage_update, Some(expected));
     }
 
+    #[test]
+    fn drift_limit_fails() {
+        let mut operation = drifted_operation();
+        operation.drift_attempts = MAX_DRIFT_ADVANCE_ATTEMPTS;
+        operation.state = GetObjectState::HeadReferenceSource;
+
+        let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(9),
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::ReferenceSourceChanged)
+        );
+    }
+
     // The source can drift again between the head and the read; those bytes must
     // never be served under the VersionId that promised the head observation.
     #[test]
     fn read_drift_restarts() {
         let mut operation = drifted_operation();
-        operation.source_metadata = Some(observation(9));
+        let headed = observation(9);
+        let mut read = headed.clone();
+        read.etag = Some("changed-etag".to_string());
+        operation.advance_observation = None;
+        operation.source_metadata = Some(headed);
         operation.state = GetObjectState::ReadReferenceSource;
 
-        let effects = operation.step(source_read(observation(11)));
+        let effects = operation.step(source_read(read));
 
         assert!(matches!(
             effects.as_slice(),
@@ -2243,6 +2305,26 @@ mod test {
         ));
         assert_eq!(operation.state, GetObjectState::StartTransaction);
         assert!(operation.advance_observation.is_none());
+    }
+
+    #[test]
+    fn historical_read_fails() {
+        let mut operation = drifted_operation();
+        let headed = observation(9);
+        let mut read = headed.clone();
+        read.content_type = Some("changed/type".to_string());
+        operation.advance_observation = None;
+        operation.reference_explicit = true;
+        operation.source_metadata = Some(headed);
+        operation.state = GetObjectState::ReadReferenceSource;
+
+        let effects = operation.step(source_read(read));
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::HistoricalReferenceUnavailable)
+        );
     }
 
     // A matching read is served, and the stale promise is cleared with it.
@@ -2318,7 +2400,7 @@ mod test {
     // its recorded observation cannot serve current bytes: #375 caching is
     // deferred, so there are no historical bytes to return.
     #[tokio::test]
-    async fn explicit_reference_version_drift_is_unavailable() {
+    async fn historical_drift_fails() {
         let endpoint = spawn_reference_server(b"hello reference").await;
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
