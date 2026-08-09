@@ -106,17 +106,28 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
 
     for _ in 0..MAX_HARVEST_PAGES {
         check_signals(ctx)?;
+        let resumed = resumption_token.clone();
         let url = list_records_url(
             &connector.endpoint,
             &source.selector,
             from.as_deref(),
-            resumption_token.as_deref(),
+            resumed.as_deref(),
         )
         .map_err(|error| permanent(format!("invalid OAI endpoint URL: {error}")))?;
 
         let body = fetch(blob, url).await?;
-        let page =
-            parse_list_page(&body).map_err(|error| permanent(format!("OAI response: {error}")))?;
+        let page = match parse_list_page(&body) {
+            Ok(page) => page,
+            // A token the provider no longer honours would be replayed by every
+            // later run, so drop it and let the next run restart the window.
+            Err(error) if resumed.is_some() => {
+                persist_cursor(ctx, &source, original_last, None).await?;
+                return Err(retryable(format!(
+                    "OAI resumption token rejected, listing restarts next run: {error}"
+                )));
+            }
+            Err(error) => return Err(permanent(format!("OAI response: {error}"))),
+        };
 
         for record in &page.records {
             check_signals(ctx)?;
