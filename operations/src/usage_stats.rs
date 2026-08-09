@@ -282,9 +282,8 @@ pub enum QuotaGateError {
 /// budget for remote snapshot staleness, since remote group totals lag the
 /// authoritative counters that produced them.
 ///
-/// This in-transaction conflict is the write-path reservation (#352): no separate
-/// reserved-bytes ledger is built, because a concurrent write already cannot
-/// over-commit the ceiling.
+/// The write-path reservation (#352) uses this transaction conflict instead of a
+/// separate ledger, because concurrent writes cannot over-commit the ceiling.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,

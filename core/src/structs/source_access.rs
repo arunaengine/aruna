@@ -31,11 +31,9 @@ pub struct SourceMetadata {
 }
 
 impl SourceMetadata {
-    /// Canonical fingerprint of the drift-identifying fields of a source
-    /// observation. Two observations with the same fingerprint are the same
-    /// representation, so a resolving access MUST NOT create a successor
-    /// version. Provider version and the complete-read BLAKE3 are folded in by
-    /// the verified reference cache (#375); this is the HEAD-derived signal.
+    /// Canonical fingerprint of HEAD-derived drift fields. Equal fingerprints
+    /// identify one representation; provider version and complete-read BLAKE3
+    /// are folded in by the verified reference cache (#375).
     pub fn observation_fingerprint(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.content_length.to_le_bytes());
@@ -103,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_stable_and_field_sensitive() {
+    fn fingerprint_tracks_fields() {
         let base = metadata();
         assert_eq!(
             base.observation_fingerprint(),
@@ -135,7 +133,7 @@ mod tests {
     // source_version is transient (not persisted), so it must not perturb the
     // fingerprint or a stored observation would spuriously read as drifted.
     #[test]
-    fn fingerprint_ignores_transient_source_version() {
+    fn fingerprint_ignores_version() {
         let base = metadata();
         let mut versioned = base.clone();
         versioned.source_version = Some("v7".to_string());

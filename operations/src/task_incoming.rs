@@ -1869,22 +1869,18 @@ impl OperationsTaskHandler {
     }
 }
 
-fn spawn_durable_queue_rearm(
-    context: &Arc<DriverContext>,
-    task_handle: &TaskHandle,
-    shutdown: &Shutdown,
-) {
+fn spawn_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle, shutdown: &Shutdown) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    shutdown.spawn(durable_queue_rearm_loop(
+    shutdown.spawn(durable_rearm_loop(
         Arc::downgrade(context),
         task_handle.clone(),
         shutdown.token(),
     ));
 }
 
-async fn durable_queue_rearm_loop(
+async fn durable_rearm_loop(
     context: Weak<DriverContext>,
     task_handle: TaskHandle,
     cancelled: CancellationToken,
@@ -2013,7 +2009,7 @@ async fn initialize_task_handler(
         let table = rebuild_watch_interest_table(&context.storage_handle).await;
         net_handle.replace_watch_interest(table);
     }
-    spawn_durable_queue_rearm(&context, &task_handle, shutdown);
+    spawn_queue_rearm(&context, &task_handle, shutdown);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;

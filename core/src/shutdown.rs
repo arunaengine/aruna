@@ -1,8 +1,6 @@
 //! Single cancellation path for node shutdown.
-//!
-//! Subsystems register their background children here instead of detaching them
-//! with a bare `tokio::spawn`, so an ordered shutdown can stop admission, drain
-//! what is still running, and know when nothing can write any more.
+//! Subsystems register background children here so ordered shutdown can drain
+//! active work and know when nothing can write any more.
 
 use std::future::Future;
 use std::sync::{Arc, RwLock};
@@ -122,7 +120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_times_out_on_stuck_child() {
+    async fn drain_times_out() {
         let shutdown = Shutdown::new();
         shutdown.spawn(std::future::pending());
 
