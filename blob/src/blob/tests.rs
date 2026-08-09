@@ -2243,7 +2243,7 @@ fn group_effect(backend_id: Ulid) -> BlobEffect {
 // The seal stops new blob mutations before storage is sealed, so a restart
 // cannot find a backend write whose location never reached storage.
 #[tokio::test]
-async fn seal_rejects_blob_writes() {
+async fn seal_blocks_writes() {
     let context = setup_blob_handle(64).await;
     context.blob_handle.seal();
     assert!(context.blob_handle.is_sealed());
@@ -2275,7 +2275,7 @@ async fn seal_rejects_blob_writes() {
 // A copy that fails verification is tracked durably, keyed per (hash, backend)
 // so re-detecting the same corrupt copy overwrites its own row (§8.2).
 #[tokio::test]
-async fn quarantine_persists_and_overwrites() {
+async fn quarantine_upserts_record() {
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
     use aruna_core::structs::{BackendRef, BlobQuarantineRecord};
@@ -2324,7 +2324,7 @@ async fn quarantine_persists_and_overwrites() {
 
 // With no mutation in flight the drain returns immediately.
 #[tokio::test]
-async fn drain_writes_when_idle() {
+async fn idle_drain_succeeds() {
     let context = setup_blob_handle(64).await;
     assert!(
         context

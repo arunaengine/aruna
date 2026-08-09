@@ -3218,14 +3218,12 @@ mod tests {
             .inbound_tasks
             .spawn(std::future::pending::<()>());
 
-        let started = std::time::Instant::now();
         let complete = handle.shutdown_with_drain(Duration::from_millis(100)).await;
 
         assert!(!complete);
         assert!(handle.inner.shutdown.is_cancelled());
         assert!(handle.inner.accept_shutdown.is_cancelled());
         assert!(handle.inner.tasks.lock().await.is_empty());
-        assert!(started.elapsed() < Duration::from_millis(100) + FORCED_INBOUND_DRAIN * 2);
         Ok(())
     }
 

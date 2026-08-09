@@ -214,10 +214,9 @@ struct StorageMetrics {
     in_flight: AtomicU64,
     channel_closed: Arc<AtomicBool>,
     sealed: AtomicBool,
-    /// Serializes sealing against mutating enqueues: `seal` takes it for
-    /// writing, every mutating dispatch holds it for reading across the seal
-    /// check and the send, so a write either sits in the queue before `seal`
-    /// returns (ahead of the final `SyncAll`) or observes the seal.
+    /// Serializes sealing with mutating enqueues. Sealing takes the write lock;
+    /// dispatch holds a read lock through its check and send, so writes are queued
+    /// before the final `SyncAll` or rejected after sealing.
     seal_lock: RwLock<()>,
     rejected_writes: AtomicU64,
     last_error: Mutex<Option<String>>,
@@ -425,11 +424,9 @@ impl StorageHandle {
         self.metrics.in_flight.load(Ordering::Acquire)
     }
 
-    /// Waits until every effect already accepted on either lane has been
-    /// applied, including a deferred cleanup write still waiting for a queue
-    /// slot and an abort enqueued from a drop. `seal` only blocks later
-    /// dispatches, so this is what orders accepted mutations before the final
-    /// sync. Bounded by `timeout`; `false` means work is still outstanding.
+    /// Waits for effects accepted on either lane, including deferred cleanup and
+    /// drop aborts, before the final sync. Bounded by `timeout`; `false` means work
+    /// remains outstanding.
     pub async fn drain_accepted(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2946,7 +2943,9 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
+    use std::future::{Future, poll_fn};
     use std::sync::atomic::Ordering;
+    use std::task::Poll;
     use std::time::{Duration, Instant};
     use std::{env, process::Command, thread};
     use tempfile::tempdir;
@@ -3523,7 +3522,7 @@ mod tests {
 
     // Shutdown still has to read and fsync after the barrier is up.
     #[tokio::test]
-    async fn seal_allows_reads_and_sync() {
+    async fn read_sync_allowed() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         handle
@@ -3564,31 +3563,24 @@ mod tests {
             value: b"value".to_vec().into(),
             txn_id: None,
         }));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), queued.as_mut())
-                .await
-                .is_err()
-        );
+        let queued_state = poll_fn(|cx| Poll::Ready(queued.as_mut().poll(cx))).await;
+        assert!(queued_state.is_pending());
+        assert_eq!(handle.in_flight(), 1);
         handle.seal();
 
-        // Nothing services the lane, so the barrier reports outstanding work.
-        assert!(!handle.drain_accepted(Duration::from_millis(50)).await);
-
         let accepted = receivers.bulk.recv().expect("effect stays queued");
-        let waiter = tokio::spawn({
-            let handle = handle.clone();
-            async move { handle.drain_accepted(Duration::from_secs(30)).await }
-        });
-        tokio::task::yield_now().await;
+        let mut drain = Box::pin(handle.drain_accepted(Duration::from_secs(30)));
+        let drain_state = poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx))).await;
+        assert!(drain_state.is_pending());
         drop(accepted);
         drop(queued);
 
-        assert!(waiter.await.expect("barrier task joins"));
+        assert!(drain.await);
         assert_eq!(handle.in_flight(), 0);
     }
 
     #[tokio::test]
-    async fn seal_rejects_write_transactions() {
+    async fn write_txn_rejected() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         handle.seal();

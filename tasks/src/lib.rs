@@ -415,7 +415,7 @@ impl SchedulerState {
         self.running_by_id.len()
     }
 
-    fn abort_all_running_handlers(&mut self) -> usize {
+    fn abort_all_handlers(&mut self) -> usize {
         let aborted = self.running_by_id.len();
         for (_, entry) in self.running_by_id.drain() {
             entry.task.abort();
@@ -511,7 +511,7 @@ impl SchedulerState {
                 }
             }
             TaskCommand::AbortAllRunningHandlers { response } => {
-                let _ = response.send(self.abort_all_running_handlers());
+                let _ = response.send(self.abort_all_handlers());
             }
         }
     }
@@ -1195,7 +1195,7 @@ mod tests {
 
     // A handler that finishes inside the drain budget is joined, not cut.
     #[tokio::test]
-    async fn shutdown_drains_running_handler() {
+    async fn shutdown_drains_handler() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1223,7 +1223,7 @@ mod tests {
 
     // A handler that ignores the deadline is aborted instead of hanging exit.
     #[tokio::test]
-    async fn shutdown_aborts_stuck_handler() {
+    async fn shutdown_aborts_stuck() {
         let handle = TaskHandle::new();
         let started = Arc::new(Notify::new());
         let dropped = Arc::new(Notify::new());
@@ -1251,11 +1251,11 @@ mod tests {
 
     // Admission stops first: timers that fire after shutdown find no handler.
     #[tokio::test]
-    async fn shutdown_stops_new_handlers() {
+    async fn shutdown_stops_admission() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
-        let gate = Arc::new(tokio::sync::Semaphore::new(100));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let key = test_key();
 
         handle
@@ -1269,8 +1269,14 @@ mod tests {
         let report = handle.shutdown(Duration::from_secs(1)).await;
         assert_eq!(report.in_flight, 0);
 
-        fire_timer(&handle, key).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        fire_timer(&handle, key.clone()).await;
+        let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers { key }))
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 0);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
