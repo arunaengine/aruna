@@ -290,6 +290,7 @@ impl LocationSummaryOperation {
 
     fn send_answer(&mut self) -> Effects {
         self.summary.version_id = self.version_id;
+        self.summary.group_id = self.bucket.as_ref().map(|bucket| bucket.group_id);
         let summary = self.summary.clone();
         let Some(stream_id) = self.stream_id else {
             self.state = SummaryState::Finish;
@@ -553,6 +554,8 @@ impl LocationSummaryOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.summary.held = true;
+        self.summary.blob_size = Some(location.blob_size);
+        self.summary.hashes = location.hashes.into_iter().collect();
         match location.backend {
             BackendRef::Node(_) => {
                 self.summary.storage = Some(LocationCopyStorage::NodeManaged {

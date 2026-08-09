@@ -9,7 +9,7 @@ use aruna_core::structs::{
     SourceMetadata, VersionSourceBinding, VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
 
 const VERSION_REPLICATION_MAGIC: &[u8; 4] = b"vrp1";
@@ -458,6 +458,11 @@ pub struct LocationSummary {
     /// Whether the resolved version carries stored bytes at all. A delete
     /// marker or a reference-only version never will, anywhere.
     pub materialized: bool,
+    /// Group owning the answering node's bucket record, so a routed resolve can
+    /// report the object without a second authorization round trip.
+    pub group_id: Option<Ulid>,
+    pub blob_size: Option<u64>,
+    pub hashes: BTreeMap<String, Vec<u8>>,
 }
 
 impl LocationSummary {
@@ -467,6 +472,9 @@ impl LocationSummary {
             held: false,
             storage: None,
             materialized: false,
+            group_id: None,
+            blob_size: None,
+            hashes: BTreeMap::new(),
         }
     }
 }

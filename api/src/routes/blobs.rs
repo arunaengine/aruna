@@ -802,6 +802,9 @@ mod tests {
                     storage_class: Some("cold".to_string()),
                 }),
                 materialized: true,
+                group_id: None,
+                blob_size: None,
+                hashes: Default::default(),
             },
         );
 
@@ -825,6 +828,9 @@ mod tests {
                     name: Some("lab-minio".to_string()),
                 }),
                 materialized: true,
+                group_id: None,
+                blob_size: None,
+                hashes: Default::default(),
             },
         );
 
@@ -848,6 +854,9 @@ mod tests {
                 held: false,
                 storage: None,
                 materialized: false,
+                group_id: None,
+                blob_size: None,
+                hashes: Default::default(),
             },
         );
 

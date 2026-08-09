@@ -2158,6 +2158,7 @@ mod tests {
             version_id: None,
             dest_key: "in/data.csv".to_string(),
             container_path: None,
+            mode: InputModeRequest::Snapshot,
         };
         let mapped = native_input(input.clone()).unwrap();
         assert_eq!(

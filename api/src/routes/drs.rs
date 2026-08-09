@@ -10,7 +10,12 @@ use aruna_core::structs::{
     VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
 };
 use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::replication::location_summary::{
+    LocationSummaryError, RemoteLocationSummaryOperation,
+};
+use aruna_operations::replication::protocol::LocationSummaryRequest;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -23,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 use ulid::Ulid;
 use url::form_urlencoded::byte_serialize;
@@ -32,6 +39,7 @@ use utoipa_axum::routes;
 
 const W3ID_DATA_PREFIX: &str = "https://w3id.org/aruna/data/";
 const ACCESS_ID_HTTPS: &str = "https";
+const DRS_ROUTED_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -191,8 +199,11 @@ struct ResolvedObject {
     version_id: Ulid,
     canonical_w3id: String,
     requested_id: String,
-    location: BackendLocation,
+    size: u64,
+    hashes: HashMap<String, Vec<u8>>,
     source_metadata: Option<SourceMetadata>,
+    /// Present only when the bytes live here; a routed resolve reports metadata.
+    location: Option<BackendLocation>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -200,6 +211,8 @@ enum ResolveOutcome {
     Found(ResolvedObject),
     Denied,
     NotFound,
+    /// The owning node could not answer; absence was never established.
+    Unavailable,
 }
 
 #[utoipa::path(
@@ -345,6 +358,7 @@ pub async fn get_object(
         }
         Ok(ResolveOutcome::Denied) => drs_denied_error(anonymous).into_response(),
         Ok(ResolveOutcome::NotFound) => DrsError::not_found("DRS object not found").into_response(),
+        Ok(ResolveOutcome::Unavailable) => DrsError::unavailable().into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -431,6 +445,10 @@ pub async fn post_objects(
             Ok(ResolveOutcome::NotFound) => {
                 json!({ "status_code": 404, "msg": "DRS object not found" })
             }
+            Ok(ResolveOutcome::Unavailable) => {
+                let error = DrsError::unavailable();
+                json!({ "status_code": error.status.as_u16(), "msg": error.message })
+            }
             Err(error) => json!({ "status_code": error.status.as_u16(), "msg": error.message }),
         };
         objects.push(DrsBulkObjectItem { object_id, result });
@@ -495,7 +513,14 @@ pub async fn download_object(
         Ok(ResolveOutcome::NotFound) => {
             return DrsError::not_found("DRS object not found").into_response();
         }
+        Ok(ResolveOutcome::Unavailable) => return DrsError::unavailable().into_response(),
         Err(error) => return error.into_response(),
+    };
+    let Some(resolved_location) = resolved.location.clone() else {
+        return drs_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "object bytes are served by the owning node",
+        );
     };
 
     let key = if anonymous {
@@ -535,7 +560,7 @@ pub async fn download_object(
         Ok(Some(Err(error))) | Err(error) => return download_error(error),
     };
 
-    let location = result.location.unwrap_or_else(|| resolved.location.clone());
+    let location = result.location.unwrap_or(resolved_location);
 
     let mut response = Response::new(download::body(result.blob, permit));
     *response.status_mut() = StatusCode::OK;
@@ -558,7 +583,6 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
         .unwrap_or_default();
     let name = format!("content-{}", &hash[..hash.len().min(12)]);
     let checksums = resolved
-        .location
         .hashes
         .iter()
         .map(|(kind, value)| DrsChecksum {
@@ -571,25 +595,30 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
     } else {
         vec![resolved.canonical_w3id.clone()]
     };
-    let access_methods = vec![DrsAccessMethod {
-        access_id: ACCESS_ID_HTTPS.to_string(),
-        kind: "https".to_string(),
-        region: None,
-        access_url: Some(DrsAccessUrl {
-            url: format!(
-                "{base_url}/api/v1/ga4gh/drs/v1/download?object_id={}",
-                encode_component(&resolved.requested_id)
-            ),
-            headers: HashMap::new(),
-        }),
-    }];
+    // Only the owning node can serve the bytes, so a routed answer advertises none.
+    let access_methods = resolved
+        .location
+        .iter()
+        .map(|_| DrsAccessMethod {
+            access_id: ACCESS_ID_HTTPS.to_string(),
+            kind: "https".to_string(),
+            region: None,
+            access_url: Some(DrsAccessUrl {
+                url: format!(
+                    "{base_url}/api/v1/ga4gh/drs/v1/download?object_id={}",
+                    encode_component(&resolved.requested_id)
+                ),
+                headers: HashMap::new(),
+            }),
+        })
+        .collect();
 
     DrsObjectResponse {
         id: resolved.requested_id.clone(),
         self_uri,
         name,
         description: None,
-        size: Some(resolved.location.blob_size),
+        size: Some(resolved.size),
         checksums,
         mime_type: resolved
             .source_metadata
@@ -649,14 +678,76 @@ async fn resolve_object(
     }
 }
 
+/// Resolve a versioned ARN owned by another node in this realm. Only the owner
+/// establishes absence; anything short of its answer is `Unavailable`.
+async fn resolve_routed(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested_id: &str,
+    arn: &VersionedObjectArn,
+) -> Result<ResolveOutcome, DrsError> {
+    let context = state.get_ctx();
+    let config = match drive(GetRealmConfigOperation::new(arn.realm_id), &context).await {
+        Ok(config) => config,
+        Err(_) => return Ok(ResolveOutcome::Unavailable),
+    };
+    // A stale config cannot prove a node is not a member, so absence is not 404.
+    if !config.has_node(arn.node_id) {
+        return Ok(ResolveOutcome::Unavailable);
+    }
+    let summary = drive_until(
+        RemoteLocationSummaryOperation::new(
+            arn.node_id,
+            LocationSummaryRequest {
+                realm_id: arn.realm_id,
+                bucket: arn.bucket.clone(),
+                key: arn.key.clone(),
+                version_id: Some(arn.version),
+                auth_context: auth.clone(),
+            },
+        ),
+        &context,
+        Instant::now() + DRS_ROUTED_TIMEOUT,
+    )
+    .await;
+    let summary = match summary {
+        Ok(summary) => summary,
+        Err(LocationSummaryError::Denied) => return Ok(ResolveOutcome::Denied),
+        Err(LocationSummaryError::BucketNotFound) => return Ok(ResolveOutcome::NotFound),
+        Err(_) => return Ok(ResolveOutcome::Unavailable),
+    };
+    if summary.version_id != Some(arn.version) || !summary.materialized {
+        return Ok(ResolveOutcome::NotFound);
+    }
+    let (Some(group_id), Some(size)) = (summary.group_id, summary.blob_size) else {
+        return Ok(ResolveOutcome::Unavailable);
+    };
+    Ok(ResolveOutcome::Found(ResolvedObject {
+        bucket: arn.bucket.clone(),
+        key: arn.key.clone(),
+        group_id,
+        version_id: arn.version,
+        canonical_w3id: arn.to_w3id(),
+        requested_id: requested_id.to_string(),
+        size,
+        hashes: summary.hashes.into_iter().collect(),
+        source_metadata: None,
+        location: None,
+    }))
+}
+
 async fn resolve_versioned(
     state: &ServerState,
     auth: &AuthContext,
     requested_id: &str,
     arn: &VersionedObjectArn,
 ) -> Result<ResolveOutcome, DrsError> {
-    if arn.realm_id != state.get_realm_id() || arn.node_id != state.get_node_id() {
+    // This node serves exactly one realm, so a foreign realm is definitive absence.
+    if arn.realm_id != state.get_realm_id() {
         return Ok(ResolveOutcome::NotFound);
+    }
+    if arn.node_id != state.get_node_id() {
+        return resolve_routed(state, auth, requested_id, arn).await;
     }
 
     let bucket_info = match drive(
@@ -722,8 +813,10 @@ async fn resolve_versioned(
         version_id: arn.version,
         canonical_w3id: arn.to_w3id(),
         requested_id: requested_id.to_string(),
-        location,
+        size: location.blob_size,
+        hashes: location.hashes.clone(),
         source_metadata: head.source_metadata,
+        location: Some(location),
     }))
 }
 
@@ -812,8 +905,10 @@ async fn resolve_content_hash(
             version_id: mapping.version_id,
             canonical_w3id: format!("{W3ID_DATA_PREFIX}{}", hex::encode(hash)),
             requested_id: requested_id.to_string(),
-            location,
+            size: location.blob_size,
+            hashes: location.hashes.clone(),
             source_metadata: head.source_metadata,
+            location: Some(location),
         }));
     }
 
@@ -928,6 +1023,14 @@ impl DrsError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+        }
+    }
+
+    /// The owning node did not answer, so absence was never established.
+    fn unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "DRS object owner unavailable".to_string(),
         }
     }
 }
@@ -1296,26 +1399,33 @@ mod tests {
                 .as_bytes(),
         );
         let version = Ulid::from_bytes([7u8; 16]);
-        let arns = [
-            VersionedObjectArn::new(
-                state.get_realm_id(),
-                other_node,
-                "mybucket",
-                "path/file.txt",
-                version,
-            )
-            .unwrap(),
-            VersionedObjectArn::new(
-                other_realm,
-                state.get_node_id(),
-                "mybucket",
-                "path/file.txt",
-                version,
-            )
-            .unwrap(),
+        // A foreign realm is definitive absence; a foreign node is only unproven.
+        let cases = [
+            (
+                VersionedObjectArn::new(
+                    other_realm,
+                    state.get_node_id(),
+                    "mybucket",
+                    "path/file.txt",
+                    version,
+                )
+                .unwrap(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                VersionedObjectArn::new(
+                    state.get_realm_id(),
+                    other_node,
+                    "mybucket",
+                    "path/file.txt",
+                    version,
+                )
+                .unwrap(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ];
 
-        for arn in arns {
+        for (arn, expected) in cases {
             let response = get_object(
                 State(state.clone()),
                 Extension(Some(auth.clone())),
@@ -1324,14 +1434,13 @@ mod tests {
                 Path(arn.to_string()),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.status(), expected);
             let body = to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("response body");
             let payload: serde_json::Value =
                 serde_json::from_slice(&body).expect("typed error body");
-            assert_eq!(payload["status_code"], 404);
-            assert_eq!(payload["msg"], "DRS object not found");
+            assert_eq!(payload["status_code"], expected.as_u16());
         }
     }
 
@@ -1387,7 +1496,9 @@ mod tests {
             version_id: Ulid::from_bytes([5u8; 16]),
             canonical_w3id: canonical_w3id.clone(),
             requested_id: canonical_w3id.clone(),
-            location: materialized_location(blake3),
+            size: 42,
+            hashes: materialized_location(blake3).hashes.clone(),
+            location: Some(materialized_location(blake3)),
             source_metadata: Some(SourceMetadata {
                 content_length: 42,
                 content_type: Some("application/octet-stream".to_string()),
@@ -1440,7 +1551,9 @@ mod tests {
             version_id: Ulid::from_bytes([7u8; 16]),
             canonical_w3id: canonical_w3id.clone(),
             requested_id: requested_id.clone(),
-            location: materialized_location(blake3),
+            size: 42,
+            hashes: materialized_location(blake3).hashes.clone(),
+            location: Some(materialized_location(blake3)),
             source_metadata: Some(SourceMetadata {
                 content_length: 42,
                 content_type: Some("application/octet-stream".to_string()),
