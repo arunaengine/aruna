@@ -1056,6 +1056,7 @@ fn map_task_to_spec(
         file_outputs,
         workspace_outputs: Vec::new(),
         output_prefixes: Vec::new(),
+        collision_policy: Default::default(),
     };
 
     // Handed over as the raw idempotency key: `submit_execution_job` applies the per-user
@@ -2298,6 +2299,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         };
         let mut record = execution_record(JobId::from_bytes([1u8; 16]), user(2), spec());
         let cases = [
@@ -2437,6 +2439,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         };
         let record = execution_record(JobId::from_bytes([3u8; 16]), user(2), spec.clone());
         let task = project_task(&record, TesView::Basic, "http://x");

@@ -543,6 +543,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         };
         let job_id = JobId::from_bytes([5; 16]);
         let mut record = JobRecord::new(

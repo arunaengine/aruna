@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use aruna_core::compute::normalize_container_path;
 use aruna_core::structs::{
-    AuthContext, ComputeResources, ExecutionSpec, ExportReportRow, ImportReportRow, InputMode,
-    InputSelection, InputSource, JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, Permission,
-    WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
+    AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
+    ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
+    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, Permission, WorkspaceMode,
+    WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
@@ -75,6 +76,28 @@ pub struct ExecutionInputRequest {
     /// Absolute container path; defaults to `/inputs/<dest_key>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_path: Option<String>,
+    #[serde(default)]
+    pub mode: InputModeRequest,
+}
+
+/// Per-input composition mode. `exact_reference` requires `version_id`,
+/// `floating_reference` rejects it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InputModeRequest {
+    #[default]
+    Snapshot,
+    FloatingReference,
+    ExactReference,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionPolicyRequest {
+    #[default]
+    Reject,
+    Replace,
+    KeepExisting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -124,6 +147,8 @@ pub struct SubmitExecutionRequest {
     pub outputs: Vec<ExecutionOutputRequest>,
     #[serde(default)]
     pub output_prefixes: Vec<String>,
+    #[serde(default)]
+    pub collision_policy: CollisionPolicyRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,6 +409,10 @@ pub(crate) fn map_submit_error(
             ServerError::Conflict(format!("active RO-Crate job limit of {limit} reached"))
         }
         SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
+        SubmitJobError::Composition(CompositionError::KeyConflict(key)) => {
+            ServerError::Conflict(format!("composition key conflict on {key}"))
+        }
+        SubmitJobError::Composition(other) => ServerError::BadRequestMessage(other.to_string()),
         SubmitJobError::ClockHealth(_) => {
             ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
         }
@@ -465,11 +494,23 @@ fn native_input(input: ExecutionInputRequest) -> ServerResult<InputSelection> {
             version_id: input.version_id,
         },
         dest_key: input.dest_key,
-        mode: InputMode::Snapshot,
+        mode: match input.mode {
+            InputModeRequest::Snapshot => InputMode::Snapshot,
+            InputModeRequest::FloatingReference => InputMode::FloatingReference,
+            InputModeRequest::ExactReference => InputMode::ExactReference,
+        },
         container_path: Some(path),
         name: None,
         description: None,
     })
+}
+
+fn collision_policy(policy: CollisionPolicyRequest) -> CollisionPolicy {
+    match policy {
+        CollisionPolicyRequest::Reject => CollisionPolicy::Reject,
+        CollisionPolicyRequest::Replace => CollisionPolicy::Replace,
+        CollisionPolicyRequest::KeepExisting => CollisionPolicy::KeepExisting,
+    }
 }
 
 fn native_output(output: ExecutionOutputRequest) -> ServerResult<WorkspaceOutput> {
@@ -661,12 +702,14 @@ pub async fn submit_job(
     if request.inputs.len() > MAX_INPUTS || request.outputs.len() > MAX_INPUTS {
         return Err(ServerError::BadRequest);
     }
+    // Destination-key overlaps are the composition's collision policy to resolve.
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
         let input = native_input(input)?;
-        if inputs.iter().any(|existing| {
-            existing.dest_key == input.dest_key || existing.container_path == input.container_path
-        }) {
+        if inputs
+            .iter()
+            .any(|existing| existing.container_path == input.container_path)
+        {
             return Err(ServerError::BadRequest);
         }
         inputs.push(input);
@@ -704,6 +747,7 @@ pub async fn submit_job(
         file_outputs: Vec::new(),
         workspace_outputs,
         output_prefixes,
+        collision_policy: collision_policy(request.collision_policy),
     };
     let result = submit_execution_job(
         &state.get_ctx(),
@@ -2088,6 +2132,7 @@ mod tests {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
                 idempotency_key: None,
                 workspace: None,
             };

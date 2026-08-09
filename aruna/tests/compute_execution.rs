@@ -166,6 +166,7 @@ fn execution_spec(
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
         output_prefixes: vec!["outputs/".to_string()],
+        collision_policy: Default::default(),
     }
 }
 

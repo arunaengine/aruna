@@ -113,7 +113,7 @@ pub(crate) async fn submit_local_job(
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
-    spec: ExecutionSpec,
+    mut spec: ExecutionSpec,
     created_by: UserId,
     owner_node_id: NodeId,
     idempotency_key: Option<String>,
@@ -121,6 +121,7 @@ pub async fn submit_execution_job(
     workspace_bucket: Option<String>,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
+    spec.inputs = aruna_core::structs::plan_composition(spec.inputs, spec.collision_policy)?;
     match workspace_mode {
         WorkspaceMode::None if workspace_bucket.is_some() => {
             return Err(SubmitJobError::InvalidWorkspace(

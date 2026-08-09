@@ -10,11 +10,11 @@ use aruna_core::compute::{
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobError, JobRecord, OutputDestination, OutputObject, OutputSelection,
-    PathRestriction, Permission, UserAccess, WorkspaceMode, blob_bucket_permission_path,
-    blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
-    workspace_credential_id,
+    AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec, InputMode,
+    InputSelection, InputSource, JobError, JobRecord, OutputDestination, OutputObject,
+    OutputSelection, PathRestriction, Permission, UserAccess, WorkspaceMode,
+    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
+    ensure_confined_relative_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -857,6 +857,18 @@ async fn stage_one_input(
     ) {
         return Ok(());
     }
+    if destination.is_some() {
+        match spec.collision_policy {
+            CollisionPolicy::Reject => {
+                return Err(JobError::permanent(format!(
+                    "composition key conflict on {}",
+                    input.dest_key
+                )));
+            }
+            CollisionPolicy::KeepExisting => return Ok(()),
+            CollisionPolicy::Replace => {}
+        }
+    }
 
     let content_length = get.location.as_ref().map(|location| location.blob_size);
     let realm_config = Box::pin(drive(
@@ -1137,6 +1149,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes,
+            collision_policy: Default::default(),
         }
     }
 

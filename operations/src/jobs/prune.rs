@@ -275,6 +275,7 @@ mod tests {
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
                 output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
             }),
             UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
             node_id(7),

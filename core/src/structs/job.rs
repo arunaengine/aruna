@@ -151,11 +151,83 @@ impl JobState {
     }
 }
 
-/// How an input is exposed to the task.
+/// How an input is exposed to the task. Reference modes stage a copy today; the
+/// non-copying durable binding waits on native reference reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputMode {
     Snapshot,
     Mount,
+    /// Membership is fixed while the source content may advance.
+    FloatingReference,
+    /// Bound to the exact source version the request names.
+    ExactReference,
+}
+
+/// How a composition resolves a destination key that is already claimed, either
+/// by another input or by an object already in the destination bucket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionPolicy {
+    #[default]
+    Reject,
+    Replace,
+    KeepExisting,
+}
+
+impl CollisionPolicy {
+    /// Stable wire and log spelling; never change an existing mapping.
+    pub const fn name(self) -> &'static str {
+        match self {
+            CollisionPolicy::Reject => "reject",
+            CollisionPolicy::Replace => "replace",
+            CollisionPolicy::KeepExisting => "keep_existing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CompositionError {
+    #[error("composition key conflict on `{0}`")]
+    KeyConflict(String),
+    #[error("exact_reference input `{0}` requires a source version")]
+    MissingVersion(String),
+    #[error("floating_reference input `{0}` must not pin a source version")]
+    PinnedVersion(String),
+}
+
+/// Resolve one destination key per input under `policy`. `Replace` keeps the last
+/// claim, `KeepExisting` the first, and `Reject` fails the whole composition.
+pub fn plan_composition(
+    inputs: Vec<InputSelection>,
+    policy: CollisionPolicy,
+) -> Result<Vec<InputSelection>, CompositionError> {
+    let mut planned: Vec<InputSelection> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        validate_input_version(&input)?;
+        match planned
+            .iter()
+            .position(|existing| existing.dest_key == input.dest_key)
+        {
+            None => planned.push(input),
+            Some(_) if policy == CollisionPolicy::KeepExisting => {}
+            Some(index) if policy == CollisionPolicy::Replace => planned[index] = input,
+            Some(_) => return Err(CompositionError::KeyConflict(input.dest_key)),
+        }
+    }
+    Ok(planned)
+}
+
+fn validate_input_version(input: &InputSelection) -> Result<(), CompositionError> {
+    let InputSource::S3 { version_id, .. } = &input.source;
+    match input.mode {
+        InputMode::ExactReference if version_id.is_none() => {
+            Err(CompositionError::MissingVersion(input.dest_key.clone()))
+        }
+        InputMode::FloatingReference if version_id.is_some() => {
+            Err(CompositionError::PinnedVersion(input.dest_key.clone()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Where an input comes from. v1 supports internal S3 objects only.
@@ -241,6 +313,8 @@ pub struct ExecutionSpec {
     pub workspace_outputs: Vec<WorkspaceOutput>,
     /// Declared output prefixes in the workspace, inventoried at completion.
     pub output_prefixes: Vec<String>,
+    /// How a claimed destination key is resolved while composing the workspace.
+    pub collision_policy: CollisionPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1613,6 +1687,79 @@ mod tests {
         }
     }
 
+    fn input(key: &str, mode: InputMode, version: Option<&str>) -> InputSelection {
+        InputSelection {
+            source: InputSource::S3 {
+                bucket: "src".to_string(),
+                key: key.to_string(),
+                version_id: version.map(str::to_string),
+            },
+            dest_key: format!("in/{key}"),
+            mode,
+            container_path: Some(format!("/inputs/{key}")),
+            name: None,
+            description: None,
+        }
+    }
+
+    fn colliding() -> Vec<InputSelection> {
+        let mut second = input("a", InputMode::Snapshot, None);
+        second.source = InputSource::S3 {
+            bucket: "other".to_string(),
+            key: "a".to_string(),
+            version_id: None,
+        };
+        vec![input("a", InputMode::Snapshot, None), second]
+    }
+
+    #[test]
+    fn rejects_key_conflict() {
+        assert_eq!(
+            plan_composition(colliding(), CollisionPolicy::Reject),
+            Err(CompositionError::KeyConflict("in/a".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolves_key_conflict() {
+        // Replace keeps the last claim on a key, KeepExisting the first.
+        let replaced = plan_composition(colliding(), CollisionPolicy::Replace).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].source, colliding()[1].source);
+
+        let kept = plan_composition(colliding(), CollisionPolicy::KeepExisting).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].source, colliding()[0].source);
+    }
+
+    #[test]
+    fn enforces_reference_versions() {
+        assert_eq!(
+            plan_composition(
+                vec![input("a", InputMode::ExactReference, None)],
+                CollisionPolicy::Reject
+            ),
+            Err(CompositionError::MissingVersion("in/a".to_string()))
+        );
+        assert_eq!(
+            plan_composition(
+                vec![input("a", InputMode::FloatingReference, Some("01ARZ"))],
+                CollisionPolicy::Reject
+            ),
+            Err(CompositionError::PinnedVersion("in/a".to_string()))
+        );
+        assert!(
+            plan_composition(
+                vec![
+                    input("a", InputMode::ExactReference, Some("01ARZ")),
+                    input("b", InputMode::FloatingReference, None),
+                ],
+                CollisionPolicy::Reject
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn resolves_workspace_outputs() {
         // Intents materialize against the derived bucket and drain once.
@@ -1635,6 +1782,7 @@ mod tests {
                 dest_key: "outputs/report.txt".to_string(),
             }],
             output_prefixes: vec!["outputs/".to_string()],
+            collision_policy: Default::default(),
         };
 
         spec.resolve_outputs("ws-job");
