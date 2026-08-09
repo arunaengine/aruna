@@ -4568,6 +4568,9 @@ fn realm_config_from_reducer_materialization(
         placement_bindings: Vec::new(),
         placement_handle_ranges: Vec::new(),
         band_pools: Vec::new(),
+        candidate_maps: Vec::new(),
+        placement_activations: Vec::new(),
+        placement_transitions: Vec::new(),
         revoked_tokens: Vec::new(),
         revocation_floor: reducer_state.revocation_floor,
     };

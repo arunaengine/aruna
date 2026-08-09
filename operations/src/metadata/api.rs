@@ -745,10 +745,7 @@ fn select_path_holders(
         if tokio::time::Instant::now() >= deadline {
             return Err(MetadataApiError::ServiceUnavailable);
         }
-        let placement = PlacementRef {
-            strategy_id,
-            shard,
-        };
+        let placement = PlacementRef { strategy_id, shard };
         let holders =
             resolve_holders_limit(config, &placement, METADATA_DISTRIBUTED_QUERY_MAX_NODES);
         if holders.is_empty() {

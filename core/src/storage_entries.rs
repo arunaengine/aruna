@@ -32,8 +32,7 @@ use crate::metadata::{
 };
 use crate::structs::{
     MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PLACEMENT_EPOCH_PAD,
-    PlacementRef, User,
-    WatchSubscription, notification_inbox_key, notification_outbox_key,
+    PlacementRef, User, WatchSubscription, notification_inbox_key, notification_outbox_key,
     notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};

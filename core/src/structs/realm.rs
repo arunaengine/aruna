@@ -4,10 +4,11 @@ use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BandPool, BindingDirectory, BindingError, BindingScope, DEFAULT_SHARD_COUNT,
-    DocumentClass, HandleRange, HandleRangeDirectory, JobId, METADATA_HANDLE, NodePlacementEntry,
-    PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, StrategyBinding,
-    coordinator_spans,
+    Actor, BandPool, BindingDirectory, BindingError, BindingScope, CandidateMapNode,
+    CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
+    DocumentClass, HandleRange, HandleRangeDirectory, JobId, KIND_LABEL_KEY, METADATA_HANDLE,
+    NodePlacementEntry, PlacementActivation, PlacementBinding, PlacementOverride, PlacementScope,
+    PlacementStrategy, PlacementTransition, StrategyBinding, coordinator_spans,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -172,6 +173,18 @@ pub struct RealmConfigDocument {
     /// Each coordinator grants node bands only from pools it owns; precedence
     /// is by lineage (see [`coordinator_spans`]).
     pub band_pools: Vec<BandPool>,
+    /// Immutable snapshots of the placement view. `placement_map` stays the
+    /// edit surface; only a published map can become a holder-set input.
+    #[serde(default)]
+    pub candidate_maps: Vec<CandidatePlacementMap>,
+    /// One activated map epoch per `(strategy, bucket)`; the pinned input every
+    /// holder resolution reads.
+    #[serde(default)]
+    pub placement_activations: Vec<PlacementActivation>,
+    /// Non-terminal transitions plus their reduced barrier, proof, and
+    /// completion sets.
+    #[serde(default)]
+    pub placement_transitions: Vec<PlacementTransition>,
     /// CEL request policies applied realm-wide (Class-1 replicated, so
     /// evaluation is local on every node).
     #[serde(default)]
@@ -329,6 +342,16 @@ impl RealmNodeKind {
     pub fn is_sync_eligible(&self) -> bool {
         !matches!(self, RealmNodeKind::User)
     }
+
+    /// Value of the derived, read-only kind label placement views carry.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RealmNodeKind::Management => "management",
+            RealmNodeKind::Server => "server",
+            RealmNodeKind::Local => "local",
+            RealmNodeKind::User => "user",
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -388,6 +411,12 @@ impl RealmConfigDocument {
         sort_canonical(&mut canonical.placement_bindings)?;
         sort_canonical(&mut canonical.placement_handle_ranges)?;
         sort_canonical(&mut canonical.band_pools)?;
+        sort_canonical(&mut canonical.candidate_maps)?;
+        sort_canonical(&mut canonical.placement_activations)?;
+        // Transitions are excluded for the same reason as revocations: their
+        // barrier and proof sets converge independently, and only the
+        // activation they advance changes where a request routes.
+        canonical.placement_transitions.clear();
         // Revocations are excluded: the digest binds routing agreement between
         // nodes, and a deny-list that converges independently would otherwise
         // make every revocation reject forwarded requests until it replicated.
@@ -424,6 +453,9 @@ impl RealmConfigDocument {
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
             band_pools: Vec::new(),
+            candidate_maps: Vec::new(),
+            placement_activations: Vec::new(),
+            placement_transitions: Vec::new(),
         }
     }
 
@@ -603,6 +635,98 @@ impl RealmConfigDocument {
         self.strategies
             .iter()
             .find(|strategy| strategy.strategy_id == *strategy_id)
+    }
+
+    /// Eligible-node view derived from the live config: one entry per node with
+    /// a parseable id, `placement_map` fields defaulted, and the derived kind
+    /// label overlaying entry labels (it always wins). This is what a published
+    /// candidate map freezes.
+    pub fn candidate_nodes(&self) -> Vec<CandidateMapNode> {
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for realm_node in &self.nodes {
+            let Ok(node_id) = NodeId::from_str(&realm_node.node_id) else {
+                continue;
+            };
+            let entry = self.placement_entry(node_id);
+            let mut labels = entry.map(|entry| entry.labels.clone()).unwrap_or_default();
+            labels.insert(
+                KIND_LABEL_KEY.to_string(),
+                realm_node.kind.label().to_string(),
+            );
+            nodes.push(CandidateMapNode {
+                node_id,
+                kind: realm_node.kind.clone(),
+                location: entry
+                    .map(|entry| entry.effective_location().to_string())
+                    .unwrap_or_else(|| DEFAULT_LOCATION.to_string()),
+                weight: entry
+                    .map(|entry| entry.weight)
+                    .unwrap_or(DEFAULT_NODE_WEIGHT),
+                full: entry.is_some_and(|entry| entry.full),
+                draining: entry.is_some_and(|entry| entry.draining),
+                labels,
+            });
+        }
+        nodes
+    }
+
+    /// Freezes the current view as the next candidate map epoch and activates
+    /// it for every bucket that has no activation yet. Already activated
+    /// buckets keep their epoch: only a transition moves those.
+    pub fn snapshot_candidate_map(&mut self) -> u64 {
+        let epoch = self.newest_map_epoch().unwrap_or(0) + 1;
+        self.candidate_maps.push(CandidatePlacementMap {
+            epoch,
+            nodes: self.candidate_nodes(),
+        });
+        for strategy in &self.strategies {
+            for shard in 0..strategy.shard_count {
+                if self
+                    .placement_activations
+                    .iter()
+                    .any(|entry| entry.strategy_id == strategy.strategy_id && entry.shard == shard)
+                {
+                    continue;
+                }
+                self.placement_activations.push(PlacementActivation {
+                    strategy_id: strategy.strategy_id,
+                    shard,
+                    activation_epoch: 1,
+                    candidate_map_epoch: epoch,
+                    transition_id: None,
+                });
+            }
+        }
+        epoch
+    }
+
+    pub fn newest_map_epoch(&self) -> Option<u64> {
+        self.candidate_maps.iter().map(|map| map.epoch).max()
+    }
+
+    /// The map at `epoch`, or `None` when it is missing or conflicted (two
+    /// divergent maps at one epoch keep the epoch unusable).
+    pub fn candidate_map(&self, epoch: u64) -> Option<&CandidatePlacementMap> {
+        let mut matches = self.candidate_maps.iter().filter(|map| map.epoch == epoch);
+        let map = matches.next()?;
+        matches.next().is_none().then_some(map)
+    }
+
+    /// The activation of one bucket, or `None` when it is missing or
+    /// conflicted. Fail-closed: a conflicted bucket resolves no holders.
+    pub fn activation(&self, strategy_id: &Ulid, shard: u32) -> Option<&PlacementActivation> {
+        let mut matches = self
+            .placement_activations
+            .iter()
+            .filter(|entry| entry.strategy_id == *strategy_id && entry.shard == shard);
+        let activation = matches.next()?;
+        matches.next().is_none().then_some(activation)
+    }
+
+    pub fn transition(&self, transition_id: &Ulid) -> Option<&PlacementTransition> {
+        self.placement_transitions
+            .iter()
+            .find(|transition| transition.plan.transition_id == *transition_id)
     }
 
     /// Rebuilds the derived Placement Binding Directory from the stored set.
@@ -792,10 +916,10 @@ mod test {
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::auth::REVOCATION_GRACE_SECS;
     use crate::structs::{
-        Actor, DynamicDiscoveryMethod, MetadataGroupReplicationOverride,
-        MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, TokenRevocation,
-        default_realm_discovery_config,
+        Actor, CandidatePlacementMap, DynamicDiscoveryMethod, KIND_LABEL_KEY,
+        MetadataGroupReplicationOverride, MetadataPathReplicationOverride, OidcProviderConfig,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind, TokenRevocation, default_realm_discovery_config,
     };
     use ulid::Ulid;
 
@@ -857,6 +981,9 @@ mod test {
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
             band_pools: Vec::new(),
+            candidate_maps: Vec::new(),
+            placement_activations: Vec::new(),
+            placement_transitions: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1024,6 +1151,63 @@ mod test {
     }
 
     #[test]
+    fn snapshot_freezes_the_view() {
+        use crate::structs::NodePlacementEntry;
+
+        fn node_id(seed: u8) -> NodeId {
+            iroh::SecretKey::from_bytes(&[seed; 32]).public()
+        }
+        let mut config = RealmConfigDocument::new(RealmId([11u8; 32]), Vec::new(), 3);
+        config.seed_default_placement();
+        config.ensure_node(node_id(1), RealmNodeKind::Server);
+        config.placement_map.push(NodePlacementEntry {
+            node_id: node_id(1),
+            location: "eu".to_string(),
+            weight: 250,
+            full: false,
+            draining: false,
+            labels: Default::default(),
+        });
+
+        assert_eq!(config.snapshot_candidate_map(), 1);
+        let buckets: u32 = config.strategies.iter().map(|s| s.shard_count).sum();
+        assert_eq!(config.placement_activations.len(), buckets as usize);
+        let strategy_id = config.default_strategy_id.unwrap();
+        let activation = *config
+            .activation(&strategy_id, 7)
+            .expect("bucket activated");
+        assert_eq!(activation.activation_epoch, 1);
+        assert_eq!(activation.candidate_map_epoch, 1);
+        assert_eq!(activation.transition_id, None);
+
+        // A later config edit changes the live view but never a published map.
+        config.placement_map[0].weight = 1;
+        config.ensure_node(node_id(2), RealmNodeKind::Server);
+        let frozen = config.candidate_map(1).expect("epoch 1 is unconflicted");
+        assert_eq!(frozen.nodes.len(), 1);
+        assert_eq!(frozen.nodes[0].weight, 250);
+        assert_eq!(
+            frozen.nodes[0].labels.get(KIND_LABEL_KEY),
+            Some(&"server".to_string())
+        );
+        assert_eq!(config.candidate_nodes().len(), 2);
+
+        // A second snapshot opens a new epoch and leaves activations pinned.
+        assert_eq!(config.snapshot_candidate_map(), 2);
+        assert_eq!(config.newest_map_epoch(), Some(2));
+        assert_eq!(config.activation(&strategy_id, 7), Some(&activation));
+        assert_eq!(config.candidate_map(2).unwrap().nodes.len(), 2);
+
+        // Divergent maps at one epoch keep the epoch unusable.
+        let conflicting = CandidatePlacementMap {
+            epoch: 2,
+            nodes: Vec::new(),
+        };
+        config.candidate_maps.push(conflicting);
+        assert!(config.candidate_map(2).is_none());
+    }
+
+    #[test]
     fn digest_ignores_order() {
         let mut config = RealmConfigDocument::new(
             RealmId([4u8; 32]),
@@ -1163,6 +1347,9 @@ mod test {
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
             band_pools: Vec::new(),
+            candidate_maps: Vec::new(),
+            placement_activations: Vec::new(),
+            placement_transitions: Vec::new(),
         };
 
         assert_eq!(
