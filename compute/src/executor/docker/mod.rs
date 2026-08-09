@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
@@ -372,6 +372,7 @@ impl DockerBackend {
         plan: Option<&ArchivePlan<'_>>,
         inspect: ContainerInspectResponse,
         cancel: &CancellationToken,
+        guard: &mut ControlGuard,
     ) -> Result<AttemptStatus, BackendError> {
         self.cancel_submission(attempt, cancel).await?;
         let status = inspect_to_status(inspect.clone());
@@ -393,6 +394,7 @@ impl DockerBackend {
             self.verify_layout(container_id, plan).await?;
         }
         self.cancel_submission(attempt, cancel).await?;
+        guard.mark_start()?;
         let started = self.start_by_name(container_id).await;
         self.cancel_submission(attempt, cancel).await?;
         started?;
@@ -1159,7 +1161,7 @@ impl ExecutorBackend for DockerBackend {
             ));
         }
         validate_spec(&self.config, spec)?;
-        let guard = self.control_guard(context).await?;
+        let mut guard = self.control_guard(context).await?;
         if guard.tombstone().is_some() {
             return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
         }
@@ -1175,6 +1177,18 @@ impl ExecutorBackend for DockerBackend {
             .then(|| ArchivePlan::new(spec))
             .transpose()?;
         let name = spec.attempt.external_name();
+        // Once a start is durably recorded, an absent container is lost evidence:
+        // creating a second one would run the same attempt twice.
+        if guard.started() {
+            return match self.inspect_matching_attempt(&spec.attempt).await {
+                Ok(inspect) => {
+                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect, cancel, &mut guard)
+                        .await
+                }
+                Err(BackendError::NotFound(_)) => Ok(lost_status(&name)),
+                Err(other) => Err(other),
+            };
+        }
         self.ensure_image(&spec.image, cancel).await?;
 
         let create_opts = CreateContainerOptionsBuilder::new().name(&name).build();
@@ -1190,7 +1204,7 @@ impl ExecutorBackend for DockerBackend {
                 }
                 let inspect = self.inspect_matching_attempt(&spec.attempt).await;
                 self.cancel_submission(&spec.attempt, cancel).await?;
-                self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel)
+                self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel, &mut guard)
                     .await
             }
             // Name collision: adopt the existing attempt, never start a second run.
@@ -1198,7 +1212,7 @@ impl ExecutorBackend for DockerBackend {
                 BackendError::Conflict(_) => {
                     let inspect = self.inspect_matching_attempt(&spec.attempt).await;
                     self.cancel_submission(&spec.attempt, cancel).await?;
-                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel)
+                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel, &mut guard)
                         .await
                 }
                 other => {
@@ -1231,8 +1245,15 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn status(&self, context: &FenceContext) -> Result<AttemptStatus, BackendError> {
-        validate_control(self.daemon_lock.read(context)?, context)?;
-        let inspect = self.inspect_matching_attempt(&context.attempt).await?;
+        let control = self.daemon_lock.read(context)?;
+        validate_control(control.clone(), context)?;
+        let inspect = match self.inspect_matching_attempt(&context.attempt).await {
+            Ok(inspect) => inspect,
+            Err(BackendError::NotFound(_)) if control_started(control.as_ref()) => {
+                return Ok(lost_status(&context.attempt.external_name()));
+            }
+            Err(other) => return Err(other),
+        };
         validate_labels(&inspect, context)?;
         Ok(inspect_to_status(inspect))
     }
@@ -1251,8 +1272,15 @@ impl ExecutorBackend for DockerBackend {
         // non-terminal status and break the wait contract. Poll inspect to
         // terminal evidence or the cancel token, like the trait default.
         loop {
-            validate_control(self.daemon_lock.read(context)?, context)?;
-            let inspect = self.inspect_matching_attempt(&context.attempt).await?;
+            let control = self.daemon_lock.read(context)?;
+            validate_control(control.clone(), context)?;
+            let inspect = match self.inspect_matching_attempt(&context.attempt).await {
+                Ok(inspect) => inspect,
+                Err(BackendError::NotFound(_)) if control_started(control.as_ref()) => {
+                    return Ok(lost_status(&context.attempt.external_name()));
+                }
+                Err(other) => return Err(other),
+            };
             validate_labels(&inspect, context)?;
             let status = inspect_to_status(inspect);
             if status.is_terminal() {
@@ -1669,6 +1697,32 @@ fn validate_control(
         return Err(BackendError::Fenced);
     }
     Ok(())
+}
+
+fn control_started(record: Option<&ControlRecord>) -> bool {
+    record.is_some_and(|record| record.started)
+}
+
+/// A start was durably recorded but the container is gone, so the attempt may
+/// have run: terminal evidence, never a licence to create a second container.
+fn lost_status(name: &str) -> AttemptStatus {
+    AttemptStatus {
+        phase: AttemptPhase::Failed {
+            reason: "lost evidence after recorded start".to_string(),
+        },
+        backend_ref: name.to_string(),
+        started_at_ms: None,
+        finished_at_ms: Some(now_ms()),
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// A container created by a partial submit that never started a run: only such a
