@@ -493,7 +493,10 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
     let realm_id = RealmId([95u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let full_config = realm_config_for(&nodes, realm_id);
-    let mut reduced_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    // Same strategies as the full config, fewer nodes: only the eligible set
+    // may differ, or the rerank would also remap every shard topic.
+    let mut reduced_config = full_config.clone();
+    reduced_config.nodes.clear();
     for node in &nodes[..2] {
         reduced_config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
@@ -525,6 +528,43 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
     // published into topic history before changing which node holds the inbox.
     wait_for(|| async { iter_len(old_holder_node, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await == 0 })
         .await?;
+
+    // Deliver once before the rerank, so the post-rerank delivery below proves
+    // the subscription moved rather than that it never worked.
+    wait_for_holder(
+        &nodes[1],
+        realm_id,
+        &probe,
+        WatchEventKind::DataUploaded,
+        old_holder,
+        true,
+    )
+    .await?;
+    let before_event_id = Ulid::generate();
+    emit_resource_watch_event(
+        nodes[1].context.as_ref(),
+        upload_event(
+            before_event_id,
+            realm_id,
+            UserId::local(Ulid::generate(), realm_id),
+            UploadLocation {
+                group_id,
+                node_id: data_node_id,
+                bucket: "bucket",
+                key: "reranked/before",
+            },
+            unix_timestamp_millis(),
+        ),
+    )
+    .await;
+    let before_id = watch_notification_id(before_event_id, subscription.watch_id);
+    wait_for(|| async {
+        list_via(&nodes[0], watcher)
+            .await
+            .iter()
+            .any(|record| record.notification_id == before_id)
+    })
+    .await?;
 
     install_config_document(&nodes, realm_id, &full_config).await?;
     let new_holder_node = node_by_id(&nodes, new_holder);
