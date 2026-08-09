@@ -59,7 +59,6 @@ async fn ensure_held_shard_topics(
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
@@ -627,7 +626,6 @@ mod tests {
             config,
             PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard: 3,
             },
         )

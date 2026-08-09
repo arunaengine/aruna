@@ -973,7 +973,6 @@ mod tests {
                 permission_path: "/referenced".to_string(),
                 placement: PlacementRef {
                     strategy_id,
-                    epoch: 0,
                     shard: 1,
                 },
                 holder_node_ids: vec![actor.node_id],

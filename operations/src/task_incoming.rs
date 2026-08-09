@@ -4016,7 +4016,6 @@ mod tests {
             kind: DocumentSyncChangeKind::Upsert,
             placement: aruna_core::structs::PlacementRef {
                 strategy_id: Ulid::from_parts(42, 1),
-                epoch: 0,
                 shard: 3,
             },
         };
@@ -4580,7 +4579,6 @@ mod tests {
             realm_id,
             &aruna_core::structs::PlacementRef {
                 strategy_id,
-                epoch: 0,
                 shard: 0,
             },
         );
@@ -4704,7 +4702,6 @@ mod tests {
         let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
         let placement = aruna_core::structs::PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 0,
         };
         let target = DocumentSyncTarget::MetadataRegistry {

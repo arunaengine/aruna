@@ -61,7 +61,6 @@ pub fn placement_ref_for_target(
     match strategy_for_target(config, target, context) {
         Some((strategy, _)) => PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
         },
         None => PlacementRef::NIL,
@@ -96,7 +95,6 @@ pub(crate) fn registry_placement_for(
     };
     PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: shard_for_subject(&subject_bytes(&target), strategy.shard_count),
     }
 }
@@ -123,7 +121,6 @@ pub fn plan_target_placement(
     let (strategy, _override) = strategy_for_target(config, target, context)?;
     let placement = PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
     };
     let holders = resolve_shard_holders_with(config, strategy, &placement);
@@ -151,7 +148,6 @@ pub fn rank_eligible_holders(
     };
     let placement = PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
     };
     let mut uncapped = strategy.clone();
@@ -223,7 +219,6 @@ pub fn first_disjoint_shard_transition(
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let pre_holders =
@@ -278,7 +273,6 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: id,
-                epoch: 0,
                 shard,
             };
             if resolve_shard_holders_from_view(config, &view, strategy, &placement).is_empty() {
@@ -372,7 +366,6 @@ pub fn first_draining_holder_set_change(
             for shard in 0..shard_count {
                 let placement = PlacementRef {
                     strategy_id: strategy.strategy_id,
-                    epoch: 0,
                     shard,
                 };
                 if is_draining_former_holder(pre, &placement, node_id)
@@ -418,7 +411,6 @@ pub fn held_buckets(
         .filter(|shard| {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard: *shard,
             };
             resolve_shard_holders_from_view(config, &view, strategy, &placement).contains(&node_id)
@@ -443,7 +435,6 @@ pub fn choose_origin_bucket(
     let best = *rank_weighted(ROLE_SHARD, subject, &candidates).first()?;
     Some(PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: held[best],
     })
 }
@@ -502,7 +493,6 @@ mod tests {
             config,
             PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard: 7,
             },
         )
@@ -734,7 +724,6 @@ mod tests {
         }
         let placement = PlacementRef {
             strategy_id: config.default_strategy_id.expect("default strategy"),
-            epoch: 0,
             shard: 0,
         };
         let full = resolve_shard_holders(&config, &placement);

@@ -135,10 +135,17 @@ pub struct StrategyBinding {
     pub strategy_id: Ulid,
 }
 
+/// Fixed zero slot every key and topic derivation that once carried a
+/// placement epoch keeps writing, so those byte layouts stay stable now that
+/// placement identity is epoch-free.
+pub const PLACEMENT_EPOCH_PAD: [u8; 8] = [0; 8];
+
+/// Durable placement identity: the bucket a record lives in. Holder sets move
+/// through activation records, never through this reference, so a rebalance
+/// never re-keys a stored row or forks a topic.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct PlacementRef {
     pub strategy_id: Ulid,
-    pub epoch: u64,
     pub shard: u32,
 }
 
@@ -148,7 +155,6 @@ impl PlacementRef {
     /// ad-hoc `PlacementRef` literals scatter across producers.
     pub const NIL: PlacementRef = PlacementRef {
         strategy_id: Ulid::nil(),
-        epoch: 0,
         shard: 0,
     };
 }
@@ -632,7 +638,6 @@ mod tests {
     fn placement_ref_round_trips() {
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([9u8; 16]),
-            epoch: 0,
             shard: 7,
         };
         let bytes = postcard::to_allocvec(&placement).unwrap();

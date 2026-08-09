@@ -473,7 +473,6 @@ mod tests {
     fn placement() -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9; 16]),
-            epoch: 0,
             shard: 7,
         }
     }
@@ -481,7 +480,6 @@ mod tests {
     #[test]
     fn manifest_request_round_trips() {
         let mut placement = placement();
-        placement.epoch = u64::MAX;
         placement.shard = u32::MAX;
         let message = ShardTransportMessage::ManifestRequest {
             realm_id: RealmId::from_bytes([2; 32]),

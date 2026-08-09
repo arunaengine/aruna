@@ -5,7 +5,7 @@ use aruna_core::NodeId;
 use aruna_core::document::PendingShardPlacement;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
-use aruna_core::structs::{PlacementRef, RealmId};
+use aruna_core::structs::{PLACEMENT_EPOCH_PAD, PlacementRef, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_secs;
@@ -50,12 +50,12 @@ pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())
 }
 
-/// Shard-scoped record key: `realm(32) ‖ strategy(16) ‖ epoch(8, le) ‖
-/// shard(4, be)`. One record per shard the local node authoritatively holds.
+/// Shard-scoped record key: `realm(32) ‖ strategy(16) ‖ pad(8) ‖ shard(4, be)`.
+/// One record per shard the local node authoritatively holds.
 pub fn placement_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
     let mut bytes = realm_id.as_bytes().to_vec();
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
-    bytes.extend_from_slice(&placement.epoch.to_le_bytes());
+    bytes.extend_from_slice(&PLACEMENT_EPOCH_PAD);
     bytes.extend_from_slice(&placement.shard.to_be_bytes());
     ByteView::from(bytes)
 }
@@ -157,7 +157,6 @@ mod tests {
     fn placement(shard: u32) -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9u8; 16]),
-            epoch: 0,
             shard,
         }
     }

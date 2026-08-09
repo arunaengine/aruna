@@ -1062,7 +1062,6 @@ fn plan_shard_groups(
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);

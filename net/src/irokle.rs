@@ -6688,7 +6688,6 @@ async fn derive_placement_txn(
     };
     let derived = PlacementRef {
         strategy_id: resolved.strategy_id,
-        epoch: 0,
         shard: u32::from(resolved.bucket.get()),
     };
     if resolved.document_class != DocumentClass::Metadata || !scope_matches || derived != placement
@@ -9265,7 +9264,6 @@ mod tests {
     fn restart_placement() -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_parts(99, 7),
-            epoch: 0,
             shard: 11,
         }
     }
@@ -9443,7 +9441,6 @@ mod tests {
     fn admin_test_placement() -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_parts(9_990, 1),
-            epoch: 0,
             shard: 0,
         }
     }
@@ -13814,7 +13811,6 @@ mod tests {
         });
         let placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let document_id = MetaResourceId::from_parts(
@@ -13942,7 +13938,6 @@ mod tests {
         );
         record.placement = PlacementRef {
             strategy_id: Ulid::from_parts(2_103, 1),
-            epoch: 0,
             shard: 1,
         };
         let mut config = RealmConfigDocument::default_for_realm(record.realm_id, Vec::new());
@@ -14000,7 +13995,6 @@ mod tests {
         config.seed_default_placement();
         let placement = PlacementRef {
             strategy_id: config.default_strategy_id.unwrap(),
-            epoch: 0,
             shard: 4,
         };
         let document_id = MetaResourceId::from_parts(
@@ -14112,12 +14106,10 @@ mod tests {
         assert!(config.strategy(&strategy_id).is_none());
         let registry_placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let create_placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 5,
         };
         let registry_group_id = Ulid::from_parts(2_122, 1);
@@ -14398,7 +14390,6 @@ mod tests {
         };
         let placement = PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let group_id = Ulid::from_parts(2_112, 1);
@@ -15038,7 +15029,6 @@ mod tests {
         };
         let placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(4, 4),
-            epoch: 7,
             shard: 3,
         };
         let change = aruna_core::storage_entries::metadata_document_lifecycle_revision_change(
@@ -15166,7 +15156,6 @@ mod tests {
         mismatched.record.last_event_id = mismatched.event_id;
         mismatched.record.placement = PlacementRef {
             strategy_id: Ulid::from_parts(17, 1),
-            epoch: 1,
             shard: 1,
         };
         mismatched.payload = MetadataCreateEventPayload::ReplaceRoCrate {
@@ -15254,7 +15243,6 @@ mod tests {
         let mut local_change = metadata_lifecycle_change(&local_delete, node(8));
         local_change.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(25, 1),
-            epoch: 9,
             shard: 5,
         };
         assert!(
@@ -15537,7 +15525,6 @@ mod tests {
         let admin_target = AdminDocumentTarget::User { user_id };
         let placement = PlacementRef {
             strategy_id: Ulid::from_parts(71, 7),
-            epoch: 0,
             shard: 1,
         };
         let topic_id = target.sync_topic_id(realm_id, &placement);
@@ -15755,7 +15742,6 @@ mod tests {
         let target = DocumentSyncTarget::User { user_id };
         let placement = PlacementRef {
             strategy_id: Ulid::from_parts(54, 7),
-            epoch: 0,
             shard: 1,
         };
         let topic_id = target.sync_topic_id(realm_id, &placement);

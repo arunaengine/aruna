@@ -586,7 +586,6 @@ pub fn resolve_metadata_id(
     }
     Ok(PlacementRef {
         strategy_id: resolved.strategy_id,
-        epoch: 0,
         shard: u32::from(resolved.bucket.get()),
     })
 }
@@ -721,7 +720,6 @@ fn resolve_create_placement(
     let placement = if forward_blind {
         PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard: shard_for_subject(&subject, strategy.shard_count),
         }
     } else {

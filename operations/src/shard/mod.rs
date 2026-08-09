@@ -151,7 +151,6 @@ mod tests {
     fn placement(shard: u32) -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9; 16]),
-            epoch: 0,
             shard,
         }
     }

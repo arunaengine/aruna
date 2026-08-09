@@ -82,7 +82,6 @@ async fn manifest_request_rejected_for_non_held_shard() -> Result<(), Box<dyn st
     // so the responder never holds it.
     let bogus = PlacementRef {
         strategy_id: Ulid::from_bytes([0xAB; 16]),
-        epoch: 0,
         shard: 1,
     };
     let error = fetch_shard_manifest(&nodes[1].net, nodes[0].net.node_id(), realm_id, bogus)
@@ -309,7 +308,6 @@ fn any_held_placement(config: &RealmConfigDocument, node_id: NodeId) -> Placemen
     for shard in 0..strategy.shard_count {
         let placement = PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard,
         };
         if aruna_operations::placement::resolve_shard_holders(config, &placement).contains(&node_id)
@@ -329,7 +327,6 @@ fn placement_with_non_holder_requester(
     for shard in 0..strategy.shard_count {
         let placement = PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard,
         };
         let holders = aruna_operations::placement::resolve_shard_holders(config, &placement);

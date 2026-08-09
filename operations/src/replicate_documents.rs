@@ -576,7 +576,6 @@ mod tests {
         operation.state = ReplicateDocumentsState::Publish;
         operation.placement_action = Some(PlacementAction::Delete(PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([9u8; 16]),
-            epoch: 0,
             shard: 1,
         }));
 

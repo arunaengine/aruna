@@ -488,7 +488,6 @@ mod tests {
     fn placement(shard: u32) -> aruna_core::structs::PlacementRef {
         aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(42, 1),
-            epoch: 0,
             shard,
         }
     }

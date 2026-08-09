@@ -298,7 +298,6 @@ fn pin_rank0_everywhere(config: &RealmConfigDocument, rank0: NodeId) -> Vec<Plac
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             overrides.push(PlacementOverride {
@@ -324,7 +323,6 @@ fn member_shard_topics(
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
@@ -341,7 +339,6 @@ fn rank0_shard_of(config: &RealmConfigDocument, rank0: NodeId, co_holder: NodeId
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);

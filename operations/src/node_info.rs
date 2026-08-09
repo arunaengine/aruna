@@ -741,7 +741,6 @@ mod tests {
             .unwrap();
         let placed = |shard| PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard,
         };
 

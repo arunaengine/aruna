@@ -747,7 +747,6 @@ fn select_path_holders(
         }
         let placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard,
         };
         let holders =

@@ -81,7 +81,6 @@ pub async fn verify_held_shards(
             (0..strategy.shard_count).filter_map(|shard| {
                 let placement = PlacementRef {
                     strategy_id: strategy.strategy_id,
-                    epoch: 0,
                     shard,
                 };
                 let holders = resolve_shard_holders(&config, &placement);
@@ -415,7 +414,6 @@ mod tests {
     fn placement() -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9; 16]),
-            epoch: 0,
             shard: 7,
         }
     }

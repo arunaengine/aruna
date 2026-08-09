@@ -102,7 +102,6 @@ struct TopicsListOutput {
 struct TopicListEntry {
     topic_id: String,
     strategy_id: String,
-    epoch: u64,
     shard: u32,
     status: &'static str,
     selected_peer_count: usize,
@@ -509,11 +508,10 @@ impl Serialize for JsonPendingDocumentPlacement {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PendingShardPlacement", 8)?;
+        let mut state = serializer.serialize_struct("PendingShardPlacement", 7)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
         state.serialize_field("strategy_id", &self.0.placement.strategy_id.to_string())?;
-        state.serialize_field("epoch", &self.0.placement.epoch)?;
         state.serialize_field("shard", &self.0.placement.shard)?;
         state.serialize_field(
             "authoritative_node_id",
@@ -1112,7 +1110,6 @@ fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerE
         .map(|placement| TopicListEntry {
             topic_id: placement_topic_id(&placement),
             strategy_id: placement.placement.strategy_id.to_string(),
-            epoch: placement.placement.epoch,
             shard: placement.placement.shard,
             status: "under_replicated",
             selected_peer_count: placement.selected_peers.len(),
@@ -1883,7 +1880,6 @@ mod tests {
         let realm_id = RealmId::from_bytes([4_u8; 32]);
         let placement_ref = aruna_core::structs::PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([9_u8; 16]),
-            epoch: 0,
             shard: 5,
         };
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();

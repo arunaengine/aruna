@@ -1130,7 +1130,6 @@ mod tests {
         let mut record = record(&actor);
         record.placement = PlacementRef {
             strategy_id: Ulid::from_bytes([5u8; 16]),
-            epoch: 0,
             shard: 11,
         };
         let txn_id = Ulid::generate();
@@ -1177,7 +1176,6 @@ mod tests {
         let mut fenced = record.clone();
         fenced.placement = PlacementRef {
             strategy_id: Ulid::from_bytes([6u8; 16]),
-            epoch: 1,
             shard: 12,
         };
         let txn_id = Ulid::generate();
