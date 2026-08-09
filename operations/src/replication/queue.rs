@@ -3830,7 +3830,10 @@ mod tests {
         // Greenfield: pre-advance record bytes decode strictly or not at all.
         let record = BlobReplicationJobRecord::new(on_demand_input(), None, 42);
         let encoded = record.to_bytes().unwrap();
-        assert_eq!(BlobReplicationJobRecord::from_bytes(&encoded).unwrap(), record);
+        assert_eq!(
+            BlobReplicationJobRecord::from_bytes(&encoded).unwrap(),
+            record
+        );
 
         let mut trailing = encoded.clone();
         trailing.push(0xff);
