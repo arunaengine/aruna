@@ -533,10 +533,6 @@ pub enum MutateRealmPlacementError {
     RealmConfigNotFound,
     #[error("invalid placement mutation: {0}")]
     InvalidInput(String),
-    #[error(
-        "disjoint holder transition for strategy {strategy_id} shard {shard}: at least one current holder must remain until new holders verify"
-    )]
-    DisjointHolderTransition { strategy_id: Ulid, shard: u32 },
     #[error("placement leaves strategy {strategy_id} shard {shard} with no eligible holders")]
     EmptyShardHolders { strategy_id: Ulid, shard: u32 },
     #[error("placement strategy {strategy_id} is currently referenced")]
@@ -649,14 +645,6 @@ impl MutateRealmPlacementOperation {
                 "placement change alters drain-time holder set for node {node_id}, strategy {} shard {}",
                 placement.strategy_id, placement.shard
             )));
-        }
-        if let Some(placement) =
-            crate::placement::first_disjoint_shard_transition(&pre_document, &document)
-        {
-            return Err(MutateRealmPlacementError::DisjointHolderTransition {
-                strategy_id: placement.strategy_id,
-                shard: placement.shard,
-            });
         }
         if let Some(placement) = crate::placement::first_empty_referenced_shard(&document) {
             return Err(MutateRealmPlacementError::EmptyShardHolders {
@@ -1702,27 +1690,6 @@ mod tests {
                 .validate(&document)
                 .is_ok()
         );
-    }
-
-    #[tokio::test]
-    async fn disjoint_transition_rejected() {
-        let directory = tempdir().unwrap();
-        let context = context(directory.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([21; 32]);
-        let actor = actor(realm_id);
-        // Single-replica: every shard has one holder, so draining a node moves its
-        // shards to a disjoint holder.
-        seed_placement_config(&context, &actor, &[node(1), node(2)], Some(1)).await;
-
-        assert!(matches!(
-            mutate(
-                &context,
-                &actor,
-                RealmPlacementMutation::UpsertNode(draining_entry(node(1)))
-            )
-            .await,
-            Err(MutateRealmPlacementError::DisjointHolderTransition { .. })
-        ));
     }
 
     #[tokio::test]

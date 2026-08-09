@@ -461,6 +461,24 @@ impl Topology {
             .count()
     }
 
+    /// Every activated bucket of every strategy, in resolution order.
+    pub fn holder_map(&self) -> BTreeMap<(Ulid, u32), Vec<NodeId>> {
+        let mut holders = BTreeMap::new();
+        for strategy in &self.config.strategies {
+            for shard in 0..strategy.shard_count {
+                let placement = PlacementRef {
+                    strategy_id: strategy.strategy_id,
+                    shard,
+                };
+                holders.insert(
+                    (strategy.strategy_id, shard),
+                    resolve_shard_holders(&self.config, &placement),
+                );
+            }
+        }
+        holders
+    }
+
     /// Reinstalls a mutated realm config on every node, as an admin change would.
     pub async fn apply_config(&mut self, config: RealmConfigDocument) -> TestResult<()> {
         for node in &self.nodes {
@@ -601,6 +619,10 @@ async fn install_realm_config(
         });
         band += 1;
     }
+
+    // Freeze the assembled view as epoch 1 and activate it: holder resolution is
+    // pinned to a published map, exactly as a bootstrapped realm is.
+    config.snapshot_candidate_map();
 
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
     let trusted = HashSet::from([realm_id]);

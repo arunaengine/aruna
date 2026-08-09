@@ -1307,13 +1307,17 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         MutateRealmPlacementError::RealmConfigNotFound => ServerError::NotFound,
         MutateRealmPlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
         error @ (MutateRealmPlacementError::AdminDocumentReducerError(_)
-        | MutateRealmPlacementError::DisjointHolderTransition { .. }
-        | MutateRealmPlacementError::EmptyShardHolders { .. }) => {
+        | MutateRealmPlacementError::EmptyShardHolders { .. }
+        | MutateRealmPlacementError::UnknownTransition { .. }
+        | MutateRealmPlacementError::ForceWithoutProof { .. }) => {
             ServerError::BadRequestReason(error.to_string())
         }
         MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
             format!("placement strategy {strategy_id} is currently referenced"),
         ),
+        error @ MutateRealmPlacementError::TransitionInFlight { .. } => {
+            ServerError::Conflict(error.to_string())
+        }
         MutateRealmPlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
         }
