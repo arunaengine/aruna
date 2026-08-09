@@ -784,16 +784,12 @@ impl GetObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(GetObjectError::NoTransactionFound);
         };
-        let (Some(observation), Some(baseline)) = (
-            self.advance_observation.as_ref(),
-            self.reference_cached.as_ref(),
-        ) else {
+        let Some(observation) = self.advance_observation.as_ref() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
-        // Adjust the same group's referenced_bytes by the size change so the
-        // count tracks the current version across the whole chain.
-        let referenced_bytes =
-            i128::from(observation.content_length) - i128::from(baseline.content_length);
+        // Every stored reference version is charged its own full size, and the
+        // superseded version stays stored, so the successor adds its own size.
+        let referenced_bytes = i128::from(observation.content_length);
         let mut update = UsageCounterUpdate::for_group(
             self.input.group_id,
             UsageDelta {
@@ -1079,6 +1075,7 @@ mod test {
     use crate::s3::get_object::{
         GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, ObjectRangeRequest,
     };
+    use crate::usage_stats::UsageCounterUpdate;
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
@@ -1095,7 +1092,8 @@ mod test {
         Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
         BlobVersion, BlobVersionState, CurrentVersionPointer, MultipartChecksumType,
         PathRestriction, Permission, PortableSourceDescriptor, RealmId, ResolvedSourceAccess,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, UsageDelta, VersionKey,
+        VersionSourceBinding, usage_group_key,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -1990,6 +1988,22 @@ mod test {
         assert_eq!(original.content_length, 1);
         assert_eq!(original.etag.as_deref(), Some("stale-etag"));
 
+        // Both versions stay stored, so the successor is charged its full size.
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
+                key: usage_group_key(group_id).into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing usage counters");
+        };
+        let counters =
+            aruna_core::structs::UsageCounters::from_bytes(value.unwrap().as_ref()).unwrap();
+        assert_eq!(counters.referenced_bytes, 15);
+
         // The successor's obligation is committed with it, so replication and
         // the repair scanner can both find it.
         let Event::Storage(StorageEvent::IterResult { values, .. }) = driver_ctx
@@ -2148,6 +2162,32 @@ mod test {
             effects.as_slice(),
             [Effect::StagingSource(StagingSourceEffect::Read { .. })]
         ));
+    }
+
+    // The superseded version stays stored and stays charged, so the successor
+    // adds its own full size rather than the size difference.
+    #[test]
+    fn successor_charges_size() {
+        let mut operation = drifted_operation();
+        let txn_id = Ulid::generate();
+        operation.reference_cached = Some(observation(4));
+        operation.txn_id = Some(txn_id);
+        operation.state = GetObjectState::WriteSuccessor;
+
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+
+        assert_eq!(operation.state, GetObjectState::UpdateReferenceUsage);
+        let mut expected = UsageCounterUpdate::for_group(
+            operation.input.group_id,
+            UsageDelta {
+                referenced_bytes: 9,
+                ..Default::default()
+            },
+        );
+        let _ = expected.start(txn_id);
+        assert_eq!(operation.usage_update, Some(expected));
     }
 
     async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> SourceMetadata {
