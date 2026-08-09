@@ -21,7 +21,8 @@
 //! 7. The metadata store is flushed.
 //! 8. Blob writes are sealed and drained, so a mutation's storage location
 //!    lands before storage is sealed.
-//! 9. Storage is sealed, then synced. Nothing can commit after the seal.
+//! 9. Storage is sealed, the mutations accepted before the seal are drained,
+//!    then storage is synced. Nothing can commit after the seal.
 
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -240,8 +241,13 @@ impl NodeShutdown {
             0
         };
 
-        // 9. Close the write path, then fsync. Nothing commits after this.
+        // 9. Seal the write path, then drain the mutations accepted before the
+        //    seal so they commit ahead of the fsync.
         self.storage_handle.seal();
+        let storage_drain = budget.remaining().min(TAIL_BUDGET_RESERVE);
+        if !self.storage_handle.drain_accepted(storage_drain).await {
+            warn!("Accepted storage mutations outlived the shutdown drain");
+        }
         if let Err(error) = self.storage_handle.sync_all().await {
             error!(error = %error, "Failed to sync storage during shutdown");
         }

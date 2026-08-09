@@ -18,7 +18,7 @@ use crossfire::{RecvError, TryRecvError, TrySendError, mpsc};
 use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
@@ -221,6 +221,8 @@ struct StorageMetrics {
     seal_lock: RwLock<()>,
     rejected_writes: AtomicU64,
     last_error: Mutex<Option<String>>,
+    /// Woken when `in_flight` falls to zero, so the shutdown barrier does not poll.
+    drained: Notify,
 }
 
 /// Decrements `in_flight` when an accepted effect completes or is discarded.
@@ -229,14 +231,16 @@ pub struct InFlightGuard(Arc<StorageMetrics>);
 
 impl InFlightGuard {
     fn acquire(metrics: &Arc<StorageMetrics>) -> Self {
-        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        metrics.in_flight.fetch_add(1, Ordering::AcqRel);
         Self(metrics.clone())
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drained.notify_waiters();
+        }
     }
 }
 
@@ -418,7 +422,33 @@ impl StorageHandle {
 
     /// Number of storage effects currently enqueued or being processed.
     pub fn in_flight(&self) -> u64 {
-        self.metrics.in_flight.load(Ordering::Relaxed)
+        self.metrics.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Waits until every effect already accepted on either lane has been
+    /// applied, including a deferred cleanup write still waiting for a queue
+    /// slot and an abort enqueued from a drop. `seal` only blocks later
+    /// dispatches, so this is what orders accepted mutations before the final
+    /// sync. Bounded by `timeout`; `false` means work is still outstanding.
+    pub async fn drain_accepted(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.in_flight() == 0 {
+                return true;
+            }
+            let notified = self.metrics.drained.notified();
+            // Re-check after arming the wait so a wake between the two is not lost.
+            if self.in_flight() == 0 {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.in_flight() == 0;
+            }
+        }
     }
 
     /// True once the effect channel has permanently closed because the worker
@@ -3520,6 +3550,41 @@ mod tests {
         ));
         assert!(handle.sync_all().await.is_ok());
         assert_eq!(handle.rejected_writes(), 0);
+    }
+
+    // The seal only blocks later dispatches, so a mutation already queued on the
+    // bulk lane must be waited out before the final sync.
+    #[tokio::test]
+    async fn drain_waits_accepted() {
+        let (handle, receivers) = small_handle(4);
+        let bulk = handle.bulk();
+        let mut queued = Box::pin(bulk.send_storage_effect(StorageEffect::Write {
+            key_space: "bulk".to_string(),
+            key: b"key".to_vec().into(),
+            value: b"value".to_vec().into(),
+            txn_id: None,
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), queued.as_mut())
+                .await
+                .is_err()
+        );
+        handle.seal();
+
+        // Nothing services the lane, so the barrier reports outstanding work.
+        assert!(!handle.drain_accepted(Duration::from_millis(50)).await);
+
+        let accepted = receivers.bulk.recv().expect("effect stays queued");
+        let waiter = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.drain_accepted(Duration::from_secs(30)).await }
+        });
+        tokio::task::yield_now().await;
+        drop(accepted);
+        drop(queued);
+
+        assert!(waiter.await.expect("barrier task joins"));
+        assert_eq!(handle.in_flight(), 0);
     }
 
     #[tokio::test]
