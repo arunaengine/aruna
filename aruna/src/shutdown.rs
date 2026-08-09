@@ -51,7 +51,9 @@ const WATCHDOG_MARGIN: Duration = Duration::from_secs(5);
 /// that keeps a stream open, a stalled upload) must not starve the later
 /// phases down to hard aborts.
 const INGRESS_BUDGET_DIVISOR: u32 = 4;
-/// Minimum time phase 3 leaves for the shutdown phases behind it.
+/// Minimum time every draining phase leaves for the phases behind it, so a
+/// stuck child cannot consume the budget the network, metadata, blob and
+/// storage phases need to close cleanly.
 const TAIL_BUDGET_RESERVE: Duration = Duration::from_secs(5);
 /// Slice of the net phase reserved for the teardown behind the inbound drain.
 /// The drain deadline must sit strictly below the phase budget: with both
@@ -163,8 +165,10 @@ impl NodeShutdown {
         }
 
         // 3. Timer handlers drain while the network still works.
-        let drain = budget.remaining().saturating_sub(TAIL_BUDGET_RESERVE);
-        let report = self.task_handle.shutdown(drain).await;
+        let report = self
+            .task_handle
+            .shutdown(tail_reserved(budget.remaining()))
+            .await;
         info!(
             in_flight = report.in_flight,
             aborted = report.aborted,
@@ -172,7 +176,7 @@ impl NodeShutdown {
         );
 
         // 4. Job workers write storage: drain them before the seal.
-        let job_grace = JOB_SHUTDOWN_GRACE.min(budget.remaining());
+        let job_grace = JOB_SHUTDOWN_GRACE.min(tail_reserved(budget.remaining()));
         let job_report = self
             .jobs_runtime
             .shutdown(&self.storage_handle, job_grace)
@@ -181,8 +185,9 @@ impl NodeShutdown {
 
         // 5. Background children write metadata and storage: join them.
         let mut background_drained = false;
-        phase("background", budget.remaining(), async {
-            background_drained = self.shutdown.drain(budget.remaining()).await;
+        let background_budget = tail_reserved(budget.remaining());
+        phase("background", background_budget, async {
+            background_drained = self.shutdown.drain(background_budget).await;
         })
         .await;
         if !background_drained {
@@ -276,6 +281,12 @@ impl Budget {
     fn remaining(&self) -> Duration {
         self.grace.saturating_sub(self.started.elapsed())
     }
+}
+
+/// What a draining phase may spend: the remaining budget minus the floor the
+/// phases behind it need.
+fn tail_reserved(remaining: Duration) -> Duration {
+    remaining.saturating_sub(TAIL_BUDGET_RESERVE)
 }
 
 fn net_drain_budget(phase_budget: Duration) -> Duration {
@@ -415,6 +426,16 @@ mod tests {
             Duration::from_secs(8)
         );
         assert_eq!(net_drain_budget(Duration::from_secs(1)), Duration::ZERO);
+    }
+
+    // Every draining phase must leave the tail phases their floor.
+    #[test]
+    fn phases_reserve_tail() {
+        assert_eq!(
+            tail_reserved(Duration::from_secs(20)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(tail_reserved(Duration::from_secs(3)), Duration::ZERO);
     }
 
     #[tokio::test]
