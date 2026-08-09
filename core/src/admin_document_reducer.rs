@@ -14,10 +14,12 @@ use crate::admin_documents::{
 };
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
 use crate::structs::{
-    Actor, BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
+    Actor, BandPool, BindingScope, BucketBarrier, BucketCompletion, BucketForceFinalize,
+    CandidatePlacementMap, CompletionProof, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
     MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
-    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmConfigDocument,
-    RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding, reserved_label,
+    PlacementActivation, PlacementBinding, PlacementOverride, PlacementStrategy,
+    PlacementTransition, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+    RealmNodeKind, StallReport, StrategyBinding, TransitionPlan, TransitionStatus, reserved_label,
 };
 use crate::structured_id::PlacementHandle;
 use crate::types::{RoleId, UserId};
@@ -56,6 +58,14 @@ pub enum AdminDocumentReducerError {
     InvalidHandleRange,
     #[error("revoked bearer token hash is malformed")]
     InvalidTokenHash,
+    #[error("candidate placement map is malformed")]
+    InvalidCandidateMap,
+    #[error("placement transition plan is malformed")]
+    InvalidTransitionPlan,
+    #[error("placement transition proof does not verify")]
+    InvalidTransitionProof,
+    #[error("placement transition report does not come from the node it names")]
+    TransitionOriginMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,7 +674,129 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
+    overlay_placement_transitions(config, reducer_state);
     repair_realm_config_placement_references(config);
+}
+
+/// Overlays candidate maps and transitions, then re-derives every activation
+/// they govern. A conflicted map epoch keeps all its divergent values (the
+/// epoch stays unusable); a conflicted plan or activation drops the record
+/// entirely, so the affected buckets resolve nothing.
+fn overlay_placement_transitions(
+    config: &mut RealmConfigDocument,
+    reducer_state: &AdminDocumentReducerState,
+) {
+    let materialized_maps = reducer_state.materialized_candidate_maps();
+    for (path, conflict) in &reducer_state.conflicts {
+        let Some(epoch) = candidate_map_epoch(path) else {
+            continue;
+        };
+        config.candidate_maps.retain(|map| map.epoch != epoch);
+        for value in &conflict.values {
+            if let Some(map) = value.value.as_deref().and_then(candidate_map_from_value) {
+                config.candidate_maps.push(map);
+            }
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(epoch) = candidate_map_epoch(path) else {
+            continue;
+        };
+        config.candidate_maps.retain(|map| map.epoch != epoch);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(map) = materialized_maps.get(&epoch) {
+            config.candidate_maps.push(map.clone());
+        }
+    }
+
+    let mut transitions = reducer_state.materialized_transitions();
+    for path in reducer_state.conflicts.keys() {
+        if let Some((transition_id, TransitionPart::Plan)) = transition_part(path) {
+            transitions.retain(|transition| transition.plan.transition_id != transition_id);
+        }
+    }
+    for transition in &transitions {
+        config
+            .placement_transitions
+            .retain(|existing| existing.plan.transition_id != transition.plan.transition_id);
+    }
+    config
+        .placement_transitions
+        .extend(transitions.iter().cloned());
+
+    let epochs = reducer_state.materialized_activation_epochs();
+    let mut initialized: Vec<(Ulid, u32, u64)> = Vec::new();
+    for path in reducer_state
+        .user_subject_ids
+        .keys()
+        .chain(reducer_state.conflicts.keys())
+    {
+        let Some(strategy_id) = activation_strategy(path) else {
+            continue;
+        };
+        config
+            .placement_activations
+            .retain(|activation| activation.strategy_id != strategy_id);
+        if let (Some(epoch), Some(strategy)) =
+            (epochs.get(&strategy_id), config.strategy(&strategy_id))
+        {
+            initialized.push((strategy_id, strategy.shard_count, *epoch));
+        }
+    }
+    // Transition order is the id order: a successor is admitted only once its
+    // predecessor is terminal, so the chain replays the same way everywhere.
+    transitions.sort_by_key(|transition| transition.plan.transition_id);
+    for (strategy_id, shard_count, epoch) in initialized {
+        for shard in 0..shard_count {
+            let mut activation = PlacementActivation {
+                strategy_id,
+                shard,
+                activation_epoch: 1,
+                candidate_map_epoch: epoch,
+                transition_id: None,
+            };
+            for transition in transitions
+                .iter()
+                .filter(|transition| transition.plan.strategy_id == strategy_id)
+            {
+                if !transition.plan.covers(shard) {
+                    continue;
+                }
+                if transition.bucket_ready(shard) {
+                    activation.candidate_map_epoch = transition.plan.target_map_epoch;
+                    activation.activation_epoch += 1;
+                    activation.transition_id = None;
+                } else if matches!(transition.status, TransitionStatus::Active) {
+                    activation.transition_id = Some(transition.plan.transition_id);
+                }
+            }
+            config.placement_activations.push(activation);
+        }
+    }
+}
+
+fn order_by_bucket_and_node(left: &BucketBarrier, right: &BucketBarrier) -> Ordering {
+    left.bucket.cmp(&right.bucket).then_with(|| {
+        left.reported_by
+            .as_bytes()
+            .cmp(right.reported_by.as_bytes())
+    })
+}
+
+fn order_proofs(left: &CompletionProof, right: &CompletionProof) -> Ordering {
+    left.bucket
+        .cmp(&right.bucket)
+        .then_with(|| left.holder.as_bytes().cmp(right.holder.as_bytes()))
+}
+
+fn order_stalls(left: &StallReport, right: &StallReport) -> Ordering {
+    left.bucket.cmp(&right.bucket).then_with(|| {
+        left.reported_by
+            .as_bytes()
+            .cmp(right.reported_by.as_bytes())
+    })
 }
 
 fn repair_realm_config_placement_references(config: &mut RealmConfigDocument) {
@@ -807,6 +939,14 @@ impl AdminDocumentReducerState {
                 | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
                 | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
                 | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+                | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+                | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+                | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+                | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+                | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+                | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+                | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+                | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
         ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_is_stale_for_path(event, path));
@@ -1111,6 +1251,146 @@ impl AdminDocumentReducerState {
                 AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
             ) => {
                 self.apply_placement_binding(event, binding);
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigCandidateMapPublished { map },
+            ) => {
+                // Epoch zero is reserved for "no map", and a map naming a node
+                // twice would make its selection weight ambiguous.
+                let mut seen = BTreeSet::new();
+                if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
+                    return Err(AdminDocumentReducerError::InvalidCandidateMap);
+                }
+                self.apply_immutable_value(
+                    event,
+                    candidate_map_path(map.epoch),
+                    candidate_map_value(map),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigActivationsInitialized {
+                    strategy_id,
+                    candidate_map_epoch,
+                },
+            ) => {
+                if *candidate_map_epoch == 0 {
+                    return Err(AdminDocumentReducerError::InvalidCandidateMap);
+                }
+                self.apply_immutable_value(
+                    event,
+                    activation_path(strategy_id),
+                    candidate_map_epoch.to_string(),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigTransitionStarted { plan },
+            ) => {
+                let mut seen = BTreeSet::new();
+                let well_formed = plan.limits.max_incomplete_buckets >= 1
+                    && plan.target_map_epoch > 0
+                    && !plan.buckets.is_empty()
+                    && plan.buckets.iter().all(|bucket| {
+                        seen.insert(bucket.bucket) && !bucket.target_holders.is_empty()
+                    });
+                if !well_formed {
+                    return Err(AdminDocumentReducerError::InvalidTransitionPlan);
+                }
+                self.apply_immutable_value(
+                    event,
+                    transition_path(&plan.transition_id),
+                    transition_plan_value(plan),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    transition_id,
+                    bucket,
+                    reported_by,
+                    frontier,
+                },
+            ) => {
+                if *reported_by != event.origin_node_id {
+                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                }
+                self.apply_immutable_value(
+                    event,
+                    transition_barrier_path(transition_id, *bucket, reported_by),
+                    hex::encode(frontier),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { realm_id },
+                AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    transition_id,
+                    strategy_id,
+                    proof,
+                },
+            ) => {
+                if proof.holder != event.origin_node_id {
+                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                }
+                // The plan wins when it has replicated; otherwise the submitted
+                // strategy carries the signature and materialization rechecks it
+                // against the plan.
+                let strategy_id = self
+                    .materialized_transition_plans()
+                    .get(transition_id)
+                    .map(|plan| plan.strategy_id)
+                    .unwrap_or(*strategy_id);
+                if !proof.verify(*realm_id, *transition_id, strategy_id) {
+                    return Err(AdminDocumentReducerError::InvalidTransitionProof);
+                }
+                self.apply_immutable_value(
+                    event,
+                    transition_proof_path(transition_id, proof.bucket, &proof.holder),
+                    transition_proof_value(&strategy_id, proof),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigTransitionAborted { transition_id },
+            ) => {
+                self.apply_immutable_value(
+                    event,
+                    transition_abort_path(transition_id),
+                    true.to_string(),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigTransitionBucketForced {
+                    transition_id,
+                    bucket,
+                    at_risk_report,
+                },
+            ) => {
+                self.apply_immutable_value(
+                    event,
+                    transition_force_path(transition_id, *bucket),
+                    at_risk_report.clone(),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigTransitionStallReported {
+                    transition_id,
+                    bucket,
+                    reported_by,
+                    reason,
+                },
+            ) => {
+                if *reported_by != event.origin_node_id {
+                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                }
+                self.apply_immutable_value(
+                    event,
+                    transition_stall_path(transition_id, *bucket, reported_by),
+                    reason.clone(),
+                );
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
@@ -1525,6 +1805,177 @@ impl AdminDocumentReducerState {
                 (range.range_id == range_id).then_some((range_id, range))
             })
             .collect()
+    }
+
+    pub fn materialized_candidate_maps(&self) -> BTreeMap<u64, CandidatePlacementMap> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let epoch = candidate_map_epoch(path)?;
+                let map = version
+                    .value
+                    .as_deref()
+                    .and_then(candidate_map_from_value)?;
+
+                (map.epoch == epoch).then_some((epoch, map))
+            })
+            .collect()
+    }
+
+    /// Map epoch each strategy's buckets were activated at. Per-bucket
+    /// activations are derived from it plus the reduced transitions.
+    pub fn materialized_activation_epochs(&self) -> BTreeMap<Ulid, u64> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let strategy_id = activation_strategy(path)?;
+                let epoch = version.value.as_deref()?.parse().ok()?;
+
+                Some((strategy_id, epoch))
+            })
+            .collect()
+    }
+
+    pub fn materialized_transition_plans(&self) -> BTreeMap<Ulid, TransitionPlan> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let (transition_id, TransitionPart::Plan) = transition_part(path)? else {
+                    return None;
+                };
+                let plan = version
+                    .value
+                    .as_deref()
+                    .and_then(transition_plan_from_value)?;
+
+                (plan.transition_id == transition_id).then_some((transition_id, plan))
+            })
+            .collect()
+    }
+
+    /// Assembles each transition from its plan plus the reduced barrier, proof,
+    /// force, and stall sets. Entries that do not match their own path, the
+    /// plan's strategy, or a planned bucket are dropped.
+    pub fn materialized_transitions(&self) -> Vec<PlacementTransition> {
+        let mut transitions: BTreeMap<Ulid, PlacementTransition> = self
+            .materialized_transition_plans()
+            .into_iter()
+            .map(|(transition_id, plan)| (transition_id, PlacementTransition::new(plan)))
+            .collect();
+
+        for (path, version) in &self.user_subject_ids {
+            let Some((transition_id, part)) = transition_part(path) else {
+                continue;
+            };
+            let Some(transition) = transitions.get_mut(&transition_id) else {
+                continue;
+            };
+            let Some(value) = version.value.as_deref() else {
+                continue;
+            };
+            match part {
+                TransitionPart::Plan => {}
+                TransitionPart::Aborted => transition.status = TransitionStatus::Aborted,
+                TransitionPart::Barrier(bucket, reported_by) => {
+                    if let Ok(frontier) = hex::decode(value)
+                        && transition.plan.covers(bucket)
+                    {
+                        transition.barriers.push(BucketBarrier {
+                            bucket,
+                            reported_by,
+                            frontier,
+                        });
+                    }
+                }
+                TransitionPart::Proof(bucket, holder) => {
+                    let Some((strategy_id, proof)) = transition_proof_from_value(value) else {
+                        continue;
+                    };
+                    if strategy_id == transition.plan.strategy_id
+                        && proof.bucket == bucket
+                        && proof.holder == holder
+                        && transition.plan.covers(bucket)
+                    {
+                        transition.proofs.push(proof);
+                    }
+                }
+                TransitionPart::Forced(bucket) => {
+                    if transition.plan.covers(bucket) {
+                        transition.forced.push(BucketForceFinalize {
+                            bucket,
+                            at_risk_report: value.to_string(),
+                        });
+                    }
+                }
+                TransitionPart::Stall(bucket, reported_by) => transition.stalls.push(StallReport {
+                    bucket,
+                    reported_by,
+                    reason: value.to_string(),
+                }),
+            }
+        }
+
+        let mut assembled: Vec<PlacementTransition> = transitions.into_values().collect();
+        for transition in assembled.iter_mut() {
+            transition.barriers.sort_by(order_by_bucket_and_node);
+            transition
+                .proofs
+                .sort_by(|left, right| order_proofs(left, right));
+            transition.forced.sort_by_key(|entry| entry.bucket);
+            transition.stalls.sort_by(order_stalls);
+            transition.completed = transition
+                .plan
+                .buckets
+                .iter()
+                .filter(|plan| transition.bucket_ready(plan.bucket))
+                .map(|plan| BucketCompletion {
+                    bucket: plan.bucket,
+                    completed_at_ms: self.proof_timestamp(transition, plan.bucket),
+                })
+                .collect();
+        }
+        assembled
+    }
+
+    /// Completion time of a bucket: the newest carried event timestamp among
+    /// its proofs. Carried data, so every replica derives the same instant
+    /// without consulting a local clock.
+    fn proof_timestamp(&self, transition: &PlacementTransition, bucket: u32) -> u64 {
+        transition
+            .plan
+            .bucket_plan(bucket)
+            .into_iter()
+            .flat_map(|plan| plan.target_holders.iter())
+            .map(|holder| transition_proof_path(&transition.plan.transition_id, bucket, holder))
+            .filter_map(|path| self.path_timestamp(&path))
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// Newest event timestamp recorded for a path, across its version dot and
+    /// any equivalent-value dots.
+    fn path_timestamp(&self, path: &str) -> Option<u64> {
+        let version = self
+            .user_subject_ids
+            .get(path)
+            .map(|version| version.dot.event_id.timestamp_ms());
+        let equivalent = self
+            .equivalent_value_dots
+            .get(path)
+            .and_then(|dots| dots.iter().map(|dot| dot.event_id.timestamp_ms()).max());
+        version.max(equivalent).or(equivalent)
     }
 
     pub fn revocation_index(&self, now: u64) -> RevocationIndex {
@@ -2250,6 +2701,52 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding } => {
             vec![placement_binding_path(binding.handle)]
         }
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
+            vec![candidate_map_path(map.epoch)]
+        }
+        AdminDocumentOperation::RealmConfigActivationsInitialized { strategy_id, .. } => {
+            vec![activation_path(strategy_id)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
+            vec![transition_path(&plan.transition_id)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => {
+            vec![transition_barrier_path(transition_id, *bucket, reported_by)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            proof,
+            ..
+        } => {
+            vec![transition_proof_path(
+                transition_id,
+                proof.bucket,
+                &proof.holder,
+            )]
+        }
+        AdminDocumentOperation::RealmConfigTransitionAborted { transition_id } => {
+            vec![transition_abort_path(transition_id)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionBucketForced {
+            transition_id,
+            bucket,
+            ..
+        } => {
+            vec![transition_force_path(transition_id, *bucket)]
+        }
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => {
+            vec![transition_stall_path(transition_id, *bucket, reported_by)]
+        }
         AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
             vec![handle_range_path(range.range_id)]
         }
@@ -2323,6 +2820,49 @@ pub fn realm_config_placement_override_path(subject: &[u8]) -> String {
 
 pub fn placement_binding_path(handle: PlacementHandle) -> String {
     format!("realm_config.placement.placement_bindings.{}", handle.get())
+}
+
+pub fn candidate_map_path(epoch: u64) -> String {
+    format!("realm_config.placement.candidate_maps.{epoch}")
+}
+
+/// One path per strategy: the map epoch its buckets were activated at. The
+/// per-bucket activation is derived from it plus the reduced transitions.
+pub fn activation_path(strategy_id: &Ulid) -> String {
+    format!("realm_config.placement.activations.{strategy_id}")
+}
+
+pub fn transition_path(transition_id: &Ulid) -> String {
+    format!("realm_config.placement.transitions.{transition_id}")
+}
+
+pub fn transition_abort_path(transition_id: &Ulid) -> String {
+    format!("{}.aborted", transition_path(transition_id))
+}
+
+pub fn transition_barrier_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.barriers.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
+}
+
+pub fn transition_proof_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.proofs.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
+}
+
+pub fn transition_force_path(transition_id: &Ulid, bucket: u32) -> String {
+    format!("{}.forced.{bucket}", transition_path(transition_id))
+}
+
+pub fn transition_stall_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.stalls.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
 }
 
 pub fn handle_range_path(range_id: Ulid) -> String {
@@ -2434,6 +2974,32 @@ fn placement_override_value(record: &PlacementOverride) -> String {
 
 fn placement_binding_value(binding: &PlacementBinding) -> String {
     serde_json::to_string(binding).expect("admin document placement binding serializes")
+}
+
+fn candidate_map_value(map: &CandidatePlacementMap) -> String {
+    serde_json::to_string(map).expect("admin document candidate map serializes")
+}
+
+fn transition_plan_value(plan: &TransitionPlan) -> String {
+    serde_json::to_string(plan).expect("admin document transition plan serializes")
+}
+
+/// The strategy the proof was signed for rides with it, so materialization can
+/// reject a proof aimed at a different strategy than the plan names.
+fn transition_proof_value(strategy_id: &Ulid, proof: &CompletionProof) -> String {
+    serde_json::to_string(&(strategy_id, proof)).expect("admin document proof serializes")
+}
+
+fn candidate_map_from_value(value: &str) -> Option<CandidatePlacementMap> {
+    serde_json::from_str(value).ok()
+}
+
+fn transition_plan_from_value(value: &str) -> Option<TransitionPlan> {
+    serde_json::from_str(value).ok()
+}
+
+fn transition_proof_from_value(value: &str) -> Option<(Ulid, CompletionProof)> {
+    serde_json::from_str(value).ok()
 }
 
 fn handle_range_value(range: &HandleRange) -> String {
@@ -2552,6 +3118,50 @@ pub fn handle_range_id(path: &str) -> Option<Ulid> {
     Ulid::from_string(range_id).ok()
 }
 
+fn candidate_map_epoch(path: &str) -> Option<u64> {
+    path.strip_prefix("realm_config.placement.candidate_maps.")?
+        .parse()
+        .ok()
+}
+
+fn activation_strategy(path: &str) -> Option<Ulid> {
+    let strategy_id = path.strip_prefix("realm_config.placement.activations.")?;
+    Ulid::from_string(strategy_id).ok()
+}
+
+/// Which part of a transition record a reducer path addresses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransitionPart {
+    Plan,
+    Aborted,
+    Barrier(u32, NodeId),
+    Proof(u32, NodeId),
+    Forced(u32),
+    Stall(u32, NodeId),
+}
+
+fn transition_part(path: &str) -> Option<(Ulid, TransitionPart)> {
+    let rest = path.strip_prefix("realm_config.placement.transitions.")?;
+    let mut parts = rest.split('.');
+    let transition_id = Ulid::from_string(parts.next()?).ok()?;
+    let part = match (parts.next(), parts.next(), parts.next()) {
+        (None, _, _) => TransitionPart::Plan,
+        (Some("aborted"), None, None) => TransitionPart::Aborted,
+        (Some("forced"), Some(bucket), None) => TransitionPart::Forced(bucket.parse().ok()?),
+        (Some("barriers"), Some(bucket), Some(node)) => {
+            TransitionPart::Barrier(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        (Some("proofs"), Some(bucket), Some(node)) => {
+            TransitionPart::Proof(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        (Some("stalls"), Some(bucket), Some(node)) => {
+            TransitionPart::Stall(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        _ => return None,
+    };
+    parts.next().is_none().then_some((transition_id, part))
+}
+
 fn oidc_provider_from_value(value: &str) -> Option<OidcProviderConfig> {
     serde_json::from_str(value).ok()
 }
@@ -2635,12 +3245,14 @@ mod tests {
     };
     use crate::auth::REVOCATION_GRACE_SECS;
     use crate::structs::{
-        Actor, AffinityEffect, AffinityRule, BindingError, BindingScope, DocumentClass,
+        Actor, AffinityEffect, AffinityRule, BindingError, BindingScope, BucketPlan,
+        CandidateMapNode, CandidatePlacementMap, CompletionProof, DocumentClass,
         FIRST_GRANTABLE_HANDLE, GroupQuotaOverride, HandleRange, KIND_LABEL_KEY, LabelMatch,
         MAX_PLACEMENT_SHARD_COUNT, MetadataReplicationConfig, NodePlacementEntry,
         OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementScope,
-        PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, STORAGE_CLASS_LABEL_PREFIX, StrategyBinding, UserGroupCapOverride,
+        PlacementStrategy, ProofClaim, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RealmNodeKind, STORAGE_CLASS_LABEL_PREFIX, StrategyBinding, TransitionLimits,
+        TransitionPlan, TransitionStatus, UserGroupCapOverride,
     };
     use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId};
@@ -6539,5 +7151,387 @@ mod tests {
             Err(AdminDocumentReducerError::InvalidTokenHash)
         );
         assert!(state.materialized_revoked_tokens().is_empty());
+    }
+
+    fn secret(seed: u8) -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&[seed; 32])
+    }
+
+    fn map_with(epoch: u64, seeds: &[u8]) -> CandidatePlacementMap {
+        CandidatePlacementMap {
+            epoch,
+            nodes: seeds
+                .iter()
+                .map(|seed| CandidateMapNode {
+                    node_id: node(*seed),
+                    kind: RealmNodeKind::Server,
+                    location: "eu".to_string(),
+                    weight: 100,
+                    full: false,
+                    draining: false,
+                    labels: BTreeMap::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn transition_strategy() -> PlacementStrategy {
+        PlacementStrategy {
+            strategy_id: Ulid::from_bytes([21; 16]),
+            name: "moved".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 2,
+        }
+    }
+
+    fn transition_plan(old: &[u8], target: &[u8]) -> TransitionPlan {
+        let bucket = |bucket: u32| BucketPlan {
+            bucket,
+            old_holders: old.iter().map(|seed| node(*seed)).collect(),
+            target_holders: target.iter().map(|seed| node(*seed)).collect(),
+        };
+        TransitionPlan {
+            transition_id: Ulid::from_bytes([31; 16]),
+            strategy_id: transition_strategy().strategy_id,
+            buckets: vec![bucket(0), bucket(1)],
+            target_map_epoch: 2,
+            limits: TransitionLimits::default(),
+            created_by: node(1),
+            created_at_ms: 5,
+        }
+    }
+
+    fn proof_for(plan: &TransitionPlan, bucket: u32, seed: u8) -> CompletionProof {
+        ProofClaim {
+            realm_id: realm_id(),
+            transition_id: plan.transition_id,
+            strategy_id: plan.strategy_id,
+            bucket,
+            old_activation_epoch: 1,
+            target_map_epoch: plan.target_map_epoch,
+            barrier_digest: [0; 32],
+            checkpoint_root: [7; 32],
+            holder: node(seed),
+        }
+        .sign(&secret(seed))
+    }
+
+    /// Publish two maps, activate epoch 1, and start a 1 -> 2 transition.
+    fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
+        vec![
+            realm_config_event(
+                40,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: transition_strategy(),
+                },
+            ),
+            realm_config_event(
+                41,
+                node(1),
+                2,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                    map: map_with(1, &[1, 2]),
+                },
+            ),
+            realm_config_event(
+                42,
+                node(1),
+                3,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                    map: map_with(2, &[3, 4]),
+                },
+            ),
+            realm_config_event(
+                43,
+                node(1),
+                4,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigActivationsInitialized {
+                    strategy_id: plan.strategy_id,
+                    candidate_map_epoch: 1,
+                },
+            ),
+            realm_config_event(
+                44,
+                node(1),
+                5,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() },
+            ),
+        ]
+    }
+
+    /// Every barrier and proof bucket 0 needs to cut over.
+    fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
+        let barrier = |seed: u8, event_seed: u8| {
+            realm_config_event(
+                event_seed,
+                node(seed),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    transition_id: plan.transition_id,
+                    bucket: 0,
+                    reported_by: node(seed),
+                    frontier: vec![seed],
+                },
+            )
+        };
+        let proof = |seed: u8, event_seed: u8| {
+            realm_config_event(
+                event_seed,
+                node(seed),
+                2,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    transition_id: plan.transition_id,
+                    strategy_id: plan.strategy_id,
+                    proof: proof_for(plan, 0, seed),
+                },
+            )
+        };
+        vec![barrier(1, 50), barrier(2, 51), proof(3, 52), proof(4, 53)]
+    }
+
+    fn transition_config(state: &AdminDocumentReducerState) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, state);
+        config
+    }
+
+    #[test]
+    fn map_conflict_fails_closed() {
+        // Two divergent maps at one epoch keep the epoch unusable, both retained.
+        let mut state = realm_config_state();
+        for (event_seed, origin, seeds) in [(60u8, node(1), &[1u8, 2][..]), (61, node(2), &[3][..])]
+        {
+            state
+                .apply(&realm_config_event(
+                    event_seed,
+                    origin,
+                    1,
+                    AdminDocumentClock::default(),
+                    AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                        map: map_with(1, seeds),
+                    },
+                ))
+                .unwrap();
+        }
+
+        let config = transition_config(&state);
+        assert_eq!(config.candidate_maps.len(), 2);
+        assert!(config.candidate_map(1).is_none());
+        assert!(state.materialized_candidate_maps().is_empty());
+    }
+
+    #[test]
+    fn activation_init_covers_buckets() {
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan).iter().take(4) {
+            state.apply(event).unwrap();
+        }
+
+        let config = transition_config(&state);
+        assert_eq!(config.placement_activations.len(), 2);
+        for shard in 0..2 {
+            let activation = config
+                .activation(&plan.strategy_id, shard)
+                .expect("bucket activated");
+            assert_eq!(activation.activation_epoch, 1);
+            assert_eq!(activation.candidate_map_epoch, 1);
+            assert_eq!(activation.transition_id, None);
+        }
+    }
+
+    #[test]
+    fn proof_admission_rejects_forgery() {
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan) {
+            state.apply(&event).unwrap();
+        }
+        let submit = |proof: CompletionProof, origin: NodeId, event_seed: u8| {
+            realm_config_event(
+                event_seed,
+                origin,
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    transition_id: plan.transition_id,
+                    strategy_id: plan.strategy_id,
+                    proof,
+                },
+            )
+        };
+
+        // A proof relayed by anyone but its holder never enters the record.
+        assert_eq!(
+            state.apply(&submit(proof_for(&plan, 0, 3), node(1), 70)),
+            Err(AdminDocumentReducerError::TransitionOriginMismatch)
+        );
+        // A tampered epoch invalidates the signature over the claim.
+        let mut retargeted = proof_for(&plan, 0, 3);
+        retargeted.target_map_epoch = 9;
+        assert_eq!(
+            state.apply(&submit(retargeted, node(3), 71)),
+            Err(AdminDocumentReducerError::InvalidTransitionProof)
+        );
+        // So does a signature made by another node key.
+        let mut forged = proof_for(&plan, 0, 4);
+        forged.holder = node(3);
+        assert_eq!(
+            state.apply(&submit(forged, node(3), 72)),
+            Err(AdminDocumentReducerError::InvalidTransitionProof)
+        );
+
+        let config = transition_config(&state);
+        assert!(config.placement_transitions[0].proofs.is_empty());
+    }
+
+    #[test]
+    fn duplicate_proof_is_idempotent() {
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan) {
+            state.apply(&event).unwrap();
+        }
+        let first = realm_config_event(
+            73,
+            node(3),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                transition_id: plan.transition_id,
+                strategy_id: plan.strategy_id,
+                proof: proof_for(&plan, 0, 3),
+            },
+        );
+        let mut resent = first.clone();
+        resent.event_id = Ulid::from_bytes([74; 16]);
+        resent.origin_seq = 2;
+
+        state.apply(&first).unwrap();
+        assert_eq!(state.apply(&first), Ok(AdminDocumentApplyStatus::Duplicate));
+        state.apply(&resent).unwrap();
+
+        let config = transition_config(&state);
+        assert_eq!(config.placement_transitions[0].proofs.len(), 1);
+    }
+
+    #[test]
+    fn activation_advances_on_completion() {
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan)
+            .into_iter()
+            .chain(completion_events(&plan))
+        {
+            state.apply(&event).unwrap();
+        }
+
+        let config = transition_config(&state);
+        let cut = config.activation(&plan.strategy_id, 0).expect("bucket 0");
+        assert_eq!(cut.candidate_map_epoch, 2);
+        assert_eq!(cut.activation_epoch, 2);
+        assert_eq!(cut.transition_id, None);
+
+        // Bucket 1 has no barrier or proof, so it stays where it was and keeps
+        // naming the transition still working on it.
+        let pending = config.activation(&plan.strategy_id, 1).expect("bucket 1");
+        assert_eq!(pending.candidate_map_epoch, 1);
+        assert_eq!(pending.activation_epoch, 1);
+        assert_eq!(pending.transition_id, Some(plan.transition_id));
+
+        let transition = &config.placement_transitions[0];
+        assert_eq!(transition.completed.len(), 1);
+        assert_eq!(transition.completed[0].bucket, 0);
+        assert_eq!(
+            transition.completed[0].completed_at_ms,
+            Ulid::from_bytes([53; 16]).timestamp_ms()
+        );
+        assert!(!transition.is_terminal());
+    }
+
+    #[test]
+    fn advance_ignores_event_order() {
+        // Every replica reduces the same set into the same activations, whatever
+        // order the events arrive in.
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let events: Vec<AdminDocumentEvent> = transition_events(&plan)
+            .into_iter()
+            .chain(completion_events(&plan))
+            .collect();
+        let mut forward = realm_config_state();
+        for event in &events {
+            forward.apply(event).unwrap();
+        }
+        let mut permuted = realm_config_state();
+        for index in [8, 3, 6, 1, 7, 0, 5, 4, 2] {
+            permuted.apply(&events[index]).unwrap();
+        }
+
+        let expected = transition_config(&forward);
+        let actual = transition_config(&permuted);
+        assert_eq!(expected.placement_activations, actual.placement_activations);
+        assert_eq!(expected.placement_transitions, actual.placement_transitions);
+        assert_eq!(expected.candidate_maps, actual.candidate_maps);
+    }
+
+    #[test]
+    fn abort_keeps_cut_buckets() {
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan)
+            .into_iter()
+            .chain(completion_events(&plan))
+        {
+            state.apply(&event).unwrap();
+        }
+        state
+            .apply(&realm_config_event(
+                80,
+                node(1),
+                6,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionAborted {
+                    transition_id: plan.transition_id,
+                },
+            ))
+            .unwrap();
+
+        let config = transition_config(&state);
+        let transition = &config.placement_transitions[0];
+        assert!(matches!(transition.status, TransitionStatus::Aborted));
+        assert!(transition.is_terminal());
+        // The cut bucket stays cut; the un-cut one keeps its old activation.
+        assert_eq!(
+            config
+                .activation(&plan.strategy_id, 0)
+                .unwrap()
+                .candidate_map_epoch,
+            2
+        );
+        assert_eq!(
+            config
+                .activation(&plan.strategy_id, 1)
+                .unwrap()
+                .candidate_map_epoch,
+            1
+        );
+        assert_eq!(
+            config
+                .activation(&plan.strategy_id, 1)
+                .unwrap()
+                .transition_id,
+            None
+        );
     }
 }

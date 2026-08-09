@@ -7280,6 +7280,14 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
         | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
         | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+        | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+        | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+        | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+        | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+        | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
         | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
@@ -7398,7 +7406,55 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
         AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. } => {}
+        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+        | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. } => {}
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
+            let mut seen = std::collections::BTreeSet::new();
+            if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
+                return reject("candidate placement map is malformed");
+            }
+        }
+        AdminDocumentOperation::RealmConfigActivationsInitialized {
+            candidate_map_epoch,
+            ..
+        } => {
+            if *candidate_map_epoch == 0 {
+                return reject("activation names no candidate map epoch");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
+            let mut seen = std::collections::BTreeSet::new();
+            let well_formed = plan.limits.max_incomplete_buckets >= 1
+                && plan.target_map_epoch > 0
+                && !plan.buckets.is_empty()
+                && plan
+                    .buckets
+                    .iter()
+                    .all(|bucket| seen.insert(bucket.bucket) && !bucket.target_holders.is_empty());
+            if !well_formed {
+                return reject("placement transition plan is malformed");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported { reported_by, .. }
+        | AdminDocumentOperation::RealmConfigTransitionStallReported { reported_by, .. } => {
+            if *reported_by != event.origin_node_id {
+                return reject("transition report does not come from the node it names");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            strategy_id,
+            proof,
+        } => {
+            // Verified here as well as in the reducer: a forged proof must never
+            // reach storage, and the publisher binding already fixed the origin.
+            if proof.holder != event.origin_node_id
+                || !proof.verify(event.actor.realm_id, *transition_id, *strategy_id)
+            {
+                return reject("transition completion proof does not verify");
+            }
+        }
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             if let Some(label) = reserved_label(&entry.labels) {
                 return reject(&format!(
@@ -7686,6 +7742,18 @@ async fn validate_realm_config_admin_authority(
             }
             _ => false,
         };
+        // D9: every holder acts. A barrier, proof, or stall names its own origin
+        // and moves no authority on its own, so a holder may emit it.
+        let self_report = matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported { reported_by, .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { reported_by, .. }
+                if *reported_by == event.origin_node_id
+        ) || matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigTransitionProofSubmitted { proof, .. }
+                if proof.holder == event.origin_node_id
+        );
         if matches!(
             configured_node_kind(config, &event.origin_node_id),
             Some(RealmNodeKind::Management)
@@ -7706,6 +7774,7 @@ async fn validate_realm_config_admin_authority(
                 configured_node_kind(config, &event.origin_node_id),
                 Some(RealmNodeKind::Management)
             ) || server_binding
+                || (self_report && configured_node_kind(config, &event.origin_node_id).is_some())
             {
                 AdminEventValidation::Accepted
             } else {

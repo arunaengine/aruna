@@ -73,14 +73,27 @@ pub enum TransitionStatus {
     Aborted,
 }
 
+/// One bucket of a transition with the two holder sets it moves between.
+///
+/// Both sets are pure functions of immutable inputs (the bucket's activated map
+/// and the target map), so naming them here is a restatement any node can
+/// re-derive - which is exactly what the admission guard does. Carrying them
+/// keeps completion a set-membership question the reducer can settle without a
+/// selector.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct BucketPlan {
+    pub bucket: u32,
+    pub old_holders: Vec<NodeId>,
+    pub target_holders: Vec<NodeId>,
+}
+
 /// The operator-authored part of a transition. Immutable once admitted; every
 /// other field of [`PlacementTransition`] is reduced from later events.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct TransitionPlan {
     pub transition_id: Ulid,
     pub strategy_id: Ulid,
-    /// Explicit bucket list; empty means every bucket of the strategy.
-    pub buckets: Vec<u32>,
+    pub buckets: Vec<BucketPlan>,
     pub target_map_epoch: u64,
     pub limits: TransitionLimits,
     pub created_by: NodeId,
@@ -89,25 +102,16 @@ pub struct TransitionPlan {
 }
 
 impl TransitionPlan {
-    /// Whether `bucket` is in scope, honoring the empty-means-all convention.
-    pub fn covers(&self, bucket: u32) -> bool {
-        self.buckets.is_empty() || self.buckets.contains(&bucket)
+    pub fn bucket_plan(&self, bucket: u32) -> Option<&BucketPlan> {
+        self.buckets.iter().find(|plan| plan.bucket == bucket)
     }
 
-    /// In-scope buckets in ascending order for `shard_count`.
-    pub fn bucket_list(&self, shard_count: u32) -> Vec<u32> {
-        if self.buckets.is_empty() {
-            return (0..shard_count).collect();
-        }
-        let mut buckets: Vec<u32> = self
-            .buckets
-            .iter()
-            .copied()
-            .filter(|bucket| *bucket < shard_count)
-            .collect();
-        buckets.sort_unstable();
-        buckets.dedup();
-        buckets
+    pub fn covers(&self, bucket: u32) -> bool {
+        self.bucket_plan(bucket).is_some()
+    }
+
+    pub fn bucket_list(&self) -> Vec<u32> {
+        self.buckets.iter().map(|plan| plan.bucket).collect()
     }
 }
 
@@ -244,22 +248,44 @@ impl PlacementTransition {
     }
 
     pub fn completion(&self, bucket: u32) -> Option<&BucketCompletion> {
-        self.completed
-            .iter()
-            .find(|entry| entry.bucket == bucket)
-            .or(None)
+        self.completed.iter().find(|entry| entry.bucket == bucket)
     }
 
     /// A transition is terminal once it is aborted or every covered bucket has
     /// cut over; a terminal record moves no authority.
-    pub fn is_terminal(&self, shard_count: u32) -> bool {
-        if matches!(self.status, TransitionStatus::Aborted) {
-            return true;
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status, TransitionStatus::Aborted)
+            || self
+                .plan
+                .buckets
+                .iter()
+                .all(|plan| self.completion(plan.bucket).is_some())
+    }
+
+    /// Whether the bucket may cut over: every old holder reported its barrier
+    /// and every target holder proved it verified the handoff. A forced bucket
+    /// needs one verified proof instead, so the last verified copy is never
+    /// the one being cut away.
+    ///
+    /// Deliberately independent of [`TransitionStatus`]: a bucket whose proofs
+    /// are all in has cut over, and an abort that arrives afterwards must not
+    /// un-cut it. An abort stops the executors, so an incomplete bucket simply
+    /// never completes.
+    pub fn bucket_ready(&self, bucket: u32) -> bool {
+        let Some(plan) = self.plan.bucket_plan(bucket) else {
+            return false;
+        };
+        let proved = |holder: &NodeId| {
+            self.proofs
+                .iter()
+                .any(|proof| proof.bucket == bucket && proof.holder == *holder)
+        };
+        if self.forced.iter().any(|entry| entry.bucket == bucket) {
+            return plan.target_holders.iter().any(proved);
         }
-        self.plan
-            .bucket_list(shard_count)
-            .iter()
-            .all(|bucket| self.completion(*bucket).is_some())
+        self.barrier_established(bucket, &plan.old_holders)
+            && !plan.target_holders.is_empty()
+            && plan.target_holders.iter().all(proved)
     }
 
     /// Digest over the bucket's reduced barrier join: the sorted
@@ -309,11 +335,19 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32])
     }
 
+    fn bucket_plan(bucket: u32) -> BucketPlan {
+        BucketPlan {
+            bucket,
+            old_holders: vec![secret(1).public(), secret(2).public()],
+            target_holders: vec![secret(2).public(), secret(3).public()],
+        }
+    }
+
     fn plan() -> TransitionPlan {
         TransitionPlan {
             transition_id: Ulid::from_bytes([1; 16]),
             strategy_id: Ulid::from_bytes([2; 16]),
-            buckets: vec![3, 1, 1],
+            buckets: vec![bucket_plan(1), bucket_plan(3)],
             target_map_epoch: 4,
             limits: TransitionLimits::default(),
             created_by: secret(9).public(),
@@ -457,33 +491,73 @@ mod tests {
     }
 
     #[test]
-    fn bucket_list_expands_and_normalizes() {
-        assert_eq!(plan().bucket_list(8), vec![1, 3]);
-        assert_eq!(plan().bucket_list(2), vec![1]);
-        let mut all = plan();
-        all.buckets.clear();
-        assert_eq!(all.bucket_list(3), vec![0, 1, 2]);
-        assert!(all.covers(2));
+    fn plan_names_its_buckets() {
+        assert_eq!(plan().bucket_list(), vec![1, 3]);
+        assert!(plan().covers(1));
         assert!(!plan().covers(2));
+        assert_eq!(plan().bucket_plan(3).unwrap().target_holders.len(), 2);
     }
 
     #[test]
     fn terminal_needs_every_bucket() {
         let mut transition = PlacementTransition::new(plan());
-        assert!(!transition.is_terminal(8));
+        assert!(!transition.is_terminal());
         transition.completed.push(BucketCompletion {
             bucket: 1,
             completed_at_ms: 1,
         });
-        assert!(!transition.is_terminal(8));
+        assert!(!transition.is_terminal());
         transition.completed.push(BucketCompletion {
             bucket: 3,
             completed_at_ms: 2,
         });
-        assert!(transition.is_terminal(8));
+        assert!(transition.is_terminal());
 
         let mut aborted = PlacementTransition::new(plan());
         aborted.status = TransitionStatus::Aborted;
-        assert!(aborted.is_terminal(8));
+        assert!(aborted.is_terminal());
+    }
+
+    #[test]
+    fn ready_needs_barrier_and_every_proof() {
+        // Old holders 1 and 2 must fence; target holders 2 and 3 must prove.
+        let mut transition = PlacementTransition::new(plan());
+        let barrier = |seed: u8| BucketBarrier {
+            bucket: 1,
+            reported_by: secret(seed).public(),
+            frontier: vec![seed],
+        };
+        transition.barriers.push(barrier(1));
+        transition
+            .proofs
+            .push(claim(1, secret(2).public(), [0; 32]).sign(&secret(2)));
+        transition
+            .proofs
+            .push(claim(1, secret(3).public(), [0; 32]).sign(&secret(3)));
+        assert!(!transition.bucket_ready(1));
+
+        transition.barriers.push(barrier(2));
+        assert!(transition.bucket_ready(1));
+        assert!(!transition.bucket_ready(3));
+        assert!(!transition.bucket_ready(9));
+
+        // An abort never un-cuts a bucket whose proofs are already in.
+        transition.status = TransitionStatus::Aborted;
+        assert!(transition.bucket_ready(1));
+        assert!(!transition.bucket_ready(3));
+    }
+
+    #[test]
+    fn force_needs_one_proof() {
+        let mut transition = PlacementTransition::new(plan());
+        transition.forced.push(BucketForceFinalize {
+            bucket: 3,
+            at_risk_report: "old holders lost".to_string(),
+        });
+        assert!(!transition.bucket_ready(3));
+        transition
+            .proofs
+            .push(claim(3, secret(3).public(), [0; 32]).sign(&secret(3)));
+        assert!(transition.bucket_ready(3));
     }
 }

@@ -20,9 +20,10 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
-    PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
+    Actor, BindingError, BindingScope, CandidatePlacementMap, CompletionProof, DEFAULT_LOCATION,
+    DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord, NodePlacementEntry,
+    PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
+    RealmConfigDocument, StrategyBinding, TransitionPlan,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -51,6 +52,35 @@ pub enum RealmPlacementMutation {
     SetOverride(PlacementOverride),
     RemoveOverride(Vec<u8>),
     AppendPlacementBinding(PlacementBinding),
+    PublishCandidateMap(CandidatePlacementMap),
+    InitializeActivations {
+        strategy_id: Ulid,
+        candidate_map_epoch: u64,
+    },
+    StartTransition(TransitionPlan),
+    ReportBarrier {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+        frontier: Vec<u8>,
+    },
+    SubmitCompletion {
+        transition_id: Ulid,
+        strategy_id: Ulid,
+        proof: CompletionProof,
+    },
+    AbortTransition(Ulid),
+    ForceFinalizeBucket {
+        transition_id: Ulid,
+        bucket: u32,
+        at_risk_report: String,
+    },
+    ReportStall {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+        reason: String,
+    },
 }
 
 impl RealmPlacementMutation {
@@ -98,6 +128,64 @@ impl RealmPlacementMutation {
                     binding: binding.clone(),
                 }
             }
+            Self::PublishCandidateMap(map) => {
+                AdminDocumentOperation::RealmConfigCandidateMapPublished { map: map.clone() }
+            }
+            Self::InitializeActivations {
+                strategy_id,
+                candidate_map_epoch,
+            } => AdminDocumentOperation::RealmConfigActivationsInitialized {
+                strategy_id: *strategy_id,
+                candidate_map_epoch: *candidate_map_epoch,
+            },
+            Self::StartTransition(plan) => {
+                AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() }
+            }
+            Self::ReportBarrier {
+                transition_id,
+                bucket,
+                reported_by,
+                frontier,
+            } => AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                reported_by: *reported_by,
+                frontier: frontier.clone(),
+            },
+            Self::SubmitCompletion {
+                transition_id,
+                strategy_id,
+                proof,
+            } => AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                transition_id: *transition_id,
+                strategy_id: *strategy_id,
+                proof: proof.clone(),
+            },
+            Self::AbortTransition(transition_id) => {
+                AdminDocumentOperation::RealmConfigTransitionAborted {
+                    transition_id: *transition_id,
+                }
+            }
+            Self::ForceFinalizeBucket {
+                transition_id,
+                bucket,
+                at_risk_report,
+            } => AdminDocumentOperation::RealmConfigTransitionBucketForced {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                at_risk_report: at_risk_report.clone(),
+            },
+            Self::ReportStall {
+                transition_id,
+                bucket,
+                reported_by,
+                reason,
+            } => AdminDocumentOperation::RealmConfigTransitionStallReported {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                reported_by: *reported_by,
+                reason: reason.clone(),
+            },
         }
     }
 
@@ -190,6 +278,113 @@ impl RealmPlacementMutation {
                 Some(strategy_id) => require_strategy(document, strategy_id, "override"),
                 None => Ok(()),
             },
+            Self::PublishCandidateMap(map) => {
+                if document.candidate_map(map.epoch).is_some()
+                    || document
+                        .candidate_maps
+                        .iter()
+                        .any(|known| known.epoch == map.epoch)
+                {
+                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                        "candidate map epoch {} is already published",
+                        map.epoch
+                    )));
+                }
+                Ok(())
+            }
+            Self::InitializeActivations {
+                strategy_id,
+                candidate_map_epoch,
+            } => {
+                require_strategy(document, strategy_id, "activation")?;
+                if document.candidate_map(*candidate_map_epoch).is_none() {
+                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                        "candidate map epoch {candidate_map_epoch} is missing or conflicted"
+                    )));
+                }
+                Ok(())
+            }
+            Self::StartTransition(plan) => {
+                require_strategy(document, &plan.strategy_id, "transition")?;
+                if plan.limits.max_incomplete_buckets == 0 {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "a transition must allow at least one bucket in flight".to_string(),
+                    ));
+                }
+                if let Some(existing) = document.placement_transitions.iter().find(|transition| {
+                    transition.plan.strategy_id == plan.strategy_id && !transition.is_terminal()
+                }) {
+                    return Err(MutateRealmPlacementError::TransitionInFlight {
+                        transition_id: existing.plan.transition_id,
+                    });
+                }
+                // The plan restates derived holder sets, so admission re-derives
+                // them: a plan naming sets this node disagrees with never enters.
+                if !crate::placement::transition::plan_is_derivable(document, plan) {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "transition plan does not match the resolved holder sets".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::ReportBarrier {
+                transition_id,
+                bucket,
+                ..
+            }
+            | Self::ReportStall {
+                transition_id,
+                bucket,
+                ..
+            } => require_transition_bucket(document, transition_id, *bucket),
+            Self::SubmitCompletion {
+                transition_id,
+                strategy_id,
+                proof,
+            } => {
+                let transition = require_transition_bucket(document, transition_id, proof.bucket)
+                    .and(document.transition(transition_id).ok_or(
+                    MutateRealmPlacementError::UnknownTransition {
+                        transition_id: *transition_id,
+                    },
+                ))?;
+                if transition.plan.strategy_id != *strategy_id
+                    || !proof.verify(document.realm_id, *transition_id, *strategy_id)
+                {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "transition completion proof does not verify".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::AbortTransition(transition_id) => document
+                .transition(transition_id)
+                .map(|_| ())
+                .ok_or(MutateRealmPlacementError::UnknownTransition {
+                    transition_id: *transition_id,
+                }),
+            Self::ForceFinalizeBucket {
+                transition_id,
+                bucket,
+                ..
+            } => {
+                let transition = require_transition_bucket(document, transition_id, *bucket).and(
+                    document.transition(transition_id).ok_or(
+                        MutateRealmPlacementError::UnknownTransition {
+                            transition_id: *transition_id,
+                        },
+                    ),
+                )?;
+                // A forced cut still needs one verified copy on a target holder,
+                // so the last verified copy is never the one cut away.
+                if transition.proofs_for(*bucket).next().is_none() {
+                    return Err(MutateRealmPlacementError::ForceWithoutProof {
+                        transition_id: *transition_id,
+                        bucket: *bucket,
+                    });
+                }
+                Ok(())
+            }
             Self::RemoveStrategy(strategy_id) => {
                 let referenced = document.default_strategy_id == Some(*strategy_id)
                     || document
@@ -225,6 +420,25 @@ fn require_strategy(
     if document.strategy(strategy_id).is_none() {
         return Err(MutateRealmPlacementError::InvalidInput(format!(
             "{reference} references missing strategy {strategy_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_transition_bucket(
+    document: &RealmConfigDocument,
+    transition_id: &Ulid,
+    bucket: u32,
+) -> Result<(), MutateRealmPlacementError> {
+    let transition =
+        document
+            .transition(transition_id)
+            .ok_or(MutateRealmPlacementError::UnknownTransition {
+                transition_id: *transition_id,
+            })?;
+    if !transition.plan.covers(bucket) {
+        return Err(MutateRealmPlacementError::InvalidInput(format!(
+            "transition {transition_id} does not cover bucket {bucket}"
         )));
     }
     Ok(())
@@ -327,6 +541,14 @@ pub enum MutateRealmPlacementError {
     EmptyShardHolders { strategy_id: Ulid, shard: u32 },
     #[error("placement strategy {strategy_id} is currently referenced")]
     StrategyReferenced { strategy_id: Ulid },
+    #[error("placement transition {transition_id} is still in flight")]
+    TransitionInFlight { transition_id: Ulid },
+    #[error("placement transition {transition_id} is unknown")]
+    UnknownTransition { transition_id: Ulid },
+    #[error(
+        "forcing transition {transition_id} bucket {bucket} needs at least one verified completion proof"
+    )]
+    ForceWithoutProof { transition_id: Ulid, bucket: u32 },
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]
@@ -876,9 +1098,18 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::placement::transition::{TransitionRequest, plan_transition};
+    use aruna_core::structs::{PlacementTransition, ProofClaim, TransitionLimits};
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn node_secret(node_id: &aruna_core::NodeId) -> iroh::SecretKey {
+        (1..=8u8)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
+            .find(|secret| secret.public() == *node_id)
+            .expect("fixture node keys are seeded")
     }
 
     fn actor(realm_id: RealmId) -> Actor {
@@ -1679,6 +1910,165 @@ mod tests {
         assert!(matches!(
             RealmPlacementMutation::AppendPlacementBinding(foreign).validate(&document),
             Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("does not match")
+        ));
+    }
+
+    fn transition_document() -> (RealmConfigDocument, Ulid) {
+        // Four nodes, one replica: every bucket moves to a disjoint holder when
+        // the newest map adds a node, which is what a transition is for.
+        let realm_id = RealmId::from_bytes([41; 32]);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        let strategy_id = Ulid::from_bytes([42; 16]);
+        document.strategies.push(PlacementStrategy {
+            strategy_id,
+            name: "moved".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 4,
+        });
+        document.default_strategy_id = Some(strategy_id);
+        for seed in 1..=3u8 {
+            document.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        document.snapshot_candidate_map();
+        document.ensure_node(node(4), RealmNodeKind::Server);
+        document.snapshot_candidate_map();
+        (document, strategy_id)
+    }
+
+    fn transition_request(strategy_id: Ulid) -> TransitionRequest {
+        TransitionRequest {
+            transition_id: Ulid::from_bytes([43; 16]),
+            strategy_id,
+            buckets: Vec::new(),
+            target_map_epoch: 2,
+            limits: TransitionLimits::default(),
+            created_by: node(1),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn transition_plan_must_match() {
+        let (document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        assert_eq!(plan.buckets.len(), 4);
+        assert!(
+            RealmPlacementMutation::StartTransition(plan.clone())
+                .validate(&document)
+                .is_ok()
+        );
+
+        // A plan naming a holder set this node does not derive never enters.
+        let mut forged = plan.clone();
+        forged.buckets[0].target_holders = vec![node(1)];
+        assert!(matches!(
+            RealmPlacementMutation::StartTransition(forged).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("does not match the resolved holder sets")
+        ));
+
+        // One transition per strategy at a time.
+        let mut in_flight = document.clone();
+        in_flight
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        let mut successor = plan.clone();
+        successor.transition_id = Ulid::from_bytes([44; 16]);
+        assert!(matches!(
+            RealmPlacementMutation::StartTransition(successor).validate(&in_flight),
+            Err(MutateRealmPlacementError::TransitionInFlight { transition_id })
+                if transition_id == plan.transition_id
+        ));
+    }
+
+    #[test]
+    fn force_needs_one_proof() {
+        let (mut document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        let bucket = plan.buckets[0].bucket;
+        let holder = plan.buckets[0].target_holders[0];
+        document
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        let force = RealmPlacementMutation::ForceFinalizeBucket {
+            transition_id: plan.transition_id,
+            bucket,
+            at_risk_report: "old holders lost".to_string(),
+        };
+
+        assert!(matches!(
+            force.validate(&document),
+            Err(MutateRealmPlacementError::ForceWithoutProof { bucket: forced, .. })
+                if forced == bucket
+        ));
+
+        let secret = node_secret(&holder);
+        document.placement_transitions[0].proofs.push(
+            ProofClaim {
+                realm_id: document.realm_id,
+                transition_id: plan.transition_id,
+                strategy_id,
+                bucket,
+                old_activation_epoch: 1,
+                target_map_epoch: 2,
+                barrier_digest: [0; 32],
+                checkpoint_root: [1; 32],
+                holder,
+            }
+            .sign(&secret),
+        );
+        assert_eq!(force.validate(&document), Ok(()));
+    }
+
+    #[test]
+    fn completion_must_verify() {
+        let (mut document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        let bucket = plan.buckets[0].bucket;
+        let holder = plan.buckets[0].target_holders[0];
+        document
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        let claim = ProofClaim {
+            realm_id: document.realm_id,
+            transition_id: plan.transition_id,
+            strategy_id,
+            bucket,
+            old_activation_epoch: 1,
+            target_map_epoch: 2,
+            barrier_digest: [0; 32],
+            checkpoint_root: [1; 32],
+            holder,
+        };
+        let submit = |proof| RealmPlacementMutation::SubmitCompletion {
+            transition_id: plan.transition_id,
+            strategy_id,
+            proof,
+        };
+
+        assert_eq!(
+            submit(claim.sign(&node_secret(&holder))).validate(&document),
+            Ok(())
+        );
+
+        // Signed by the wrong key, and aimed at a bucket the plan does not cover.
+        let other = (1..=4u8)
+            .map(node)
+            .find(|candidate| *candidate != holder)
+            .expect("the fixture has more than one node");
+        assert!(matches!(
+            submit(claim.sign(&node_secret(&other))).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("does not verify")
+        ));
+        let mut off_plan = claim;
+        off_plan.bucket = 9;
+        assert!(matches!(
+            submit(off_plan.sign(&node_secret(&holder))).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("does not cover bucket")
         ));
     }
 }

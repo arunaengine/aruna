@@ -2,6 +2,7 @@
 mod distribution;
 pub mod resolver;
 pub mod selector;
+pub mod transition;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
@@ -36,7 +37,7 @@ pub fn shard_subject_bytes(placement: &PlacementRef) -> Vec<u8> {
 /// a document subject, because one shard topic has exactly one holder set.
 /// Per-document overrides still steer strategy selection (see
 /// [`strategy_for_target`]); their pin/exclude lists are inert for holders.
-fn shard_override<'a>(
+pub(crate) fn shard_override<'a>(
     config: &'a RealmConfigDocument,
     placement: &PlacementRef,
 ) -> Option<&'a PlacementOverride> {

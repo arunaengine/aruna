@@ -5,9 +5,10 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{
-    Actor, BandPool, BindingScope, HandleRange, MetadataReplicationConfig, NodePlacementEntry,
-    OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementStrategy,
-    QuotaConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding,
+    Actor, BandPool, BindingScope, CandidatePlacementMap, CompletionProof, HandleRange,
+    MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
+    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig,
+    RealmId, RealmNodeKind, Role, StrategyBinding, TransitionPlan,
 };
 use crate::types::{GroupId, RoleId, UserId};
 
@@ -197,6 +198,52 @@ pub enum AdminDocumentOperation {
     /// delegation tree resolved by lineage, not by assignment order.
     RealmConfigBandPoolAssigned {
         pool: BandPool,
+    },
+    /// Publishes an immutable candidate map. Two divergent maps at one epoch
+    /// conflict and leave the epoch unusable.
+    RealmConfigCandidateMapPublished {
+        map: CandidatePlacementMap,
+    },
+    /// Activates a published map for every bucket of a strategy that has no
+    /// activation yet. Explicit, so nothing initializes as a create side effect.
+    RealmConfigActivationsInitialized {
+        strategy_id: Ulid,
+        candidate_map_epoch: u64,
+    },
+    /// Starts a proof-gated handoff of a strategy's buckets to a target map.
+    RealmConfigTransitionStarted {
+        plan: TransitionPlan,
+    },
+    /// An old holder's frozen frontier for one bucket.
+    RealmConfigTransitionBarrierReported {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+        frontier: Vec<u8>,
+    },
+    /// A target holder's signed completion proof. Admitted only when the origin
+    /// is the signing holder and the signature covers this exact tuple.
+    RealmConfigTransitionProofSubmitted {
+        transition_id: Ulid,
+        strategy_id: Ulid,
+        proof: CompletionProof,
+    },
+    RealmConfigTransitionAborted {
+        transition_id: Ulid,
+    },
+    /// Cuts one bucket over without every proof; the reducer still requires at
+    /// least one verified proof.
+    RealmConfigTransitionBucketForced {
+        transition_id: Ulid,
+        bucket: u32,
+        at_risk_report: String,
+    },
+    /// Diagnostics only: a stall never moves authority.
+    RealmConfigTransitionStallReported {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+        reason: String,
     },
     RealmConfigPoliciesSet {
         policies: Vec<crate::request_policy::RequestPolicy>,
