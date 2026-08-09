@@ -642,9 +642,8 @@ async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
         .map(|(count, capped)| (count as u64, capped))
 }
 
-/// Yields the recipient's unread count: once initially, then whenever it may have
-/// changed. Ends when the node shutdown token fires, the wake channel closes, or
-/// the consumer drops the stream (client disconnect); transient count-fetch
+/// Yields the recipient's unread count initially and whenever it may have changed.
+/// Ends on shutdown, wake-channel closure, or client disconnect. Transient fetch
 /// failures are skipped so a blip never tears the stream down.
 fn unread_count_stream(
     context: Arc<DriverContext>,
@@ -825,8 +824,7 @@ where
                     });
                 }
                 NotificationStateStep::Unread(None) => {
-                    state.unread_open = false;
-                    continue;
+                    return None;
                 }
                 NotificationStateStep::Revision(Ok(())) => {
                     let revision = *state.revisions.borrow_and_update();
@@ -1604,6 +1602,21 @@ mod tests {
         );
         changes.send_replace(4);
         assert_eq!(states.next().await.expect("dashboard state").revision, 4);
+    }
+
+    #[tokio::test]
+    async fn state_stream_closes() {
+        let (_changes, revisions) = watch::channel(3);
+        let unread = stream::iter([(4, false)]);
+        let mut states = Box::pin(notification_state_stream(
+            unread,
+            "test-epoch".to_string(),
+            revisions,
+            Duration::from_secs(20),
+        ));
+
+        assert!(states.next().await.is_some());
+        assert_eq!(states.next().await, None);
     }
 
     #[tokio::test]
