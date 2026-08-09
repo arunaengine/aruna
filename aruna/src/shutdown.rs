@@ -32,7 +32,7 @@ use aruna_api::error::ServerSetupError;
 use aruna_api::ops::Readiness;
 use aruna_blob::blob::BlobHandle;
 use aruna_core::shutdown::Shutdown;
-use aruna_net::NetHandle;
+use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle};
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
@@ -56,11 +56,11 @@ const INGRESS_BUDGET_DIVISOR: u32 = 4;
 /// stuck child cannot consume the budget the network, metadata, blob and
 /// storage phases need to close cleanly.
 const TAIL_BUDGET_RESERVE: Duration = Duration::from_secs(5);
-/// Slice of the net phase reserved for the teardown behind the inbound drain.
-/// The drain deadline must sit strictly below the phase budget: with both
-/// equal, a drain that times out consumes the whole phase and the outer timeout
-/// drops the teardown unrun.
-const NET_TEARDOWN_HEADROOM: Duration = Duration::from_secs(2);
+/// Slice of the net phase reserved for the DHT, document-sync, connection-pool
+/// and endpoint-close teardown that runs behind the inbound drain, on top of
+/// the `FORCED_INBOUND_DRAIN` the forced join costs. Without both, the outer
+/// phase timeout fires mid-teardown and drops it unrun.
+const NET_TEARDOWN_MARGIN: Duration = Duration::from_secs(2);
 /// Exit code when the watchdog has to kill a shutdown that would not finish.
 const FORCED_EXIT_CODE: i32 = 75;
 
@@ -295,8 +295,10 @@ fn tail_reserved(remaining: Duration) -> Duration {
     remaining.saturating_sub(TAIL_BUDGET_RESERVE)
 }
 
+/// A short phase budget yields zero: skip the soft drain and go straight to the
+/// forced teardown.
 fn net_drain_budget(phase_budget: Duration) -> Duration {
-    phase_budget.saturating_sub(NET_TEARDOWN_HEADROOM)
+    phase_budget.saturating_sub(FORCED_INBOUND_DRAIN + NET_TEARDOWN_MARGIN)
 }
 
 async fn phase<F>(name: &'static str, budget: Duration, future: F)
@@ -423,13 +425,13 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    // The inbound drain must never get the whole net phase, or the teardown
-    // behind it is dropped by the outer phase timeout.
+    // The inbound drain must leave the forced teardown behind it its own time,
+    // or the outer phase timeout drops that teardown unrun.
     #[test]
     fn drain_below_phase_budget() {
         assert_eq!(
             net_drain_budget(Duration::from_secs(10)),
-            Duration::from_secs(8)
+            Duration::from_secs(3)
         );
         assert_eq!(net_drain_budget(Duration::from_secs(1)), Duration::ZERO);
     }

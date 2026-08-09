@@ -63,7 +63,7 @@ const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
 /// Drain budget for inbound stream handlers when `shutdown` is called without one.
 const DEFAULT_INBOUND_DRAIN: Duration = Duration::from_secs(5);
 /// Grace for the same handlers once the endpoint is closed under them.
-const FORCED_INBOUND_DRAIN: Duration = Duration::from_secs(5);
+pub const FORCED_INBOUND_DRAIN: Duration = Duration::from_secs(5);
 const NOTIFICATION_WAKE_CAPACITY: usize = 256;
 use connection_pool::{ConnectionPool, ConnectionPoolOptions};
 pub use streams::StreamsService;
