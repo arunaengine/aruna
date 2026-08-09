@@ -1551,11 +1551,15 @@ impl ReplicateObjectVersionOperation {
                         .sync
                         .as_ref()
                         .ok_or(ReplicateObjectVersionError::UnresolvedReferenceVersion)?;
+                    // Must equal what a live head of this native source reports,
+                    // or the target's first read sees drift and forks a
+                    // successor. The head reads the version, not the shared
+                    // (content-addressed, deduplicated) location row.
                     let reference = SourceMetadata {
                         content_length: location.blob_size,
                         content_type: None,
                         etag: None,
-                        last_modified: Some(location.created_at),
+                        last_modified: Some(created_at),
                         source_version: None,
                     };
                     (
@@ -3047,10 +3051,11 @@ mod tests {
         let location = materialized_location();
         let source_node_id = sync.source_node_id;
         let relationship_id = sync.relationship_id;
+        let created_at = SystemTime::now();
         let mut op =
             ReplicateObjectVersionOperation::new(version_request(version_id)).with_sync(sync);
         op.replication_version = Some(ReplicationVersion::Materialized {
-            created_at: SystemTime::now(),
+            created_at,
             created_by: test_user_id(),
             location: location.clone(),
             source: None,
@@ -3070,7 +3075,7 @@ mod tests {
                 content_length: location.blob_size,
                 content_type: None,
                 etag: None,
-                last_modified: Some(location.created_at),
+                last_modified: Some(created_at),
                 source_version: None,
             })
         );
@@ -3088,6 +3093,47 @@ mod tests {
             source.descriptor.public_config.get("relationship_id"),
             Some(&relationship_id.to_string())
         );
+    }
+
+    // The target heads this native source on its first read and compares
+    // fingerprints, so the replicated observation must be the one that head
+    // returns: derived from the version, not from the shared location row.
+    #[test]
+    fn observation_matches_head() {
+        let version_id = Ulid::generate();
+        let location = materialized_location();
+        let created_at = SystemTime::now();
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id))
+            .with_sync(reference_sync());
+        op.replication_version = Some(ReplicationVersion::Materialized {
+            created_at,
+            created_by: test_user_id(),
+            location: location.clone(),
+            source: None,
+            metadata: HashMap::new(),
+        });
+
+        op.build_manifest(None).unwrap();
+
+        // What the origin's native head reports for a materialized version;
+        // source_version is transient and excluded from the fingerprint.
+        let head = SourceMetadata {
+            content_length: location.blob_size,
+            content_type: None,
+            etag: None,
+            last_modified: Some(created_at),
+            source_version: Some(version_id.to_string()),
+        };
+        let replicated = op
+            .manifest
+            .expect("manifest built")
+            .reference_metadata
+            .expect("reference observation");
+        assert_eq!(
+            replicated.observation_fingerprint(),
+            head.observation_fingerprint()
+        );
+        assert_ne!(location.created_at, created_at);
     }
 
     #[test]
