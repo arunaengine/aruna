@@ -21,6 +21,7 @@ use crate::driver::{DriverContext, drive};
 use crate::ensure_realm_config::{
     EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
 };
+use crate::expand_placement::{ensure_activated_map, expand_realm_placement};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use crate::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
@@ -113,8 +114,13 @@ pub async fn bootstrap_onboarding_finalize(
     )
     .await?;
 
+    // The bridge must close before the joiner is registered: activations have to
+    // be pinned to a map that does not name it, or the join itself would move
+    // buckets instead of the transition below.
+    ensure_activated_map(context.as_ref(), &realm_actor(&input)).await?;
     ensure_realm_node_with_retries(&input, reserved.mode, context.as_ref()).await?;
     set_joiner_placement_entry(&input, placement_entry, context.as_ref()).await?;
+    expand_realm_placement(context.as_ref(), &realm_actor(&input)).await?;
     process_pending_placements(&input, &context).await;
 
     let ticket = drive(
@@ -287,6 +293,14 @@ fn build_joiner_placement_entry(
     })
 }
 
+fn realm_actor(input: &BootstrapOnboardingFinalizeInput) -> Actor {
+    Actor {
+        node_id: input.local_node_id,
+        user_id: UserId::nil(input.realm_id),
+        realm_id: input.realm_id,
+    }
+}
+
 async fn set_joiner_placement_entry(
     input: &BootstrapOnboardingFinalizeInput,
     entry: NodePlacementEntry,
@@ -294,11 +308,7 @@ async fn set_joiner_placement_entry(
 ) -> Result<(), BootstrapOnboardingFinalizeError> {
     drive(
         MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
-            actor: Actor {
-                node_id: input.local_node_id,
-                user_id: UserId::nil(input.realm_id),
-                realm_id: input.realm_id,
-            },
+            actor: realm_actor(input),
             mutation: RealmPlacementMutation::UpsertNode(entry),
         }),
         context,
@@ -843,6 +853,11 @@ mod tests {
             .find(|strategy| strategy.strategy_id == user_strategy_id)
             .unwrap()
             .replica_count = Some(1);
+        // Stand in for the expansion transition: a node registered after the
+        // realm activated its map holds nothing until one names it.
+        config.candidate_maps.clear();
+        config.placement_activations.clear();
+        config.snapshot_candidate_map();
 
         let actor = Actor {
             node_id: fixture.local_node_id,

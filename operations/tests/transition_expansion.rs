@@ -1,6 +1,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! A late node joins and an explicit expansion transition hands it the buckets.
+//! A late node joins and onboarding hands it the buckets with an expansion
+//! transition it issues itself.
 //!
 //! Expansion is the superset case: every bucket's target set contains its old
 //! set, so nothing moves off any node and the old holders stay write authority
@@ -12,7 +13,7 @@
 mod topology;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::{PlacementRef, RealmNodeKind, TransitionLimits};
+use aruna_core::structs::{PlacementRef, RealmNodeKind};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
@@ -27,10 +28,17 @@ use topology::{TestNode, TestResult, Topology, wait_until};
 const MANAGEMENT_NODES: usize = 4;
 const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
+const SHARD_COUNT: u32 = 4;
 
 #[tokio::test]
 async fn expansion_hands_buckets_to_the_joiner() -> TestResult<()> {
-    let mut realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let mut realm = Topology::spawn_sharded(
+        MANAGEMENT_NODES,
+        USER_NODES,
+        REPLICATION_FACTOR,
+        SHARD_COUNT,
+    )
+    .await?;
     let group_id = realm.seed_group().await?;
     let everywhere = realm
         .config
@@ -39,12 +47,9 @@ async fn expansion_hands_buckets_to_the_joiner() -> TestResult<()> {
         .find(|strategy| strategy.replica_count.is_none())
         .map(|strategy| strategy.strategy_id)
         .expect("the seeded realm binds an everywhere strategy");
-    // Two named buckets: every step of the machinery runs, without paying for
-    // the strategy's whole fan-out in a fixture.
-    const BUCKETS: [u32; 2] = [0, 1];
     let probe = PlacementRef {
         strategy_id: everywhere,
-        shard: BUCKETS[0],
+        shard: 0,
     };
     let before = realm.holders(&probe);
 
@@ -55,47 +60,33 @@ async fn expansion_hands_buckets_to_the_joiner() -> TestResult<()> {
     let placement = create_document(&realm, realm.node(0), group_id, document_id, path).await?;
 
     let joiner = realm.spawn_late_node(RealmNodeKind::Management).await?;
-    // A registered node holds nothing until a map naming it is activated.
+    // A registered node holds nothing until a map naming it is activated, even
+    // though onboarding already published that map and started the handover.
     assert_eq!(realm.holders(&probe), before);
     assert!(!realm.is_holder(joiner, &probe));
 
-    let epoch = realm.publish_map(0).await?;
-    assert_eq!(
-        realm.holders(&probe),
-        before,
-        "publishing is not activating"
+    let started = realm.live_transitions();
+    let plans: Vec<_> = started
+        .iter()
+        .map(|transition_id| {
+            realm
+                .config
+                .transition(transition_id)
+                .expect("the started transition replicated")
+                .plan
+                .clone()
+        })
+        .collect();
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.strategy_id == everywhere && plan.buckets.len() == SHARD_COUNT as usize),
+        "onboarding must hand over every bucket of the everywhere strategy"
     );
-
-    // Every bucket may run at once: the one-at-a-time bound is exercised by the
-    // bounds scenario, not here.
-    let transition = realm
-        .start_transition(
-            0,
-            everywhere,
-            BUCKETS.to_vec(),
-            epoch,
-            TransitionLimits {
-                max_incomplete_buckets: u32::MAX,
-                ..TransitionLimits::default()
-            },
-        )
-        .await?;
-    // Every bucket of an everywhere strategy grows by exactly the joiner.
-    let plan = realm
-        .config
-        .transition(&transition)
-        .expect("the transition replicated")
-        .plan
-        .clone();
-    for bucket in &plan.buckets {
-        assert!(
-            bucket
-                .old_holders
-                .iter()
-                .all(|holder| bucket.target_holders.contains(holder)),
-            "expansion must not move a bucket off any node"
-        );
-        assert!(bucket.target_holders.contains(&joiner));
+    for plan in &plans {
+        for bucket in &plan.buckets {
+            assert!(bucket.target_holders.contains(&joiner));
+        }
     }
     // The joiner is a member from the moment the record exists, which is what
     // lets it pull. (Whether it is already a holder is a race: the reconciler
@@ -103,7 +94,9 @@ async fn expansion_hands_buckets_to_the_joiner() -> TestResult<()> {
     // transition is asserted by the reducer tests instead.)
     assert!(realm.members(&probe).contains(&joiner));
 
-    realm.await_transition(transition).await?;
+    for transition_id in &started {
+        realm.await_transition(*transition_id).await?;
+    }
 
     let after = realm.holders(&probe);
     assert!(after.contains(&joiner), "the joiner never became a holder");
@@ -113,34 +106,35 @@ async fn expansion_hands_buckets_to_the_joiner() -> TestResult<()> {
     for view in realm.holder_views(&probe).await? {
         assert_eq!(view, after, "holder set diverged across nodes");
     }
-    let record = realm
-        .config
-        .transition(&transition)
-        .expect("the completed record is still readable");
-    for bucket in &plan.buckets {
-        assert!(
-            record.completion(bucket.bucket).is_some(),
-            "bucket {} never cut over",
-            bucket.bucket
-        );
-        for target in &bucket.target_holders {
+    for transition_id in &started {
+        let record = realm
+            .config
+            .transition(transition_id)
+            .expect("the completed record is still readable");
+        for bucket in &record.plan.buckets {
             assert!(
-                record
-                    .proofs_for(bucket.bucket)
-                    .any(|proof| proof.holder == *target),
-                "target {target} never proved bucket {}",
+                record.completion(bucket.bucket).is_some(),
+                "bucket {} never cut over",
                 bucket.bucket
             );
-        }
-        for old in &bucket.old_holders {
-            assert!(
-                record
-                    .barriers
-                    .iter()
-                    .any(|barrier| barrier.bucket == bucket.bucket && barrier.reported_by == *old),
-                "old holder {old} never fenced bucket {}",
-                bucket.bucket
-            );
+            for target in &bucket.target_holders {
+                assert!(
+                    record
+                        .proofs_for(bucket.bucket)
+                        .any(|proof| proof.holder == *target),
+                    "target {target} never proved bucket {}",
+                    bucket.bucket
+                );
+            }
+            for old in &bucket.old_holders {
+                assert!(
+                    record.barriers.iter().any(|barrier| {
+                        barrier.bucket == bucket.bucket && barrier.reported_by == *old
+                    }),
+                    "old holder {old} never fenced bucket {}",
+                    bucket.bucket
+                );
+            }
         }
     }
 

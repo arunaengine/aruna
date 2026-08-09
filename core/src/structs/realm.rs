@@ -673,6 +673,11 @@ impl RealmConfigDocument {
     /// Freezes the current view as the next candidate map epoch and activates
     /// it for every bucket that has no activation yet. Already activated
     /// buckets keep their epoch: only a transition moves those.
+    ///
+    /// The activations this writes are literal document values. A production
+    /// caller MUST pair it with a reduced `PublishCandidateMap` plus
+    /// `InitializeActivations`, or the buckets can never advance: the reducer
+    /// re-derives activations only for strategies it owns a path for.
     pub fn snapshot_candidate_map(&mut self) -> u64 {
         let epoch = self.newest_map_epoch().unwrap_or(0) + 1;
         self.candidate_maps.push(CandidatePlacementMap {

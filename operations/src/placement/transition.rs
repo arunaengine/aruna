@@ -127,6 +127,27 @@ pub fn preview_transition(
     Ok(previews)
 }
 
+/// Buckets of `strategy_id` whose holder set under `target_map_epoch` strictly
+/// contains its current one: the only shape a machine-initiated transition may
+/// take, because no node loses authority and nothing has to move off.
+pub fn expansion_buckets(
+    config: &RealmConfigDocument,
+    strategy_id: Ulid,
+    target_map_epoch: u64,
+) -> Result<Vec<u32>, TransitionPlanError> {
+    Ok(preview_transition(config, strategy_id, &[], target_map_epoch)?
+        .into_iter()
+        .filter(|preview| {
+            preview.new_holders != preview.old_holders
+                && preview
+                    .old_holders
+                    .iter()
+                    .all(|holder| preview.new_holders.contains(holder))
+        })
+        .map(|preview| preview.bucket)
+        .collect())
+}
+
 /// Builds the plan a `StartPlacementTransition` carries from the preview, so
 /// the record names exactly the sets the resolver derives.
 pub fn plan_transition(

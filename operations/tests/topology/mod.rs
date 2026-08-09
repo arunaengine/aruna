@@ -50,6 +50,8 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::expand_placement::expand_realm_placement;
+use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::mutate_realm_placement::{
@@ -124,6 +126,18 @@ impl Topology {
         users: usize,
         replication_factor: u32,
     ) -> TestResult<Self> {
+        Self::spawn_sharded(management, users, replication_factor, TOPOLOGY_SHARD_COUNT).await
+    }
+
+    /// [`Topology::spawn`] with an explicit bucket count per strategy. A
+    /// transition scenario hands every bucket over one by one, so it pays for
+    /// the realm's whole shard space; a smaller one exercises the same paths.
+    pub async fn spawn_sharded(
+        management: usize,
+        users: usize,
+        replication_factor: u32,
+        shard_count: u32,
+    ) -> TestResult<Self> {
         assert!(
             management > replication_factor as usize,
             "non-holder fixture needs more sync-eligible nodes than the replication factor: \
@@ -159,7 +173,11 @@ impl Topology {
             )
             .await?;
         }
-        let config = install_realm_config(&nodes, realm_id, user_id, replication_factor).await?;
+        wait_for_realm_nodes(&nodes, realm_id).await?;
+
+        let config =
+            install_realm_config(&nodes, realm_id, user_id, replication_factor, shard_count)
+                .await?;
 
         Ok(Self {
             realm_id,
@@ -473,6 +491,16 @@ impl Topology {
         transition_members(&self.config, placement)
     }
 
+    /// Every transition the realm has not finished yet.
+    pub fn live_transitions(&self) -> Vec<Ulid> {
+        self.config
+            .placement_transitions
+            .iter()
+            .filter(|transition| !transition.is_terminal())
+            .map(|transition| transition.plan.transition_id)
+            .collect()
+    }
+
     /// Every activated bucket of every strategy, in resolution order.
     pub fn holder_map(&self) -> BTreeMap<(Ulid, u32), Vec<NodeId>> {
         let mut holders = BTreeMap::new();
@@ -654,9 +682,10 @@ impl Topology {
         Ok(())
     }
 
-    /// Spawns, meshes, announces, and registers one more node, then publishes a
-    /// candidate map that includes it. The node holds nothing until a
-    /// transition activates the map naming it.
+    /// Spawns, meshes, announces, and registers one more node, then runs the
+    /// production onboarding expansion: it publishes a map naming the joiner and
+    /// starts a transition for every bucket that only grows. The joiner holds
+    /// nothing until that transition completes.
     pub async fn spawn_late_node(&mut self, kind: RealmNodeKind) -> TestResult<NodeId> {
         let node = spawn_node(self.realm_id, kind.clone()).await?;
         let node_id = node.node_id();
@@ -712,6 +741,34 @@ impl Topology {
                 },
             )))
             .await;
+
+        let actor = self.actor(self.node(0));
+        let started = hang_cap(
+            "onboarding expansion",
+            expand_realm_placement(self.nodes[0].context.as_ref(), &actor),
+        )
+        .await?;
+        self.await_config("expansion transitions replicate", |config| {
+            started
+                .iter()
+                .all(|transition_id| config.transition(transition_id).is_some())
+        })
+        .await?;
+        for transition_id in &started {
+            let transition = self
+                .config
+                .transition(transition_id)
+                .expect("the started transition replicated");
+            for bucket in &transition.plan.buckets {
+                assert!(
+                    bucket
+                        .old_holders
+                        .iter()
+                        .all(|holder| bucket.target_holders.contains(holder)),
+                    "onboarding issued a transition that moves a bucket off a holder"
+                );
+            }
+        }
         Ok(node_id)
     }
 
@@ -813,11 +870,12 @@ async fn install_realm_config(
     realm_id: RealmId,
     user_id: UserId,
     replication_factor: u32,
+    shard_count: u32,
 ) -> TestResult<RealmConfigDocument> {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), replication_factor);
     config.seed_default_placement();
     for strategy in &mut config.strategies {
-        strategy.shard_count = TOPOLOGY_SHARD_COUNT;
+        strategy.shard_count = shard_count;
     }
     let mut band = 0u32;
     for (index, node) in nodes.iter().enumerate() {

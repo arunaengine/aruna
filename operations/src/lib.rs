@@ -32,6 +32,7 @@ pub mod driver;
 pub(crate) mod endpoint;
 pub mod ensure_canonical_user_token_subject;
 pub mod ensure_realm_config;
+pub mod expand_placement;
 pub mod get_group;
 pub mod get_metadata_document;
 pub mod get_oidc_user;
