@@ -1,0 +1,296 @@
+//! Per-node execution of placement transitions.
+//!
+//! Nobody drives a transition centrally (DECISIONS D9): every node acts on its
+//! own replicated observation of the record and the reducer settles the result.
+//! An old holder freezes its frontier; a target holder joins the existing topic,
+//! pulls its complete history, verifies it against an old holder with the shard
+//! manifest machinery, and signs the digest it converged on. A target never
+//! mints a genesis - with every source unreachable the bucket stalls instead
+//! (#400), because a rival genesis is a permanent split-brain.
+
+use std::sync::Arc;
+
+use aruna_core::NodeId;
+use aruna_core::document::shard_topic_id;
+use aruna_core::structs::{
+    Actor, PlacementRef, PlacementTransition, ProofClaim, RealmConfigDocument, RealmId,
+    TransitionStatus,
+};
+use aruna_core::types::UserId;
+use tracing::{debug, warn};
+
+use crate::driver::{DriverContext, drive};
+use crate::mutate_realm_placement::{
+    MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
+};
+use crate::placement::transition::holders_in_map;
+use crate::shard::assemble_shard_manifest;
+use crate::shard::verify::converge_shard_digest;
+
+/// Runs every transition step the local node owns. Returns whether a step is
+/// still outstanding, so the caller re-arms the placement retry.
+pub async fn process_placement_transitions(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    config: &RealmConfigDocument,
+) -> bool {
+    if config.placement_transitions.is_empty() {
+        return ensure_strategy_activations(context, realm_id, local_node_id, config).await;
+    }
+    let mut pending = ensure_strategy_activations(context, realm_id, local_node_id, config).await;
+    for transition in &config.placement_transitions {
+        // An observed abort stops this node from submitting anything further:
+        // the un-cut buckets simply never complete.
+        if !matches!(transition.status, TransitionStatus::Active) || transition.is_terminal() {
+            continue;
+        }
+        let mut in_flight = 0u32;
+        for bucket in &transition.plan.buckets {
+            if transition.completion(bucket.bucket).is_some() {
+                continue;
+            }
+            in_flight += 1;
+            if in_flight > transition.plan.limits.max_incomplete_buckets {
+                pending = true;
+                break;
+            }
+            let placement = PlacementRef {
+                strategy_id: transition.plan.strategy_id,
+                shard: bucket.bucket,
+            };
+            if bucket.old_holders.contains(&local_node_id) {
+                pending |=
+                    report_barrier(context, realm_id, local_node_id, transition, &placement).await;
+            }
+            if bucket.target_holders.contains(&local_node_id) {
+                pending |=
+                    submit_completion(context, realm_id, local_node_id, transition, &placement)
+                        .await;
+            }
+        }
+    }
+    pending
+}
+
+/// Freezes this old holder's frontier for the bucket, once.
+async fn report_barrier(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    transition: &PlacementTransition,
+    placement: &PlacementRef,
+) -> bool {
+    if transition
+        .barriers
+        .iter()
+        .any(|barrier| barrier.bucket == placement.shard && barrier.reported_by == local_node_id)
+    {
+        return false;
+    }
+    let frontier = match assemble_shard_manifest(context, realm_id, *placement).await {
+        Ok(manifest) => manifest.cursor,
+        Err(error) => {
+            debug!(error = %error, "Cannot assemble a transition barrier frontier yet");
+            return true;
+        }
+    };
+    submit_mutation(
+        context,
+        realm_id,
+        local_node_id,
+        RealmPlacementMutation::ReportBarrier {
+            transition_id: transition.plan.transition_id,
+            bucket: placement.shard,
+            reported_by: local_node_id,
+            frontier,
+        },
+    )
+    .await
+}
+
+/// Joins, pulls, verifies, and proves the bucket from the target side.
+async fn submit_completion(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    transition: &PlacementTransition,
+    placement: &PlacementRef,
+) -> bool {
+    if transition
+        .proofs_for(placement.shard)
+        .any(|proof| proof.holder == local_node_id)
+    {
+        return false;
+    }
+    let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
+        return false;
+    };
+    // Until every old holder has fenced there is no reference frontier, so a
+    // proof would attest to a moving target.
+    if !transition.barrier_established(placement.shard, &bucket.old_holders) {
+        return true;
+    }
+    let Some(net_handle) = context.net_handle.clone() else {
+        return true;
+    };
+    let sources: Vec<NodeId> = bucket
+        .old_holders
+        .iter()
+        .copied()
+        .filter(|holder| *holder != local_node_id)
+        .collect();
+
+    let topic = shard_topic_id(realm_id, placement);
+    if !sources.is_empty()
+        && !net_handle
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false)
+    {
+        // Join-only: this adopts an existing genesis and can never mint one.
+        let event = net_handle
+            .sync_document_topics(vec![topic], sources.clone())
+            .await;
+        crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+    }
+
+    let checkpoint_root = if sources.is_empty() {
+        // No source to verify against: the bucket had no holder to lose history
+        // to, so the local (empty) manifest is the root.
+        match assemble_shard_manifest(context, realm_id, *placement).await {
+            Ok(manifest) => manifest.digest,
+            Err(error) => {
+                debug!(error = %error, "Cannot assemble a source-less transition checkpoint");
+                return true;
+            }
+        }
+    } else {
+        match converge_shard_digest(
+            context,
+            &net_handle,
+            local_node_id,
+            realm_id,
+            *placement,
+            &sources,
+        )
+        .await
+        {
+            Some((_, digest)) => digest,
+            None => {
+                debug!(
+                    strategy = %placement.strategy_id,
+                    shard = placement.shard,
+                    "No old holder served a verifiable shard copy yet"
+                );
+                return true;
+            }
+        }
+    };
+
+    let Some(activation) = config_activation(context, realm_id, placement).await else {
+        return true;
+    };
+    let claim = ProofClaim {
+        realm_id,
+        transition_id: transition.plan.transition_id,
+        strategy_id: transition.plan.strategy_id,
+        bucket: placement.shard,
+        old_activation_epoch: activation,
+        target_map_epoch: transition.plan.target_map_epoch,
+        barrier_digest: transition.barrier_digest(placement.shard),
+        checkpoint_root,
+        holder: local_node_id,
+    };
+    let proof = claim.signed_with(|message| net_handle.sign(message));
+    submit_mutation(
+        context,
+        realm_id,
+        local_node_id,
+        RealmPlacementMutation::SubmitCompletion {
+            transition_id: transition.plan.transition_id,
+            strategy_id: transition.plan.strategy_id,
+            proof,
+        },
+    )
+    .await
+}
+
+/// Activates the newest map for a strategy that has none, so a strategy that
+/// becomes referenced after the realm's first map never resolves nothing.
+/// Only the strategy's rank-0 node under that map issues it; the record is an
+/// immutable value, so a concurrent duplicate coalesces.
+async fn ensure_strategy_activations(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    config: &RealmConfigDocument,
+) -> bool {
+    let Some(epoch) = config.newest_map_epoch() else {
+        return false;
+    };
+    let Some(map) = config.candidate_map(epoch) else {
+        return false;
+    };
+    let mut pending = false;
+    for strategy in &config.strategies {
+        if config.activation(&strategy.strategy_id, 0).is_some() {
+            continue;
+        }
+        let placement = PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard: 0,
+        };
+        if holders_in_map(config, strategy, &placement, map).first() != Some(&local_node_id) {
+            pending = true;
+            continue;
+        }
+        pending |= submit_mutation(
+            context,
+            realm_id,
+            local_node_id,
+            RealmPlacementMutation::InitializeActivations {
+                strategy_id: strategy.strategy_id,
+                candidate_map_epoch: epoch,
+            },
+        )
+        .await;
+    }
+    pending
+}
+
+/// The bucket's current activation epoch, read back from storage so the proof
+/// commits to the epoch the reducer will compare it against.
+async fn config_activation(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    placement: &PlacementRef,
+) -> Option<u64> {
+    let config = crate::process_placements::load_realm_config(context, realm_id).await?;
+    config
+        .activation(&placement.strategy_id, placement.shard)
+        .map(|activation| activation.activation_epoch)
+}
+
+/// Drives one placement mutation and reports whether it needs another pass.
+async fn submit_mutation(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    mutation: RealmPlacementMutation,
+) -> bool {
+    let config = MutateRealmPlacementConfig {
+        actor: Actor {
+            node_id: local_node_id,
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        },
+        mutation,
+    };
+    match drive(MutateRealmPlacementOperation::new(config), context).await {
+        Ok(_) => false,
+        Err(error) => {
+            warn!(error = %error, "Placement transition step did not apply");
+            true
+        }
+    }
+}

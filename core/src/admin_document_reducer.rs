@@ -1316,7 +1316,7 @@ impl AdminDocumentReducerState {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentReducerError::TransitionOriginMismatch);
                 }
-                self.apply_immutable_value(
+                self.apply_transition_report(
                     event,
                     transition_barrier_path(transition_id, *bucket, reported_by),
                     hex::encode(frontier),
@@ -1344,7 +1344,7 @@ impl AdminDocumentReducerState {
                 if !proof.verify(*realm_id, *transition_id, strategy_id) {
                     return Err(AdminDocumentReducerError::InvalidTransitionProof);
                 }
-                self.apply_immutable_value(
+                self.apply_transition_report(
                     event,
                     transition_proof_path(transition_id, proof.bucket, &proof.holder),
                     transition_proof_value(&strategy_id, proof),
@@ -1368,7 +1368,7 @@ impl AdminDocumentReducerState {
                     at_risk_report,
                 },
             ) => {
-                self.apply_immutable_value(
+                self.apply_transition_report(
                     event,
                     transition_force_path(transition_id, *bucket),
                     at_risk_report.clone(),
@@ -1386,7 +1386,7 @@ impl AdminDocumentReducerState {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentReducerError::TransitionOriginMismatch);
                 }
-                self.apply_immutable_value(
+                self.apply_transition_report(
                     event,
                     transition_stall_path(transition_id, *bucket, reported_by),
                     reason.clone(),
@@ -1930,9 +1930,7 @@ impl AdminDocumentReducerState {
         let mut assembled: Vec<PlacementTransition> = transitions.into_values().collect();
         for transition in assembled.iter_mut() {
             transition.barriers.sort_by(order_by_bucket_and_node);
-            transition
-                .proofs
-                .sort_by(|left, right| order_proofs(left, right));
+            transition.proofs.sort_by(order_proofs);
             transition.forced.sort_by_key(|entry| entry.bucket);
             transition.stalls.sort_by(order_stalls);
             transition.completed = transition
@@ -2413,6 +2411,29 @@ impl AdminDocumentReducerState {
 
     fn apply_band_pool(&mut self, event: &AdminDocumentEvent, pool: &BandPool) {
         self.apply_immutable_value(event, band_pool_path(pool.pool_id), band_pool_value(pool));
+    }
+
+    /// One actor's report about one bucket: a retry is not divergence.
+    ///
+    /// A holder re-runs the transition step until it observes its own report, so
+    /// it can legitimately submit twice with a moved frontier or a re-signed
+    /// proof. Treating that as a conflict would strand the bucket forever, so
+    /// the earliest event wins - deterministic on every replica, whatever order
+    /// the two arrived in.
+    fn apply_transition_report(&mut self, event: &AdminDocumentEvent, path: String, value: String) {
+        let dot = event.dot();
+        if let Some(current) = self.user_subject_ids.get(&path)
+            && current.dot <= dot
+        {
+            return;
+        }
+        self.user_subject_ids.insert(
+            path,
+            AdminDocumentAttributeVersion {
+                value: Some(value),
+                dot,
+            },
+        );
     }
 
     /// Append-only path: a divergent value for an existing path fails closed as

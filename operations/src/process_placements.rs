@@ -13,7 +13,7 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::{draining_former_holders, resolve_shard_holders};
+use crate::placement::{draining_former_holders, resolve_shard_holders, transition_members};
 use crate::sync_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
@@ -62,11 +62,18 @@ async fn ensure_held_shard_topics(
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            if !holders.contains(&local_node_id) {
+            // Members are the activated holders plus every set a transition
+            // still names for the bucket, so a target joins and an old holder
+            // stays reachable through the grace window (#399 bounds the peak at
+            // |old U new|).
+            let members = transition_members(config, &placement);
+            if !members.contains(&local_node_id) {
                 continue;
             }
+            // Rank-0 is an activation role: a target that has not cut over yet
+            // never creates a genesis (#400).
             let local_is_rank0 = holders.first() == Some(&local_node_id);
-            let mut co_holders: Vec<NodeId> = holders
+            let mut co_holders: Vec<NodeId> = members
                 .into_iter()
                 .filter(|candidate| *candidate != local_node_id)
                 .collect();
@@ -390,6 +397,13 @@ pub async fn process_shard_placements(
     )
     .await;
     let mut retry_needed = held.withheld || held.pull_pending;
+    retry_needed |= crate::process_transitions::process_placement_transitions(
+        context,
+        realm_id,
+        local_node_id,
+        &config,
+    )
+    .await;
 
     let mut start_after: Option<Key> = None;
     loop {
@@ -491,7 +505,12 @@ pub async fn process_shard_placements(
                 .into_iter()
                 .collect();
             let membership = net_handle
-                .reconcile_shard_membership(&[topic], holders, &retained, &verified)
+                .reconcile_shard_membership(
+                    &[topic],
+                    transition_members(&config, &record.placement),
+                    &retained,
+                    &verified,
+                )
                 .await;
             match membership {
                 Ok(()) => {

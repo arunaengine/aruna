@@ -183,6 +183,40 @@ async fn verify_one_shard(
         return true;
     }
 
+    match converge_shard_digest(
+        context, net_handle, node_id, realm_id, placement, co_holders,
+    )
+    .await
+    {
+        Some((co_holder, digest)) => {
+            mark_verified(context, realm_id, placement, Some(co_holder), digest).await;
+            info!(
+                strategy = %placement.strategy_id,
+                shard = placement.shard,
+                co_holder = %co_holder,
+                "Verified shard against co-holder",
+            );
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reconciles the local shard copy against the first reachable co-holder and
+/// returns that co-holder with the digest both sides agree on.
+///
+/// The same machinery a joining holder verifies with, reused by the transition
+/// executor: the matched digest is the checkpoint root a completion proof
+/// commits to. `None` when no co-holder converged within the retry budget.
+pub async fn converge_shard_digest(
+    context: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    realm_id: RealmId,
+    placement: PlacementRef,
+    co_holders: &[NodeId],
+) -> Option<(NodeId, [u8; 32])> {
+    let topic = shard_topic_id(realm_id, &placement);
     for co_holder in co_holders {
         let mut remote =
             match fetch_shard_manifest(net_handle, *co_holder, realm_id, placement).await {
@@ -204,7 +238,7 @@ async fn verify_one_shard(
                 Ok(manifest) => manifest,
                 Err(error) => {
                     warn!(error = %error, "Failed to assemble local shard manifest for verification");
-                    return false;
+                    return None;
                 }
             };
             // Never certify convergence without a local genesis: two genesis-less
@@ -215,15 +249,7 @@ async fn verify_one_shard(
                 .unwrap_or(false)
                 && manifests_converged(&local, &remote)
             {
-                mark_verified(context, realm_id, placement, Some(*co_holder), local.digest).await;
-                info!(
-                    strategy = %placement.strategy_id,
-                    shard = placement.shard,
-                    co_holder = %co_holder,
-                    entries = local.entries.len(),
-                    "Verified shard against co-holder",
-                );
-                return true;
+                return Some((*co_holder, local.digest));
             }
             // Topic or entry digests differ: pull the co-holder's events and re-compare.
             let event = net_handle
@@ -240,9 +266,9 @@ async fn verify_one_shard(
         }
         // The first reachable co-holder did not converge within the retry
         // budget; leave the shard unverified for the next pass.
-        return false;
+        return None;
     }
-    false
+    None
 }
 
 fn manifests_converged(

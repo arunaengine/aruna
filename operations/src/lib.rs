@@ -59,6 +59,7 @@ pub mod permission_rules;
 pub mod persistent_id;
 pub mod placement;
 pub mod process_placements;
+pub mod process_transitions;
 mod queue_backoff;
 pub mod queue_lag;
 pub mod read_realm_authorization;

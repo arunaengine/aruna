@@ -365,6 +365,31 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
     None
 }
 
+/// Desired shard-topic membership for a bucket: its activated holders plus
+/// every holder set a live transition still names for it.
+///
+/// A target must be a member to pull the history it has to verify, and an old
+/// holder must stay one until the record is released, or a reader mid-cutover
+/// would lose its source. The record's lifetime is that window, so repeated
+/// transitions bound peak membership at `|old U new|` (#399).
+pub fn transition_members(config: &RealmConfigDocument, placement: &PlacementRef) -> Vec<NodeId> {
+    let mut members = resolve_shard_holders(config, placement);
+    for transition in &config.placement_transitions {
+        if transition.plan.strategy_id != placement.strategy_id {
+            continue;
+        }
+        let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
+            continue;
+        };
+        for node_id in bucket.old_holders.iter().chain(&bucket.target_holders) {
+            if !members.contains(node_id) {
+                members.push(*node_id);
+            }
+        }
+    }
+    members
+}
+
 /// Whether `node_id` holds `placement`, and may therefore publish onto its
 /// topic. [`PlacementRef::NIL`] means no strategy governs the bucket during
 /// early bootstrap: nobody shards it, so it is nobody's to withhold and the
@@ -501,13 +526,15 @@ pub fn held_buckets(
         let Ok(epoch) = selection_epoch(config, &placement) else {
             continue;
         };
-        if !views.contains_key(&epoch) {
-            let Ok(view) = view_for_epoch(config, epoch) else {
-                continue;
-            };
-            views.insert(epoch, view);
-        }
-        let view = &views[&epoch];
+        let view = match views.entry(epoch) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let Ok(view) = view_for_epoch(config, epoch) else {
+                    continue;
+                };
+                entry.insert(view)
+            }
+        };
         if resolve_shard_holders_from_view(config, view, strategy, &placement).contains(&node_id) {
             held.push(shard);
         }

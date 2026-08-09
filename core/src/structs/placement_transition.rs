@@ -162,6 +162,12 @@ impl ProofClaim {
     }
 
     pub fn sign(&self, secret: &iroh::SecretKey) -> CompletionProof {
+        self.signed_with(|message| secret.sign(message))
+    }
+
+    /// Signs with the node's own signer, for holders that hold a handle rather
+    /// than the key itself.
+    pub fn signed_with(&self, sign: impl FnOnce(&[u8]) -> iroh::Signature) -> CompletionProof {
         CompletionProof {
             bucket: self.bucket,
             holder: self.holder,
@@ -169,7 +175,7 @@ impl ProofClaim {
             target_map_epoch: self.target_map_epoch,
             barrier_digest: self.barrier_digest,
             checkpoint_root: self.checkpoint_root,
-            signature: secret.sign(&self.signing_bytes()),
+            signature: sign(&self.signing_bytes()),
         }
     }
 }
@@ -310,14 +316,15 @@ impl PlacementTransition {
         *hasher.finalize().as_bytes()
     }
 
-    /// Whether every node in `old_holders` has reported its barrier.
+    /// Whether every node in `old_holders` has reported its barrier. A bucket
+    /// with no old holder has no history to fence, so it is vacuously fenced;
+    /// completion still needs every target's proof.
     pub fn barrier_established(&self, bucket: u32, old_holders: &[NodeId]) -> bool {
-        !old_holders.is_empty()
-            && old_holders.iter().all(|holder| {
-                self.barriers
-                    .iter()
-                    .any(|barrier| barrier.bucket == bucket && barrier.reported_by == *holder)
-            })
+        old_holders.iter().all(|holder| {
+            self.barriers
+                .iter()
+                .any(|barrier| barrier.bucket == bucket && barrier.reported_by == *holder)
+        })
     }
 
     pub fn proofs_for(&self, bucket: u32) -> impl Iterator<Item = &CompletionProof> {
@@ -487,7 +494,8 @@ mod tests {
         let holders = [secret(1).public(), secret(2).public()];
         assert!(left.barrier_established(1, &holders));
         assert!(!left.barrier_established(3, &holders));
-        assert!(!left.barrier_established(1, &[]));
+        // No old holder means no history to fence.
+        assert!(left.barrier_established(1, &[]));
     }
 
     #[test]

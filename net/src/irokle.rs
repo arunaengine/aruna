@@ -5765,10 +5765,18 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
             | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
             | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+            | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
             | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, policy updates, and token revocations"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, and token revocations"
                 .to_string(),
         ));
     }
