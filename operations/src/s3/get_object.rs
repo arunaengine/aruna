@@ -961,6 +961,18 @@ impl GetObjectOperation {
     pub fn handle_received_reference_source(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
+                // A committed successor names one observation; bytes that drifted
+                // again between the head and this read must not be served under
+                // its VersionId. The advance counter bounds the retries.
+                if self
+                    .advance_observation
+                    .as_ref()
+                    .is_some_and(|observation| {
+                        observation.observation_fingerprint() != metadata.observation_fingerprint()
+                    })
+                {
+                    return self.restart_after_conflict();
+                }
                 if self.resolved_range.is_some()
                     && self.source_metadata.as_ref().is_some_and(|head_metadata| {
                         head_metadata.content_length != metadata.content_length
@@ -968,6 +980,7 @@ impl GetObjectOperation {
                 {
                     return self.emit_error(GetObjectError::ReferenceSourceChanged);
                 }
+                self.advance_observation = None;
                 // `last_refresh` was set by the head handler from the drift check.
                 self.source_metadata = Some(metadata);
                 self.reference_stream = Some(stream);
@@ -2081,6 +2094,18 @@ mod test {
         })
     }
 
+    fn source_read(metadata: SourceMetadata) -> Event {
+        Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata,
+            stream: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"body"),
+            )])),
+        })
+    }
+
     // CAS guard: if the head advanced under a drifted read (a concurrent reader
     // already wrote the successor), this read must not write a second one — it
     // aborts and restarts against the winner.
@@ -2188,6 +2213,40 @@ mod test {
         );
         let _ = expected.start(txn_id);
         assert_eq!(operation.usage_update, Some(expected));
+    }
+
+    // The source can drift again between the head and the read; those bytes must
+    // never be served under the VersionId that promised the head observation.
+    #[test]
+    fn read_drift_restarts() {
+        let mut operation = drifted_operation();
+        operation.source_metadata = Some(observation(9));
+        operation.state = GetObjectState::ReadReferenceSource;
+
+        let effects = operation.step(source_read(observation(11)));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: true
+            })]
+        ));
+        assert_eq!(operation.state, GetObjectState::StartTransaction);
+        assert!(operation.advance_observation.is_none());
+    }
+
+    // A matching read is served, and the stale promise is cleared with it.
+    #[test]
+    fn read_match_serves() {
+        let mut operation = drifted_operation();
+        operation.source_metadata = Some(observation(9));
+        operation.state = GetObjectState::ReadReferenceSource;
+
+        let effects = operation.step(source_read(observation(9)));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, GetObjectState::Finish);
+        assert!(operation.advance_observation.is_none());
     }
 
     async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> SourceMetadata {
