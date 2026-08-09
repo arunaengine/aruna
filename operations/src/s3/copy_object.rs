@@ -4,7 +4,7 @@ use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, Put
 use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
+    AuthContext, BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::types::{GroupId, NodeId};
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ pub struct CopyObjectInput {
     pub source_key: String,
     pub source_version_id: Option<Ulid>,
     pub source_group_id: GroupId,
+    pub source_auth_context: AuthContext,
     pub dest_bucket: String,
     pub dest_key: String,
     pub user_id: UserId,
@@ -129,9 +130,10 @@ pub async fn copy_object(
             version_id: input.source_version_id,
             range: None,
             group_id: input.source_group_id,
-            user_identity: input.user_id,
+            user_identity: input.source_auth_context.user_id,
             node_id: input.node_id,
-        }),
+        })
+        .with_restrictions(input.source_auth_context.path_restrictions.clone()),
         context,
     )
     .await
@@ -252,6 +254,14 @@ mod test {
 
     fn test_node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
+
+    fn auth_context(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: user_id.realm_id,
+            path_restrictions: None,
+        }
     }
 
     async fn full_context() -> (TempDir, DriverContext) {
@@ -402,6 +412,7 @@ mod test {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let source = drive(
             PutObjectOperation::new(put_config(
@@ -430,9 +441,10 @@ mod test {
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,
@@ -470,6 +482,7 @@ mod test {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
         let source = VersionSourceBinding {
@@ -511,9 +524,10 @@ mod test {
                 source_key: "ref.txt".to_string(),
                 source_version_id: None,
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,
@@ -569,6 +583,7 @@ mod test {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let version_id = Ulid::generate();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
@@ -608,9 +623,10 @@ mod test {
                 source_key: "gone.txt".to_string(),
                 source_version_id: Some(version_id),
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,
@@ -745,6 +761,7 @@ mod test {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         drive(
             PutObjectOperation::new(put_config(
@@ -769,9 +786,10 @@ mod test {
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,

@@ -816,7 +816,7 @@ async fn stage_one_input(
             key: src_key.clone(),
             version_id: version,
             range: None,
-            group_id: spec.group_id,
+            group_id: bucket_info.group_id,
             user_identity: record.created_by,
             node_id,
         }),

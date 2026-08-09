@@ -1824,6 +1824,7 @@ impl S3 for ArunaS3Service {
                         req.input.content_type.as_deref(),
                     )
                 }),
+                source_auth_context,
                 restrictions: replication_auth.path_restrictions.clone(),
             },
         )
@@ -2127,6 +2128,7 @@ impl S3 for ArunaS3Service {
                 user_id: user_access.user_identity,
                 node_id: self.node_id,
                 conditions,
+                source_auth_context,
             },
         )
         .await
