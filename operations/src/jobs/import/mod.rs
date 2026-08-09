@@ -418,6 +418,7 @@ async fn acquire_source(
                     range: None,
                     group_id: bucket_info.group_id,
                     user_identity: spec.auth_context.user_id,
+                    node_id: ctx.owner_node_id,
                 }),
                 &ctx.driver,
             )

@@ -318,7 +318,7 @@ pub fn live_replication_obligation_key(
     Ok(ByteView::from(key))
 }
 
-fn live_replication_obligation_write_entry(
+pub(crate) fn live_replication_obligation_write_entry(
     record: &LiveReplicationObligationRecord,
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((

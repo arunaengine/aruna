@@ -414,6 +414,7 @@ async fn prepare_reference(
             range,
             group_id: bucket_info.group_id,
             user_identity: relationship.created_by,
+            node_id: relationship.source.node_id,
         }),
         context,
     )

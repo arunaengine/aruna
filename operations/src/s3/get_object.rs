@@ -2,8 +2,11 @@ use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use crate::replication::queue::{
+    LiveReplicationObligationRecord, QueueLiveVersionReplicationInput,
+    QueueLiveVersionReplicationOperation, live_replication_obligation_write_entry,
+};
 use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
-use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
     ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
@@ -12,21 +15,23 @@ use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, Sub
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, ResolvedSourceAccess, SourceMetadata, UsageDelta, VersionKey,
-    VersionSourceBinding,
+    MultipartObjectSummary, PathRestriction, ResolvedSourceAccess, SourceMetadata, UsageDelta,
+    VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::Effects;
+use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::warn;
 
 /// Bounds successor creation on a genuinely still-changing source: after this
 /// many advance attempts a drifting current read serves the latest observation
@@ -50,6 +55,7 @@ pub enum GetObjectState {
     WriteSuccessor,
     UpdateReferenceUsage,
     CommitAdvance,
+    QueueSuccessorReplication,
     RestartReference,
     GetBlob,
     ReadReferenceSource,
@@ -155,6 +161,8 @@ pub struct GetObjectInput {
     pub range: Option<ObjectRangeRequest>,
     pub group_id: Ulid,
     pub user_identity: UserId,
+    /// Local node recorded on the replication obligation of a drift successor.
+    pub node_id: NodeId,
 }
 
 #[derive(Debug, PartialEq)]
@@ -194,6 +202,8 @@ pub struct GetObjectOperation {
     usage_update: Option<UsageCounterUpdate>,
     /// Advance attempts so a still-drifting source cannot spin forever.
     drift_attempts: u8,
+    /// Reader's scoped credential, carried onto the successor's obligation.
+    restrictions: Option<Vec<PathRestriction>>,
     metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
@@ -222,6 +232,7 @@ impl GetObjectOperation {
             advance_observation: None,
             usage_update: None,
             drift_attempts: 0,
+            restrictions: None,
             metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
@@ -233,6 +244,19 @@ impl GetObjectOperation {
             part_count: None,
             resolved_range: None,
             output: None,
+        }
+    }
+
+    pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
+        self.restrictions = restrictions;
+        self
+    }
+
+    fn auth_context(&self) -> AuthContext {
+        AuthContext {
+            user_id: self.input.user_identity,
+            realm_id: self.input.user_identity.realm_id,
+            path_restrictions: self.restrictions.clone(),
         }
     }
 
@@ -718,6 +742,21 @@ impl GetObjectOperation {
                 Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
             };
 
+        // The durable obligation rides the same transaction as the successor, so
+        // a lost enqueue is still discoverable by the repair scanner.
+        let obligation = LiveReplicationObligationRecord::new(
+            self.input.node_id,
+            self.auth_context(),
+            self.input.bucket.clone(),
+            self.input.key.clone(),
+            new_version_id,
+            false,
+        );
+        let obligation_entry = match live_replication_obligation_write_entry(&obligation) {
+            Ok(entry) => entry,
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+
         self.resolved_version_id = Some(new_version_id);
         self.state = GetObjectState::WriteSuccessor;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -728,6 +767,7 @@ impl GetObjectOperation {
                     version_value
                 ),
                 (BLOB_HEAD_KEYSPACE.to_string(), head_key, head_value),
+                obligation_entry,
             ],
             txn_id: Some(txn_id),
         })]
@@ -792,11 +832,7 @@ impl GetObjectOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                let Some(observation) = self.advance_observation.take() else {
-                    return self.emit_error(GetObjectError::GetObjectFailed);
-                };
-                self.last_refresh = Some(SystemTime::now());
-                self.serve_reference_source(observation)
+                self.queue_successor_replication()
             }
             Event::Storage(StorageEvent::Error {
                 error: StorageError::TransactionConflict,
@@ -813,6 +849,53 @@ impl GetObjectOperation {
                 received: other,
             }),
         }
+    }
+
+    /// Enqueues the committed successor for live replication, the same way the
+    /// normal write path does after its commit.
+    fn queue_successor_replication(&mut self) -> Effects {
+        let Some(version_id) = self.resolved_version_id else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        self.state = GetObjectState::QueueSuccessorReplication;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+                local_node_id: self.input.node_id,
+                auth_context: self.auth_context(),
+                bucket: self.input.bucket.clone(),
+                key: self.input.key.clone(),
+                version_id,
+                delete_marker: false,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::LiveReplicationQueued {
+                result: result.map(|_| ()).map_err(|error| error.to_string()),
+            }),
+        ))]
+    }
+
+    fn handle_successor_queued(&mut self, event: Event) -> Effects {
+        let Event::SubOperation(SubOperationEvent::LiveReplicationQueued { result }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::SubOperation(SubOperationEvent::LiveReplicationQueued)",
+                received: event,
+            });
+        };
+        // The committed obligation is what repair replays, so a failed enqueue
+        // must not fail the read.
+        if let Err(error) = result {
+            warn!(
+                error = %error,
+                "Reference successor obligation committed but live replication was not queued"
+            );
+        }
+        // Kept until the read returns: it is the fingerprint the committed
+        // successor promises, so the served bytes are checked against it.
+        let Some(observation) = self.advance_observation.clone() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        self.last_refresh = Some(SystemTime::now());
+        self.serve_reference_source(observation)
     }
 
     /// Aborts an in-flight advance transaction and re-reads against the winner.
@@ -959,6 +1042,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::WriteSuccessor => self.handle_successor_written(event),
             GetObjectState::UpdateReferenceUsage => self.handle_advance_usage(event),
             GetObjectState::CommitAdvance => self.handle_advance_committed(event),
+            GetObjectState::QueueSuccessorReplication => self.handle_successor_queued(event),
             GetObjectState::RestartReference => self.handle_restart_reference(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.handle_received_reference_source(event),
@@ -991,6 +1075,7 @@ impl Operation for GetObjectOperation {
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
+    use crate::replication::queue::LiveReplicationObligationRecord;
     use crate::s3::get_object::{
         GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, ObjectRangeRequest,
     };
@@ -999,16 +1084,18 @@ mod test {
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::egress::EgressPolicy;
+    use aruna_core::events::SubOperationEvent;
     use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
         BlobVersion, BlobVersionState, CurrentVersionPointer, MultipartChecksumType,
-        PortableSourceDescriptor, RealmId, ResolvedSourceAccess, SourceConnectorKind,
-        SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+        PathRestriction, Permission, PortableSourceDescriptor, RealmId, ResolvedSourceAccess,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -1021,6 +1108,10 @@ mod test {
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use ulid::Ulid;
+
+    fn test_node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
 
     async fn spawn_reference_server(body: &'static [u8]) -> String {
         let app =
@@ -1094,6 +1185,7 @@ mod test {
             range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 4 }),
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            node_id: test_node_id(),
         });
         let txn_id = Ulid::generate();
         let location = BackendLocation {
@@ -1135,6 +1227,7 @@ mod test {
             range: Some(ObjectRangeRequest::Suffix { length: 4 }),
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            node_id: test_node_id(),
         });
         let txn_id = Ulid::generate();
         let access = ResolvedSourceAccess::OpenDal {
@@ -1207,6 +1300,7 @@ mod test {
             range: Some(ObjectRangeRequest::StartEnd { start: 1, end: 3 }),
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            node_id: test_node_id(),
         });
         operation.source_metadata = Some(SourceMetadata {
             content_length: 10,
@@ -1375,6 +1469,7 @@ mod test {
             range: None,
             group_id: Ulid::generate(),
             user_identity: Default::default(),
+            node_id: test_node_id(),
         });
 
         let blob_result = drive(operation, &driver_ctx)
@@ -1527,6 +1622,7 @@ mod test {
             range: None,
             group_id: Ulid::generate(),
             user_identity: Default::default(),
+            node_id: test_node_id(),
         });
 
         let mut blob_stream = drive(operation, &driver_ctx)
@@ -1663,6 +1759,7 @@ mod test {
                 range: None,
                 group_id: Ulid::generate(),
                 user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+                node_id: test_node_id(),
             }),
             &driver_ctx,
         )
@@ -1824,14 +1921,16 @@ mod test {
             .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
             .await;
 
+        let group_id = Ulid::generate();
         let result = drive(
             GetObjectOperation::new(GetObjectInput {
                 bucket: "s3test".to_string(),
                 key: "refresh.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::generate(),
+                group_id,
                 user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+                node_id: test_node_id(),
             }),
             &driver_ctx,
         )
@@ -1890,13 +1989,43 @@ mod test {
         let original = read_reference_version(&driver_ctx, version_id).await;
         assert_eq!(original.content_length, 1);
         assert_eq!(original.etag.as_deref(), Some("stale-etag"));
+
+        // The successor's obligation is committed with it, so replication and
+        // the repair scanner can both find it.
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 16,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing obligation listing");
+        };
+        let obligations: Vec<_> = values
+            .iter()
+            .map(|(_, value)| LiveReplicationObligationRecord::from_bytes(value.as_ref()).unwrap())
+            .collect();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].version_id, successor_id);
+        assert_eq!(obligations[0].bucket, "s3test");
     }
 
-    // CAS guard: if the head advanced under a drifted read (a concurrent reader
-    // already wrote the successor), this read must not write a second one — it
-    // aborts and restarts against the winner.
-    #[test]
-    fn advance_restarts_when_head_moved() {
+    fn observation(content_length: u64) -> SourceMetadata {
+        SourceMetadata {
+            content_length,
+            content_type: None,
+            etag: Some(format!("etag-{content_length}")),
+            last_modified: None,
+            source_version: None,
+        }
+    }
+
+    /// A current-version read whose head observation already drifted.
+    fn drifted_operation() -> GetObjectOperation {
         let mut operation = GetObjectOperation::new(GetObjectInput {
             bucket: "s3test".to_string(),
             key: "range.txt".to_string(),
@@ -1904,19 +2033,14 @@ mod test {
             range: None,
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            node_id: test_node_id(),
         });
-        let headed = Ulid::generate();
-        let winner = Ulid::generate();
-        let txn_id = Ulid::generate();
-        operation.resolved_version_id = Some(headed);
-        operation.txn_id = Some(txn_id);
-        operation.state = GetObjectState::ReadHeadForAdvance;
-        operation.advance_observation = Some(SourceMetadata {
-            content_length: 9,
-            content_type: None,
-            etag: Some("new".to_string()),
-            last_modified: None,
-            source_version: None,
+        operation.advance_observation = Some(observation(9));
+        operation.reference_access = Some(ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::new(),
+            path: "folder/file.txt".to_string(),
+            version: None,
         });
         operation.source_binding = Some(VersionSourceBinding {
             strategy: StagingStrategy::Reference,
@@ -1930,16 +2054,32 @@ mod test {
             },
             connector_id: Some(Ulid::generate()),
         });
+        operation
+    }
 
-        // The head already names a different (winning) successor.
-        let head_value = CurrentVersionPointer::new(winner).to_bytes().unwrap();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+    fn head_read(value: Ulid) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
             key: BlobHeadKey::new("s3test", "range.txt")
                 .to_bytes()
                 .unwrap()
                 .into(),
-            value: Some(head_value.into()),
-        }));
+            value: Some(CurrentVersionPointer::new(value).to_bytes().unwrap().into()),
+        })
+    }
+
+    // CAS guard: if the head advanced under a drifted read (a concurrent reader
+    // already wrote the successor), this read must not write a second one — it
+    // aborts and restarts against the winner.
+    #[test]
+    fn advance_restarts_when_head_moved() {
+        let mut operation = drifted_operation();
+        let txn_id = Ulid::generate();
+        operation.resolved_version_id = Some(Ulid::generate());
+        operation.txn_id = Some(txn_id);
+        operation.state = GetObjectState::ReadHeadForAdvance;
+
+        // The head already names a different (winning) successor.
+        let effects = operation.step(head_read(Ulid::generate()));
 
         assert!(matches!(
             effects.as_slice(),
@@ -1947,6 +2087,67 @@ mod test {
                 if *aborted == txn_id
         ));
         assert_eq!(operation.state, GetObjectState::RestartReference);
+    }
+
+    // The successor's replication obligation must be committed with it, or peers
+    // never learn of it and the repair scanner cannot discover it.
+    #[test]
+    fn advance_writes_obligation() {
+        let restrictions = vec![PathRestriction {
+            pattern: "/realm/g/group/data/node/s3test/range.txt".to_string(),
+            permission: Permission::READ,
+        }];
+        let mut operation = drifted_operation().with_restrictions(Some(restrictions.clone()));
+        let headed = Ulid::generate();
+        operation.resolved_version_id = Some(headed);
+        operation.txn_id = Some(Ulid::generate());
+        operation.state = GetObjectState::ReadHeadForAdvance;
+
+        let effects = operation.step(head_read(headed));
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected a single batch write, got {effects:?}")
+        };
+        let [_, _, (key_space, _, value)] = writes.as_slice() else {
+            panic!("expected version, head and obligation writes, got {writes:?}")
+        };
+        assert_eq!(key_space, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE);
+        let record = LiveReplicationObligationRecord::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(Some(record.version_id), operation.resolved_version_id);
+        assert_ne!(record.version_id, headed);
+        assert_eq!(record.local_node_id, test_node_id());
+        assert!(!record.delete_marker);
+        assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
+    }
+
+    // A committed successor is enqueued for live replication before its bytes
+    // are served, the same way the normal write path enqueues after its commit.
+    #[test]
+    fn commit_queues_replication() {
+        let mut operation = drifted_operation();
+        let txn_id = Ulid::generate();
+        operation.resolved_version_id = Some(Ulid::generate());
+        operation.txn_id = Some(txn_id);
+        operation.state = GetObjectState::CommitAdvance;
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        assert_eq!(operation.state, GetObjectState::QueueSuccessorReplication);
+
+        // A failed enqueue leaves the durable obligation for repair and serves.
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::LiveReplicationQueued {
+                result: Err("queue unavailable".to_string()),
+            },
+        ));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+        ));
     }
 
     async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> SourceMetadata {
@@ -2070,6 +2271,7 @@ mod test {
                 range: None,
                 group_id: Ulid::generate(),
                 user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+                node_id: test_node_id(),
             }),
             &driver_ctx,
         )

@@ -417,6 +417,7 @@ pub async fn load_inputs(
     spec: &ExecutionSpec,
     record: &JobRecord,
     bucket: &str,
+    node_id: NodeId,
 ) -> Result<Vec<TaskInput>, JobError> {
     let mut files = Vec::new();
     let mut total_bytes = 0u64;
@@ -432,6 +433,7 @@ pub async fn load_inputs(
                 range: None,
                 group_id: spec.group_id,
                 user_identity: record.created_by,
+                node_id,
             }),
             context,
         ))
@@ -816,6 +818,7 @@ async fn stage_one_input(
             range: None,
             group_id: spec.group_id,
             user_identity: record.created_by,
+            node_id,
         }),
         context,
     ))

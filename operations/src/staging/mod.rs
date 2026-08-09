@@ -52,6 +52,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::DocumentSyncResult { .. } => {
                 "Event::SubOperation(SubOperationEvent::DocumentSyncResult)".to_string()
             }
+            SubOperationEvent::LiveReplicationQueued { .. } => {
+                "Event::SubOperation(SubOperationEvent::LiveReplicationQueued)".to_string()
+            }
             SubOperationEvent::SourceConnectorResolved { .. } => {
                 "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)".to_string()
             }

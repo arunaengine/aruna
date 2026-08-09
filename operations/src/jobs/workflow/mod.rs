@@ -366,7 +366,7 @@ async fn prepare_workspace(
     .await
     .map_err(|error| JobError::retryable(format!("workspace bucket record failed: {error}")))?;
     Box::pin(stage_inputs(context, spec, record, bucket, node_id)).await?;
-    Box::pin(load_inputs(context, spec, record, bucket)).await
+    Box::pin(load_inputs(context, spec, record, bucket, node_id)).await
 }
 
 pub(super) struct PreparedTask {
@@ -451,7 +451,7 @@ pub(super) async fn reload_task(
         return Box::pin(mounted_task(context, spec, record, node_id)).await;
     }
     Ok(PreparedTask {
-        inputs: Box::pin(load_inputs(context, spec, record, bucket)).await?,
+        inputs: Box::pin(load_inputs(context, spec, record, bucket, node_id)).await?,
         mounts: Vec::new(),
         secrets: BTreeMap::new(),
         staging: StagingMode::Files,

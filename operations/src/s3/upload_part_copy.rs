@@ -4,13 +4,13 @@ use crate::s3::get_object::{
     GetObjectError, GetObjectInput, GetObjectOperation, ObjectRangeRequest,
 };
 use crate::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{BackendLocation, MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -27,6 +27,7 @@ pub struct UploadPartCopyInput {
     pub part_number: u16,
     pub range: Option<ObjectRangeRequest>,
     pub user_id: UserId,
+    pub node_id: NodeId,
     pub conditions: CopySourceConditions,
 }
 
@@ -61,6 +62,7 @@ pub async fn upload_part_copy(
             range: input.range,
             group_id: input.source_group_id,
             user_identity: input.user_id,
+            node_id: input.node_id,
         }),
         context,
     )
@@ -196,6 +198,10 @@ mod test {
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::{TempDir, tempdir};
+
+    fn test_node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
 
     async fn full_context() -> (TempDir, DriverContext) {
         let temp_handle = tempdir().unwrap();
@@ -339,6 +345,7 @@ mod test {
                 part_number: 1,
                 range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 5 }),
                 user_id,
+                node_id: test_node_id(),
                 conditions: CopySourceConditions::default(),
             },
         )
@@ -392,6 +399,7 @@ mod test {
                 part_number: 1,
                 range: None,
                 user_id,
+                node_id: test_node_id(),
                 conditions: CopySourceConditions::default(),
             },
         )
@@ -441,6 +449,7 @@ mod test {
                     end: 200,
                 }),
                 user_id,
+                node_id: test_node_id(),
                 conditions: CopySourceConditions::default(),
             },
         )

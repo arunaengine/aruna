@@ -130,6 +130,7 @@ pub async fn copy_object(
             range: None,
             group_id: input.source_group_id,
             user_identity: input.user_id,
+            node_id: input.node_id,
         }),
         context,
     )
@@ -248,6 +249,10 @@ mod test {
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use tokio::net::TcpListener;
+
+    fn test_node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
 
     async fn full_context() -> (TempDir, DriverContext) {
         let temp_handle = tempdir().unwrap();
@@ -542,6 +547,7 @@ mod test {
                 range: None,
                 group_id,
                 user_identity: UserId::local(Ulid::generate(), realm_id),
+                node_id: test_node_id(),
             }),
             &context,
         )

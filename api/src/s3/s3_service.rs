@@ -2125,6 +2125,7 @@ impl S3 for ArunaS3Service {
                 part_number,
                 range,
                 user_id: user_access.user_identity,
+                node_id: self.node_id,
                 conditions,
             },
         )
@@ -2315,7 +2316,9 @@ impl S3 for ArunaS3Service {
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
             user_identity: user_access.user_identity,
-        });
+            node_id: self.node_id,
+        })
+        .with_restrictions(user_access.path_restrictions.clone());
 
         let result = drive(operation, &self.state)
             .await
