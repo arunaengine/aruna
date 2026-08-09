@@ -6,9 +6,7 @@ use aruna::bootstrap::{
 };
 use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::portal;
-use aruna::shutdown::{
-    NodeShutdown, escalate_on_second_signal, shutdown_grace_from_env, wait_for_signal,
-};
+use aruna::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_for_signal};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
@@ -133,8 +131,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the ops listener before realm bootstrap so `/readyz` reports 503
     // (startup) and `/metrics` is scrapable while the node is still coming up.
-    // Its handle is held so shutdown can keep it answering probes through the
-    // drain and abort it only after the final storage sync.
+    // Its handle survives the drain and is aborted only after final storage sync.
     let metrics = Arc::new(NodeMetrics::new());
     let readiness = Readiness::new();
     let ops_handle = {
@@ -506,10 +503,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if failure.is_some() {
         tokio::spawn(async move {
             let _ = signal.await;
-            let _ = escalate_on_second_signal().await;
+            let _ = arm_signal_exit().await;
         });
     } else {
-        escalate_on_second_signal();
+        arm_signal_exit();
     }
 
     NodeShutdown {
@@ -524,7 +521,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         blob_handle: driver_ctx.blob_handle.clone(),
         storage_handle: driver_ctx.storage_handle.clone(),
         ops: Some(ops_handle),
-        grace: shutdown_grace_from_env(),
+        grace: shutdown_grace_env(),
     }
     .run()
     .await;

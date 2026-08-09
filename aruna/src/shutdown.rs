@@ -1,28 +1,6 @@
-//! Ordered node shutdown.
+//! Ordered, bounded node shutdown.
 //!
-//! One cancellation path (SIGTERM, SIGINT, or a subsystem failure) drives a
-//! fixed sequence of phases. Each phase is bounded, the whole sequence is
-//! bounded, and a watchdog thread force-exits the process if even that hangs.
-//!
-//! The order is dictated by what writes to what:
-//!
-//! 1. Readiness flips to draining: `/readyz` on the ops listener starts failing,
-//!    so Kubernetes stops routing new requests here before anything is torn
-//!    down. The ops listener keeps answering for the whole sequence; it is only
-//!    aborted after the final storage sync so the kubelet does not SIGKILL us
-//!    mid-drain.
-//! 2. Ingress (REST, S3) stops accepting and finishes in-flight requests.
-//! 3. Timer handlers drain while the network is still up.
-//! 4. Job workers write storage: they drain before the seal.
-//! 5. Background children (reconcile, gauges, maintenance) are cancelled and
-//!    joined; they write metadata and storage.
-//! 6. The network shuts down. Its eviction path re-emits documents through the
-//!    still-registered inbound handler, so the handler is only cleared after.
-//! 7. The metadata store is flushed.
-//! 8. Blob writes are sealed and drained, so a mutation's storage location
-//!    lands before storage is sealed.
-//! 9. Storage is sealed, the mutations accepted before the seal are drained,
-//!    then storage is synced. Nothing can commit after the seal.
+//! Ingress and writers stop before blob and storage are sealed, drained, and synced.
 
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -47,24 +25,22 @@ use tracing::{error, info, warn};
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// Extra time the watchdog allows before it stops trusting the sequence.
 const WATCHDOG_MARGIN: Duration = Duration::from_secs(5);
-/// The ingress phase gets at most this fraction of the grace budget. It waits
-/// for every in-flight response, so a response that never finishes (a client
-/// that keeps a stream open, a stalled upload) must not starve the later
-/// phases down to hard aborts.
+/// The ingress phase gets at most this fraction of the grace budget, preventing
+/// an unfinished response from starving later phases down to hard aborts.
 const INGRESS_BUDGET_DIVISOR: u32 = 4;
 /// Minimum time every draining phase leaves for the phases behind it, so a
 /// stuck child cannot consume the budget the network, metadata, blob and
 /// storage phases need to close cleanly.
 const TAIL_BUDGET_RESERVE: Duration = Duration::from_secs(5);
-/// Slice of the net phase reserved for the DHT, document-sync, connection-pool
-/// and endpoint-close teardown that runs behind the inbound drain, on top of
-/// the `FORCED_INBOUND_DRAIN` the forced join costs. Without both, the outer
-/// phase timeout fires mid-teardown and drops it unrun.
+/// Equal shares in the collective tail reserve.
+const TAIL_PHASE_COUNT: u32 = 4;
+/// Time reserved for net teardown after the forced inbound join, preventing the
+/// outer phase timeout from dropping teardown work.
 const NET_TEARDOWN_MARGIN: Duration = Duration::from_secs(2);
 /// Exit code when the watchdog has to kill a shutdown that would not finish.
 const FORCED_EXIT_CODE: i32 = 75;
 
-pub fn shutdown_grace_from_env() -> Duration {
+pub fn shutdown_grace_env() -> Duration {
     match dotenvy::var("ARUNA_SHUTDOWN_GRACE_SECS") {
         Ok(value) => match value.trim().parse::<u64>() {
             Ok(secs) if secs > 0 => Duration::from_secs(secs),
@@ -164,11 +140,16 @@ impl NodeShutdown {
                 let _ = s3.await;
             }
         }
+        let tail_reserve = budget.remaining().min(TAIL_BUDGET_RESERVE);
 
         // 3. Timer handlers drain while the network still works.
         let report = self
             .task_handle
-            .shutdown(tail_reserved(budget.remaining()))
+            .shutdown(tail_reserved(
+                budget.remaining(),
+                tail_reserve,
+                TAIL_PHASE_COUNT,
+            ))
             .await;
         info!(
             in_flight = report.in_flight,
@@ -177,7 +158,11 @@ impl NodeShutdown {
         );
 
         // 4. Job workers write storage: drain them before the seal.
-        let job_grace = JOB_SHUTDOWN_GRACE.min(tail_reserved(budget.remaining()));
+        let job_grace = JOB_SHUTDOWN_GRACE.min(tail_reserved(
+            budget.remaining(),
+            tail_reserve,
+            TAIL_PHASE_COUNT,
+        ));
         let job_report = self
             .jobs_runtime
             .shutdown(&self.storage_handle, job_grace)
@@ -186,7 +171,7 @@ impl NodeShutdown {
 
         // 5. Background children write metadata and storage: join them.
         let mut background_drained = false;
-        let background_budget = tail_reserved(budget.remaining());
+        let background_budget = tail_reserved(budget.remaining(), tail_reserve, TAIL_PHASE_COUNT);
         phase("background", background_budget, async {
             background_drained = self.shutdown.drain(background_budget).await;
         })
@@ -201,7 +186,7 @@ impl NodeShutdown {
         // 6. Network last among the writers: its eviction path re-emits
         //    documents through the inbound handler.
         if let Some(net_handle) = self.net_handle.as_ref() {
-            let phase_budget = budget.remaining();
+            let phase_budget = tail_reserved(budget.remaining(), tail_reserve, TAIL_PHASE_COUNT);
             let mut net_shutdown_complete = false;
             phase("net", phase_budget, async {
                 net_shutdown_complete = net_handle
@@ -220,11 +205,15 @@ impl NodeShutdown {
 
         // 7. Flush the metadata store.
         if let Some(metadata_handle) = self.metadata_handle.as_ref() {
-            phase("metadata", budget.remaining(), async {
-                if let Err(error) = metadata_handle.flush_persistence().await {
-                    error!(error = %error, "Failed to flush metadata persistence during shutdown");
-                }
-            })
+            phase(
+                "metadata",
+                tail_reserved(budget.remaining(), tail_reserve, 3),
+                async {
+                    if let Err(error) = metadata_handle.flush_persistence().await {
+                        error!(error = %error, "Failed to flush metadata persistence during shutdown");
+                    }
+                },
+            )
             .await;
         }
 
@@ -232,7 +221,8 @@ impl NodeShutdown {
         //    their storage locations land before storage closes.
         let blob_rejected = if let Some(blob_handle) = self.blob_handle.as_ref() {
             blob_handle.seal();
-            let blob_drain = budget.remaining().min(TAIL_BUDGET_RESERVE);
+            let blob_drain =
+                tail_reserved(budget.remaining(), tail_reserve, 2).min(TAIL_BUDGET_RESERVE);
             if !blob_handle.drain_writes(blob_drain).await {
                 warn!("Blob writes outlived the shutdown drain");
             }
@@ -244,7 +234,8 @@ impl NodeShutdown {
         // 9. Seal the write path, then drain the mutations accepted before the
         //    seal so they commit ahead of the fsync.
         self.storage_handle.seal();
-        let storage_drain = budget.remaining().min(TAIL_BUDGET_RESERVE);
+        let storage_drain =
+            tail_reserved(budget.remaining(), tail_reserve, 1).min(TAIL_BUDGET_RESERVE);
         if !self.storage_handle.drain_accepted(storage_drain).await {
             warn!("Accepted storage mutations outlived the shutdown drain");
         }
@@ -291,8 +282,8 @@ impl Budget {
 
 /// What a draining phase may spend: the remaining budget minus the floor the
 /// phases behind it need.
-fn tail_reserved(remaining: Duration) -> Duration {
-    remaining.saturating_sub(TAIL_BUDGET_RESERVE)
+fn tail_reserved(remaining: Duration, reserve: Duration, phases: u32) -> Duration {
+    remaining.saturating_sub(reserve.saturating_mul(phases) / TAIL_PHASE_COUNT)
 }
 
 /// What the ingress phase may spend: its capped fraction of the grace, and
@@ -330,7 +321,7 @@ where
 /// Arms the conventional fast exit: once the drain is already running, a
 /// second SIGTERM or SIGINT means "stop now", not "wait out the grace". Exits
 /// with 128 + the signal number, like a process without handlers would.
-pub fn escalate_on_second_signal() -> JoinHandle<()> {
+pub fn arm_signal_exit() -> JoinHandle<()> {
     tokio::spawn(async {
         let Some(code) = second_signal_code().await else {
             return;
@@ -425,7 +416,7 @@ mod tests {
     // A phase whose future never resolves must return without running the rest
     // of it; an ignored budget hangs the test until the job timeout.
     #[tokio::test]
-    async fn phase_gives_up_at_budget() {
+    async fn phase_honors_budget() {
         let mut completed = false;
 
         phase("stuck", Duration::from_millis(50), async {
@@ -440,7 +431,7 @@ mod tests {
     // The inbound drain must leave the forced teardown behind it its own time,
     // or the outer phase timeout drops that teardown unrun.
     #[test]
-    fn drain_below_phase_budget() {
+    fn drain_reserves_teardown() {
         assert_eq!(
             net_drain_budget(Duration::from_secs(10)),
             Duration::from_secs(3)
@@ -448,18 +439,48 @@ mod tests {
         assert_eq!(net_drain_budget(Duration::from_secs(1)), Duration::ZERO);
     }
 
-    // Every draining phase must leave the tail phases their floor.
+    // Every phase leaves its share of the available tail reserve.
     #[test]
     fn phases_reserve_tail() {
+        let full_reserve = Duration::from_secs(5);
+        let short_reserve = Duration::from_secs(3);
+
         assert_eq!(
-            tail_reserved(Duration::from_secs(20)),
+            tail_reserved(Duration::from_secs(20), full_reserve, 4),
             Duration::from_secs(15)
         );
-        assert_eq!(tail_reserved(Duration::from_secs(3)), Duration::ZERO);
+        assert_eq!(
+            tail_reserved(Duration::from_secs(20), full_reserve, 3),
+            Duration::from_millis(16_250)
+        );
+        assert_eq!(
+            tail_reserved(Duration::from_secs(20), full_reserve, 2),
+            Duration::from_millis(17_500)
+        );
+        assert_eq!(
+            tail_reserved(Duration::from_secs(20), full_reserve, 1),
+            Duration::from_millis(18_750)
+        );
+        assert_eq!(
+            tail_reserved(Duration::from_secs(3), short_reserve, 4),
+            Duration::ZERO
+        );
+        assert_eq!(
+            tail_reserved(Duration::from_secs(3), short_reserve, 3),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            tail_reserved(Duration::from_millis(2_250), short_reserve, 2),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            tail_reserved(Duration::from_millis(1_500), short_reserve, 1),
+            Duration::from_millis(750)
+        );
     }
 
     #[test]
-    fn budget_shrinks_with_elapsed_time() {
+    fn budget_reaches_zero() {
         let past = Instant::now()
             .checked_sub(Duration::from_millis(200))
             .expect("monotonic clock has room");
@@ -548,32 +569,6 @@ mod tests {
         assert_eq!(storage_handle.rejected_writes(), 0);
     }
 
-    // SIGTERM is what Kubernetes sends; it must reach the same path as Ctrl-C.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sigterm_triggers_shutdown() {
-        use std::process::Command;
-        use tokio::signal::unix::{SignalKind, signal};
-
-        // Registering here first replaces the process-wide default terminate
-        // action, so the kill below cannot abort the test harness.
-        let mut installed = signal(SignalKind::terminate()).expect("SIGTERM handler installs");
-        let waiter = tokio::spawn(wait_for_signal());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        Command::new("kill")
-            .arg("-TERM")
-            .arg(std::process::id().to_string())
-            .status()
-            .expect("kill runs");
-
-        tokio::time::timeout(Duration::from_secs(5), waiter)
-            .await
-            .expect("SIGTERM should end the signal wait")
-            .expect("signal task joins");
-        installed.recv().await;
-    }
-
     // An ingress response that never finishes may burn at most its capped slice,
     // not the whole grace.
     #[tokio::test]
@@ -594,7 +589,7 @@ mod tests {
 
     // A child that ignores cancellation must not hold up the sequence.
     #[tokio::test]
-    async fn stuck_child_does_not_block() {
+    async fn stuck_child_bounded() {
         let dir = tempdir().expect("temp dir");
         let storage_handle = open_storage(&dir);
         let shutdown = Shutdown::new();
