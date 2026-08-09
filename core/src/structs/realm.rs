@@ -411,12 +411,15 @@ impl RealmConfigDocument {
         sort_canonical(&mut canonical.placement_bindings)?;
         sort_canonical(&mut canonical.placement_handle_ranges)?;
         sort_canonical(&mut canonical.band_pools)?;
-        sort_canonical(&mut canonical.candidate_maps)?;
         sort_canonical(&mut canonical.placement_activations)?;
         // Transitions are excluded for the same reason as revocations: their
         // barrier and proof sets converge independently, and only the
-        // activation they advance changes where a request routes.
+        // activation they advance changes where a request routes. Candidate
+        // maps follow them: an unreferenced map is pruned once the transition
+        // that named it is released, which is a per-node moment, and a map an
+        // activation still names is immutable and fails closed when divergent.
         canonical.placement_transitions.clear();
+        canonical.candidate_maps.clear();
         // Revocations are excluded: the digest binds routing agreement between
         // nodes, and a deny-list that converges independently would otherwise
         // make every revocation reject forwarded requests until it replicated.

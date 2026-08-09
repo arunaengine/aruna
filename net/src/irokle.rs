@@ -4536,7 +4536,13 @@ fn overlay_realm_config_reducer_materialization(
         }
     }
 
-    overlay_realm_config_placement_reducer_materialization(config, reducer_state);
+    // The revocation clock is in seconds; the transition grace is in
+    // milliseconds, and a second of granularity is nothing against it.
+    overlay_realm_config_placement_reducer_materialization(
+        config,
+        reducer_state,
+        now.saturating_mul(1_000),
+    );
 }
 
 fn realm_config_from_reducer_materialization(
@@ -7688,7 +7694,7 @@ async fn validate_realm_config_admin_authority(
         .clone()
         .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
     if let Some(state) = previous_state {
-        overlay_realm_config_placement_reducer_materialization(&mut placement_config, state);
+        overlay_realm_config_placement_reducer_materialization(&mut placement_config, state, 0);
     }
     // Band pools form a causal delegation tree; reject a forged or
     // non-owning issuer, and defer a child until its parent replicates.

@@ -42,6 +42,7 @@ use aruna_core::structs::{
     TransitionLimits, band_start,
 };
 use aruna_core::structured_id::PlacementHandle;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
@@ -488,7 +489,7 @@ impl Topology {
 
     /// Desired shard-topic membership for a bucket, as the reconciler derives it.
     pub fn members(&self, placement: &PlacementRef) -> Vec<NodeId> {
-        transition_members(&self.config, placement)
+        transition_members(&self.config, placement, unix_timestamp_millis())
     }
 
     /// Every transition the realm has not finished yet.
@@ -558,7 +559,8 @@ impl Topology {
     }
 
     /// Starts a transition of `strategy_id` onto `target_epoch` and waits for
-    /// every node to observe the record.
+    /// every node to observe it - as the record, or as the cutover it already
+    /// produced, since a zero grace releases the record with the last proof.
     pub async fn start_transition(
         &mut self,
         node_index: usize,
@@ -580,10 +582,16 @@ impl Topology {
                 created_at_ms: 1,
             },
         )?;
+        let planned = plan.bucket_list();
         self.mutate(node_index, RealmPlacementMutation::StartTransition(plan))
             .await?;
         self.await_config("transition record replicates", move |config| {
             config.transition(&transition_id).is_some()
+                || planned.iter().all(|bucket| {
+                    config
+                        .activation(&strategy_id, *bucket)
+                        .is_some_and(|activation| activation.candidate_map_epoch == target_epoch)
+                })
         })
         .await?;
         Ok(transition_id)
@@ -638,16 +646,16 @@ impl Topology {
                 let mut pending = 0;
                 for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
                     let config = read_realm_config(node, realm_id).await?;
-                    match config.transition(&transition_id) {
-                        Some(transition) => {
-                            pending += transition
-                                .plan
-                                .buckets
-                                .iter()
-                                .filter(|bucket| transition.completion(bucket.bucket).is_none())
-                                .count();
-                        }
-                        None => pending += 1,
+                    // A record that is gone was released after cutting every
+                    // bucket over; `start_transition` already waited for it to
+                    // replicate, so absence here is completion.
+                    if let Some(transition) = config.transition(&transition_id) {
+                        pending += transition
+                            .plan
+                            .buckets
+                            .iter()
+                            .filter(|bucket| transition.completion(bucket.bucket).is_none())
+                            .count();
                     }
                 }
                 Ok(pending)

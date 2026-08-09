@@ -78,9 +78,9 @@ async fn expansion_hands_buckets_to_the_joiner() -> TestResult<()> {
         })
         .collect();
     assert!(
-        plans
-            .iter()
-            .any(|plan| plan.strategy_id == everywhere && plan.buckets.len() == SHARD_COUNT as usize),
+        plans.iter().any(
+            |plan| plan.strategy_id == everywhere && plan.buckets.len() == SHARD_COUNT as usize
+        ),
         "onboarding must hand over every bucket of the everywhere strategy"
     );
     for plan in &plans {

@@ -986,7 +986,7 @@ mod tests {
         let reducer_state =
             AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
 
-        overlay_realm_config_placement_reducer_materialization(&mut config, &reducer_state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &reducer_state, 0);
 
         assert_eq!(config.default_strategy_id, Some(live));
         assert_eq!(config.strategy_bindings[0].strategy_id, live);

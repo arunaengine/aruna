@@ -27,6 +27,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -636,7 +637,11 @@ impl MutateRealmPlacementOperation {
         let admin_event = reducer_state
             .apply_operation(&self.config.actor, self.config.mutation.admin_operation())?;
         let pre_document = document.clone();
-        overlay_realm_config_placement_reducer_materialization(&mut document, &reducer_state);
+        overlay_realm_config_placement_reducer_materialization(
+            &mut document,
+            &reducer_state,
+            unix_timestamp_millis(),
+        );
 
         if let Some((node_id, placement)) =
             crate::placement::first_draining_holder_set_change(&pre_document, &document)

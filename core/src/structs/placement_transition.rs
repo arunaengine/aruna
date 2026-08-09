@@ -16,6 +16,9 @@ pub const TRANSITION_BARRIER_DOMAIN: &[u8] = b"aruna-transition-barrier-v1";
 /// Default window a cut-over bucket keeps its old holders as members and
 /// retained publishers before they are released.
 pub const DEFAULT_TRANSITION_GRACE_MS: u64 = 3_600_000;
+/// A transition still incomplete after this long is surfaced to operators. It
+/// is a health signal only: nothing about the record changes.
+pub const TRANSITION_OVERDUE_MS: u64 = 86_400_000;
 
 /// One eligible node as frozen into a candidate map. Selection input only: the
 /// selector ranks over these fields and never over live config state.
@@ -266,6 +269,33 @@ impl PlacementTransition {
                 .buckets
                 .iter()
                 .all(|plan| self.completion(plan.bucket).is_some())
+    }
+
+    /// Whether the record has outlived its purpose: it is terminal and its last
+    /// cut-over is older than the grace window.
+    ///
+    /// The grace is what keeps a departing old holder in the topic while a
+    /// reader mid-cutover may still need it and its outbox drains. `now_ms`
+    /// only ever ends that window; the window starts at `completed_at_ms`,
+    /// carried data every replica reduces identically. An aborted record that
+    /// cut nothing over releases at once - it moved nobody.
+    pub fn released(&self, now_ms: u64) -> bool {
+        self.is_terminal()
+            && self
+                .completed
+                .iter()
+                .map(|entry| entry.completed_at_ms)
+                .max()
+                .is_none_or(|at| now_ms >= at.saturating_add(self.plan.limits.grace_ms))
+    }
+
+    /// Covered buckets that have not cut over yet.
+    pub fn incomplete_buckets(&self) -> usize {
+        self.plan
+            .buckets
+            .iter()
+            .filter(|plan| self.completion(plan.bucket).is_none())
+            .count()
     }
 
     /// Whether the bucket may cut over: every old holder reported its barrier
@@ -553,6 +583,34 @@ mod tests {
         transition.status = TransitionStatus::Aborted;
         assert!(transition.bucket_ready(1));
         assert!(!transition.bucket_ready(3));
+    }
+
+    #[test]
+    fn release_waits_out_the_grace() {
+        let mut transition = PlacementTransition::new(plan());
+        transition.plan.limits.grace_ms = 100;
+        assert!(
+            !transition.released(u64::MAX),
+            "a live record never releases"
+        );
+
+        transition.completed.push(BucketCompletion {
+            bucket: 1,
+            completed_at_ms: 10,
+        });
+        transition.completed.push(BucketCompletion {
+            bucket: 3,
+            completed_at_ms: 40,
+        });
+        assert_eq!(transition.incomplete_buckets(), 0);
+        // The window runs from the newest cut-over, not the first.
+        assert!(!transition.released(139));
+        assert!(transition.released(140));
+
+        let mut aborted = PlacementTransition::new(plan());
+        aborted.status = TransitionStatus::Aborted;
+        assert_eq!(aborted.incomplete_buckets(), 2);
+        assert!(aborted.released(0));
     }
 
     #[test]

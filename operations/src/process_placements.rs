@@ -9,6 +9,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
+use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
@@ -51,6 +52,7 @@ async fn ensure_held_shard_topics(
     realm_id: RealmId,
     local_node_id: NodeId,
     verified: &BTreeSet<::irokle::TopicId>,
+    now_ms: u64,
 ) -> HeldTopicOutcome {
     type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
     let mut rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
@@ -66,7 +68,7 @@ async fn ensure_held_shard_topics(
             // still names for the bucket, so a target joins and an old holder
             // stays reachable through the grace window (#399 bounds the peak at
             // |old U new|).
-            let members = transition_members(config, &placement);
+            let members = transition_members(config, &placement, now_ms);
             if !members.contains(&local_node_id) {
                 continue;
             }
@@ -394,6 +396,7 @@ pub async fn process_shard_placements(
         realm_id,
         local_node_id,
         &verified,
+        unix_timestamp_millis(),
     )
     .await;
     let mut retry_needed = held.withheld || held.pull_pending;
@@ -507,7 +510,7 @@ pub async fn process_shard_placements(
             let membership = net_handle
                 .reconcile_shard_membership(
                     &[topic],
-                    transition_members(&config, &record.placement),
+                    transition_members(&config, &record.placement, unix_timestamp_millis()),
                     &retained,
                     &verified,
                 )

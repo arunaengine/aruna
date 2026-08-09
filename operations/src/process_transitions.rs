@@ -39,15 +39,18 @@ pub async fn process_placement_transitions(
         return ensure_strategy_activations(context, realm_id, local_node_id, config).await;
     }
     let mut pending = ensure_strategy_activations(context, realm_id, local_node_id, config).await;
+    let mut departed = false;
     for transition in &config.placement_transitions {
-        // An observed abort stops this node from submitting anything further:
-        // the un-cut buckets simply never complete.
-        if !matches!(transition.status, TransitionStatus::Active) || transition.is_terminal() {
-            continue;
-        }
         let mut in_flight = 0u32;
         for bucket in &transition.plan.buckets {
             if transition.completion(bucket.bucket).is_some() {
+                departed |= bucket.old_holders.contains(&local_node_id)
+                    && !bucket.target_holders.contains(&local_node_id);
+                continue;
+            }
+            // An observed abort stops this node from submitting anything
+            // further: the un-cut buckets simply never complete.
+            if !matches!(transition.status, TransitionStatus::Active) {
                 continue;
             }
             in_flight += 1;
@@ -69,6 +72,12 @@ pub async fn process_placement_transitions(
                         .await;
             }
         }
+    }
+    // Flush-then-leave (DECISIONS K3): a bucket this node just handed over
+    // leaves it a member only until the grace elapses, so whatever it accepted
+    // before the cutover has to reach the topic inside that window.
+    if departed {
+        crate::task_incoming::drive_document_sync_outbox_drain(context.clone()).await;
     }
     pending
 }

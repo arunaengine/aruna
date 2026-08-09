@@ -479,9 +479,15 @@ pub fn decode_admin_document_reducer_state(
 /// no strategy is live, references are cleared while override pins and exclusions
 /// are retained. Reducer values are not changed, so a later strategy upsert can
 /// restore an assignment that was only dangling in the materialized snapshot.
+/// Materializes every placement structure the reducer owns into `config`.
+///
+/// `now_ms` decides only which terminal transitions have outlived their grace
+/// and are dropped from the document; it never reaches an activation, so two
+/// replicas reading different clocks still route identically.
 pub fn overlay_realm_config_placement_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
+    now_ms: u64,
 ) {
     if reducer_state
         .user_subject_ids
@@ -674,7 +680,7 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
-    overlay_placement_transitions(config, reducer_state);
+    overlay_placement_transitions(config, reducer_state, now_ms);
     repair_realm_config_placement_references(config);
 }
 
@@ -685,6 +691,7 @@ pub fn overlay_realm_config_placement_reducer_materialization(
 fn overlay_placement_transitions(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
+    now_ms: u64,
 ) {
     let materialized_maps = reducer_state.materialized_candidate_maps();
     for (path, conflict) in &reducer_state.conflicts {
@@ -722,9 +729,15 @@ fn overlay_placement_transitions(
             .placement_transitions
             .retain(|existing| existing.plan.transition_id != transition.plan.transition_id);
     }
-    config
-        .placement_transitions
-        .extend(transitions.iter().cloned());
+    // A released record is dropped from the document but never from the fold
+    // below: activations are replayed from the whole reduced chain, so pruning
+    // a cut-over out of that chain would silently regress its buckets.
+    config.placement_transitions.extend(
+        transitions
+            .iter()
+            .filter(|transition| !transition.released(now_ms))
+            .cloned(),
+    );
 
     let epochs = reducer_state.materialized_activation_epochs();
     let mut initialized: Vec<(Ulid, u32, u64)> = Vec::new();
@@ -775,6 +788,31 @@ fn overlay_placement_transitions(
             config.placement_activations.push(activation);
         }
     }
+    retain_referenced_candidate_maps(config);
+}
+
+/// Drops maps nothing can select from any more: no activation names them, no
+/// retained transition targets them, and they are not the newest - which the
+/// next transition would target.
+fn retain_referenced_candidate_maps(config: &mut RealmConfigDocument) {
+    let Some(newest) = config.newest_map_epoch() else {
+        return;
+    };
+    let referenced: BTreeSet<u64> = config
+        .placement_activations
+        .iter()
+        .map(|activation| activation.candidate_map_epoch)
+        .chain(
+            config
+                .placement_transitions
+                .iter()
+                .map(|transition| transition.plan.target_map_epoch),
+        )
+        .chain(std::iter::once(newest))
+        .collect();
+    config
+        .candidate_maps
+        .retain(|map| referenced.contains(&map.epoch));
 }
 
 fn order_by_bucket_and_node(left: &BucketBarrier, right: &BucketBarrier) -> Ordering {
@@ -5545,7 +5583,11 @@ mod tests {
         ];
 
         let untouched = config.clone();
-        overlay_realm_config_placement_reducer_materialization(&mut config, &realm_config_state());
+        overlay_realm_config_placement_reducer_materialization(
+            &mut config,
+            &realm_config_state(),
+            0,
+        );
         assert_eq!(config, untouched);
 
         let mut state = realm_config_state();
@@ -5570,7 +5612,7 @@ mod tests {
             state.apply_operation(&actor, op).unwrap();
         }
 
-        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
         assert_eq!(config.placement_map, vec![unowned_entry, owned_entry]);
         assert_eq!(
             config.strategies,
@@ -5587,7 +5629,7 @@ mod tests {
         );
 
         let materialized = config.clone();
-        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
         assert_eq!(config, materialized);
     }
 
@@ -5609,7 +5651,11 @@ mod tests {
             strategy_id: Some(missing_strategy_id),
         }];
 
-        overlay_realm_config_placement_reducer_materialization(&mut config, &realm_config_state());
+        overlay_realm_config_placement_reducer_materialization(
+            &mut config,
+            &realm_config_state(),
+            0,
+        );
 
         assert_eq!(config.default_strategy_id, None);
         assert!(config.strategy_bindings.is_empty());
@@ -6084,11 +6130,13 @@ mod tests {
             overlay_realm_config_placement_reducer_materialization(
                 &mut remove_first_config,
                 &remove_first,
+                0,
             );
             let mut reference_first_config = base_config;
             overlay_realm_config_placement_reducer_materialization(
                 &mut reference_first_config,
                 &reference_first,
+                0,
             );
             assert_eq!(remove_first_config, reference_first_config);
             assert_eq!(
@@ -6135,6 +6183,7 @@ mod tests {
             overlay_realm_config_placement_reducer_materialization(
                 &mut remove_first_config,
                 &remove_first,
+                0,
             );
             assert!(remove_first_config.strategy(&strategy_id).is_some());
             assert_realm_config_strategy_references_are_live(&remove_first_config);
@@ -6422,7 +6471,7 @@ mod tests {
         assert_eq!(state.materialized_handle_ranges().len(), 2);
 
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
         let directory = config.handle_range_directory();
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
@@ -6471,7 +6520,7 @@ mod tests {
 
         for state in [&left, &right] {
             let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-            overlay_realm_config_placement_reducer_materialization(&mut config, state);
+            overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
             assert_eq!(config.placement_handle_ranges.len(), 2);
             let directory = config.handle_range_directory();
             assert_eq!(directory.conflicts(), 2);
@@ -6538,7 +6587,7 @@ mod tests {
 
         for state in [&left, &right] {
             let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-            overlay_realm_config_placement_reducer_materialization(&mut config, state);
+            overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
             let directory = config.binding_directory();
             assert_eq!(
                 directory.resolve(handle),
@@ -6568,7 +6617,7 @@ mod tests {
         assert!(state.materialized_placement_bindings().is_empty());
 
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
         assert_eq!(config.placement_bindings.len(), 2);
         assert_eq!(
             config.binding_directory().resolve(handle),
@@ -6606,7 +6655,7 @@ mod tests {
         config
             .placement_handle_ranges
             .push(handle_range(8, origin, 3, 20));
-        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
         assert_eq!(config.placement_bindings.len(), 1);
         assert_eq!(
             config
@@ -6632,7 +6681,7 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
         // A stale local entry for the handle must be replaced, not accumulated.
         config.placement_bindings.push(first.clone());
-        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
 
         assert_eq!(config.placement_bindings.len(), 2);
         let strategies: BTreeSet<_> = config
@@ -7323,7 +7372,7 @@ mod tests {
 
     fn transition_config(state: &AdminDocumentReducerState) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        overlay_realm_config_placement_reducer_materialization(&mut config, state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
         config
     }
 
@@ -7554,5 +7603,142 @@ mod tests {
                 .transition_id,
             None
         );
+    }
+
+    #[test]
+    fn prune_keeps_every_advance() {
+        // Dropping a released record must not drop what it moved: activations
+        // are replayed from the whole reduced chain, so a fold that skipped the
+        // pruned record would silently regress the bucket to its old map.
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan)
+            .into_iter()
+            .chain(completion_events(&plan))
+        {
+            state.apply(&event).unwrap();
+        }
+        // Only a record whose every bucket cut over is terminal, so bucket one
+        // has to finish before the release can be observed at all.
+        for (event_seed, seed, op) in [
+            (
+                60u8,
+                1u8,
+                AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    transition_id: plan.transition_id,
+                    bucket: 1,
+                    reported_by: node(1),
+                    frontier: vec![1],
+                },
+            ),
+            (
+                61,
+                2,
+                AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    transition_id: plan.transition_id,
+                    bucket: 1,
+                    reported_by: node(2),
+                    frontier: vec![2],
+                },
+            ),
+            (
+                62,
+                3,
+                AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    transition_id: plan.transition_id,
+                    strategy_id: plan.strategy_id,
+                    proof: proof_for(&plan, 1, 3),
+                },
+            ),
+            (
+                63,
+                4,
+                AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    transition_id: plan.transition_id,
+                    strategy_id: plan.strategy_id,
+                    proof: proof_for(&plan, 1, 4),
+                },
+            ),
+        ] {
+            state
+                .apply(&realm_config_event(
+                    event_seed,
+                    node(seed),
+                    3,
+                    AdminDocumentClock::default(),
+                    op,
+                ))
+                .unwrap();
+        }
+        let live = transition_config(&state);
+        assert_eq!(live.placement_transitions.len(), 1);
+        assert!(live.placement_transitions[0].is_terminal());
+
+        let mut pruned = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut pruned, &state, u64::MAX);
+        assert!(pruned.placement_transitions.is_empty());
+        assert_eq!(pruned.placement_activations, live.placement_activations);
+
+        // Re-materializing from scratch reproduces the pruned view exactly, so
+        // the record's absence is stable rather than a one-time loss.
+        let mut again = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut again, &state, u64::MAX);
+        assert_eq!(again, pruned);
+        // The bucket that cut over still names its target map, and that map
+        // survives the prune because an activation references it.
+        assert_eq!(
+            pruned
+                .activation(&plan.strategy_id, 0)
+                .expect("bucket 0")
+                .candidate_map_epoch,
+            2
+        );
+        assert!(pruned.candidate_map(2).is_some());
+    }
+
+    #[test]
+    fn prune_drops_unreferenced_maps() {
+        // A map no activation selects from and no retained transition targets
+        // is unreachable - unless it is the newest, which the next transition
+        // would name.
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan) {
+            state.apply(&event).unwrap();
+        }
+        state
+            .apply(&realm_config_event(
+                90,
+                node(1),
+                6,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                    map: map_with(3, &[1, 4]),
+                },
+            ))
+            .unwrap();
+
+        let config = transition_config(&state);
+        assert!(config.candidate_map(1).is_some(), "activated");
+        assert!(config.candidate_map(2).is_some(), "targeted in flight");
+        assert!(config.candidate_map(3).is_some(), "newest");
+
+        // Aborting frees the target map: nothing selects from epoch two any more.
+        state
+            .apply(&realm_config_event(
+                91,
+                node(1),
+                7,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionAborted {
+                    transition_id: plan.transition_id,
+                },
+            ))
+            .unwrap();
+        let config = transition_config(&state);
+        assert!(config.placement_transitions.is_empty());
+        assert!(config.candidate_map(2).is_none());
+        assert!(config.candidate_map(1).is_some());
+        assert!(config.candidate_map(3).is_some());
     }
 }

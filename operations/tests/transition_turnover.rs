@@ -110,15 +110,9 @@ async fn turnover_moves_one_holder() -> TestResult<()> {
     // A complete local copy is not holdership: only the activation is.
     assert!(!holds_placement(&realm.config, &placement, leaver));
     assert!(document_present(realm.find(leaver), group_id, document_id).await);
-    let members = realm.members(&placement);
-    for node_id in before.iter().chain(&after) {
-        assert!(members.contains(node_id), "membership lost {node_id}");
-    }
-    assert_eq!(
-        members.len(),
-        before.len() + 1,
-        "membership exceeded the old and new sets"
-    );
+    // The record carried a zero grace, so the leaver was released with the
+    // cutover and membership collapsed from `|old U new|` back to the holders.
+    assert_eq!(realm.members(&placement), after);
 
     let node = realm.find(joiner);
     wait_until("document reaches the new holder", joiner, || {

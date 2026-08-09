@@ -209,7 +209,11 @@ impl EnsureRealmConfigOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        overlay_realm_config_reducer_materialization(&mut document, &reducer_state);
+        overlay_realm_config_reducer_materialization(
+            &mut document,
+            &reducer_state,
+            unix_timestamp_millis(),
+        );
 
         let node_is_noop = previous_reducer_state.as_ref().is_some_and(|state| {
             realm_config_node_ensure_is_noop(
@@ -364,7 +368,11 @@ impl EnsureRealmConfigOperation {
                 AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
             )?);
         }
-        overlay_realm_config_reducer_materialization(&mut document, &reducer_state);
+        overlay_realm_config_reducer_materialization(
+            &mut document,
+            &reducer_state,
+            unix_timestamp_millis(),
+        );
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             previous_reducer_state.as_ref(),
@@ -632,6 +640,7 @@ fn apply_realm_config_node_ensure(
 fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
+    now_ms: u64,
 ) {
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
@@ -648,7 +657,7 @@ fn overlay_realm_config_reducer_materialization(
         config.ensure_node(node_id, kind);
     }
 
-    overlay_realm_config_placement_reducer_materialization(config, reducer_state);
+    overlay_realm_config_placement_reducer_materialization(config, reducer_state, now_ms);
 }
 
 fn realm_config_node_ensure_is_noop(
@@ -1213,7 +1222,7 @@ mod tests {
         }
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        overlay_realm_config_reducer_materialization(&mut config, &state);
+        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
 
         assert_eq!(config.placement_map, vec![entry]);
         assert_eq!(config.strategies, vec![strategy.clone()]);
@@ -1233,7 +1242,7 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.default_strategy_id = Some(prior_default);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state);
+        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -1268,7 +1277,7 @@ mod tests {
         );
         assert_eq!(state.materialized_realm_config_default_strategy(), None);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state);
+        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
         assert_eq!(config.default_strategy_id, None);
     }
 

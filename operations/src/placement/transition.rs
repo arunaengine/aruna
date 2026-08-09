@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::structs::{
     BucketPlan, CandidatePlacementMap, PlacementRef, PlacementStrategy, RealmConfigDocument,
-    TransitionLimits, TransitionPlan,
+    TRANSITION_OVERDUE_MS, TransitionLimits, TransitionPlan,
 };
 use thiserror::Error;
 use ulid::Ulid;
@@ -42,6 +42,46 @@ pub struct BucketPreview {
     pub old_locations: Vec<String>,
     pub new_locations: Vec<String>,
     pub disjoint: bool,
+}
+
+/// What operators need to see about the realm's transitions. Counts only: a
+/// stall or an overdue bucket is a diagnostic and never moves authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransitionHealth {
+    pub active: usize,
+    pub incomplete_buckets: usize,
+    pub stalled_buckets: usize,
+    /// Active transitions older than [`TRANSITION_OVERDUE_MS`].
+    pub overdue: usize,
+}
+
+pub fn transition_health(config: &RealmConfigDocument, now_ms: u64) -> TransitionHealth {
+    let mut health = TransitionHealth::default();
+    for transition in config
+        .placement_transitions
+        .iter()
+        .filter(|transition| !transition.is_terminal())
+    {
+        health.active += 1;
+        health.incomplete_buckets += transition.incomplete_buckets();
+        let mut stalled: Vec<u32> = transition
+            .stalls
+            .iter()
+            .map(|report| report.bucket)
+            .collect();
+        stalled.sort_unstable();
+        stalled.dedup();
+        health.stalled_buckets += stalled.len();
+        if now_ms
+            >= transition
+                .plan
+                .created_at_ms
+                .saturating_add(TRANSITION_OVERDUE_MS)
+        {
+            health.overdue += 1;
+        }
+    }
+    health
 }
 
 /// Rank-ordered holders of `placement` under one frozen candidate map.
@@ -135,17 +175,19 @@ pub fn expansion_buckets(
     strategy_id: Ulid,
     target_map_epoch: u64,
 ) -> Result<Vec<u32>, TransitionPlanError> {
-    Ok(preview_transition(config, strategy_id, &[], target_map_epoch)?
-        .into_iter()
-        .filter(|preview| {
-            preview.new_holders != preview.old_holders
-                && preview
-                    .old_holders
-                    .iter()
-                    .all(|holder| preview.new_holders.contains(holder))
-        })
-        .map(|preview| preview.bucket)
-        .collect())
+    Ok(
+        preview_transition(config, strategy_id, &[], target_map_epoch)?
+            .into_iter()
+            .filter(|preview| {
+                preview.new_holders != preview.old_holders
+                    && preview
+                        .old_holders
+                        .iter()
+                        .all(|holder| preview.new_holders.contains(holder))
+            })
+            .map(|preview| preview.bucket)
+            .collect(),
+    )
 }
 
 /// Builds the plan a `StartPlacementTransition` carries from the preview, so
@@ -234,4 +276,105 @@ fn locations_of(config: &RealmConfigDocument, holders: &[NodeId]) -> Vec<String>
     locations.sort_unstable();
     locations.dedup();
     locations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::{
+        PlacementTransition, RealmId, RealmNodeKind, StallReport, TransitionStatus,
+    };
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// Three nodes activated at epoch one, four published at epoch two.
+    fn seeded() -> (RealmConfigDocument, Ulid, Ulid) {
+        let everywhere = Ulid::from_bytes([1; 16]);
+        let capped = Ulid::from_bytes([2; 16]);
+        let strategy = |strategy_id, replica_count| PlacementStrategy {
+            strategy_id,
+            name: "seeded".to_string(),
+            replica_count,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 8,
+        };
+        let mut config = RealmConfigDocument::new(RealmId::from_bytes([9; 32]), Vec::new(), 3);
+        config.strategies = vec![strategy(everywhere, None), strategy(capped, Some(1))];
+        for seed in 1..=3u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        config.snapshot_candidate_map();
+        config.ensure_node(node(4), RealmNodeKind::Server);
+        config.snapshot_candidate_map();
+        (config, everywhere, capped)
+    }
+
+    #[test]
+    fn expansion_needs_a_superset() {
+        let (config, everywhere, capped) = seeded();
+        assert_eq!(
+            expansion_buckets(&config, everywhere, 2).unwrap(),
+            (0..8).collect::<Vec<u32>>()
+        );
+        // A capped bucket either keeps its holder or swaps it: unchanged is not
+        // worth a handoff and a swap is not an expansion.
+        assert!(expansion_buckets(&config, capped, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn health_counts_stalls_and_overdue() {
+        let (mut config, everywhere, _) = seeded();
+        assert_eq!(
+            transition_health(&config, u64::MAX),
+            TransitionHealth::default()
+        );
+
+        let plan = plan_transition(
+            &config,
+            TransitionRequest {
+                transition_id: Ulid::from_bytes([3; 16]),
+                strategy_id: everywhere,
+                buckets: vec![0, 1],
+                target_map_epoch: 2,
+                limits: TransitionLimits::default(),
+                created_by: node(1),
+                created_at_ms: 10,
+            },
+        )
+        .expect("the plan derives");
+        let mut transition = PlacementTransition::new(plan);
+        // Two reports about one bucket are one stalled bucket.
+        for seed in 1..=2u8 {
+            transition.stalls.push(StallReport {
+                bucket: 0,
+                reported_by: node(seed),
+                reason: "no old holder reachable".to_string(),
+            });
+        }
+        config.placement_transitions.push(transition);
+
+        assert_eq!(
+            transition_health(&config, 10 + TRANSITION_OVERDUE_MS - 1),
+            TransitionHealth {
+                active: 1,
+                incomplete_buckets: 2,
+                stalled_buckets: 1,
+                overdue: 0,
+            }
+        );
+        assert_eq!(
+            transition_health(&config, 10 + TRANSITION_OVERDUE_MS).overdue,
+            1
+        );
+
+        // A terminal record is history, not health.
+        config.placement_transitions[0].status = TransitionStatus::Aborted;
+        assert_eq!(
+            transition_health(&config, u64::MAX),
+            TransitionHealth::default()
+        );
+    }
 }

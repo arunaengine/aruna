@@ -370,12 +370,18 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
 ///
 /// A target must be a member to pull the history it has to verify, and an old
 /// holder must stay one until the record is released, or a reader mid-cutover
-/// would lose its source. The record's lifetime is that window, so repeated
-/// transitions bound peak membership at `|old U new|` (#399).
-pub fn transition_members(config: &RealmConfigDocument, placement: &PlacementRef) -> Vec<NodeId> {
+/// would lose its source. That window closes `grace_ms` after the bucket cut
+/// over, so repeated transitions bound peak membership at `|old U new|` and
+/// steady-state membership at the holders (#399). `now_ms` only ends the
+/// window; when it starts is carried in the record.
+pub fn transition_members(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    now_ms: u64,
+) -> Vec<NodeId> {
     let mut members = resolve_shard_holders(config, placement);
     for transition in &config.placement_transitions {
-        if transition.plan.strategy_id != placement.strategy_id {
+        if transition.plan.strategy_id != placement.strategy_id || transition.released(now_ms) {
             continue;
         }
         let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
@@ -589,9 +595,13 @@ fn resolve_shard_holders_from_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::admin_document_reducer::{
+        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
+    };
+    use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::structs::{
-        BindingScope, CandidatePlacementMap, MetadataRegistryRecord, NodePlacementEntry, RealmId,
-        RealmNodeKind, StrategyBinding,
+        Actor, BindingScope, CandidateMapNode, CandidatePlacementMap, MetadataRegistryRecord,
+        NodePlacementEntry, RealmId, RealmNodeKind, StrategyBinding,
     };
     use ulid::Ulid;
 
@@ -1001,6 +1011,175 @@ mod tests {
         for target in &targets {
             assert!(!holds_placement(&config, &placement, *target));
         }
+    }
+
+    /// Reduces a full two-bucket handoff from map one onto map two and returns
+    /// the state that replays it.
+    fn reduced_handoff(realm_id: RealmId, strategy_id: Ulid) -> AdminDocumentReducerState {
+        let mut state =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let actor = |seed: u8| Actor {
+            node_id: node(seed),
+            user_id: aruna_core::UserId::nil(realm_id),
+            realm_id,
+        };
+        let map = |epoch: u64, seeds: [u8; 2]| CandidatePlacementMap {
+            epoch,
+            nodes: seeds
+                .iter()
+                .map(|seed| CandidateMapNode {
+                    node_id: node(*seed),
+                    kind: RealmNodeKind::Server,
+                    location: "eu".to_string(),
+                    weight: 100,
+                    full: false,
+                    draining: false,
+                    labels: std::collections::BTreeMap::new(),
+                })
+                .collect(),
+        };
+        for operation in [
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: PlacementStrategy {
+                    strategy_id,
+                    name: "moved".to_string(),
+                    replica_count: Some(1),
+                    distinct_locations: false,
+                    affinity: Vec::new(),
+                    shard_count: 2,
+                },
+            },
+            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                map: map(1, [1, 2]),
+            },
+            AdminDocumentOperation::RealmConfigActivationsInitialized {
+                strategy_id,
+                candidate_map_epoch: 1,
+            },
+            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                map: map(2, [3, 4]),
+            },
+        ] {
+            state
+                .apply_operation(&actor(1), operation)
+                .expect("applies");
+        }
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+        let plan = crate::placement::transition::plan_transition(
+            &config,
+            crate::placement::transition::TransitionRequest {
+                transition_id: Ulid::from_bytes([7; 16]),
+                strategy_id,
+                buckets: Vec::new(),
+                target_map_epoch: 2,
+                limits: Default::default(),
+                created_by: node(1),
+                created_at_ms: 1,
+            },
+        )
+        .expect("the plan derives");
+        state
+            .apply_operation(
+                &actor(1),
+                AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() },
+            )
+            .expect("applies");
+
+        for bucket in &plan.buckets {
+            for holder in &bucket.old_holders {
+                let seed = (1..=4u8)
+                    .find(|seed| node(*seed) == *holder)
+                    .expect("known");
+                state
+                    .apply_operation(
+                        &actor(seed),
+                        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                            transition_id: plan.transition_id,
+                            bucket: bucket.bucket,
+                            reported_by: *holder,
+                            frontier: vec![seed],
+                        },
+                    )
+                    .expect("applies");
+            }
+            for holder in &bucket.target_holders {
+                let seed = (1..=4u8)
+                    .find(|seed| node(*seed) == *holder)
+                    .expect("known");
+                let proof = aruna_core::structs::ProofClaim {
+                    realm_id,
+                    transition_id: plan.transition_id,
+                    strategy_id,
+                    bucket: bucket.bucket,
+                    old_activation_epoch: 1,
+                    target_map_epoch: 2,
+                    barrier_digest: [0; 32],
+                    checkpoint_root: [1; 32],
+                    holder: *holder,
+                }
+                .sign(&iroh::SecretKey::from_bytes(&[seed; 32]));
+                state
+                    .apply_operation(
+                        &actor(seed),
+                        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                            transition_id: plan.transition_id,
+                            strategy_id,
+                            proof,
+                        },
+                    )
+                    .expect("applies");
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn prune_keeps_holder_sets() {
+        // Dropping a released record must leave every bucket exactly where the
+        // transition put it: the fold that advances activations replays the
+        // whole reduced chain, pruned records included.
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let strategy_id = Ulid::from_bytes([5u8; 16]);
+        let state = reduced_handoff(realm_id, strategy_id);
+        let materialize = |now_ms: u64| {
+            let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+            overlay_realm_config_placement_reducer_materialization(&mut config, &state, now_ms);
+            config
+        };
+        let buckets = [
+            PlacementRef {
+                strategy_id,
+                shard: 0,
+            },
+            PlacementRef {
+                strategy_id,
+                shard: 1,
+            },
+        ];
+
+        let live = materialize(0);
+        assert_eq!(live.placement_transitions.len(), 1);
+        let moved: Vec<Vec<NodeId>> = buckets
+            .iter()
+            .map(|placement| resolve_shard_holders(&live, placement))
+            .collect();
+        assert!(moved.iter().all(|holders| holders.len() == 1));
+        assert!(
+            moved
+                .iter()
+                .all(|holders| [node(3), node(4)].contains(&holders[0])),
+            "the handoff moved both buckets onto the target map"
+        );
+
+        let pruned = materialize(u64::MAX);
+        assert!(pruned.placement_transitions.is_empty());
+        for (placement, holders) in buckets.iter().zip(&moved) {
+            assert_eq!(&resolve_shard_holders(&pruned, placement), holders);
+            assert!(transition_members(&pruned, placement, u64::MAX) == *holders);
+        }
+        assert_eq!(pruned.placement_activations, live.placement_activations);
     }
 
     #[test]

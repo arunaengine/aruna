@@ -127,7 +127,12 @@ pub async fn expand_realm_placement(
             },
         )
         .map_err(invalid)?;
-        config = mutate(context, actor, RealmPlacementMutation::StartTransition(plan)).await?;
+        config = mutate(
+            context,
+            actor,
+            RealmPlacementMutation::StartTransition(plan),
+        )
+        .await?;
         started.push(transition_id);
     }
     Ok(started)

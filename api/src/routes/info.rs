@@ -12,6 +12,7 @@ use aruna_core::structs::{
 use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::allocate_handle::{HandleAllocationError, provision_metadata_binding};
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -23,6 +24,7 @@ use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
     drive_realm_placement_mutation,
 };
+use aruna_operations::placement::transition::transition_health;
 use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
 };
@@ -392,6 +394,18 @@ pub struct RealmPlacementConfigResponse {
     pub default_strategy_id: Option<String>,
     pub bindings: Vec<RealmPlacementBinding>,
     pub overrides: Vec<RealmPlacementOverride>,
+    pub transitions: RealmTransitionHealthResponse,
+}
+
+/// Health of the realm's in-flight placement transitions. Counts only: nothing
+/// here changes where a request routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmTransitionHealthResponse {
+    pub active: usize,
+    pub incomplete_buckets: usize,
+    pub stalled_buckets: usize,
+    /// Transitions still incomplete after a day.
+    pub overdue: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -498,7 +512,14 @@ enum RealmPlacementAction {
 
 impl RealmPlacementConfigResponse {
     fn from_document(document: &RealmConfigDocument) -> Self {
+        let health = transition_health(document, unix_timestamp_millis());
         Self {
+            transitions: RealmTransitionHealthResponse {
+                active: health.active,
+                incomplete_buckets: health.incomplete_buckets,
+                stalled_buckets: health.stalled_buckets,
+                overdue: health.overdue,
+            },
             strategies: document
                 .strategies
                 .iter()
