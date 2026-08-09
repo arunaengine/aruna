@@ -905,8 +905,18 @@ impl GetObjectOperation {
         }
     }
 
-    fn handle_restart_reference(&mut self, _event: Event) -> Effects {
-        self.restart_reference_read()
+    fn handle_restart_reference(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                self.restart_reference_read()
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionAborted)",
+                received: other,
+            }),
+        }
     }
 
     /// Re-reads the reference from the current head so a restarted access
@@ -2247,6 +2257,36 @@ mod test {
         assert!(effects.is_empty());
         assert_eq!(operation.state, GetObjectState::Finish);
         assert!(operation.advance_observation.is_none());
+    }
+
+    // The restart must observe its own abort before re-reading the head.
+    #[test]
+    fn restart_needs_abort() {
+        let mut operation = drifted_operation();
+        operation.state = GetObjectState::RestartReference;
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"unrelated".to_vec().into(),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(GetObjectError::InvalidStateEvent { .. })
+        ));
+
+        let mut operation = drifted_operation();
+        operation.state = GetObjectState::RestartReference;
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::generate(),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: true
+            })]
+        ));
     }
 
     async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> SourceMetadata {
