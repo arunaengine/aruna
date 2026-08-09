@@ -5,16 +5,21 @@
 //! what is still running, and know when nothing can write any more.
 
 use std::future::Future;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::warn;
 
 /// Cancellation token plus the set of background children that observe it.
 #[derive(Clone, Debug, Default)]
 pub struct Shutdown {
     token: CancellationToken,
     tracker: TaskTracker,
+    /// Admission gate. `TaskTracker::close` does not stop later spawns, so a
+    /// racer could otherwise slip a child in behind a completed `drain`.
+    closed: Arc<RwLock<bool>>,
 }
 
 impl Shutdown {
@@ -40,10 +45,20 @@ impl Shutdown {
     }
 
     /// Spawns a tracked child. Children spawned here are awaited by `drain`.
+    /// Once `drain` has closed admission the future is dropped without ever
+    /// running, so nothing can start writing behind the drain.
     pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let closed = self
+            .closed
+            .read()
+            .expect("shutdown admission lock poisoned");
+        if *closed {
+            warn!("Rejected a background child spawned after the shutdown drain");
+            return;
+        }
         self.tracker.spawn(future);
     }
 
@@ -51,9 +66,15 @@ impl Shutdown {
         self.tracker.len()
     }
 
-    /// Triggers cancellation and waits for tracked children, bounded by
-    /// `timeout`. Returns `true` when every child finished in time.
+    /// Closes admission, triggers cancellation, then waits for tracked children
+    /// bounded by `timeout`. Returns `true` when every child finished in time.
     pub async fn drain(&self, timeout: Duration) -> bool {
+        // Closing first serializes against `spawn`: a spawn already inside the
+        // read guard is tracked, and every later one is rejected.
+        *self
+            .closed
+            .write()
+            .expect("shutdown admission lock poisoned") = true;
         self.token.cancel();
         self.tracker.close();
         tokio::time::timeout(timeout, self.tracker.wait())
@@ -81,6 +102,23 @@ mod tests {
 
         assert!(shutdown.drain(Duration::from_secs(5)).await);
         assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    // A child admitted after the drain returned would write behind the seal.
+    #[tokio::test]
+    async fn rejects_late_spawn() {
+        let shutdown = Shutdown::new();
+        assert!(shutdown.drain(Duration::from_secs(5)).await);
+
+        let started = Arc::new(AtomicBool::new(false));
+        let child_started = started.clone();
+        shutdown.spawn(async move {
+            child_started.store(true, Ordering::SeqCst);
+        });
+
+        assert_eq!(shutdown.tracked_children(), 0);
+        tokio::task::yield_now().await;
+        assert!(!started.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
