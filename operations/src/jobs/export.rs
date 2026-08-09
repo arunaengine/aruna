@@ -1001,6 +1001,9 @@ fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {
         MetadataApiError::ServiceUnavailable => {
             ExportFailure::Retryable("metadata document is unavailable".to_string())
         }
+        MetadataApiError::PlacementUnavailable(error) => {
+            ExportFailure::Retryable(error.to_string())
+        }
         MetadataApiError::InvalidCursor(message) | MetadataApiError::Internal(message) => {
             ExportFailure::Retryable(message)
         }

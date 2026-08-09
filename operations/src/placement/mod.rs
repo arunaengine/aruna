@@ -216,12 +216,23 @@ pub(crate) fn resolve_holders_limit(
     placement: &PlacementRef,
     limit: usize,
 ) -> Vec<NodeId> {
+    holders_limit_checked(config, placement, limit).unwrap_or_default()
+}
+
+fn holders_limit_checked(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    limit: usize,
+) -> Result<Vec<NodeId>, PlacementResolveError> {
     if limit == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Some(strategy) = config.strategy(&placement.strategy_id) else {
-        return Vec::new();
-    };
+    let strategy =
+        config
+            .strategy(&placement.strategy_id)
+            .ok_or(PlacementResolveError::StrategyUnknown(
+                placement.strategy_id,
+            ))?;
     let target = limit.min(u32::MAX as usize) as u32;
     let mut bounded = strategy.clone();
     bounded.replica_count = Some(
@@ -229,12 +240,40 @@ pub(crate) fn resolve_holders_limit(
             .replica_count
             .map_or(target, |replicas| replicas.min(target)),
     );
-    let Ok(view) =
-        selection_epoch(config, placement).and_then(|epoch| view_for_epoch(config, epoch))
-    else {
-        return Vec::new();
-    };
-    resolve_shard_holders_from_view(config, &view, &bounded, placement)
+    let view = view_for_epoch(config, selection_epoch(config, placement)?)?;
+    Ok(resolve_shard_holders_from_view(
+        config, &view, &bounded, placement,
+    ))
+}
+
+/// Read fan-out for a bucket: its activated holders first, then every holder a
+/// transition still names for it, in rank order and deduped.
+///
+/// A bucket in flight has its history on the old set and, once a target has
+/// proved, on the new one; a bucket that just cut over may still be catching a
+/// reader up from an old holder. The transition record's own lifetime is that
+/// window - it is pruned only after the grace release - so no clock is read
+/// here. Writes deliberately do not union: authority is the activation alone.
+pub fn read_holder_sets(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+) -> Result<Vec<NodeId>, PlacementResolveError> {
+    let mut holders = holders_limit_checked(config, placement, MAX_READ_HOLDERS)?;
+    for transition in &config.placement_transitions {
+        if transition.plan.strategy_id != placement.strategy_id {
+            continue;
+        }
+        let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
+            continue;
+        };
+        for node_id in bucket.target_holders.iter().chain(&bucket.old_holders) {
+            if !holders.contains(node_id) {
+                holders.push(*node_id);
+            }
+        }
+    }
+    holders.truncate(MAX_READ_HOLDERS);
+    Ok(holders)
 }
 
 /// Candidate map epoch a bucket selects from. `None` while the realm has
@@ -895,6 +934,46 @@ mod tests {
         assert_eq!(first_empty_referenced_shard(&config), None);
         config.snapshot_candidate_map();
         assert!(first_empty_referenced_shard(&config).is_some());
+    }
+
+    #[test]
+    fn read_union_spans_transition() {
+        // Readers must reach both sides of a bucket in flight; writers must not.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let activated = resolve_shard_holders(&config, &placement);
+        assert_eq!(read_holder_sets(&config, &placement), Ok(activated.clone()));
+
+        let targets: Vec<NodeId> = (5..=6u8).map(node).collect();
+        config
+            .placement_transitions
+            .push(aruna_core::structs::PlacementTransition::new(
+                aruna_core::structs::TransitionPlan {
+                    transition_id: Ulid::from_bytes([7; 16]),
+                    strategy_id: placement.strategy_id,
+                    buckets: vec![aruna_core::structs::BucketPlan {
+                        bucket: placement.shard,
+                        old_holders: activated.clone(),
+                        target_holders: targets.clone(),
+                    }],
+                    target_map_epoch: 2,
+                    limits: Default::default(),
+                    created_by: node(1),
+                    created_at_ms: 1,
+                },
+            ));
+
+        let union = read_holder_sets(&config, &placement).expect("bucket resolves");
+        assert_eq!(union[..activated.len()], activated[..]);
+        for target in &targets {
+            assert!(union.contains(target));
+        }
+        assert_eq!(union.len(), activated.len() + targets.len());
+        // Write authority stays the activation alone.
+        assert_eq!(resolve_shard_holders(&config, &placement), activated);
+        for target in &targets {
+            assert!(!holds_placement(&config, &placement, *target));
+        }
     }
 
     #[test]

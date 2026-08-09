@@ -99,6 +99,10 @@ pub enum MetadataApiError {
     NotFound,
     #[error("service unavailable")]
     ServiceUnavailable,
+    /// The bucket has no usable activation, so the request cannot be routed.
+    /// Never absence: no holder was resolved to answer it.
+    #[error("placement unavailable: {0}")]
+    PlacementUnavailable(crate::placement::PlacementResolveError),
     #[error("{0}")]
     InvalidCursor(String),
     #[error("{0}")]
