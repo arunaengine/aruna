@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn release_waits_out_the_grace() {
+    fn release_awaits_grace() {
         let mut transition = PlacementTransition::new(plan());
         transition.plan.limits.grace_ms = 100;
         assert!(

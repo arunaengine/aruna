@@ -31,7 +31,7 @@ const REPLICATION_FACTOR: u32 = 3;
 const SHARD_COUNT: u32 = 4;
 
 #[tokio::test]
-async fn expansion_hands_buckets_to_the_joiner() -> TestResult<()> {
+async fn expansion_hands_buckets() -> TestResult<()> {
     let mut realm = Topology::spawn_sharded(
         MANAGEMENT_NODES,
         USER_NODES,

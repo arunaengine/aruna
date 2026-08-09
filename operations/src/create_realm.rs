@@ -977,7 +977,7 @@ mod test {
     // The creator's own view is activated at realm creation, through the
     // reducer: a literal activation could never advance with a transition.
     #[test]
-    fn seeds_an_activated_first_map() {
+    fn seeds_activated_map() {
         let realm_id = RealmId::from_bytes([27; 32]);
         let actor = actor(realm_id, 3, 4);
         let txn_id = TxnId::generate();

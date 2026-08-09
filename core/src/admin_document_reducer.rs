@@ -788,13 +788,13 @@ fn overlay_placement_transitions(
             config.placement_activations.push(activation);
         }
     }
-    retain_referenced_candidate_maps(config);
+    retain_referenced_maps(config);
 }
 
 /// Drops maps nothing can select from any more: no activation names them, no
 /// retained transition targets them, and they are not the newest - which the
 /// next transition would target.
-fn retain_referenced_candidate_maps(config: &mut RealmConfigDocument) {
+fn retain_referenced_maps(config: &mut RealmConfigDocument) {
     let Some(newest) = config.newest_map_epoch() else {
         return;
     };
@@ -7606,7 +7606,65 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_every_advance() {
+    fn late_proof_completes() {
+        // A proof that lands after the abort completes its bucket anyway:
+        // reduction cannot depend on arrival order, so an abort stops the
+        // executors rather than un-making a hand-off every target proved.
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let abort = realm_config_event(
+            81,
+            node(1),
+            6,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTransitionAborted {
+                transition_id: plan.transition_id,
+            },
+        );
+        let completion = completion_events(&plan);
+        let mut interleaved = realm_config_state();
+        for event in transition_events(&plan)
+            .iter()
+            .chain(completion.iter().take(3))
+            .chain(std::iter::once(&abort))
+            .chain(completion.iter().skip(3))
+        {
+            interleaved.apply(event).unwrap();
+        }
+
+        let config = transition_config(&interleaved);
+        let transition = &config.placement_transitions[0];
+        assert!(matches!(transition.status, TransitionStatus::Aborted));
+        assert!(transition.completion(0).is_some());
+        assert_eq!(
+            config
+                .activation(&plan.strategy_id, 0)
+                .expect("bucket 0")
+                .candidate_map_epoch,
+            2
+        );
+
+        // The bucket the abort caught mid-flight keeps its old activation.
+        assert_eq!(
+            config
+                .activation(&plan.strategy_id, 1)
+                .expect("bucket 1")
+                .candidate_map_epoch,
+            1
+        );
+
+        let mut abort_last = realm_config_state();
+        for event in transition_events(&plan)
+            .iter()
+            .chain(completion.iter())
+            .chain(std::iter::once(&abort))
+        {
+            abort_last.apply(event).unwrap();
+        }
+        assert_eq!(transition_config(&abort_last), config);
+    }
+
+    #[test]
+    fn prune_keeps_advances() {
         // Dropping a released record must not drop what it moved: activations
         // are replayed from the whole reduced chain, so a fold that skipped the
         // pruned record would silently regress the bucket to its old map.
@@ -7697,7 +7755,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_drops_unreferenced_maps() {
+    fn drops_unreferenced_maps() {
         // A map no activation selects from and no retained transition targets
         // is unreachable - unless it is the newest, which the next transition
         // would name.

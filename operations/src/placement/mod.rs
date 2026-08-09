@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_holder_sets() {
+    fn prune_keeps_holders() {
         // Dropping a released record must leave every bucket exactly where the
         // transition put it: the fold that advances activations replays the
         // whole reduced chain, pruned records included.

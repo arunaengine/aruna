@@ -34,7 +34,7 @@ const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
 
 #[tokio::test]
-async fn turnover_moves_one_holder() -> TestResult<()> {
+async fn turnover_moves_holder() -> TestResult<()> {
     let mut realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let leaver = realm.node(0).node_id();

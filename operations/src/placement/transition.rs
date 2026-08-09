@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_needs_a_superset() {
+    fn expansion_needs_superset() {
         let (config, everywhere, capped) = seeded();
         assert_eq!(
             expansion_buckets(&config, everywhere, 2).unwrap(),
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn health_counts_stalls_and_overdue() {
+    fn health_counts_stalls() {
         let (mut config, everywhere, _) = seeded();
         assert_eq!(
             transition_health(&config, u64::MAX),
