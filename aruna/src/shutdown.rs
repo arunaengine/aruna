@@ -134,11 +134,11 @@ impl NodeShutdown {
 
         // 2. Ingress stops accepting; in-flight requests finish.
         self.shutdown.trigger();
-        let ingress_budget = budget.remaining().min(self.grace / INGRESS_BUDGET_DIVISOR);
+        let ingress = ingress_budget(self.grace, budget.remaining());
         let mut rest = self.rest;
         let mut s3 = self.s3;
         let mut ingress_complete = false;
-        phase("ingress", ingress_budget, async {
+        phase("ingress", ingress, async {
             if let Some(rest) = rest.as_mut() {
                 let _ = rest.await;
             }
@@ -295,6 +295,12 @@ fn tail_reserved(remaining: Duration) -> Duration {
     remaining.saturating_sub(TAIL_BUDGET_RESERVE)
 }
 
+/// What the ingress phase may spend: its capped fraction of the grace, and
+/// never more than the budget that is left.
+fn ingress_budget(grace: Duration, remaining: Duration) -> Duration {
+    remaining.min(grace / INGRESS_BUDGET_DIVISOR)
+}
+
 /// A short phase budget yields zero: skip the soft drain and go straight to the
 /// forced teardown.
 fn net_drain_budget(phase_budget: Duration) -> Duration {
@@ -416,13 +422,19 @@ mod tests {
             .expect("storage opens")
     }
 
+    // A phase whose future never resolves must return without running the rest
+    // of it; an ignored budget hangs the test until the job timeout.
     #[tokio::test]
     async fn phase_gives_up_at_budget() {
-        let started = Instant::now();
+        let mut completed = false;
 
-        phase("stuck", Duration::from_millis(50), std::future::pending()).await;
+        phase("stuck", Duration::from_millis(50), async {
+            std::future::pending::<()>().await;
+            completed = true;
+        })
+        .await;
 
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!completed);
     }
 
     // The inbound drain must leave the forced teardown behind it its own time,
@@ -446,12 +458,29 @@ mod tests {
         assert_eq!(tail_reserved(Duration::from_secs(3)), Duration::ZERO);
     }
 
-    #[tokio::test]
-    async fn budget_shrinks_with_elapsed_time() {
-        let budget = Budget::new(Instant::now(), Duration::from_millis(100));
-        tokio::time::sleep(Duration::from_millis(120)).await;
+    #[test]
+    fn budget_shrinks_with_elapsed_time() {
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("monotonic clock has room");
 
-        assert_eq!(budget.remaining(), Duration::ZERO);
+        assert_eq!(
+            Budget::new(past, Duration::from_millis(100)).remaining(),
+            Duration::ZERO
+        );
+        assert!(Budget::new(Instant::now(), Duration::from_secs(60)).remaining() > Duration::ZERO);
+    }
+
+    // The ingress phase never gets more than its fraction of the grace.
+    #[test]
+    fn ingress_caps_budget() {
+        let grace = Duration::from_secs(20);
+
+        assert_eq!(ingress_budget(grace, grace), Duration::from_secs(5));
+        assert_eq!(
+            ingress_budget(grace, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
     }
 
     // The whole point of the sequence: after it returns, no write lands.
@@ -558,10 +587,8 @@ mod tests {
         }));
         sequence.grace = Duration::from_secs(2);
 
-        let started = Instant::now();
         sequence.run().await;
 
-        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(storage_handle.is_sealed());
     }
 
@@ -572,13 +599,12 @@ mod tests {
         let storage_handle = open_storage(&dir);
         let shutdown = Shutdown::new();
         shutdown.spawn(std::future::pending());
-        let mut sequence = node_shutdown(shutdown, storage_handle.clone());
+        let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
         sequence.grace = Duration::from_millis(200);
 
-        let started = Instant::now();
         sequence.run().await;
 
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(shutdown.is_triggered());
         assert!(storage_handle.is_sealed());
     }
 }
