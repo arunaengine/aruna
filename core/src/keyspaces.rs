@@ -41,6 +41,9 @@ pub const DOCUMENT_SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const DOCUMENT_SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
 /// Durable store for permanently-invalid replicated sync events (#338).
 pub const SYNC_QUARANTINE_KEYSPACE: &str = "sync_quarantine";
+/// Single-row record/byte accounting for the quarantine store, written in the
+/// same batch as every quarantine row write and prune delete.
+pub const SYNC_QUARANTINE_USAGE_KEYSPACE: &str = "sync_quarantine_usage";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
 pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
