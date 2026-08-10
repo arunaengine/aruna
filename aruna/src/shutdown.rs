@@ -241,7 +241,9 @@ impl NodeShutdown {
         let storage_drain =
             tail_reserved(budget.remaining(), tail_reserve, 1).min(TAIL_BUDGET_RESERVE);
         if !self.storage_handle.drain_accepted(storage_drain).await {
-            warn!("Accepted storage mutations outlived the shutdown drain");
+            // Undrained work must not commit behind the final fsync.
+            self.storage_handle.fence_mutations();
+            warn!("Accepted storage mutations outlived the shutdown drain; mutations fenced");
         }
         if let Err(error) = self.storage_handle.sync_all().await {
             error!(error = %error, "Failed to sync storage during shutdown");
