@@ -30,6 +30,7 @@ use crate::harvest::repository::{
     write_source_effect,
 };
 use crate::jobs::executor::{JobContext, JobRunOutcome};
+use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
@@ -626,11 +627,14 @@ fn read_failure(error: StorageReadError) -> HarvestFailure {
 }
 
 fn apply_failure(error: MetadataWriteError) -> HarvestFailure {
-    match error {
-        MetadataWriteError::Undeliverable(message) => {
-            retryable(format!("harvest apply undeliverable: {message}"))
+    match classify_metadata(error) {
+        MetadataFailure::Retryable(message) => retryable(format!("harvest apply: {message}")),
+        MetadataFailure::Permanent(message) => {
+            permanent(format!("harvest apply failed: {message}"))
         }
-        other => permanent(format!("harvest apply failed: {other}")),
+        MetadataFailure::Validation(violations) => permanent(format!(
+            "harvest record rejected by validation: {violations:?}"
+        )),
     }
 }
 

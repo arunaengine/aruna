@@ -29,7 +29,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE};
-use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
+use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
@@ -57,10 +57,11 @@ use self::archive::{
 use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
+use super::metadata_class::MetadataFailure;
 use super::store::{list_job_entries, put_job_entry, put_rocrate_checkpoint, put_rocrate_plan};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload,
 };
 use crate::driver::{bucket_snapshot, drive};
@@ -1788,26 +1789,11 @@ fn permanent_staging(error: &StagingSourceError) -> bool {
 /// A rejected document never becomes acceptable by retrying, so it is reported
 /// as violations and rolled back instead of burning the remaining attempts.
 fn classify_metadata(error: MetadataWriteError) -> ImportFailure {
-    match error {
-        MetadataWriteError::Create(CreateMetadataDocumentError::MetadataError(
-            MetadataError::Validation(violations),
-        )) => ImportFailure::Validation(violations),
-        MetadataWriteError::Create(CreateMetadataDocumentError::MetadataError(
-            MetadataError::InvalidInput(message),
-        )) => ImportFailure::Permanent(message),
-        error if metadata_is_transient(&error) => ImportFailure::Retryable(error.to_string()),
-        error => ImportFailure::Permanent(error.to_string()),
+    match crate::jobs::metadata_class::classify_metadata(error) {
+        MetadataFailure::Validation(violations) => ImportFailure::Validation(violations),
+        MetadataFailure::Permanent(message) => ImportFailure::Permanent(message),
+        MetadataFailure::Retryable(message) => ImportFailure::Retryable(message),
     }
-}
-
-fn metadata_is_transient(error: &MetadataWriteError) -> bool {
-    matches!(
-        error,
-        MetadataWriteError::Create(
-            CreateMetadataDocumentError::StorageError(_)
-                | CreateMetadataDocumentError::MetadataError(_)
-        ) | MetadataWriteError::Undeliverable(_)
-    )
 }
 
 fn phase_name(phase: ImportPhase) -> &'static str {
