@@ -3,8 +3,10 @@ use std::future::Future;
 use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandle;
+use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
 use aruna_core::structs::{
     Actor, AuthContext, HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance,
     HarvestRecordState, HarvestSource, IncomingRecord, JobError, JobResultPayload,
@@ -12,6 +14,7 @@ use aruna_core::structs::{
 };
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
+use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::create_metadata_document::{
@@ -285,20 +288,7 @@ async fn apply_record(
             counts.updated += 1;
         }
         ProvenanceDecision::Tombstone { meta_resource_id } => {
-            if let Some(stored) = load_metadata_record_by_document(&ctx.driver, meta_resource_id)
-                .await
-                .map_err(|error| retryable(format!("harvest record read: {error:?}")))?
-            {
-                delete_metadata_document_routed(
-                    &ctx.driver,
-                    actor.clone(),
-                    Some(&stored),
-                    meta_resource_id,
-                    Some(internal_token(source.created_by, realm_id)),
-                )
-                .await
-                .map_err(apply_failure)?;
-            }
+            confirm_withdrawn(ctx, source, actor, realm_id, meta_resource_id).await?;
             row.meta_resource_id = meta_resource_id;
             row.state = HarvestRecordState::Tombstoned;
             write_provenance(ctx, &row).await?;
@@ -306,6 +296,69 @@ async fn apply_record(
         }
     }
     Ok(())
+}
+
+/// Prove the harvested document is gone before its provenance may go terminal.
+///
+/// An empty local registry read is not evidence of absence: the row is a
+/// projection of a create that may still be queued here, and a `Tombstoned` row
+/// written over that race would leave the document live forever. Only a routed
+/// delete that succeeds, or one every holder answers as already absent, retires
+/// the identity; anything else is retryable and keeps the prior state.
+async fn confirm_withdrawn(
+    ctx: &JobContext,
+    source: &HarvestSource,
+    actor: &Actor,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> Result<(), HarvestFailure> {
+    let stored = load_metadata_record_by_document(&ctx.driver, document_id)
+        .await
+        .map_err(|error| retryable(format!("harvest record read: {error:?}")))?;
+    if stored.is_none() && projection_pending(ctx, document_id).await? {
+        return Err(retryable(format!(
+            "harvest deletion waits for the pending registry projection of {document_id}"
+        )));
+    }
+    match delete_metadata_document_routed(
+        &ctx.driver,
+        actor.clone(),
+        stored.as_ref(),
+        document_id,
+        Some(internal_token(source.created_by, realm_id)),
+    )
+    .await
+    {
+        // Every holder reporting the document absent is the same evidence as a
+        // delete this run performed.
+        Ok(()) | Err(MetadataWriteError::NotFound) => Ok(()),
+        Err(error) => Err(apply_failure(error)),
+    }
+}
+
+/// Whether a committed metadata event for this document is still waiting to be
+/// projected into the local registry.
+async fn projection_pending(ctx: &JobContext, document_id: Ulid) -> Result<bool, HarvestFailure> {
+    let event = ctx
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: Some(ByteView::from(document_id.to_bytes().to_vec())),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
+        Event::Storage(StorageEvent::Error { error }) => Err(retryable(format!(
+            "harvest pending projection scan: {error}"
+        ))),
+        other => Err(retryable(format!(
+            "harvest pending projection scan: unexpected {other:?}"
+        ))),
+    }
 }
 
 /// Allocate a structured document id, record it as `PendingCreate` before the
