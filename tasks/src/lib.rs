@@ -722,10 +722,10 @@ impl TaskHandle {
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
     }
 
-    /// Stops admitting timer handlers, waits up to `drain` for the ones already
-    /// running, then aborts whatever is left. Pending timers are durable, so an
-    /// undrained handler is retried on the next boot rather than lost.
-    pub async fn shutdown(&self, drain: Duration) -> TaskShutdownReport {
+    /// Drops the inbound handler and every pending timer so no further handler
+    /// starts, and reports how many are still running. `None` means the
+    /// scheduler is already gone. Repeat calls are harmless.
+    pub async fn close_admission(&self) -> Option<usize> {
         let (response, stopped) = oneshot::channel();
         if self
             .command_tx
@@ -733,12 +733,21 @@ impl TaskHandle {
             .await
             .is_err()
         {
+            return None;
+        }
+        Some(stopped.await.unwrap_or(0))
+    }
+
+    /// Stops admitting timer handlers, waits up to `drain` for the ones already
+    /// running, then aborts whatever is left. Pending timers are durable, so an
+    /// undrained handler is retried on the next boot rather than lost.
+    pub async fn shutdown(&self, drain: Duration) -> TaskShutdownReport {
+        let Some(in_flight) = self.close_admission().await else {
             return TaskShutdownReport {
                 in_flight: 0,
                 aborted: 0,
             };
-        }
-        let in_flight = stopped.await.unwrap_or(0);
+        };
         if in_flight == 0 {
             return TaskShutdownReport {
                 in_flight: 0,
@@ -1268,6 +1277,36 @@ mod tests {
 
         let report = handle.shutdown(Duration::from_secs(1)).await;
         assert_eq!(report.in_flight, 0);
+
+        fire_timer(&handle, key.clone()).await;
+        let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers { key }))
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    // Admission closes on its own, before any drain wait: a timer that fires
+    // afterwards finds no handler even though nothing was waited on.
+    #[tokio::test]
+    async fn close_stops_handlers() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate,
+            }))
+            .await;
+        assert_eq!(handle.close_admission().await, Some(0));
 
         fire_timer(&handle, key.clone()).await;
         let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle

@@ -1381,6 +1381,13 @@ impl NetHandle {
         self.shutdown_with_drain(DEFAULT_INBOUND_DRAIN).await;
     }
 
+    /// Stops accepting inbound streams and rejects further inbound handlers,
+    /// without waiting for the ones in flight or tearing the endpoint down.
+    pub fn close_admission(&self) {
+        self.inner.accept_shutdown.cancel();
+        self.inner.inbound_tasks.close();
+    }
+
     /// Stops inbound admission, gives handlers that are already running up to
     /// `drain` to finish while the endpoint is still usable, then tears the
     /// network down and joins every child.
@@ -1389,8 +1396,7 @@ impl NetHandle {
             return false;
         }
 
-        self.inner.accept_shutdown.cancel();
-        self.inner.inbound_tasks.close();
+        self.close_admission();
         if tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
             .await
             .is_err()
@@ -3224,6 +3230,21 @@ mod tests {
         assert!(handle.inner.shutdown.is_cancelled());
         assert!(handle.inner.accept_shutdown.is_cancelled());
         assert!(handle.inner.tasks.lock().await.is_empty());
+        Ok(())
+    }
+
+    // Admission closes on its own, so a net phase left with no drain budget
+    // still stops accepting inbound streams.
+    #[tokio::test]
+    async fn close_stops_accept() -> Result<()> {
+        let (handle, _dir) = test_net_handle().await?;
+
+        handle.close_admission();
+
+        assert!(handle.inner.accept_shutdown.is_cancelled());
+        assert!(handle.inner.inbound_tasks.is_closed());
+        assert!(!handle.inner.shutdown.is_cancelled());
+        handle.shutdown().await;
         Ok(())
     }
 

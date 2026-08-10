@@ -332,13 +332,20 @@ impl JobsRuntime {
         true
     }
 
+    /// Stops claiming further jobs and cancels the running ones, without
+    /// waiting for them or handing their leases back.
+    pub fn close_admission(&self) {
+        self.state().draining = true;
+        self.shutdown.cancel();
+    }
+
     /// Stop claiming, signal the jobs in flight, and give them `grace` to wind down.
     /// Whatever is still running then has its lease handed back, so a restart costs a
     /// job no attempt. Storage must outlive this call: releasing a lease writes.
     pub async fn shutdown(&self, storage: &StorageHandle, grace: Duration) -> JobShutdownReport {
+        self.close_admission();
         let waiters: Vec<_> = {
-            let mut state = self.state();
-            state.draining = true;
+            let state = self.state();
             state
                 .running
                 .iter()
@@ -352,7 +359,6 @@ impl JobsRuntime {
                 })
                 .collect()
         };
-        self.shutdown.cancel();
 
         let deadline = Instant::now() + grace;
         let mut report = JobShutdownReport::default();
@@ -960,6 +966,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         (dir, storage)
+    }
+
+    // Admission closes on its own, before the drain spends any budget.
+    #[test]
+    fn close_stops_claims() {
+        let runtime = JobsRuntime::new();
+        assert!(runtime.available_slots() > 0);
+
+        runtime.close_admission();
+
+        assert_eq!(runtime.available_slots(), 0);
+        assert!(runtime.shutdown.is_cancelled());
     }
 
     #[tokio::test]

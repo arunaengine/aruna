@@ -64,17 +64,24 @@ impl Shutdown {
         self.tracker.len()
     }
 
-    /// Closes admission, triggers cancellation, then waits for tracked children
-    /// bounded by `timeout`. Returns `true` when every child finished in time.
-    pub async fn drain(&self, timeout: Duration) -> bool {
-        // Closing first serializes against `spawn`: a spawn already inside the
-        // read guard is tracked, and every later one is rejected.
+    /// Rejects further children and cancels the ones already running, without
+    /// waiting for them. Runs before the drain so no child can start while an
+    /// earlier shutdown phase is still spending its budget.
+    pub fn close_admission(&self) {
+        // Closing serializes against `spawn`: a spawn already inside the read
+        // guard is tracked, and every later one is rejected.
         *self
             .closed
             .write()
             .expect("shutdown admission lock poisoned") = true;
         self.token.cancel();
         self.tracker.close();
+    }
+
+    /// Closes admission, triggers cancellation, then waits for tracked children
+    /// bounded by `timeout`. Returns `true` when every child finished in time.
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        self.close_admission();
         tokio::time::timeout(timeout, self.tracker.wait())
             .await
             .is_ok()
@@ -114,6 +121,25 @@ mod tests {
             child_started.store(true, Ordering::SeqCst);
         });
 
+        assert_eq!(shutdown.tracked_children(), 0);
+        tokio::task::yield_now().await;
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
+    // Admission closes before any phase waits, so a zero-budget drain still
+    // cannot let a child start behind it.
+    #[tokio::test]
+    async fn close_rejects_spawn() {
+        let shutdown = Shutdown::new();
+        shutdown.close_admission();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let child_started = started.clone();
+        shutdown.spawn(async move {
+            child_started.store(true, Ordering::SeqCst);
+        });
+
+        assert!(shutdown.is_triggered());
         assert_eq!(shutdown.tracked_children(), 0);
         tokio::task::yield_now().await;
         assert!(!started.load(Ordering::SeqCst));

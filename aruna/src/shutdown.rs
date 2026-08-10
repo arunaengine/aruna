@@ -23,17 +23,25 @@ use tracing::{error, info, warn};
 /// Total budget for the ordered sequence. Kubernetes sends SIGKILL after
 /// `terminationGracePeriodSeconds` (30s by default), so stay clear of it.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+/// Smallest configured grace that still funds the protected tail: ingress may
+/// take a quarter of the budget, leaving the full twelve seconds behind it.
+pub const MIN_SHUTDOWN_GRACE: Duration = Duration::from_secs(16);
 /// Extra time the watchdog allows before it stops trusting the sequence.
 const WATCHDOG_MARGIN: Duration = Duration::from_secs(5);
 /// The ingress phase gets at most this fraction of the grace budget, preventing
 /// an unfinished response from starving later phases down to hard aborts.
 const INGRESS_BUDGET_DIVISOR: u32 = 4;
-/// Minimum time every draining phase leaves for the phases behind it, so a
-/// stuck child cannot consume the budget the network, metadata, blob and
-/// storage phases need to close cleanly.
-const TAIL_BUDGET_RESERVE: Duration = Duration::from_secs(5);
-/// Equal shares in the collective tail reserve.
-const TAIL_PHASE_COUNT: u32 = 4;
+/// Protected slices for the phases that close the node down. Each is both the
+/// most its phase may spend and the floor every earlier phase leaves it; time a
+/// phase does not use carries forward to the final sync.
+const NET_SLICE: Duration = Duration::from_secs(7);
+const METADATA_SLICE: Duration = Duration::from_secs(1);
+const BLOB_SLICE: Duration = Duration::from_secs(2);
+const STORAGE_SLICE: Duration = Duration::from_secs(2);
+/// What the writer phases must leave untouched: every protected slice together.
+const TAIL_RESERVE: Duration = Duration::from_secs(
+    NET_SLICE.as_secs() + METADATA_SLICE.as_secs() + BLOB_SLICE.as_secs() + STORAGE_SLICE.as_secs(),
+);
 /// Time reserved for net teardown after the forced inbound join, preventing the
 /// outer phase timeout from dropping teardown work.
 const NET_TEARDOWN_MARGIN: Duration = Duration::from_secs(2);
@@ -42,17 +50,24 @@ const FORCED_EXIT_CODE: i32 = 75;
 
 pub fn shutdown_grace_env() -> Duration {
     match dotenvy::var("ARUNA_SHUTDOWN_GRACE_SECS") {
-        Ok(value) => match value.trim().parse::<u64>() {
-            Ok(secs) if secs > 0 => Duration::from_secs(secs),
-            _ => {
-                warn!(
-                    value = %value,
-                    "Ignoring invalid ARUNA_SHUTDOWN_GRACE_SECS; using the default"
-                );
-                DEFAULT_SHUTDOWN_GRACE
-            }
-        },
+        Ok(value) => parse_grace(&value),
         Err(_) => DEFAULT_SHUTDOWN_GRACE,
+    }
+}
+
+/// A grace below `MIN_SHUTDOWN_GRACE` cannot fund the protected tail, so it is
+/// rejected like any other invalid value and the default applies.
+fn parse_grace(value: &str) -> Duration {
+    match value.trim().parse::<u64>().map(Duration::from_secs) {
+        Ok(grace) if grace >= MIN_SHUTDOWN_GRACE => grace,
+        _ => {
+            warn!(
+                value = %value,
+                minimum_secs = MIN_SHUTDOWN_GRACE.as_secs(),
+                "Ignoring invalid ARUNA_SHUTDOWN_GRACE_SECS; using the default"
+            );
+            DEFAULT_SHUTDOWN_GRACE
+        }
     }
 }
 
@@ -140,16 +155,21 @@ impl NodeShutdown {
                 let _ = s3.await;
             }
         }
-        let tail_reserve = budget.remaining().min(TAIL_BUDGET_RESERVE);
 
-        // 3. Timer handlers drain while the network still works.
+        // 3. Every writer stops admitting before any of them is waited on: a
+        //    phase that runs out of budget must not leave one still accepting.
+        self.task_handle.close_admission().await;
+        self.jobs_runtime.close_admission();
+        self.shutdown.close_admission();
+        if let Some(net_handle) = self.net_handle.as_ref() {
+            net_handle.close_admission();
+        }
+        info!("Shutdown: writer admission closed");
+
+        // 4. Timer handlers drain while the network still works.
         let report = self
             .task_handle
-            .shutdown(tail_reserved(
-                budget.remaining(),
-                tail_reserve,
-                TAIL_PHASE_COUNT,
-            ))
+            .shutdown(writer_budget(budget.remaining()))
             .await;
         info!(
             in_flight = report.in_flight,
@@ -157,8 +177,8 @@ impl NodeShutdown {
             "Shutdown: task scheduler drained"
         );
 
-        // 4. Job workers write storage: drain them before the seal.
-        let job_budget = tail_reserved(budget.remaining(), tail_reserve, TAIL_PHASE_COUNT);
+        // 5. Job workers write storage: drain them before the seal.
+        let job_budget = writer_budget(budget.remaining());
         let job_grace = JOB_SHUTDOWN_GRACE.min(job_budget);
         let mut job_report = None;
         phase("jobs", job_budget, async {
@@ -173,9 +193,9 @@ impl NodeShutdown {
             info!(?job_report, "Shutdown: job runtime drained");
         }
 
-        // 5. Background children write metadata and storage: join them.
+        // 6. Background children write metadata and storage: join them.
         let mut background_drained = false;
-        let background_budget = tail_reserved(budget.remaining(), tail_reserve, TAIL_PHASE_COUNT);
+        let background_budget = writer_budget(budget.remaining());
         phase("background", background_budget, async {
             background_drained = self.shutdown.drain(background_budget).await;
         })
@@ -187,10 +207,14 @@ impl NodeShutdown {
             );
         }
 
-        // 6. Network last among the writers: its eviction path re-emits
+        // 7. Network last among the writers: its eviction path re-emits
         //    documents through the inbound handler.
         if let Some(net_handle) = self.net_handle.as_ref() {
-            let phase_budget = tail_reserved(budget.remaining(), tail_reserve, TAIL_PHASE_COUNT);
+            let phase_budget = phase_slice(
+                budget.remaining(),
+                METADATA_SLICE + BLOB_SLICE + STORAGE_SLICE,
+                NET_SLICE,
+            );
             let mut net_shutdown_complete = false;
             phase("net", phase_budget, async {
                 net_shutdown_complete = net_handle
@@ -207,11 +231,15 @@ impl NodeShutdown {
             }
         }
 
-        // 7. Flush the metadata store.
+        // 8. Flush the metadata store.
         if let Some(metadata_handle) = self.metadata_handle.as_ref() {
             phase(
                 "metadata",
-                tail_reserved(budget.remaining(), tail_reserve, 3),
+                phase_slice(
+                    budget.remaining(),
+                    BLOB_SLICE + STORAGE_SLICE,
+                    METADATA_SLICE,
+                ),
                 async {
                     if let Err(error) = metadata_handle.flush_persistence().await {
                         error!(error = %error, "Failed to flush metadata persistence during shutdown");
@@ -221,12 +249,11 @@ impl NodeShutdown {
             .await;
         }
 
-        // 8. Seal blob writes, then drain the ones registered before the seal so
+        // 9. Seal blob writes, then drain the ones registered before the seal so
         //    their storage locations land before storage closes.
         let blob_rejected = if let Some(blob_handle) = self.blob_handle.as_ref() {
             blob_handle.seal();
-            let blob_drain =
-                tail_reserved(budget.remaining(), tail_reserve, 2).min(TAIL_BUDGET_RESERVE);
+            let blob_drain = phase_slice(budget.remaining(), STORAGE_SLICE, BLOB_SLICE);
             if !blob_handle.drain_writes(blob_drain).await {
                 warn!("Blob writes outlived the shutdown drain");
             }
@@ -235,11 +262,10 @@ impl NodeShutdown {
             0
         };
 
-        // 9. Seal the write path, then drain the mutations accepted before the
-        //    seal so they commit ahead of the fsync.
+        // 10. Seal the write path, then drain the mutations accepted before the
+        //     seal so they commit ahead of the fsync.
         self.storage_handle.seal();
-        let storage_drain =
-            tail_reserved(budget.remaining(), tail_reserve, 1).min(TAIL_BUDGET_RESERVE);
+        let storage_drain = phase_slice(budget.remaining(), Duration::ZERO, STORAGE_SLICE);
         if !self.storage_handle.drain_accepted(storage_drain).await {
             // Undrained work must not commit behind the final fsync.
             self.storage_handle.fence_mutations();
@@ -286,10 +312,16 @@ impl Budget {
     }
 }
 
-/// What a draining phase may spend: the remaining budget minus the floor the
-/// phases behind it need.
-fn tail_reserved(remaining: Duration, reserve: Duration, phases: u32) -> Duration {
-    remaining.saturating_sub(reserve.saturating_mul(phases) / TAIL_PHASE_COUNT)
+/// What a protected phase may spend: never into the slices reserved for the
+/// phases behind it, and never more than its own slice.
+fn phase_slice(remaining: Duration, later_reserves: Duration, slice: Duration) -> Duration {
+    remaining.saturating_sub(later_reserves).min(slice)
+}
+
+/// What a writer phase may spend: everything except the protected tail. Purely
+/// best-effort, since admission is already closed when this reaches zero.
+fn writer_budget(remaining: Duration) -> Duration {
+    remaining.saturating_sub(TAIL_RESERVE)
 }
 
 /// What the ingress phase may spend: its capped fraction of the grace, and
@@ -410,7 +442,7 @@ mod tests {
             blob_handle: None,
             storage_handle,
             ops: None,
-            grace: Duration::from_secs(5),
+            grace: MIN_SHUTDOWN_GRACE,
         }
     }
 
@@ -445,44 +477,72 @@ mod tests {
         assert_eq!(net_drain_budget(Duration::from_secs(1)), Duration::ZERO);
     }
 
-    // Every phase leaves its share of the available tail reserve.
+    // At the smallest configured grace every protected phase still gets its
+    // whole slice, and the writers get what the tail does not claim.
     #[test]
-    fn phases_reserve_tail() {
-        let full_reserve = Duration::from_secs(5);
-        let short_reserve = Duration::from_secs(3);
+    fn slices_protect_tail() {
+        // Worst case at each grace: ingress burned its whole quarter and every
+        // phase then spends everything it is allowed.
+        for grace in [MIN_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_GRACE] {
+            let mut remaining = grace - grace / INGRESS_BUDGET_DIVISOR;
+            let writers = writer_budget(remaining);
+            assert_eq!(writers, remaining - TAIL_RESERVE);
+            remaining -= writers;
+            assert_eq!(remaining, TAIL_RESERVE);
 
+            let net = phase_slice(
+                remaining,
+                METADATA_SLICE + BLOB_SLICE + STORAGE_SLICE,
+                NET_SLICE,
+            );
+            assert_eq!(net, NET_SLICE);
+            remaining -= net;
+            let metadata = phase_slice(remaining, BLOB_SLICE + STORAGE_SLICE, METADATA_SLICE);
+            assert_eq!(metadata, METADATA_SLICE);
+            remaining -= metadata;
+            let blob = phase_slice(remaining, STORAGE_SLICE, BLOB_SLICE);
+            assert_eq!(blob, BLOB_SLICE);
+            remaining -= blob;
+            assert_eq!(
+                phase_slice(remaining, Duration::ZERO, STORAGE_SLICE),
+                STORAGE_SLICE
+            );
+        }
+        // Time an earlier phase did not spend carries forward but never widens
+        // a later slice.
         assert_eq!(
-            tail_reserved(Duration::from_secs(20), full_reserve, 4),
-            Duration::from_secs(15)
+            phase_slice(Duration::from_secs(30), Duration::ZERO, STORAGE_SLICE),
+            STORAGE_SLICE
         );
+    }
+
+    // A programmatically shortened budget saturates instead of underflowing.
+    #[test]
+    fn slices_saturate_short() {
+        assert_eq!(writer_budget(Duration::from_secs(3)), Duration::ZERO);
         assert_eq!(
-            tail_reserved(Duration::from_secs(20), full_reserve, 3),
-            Duration::from_millis(16_250)
-        );
-        assert_eq!(
-            tail_reserved(Duration::from_secs(20), full_reserve, 2),
-            Duration::from_millis(17_500)
-        );
-        assert_eq!(
-            tail_reserved(Duration::from_secs(20), full_reserve, 1),
-            Duration::from_millis(18_750)
-        );
-        assert_eq!(
-            tail_reserved(Duration::from_secs(3), short_reserve, 4),
+            phase_slice(Duration::from_secs(3), TAIL_RESERVE, NET_SLICE),
             Duration::ZERO
         );
         assert_eq!(
-            tail_reserved(Duration::from_secs(3), short_reserve, 3),
-            Duration::from_millis(750)
+            phase_slice(Duration::from_millis(500), STORAGE_SLICE, BLOB_SLICE),
+            Duration::ZERO
         );
         assert_eq!(
-            tail_reserved(Duration::from_millis(2_250), short_reserve, 2),
-            Duration::from_millis(750)
+            phase_slice(Duration::from_millis(500), Duration::ZERO, STORAGE_SLICE),
+            Duration::from_millis(500)
         );
-        assert_eq!(
-            tail_reserved(Duration::from_millis(1_500), short_reserve, 1),
-            Duration::from_millis(750)
-        );
+    }
+
+    // A configured grace too small for the protected tail is invalid, not a
+    // shorter sequence.
+    #[test]
+    fn grace_below_floor() {
+        assert_eq!(parse_grace("10"), DEFAULT_SHUTDOWN_GRACE);
+        assert_eq!(parse_grace("0"), DEFAULT_SHUTDOWN_GRACE);
+        assert_eq!(parse_grace("nonsense"), DEFAULT_SHUTDOWN_GRACE);
+        assert_eq!(parse_grace(" 16 "), MIN_SHUTDOWN_GRACE);
+        assert_eq!(parse_grace("25"), Duration::from_secs(25));
     }
 
     #[test]
@@ -590,6 +650,35 @@ mod tests {
 
         sequence.run().await;
 
+        assert!(storage_handle.is_sealed());
+    }
+
+    // With no budget left for any soft drain, every writer must still have
+    // stopped admitting work before storage is sealed.
+    #[tokio::test]
+    async fn zero_budget_closes() {
+        let dir = tempdir().expect("temp dir");
+        let storage_handle = open_storage(&dir);
+        let shutdown = Shutdown::new();
+        let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
+        let task_handle = sequence.task_handle.clone();
+        let jobs_runtime = sequence.jobs_runtime.clone();
+        sequence.grace = Duration::ZERO;
+        assert!(jobs_runtime.available_slots() > 0);
+
+        sequence.run().await;
+
+        assert_eq!(jobs_runtime.available_slots(), 0);
+        assert_eq!(task_handle.close_admission().await, Some(0));
+        assert!(shutdown.is_triggered());
+        let started = Arc::new(AtomicBool::new(false));
+        let child_started = started.clone();
+        shutdown.spawn(async move {
+            child_started.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(shutdown.tracked_children(), 0);
+        tokio::task::yield_now().await;
+        assert!(!started.load(Ordering::SeqCst));
         assert!(storage_handle.is_sealed());
     }
 
