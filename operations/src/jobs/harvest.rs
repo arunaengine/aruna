@@ -1,4 +1,5 @@
-use std::time::SystemTime;
+use std::future::Future;
+use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandle;
 use aruna_core::events::{Event, StorageEvent};
@@ -39,6 +40,10 @@ const MAX_HARVEST_PAGES: u32 = 100_000;
 const HARVEST_PATH_BYTES: usize = 512;
 /// `b3-` plus 64 hex characters: the shortest segment any identifier can take.
 const DIGEST_SEGMENT_BYTES: usize = 67;
+/// Hard cap on one decoded OAI-PMH response body.
+const HARVEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Total wall clock one fetch may take, connect through last byte.
+const HARVEST_FETCH_DEADLINE: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 struct HarvestCounts {
@@ -438,26 +443,73 @@ async fn discover_granularity(
     parse_granularity(&body)
 }
 
+/// Fetch one OAI-PMH response under a hard byte cap and a total wall-clock
+/// deadline.
+///
+/// The egress client only bounds connect and read *inactivity*, so a slow-drip
+/// or endless response would otherwise run until the node stops. Chunks are
+/// counted after decoding, which is what a compressed body expands to.
 async fn fetch(
     ctx: &JobContext,
     blob: &BlobHandle,
     url: url::Url,
 ) -> Result<String, HarvestFailure> {
-    let _ = ctx;
+    let deadline = tokio::time::Instant::now() + HARVEST_FETCH_DEADLINE;
     let request = blob
         .egress_request(url)
         .map_err(|error| permanent(format!("egress screen: {error}")))?;
-    let response = request
-        .send()
-        .await
+    let mut response = bounded(ctx, deadline, request.send())
+        .await?
         .map_err(|error| retryable(format!("OAI fetch: {error}")))?;
+
     if !response.status().is_success() {
-        return Err(retryable(format!("OAI HTTP status {}", response.status())));
+        let status = response.status();
+        let hint = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| format!(", retry after {value}"))
+            .unwrap_or_default();
+        return Err(retryable(format!("OAI HTTP status {status}{hint}")));
     }
-    response
-        .text()
-        .await
-        .map_err(|error| retryable(format!("OAI body: {error}")))
+    if let Some(declared) = response.content_length()
+        && declared > HARVEST_BODY_BYTES as u64
+    {
+        return Err(permanent(format!(
+            "OAI response declares {declared} bytes, over the {HARVEST_BODY_BYTES} byte cap"
+        )));
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = bounded(ctx, deadline, response.chunk())
+        .await?
+        .map_err(|error| retryable(format!("OAI body: {error}")))?
+    {
+        if body.len() + chunk.len() > HARVEST_BODY_BYTES {
+            return Err(permanent(format!(
+                "OAI response body exceeds the {HARVEST_BODY_BYTES} byte cap"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|error| permanent(format!("OAI body is not UTF-8: {error}")))
+}
+
+/// Await one network step under the fetch deadline while staying responsive to
+/// cancel and shutdown, so the job drain budget holds against a slow provider.
+async fn bounded<T>(
+    ctx: &JobContext,
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = T>,
+) -> Result<T, HarvestFailure> {
+    tokio::select! {
+        result = future => Ok(result),
+        () = ctx.cancel.cancelled() => Err(HarvestFailure::Cancelled),
+        () = ctx.shutdown.cancelled() => Err(HarvestFailure::Interrupted),
+        () = tokio::time::sleep_until(deadline) => {
+            Err(retryable("OAI fetch exceeded the total deadline"))
+        }
+    }
 }
 
 async fn read_source(
