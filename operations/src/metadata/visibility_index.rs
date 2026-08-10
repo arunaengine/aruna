@@ -420,10 +420,8 @@ async fn admit_visible(
     if pending.is_empty() {
         return Ok(());
     }
-    let records: Vec<MetadataRegistryRecord> = pending
-        .iter()
-        .map(|(_, record)| record.clone())
-        .collect();
+    let records: Vec<MetadataRegistryRecord> =
+        pending.iter().map(|(_, record)| record.clone()).collect();
     let evaluators = load_evaluators(context, &records).await?;
     entries.extend(
         pending

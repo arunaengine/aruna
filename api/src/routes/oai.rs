@@ -942,8 +942,9 @@ mod tests {
             occurred_at_ms: record.updated_at_ms,
             details: None,
         };
-        let writes = create_records_and_outbox_write_entries(record, &audit, Ulid::generate(), None)
-            .unwrap();
+        let writes =
+            create_records_and_outbox_write_entries(record, &audit, Ulid::generate(), None)
+                .unwrap();
         store(&fixture.ctx, writes).await;
     }
 
@@ -1097,9 +1098,15 @@ mod tests {
             until: Some(format_from(later + 60_000).unwrap()),
             ..OaiParams::default()
         };
-        let fresh = list(&fixture.state, &fixture.ctx, fixture.realm_id, &params, false)
-            .await
-            .unwrap();
+        let fresh = list(
+            &fixture.state,
+            &fixture.ctx,
+            fixture.realm_id,
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(fresh.contains(&created.graph_iri));
         assert!(fresh.contains(&moved.graph_iri));
     }
