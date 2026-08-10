@@ -1455,6 +1455,40 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 
+    /// Signs one op carrying `payload` under the document-sync event type
+    /// without encoding an event, so tests can deliver a payload no peer can
+    /// decode. Returns the op's transport identity.
+    #[cfg(test)]
+    pub(crate) fn publish_raw_event(
+        &self,
+        topic_id: irokle_crate::TopicId,
+        payload: Vec<u8>,
+    ) -> Result<SyncQuarantineIdentity> {
+        let oplog = Oplog::with_storage(self.node.storage().clone());
+        let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
+        let envelope = EventEnvelope {
+            type_id: DocumentSyncEvent::TYPE_ID.to_string(),
+            payload: payload.into(),
+        };
+        let op = self.publish_event_op(
+            &oplog,
+            topic_id,
+            actor_id,
+            envelope,
+            &BTreeSet::new(),
+            true,
+            true,
+            &mut 0,
+            &mut 0,
+        )?;
+        self.flush_database()?;
+        Ok(SyncQuarantineIdentity {
+            topic: topic_id,
+            actor: op.signed.body.actor_id,
+            actor_seq: op.signed.body.actor_seq,
+        })
+    }
+
     /// Marks locally published ops as applied by advancing the per-topic
     /// cursor, so the origin's own reconcile does not re-emit them. Their
     /// effects are always applied locally before the outbox publish runs.
@@ -2579,13 +2613,38 @@ impl DocumentSyncService {
                         bytes,
                         change,
                     } => {
-                        let record: MetadataRegistryRecord = postcard::from_bytes(&bytes)
-                            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        let reject = |reason: String| {
+                            SyncRejection::new(
+                                identity,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target: DocumentSyncTarget::MetadataRegistry {
+                                        group_id,
+                                        document_id,
+                                    },
+                                    bytes: bytes.clone(),
+                                    change,
+                                },
+                                reason,
+                            )
+                        };
+                        let record = match postcard::from_bytes::<MetadataRegistryRecord>(&bytes) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                warn!(%topic_id, %document_id, %error, "Rejecting undecodable metadata registry record");
+                                rejections.push(reject(format!(
+                                    "undecodable metadata registry record: {error}"
+                                )));
+                                continue;
+                            }
+                        };
                         if record.group_id != group_id || record.document_id != document_id {
-                            return Err(NetError::Bootstrap(format!(
-                                "replicated metadata registry target {group_id}/{document_id} does not match payload {}/{}",
+                            warn!(%topic_id, %document_id, "Rejecting metadata registry record whose payload does not match its target");
+                            rejections.push(reject(format!(
+                                "metadata registry target {group_id}/{document_id} does not match payload {}/{}",
                                 record.group_id, record.document_id
                             )));
+                            continue;
                         }
                         let realm_id = record.realm_id;
                         let strategy_id = record.placement.strategy_id;
@@ -2627,9 +2686,17 @@ impl DocumentSyncService {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
                     } => {
-                        let pending = self.pending_metadata_create_apply(identity, event)?;
-                        pending_metadata_creates.push(pending);
-                        deferred_creates = true;
+                        match self.pending_metadata_create_apply(identity, event) {
+                            Ok(pending) => {
+                                pending_metadata_creates.push(pending);
+                                deferred_creates = true;
+                            }
+                            Err(rejection) => {
+                                warn!(%topic_id, reason = %rejection.reason, "Rejecting malformed metadata create event");
+                                rejections.push(rejection);
+                                continue;
+                            }
+                        }
                     }
                     DocumentSyncEvent::Upsert {
                         event_id,
@@ -2638,14 +2705,38 @@ impl DocumentSyncService {
                         change,
                     } => {
                         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-                        let lifecycle: MetadataDocumentLifecycleRecord =
-                            postcard::from_bytes(&bytes)
-                                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        let reject = |reason: String| {
+                            SyncRejection::new(
+                                identity,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                                        document_id,
+                                    },
+                                    bytes: bytes.clone(),
+                                    change,
+                                },
+                                reason,
+                            )
+                        };
+                        let lifecycle =
+                            match postcard::from_bytes::<MetadataDocumentLifecycleRecord>(&bytes) {
+                                Ok(lifecycle) => lifecycle,
+                                Err(error) => {
+                                    warn!(%topic_id, %document_id, %error, "Rejecting undecodable metadata document lifecycle record");
+                                    rejections.push(reject(format!(
+                                        "undecodable metadata document lifecycle record: {error}"
+                                    )));
+                                    continue;
+                                }
+                            };
                         if lifecycle.document_id() != document_id {
-                            return Err(NetError::Bootstrap(format!(
-                                "replicated metadata document lifecycle target {document_id} does not match payload document {}",
+                            warn!(%topic_id, %document_id, "Rejecting metadata document lifecycle record whose payload does not match its target");
+                            rejections.push(reject(format!(
+                                "metadata document lifecycle target {document_id} does not match payload document {}",
                                 lifecycle.document_id()
                             )));
+                            continue;
                         }
                         match lifecycle {
                             MetadataDocumentLifecycleRecord::Upsert { event: record } => {
@@ -2685,20 +2776,47 @@ impl DocumentSyncService {
                         }
                     }
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target: DocumentSyncTarget::MetadataGraphLifecycle { graph_iri },
                         bytes,
-                        ..
+                        change,
                     } => {
                         let target = DocumentSyncTarget::MetadataGraphLifecycle {
                             graph_iri: graph_iri.clone(),
                         };
-                        let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
-                            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        let reject = |reason: String| {
+                            SyncRejection::new(
+                                identity,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target: DocumentSyncTarget::MetadataGraphLifecycle {
+                                        graph_iri: graph_iri.clone(),
+                                    },
+                                    bytes: bytes.clone(),
+                                    change,
+                                },
+                                reason,
+                            )
+                        };
+                        let record = match postcard::from_bytes::<MetadataGraphLifecycleRecord>(
+                            &bytes,
+                        ) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                warn!(%topic_id, %graph_iri, %error, "Rejecting undecodable metadata graph lifecycle record");
+                                rejections.push(reject(format!(
+                                    "undecodable metadata graph lifecycle record: {error}"
+                                )));
+                                continue;
+                            }
+                        };
                         if record.graph_iri != graph_iri {
-                            return Err(NetError::Bootstrap(format!(
-                                "replicated metadata graph lifecycle target `{graph_iri}` does not match payload graph `{}`",
+                            warn!(%topic_id, %graph_iri, "Rejecting metadata graph lifecycle record whose payload does not match its target");
+                            rejections.push(reject(format!(
+                                "metadata graph lifecycle target `{graph_iri}` does not match payload graph `{}`",
                                 record.graph_iri
                             )));
+                            continue;
                         }
                         let accepted = self
                             .apply_metadata_graph_lifecycle(record.clone(), bytes)
@@ -2996,8 +3114,23 @@ impl DocumentSyncService {
                     }
                     event => {
                         let target = event.target().clone();
-                        self.apply_document_event(event).await?;
-                        applied_targets.push(target);
+                        match self.apply_document_event(event.clone()).await {
+                            Ok(()) => applied_targets.push(target),
+                            // The apply paths raise `Bootstrap` only for decode
+                            // and shape failures, which no redelivery can fix;
+                            // storage failures stay transient and propagate.
+                            Err(NetError::Bootstrap(reason)) => {
+                                warn!(
+                                    %topic_id,
+                                    ?target,
+                                    %reason,
+                                    "Quarantining a malformed or unsupported sync event"
+                                );
+                                rejections.push(SyncRejection::new(identity, event, reason));
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
             }
@@ -3380,11 +3513,13 @@ impl DocumentSyncService {
             .events)
     }
 
+    /// `Err` is permanent evidence: a create event whose payload does not decode
+    /// or does not name its own target can never become valid.
     fn pending_metadata_create_apply(
         &self,
         identity: SyncQuarantineIdentity,
         event: DocumentSyncEvent,
-    ) -> Result<PendingMetadataCreateApply> {
+    ) -> std::result::Result<PendingMetadataCreateApply, SyncRejection> {
         let (document_id, target_event_id, bytes) = match &event {
             DocumentSyncEvent::Upsert {
                 target:
@@ -3399,13 +3534,22 @@ impl DocumentSyncService {
                 "metadata create apply helper is only called for metadata create upserts"
             ),
         };
-        let record: MetadataCreateEventRecord =
-            postcard::from_bytes(&bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let record = match postcard::from_bytes::<MetadataCreateEventRecord>(&bytes) {
+            Ok(record) => record,
+            Err(error) => {
+                return Err(SyncRejection::new(
+                    identity,
+                    event,
+                    format!("undecodable metadata create event: {error}"),
+                ));
+            }
+        };
         if record.record.document_id != document_id || record.event_id != target_event_id {
-            return Err(NetError::Bootstrap(format!(
-                "replicated metadata create-event target {document_id}/{target_event_id} does not match payload {}/{}",
+            let reason = format!(
+                "metadata create-event target {document_id}/{target_event_id} does not match payload {}/{}",
                 record.record.document_id, record.event_id
-            )));
+            );
+            return Err(SyncRejection::new(identity, event, reason));
         }
         Ok(PendingMetadataCreateApply {
             identity,
@@ -18150,6 +18294,278 @@ mod tests {
         assert!(cursor_advanced(&service, &storage, bad_topic).await);
         assert!(cursor_advanced(&service, &storage, good_topic).await);
         assert_eq!(quarantine_usage(&storage).await.records, 2);
+
+        service.shutdown().await;
+    }
+
+    /// A malformed envelope or payload from any metadata/PID family is
+    /// permanent evidence, never a replayed error: the topic keeps moving and
+    /// the valid successor behind the poison applies. While evidence cannot be
+    /// persisted, nothing advances.
+    #[tokio::test]
+    async fn quarantine_malformed_payloads() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        // `registry_record` binds its permission path to this realm.
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(78).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let actor = test_actor(
+            78,
+            UserId::local(Ulid::from_parts(3_200, 1), realm_id),
+            realm_id,
+        );
+        assert_eq!(actor.node_id, local_node);
+
+        let strategy_id = Ulid::from_parts(3_201, 1);
+        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
+        let group_id = Ulid::from_parts(3_202, 1);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_node, RealmNodeKind::Management);
+        config.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
+        config.strategies.push(PlacementStrategy {
+            strategy_id,
+            name: "placed".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        });
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let placement = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 4,
+        };
+        let document = |seed: u64| {
+            MetaResourceId::from_parts(seed, handle, BucketId::new(4).unwrap(), 1)
+                .unwrap()
+                .as_ulid()
+        };
+        let topic_id = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id: document(3_210),
+        }
+        .sync_topic_id(realm_id, &placement);
+        service
+            .ensure_document_sync_topics(&[topic_id], Vec::new())
+            .expect("metadata shard topic genesis");
+
+        // A payload no peer can decode into an event at all.
+        let raw_payload = vec![0xffu8; 24];
+        let raw_identity = service
+            .publish_raw_event(topic_id, raw_payload.clone())
+            .expect("raw op publishes");
+
+        let change = |event_id| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id,
+                actor: local_node,
+                updated_at_ms: 100,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+            placement,
+        };
+        let poison = |event_id: u64, target: DocumentSyncTarget| {
+            let event_id = Ulid::from_parts(event_id, 1);
+            DocumentSyncPublish::Upsert {
+                event_id,
+                target,
+                bytes: vec![0xfe; 12],
+                change: change(event_id),
+                allow_genesis: true,
+            }
+        };
+        // A registry payload that decodes but names another document.
+        let mismatched_event = Ulid::from_parts(3_226, 1);
+        let mut mismatched = registry_record(
+            group_id,
+            document(3_211),
+            "datasets/mismatched",
+            100,
+            mismatched_event,
+        );
+        mismatched.placement = placement;
+        let valid_event = Ulid::from_parts(3_227, 1);
+        let valid_document = document(3_212);
+        let mut valid = registry_record(
+            group_id,
+            valid_document,
+            "datasets/valid",
+            100,
+            valid_event,
+        );
+        valid.placement = placement;
+        let valid_target = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id: valid_document,
+        };
+
+        let published = service
+            .publish_documents(
+                vec![
+                    poison(
+                        3_220,
+                        DocumentSyncTarget::MetadataRegistry {
+                            group_id,
+                            document_id: document(3_213),
+                        },
+                    ),
+                    poison(
+                        3_221,
+                        DocumentSyncTarget::MetadataCreateEvent {
+                            document_id: document(3_214),
+                            event_id: Ulid::from_parts(3_221, 1),
+                        },
+                    ),
+                    poison(
+                        3_222,
+                        DocumentSyncTarget::MetadataDocumentLifecycle {
+                            document_id: document(3_215),
+                        },
+                    ),
+                    poison(
+                        3_223,
+                        DocumentSyncTarget::MetadataGraphLifecycle {
+                            graph_iri: MetadataRegistryRecord::graph_iri_for(document(3_216)),
+                        },
+                    ),
+                    poison(
+                        3_224,
+                        DocumentSyncTarget::PersistentIdMapping {
+                            document_id: document(3_217),
+                        },
+                    ),
+                    DocumentSyncPublish::Upsert {
+                        event_id: mismatched_event,
+                        target: DocumentSyncTarget::MetadataRegistry {
+                            group_id,
+                            document_id: document(3_218),
+                        },
+                        bytes: postcard::to_allocvec(&mismatched).expect("registry serializes"),
+                        change: change(mismatched_event),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: valid_event,
+                        target: valid_target.clone(),
+                        bytes: postcard::to_allocvec(&valid).expect("registry serializes"),
+                        change: change(valid_event),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "poison publish failed: {published:?}"
+        );
+
+        // While evidence cannot be persisted, neither the poison nor its valid
+        // successor may pass: the cursor stays before both.
+        write_usage(
+            &storage,
+            SyncQuarantineUsage {
+                records: SYNC_QUARANTINE_MAX_RECORDS,
+                bytes: 0,
+            },
+        )
+        .await;
+        reset_cursor(&service, topic_id).await;
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("a full quarantine store is not a reconcile failure");
+        assert!(quarantine_rows(&storage).await.is_empty());
+        // Applies are idempotent and monotone; the cursor is what may not move
+        // past evidence that is not durable, so the whole batch redelivers.
+        assert!(!cursor_advanced(&service, &storage, topic_id).await);
+
+        write_usage(&storage, SyncQuarantineUsage::default()).await;
+        let applied = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("malformed payloads are quarantined");
+        assert!(applied.targets.contains(&valid_target), "{:?}", applied.targets);
+        assert!(
+            read_storage_value(
+                &storage,
+                valid_target.storage_keyspace(),
+                valid_target.storage_key(),
+            )
+            .await
+            .is_some(),
+            "the valid successor applies"
+        );
+        assert!(cursor_advanced(&service, &storage, topic_id).await);
+
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 7, "{records:?}");
+        let raw = records
+            .iter()
+            .find(|record| record.identity == raw_identity)
+            .expect("raw evidence");
+        assert_eq!(raw.event_id(), None);
+        assert_eq!(raw.evidence.bytes(), raw_payload.as_slice());
+        assert!(raw.reason.starts_with("undecodable sync payload of type"));
+        for (event_id, reason) in [
+            (3_220, "undecodable metadata registry record"),
+            (3_221, "undecodable metadata create event"),
+            (3_222, "undecodable metadata document lifecycle record"),
+            (3_223, "undecodable metadata graph lifecycle record"),
+            (3_224, "undecodable persistent id mapping"),
+        ] {
+            let quarantined = quarantined_reason(&records, Ulid::from_parts(event_id, 1));
+            assert!(quarantined.starts_with(reason), "{quarantined}");
+        }
+        assert!(
+            quarantined_reason(&records, mismatched_event)
+                .starts_with("metadata registry target")
+        );
+        let usage = quarantine_usage(&storage).await;
+        assert_eq!(usage.records, 7);
+
+        // Redelivery is the same evidence under the same transport identity.
+        reset_cursor(&service, topic_id).await;
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("replay reconciles");
+        assert_eq!(quarantine_rows(&storage).await.len(), 7);
+        assert_eq!(quarantine_usage(&storage).await, usage);
 
         service.shutdown().await;
     }
