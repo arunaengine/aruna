@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_has_no_mint() {
+    fn tombstone_omits_mint() {
         let id = Ulid::from_bytes([4; 16]);
         let mapping = PersistentIdMapping::tombstone(id, revision(1, 12));
         assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_converges_in_any_order() {
+    fn merge_converges_unordered() {
         let id = Ulid::from_bytes([1; 16]);
         let active = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
         let mut withdrawn = active.clone();
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_tombstone_over_mint() {
+    fn merge_keeps_tombstone() {
         let id = Ulid::from_bytes([1; 16]);
         let mut tombstone = PersistentIdMapping::tombstone(id, revision(2, 3));
         let active = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_ignores_other_documents() {
+    fn merge_ignores_others() {
         let mut mapping =
             PersistentIdMapping::conceptual(Ulid::from_bytes([1; 16]), user(), revision(1, 5));
         let foreign = PersistentIdMapping::tombstone(Ulid::from_bytes([2; 16]), revision(2, 1));
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn change_is_derived_from_the_row() {
+    fn change_follows_row() {
         let id = Ulid::from_bytes([9; 16]);
         let mapping = PersistentIdMapping::conceptual(id, user(), revision(7, 42));
         let placement = PlacementRef {

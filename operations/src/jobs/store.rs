@@ -2382,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn pid_dedup_index_is_global() {
+    fn dedup_index_global() {
         let realm = RealmId([1u8; 32]);
         let first = UserId::new(Ulid::from_bytes([2u8; 16]), realm);
         let second = UserId::new(Ulid::from_bytes([3u8; 16]), realm);
@@ -2399,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_reclaims_pid_dedup() {
+    fn prune_reclaims_pid() {
         let minted_by = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let record = pid_record(JobId::from_bytes([0x58; 16]), minted_by);
         let dedup_key = record

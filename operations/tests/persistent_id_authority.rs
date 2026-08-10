@@ -40,7 +40,7 @@ const JOB_RETENTION_MS: u64 = 60_000;
 /// Mint from a node that holds nothing: the mapping must land on the document's
 /// holders and never in the forwarder's own store, and every node must resolve it.
 #[tokio::test]
-async fn mint_routes_to_holder() -> TestResult<()> {
+async fn mint_routes_holder() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let (document_id, placement) = seed_document(&realm, group_id, "datasets/minted", true).await?;
@@ -207,7 +207,7 @@ async fn resolve_gates_visibility() -> TestResult<()> {
 /// With every holder down, a non-holder must report the authority unreachable.
 /// Answering 404 from its own empty store would turn a live PID into a dead one.
 #[tokio::test]
-async fn holder_loss_is_unavailable() -> TestResult<()> {
+async fn holder_loss_unavailable() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let (document_id, placement) =
@@ -235,7 +235,7 @@ async fn holder_loss_is_unavailable() -> TestResult<()> {
 /// Two authorized users minting the same document produce one job identity: the
 /// dedup row is keyed by the document, not by the submitting user.
 #[tokio::test]
-async fn mint_dedups_across_users() -> TestResult<()> {
+async fn mint_dedups_users() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let (document_id, _) = seed_document(&realm, group_id, "datasets/shared", true).await?;

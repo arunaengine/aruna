@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn landing_maps_every_resolution() {
+    fn landing_maps_resolutions() {
         let id = Ulid::from_bytes([1; 16]);
         let status = |resolved| landing_response(id, resolved).status();
 

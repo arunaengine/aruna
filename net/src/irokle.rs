@@ -2558,10 +2558,7 @@ impl DocumentSyncService {
                                 mapping.target
                             )));
                         }
-                        if self
-                            .apply_persistent_id_mapping(&mapping, change.placement)
-                            .await?
-                        {
+                        if self.apply_pid_mapping(&mapping, change.placement).await? {
                             applied_targets.push(target);
                         }
                     }
@@ -3450,7 +3447,7 @@ impl DocumentSyncService {
             // The generic write below would clobber a local tombstone with a
             // replayed Active row, so the mapping always goes through its merge.
             return self
-                .apply_persistent_id_mapping(&mapping, change.placement)
+                .apply_pid_mapping(&mapping, change.placement)
                 .await
                 .map(|_| ());
         }
@@ -3529,12 +3526,12 @@ impl DocumentSyncService {
         apply_metadata_graph_lifecycle_to_storage(&self.storage, &record, primary_bytes).await
     }
 
-    async fn apply_persistent_id_mapping(
+    async fn apply_pid_mapping(
         &self,
         mapping: &PersistentIdMapping,
         placement: PlacementRef,
     ) -> Result<bool> {
-        apply_persistent_id_to_storage(&self.storage, mapping, placement).await
+        store_pid_mapping(&self.storage, mapping, placement).await
     }
 
     async fn apply_delete(
@@ -4447,14 +4444,14 @@ async fn apply_metadata_document_lifecycle_to_storage(
 /// entirely from the two rows, so replay, reordering, and a frozen holder catching
 /// up all converge on the same state and the same manifest revision — and an
 /// Active row can never overwrite a local Withdrawn tombstone.
-async fn apply_persistent_id_to_storage(
+async fn store_pid_mapping(
     storage: &StorageHandle,
     incoming: &PersistentIdMapping,
     placement: PlacementRef,
 ) -> Result<bool> {
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
-        let merged = match persistent_id_merge_txn(storage, incoming, txn_id).await {
+        let merged = match pid_merge_txn(storage, incoming, txn_id).await {
             Ok(Some(merged)) => merged,
             Ok(None) => {
                 let _ = storage
@@ -4514,7 +4511,7 @@ async fn apply_persistent_id_to_storage(
 }
 
 /// `Ok(None)` when the local row already absorbs the incoming one.
-async fn persistent_id_merge_txn(
+async fn pid_merge_txn(
     storage: &StorageHandle,
     incoming: &PersistentIdMapping,
     txn_id: TxnId,

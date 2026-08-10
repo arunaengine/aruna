@@ -241,13 +241,10 @@ async fn mint_in_txn(
 ) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
     // Fence on a live registry row inside the transaction: a mint may not
     // activate a PID for a document a concurrent delete is removing.
-    if read_registry_in_txn(ctx, document_id, txn_id).await? {
+    if registry_missing_txn(ctx, document_id, txn_id).await? {
         return Err(PersistentIdError::DocumentMissing);
     }
-    if read_mapping_in_txn(ctx, document_id, txn_id)
-        .await?
-        .is_some()
-    {
+    if mapping_in_txn(ctx, document_id, txn_id).await?.is_some() {
         return Ok(None);
     }
     let mapping =
@@ -265,7 +262,7 @@ async fn withdraw_in_txn(
     txn_id: TxnId,
 ) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
     let revision = revision(route, withdrawn_at_ms);
-    let mapping = match read_mapping_in_txn(ctx, document_id, txn_id).await? {
+    let mapping = match mapping_in_txn(ctx, document_id, txn_id).await? {
         Some(mut mapping) => {
             if !mapping.withdraw(revision) {
                 return Ok(None);
@@ -337,7 +334,7 @@ async fn write_transition(
 }
 
 /// Whether the document's registry row is absent inside `txn_id`.
-async fn read_registry_in_txn(
+async fn registry_missing_txn(
     ctx: &DriverContext,
     document_id: Ulid,
     txn_id: TxnId,
@@ -355,7 +352,7 @@ async fn read_registry_in_txn(
     }
 }
 
-async fn read_mapping_in_txn(
+async fn mapping_in_txn(
     ctx: &DriverContext,
     document_id: Ulid,
     txn_id: TxnId,
@@ -530,7 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_needs_a_live_record() {
+    async fn mint_needs_record() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([6; 16]);
         assert_eq!(
@@ -543,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn withdraw_tombstones_an_unminted_pid() {
+    async fn withdraw_tombstones_unminted() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([7; 16]);
         let (mapping, changed) = withdraw_persistent_id(&ctx, realm(), id, 10).await.unwrap();
@@ -557,7 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_never_replaces_a_tombstone() {
+    async fn mint_keeps_tombstone() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([8; 16]);
         seed_record(&ctx, id).await;
@@ -599,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn withdraw_flips_an_active_mapping() {
+    async fn withdraw_flips_active() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([9; 16]);
         seed_record(&ctx, id).await;

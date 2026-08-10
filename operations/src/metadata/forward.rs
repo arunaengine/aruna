@@ -1301,7 +1301,7 @@ pub async fn resolve_pid_routed(
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_holders_limit_from(&holders);
+    let holders = capped_holders(&holders);
     let holder_count = holders.len();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
@@ -1587,7 +1587,7 @@ async fn authorize_forwarded_pid(
     Ok(auth)
 }
 
-fn resolve_holders_limit_from(holders: &[NodeId]) -> Vec<NodeId> {
+fn capped_holders(holders: &[NodeId]) -> Vec<NodeId> {
     holders.iter().copied().take(MAX_READ_HOLDERS).collect()
 }
 
