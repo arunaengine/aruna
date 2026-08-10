@@ -100,7 +100,6 @@ const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
 const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 const METADATA_READ_FANOUT_LIMIT: usize = 8;
-const PID_WITHDRAW_ATTEMPTS: usize = 3;
 const METADATA_READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
 
@@ -772,7 +771,6 @@ pub async fn delete_metadata_document_routed(
     }
     let local_holds = holders.contains(&local_node_id);
     if local_holds && let Some(record) = record {
-        let realm_id = actor.realm_id;
         delete_metadata_document(
             DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
             context.as_ref(),
@@ -780,7 +778,6 @@ pub async fn delete_metadata_document_routed(
         )
         .await
         .map_err(MetadataWriteError::from)?;
-        withdraw_pid_for_deleted(context, realm_id, document_id).await;
         return Ok(());
     }
     let response = forward_to_holders(
@@ -1119,10 +1116,7 @@ pub(crate) async fn apply_forwarded_write(
                 document_id,
             );
             match delete_metadata_document(operation, context.as_ref(), document_id).await {
-                Ok(()) => {
-                    withdraw_pid_for_deleted(context, realm_id, document_id).await;
-                    MetadataTransportMessage::ForwardedDelete
-                }
+                Ok(()) => MetadataTransportMessage::ForwardedDelete,
                 Err(error) => reject(format!("forwarded metadata delete failed: {error}")),
             }
         }
@@ -1130,36 +1124,6 @@ pub(crate) async fn apply_forwarded_write(
             "unexpected forwarded metadata message: {}",
             super::handle::transport_message_kind(&other)
         )),
-    }
-}
-
-/// Flip a document's PID mapping to a permanent tombstone when the document is
-/// deleted. Runs on the holder that just removed the registry row, which is the
-/// mapping's own authority, and writes the tombstone even when nothing was ever
-/// minted so an accepted-but-unexecuted mint job cannot revive the PID. Retried
-/// because the mapping outlives the registry row it can no longer be derived from.
-async fn withdraw_pid_for_deleted(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    document_id: Ulid,
-) {
-    for attempt in 0..PID_WITHDRAW_ATTEMPTS {
-        match crate::persistent_id::withdraw_persistent_id(
-            context.as_ref(),
-            realm_id,
-            document_id,
-            aruna_core::util::unix_timestamp_millis(),
-        )
-        .await
-        {
-            Ok(_) => return,
-            Err(error) if attempt + 1 < PID_WITHDRAW_ATTEMPTS => {
-                warn!(%document_id, ?error, "Retrying the persistent id withdrawal of a deleted document");
-            }
-            Err(error) => {
-                error!(%document_id, ?error, "Failed to withdraw the persistent id of a deleted document");
-            }
-        }
     }
 }
 

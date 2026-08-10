@@ -130,9 +130,11 @@ pub async fn mint_persistent_id(
     ))
 }
 
-/// Flip a document's PID mapping to `Withdrawn`, writing the tombstone even when
-/// nothing was ever minted. Returns the resulting mapping and whether this call
-/// performed the transition.
+/// Flip a live document's PID mapping to `Withdrawn`, writing the tombstone even
+/// when nothing was ever minted, so an accepted-but-unexecuted mint job cannot
+/// land after it. A document whose registry row is already gone is
+/// `DocumentMissing`: its tombstone was written by the delete itself. Returns the
+/// resulting mapping and whether this call performed the transition.
 pub async fn withdraw_persistent_id(
     ctx: &DriverContext,
     realm_id: RealmId,
@@ -179,6 +181,7 @@ pub async fn withdraw_persistent_id(
 /// Where a mapping row lives and who replicates it: the document-lifecycle
 /// placement, never the deletable registry row, so a withdrawal still routes and
 /// replicates after the document is gone.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MappingRoute {
     pub placement: PlacementRef,
     pub peers: Vec<aruna_core::NodeId>,
@@ -196,12 +199,27 @@ async fn mapping_route(
     let config = load_realm_config(ctx, realm_id).await.ok_or_else(|| {
         PersistentIdError::Unavailable("realm placement config is unavailable".to_string())
     })?;
-    let placement = mapping_placement(&config, realm_id, document_id)?;
-    Ok(Some(MappingRoute {
+    mapping_route_for(&config, realm_id, document_id, net_handle.node_id())
+        .ok_or_else(|| {
+            PersistentIdError::Unavailable("persistent id placement is unavailable".to_string())
+        })
+        .map(Some)
+}
+
+/// The route for a caller that already holds the realm config, such as the delete
+/// transaction that writes the tombstone alongside the registry row it removes.
+pub fn mapping_route_for(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    document_id: Ulid,
+    actor: aruna_core::NodeId,
+) -> Option<MappingRoute> {
+    let placement = mapping_placement(config, realm_id, document_id).ok()?;
+    Some(MappingRoute {
         placement,
-        peers: resolve_shard_holders(&config, &placement),
-        actor: net_handle.node_id(),
-    }))
+        peers: resolve_shard_holders(config, &placement),
+        actor,
+    })
 }
 
 pub fn mapping_placement(
@@ -261,9 +279,35 @@ async fn withdraw_in_txn(
     withdrawn_at_ms: u64,
     txn_id: TxnId,
 ) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
+    // An explicit withdrawal is an operation on a live document, so it fences on
+    // the registry row exactly as a mint does. The tombstone of a document that is
+    // already gone belongs to the transaction that removed it, not here.
+    if registry_missing_txn(ctx, document_id, txn_id).await? {
+        return Err(PersistentIdError::DocumentMissing);
+    }
+    let existing = mapping_in_txn(ctx, document_id, txn_id).await?;
+    let Some((mapping, writes)) =
+        withdrawal_transition(existing.as_ref(), route, document_id, withdrawn_at_ms)?
+    else {
+        return Ok(None);
+    };
+    write_entries(ctx, writes, txn_id).await?;
+    Ok(Some(mapping))
+}
+
+/// The mapping and the writes that retire it, or `None` when it is already
+/// withdrawn. Shared with the document delete, which writes the tombstone inside
+/// the transaction that removes the registry row so it cannot be lost afterwards.
+pub fn withdrawal_transition(
+    existing: Option<&PersistentIdMapping>,
+    route: &Option<MappingRoute>,
+    document_id: Ulid,
+    withdrawn_at_ms: u64,
+) -> Result<Option<(PersistentIdMapping, Vec<TransitionEntry>)>, PersistentIdError> {
     let revision = revision(route, withdrawn_at_ms);
-    let mapping = match mapping_in_txn(ctx, document_id, txn_id).await? {
-        Some(mut mapping) => {
+    let mapping = match existing {
+        Some(mapping) => {
+            let mut mapping = mapping.clone();
             if !mapping.withdraw(revision) {
                 return Ok(None);
             }
@@ -271,18 +315,18 @@ async fn withdraw_in_txn(
         }
         None => PersistentIdMapping::tombstone(document_id, revision),
     };
-    write_transition(ctx, route, &mapping, txn_id).await?;
-    Ok(Some(mapping))
+    let writes = transition_entries(route, &mapping)?;
+    Ok(Some((mapping, writes)))
 }
 
-/// Row, sync sidecar, shard-manifest entry, and outbox publish in one batch, so
-/// an accepted transition is either fully durable and replicated or not taken.
-async fn write_transition(
-    ctx: &DriverContext,
+pub type TransitionEntry = (String, ByteView, ByteView);
+
+/// Row, sync sidecar, shard-manifest entry, and outbox publish, so an accepted
+/// transition is either fully durable and replicated or not taken.
+pub fn transition_entries(
     route: &Option<MappingRoute>,
     mapping: &PersistentIdMapping,
-    txn_id: TxnId,
-) -> Result<(), PersistentIdError> {
+) -> Result<Vec<TransitionEntry>, PersistentIdError> {
     let target = persistent_id_target(mapping.target);
     let mut writes = vec![(
         PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
@@ -317,6 +361,23 @@ async fn write_transition(
             writes.push(entry);
         }
     }
+    Ok(writes)
+}
+
+async fn write_transition(
+    ctx: &DriverContext,
+    route: &Option<MappingRoute>,
+    mapping: &PersistentIdMapping,
+    txn_id: TxnId,
+) -> Result<(), PersistentIdError> {
+    write_entries(ctx, transition_entries(route, mapping)?, txn_id).await
+}
+
+async fn write_entries(
+    ctx: &DriverContext,
+    writes: Vec<TransitionEntry>,
+    txn_id: TxnId,
+) -> Result<(), PersistentIdError> {
     match ctx
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::BatchWrite {
@@ -540,9 +601,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn withdraw_needs_record() {
+        let (ctx, _dir) = context();
+        let id = Ulid::from_bytes([12; 16]);
+        assert_eq!(
+            withdraw_persistent_id(&ctx, realm(), id, 10)
+                .await
+                .unwrap_err(),
+            PersistentIdError::DocumentMissing
+        );
+        assert!(read_mapping(&ctx, id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn withdraw_tombstones_unminted() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([7; 16]);
+        seed_record(&ctx, id).await;
         let (mapping, changed) = withdraw_persistent_id(&ctx, realm(), id, 10).await.unwrap();
         assert!(changed);
         assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);

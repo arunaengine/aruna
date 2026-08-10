@@ -39,6 +39,9 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, write_audit_effect,
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
+use crate::persistent_id::{
+    MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, withdrawal_transition,
+};
 use crate::placement::{registry_placement, resolve_shard_holders};
 
 #[derive(Debug, PartialEq)]
@@ -55,6 +58,7 @@ pub struct DeleteMetadataDocumentOperation {
     registry_placement_ref: PlacementRef,
     holder_peers: Vec<NodeId>,
     registry_peers: Vec<NodeId>,
+    mapping_route: Option<MappingRoute>,
     txn_id: Option<Ulid>,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
@@ -78,6 +82,8 @@ enum DeleteMetadataDocumentState {
     WriteDocumentLifecycleOutbox,
     WriteGraphLifecycleOutbox,
     WriteDeleteOutbox,
+    ReadPidMapping,
+    WritePidWithdrawal,
     CommitTransaction,
     ScheduleGraphPruneQueue,
     PruneGraph,
@@ -124,6 +130,7 @@ impl DeleteMetadataDocumentOperation {
             registry_placement_ref: PlacementRef::NIL,
             holder_peers: Vec::new(),
             registry_peers: Vec::new(),
+            mapping_route: None,
             txn_id: None,
             state: DeleteMetadataDocumentState::Init,
             output: None,
@@ -419,6 +426,15 @@ impl Operation for DeleteMetadataDocumentOperation {
                         self.registry_placement_ref = registry_placement(&config, record);
                         self.registry_peers =
                             resolve_shard_holders(&config, &self.registry_placement_ref);
+                        // The PID mapping rides the placement derived from the
+                        // structured id, not the deletable registry row, so its
+                        // tombstone keeps routing after this delete commits.
+                        self.mapping_route = mapping_route_for(
+                            &config,
+                            record.realm_id,
+                            self.document_id,
+                            self.actor.node_id,
+                        );
                     }
                     self.state = DeleteMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -668,8 +684,8 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = DeleteMetadataDocumentState::CommitTransaction;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    self.state = DeleteMetadataDocumentState::ReadPidMapping;
+                    smallvec![read_mapping_effect(self.document_id, Some(txn_id))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
@@ -678,6 +694,59 @@ impl Operation for DeleteMetadataDocumentOperation {
                 }
                 other => self
                     .unexpected_event("document delete outbox write result", format!("{other:?}")),
+            },
+            // The PID tombstone commits with the registry row it retires: a
+            // best-effort write afterwards can be lost to a crash and leave a
+            // deleted document's PID Active forever.
+            DeleteMetadataDocumentState::ReadPidMapping => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                };
+                let existing = match parse_mapping_read(event) {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        return self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                            "persistent id mapping read failed: {error}"
+                        )));
+                    }
+                };
+                match withdrawal_transition(
+                    existing.as_ref(),
+                    &self.mapping_route,
+                    self.document_id,
+                    unix_timestamp_millis(),
+                ) {
+                    Ok(Some((_, writes))) => {
+                        self.state = DeleteMetadataDocumentState::WritePidWithdrawal;
+                        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                            writes,
+                            txn_id: Some(txn_id),
+                        })]
+                    }
+                    Ok(None) => {
+                        self.state = DeleteMetadataDocumentState::CommitTransaction;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    Err(error) => self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                        "persistent id withdrawal encode failed: {error}"
+                    ))),
+                }
+            }
+            DeleteMetadataDocumentState::WritePidWithdrawal => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = DeleteMetadataDocumentState::CommitTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                        "persistent id withdrawal write failed: {error}"
+                    )))
+                }
+                other => self
+                    .unexpected_event("persistent id withdrawal write result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
