@@ -61,14 +61,14 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
-                let name = local_name(&element);
-                on_open(&name, &element, &mut record, &mut error_code)?;
-                stack.push(name);
+                stack.push(local_name(&element));
+                on_open(&stack, &element, &mut record, &mut error_code)?;
                 text.clear();
             }
             Ok(Event::Empty(element)) => {
-                let name = local_name(&element);
-                on_open(&name, &element, &mut record, &mut error_code)?;
+                stack.push(local_name(&element));
+                on_open(&stack, &element, &mut record, &mut error_code)?;
+                stack.pop();
             }
             Ok(Event::Text(chunk)) => {
                 let raw = std::str::from_utf8(chunk.as_ref())
@@ -96,15 +96,17 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
                 text.push_str(&resolved);
             }
             Ok(Event::End(_)) => {
+                let slot = slot_of(&stack);
                 commit_text(
-                    &stack,
+                    slot,
+                    stack.last().map(Vec::as_slice).unwrap_or_default(),
                     &text,
                     &mut record,
                     &mut resumption_token,
                     &mut error_message,
                 );
                 text.clear();
-                if stack.last().map(Vec::as_slice) == Some(b"record")
+                if slot == Slot::Record
                     && let Some(done) = record.take()
                 {
                     records.push(done);
@@ -132,14 +134,63 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
     })
 }
 
+/// The one place in the OAI-PMH envelope an element carries protocol meaning.
+/// Everything else, including a payload element that reuses a protocol name
+/// further down, is [`Slot::Payload`] and stays inert.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Slot {
+    Error,
+    Record,
+    Header,
+    ResumptionToken,
+    Identifier,
+    Datestamp,
+    SetSpec,
+    DcField,
+    Payload,
+}
+
+/// Classify the element on top of `stack`, which holds the path from the
+/// response root down to that element. Position is what decides, never the
+/// local name alone: `OAI-PMH / verb / record / {header,metadata} / ...`.
+fn slot_of(stack: &[Vec<u8>]) -> Slot {
+    let Some(name) = stack.last().map(Vec::as_slice) else {
+        return Slot::Payload;
+    };
+    let ancestor = |index: usize| stack.get(index).map(Vec::as_slice);
+    match stack.len() {
+        2 if name == b"error" => Slot::Error,
+        3 if name == b"record" => Slot::Record,
+        3 if name == b"resumptionToken" => Slot::ResumptionToken,
+        4 if name == b"header" && ancestor(2) == Some(b"record".as_slice()) => Slot::Header,
+        5 if ancestor(2) == Some(b"record".as_slice())
+            && ancestor(3) == Some(b"header".as_slice()) =>
+        {
+            match name {
+                b"identifier" => Slot::Identifier,
+                b"datestamp" => Slot::Datestamp,
+                b"setSpec" => Slot::SetSpec,
+                _ => Slot::Payload,
+            }
+        }
+        6 if ancestor(2) == Some(b"record".as_slice())
+            && ancestor(3) == Some(b"metadata".as_slice())
+            && ancestor(4) == Some(b"dc".as_slice()) =>
+        {
+            Slot::DcField
+        }
+        _ => Slot::Payload,
+    }
+}
+
 fn on_open(
-    name: &[u8],
+    stack: &[Vec<u8>],
     element: &BytesStart<'_>,
     record: &mut Option<OaiRecord>,
     error_code: &mut Option<String>,
 ) -> Result<(), OaiParseError> {
-    match name {
-        b"record" => {
+    match slot_of(stack) {
+        Slot::Record => {
             *record = Some(OaiRecord {
                 header: OaiHeader {
                     identifier: String::new(),
@@ -150,13 +201,13 @@ fn on_open(
                 dc: Vec::new(),
             });
         }
-        b"header" => {
+        Slot::Header => {
             if let Some(record) = record.as_mut() {
                 record.header.deleted =
                     attribute(element, b"status")?.is_some_and(|status| status == "deleted");
             }
         }
-        b"error" => {
+        Slot::Error => {
             *error_code = attribute(element, b"code")?.or_else(|| Some("unknown".to_string()));
         }
         _ => {}
@@ -164,30 +215,24 @@ fn on_open(
     Ok(())
 }
 
-/// Route one element's accumulated text at its closing tag. `stack` still holds
-/// the element being closed on top.
+/// Route one element's accumulated text at its closing tag, by the slot the
+/// element occupies. `name` is its local name, which only a Dublin Core field
+/// needs, as the key it is stored under.
 fn commit_text(
-    stack: &[Vec<u8>],
+    slot: Slot,
+    name: &[u8],
     value: &str,
     record: &mut Option<OaiRecord>,
     resumption_token: &mut Option<String>,
     error_message: &mut String,
 ) {
-    let Some(current) = stack.last() else {
-        return;
-    };
-    let parent = stack
-        .len()
-        .checked_sub(2)
-        .map(|index| stack[index].as_slice());
     let value = value.trim();
-
-    match current.as_slice() {
-        b"error" => {
+    match slot {
+        Slot::Error => {
             *error_message = value.to_string();
             return;
         }
-        b"resumptionToken" => {
+        Slot::ResumptionToken => {
             *resumption_token = Some(value.to_string());
             return;
         }
@@ -197,17 +242,14 @@ fn commit_text(
     let Some(record) = record.as_mut() else {
         return;
     };
-    match (parent, current.as_slice()) {
-        (Some(b"header"), b"identifier") => record.header.identifier = value.to_string(),
-        (Some(b"header"), b"datestamp") => record.header.datestamp = value.to_string(),
-        (Some(b"header"), b"setSpec") if !value.is_empty() => {
-            record.header.sets.push(value.to_string());
-        }
-        (Some(b"dc"), element) if !value.is_empty() => {
-            record.dc.push((
-                String::from_utf8_lossy(element).into_owned(),
-                value.to_string(),
-            ));
+    match slot {
+        Slot::Identifier => record.header.identifier = value.to_string(),
+        Slot::Datestamp => record.header.datestamp = value.to_string(),
+        Slot::SetSpec if !value.is_empty() => record.header.sets.push(value.to_string()),
+        Slot::DcField if !value.is_empty() => {
+            record
+                .dc
+                .push((String::from_utf8_lossy(name).into_owned(), value.to_string()));
         }
         _ => {}
     }
@@ -237,13 +279,16 @@ fn attribute(element: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, Oai
 pub fn parse_granularity(xml: &str) -> Option<HarvestGranularity> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut in_granularity = false;
+    let mut stack: Vec<Vec<u8>> = Vec::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                in_granularity = local_name(&element) == b"granularity";
+            Ok(Event::Start(element)) => stack.push(local_name(&element)),
+            Ok(Event::End(_)) => {
+                stack.pop();
             }
-            Ok(Event::Text(chunk)) if in_granularity => {
+            // `OAI-PMH / Identify / granularity`, never a repeat of the name
+            // inside a repository description block.
+            Ok(Event::Text(chunk)) if is_granularity(&stack) => {
                 let raw = std::str::from_utf8(chunk.as_ref()).ok()?;
                 return HarvestGranularity::parse(raw);
             }
@@ -251,6 +296,12 @@ pub fn parse_granularity(xml: &str) -> Option<HarvestGranularity> {
             _ => {}
         }
     }
+}
+
+fn is_granularity(stack: &[Vec<u8>]) -> bool {
+    stack.len() == 3
+        && stack[1].as_slice() == b"Identify"
+        && stack[2].as_slice() == b"granularity"
 }
 
 /// Convert an OAI-PMH datestamp (`YYYY-MM-DD` or RFC 3339) to Unix milliseconds.
@@ -345,6 +396,57 @@ mod tests {
                 code: "badArgument".to_string(),
                 message: "bad".to_string(),
             }
+        );
+    }
+
+    /// Protocol names inside a record's payload must not steer the parse: an
+    /// `error` there would fail the whole source permanently, and a `record`
+    /// would discard the enclosing record.
+    #[test]
+    fn nested_names_inert() {
+        let xml = LIST.replace(
+            "<dc:creator>Bob</dc:creator>",
+            r#"<dc:creator>Bob</dc:creator>
+          <dc:description><error code="badArgument">nope</error>
+            <record><header status="deleted"><identifier>oai:evil:1</identifier>
+              <datestamp>2000-01-01</datestamp></header></record>
+          </dc:description>"#,
+        );
+        let page = parse_list_page(&xml).unwrap();
+        assert_eq!(page.records.len(), 2);
+        assert_eq!(page.resumption_token.as_deref(), Some("TOKEN-2"));
+
+        let first = &page.records[0];
+        assert_eq!(first.header.identifier, "oai:example.org:1");
+        assert!(!first.header.deleted);
+        assert_eq!(first.header.sets, vec!["alpha".to_string()]);
+        assert_eq!(
+            first.dc[0],
+            ("title".to_string(), "First & only".to_string())
+        );
+        assert_eq!(first.dc.iter().filter(|(k, _)| k == "creator").count(), 2);
+    }
+
+    #[test]
+    fn nested_token_ignored() {
+        let xml = LIST.replace(
+            "<dc:creator>Bob</dc:creator>",
+            "<dc:creator>Bob</dc:creator>
+          <dc:relation><resumptionToken>TOKEN-EVIL</resumptionToken></dc:relation>",
+        );
+        let page = parse_list_page(&xml).unwrap();
+        assert_eq!(page.resumption_token.as_deref(), Some("TOKEN-2"));
+    }
+
+    #[test]
+    fn nested_granularity_ignored() {
+        let identify = r#"<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><Identify>
+            <description><oai-identifier><granularity>YYYY-MM-DD</granularity></oai-identifier>
+            </description>
+            <granularity>YYYY-MM-DDThh:mm:ssZ</granularity></Identify></OAI-PMH>"#;
+        assert_eq!(
+            parse_granularity(identify),
+            Some(HarvestGranularity::Second)
         );
     }
 
