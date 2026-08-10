@@ -61,14 +61,14 @@ use aruna_core::structs::{
     HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
     NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdStatus, PlacementRef,
-    PlacementScope, PoolAdmission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
-    SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
-    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User, WatchEventMask,
-    WatchInterestDigest, WatchSubscription, admit_band_pool, build_quarantine_entries,
-    coordinator_spans, group_owner_index_key, node_usage_key_node_id, persistent_id_change,
-    persistent_id_key, persistent_id_target, quarantine_usage_entry, reserved_label,
-    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
+    PlacementScope, PoolAdmission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RealmNodeKind, Role, SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,
+    SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User,
+    WatchEventMask, WatchInterestDigest, WatchSubscription, admit_band_pool,
+    build_quarantine_entries, coordinator_spans, group_owner_index_key, node_usage_key_node_id,
+    persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
+    reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
+    watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -160,11 +160,7 @@ impl SyncRejection {
     }
 
     /// Evidence for a payload that could not be decoded into an event at all.
-    fn raw(
-        identity: SyncQuarantineIdentity,
-        bytes: Vec<u8>,
-        reason: impl Into<String>,
-    ) -> Self {
+    fn raw(identity: SyncQuarantineIdentity, bytes: Vec<u8>, reason: impl Into<String>) -> Self {
         Self {
             identity,
             evidence: SyncQuarantineEvidence::raw(bytes),
@@ -2685,19 +2681,17 @@ impl DocumentSyncService {
                     event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
-                    } => {
-                        match self.pending_metadata_create_apply(identity, event) {
-                            Ok(pending) => {
-                                pending_metadata_creates.push(pending);
-                                deferred_creates = true;
-                            }
-                            Err(rejection) => {
-                                warn!(%topic_id, reason = %rejection.reason, "Rejecting malformed metadata create event");
-                                rejections.push(rejection);
-                                continue;
-                            }
+                    } => match self.pending_metadata_create_apply(identity, event) {
+                        Ok(pending) => {
+                            pending_metadata_creates.push(pending);
+                            deferred_creates = true;
                         }
-                    }
+                        Err(rejection) => {
+                            warn!(%topic_id, reason = %rejection.reason, "Rejecting malformed metadata create event");
+                            rejections.push(*rejection);
+                            continue;
+                        }
+                    },
                     DocumentSyncEvent::Upsert {
                         event_id,
                         target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
@@ -2719,17 +2713,18 @@ impl DocumentSyncService {
                                 reason,
                             )
                         };
-                        let lifecycle =
-                            match postcard::from_bytes::<MetadataDocumentLifecycleRecord>(&bytes) {
-                                Ok(lifecycle) => lifecycle,
-                                Err(error) => {
-                                    warn!(%topic_id, %document_id, %error, "Rejecting undecodable metadata document lifecycle record");
-                                    rejections.push(reject(format!(
-                                        "undecodable metadata document lifecycle record: {error}"
-                                    )));
-                                    continue;
-                                }
-                            };
+                        let lifecycle = match postcard::from_bytes::<MetadataDocumentLifecycleRecord>(
+                            &bytes,
+                        ) {
+                            Ok(lifecycle) => lifecycle,
+                            Err(error) => {
+                                warn!(%topic_id, %document_id, %error, "Rejecting undecodable metadata document lifecycle record");
+                                rejections.push(reject(format!(
+                                    "undecodable metadata document lifecycle record: {error}"
+                                )));
+                                continue;
+                            }
+                        };
                         if lifecycle.document_id() != document_id {
                             warn!(%topic_id, %document_id, "Rejecting metadata document lifecycle record whose payload does not match its target");
                             rejections.push(reject(format!(
@@ -2840,9 +2835,7 @@ impl DocumentSyncService {
                                 identity,
                                 DocumentSyncEvent::Upsert {
                                     event_id,
-                                    target: DocumentSyncTarget::PersistentIdMapping {
-                                        document_id,
-                                    },
+                                    target: DocumentSyncTarget::PersistentIdMapping { document_id },
                                     bytes: bytes.clone(),
                                     change,
                                 },
@@ -3138,8 +3131,7 @@ impl DocumentSyncService {
             loop {
                 let mut progressed = false;
                 let mut retry = Vec::new();
-                for (target, event, placement, identity, _dependency, _previous_reason) in pending
-                {
+                for (target, event, placement, identity, _dependency, _previous_reason) in pending {
                     match validate_replicated_admin_event(
                         &self.storage,
                         topic_id,
@@ -3519,7 +3511,7 @@ impl DocumentSyncService {
         &self,
         identity: SyncQuarantineIdentity,
         event: DocumentSyncEvent,
-    ) -> std::result::Result<PendingMetadataCreateApply, SyncRejection> {
+    ) -> std::result::Result<PendingMetadataCreateApply, Box<SyncRejection>> {
         let (document_id, target_event_id, bytes) = match &event {
             DocumentSyncEvent::Upsert {
                 target:
@@ -3537,11 +3529,11 @@ impl DocumentSyncService {
         let record = match postcard::from_bytes::<MetadataCreateEventRecord>(&bytes) {
             Ok(record) => record,
             Err(error) => {
-                return Err(SyncRejection::new(
+                return Err(Box::new(SyncRejection::new(
                     identity,
                     event,
                     format!("undecodable metadata create event: {error}"),
-                ));
+                )));
             }
         };
         if record.record.document_id != document_id || record.event_id != target_event_id {
@@ -3549,7 +3541,7 @@ impl DocumentSyncService {
                 "metadata create-event target {document_id}/{target_event_id} does not match payload {}/{}",
                 record.record.document_id, record.event_id
             );
-            return Err(SyncRejection::new(identity, event, reason));
+            return Err(Box::new(SyncRejection::new(identity, event, reason)));
         }
         Ok(PendingMetadataCreateApply {
             identity,
@@ -4171,7 +4163,8 @@ impl DocumentSyncService {
         }
         let mut entries = pending.into_values().collect::<Vec<_>>();
         entries.push(
-            quarantine_usage_entry(usage).map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            quarantine_usage_entry(usage)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
         );
         Ok(Some(entries))
     }
@@ -6705,7 +6698,8 @@ async fn derive_metadata_placement_txn(
         epoch: 0,
         shard: u32::from(resolved.bucket.get()),
     };
-    if resolved.document_class != DocumentClass::Metadata || !scope_matches || derived != placement {
+    if resolved.document_class != DocumentClass::Metadata || !scope_matches || derived != placement
+    {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
     Ok(MetadataPlacementOutcome::Accepted(derived))
@@ -17940,7 +17934,10 @@ mod tests {
             .iter()
             .find(|record| record.event_id() == Some(invalid_watch_event))
             .expect("watch evidence");
-        assert_eq!(invalid_watch_record.family(), Some(SyncQuarantineFamily::Upsert));
+        assert_eq!(
+            invalid_watch_record.family(),
+            Some(SyncQuarantineFamily::Upsert)
+        );
         assert_eq!(
             invalid_watch_record.target(),
             Some(&watch_target(&invalid_watch)),
@@ -17964,7 +17961,10 @@ mod tests {
             .iter()
             .find(|record| record.event_id() == Some(forged_delete_event))
             .expect("delete evidence");
-        assert_eq!(forged_delete_record.family(), Some(SyncQuarantineFamily::Delete));
+        assert_eq!(
+            forged_delete_record.family(),
+            Some(SyncQuarantineFamily::Delete)
+        );
         assert_eq!(forged_delete_record.origin(), Some(forged_node));
 
         // The valid successors of both families applied.
@@ -18536,13 +18536,8 @@ mod tests {
         mismatched.placement = placement;
         let valid_event = Ulid::from_parts(3_227, 1);
         let valid_document = document(3_212);
-        let mut valid = registry_record(
-            group_id,
-            valid_document,
-            "datasets/valid",
-            100,
-            valid_event,
-        );
+        let mut valid =
+            registry_record(group_id, valid_document, "datasets/valid", 100, valid_event);
         valid.placement = placement;
         let valid_target = DocumentSyncTarget::MetadataRegistry {
             group_id,
@@ -18635,7 +18630,11 @@ mod tests {
             .reconcile_document_topics([topic_id])
             .await
             .expect("malformed payloads are quarantined");
-        assert!(applied.targets.contains(&valid_target), "{:?}", applied.targets);
+        assert!(
+            applied.targets.contains(&valid_target),
+            "{:?}",
+            applied.targets
+        );
         assert!(
             read_storage_value(
                 &storage,
@@ -18668,8 +18667,7 @@ mod tests {
             assert!(quarantined.starts_with(reason), "{quarantined}");
         }
         assert!(
-            quarantined_reason(&records, mismatched_event)
-                .starts_with("metadata registry target")
+            quarantined_reason(&records, mismatched_event).starts_with("metadata registry target")
         );
         let usage = quarantine_usage(&storage).await;
         assert_eq!(usage.records, 7);
@@ -18782,22 +18780,22 @@ mod tests {
         let forged_actor = mapping(forged_actor_document, node(77), 3_123);
 
         let valid_topic = persistent_id_target(valid_document).sync_topic_id(realm_id, &placed(4));
-        let forged_topic = persistent_id_target(forged_document).sync_topic_id(realm_id, &placed(9));
+        let forged_topic =
+            persistent_id_target(forged_document).sync_topic_id(realm_id, &placed(9));
         let other_topic =
             persistent_id_target(uncanonical_document).sync_topic_id(realm_id, &placed(6));
         service
             .ensure_document_sync_topics(&[valid_topic, forged_topic, other_topic], Vec::new())
             .expect("mapping shard topic genesis");
 
-        let publish = |mapping: &PersistentIdMapping, placement, event_id: u64| {
-            DocumentSyncPublish::Upsert {
+        let publish =
+            |mapping: &PersistentIdMapping, placement, event_id: u64| DocumentSyncPublish::Upsert {
                 event_id: Ulid::from_parts(event_id, 1),
                 target: persistent_id_target(mapping.target),
                 bytes: mapping.to_bytes().expect("mapping serializes"),
                 change: persistent_id_change(mapping, placement),
                 allow_genesis: true,
-            }
-        };
+            };
         let published = service
             .publish_documents(
                 vec![

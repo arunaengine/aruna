@@ -292,13 +292,15 @@ async fn acknowledge_in_txn(
     key: &[u8],
     txn_id: TxnId,
 ) -> Result<Option<SyncQuarantineRecord>, QuarantineAdminError> {
-    let Some(mut record) = read_row(storage, key, Some(txn_id)).await? else {
+    let Some(value) = read_row_value(storage, key, Some(txn_id)).await? else {
         return Ok(None);
     };
+    let mut record = SyncQuarantineRecord::from_bytes(value.as_ref())?;
     if record.acknowledged {
         return Ok(Some(record));
     }
-    let before = record.to_bytes()?.len() as u64;
+    // The bytes this transaction read, not a re-encoding of them.
+    let before = value.len() as u64;
     record.acknowledged = true;
     let entry = quarantine_row_entry(&record)?;
     let after = entry.2.len() as u64;
