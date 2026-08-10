@@ -247,9 +247,10 @@ fn commit_text(
         Slot::Datestamp => record.header.datestamp = value.to_string(),
         Slot::SetSpec if !value.is_empty() => record.header.sets.push(value.to_string()),
         Slot::DcField if !value.is_empty() => {
-            record
-                .dc
-                .push((String::from_utf8_lossy(name).into_owned(), value.to_string()));
+            record.dc.push((
+                String::from_utf8_lossy(name).into_owned(),
+                value.to_string(),
+            ));
         }
         _ => {}
     }
@@ -299,9 +300,7 @@ pub fn parse_granularity(xml: &str) -> Option<HarvestGranularity> {
 }
 
 fn is_granularity(stack: &[Vec<u8>]) -> bool {
-    stack.len() == 3
-        && stack[1].as_slice() == b"Identify"
-        && stack[2].as_slice() == b"granularity"
+    stack.len() == 3 && stack[1].as_slice() == b"Identify" && stack[2].as_slice() == b"granularity"
 }
 
 /// Convert an OAI-PMH datestamp (`YYYY-MM-DD` or RFC 3339) to Unix milliseconds.
