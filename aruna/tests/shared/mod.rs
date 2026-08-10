@@ -973,7 +973,8 @@ async fn spawn_s3_server(
         metrics,
     )
     .await?;
-    let (_addr, task) = s3_server.run_with_listener(listener)?;
+    let (_addr, task) =
+        s3_server.run_with_listener(listener, tokio_util::sync::CancellationToken::new())?;
     Ok((
         S3Endpoint {
             endpoint_url: format!("http://{host}"),

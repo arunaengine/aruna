@@ -42,6 +42,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
@@ -83,6 +84,9 @@ pub struct ServerState {
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
     rocrate_upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
+    // Node shutdown token: long-lived response streams end when it fires, so
+    // the ingress drain does not have to wait for client disconnects.
+    shutdown_token: CancellationToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -190,9 +194,19 @@ impl ServerState {
             rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
             rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
             download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
+            shutdown_token: CancellationToken::new(),
         };
         state.persist_trusted_realms().await;
         state
+    }
+
+    pub fn with_shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = token;
+        self
+    }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.clone()
     }
 
     pub fn get_ctx(&self) -> Arc<DriverContext> {

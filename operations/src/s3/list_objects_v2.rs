@@ -512,6 +512,7 @@ impl ListObjectsV2Operation {
                             source,
                             cached_metadata,
                             last_refresh,
+                            ..
                         } => {
                             let descriptor = source.descriptor;
                             self.resolved

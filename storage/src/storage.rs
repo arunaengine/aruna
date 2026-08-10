@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use crossfire::{RecvError, TryRecvError, TrySendError, mpsc};
 use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
@@ -200,6 +200,7 @@ pub struct FjallStorage {
     persist_policy: FjallPersistPolicy,
     txns: HashMap<Ulid, Txn>,
     transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+    metrics: Arc<StorageMetrics>,
     read_pool: Vec<EffectSender>,
     next_reader: usize,
     bulk_read_pool: Vec<EffectSender>,
@@ -213,7 +214,19 @@ struct StorageMetrics {
     conflicts_total: AtomicU64,
     in_flight: AtomicU64,
     channel_closed: Arc<AtomicBool>,
+    sealed: AtomicBool,
+    /// Latched when the shutdown drain timed out. The worker reads it before it
+    /// starts any mutation, so nothing already queued can commit behind the
+    /// final `sync_all`.
+    mutations_fenced: Arc<AtomicBool>,
+    /// Serializes sealing with mutating enqueues. Sealing takes the write lock;
+    /// dispatch holds a read lock through its check and send, so writes are queued
+    /// before the final `SyncAll` or rejected after sealing.
+    seal_lock: RwLock<()>,
+    rejected_writes: AtomicU64,
     last_error: Mutex<Option<String>>,
+    /// Woken when `in_flight` falls to zero, so the shutdown barrier does not poll.
+    drained: Notify,
 }
 
 /// Decrements `in_flight` when an accepted effect completes or is discarded.
@@ -222,14 +235,16 @@ pub struct InFlightGuard(Arc<StorageMetrics>);
 
 impl InFlightGuard {
     fn acquire(metrics: &Arc<StorageMetrics>) -> Self {
-        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        metrics.in_flight.fetch_add(1, Ordering::AcqRel);
         Self(metrics.clone())
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drained.notify_waiters();
+        }
     }
 }
 
@@ -248,6 +263,8 @@ pub struct StorageMetricsSnapshot {
     pub conflicts_total: u64,
     pub failed_total: u64,
     pub channel_closed: bool,
+    pub sealed: bool,
+    pub rejected_writes: u64,
     pub last_error: Option<String>,
 }
 
@@ -409,13 +426,65 @@ impl StorageHandle {
 
     /// Number of storage effects currently enqueued or being processed.
     pub fn in_flight(&self) -> u64 {
-        self.metrics.in_flight.load(Ordering::Relaxed)
+        self.metrics.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Waits for effects accepted on either lane, including deferred cleanup and
+    /// drop aborts, before the final sync. Bounded by `timeout`; `false` means work
+    /// remains outstanding.
+    pub async fn drain_accepted(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.in_flight() == 0 {
+                return true;
+            }
+            let notified = self.metrics.drained.notified();
+            // Re-check after arming the wait so a wake between the two is not lost.
+            if self.in_flight() == 0 {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.in_flight() == 0;
+            }
+        }
     }
 
     /// True once the effect channel has permanently closed because the worker
     /// died. Latched and unrecoverable in-process; a cheap, lock-free read.
     pub fn channel_closed(&self) -> bool {
         self.metrics.channel_closed.load(Ordering::Relaxed)
+    }
+
+    /// Closes the write path before the final sync. Every mutating effect that
+    /// arrives afterwards is rejected and counted, so a leaked child task can
+    /// never commit behind a completed `sync_all`.
+    pub fn seal(&self) {
+        let _guard = self
+            .metrics
+            .seal_lock
+            .write()
+            .expect("storage seal lock poisoned");
+        self.metrics.sealed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.metrics.sealed.load(Ordering::SeqCst)
+    }
+
+    /// Stops the worker from starting any further mutation. Used when the
+    /// shutdown drain timed out: work still queued must not commit after the
+    /// final `sync_all`. Permanent for the life of the process.
+    pub fn fence_mutations(&self) {
+        self.metrics.mutations_fenced.store(true, Ordering::SeqCst);
+    }
+
+    /// Mutating effects rejected because storage was already sealed.
+    pub fn rejected_writes(&self) -> u64 {
+        self.metrics.rejected_writes.load(Ordering::Relaxed)
     }
 
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
@@ -426,6 +495,8 @@ impl StorageHandle {
             conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
             failed_total: errors_total,
             channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
+            sealed: self.is_sealed(),
+            rejected_writes: self.rejected_writes(),
             last_error: self
                 .metrics
                 .last_error
@@ -566,64 +637,95 @@ impl StorageHandle {
             return self
                 .observe_storage_event(StorageEvent::TransactionCommitted { txn_id: *txn_id });
         }
-        let send_result: Result<(), StorageError> = if let Some((txn_id, kind)) = cleanup {
-            let mut pending = self
-                .transaction_cleanup
-                .lock()
-                .expect("transaction cleanup mutex poisoned");
-            let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
-                Ok(admission) => admission,
-                Err(error) => {
-                    return self.observe_storage_event(StorageEvent::Error { error });
-                }
-            };
-            let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
-            let span = storage_effect_span(&effect);
-            let in_flight = InFlightGuard::acquire(&self.metrics);
-            match self.channel_for(&effect).try_send((
-                effect,
-                response_tx,
-                span,
-                Instant::now(),
-                in_flight,
-            )) {
-                Ok(()) => {
-                    if let Some(entry) = pending.get_mut(&txn_id) {
-                        entry.queued = true;
+        let mut deferred = None;
+        let send_result: Result<(), StorageError> = {
+            // Guard held across the seal check and the queue send (never an
+            // await), so a concurrent `seal` cannot slip between them.
+            let _seal_guard = storage_effect_mutates(&effect).then(|| {
+                self.metrics
+                    .seal_lock
+                    .read()
+                    .expect("storage seal lock poisoned")
+            });
+            if _seal_guard.is_some() && self.is_sealed() {
+                self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    event = "storage.write.after_seal",
+                    operation, "Rejected a storage write issued after the shutdown seal"
+                );
+                return self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::Sealed,
+                });
+            }
+            if let Some((txn_id, kind)) = cleanup {
+                let mut pending = self
+                    .transaction_cleanup
+                    .lock()
+                    .expect("transaction cleanup mutex poisoned");
+                let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        return self.observe_storage_event(StorageEvent::Error { error });
                     }
-                    Ok(())
+                };
+                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+                let span = storage_effect_span(&effect);
+                let in_flight = InFlightGuard::acquire(&self.metrics);
+                match self.channel_for(&effect).try_send((
+                    effect,
+                    response_tx,
+                    span,
+                    Instant::now(),
+                    in_flight,
+                )) {
+                    Ok(()) => {
+                        if let Some(entry) = pending.get_mut(&txn_id) {
+                            entry.queued = true;
+                        }
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(item)) => {
+                        rollback_cleanup(&mut pending, admission);
+                        // The item's ResponseToken re-locks the cleanup mutex on drop.
+                        drop(pending);
+                        drop(item);
+                        Err(StorageError::QueueFull)
+                    }
+                    Err(TrySendError::Disconnected(item)) => {
+                        rollback_cleanup(&mut pending, admission);
+                        drop(pending);
+                        drop(item);
+                        Err(StorageError::ChannelClosed)
+                    }
                 }
-                Err(TrySendError::Full(item)) => {
-                    rollback_cleanup(&mut pending, admission);
-                    // The item's ResponseToken re-locks the cleanup mutex on drop.
-                    drop(pending);
-                    drop(item);
-                    Err(StorageError::QueueFull)
-                }
-                Err(TrySendError::Disconnected(item)) => {
-                    rollback_cleanup(&mut pending, admission);
-                    drop(pending);
-                    drop(item);
-                    Err(StorageError::ChannelClosed)
+            } else {
+                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+                let span = storage_effect_span(&effect);
+                let in_flight = InFlightGuard::acquire(&self.metrics);
+                let item = (effect, response_tx, span, Instant::now(), in_flight);
+                match self.channel_for(&item.0).try_send(item) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(item)) if cleanup_write => {
+                        // Awaiting a slot needs the seal guard released first, so a
+                        // slot won after the seal enqueues; the worker mutation
+                        // fence still rejects it before it can execute.
+                        deferred = Some(item);
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(_)) => Err(StorageError::QueueFull),
+                    Err(TrySendError::Disconnected(_)) => Err(StorageError::ChannelClosed),
                 }
             }
-        } else {
-            let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
-            let span = storage_effect_span(&effect);
-            let in_flight = InFlightGuard::acquire(&self.metrics);
-            let item = (effect, response_tx, span, Instant::now(), in_flight);
-            match self.channel_for(&item.0).try_send(item) {
-                Ok(()) => Ok(()),
-                Err(TrySendError::Full(item)) if cleanup_write => {
-                    let channel = self.async_channel_for(&item.0).clone();
-                    match channel.send(item).await {
-                        Ok(()) => Ok(()),
-                        Err(_) => Err(StorageError::ChannelClosed),
-                    }
+        };
+        let send_result = match deferred {
+            Some(item) => {
+                let channel = self.async_channel_for(&item.0).clone();
+                match channel.send(item).await {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(StorageError::ChannelClosed),
                 }
-                Err(TrySendError::Full(_)) => Err(StorageError::QueueFull),
-                Err(TrySendError::Disconnected(_)) => Err(StorageError::ChannelClosed),
             }
+            None => send_result,
         };
         match send_result {
             Ok(()) => {}
@@ -790,6 +892,24 @@ impl StorageHandle {
         if matches!(error, StorageError::ChannelClosed) {
             self.metrics.channel_closed.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+/// Effects that can commit durable state. Reads, iterations, transaction aborts
+/// and `SyncAll` stay open after the seal.
+fn storage_effect_mutates(effect: &StorageEffect) -> bool {
+    match effect {
+        StorageEffect::Write { .. }
+        | StorageEffect::BatchWrite { .. }
+        | StorageEffect::Delete { .. }
+        | StorageEffect::BatchDelete { .. }
+        | StorageEffect::CommitTransaction { .. } => true,
+        StorageEffect::StartTransaction { read } => !read,
+        StorageEffect::Read { .. }
+        | StorageEffect::BatchRead { .. }
+        | StorageEffect::Iter { .. }
+        | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::SyncAll => false,
     }
 }
 
@@ -1215,8 +1335,20 @@ impl FjallStorage {
             .open()?;
 
         let (sender, receivers) = StorageHandle::new();
-        let store = Store::new(db);
-        let transaction_cleanup = sender.transaction_cleanup.clone();
+        let mut storage = Self::new(Store::new(db), policy, &sender);
+        let channel_closed = sender.metrics.channel_closed.clone();
+
+        thread::spawn(move || {
+            let _lifecycle = WorkerLifecycleGuard(channel_closed);
+            storage.receive_loop(receivers);
+        });
+
+        Ok(sender)
+    }
+
+    /// Worker sharing the handle's cleanup map and metrics, including the
+    /// mutation fence it reads before starting any mutation.
+    fn new(store: Store, policy: FjallPersistPolicy, handle: &StorageHandle) -> Self {
         let read_pool = spawn_read_pool(
             store.clone(),
             READ_POOL_THREADS,
@@ -1227,24 +1359,59 @@ impl FjallStorage {
             BULK_READ_POOL_THREADS,
             BULK_EFFECT_QUEUE_CAPACITY,
         );
-        let channel_closed = sender.metrics.channel_closed.clone();
+        Self {
+            store,
+            persist_policy: policy,
+            txns: HashMap::new(),
+            transaction_cleanup: handle.transaction_cleanup.clone(),
+            metrics: handle.metrics.clone(),
+            read_pool,
+            next_reader: 0,
+            bulk_read_pool,
+            next_bulk_reader: 0,
+        }
+    }
 
-        thread::spawn(move || {
-            let _lifecycle = WorkerLifecycleGuard(channel_closed);
-            let mut storage = FjallStorage {
-                store,
-                persist_policy: policy,
-                txns: HashMap::new(),
-                transaction_cleanup,
-                read_pool,
-                next_reader: 0,
-                bulk_read_pool,
-                next_bulk_reader: 0,
-            };
-            storage.receive_loop(receivers);
-        });
+    /// True when the drain fence is up and this effect would start a mutation
+    /// that has not begun executing yet.
+    fn fenced_mutation(&self, effect: &StorageEffect) -> bool {
+        storage_effect_mutates(effect) && self.metrics.mutations_fenced.load(Ordering::SeqCst)
+    }
 
-        Ok(sender)
+    /// Rejects a mutation the fence caught before it started, leaving no open
+    /// transaction and no cleanup entry behind it.
+    fn reject_fenced(&mut self, effect: &StorageEffect) -> StorageEvent {
+        if let Some(txn_id) = active_txn_id_for_effect(effect) {
+            self.retire_fenced_txn(txn_id);
+        }
+        self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            event = "storage.write.after_fence",
+            operation = storage_effect_kind(effect),
+            "Rejected a storage mutation issued after the shutdown drain fence"
+        );
+        StorageEvent::Error {
+            error: StorageError::Sealed,
+        }
+    }
+
+    /// Rolls a fenced transaction back and retires its cleanup entry through the
+    /// terminal `Aborted` state, whether it was open or had a commit queued.
+    fn retire_fenced_txn(&mut self, txn_id: Ulid) {
+        if let Some(Txn::Write(txn)) = self.txns.remove(&txn_id) {
+            txn.rollback();
+        }
+        if let Some(entry) = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .get_mut(&txn_id)
+        {
+            entry.kind = CleanupKind::Aborted;
+            entry.attempts = 0;
+            entry.queued = false;
+        }
+        finish_cleanup(&self.transaction_cleanup, txn_id);
     }
 
     fn process_effect(&mut self, effect: StorageEffect) -> StorageEvent {
@@ -1304,6 +1471,14 @@ impl FjallStorage {
             })
             .collect::<Vec<_>>();
         for (txn_id, kind) in retry {
+            // Past the fence an unknown commit must not be reissued: roll the
+            // transaction back if it is still open and retire the entry.
+            if matches!(kind, CleanupKind::CommitUnknown)
+                && self.metrics.mutations_fenced.load(Ordering::SeqCst)
+            {
+                self.retire_fenced_txn(txn_id);
+                continue;
+            }
             // A commit with an unknown outcome is re-issued, never aborted: the
             // original commit may still sit in the queue behind this retry.
             let event = match kind {
@@ -1449,7 +1624,11 @@ impl FjallStorage {
         }
 
         let service_started = Instant::now();
-        let event = self.process_effect(effect);
+        let event = if self.fenced_mutation(&effect) {
+            self.reject_fenced(&effect)
+        } else {
+            self.process_effect(effect)
+        };
         self.observe_cleanup(cleanup, &event);
         response_tx.observe(&event);
         self.retry_cleanup();
@@ -1490,6 +1669,14 @@ impl FjallStorage {
         slow_queue: &mut SlowQueueAggregator,
     ) {
         if group.is_empty() {
+            return;
+        }
+        // A batch the fence caught before it started never applies: its members
+        // are rejected one by one instead.
+        if self.metrics.mutations_fenced.load(Ordering::SeqCst) {
+            for item in std::mem::take(group) {
+                self.process_single(item, slow_queue);
+            }
             return;
         }
         if group.len() == 1 {
@@ -2837,7 +3024,9 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
+    use std::future::{Future, poll_fn};
     use std::sync::atomic::Ordering;
+    use std::task::Poll;
     use std::time::{Duration, Instant};
     use std::{env, process::Command, thread};
     use tempfile::tempdir;
@@ -3152,6 +3341,7 @@ mod tests {
             transaction_cleanup: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
+            metrics: std::sync::Arc::new(super::StorageMetrics::default()),
             read_pool: Vec::new(),
             next_reader: 0,
             bulk_read_pool: vec![bulk_sender],
@@ -3383,6 +3573,352 @@ mod tests {
         }
 
         assert!(metrics.channel_closed.load(Ordering::Relaxed));
+    }
+
+    // The seal is the write-after-sync barrier: a leaked child that survives the
+    // drain gets an error instead of committing behind the final sync.
+    #[tokio::test]
+    async fn seal_rejects_writes() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle.seal();
+
+        let event = handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert_eq!(handle.rejected_writes(), 1);
+        assert!(handle.snapshot_metrics().sealed);
+    }
+
+    // Shutdown still has to read and fsync after the barrier is up.
+    #[tokio::test]
+    async fn read_sync_allowed() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        handle.seal();
+
+        let read = handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            read,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
+        assert!(handle.sync_all().await.is_ok());
+        assert_eq!(handle.rejected_writes(), 0);
+    }
+
+    // The seal only blocks later dispatches, so a mutation already queued on the
+    // bulk lane must be waited out before the final sync.
+    #[tokio::test]
+    async fn drain_waits_accepted() {
+        let (handle, receivers) = small_handle(4);
+        let bulk = handle.bulk();
+        let mut queued = Box::pin(bulk.send_storage_effect(StorageEffect::Write {
+            key_space: "bulk".to_string(),
+            key: b"key".to_vec().into(),
+            value: b"value".to_vec().into(),
+            txn_id: None,
+        }));
+        let queued_state = poll_fn(|cx| Poll::Ready(queued.as_mut().poll(cx))).await;
+        assert!(queued_state.is_pending());
+        assert_eq!(handle.in_flight(), 1);
+        handle.seal();
+
+        let accepted = receivers.bulk.recv().expect("effect stays queued");
+        let mut drain = Box::pin(handle.drain_accepted(Duration::from_secs(30)));
+        let drain_state = poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx))).await;
+        assert!(drain_state.is_pending());
+        drop(accepted);
+        drop(queued);
+
+        assert!(drain.await);
+        assert_eq!(handle.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_txn_rejected() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle.seal();
+
+        let write_txn = handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await;
+        let read_txn = handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await;
+
+        assert!(matches!(
+            write_txn,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert!(matches!(
+            read_txn,
+            Event::Storage(StorageEvent::TransactionStarted { .. })
+        ));
+    }
+
+    /// Worker sharing the handle's channels, cleanup map and fence, driven by
+    /// the test thread so effect order is exact.
+    fn worker(dir: &tempfile::TempDir, handle: &StorageHandle) -> FjallStorage {
+        let db = fjall::OptimisticTxDatabase::builder(dir.path().to_str().expect("utf-8 path"))
+            .manual_journal_persist(true)
+            .open()
+            .expect("database opens");
+        FjallStorage::new(super::Store::new(db), FjallPersistPolicy::default(), handle)
+    }
+
+    fn keyed_write(key: &str) -> StorageEffect {
+        StorageEffect::Write {
+            key_space: "fenced".to_string(),
+            key: key.as_bytes().to_vec().into(),
+            value: b"value".to_vec().into(),
+            txn_id: None,
+        }
+    }
+
+    fn keyed_read(key: &str) -> StorageEffect {
+        StorageEffect::Read {
+            key_space: "fenced".to_string(),
+            key: key.as_bytes().to_vec().into(),
+            txn_id: None,
+        }
+    }
+
+    fn serve_next(storage: &mut FjallStorage, receiver: &super::EffectReceiver) {
+        let item = receiver.recv().expect("effect stays queued");
+        storage.process_single(item, &mut super::SlowQueueAggregator::default());
+    }
+
+    /// Polls a dispatch once: the effect is enqueued and still awaiting a reply.
+    async fn poll_queued<F: Future>(future: &mut std::pin::Pin<Box<F>>) {
+        assert!(
+            poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "effect should stay queued"
+        );
+    }
+
+    // The single-threaded actor finishes the mutation it already started, then
+    // syncs; a mutation still queued when the fence lands never starts.
+    #[tokio::test]
+    async fn active_precedes_sync() {
+        let dir = tempdir().unwrap();
+        let (handle, receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let mut active = Box::pin(handle.send_storage_effect(keyed_write("active")));
+        poll_queued(&mut active).await;
+        let mut queued = Box::pin(handle.send_storage_effect(keyed_write("queued")));
+        poll_queued(&mut queued).await;
+        let mut sync = Box::pin(handle.sync_all());
+        poll_queued(&mut sync).await;
+
+        serve_next(&mut storage, &receivers.foreground);
+        handle.fence_mutations();
+        serve_next(&mut storage, &receivers.foreground);
+        serve_next(&mut storage, &receivers.foreground);
+
+        assert!(matches!(
+            active.await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        assert!(matches!(
+            queued.await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert!(sync.await.is_ok());
+        let mut committed = Box::pin(handle.send_storage_effect(keyed_read("active")));
+        poll_queued(&mut committed).await;
+        let mut rejected = Box::pin(handle.send_storage_effect(keyed_read("queued")));
+        poll_queued(&mut rejected).await;
+        serve_next(&mut storage, &receivers.foreground);
+        serve_next(&mut storage, &receivers.foreground);
+        assert!(matches!(
+            committed.await,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
+        assert!(matches!(
+            rejected.await,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    // The lane hole this fence closes: bulk work queued before the seal must not
+    // commit once the drain gave up on it.
+    #[tokio::test]
+    async fn fence_blocks_bulk() {
+        let dir = tempdir().unwrap();
+        let (handle, receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let bulk = handle.bulk();
+        let mut queued = Box::pin(bulk.send_storage_effect(keyed_write("bulk")));
+        poll_queued(&mut queued).await;
+
+        handle.seal();
+        handle.fence_mutations();
+        serve_next(&mut storage, &receivers.bulk);
+
+        assert!(matches!(
+            queued.await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert_eq!(handle.rejected_writes(), 1);
+        let mut absent = Box::pin(handle.send_storage_effect(keyed_read("bulk")));
+        poll_queued(&mut absent).await;
+        serve_next(&mut storage, &receivers.foreground);
+        assert!(matches!(
+            absent.await,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    // A fenced transactional write and a fenced queued commit both leave the
+    // transaction rolled back and its cleanup entry retired.
+    #[tokio::test]
+    async fn fence_aborts_txns() {
+        let dir = tempdir().unwrap();
+        let (handle, receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let open_txn = started_txn(&handle, &receivers, &mut storage).await;
+        let commit_txn = started_txn(&handle, &receivers, &mut storage).await;
+        let mut staged = Box::pin(handle.send_storage_effect(StorageEffect::Write {
+            key_space: "fenced".to_string(),
+            key: b"staged".to_vec().into(),
+            value: b"value".to_vec().into(),
+            txn_id: Some(commit_txn),
+        }));
+        poll_queued(&mut staged).await;
+        serve_next(&mut storage, &receivers.foreground);
+        assert!(matches!(
+            staged.await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        assert_eq!(handle.pending_transactions(), 2);
+
+        let mut fenced_write = Box::pin(handle.send_storage_effect(StorageEffect::Write {
+            key_space: "fenced".to_string(),
+            key: b"late".to_vec().into(),
+            value: b"value".to_vec().into(),
+            txn_id: Some(open_txn),
+        }));
+        poll_queued(&mut fenced_write).await;
+        let mut fenced_commit = Box::pin(
+            handle.send_storage_effect(StorageEffect::CommitTransaction { txn_id: commit_txn }),
+        );
+        poll_queued(&mut fenced_commit).await;
+        handle.fence_mutations();
+        serve_next(&mut storage, &receivers.foreground);
+        serve_next(&mut storage, &receivers.foreground);
+
+        assert!(matches!(
+            fenced_write.await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert!(matches!(
+            fenced_commit.await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert!(storage.txns.is_empty());
+        assert_eq!(handle.pending_transactions(), 0);
+        assert!(!handle.commit_unknown(commit_txn));
+        let mut staged_read = Box::pin(handle.send_storage_effect(keyed_read("staged")));
+        poll_queued(&mut staged_read).await;
+        serve_next(&mut storage, &receivers.foreground);
+        assert!(matches!(
+            staged_read.await,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    async fn started_txn(
+        handle: &StorageHandle,
+        receivers: &super::StorageReceivers,
+        storage: &mut FjallStorage,
+    ) -> Ulid {
+        let mut started =
+            Box::pin(handle.send_storage_effect(StorageEffect::StartTransaction { read: false }));
+        poll_queued(&mut started).await;
+        serve_next(storage, &receivers.foreground);
+        match started.await {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    // A cleanup write that wins channel capacity after the fence is rejected by
+    // the worker gate rather than committing behind the final fsync.
+    #[tokio::test]
+    async fn deferred_respects_fence() {
+        let dir = tempdir().unwrap();
+        let (handle, receivers) = small_handle(1);
+        let mut storage = worker(&dir, &handle);
+        let filler = keyed_read("filler");
+        let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
+        let filler_span = super::storage_effect_span(&filler);
+        let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+        handle
+            .write_channel
+            .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
+            .expect("fill queue");
+        let waiter = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.send_storage_effect(cleanup_write()).await }
+        });
+        // Two accepted effects means the cleanup write is parked on capacity.
+        while handle.in_flight() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        let receiver = receivers.foreground.into_async();
+        drop(receiver.recv().await.expect("filler effect"));
+        let item = receiver.recv().await.expect("cleanup effect");
+        assert!(super::is_cleanup_write(&item.0));
+        handle.fence_mutations();
+        storage.process_single(item, &mut super::SlowQueueAggregator::default());
+
+        assert!(matches!(
+            waiter.await.expect("cleanup sender"),
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
     }
 
     #[tokio::test]
@@ -3684,6 +4220,7 @@ mod tests {
             persist_policy: FjallPersistPolicy::default(),
             txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
             transaction_cleanup,
+            metrics: std::sync::Arc::new(super::StorageMetrics::default()),
             read_pool: Vec::new(),
             next_reader: 0,
             bulk_read_pool: Vec::new(),
@@ -3726,6 +4263,7 @@ mod tests {
             persist_policy: FjallPersistPolicy::default(),
             txns: std::collections::HashMap::new(),
             transaction_cleanup,
+            metrics: std::sync::Arc::new(super::StorageMetrics::default()),
             read_pool: Vec::new(),
             next_reader: 0,
             bulk_read_pool: Vec::new(),
@@ -3765,6 +4303,7 @@ mod tests {
             persist_policy: FjallPersistPolicy::default(),
             txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
             transaction_cleanup,
+            metrics: std::sync::Arc::new(super::StorageMetrics::default()),
             read_pool: Vec::new(),
             next_reader: 0,
             bulk_read_pool: Vec::new(),
@@ -4554,6 +5093,8 @@ mod tests {
                 conflicts_total: 0,
                 failed_total: 1,
                 channel_closed: false,
+                sealed: false,
+                rejected_writes: 0,
                 last_error: Some("Transaction not found".to_string()),
             }
         );

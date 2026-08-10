@@ -2240,6 +2240,100 @@ fn group_effect(backend_id: Ulid) -> BlobEffect {
     }
 }
 
+// The seal stops new blob mutations before storage is sealed, so a restart
+// cannot find a backend write whose location never reached storage.
+#[tokio::test]
+async fn seal_blocks_writes() {
+    let context = setup_blob_handle(64).await;
+    context.blob_handle.seal();
+    assert!(context.blob_handle.is_sealed());
+
+    let rejected = context
+        .blob_handle
+        .send_blob_effect(group_effect(Ulid::generate()))
+        .await;
+    assert!(matches!(
+        rejected,
+        Event::Blob(BlobEvent::Error(BlobError::Sealed))
+    ));
+    assert_eq!(context.blob_handle.rejected_writes(), 1);
+
+    // A non-mutating effect still runs after the seal.
+    let listed = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: None,
+            cursor: None,
+        })
+        .await;
+    assert!(!matches!(
+        listed,
+        Event::Blob(BlobEvent::Error(BlobError::Sealed))
+    ));
+}
+
+// A copy that fails verification is tracked durably, keyed per (hash, backend)
+// so re-detecting the same corrupt copy overwrites its own row (§8.2).
+#[tokio::test]
+async fn quarantine_upserts_record() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
+    use aruna_core::structs::{BackendRef, BlobQuarantineRecord};
+
+    let context = setup_blob_handle(64).await;
+    let blake3 = [7u8; 32];
+    let backend = BackendRef::node_default();
+    let key = BlobQuarantineRecord::new(blake3, backend.clone(), String::new(), 0).key();
+
+    let read_record = |key: Vec<u8>| {
+        let storage = context.storage_handle.clone();
+        async move {
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: BLOB_QUARANTINE_KEYSPACE.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("expected a quarantine record");
+            };
+            BlobQuarantineRecord::from_bytes(bytes.as_ref()).unwrap()
+        }
+    };
+
+    context
+        .blob_handle
+        .handler
+        .quarantine_corrupt_blob(blake3, &backend, "bao read source hash mismatch")
+        .await;
+    let record = read_record(key.clone()).await;
+    assert_eq!(record.blake3, blake3);
+    assert_eq!(record.backend, backend);
+    assert_eq!(record.reason, "bao read source hash mismatch");
+
+    context
+        .blob_handle
+        .handler
+        .quarantine_corrupt_blob(blake3, &backend, "blake3 hash mismatch")
+        .await;
+    assert_eq!(read_record(key).await.reason, "blake3 hash mismatch");
+}
+
+// With no mutation in flight the drain returns immediately.
+#[tokio::test]
+async fn idle_drain_succeeds() {
+    let context = setup_blob_handle(64).await;
+    assert!(
+        context
+            .blob_handle
+            .drain_writes(std::time::Duration::from_secs(5))
+            .await
+    );
+}
+
 #[tokio::test]
 async fn pins_effect_snapshot() {
     // A shared entry could be replaced or dropped while this effect still runs.

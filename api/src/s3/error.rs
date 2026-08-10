@@ -47,6 +47,17 @@ fn quota_exceeded_error(limit: u64, usage: u64) -> S3Error {
     error
 }
 
+/// A reference binding at its automatic advance cap. S3 has no standard code
+/// for it, so we return a custom code with an explicit 409 and the remedy.
+fn reference_exhausted_error() -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("ReferenceAdvanceExhausted".into()),
+        "The reference binding reached its automatic advance limit; rebind it with an explicit write.".to_string(),
+    );
+    error.set_status_code(http::StatusCode::CONFLICT);
+    error
+}
+
 /// A named backend that has reached its operator quota. Refusing loudly beats
 /// hiding exhaustion by writing somewhere the rule did not name.
 fn backend_full_error(backend: &str) -> S3Error {
@@ -310,6 +321,19 @@ impl IntoS3Error for GetObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             GetObjectError::NoSuchVersion => no_such_version_error(),
+            GetObjectError::HistoricalReferenceUnavailable => {
+                s3_error!(
+                    NoSuchVersion,
+                    "The requested reference version is no longer available."
+                )
+            }
+            GetObjectError::ReferenceSourceChanged => {
+                s3_error!(
+                    ServiceUnavailable,
+                    "The reference source is changing; retry the request."
+                )
+            }
+            GetObjectError::ReferenceAdvanceExhausted => reference_exhausted_error(),
             GetObjectError::DeleteMarker => delete_marker_error(),
             GetObjectError::NoSuchKey => no_such_key_error(),
             GetObjectError::InvalidRange => {
@@ -517,6 +541,29 @@ mod tests {
         ] {
             assert_eq!(*error.code(), S3ErrorCode::InternalError);
         }
+    }
+
+    // The three reference failures are distinct to a client: gone (404), retry
+    // later (503), and rebind required (409). Copy must forward them unchanged.
+    #[test]
+    fn maps_reference_errors() {
+        let historical = GetObjectError::HistoricalReferenceUnavailable.into_s3_error();
+        assert_eq!(*historical.code(), S3ErrorCode::NoSuchVersion);
+
+        let changed = GetObjectError::ReferenceSourceChanged.into_s3_error();
+        assert_eq!(*changed.code(), S3ErrorCode::ServiceUnavailable);
+
+        let exhausted = GetObjectError::ReferenceAdvanceExhausted.into_s3_error();
+        assert_eq!(
+            *exhausted.code(),
+            S3ErrorCode::Custom("ReferenceAdvanceExhausted".into())
+        );
+        assert_eq!(exhausted.status_code(), Some(http::StatusCode::CONFLICT));
+
+        let copied =
+            CopyObjectError::Get(GetObjectError::ReferenceAdvanceExhausted).into_s3_error();
+        assert_eq!(*copied.code(), *exhausted.code());
+        assert_eq!(copied.status_code(), exhausted.status_code());
     }
 
     // UploadNotOpen from upload/complete/abort maps to NoSuchUpload (404).

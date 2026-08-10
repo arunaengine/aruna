@@ -277,6 +277,7 @@ impl HeadObjectOperation {
                 source,
                 cached_metadata,
                 last_refresh,
+                ..
             } => {
                 self.location = None;
                 self.source_metadata = Some(cached_metadata);

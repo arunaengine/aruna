@@ -414,6 +414,7 @@ async fn prepare_reference(
             range,
             group_id: bucket_info.group_id,
             user_identity: relationship.created_by,
+            node_id: relationship.source.node_id,
         }),
         context,
     )
@@ -465,7 +466,14 @@ fn map_get_error(error: GetObjectError) -> NativeReferenceReject {
     match error {
         GetObjectError::NoSuchKey
         | GetObjectError::NoSuchVersion
-        | GetObjectError::DeleteMarker => NativeReferenceReject::NotFound,
+        | GetObjectError::DeleteMarker
+        // The pinned observation is gone from the origin, so this read has no
+        // bytes to relay; drift and an exhausted binding are both transport-level
+        // unavailability the caller may retry or heal by rebinding.
+        | GetObjectError::HistoricalReferenceUnavailable => NativeReferenceReject::NotFound,
+        GetObjectError::ReferenceSourceChanged | GetObjectError::ReferenceAdvanceExhausted => {
+            NativeReferenceReject::Unavailable(error.to_string())
+        }
         GetObjectError::StagingSourceError(StagingSourceError::NotFound) => {
             NativeReferenceReject::NotFound
         }
@@ -601,6 +609,25 @@ mod tests {
     use aruna_core::structs::{ArunaArn, ReferenceHandling, SyncMode, SyncStatusSnapshot};
     use aruna_net::NetConfig;
     use aruna_storage::storage::FjallStorage;
+
+    // The relaying peer must learn that a pinned observation is gone (NotFound)
+    // rather than treating it as a transient origin failure.
+    #[test]
+    fn maps_reference_rejects() {
+        assert_eq!(
+            map_get_error(GetObjectError::HistoricalReferenceUnavailable),
+            NativeReferenceReject::NotFound
+        );
+        for error in [
+            GetObjectError::ReferenceSourceChanged,
+            GetObjectError::ReferenceAdvanceExhausted,
+        ] {
+            assert!(matches!(
+                map_get_error(error),
+                NativeReferenceReject::Unavailable(_)
+            ));
+        }
+    }
 
     #[test]
     fn request_roundtrips() {

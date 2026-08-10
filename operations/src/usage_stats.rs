@@ -281,6 +281,9 @@ pub enum QuotaGateError {
 /// `ceiling` already folds in the grace factor; that headroom is deliberately the
 /// budget for remote snapshot staleness, since remote group totals lag the
 /// authoritative counters that produced them.
+///
+/// The write-path reservation (#352) uses this transaction conflict instead of a
+/// separate ledger, because concurrent writes cannot over-commit the ceiling.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,

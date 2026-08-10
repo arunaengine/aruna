@@ -83,6 +83,47 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
     }
 }
 
+/// Effects that write bytes to a backend or remove them. Reads, serves, listings
+/// and connection control stay open after the seal.
+fn blob_effect_mutates(effect: &BlobEffect) -> bool {
+    matches!(
+        effect,
+        BlobEffect::Write { .. }
+            | BlobEffect::WritePart { .. }
+            | BlobEffect::Compose { .. }
+            | BlobEffect::SpoolHidden { .. }
+            | BlobEffect::Replicate { .. }
+            | BlobEffect::HandleReplication { .. }
+            | BlobEffect::ReceiveRead { .. }
+            | BlobEffect::Delete { .. }
+            | BlobEffect::DeleteHidden { .. }
+    )
+}
+
+/// Tracks one in-flight blob mutation so `drain_writes` can wait for it.
+struct BlobWriteGuard {
+    in_flight: Arc<AtomicUsize>,
+    drained: Arc<tokio::sync::Notify>,
+}
+
+impl BlobWriteGuard {
+    fn new(handler: &BlobHandler) -> Self {
+        handler.writes_in_flight.fetch_add(1, Ordering::AcqRel);
+        Self {
+            in_flight: handler.writes_in_flight.clone(),
+            drained: handler.writes_drained.clone(),
+        }
+    }
+}
+
+impl Drop for BlobWriteGuard {
+    fn drop(&mut self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
 // Holds a read slot until the lazily consumed stream is dropped.
 struct PermitStream {
     inner: BackendStream<Result<Bytes, StreamError>>,
@@ -143,8 +184,49 @@ impl BlobHandle {
         BlobHandle { handler }
     }
 
+    /// Closes the blob write path before storage is sealed. Mutations that
+    /// arrive afterwards are rejected and counted.
+    pub fn seal(&self) {
+        self.handler.seal();
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.handler.is_sealed()
+    }
+
+    pub fn rejected_writes(&self) -> u64 {
+        self.handler.rejected_writes.load(Ordering::Relaxed)
+    }
+
+    /// Waits until blob mutations registered before the seal complete, bounded
+    /// by `timeout`. Returns `true` when none remain.
+    pub async fn drain_writes(&self, timeout: Duration) -> bool {
+        self.handler.drain_writes(timeout).await
+    }
+
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
         let (class, kind) = classify_effect(&effect);
+        // Register a mutation before any await so a concurrent seal either
+        // rejects it or drains it; the guard lives for the whole effect.
+        let _write = if blob_effect_mutates(&effect) {
+            let _seal_guard = self
+                .handler
+                .seal_lock
+                .read()
+                .expect("blob seal lock poisoned");
+            if self.handler.is_sealed() {
+                self.handler.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    event = "blob.write.after_seal",
+                    effect = kind,
+                    "Rejected a blob write issued after the shutdown seal"
+                );
+                return Event::Blob(BlobEvent::Error(BlobError::Sealed));
+            }
+            Some(BlobWriteGuard::new(&self.handler))
+        } else {
+            None
+        };
         let deadline = match &effect {
             BlobEffect::SpoolHidden { deadline, .. } => *deadline,
             _ => None,
@@ -368,6 +450,11 @@ impl BlobHandler {
             inflight: Arc::new(AtomicUsize::new(0)),
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            sealed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seal_lock: Arc::new(std::sync::RwLock::new(())),
+            rejected_writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writes_in_flight: Arc::new(AtomicUsize::new(0)),
+            writes_drained: Arc::new(tokio::sync::Notify::new()),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
@@ -377,6 +464,36 @@ impl BlobHandler {
         });
 
         Ok(BlobHandle::new(blob_handler))
+    }
+
+    pub(super) fn seal(&self) {
+        let _guard = self.seal_lock.write().expect("blob seal lock poisoned");
+        self.sealed.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn is_sealed(&self) -> bool {
+        self.sealed.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn drain_writes(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.writes_in_flight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let notified = self.writes_drained.notified();
+            // Re-check after arming the wait so a wake between the two is not lost.
+            if self.writes_in_flight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.writes_in_flight.load(Ordering::Acquire) == 0;
+            }
+        }
     }
 
     // Effects run concurrently on their caller's task; per-operation ordering

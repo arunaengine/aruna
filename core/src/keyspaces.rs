@@ -42,6 +42,9 @@ pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
 pub const BLOB_CLEANUP_KEYSPACE: &str = "blob_pending_cleanups";
 pub const BLOB_RECLAIM_KEYSPACE: &str = "blob_reclaim_candidates";
 pub const BLOB_HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
+/// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
+/// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
+pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";

@@ -41,6 +41,7 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{
     AuthContext, HashPathIndexKey, Permission, RealmId, ReplicationItemKind, RoCrateLimits,
     WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
@@ -72,9 +73,11 @@ impl OperationsInboundHandler {
         context: Arc<DriverContext>,
         rocrate_limits: RoCrateLimits,
         jobs_runtime: Arc<JobsRuntime>,
+        shutdown: Shutdown,
     ) -> Self {
-        let document_sync_reconcile = Arc::new(DocumentSyncReconcileCoalescer::default());
-        spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile));
+        let document_sync_reconcile =
+            Arc::new(DocumentSyncReconcileCoalescer::new(shutdown.clone()));
+        spawn_queue_gauge(Arc::downgrade(&document_sync_reconcile), &shutdown);
         Self {
             context,
             document_sync_reconcile,
@@ -202,6 +205,14 @@ async fn manifest_policy(
             &manifest.key,
         )
     };
+    if manifest.reference_advance.is_some() {
+        // The sync-eligible publisher attests source READ for this advance.
+        return Ok(if auth_matches(&manifest.auth_context, local_realm) {
+            (Some(path), None)
+        } else {
+            (None, None)
+        });
+    }
     let operation = if manifest.kind == ReplicationItemKind::DeleteMarker {
         "s3.DeleteObject"
     } else {
@@ -344,6 +355,7 @@ async fn bao_policy(
 #[derive(Debug, Default)]
 struct DocumentSyncReconcileCoalescer {
     state: Mutex<DocumentSyncReconcileQueue>,
+    shutdown: Shutdown,
 }
 
 #[derive(Debug, Default)]
@@ -354,7 +366,19 @@ struct DocumentSyncReconcileQueue {
 }
 
 impl DocumentSyncReconcileCoalescer {
+    fn new(shutdown: Shutdown) -> Self {
+        Self {
+            state: Mutex::default(),
+            shutdown,
+        }
+    }
+
     fn trigger(self: &Arc<Self>, context: Arc<DriverContext>, topics: Vec<irokle::TopicId>) {
+        // Reconcile runs write metadata and storage: none may start once
+        // shutdown has begun draining.
+        if self.shutdown.is_triggered() {
+            return;
+        }
         {
             let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
             state.queued.extend(topics);
@@ -367,7 +391,7 @@ impl DocumentSyncReconcileCoalescer {
             state.running = true;
         }
         let coalescer = self.clone();
-        tokio::spawn(async move {
+        self.shutdown.spawn(async move {
             let mut failures = 0u32;
             loop {
                 let batch: Vec<irokle::TopicId> = {
@@ -420,14 +444,18 @@ impl DocumentSyncReconcileCoalescer {
 
 // Emits a `queue.lag` line every tick while the coalescer holds queued topics
 // or a reconcile run is in flight, plus one final line once it drains.
-fn spawn_reconcile_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+fn spawn_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>, shutdown: &Shutdown) {
+    if tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    runtime.spawn(async move {
+    }
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
         let mut was_active = false;
         loop {
-            sleep(QUEUE_LAG_INTERVAL).await;
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = sleep(QUEUE_LAG_INTERVAL) => {}
+            }
             let Some(coalescer) = coalescer.upgrade() else {
                 return;
             };
@@ -503,13 +531,19 @@ async fn reconcile_inbound_document_sync_topics(
 }
 
 pub fn initialize_net_incoming(context: Arc<DriverContext>) {
-    initialize_net_holder(context, RoCrateLimits::default(), JobsRuntime::new());
+    initialize_net_holder(
+        context,
+        RoCrateLimits::default(),
+        JobsRuntime::new(),
+        &Shutdown::new(),
+    );
 }
 
 pub fn initialize_net_holder(
     context: Arc<DriverContext>,
     rocrate_limits: RoCrateLimits,
     jobs_runtime: Arc<JobsRuntime>,
+    shutdown: &Shutdown,
 ) {
     let Some(net_handle) = context.net_handle.clone() else {
         warn!("Cannot initialize inbound handling without net handle");
@@ -520,6 +554,7 @@ pub fn initialize_net_holder(
         context.clone(),
         rocrate_limits,
         jobs_runtime,
+        shutdown.clone(),
     ));
 
     net_handle.set_inbound_handler(inbound_handler.clone());
@@ -528,6 +563,7 @@ pub fn initialize_net_holder(
             context,
             Arc::downgrade(&inbound_handler.document_sync_reconcile),
             metadata_handle,
+            shutdown,
         );
     }
 }
@@ -606,7 +642,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                         match first_event {
                             Event::Blob(BlobEvent::MessageReceived { payload, .. }) => {
                                 match VersionReplicationMessage::from_bytes(&payload) {
-                                    Ok(VersionReplicationMessage::VersionManifest(manifest)) => {
+                                    Ok(VersionReplicationMessage::VersionManifest(manifest))
+                                    | Ok(VersionReplicationMessage::ReferenceAdvance {
+                                        manifest,
+                                        ..
+                                    }) => {
                                         debug!(
                                             peer = %node_id,
                                             stream_id = %stream_id,
@@ -986,6 +1026,7 @@ fn schedule_periodic_metadata_document_sync_maintenance(
     context: Arc<DriverContext>,
     coalescer: Weak<DocumentSyncReconcileCoalescer>,
     metadata_handle: MetadataHandle,
+    shutdown: &Shutdown,
 ) {
     let jitter = Duration::from_secs(
         std::time::SystemTime::now()
@@ -993,10 +1034,16 @@ fn schedule_periodic_metadata_document_sync_maintenance(
             .map(|now| now.subsec_nanos() as u64 % METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS)
             .unwrap_or(0),
     );
-    tokio::spawn(async move {
+    // This loop writes the metadata store, so it has to stop before the
+    // shutdown flushes it.
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
         let mut cycle = 0usize;
         loop {
-            sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter).await;
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter) => {}
+            }
             let Some(coalescer) = coalescer.upgrade() else {
                 return;
             };
@@ -1037,10 +1084,15 @@ async fn run_metadata_document_sync_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::protocol::ReferenceAdvance;
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::UserId;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
-    use aruna_core::structs::{Backend, BackendConfig};
+    use aruna_core::structs::{
+        Backend, BackendConfig, PathRestriction, PortableSourceDescriptor, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, VersionSourceBinding,
+    };
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -1099,12 +1151,129 @@ mod tests {
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
+            Shutdown::new(),
         );
 
         assert!(handler.peer_sync_eligible(realm_id, server).await);
         assert!(!handler.peer_sync_eligible(realm_id, user).await);
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         assert!(!handler.peer_sync_eligible(realm_id, unknown).await);
+    }
+
+    #[tokio::test]
+    async fn checks_advance_policy() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let foreign_realm = RealmId::from_bytes([5u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
+        let path = blob_object_permission_path(realm_id, group_id, node_id, "bucket", "key");
+        let auth_context = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: "/source/**".to_string(),
+                permission: Permission::READ,
+            }]),
+        };
+        let mut manifest = VersionReplicationManifest {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::generate(),
+            group_id,
+            kind: ReplicationItemKind::Materialized,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user_id,
+            current_version: true,
+            current_version_generation: Some(2),
+            auth_context,
+            blob: None,
+            source: Some(VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::Http,
+                    public_config: HashMap::new(),
+                    source_path: "source".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: Some(Ulid::generate()),
+            }),
+            multipart: None,
+            reference_intent: true,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: None,
+            reference_metadata: Some(SourceMetadata {
+                content_length: 1,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            }),
+            metadata: HashMap::new(),
+            reference_advance: Some(ReferenceAdvance {
+                generation: 2,
+                predecessor: Ulid::generate(),
+            }),
+            reference_advance_count: Some(0),
+        };
+
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (Some(path.clone()), None)
+        );
+
+        manifest.auth_context = AuthContext::anonymous(realm_id);
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (Some(path), None)
+        );
+
+        manifest.auth_context = AuthContext {
+            user_id: UserId::nil(foreign_realm),
+            realm_id,
+            path_restrictions: None,
+        };
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (None, None)
+        );
+
+        manifest.auth_context = AuthContext::anonymous(foreign_realm);
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (None, None)
+        );
+
+        manifest.reference_advance = None;
+        manifest.auth_context = AuthContext::anonymous(realm_id);
+        manifest.writer_auth_context = Some(manifest.auth_context.clone());
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (None, None)
+        );
     }
 
     #[tokio::test]
@@ -1158,6 +1327,7 @@ mod tests {
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
+            Shutdown::new(),
         );
 
         let mut outbound = net_a.open_stream(net_b.node_id(), Alpn::Bao).await.unwrap();

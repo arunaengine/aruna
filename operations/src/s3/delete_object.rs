@@ -904,6 +904,10 @@ mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
+    fn test_node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
+
     fn test_user_id() -> aruna_core::UserId {
         aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
@@ -1389,6 +1393,7 @@ mod test {
                 range: None,
                 group_id: Ulid::generate(),
                 user_identity: user_id,
+                node_id: test_node_id(),
             }),
             &context,
         )
@@ -1559,6 +1564,7 @@ mod test {
                 range: None,
                 group_id: Ulid::generate(),
                 user_identity: user_id,
+                node_id: test_node_id(),
             }),
             &context,
         )
@@ -1608,6 +1614,7 @@ mod test {
                 range: None,
                 group_id: Ulid::generate(),
                 user_identity: user_id,
+                node_id: test_node_id(),
             }),
             &context,
         )

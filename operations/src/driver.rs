@@ -754,6 +754,8 @@ impl Drop for TransactionTracker {
     }
 }
 
+// Deferred (#336): an active-transaction gauge and a time-based reaper for
+// stray transactions, observability on top of this closed leak path.
 async fn abort_leaked_transaction(
     tracker: &mut TransactionTracker,
     context: &DriverContext,

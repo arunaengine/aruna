@@ -417,6 +417,7 @@ pub async fn load_inputs(
     spec: &ExecutionSpec,
     record: &JobRecord,
     bucket: &str,
+    node_id: NodeId,
 ) -> Result<Vec<TaskInput>, JobError> {
     let mut files = Vec::new();
     let mut total_bytes = 0u64;
@@ -432,6 +433,7 @@ pub async fn load_inputs(
                 range: None,
                 group_id: spec.group_id,
                 user_identity: record.created_by,
+                node_id,
             }),
             context,
         ))
@@ -814,8 +816,9 @@ async fn stage_one_input(
             key: src_key.clone(),
             version_id: version,
             range: None,
-            group_id: spec.group_id,
+            group_id: bucket_info.group_id,
             user_identity: record.created_by,
+            node_id,
         }),
         context,
     ))
@@ -903,9 +906,21 @@ fn bucket_lookup_error(scope: &str, error: GetBucketInfoError) -> JobError {
     }
 }
 
+/// Only transient source drift earns another attempt: a historical observation
+/// the source dropped and an exhausted binding both need an explicit rebind.
+fn get_input_retryable(error: &GetObjectError) -> bool {
+    match error {
+        GetObjectError::StorageError(error) => storage_retryable(error),
+        GetObjectError::ReferenceSourceChanged => true,
+        GetObjectError::HistoricalReferenceUnavailable
+        | GetObjectError::ReferenceAdvanceExhausted => false,
+        _ => false,
+    }
+}
+
 fn staged_input_error(error: GetObjectError) -> JobError {
     let message = format!("staged input read failed: {error}");
-    if matches!(&error, GetObjectError::StorageError(error) if storage_retryable(error)) {
+    if get_input_retryable(&error) {
         JobError::retryable(message)
     } else {
         JobError::permanent(message)
@@ -914,7 +929,7 @@ fn staged_input_error(error: GetObjectError) -> JobError {
 
 fn source_input_error(error: GetObjectError) -> JobError {
     let message = format!("input read failed: {error}");
-    if matches!(&error, GetObjectError::StorageError(error) if storage_retryable(error)) {
+    if get_input_retryable(&error) {
         JobError::retryable(message)
     } else {
         JobError::permanent(message)
@@ -1094,8 +1109,8 @@ mod tests {
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, JobId, JobPayload, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId,
+        Actor, Group, GroupAuthorizationDocument, JobErrorKind, JobId, JobPayload,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -1132,6 +1147,26 @@ mod tests {
             container_path: key.to_string(),
             size: 0,
             digest: None,
+        }
+    }
+
+    // Both input mappings must retry only transient drift: a job that waits on a
+    // rebind or a dropped observation would burn its whole attempt budget.
+    #[test]
+    fn classifies_input_errors() {
+        for map in [staged_input_error, source_input_error] {
+            assert_eq!(
+                map(GetObjectError::ReferenceSourceChanged).kind,
+                JobErrorKind::Retryable
+            );
+            assert_eq!(
+                map(GetObjectError::HistoricalReferenceUnavailable).kind,
+                JobErrorKind::Permanent
+            );
+            assert_eq!(
+                map(GetObjectError::ReferenceAdvanceExhausted).kind,
+                JobErrorKind::Permanent
+            );
         }
     }
 

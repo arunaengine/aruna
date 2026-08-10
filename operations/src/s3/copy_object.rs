@@ -4,7 +4,7 @@ use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, Put
 use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
+    AuthContext, BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::types::{GroupId, NodeId};
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ pub struct CopyObjectInput {
     pub source_key: String,
     pub source_version_id: Option<Ulid>,
     pub source_group_id: GroupId,
+    pub source_auth_context: AuthContext,
     pub dest_bucket: String,
     pub dest_key: String,
     pub user_id: UserId,
@@ -129,8 +130,10 @@ pub async fn copy_object(
             version_id: input.source_version_id,
             range: None,
             group_id: input.source_group_id,
-            user_identity: input.user_id,
-        }),
+            user_identity: input.source_auth_context.user_id,
+            node_id: input.node_id,
+        })
+        .with_restrictions(input.source_auth_context.path_restrictions.clone()),
         context,
     )
     .await
@@ -229,7 +232,7 @@ pub async fn copy_object(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::s3::get_object::GetObjectOperation;
+    use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::egress::EgressPolicy;
@@ -248,6 +251,18 @@ mod test {
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use tokio::net::TcpListener;
+
+    fn test_node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
+
+    fn auth_context(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: user_id.realm_id,
+            path_restrictions: None,
+        }
+    }
 
     async fn full_context() -> (TempDir, DriverContext) {
         let temp_handle = tempdir().unwrap();
@@ -397,6 +412,7 @@ mod test {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let source = drive(
             PutObjectOperation::new(put_config(
@@ -425,9 +441,10 @@ mod test {
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,
@@ -465,6 +482,7 @@ mod test {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
         let source = VersionSourceBinding {
@@ -506,9 +524,10 @@ mod test {
                 source_key: "ref.txt".to_string(),
                 source_version_id: None,
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,
@@ -542,6 +561,7 @@ mod test {
                 range: None,
                 group_id,
                 user_identity: UserId::local(Ulid::generate(), realm_id),
+                node_id: test_node_id(),
             }),
             &context,
         )
@@ -557,12 +577,88 @@ mod test {
         assert_eq!(read_buffer, b"reference-bytes");
     }
 
+    // A copy reading a capped reference must surface the exact variant, so the
+    // caller learns that only an explicit rebind heals it.
+    #[tokio::test]
+    async fn copy_reports_exhausted() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+
+        let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        };
+        write_version(
+            &context,
+            "bucket",
+            "capped.txt",
+            BlobVersion::reference(
+                source,
+                SourceMetadata {
+                    content_length: 1,
+                    content_type: Some("text/plain".to_string()),
+                    etag: Some("stale-etag".to_string()),
+                    last_modified: Some(SystemTime::UNIX_EPOCH),
+                    source_version: None,
+                },
+                SystemTime::UNIX_EPOCH,
+                UserId::local(Ulid::generate(), realm_id),
+                SystemTime::UNIX_EPOCH,
+            )
+            .with_advance_count(MAX_AUTO_ADVANCES),
+        )
+        .await;
+
+        let error = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "capped.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            error,
+            CopyObjectError::Get(GetObjectError::ReferenceAdvanceExhausted)
+        );
+    }
+
     #[tokio::test]
     async fn delete_marker_source_errors() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let version_id = Ulid::generate();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
@@ -602,9 +698,10 @@ mod test {
                 source_key: "gone.txt".to_string(),
                 source_version_id: Some(version_id),
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,
@@ -739,6 +836,7 @@ mod test {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         drive(
             PutObjectOperation::new(put_config(
@@ -763,9 +861,10 @@ mod test {
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
                 source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,

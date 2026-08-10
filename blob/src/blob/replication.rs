@@ -9,21 +9,62 @@ use crate::bao_tree::{
 };
 use crate::error::BlobLibError;
 use crate::messages::{MessageType, ReplicationMessage};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::BlobError;
-use aruna_core::events::BlobEvent;
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendLocation, ResolvedBackend};
+use aruna_core::structs::{BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend};
+use aruna_core::util::unix_timestamp_millis;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, ByteRanges};
 use bytes::BytesMut;
-use tracing::debug;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::BAO_BLOCK_SIZE;
 
 impl BlobHandler {
+    /// Persists durable evidence that a stored copy failed verification (§8.2)
+    /// before the error returns, so a corrupt copy is tracked, not just logged.
+    /// Best-effort: a failed write is logged, never masking the original error.
+    pub(super) async fn quarantine_corrupt_blob(
+        &self,
+        blake3: [u8; 32],
+        backend: &BackendRef,
+        reason: &str,
+    ) {
+        let record = BlobQuarantineRecord::new(
+            blake3,
+            backend.clone(),
+            reason.to_string(),
+            unix_timestamp_millis(),
+        );
+        let value = match record.to_bytes() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "failed to encode blob quarantine record");
+                return;
+            }
+        };
+        let event = self
+            .storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_QUARANTINE_KEYSPACE.to_string(),
+                key: record.key().into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            warn!(%error, reason, "failed to persist blob quarantine record");
+        } else {
+            warn!(reason, "Quarantined a blob that failed verification");
+        }
+    }
+
     pub async fn serve_read(
         &self,
         stream_id: Ulid,
@@ -60,6 +101,12 @@ impl BlobHandler {
             match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
                 Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,
                 Ok(_) => {
+                    self.quarantine_corrupt_blob(
+                        expected_blake3,
+                        &location.backend,
+                        "bao read source hash mismatch",
+                    )
+                    .await;
                     return BlobEvent::Error(BlobError::IntegrityCheckFailed(
                         "bao read source hash mismatch".to_string(),
                     ));

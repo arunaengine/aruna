@@ -1789,7 +1789,10 @@ async fn serve_archive(
             let archive = archive.clone();
             async move {
                 (
-                    [(header::CONTENT_TYPE, "application/zip")],
+                    [
+                        (header::CONTENT_TYPE, "application/zip"),
+                        (header::ETAG, "\"crate-fixture\""),
+                    ],
                     archive.as_ref().clone(),
                 )
             }

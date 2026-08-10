@@ -12,9 +12,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, BucketReplicationTarget, SyncMode,
-    SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
-    data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
+    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, BucketReplicationTarget,
+    ReferenceHandling, SyncMode, SyncRelationship, SyncState, WatchEvent, WatchEventDetail,
+    WatchEventKind, data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -29,7 +29,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use super::protocol::{ReplicationMode, SyncOrigin};
+use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
     SourceAuthorization, SourceAuthorizationError,
@@ -63,6 +63,7 @@ pub struct BlobReplicationJobRecord {
     pub origin: Option<SyncOrigin>,
     pub upstream_sources: Vec<ArunaArn>,
     pub writer_auth_context: Option<AuthContext>,
+    pub reference_advance: Option<ReferenceAdvance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +123,7 @@ pub struct LiveReplicationObligationRecord {
     pub origin: Option<SyncOrigin>,
     pub upstream_sources: Vec<ArunaArn>,
     pub continuation: Option<LiveReplicationContinuation>,
+    pub reference_advance: Option<ReferenceAdvance>,
 }
 
 #[derive(Serialize)]
@@ -186,6 +188,7 @@ impl BlobReplicationJobRecord {
             origin: None,
             upstream_sources: Vec::new(),
             writer_auth_context,
+            reference_advance: None,
         }
     }
 
@@ -216,13 +219,22 @@ impl BlobReplicationJobRecord {
         self
     }
 
+    pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
+        self.reference_advance = Some(advance);
+        self
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let record: Self = postcard::from_bytes(bytes)?;
-        if record.writer_auth_context.is_none() {
+        let record: Self = match postcard::take_from_bytes(bytes) {
+            Ok((record, [])) => record,
+            Ok(_) => return Err(postcard::Error::DeserializeBadEncoding.into()),
+            Err(error) => return Err(error.into()),
+        };
+        if record.writer_auth_context.is_none() && record.reference_advance.is_none() {
             return Err(ConversionError::FromStrError(
                 "replication job is missing its source writer".to_string(),
             ));
@@ -250,6 +262,7 @@ impl LiveReplicationObligationRecord {
             origin: None,
             upstream_sources: Vec::new(),
             continuation: None,
+            reference_advance: None,
         }
     }
 
@@ -263,12 +276,21 @@ impl LiveReplicationObligationRecord {
         self
     }
 
+    pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
+        self.reference_advance = Some(advance);
+        self
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        match postcard::take_from_bytes(bytes) {
+            Ok((record, [])) => Ok(record),
+            Ok(_) => Err(postcard::Error::DeserializeBadEncoding.into()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -318,7 +340,7 @@ pub fn live_replication_obligation_key(
     Ok(ByteView::from(key))
 }
 
-fn live_replication_obligation_write_entry(
+pub(crate) fn live_obligation_entry(
     record: &LiveReplicationObligationRecord,
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
@@ -332,7 +354,7 @@ pub(crate) fn live_obligation_effect(
     record: LiveReplicationObligationRecord,
     txn_id: Option<Ulid>,
 ) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = live_replication_obligation_write_entry(&record)?;
+    let (key_space, key, value) = live_obligation_entry(&record)?;
     Ok(Effect::Storage(StorageEffect::Write {
         key_space,
         key,
@@ -557,6 +579,7 @@ enum QueueLiveVersionReplicationState {
 #[derive(Debug, PartialEq)]
 pub struct QueueLiveVersionReplicationOperation {
     input: QueueLiveVersionReplicationInput,
+    reference_advance: Option<ReferenceAdvance>,
     state: QueueLiveVersionReplicationState,
     seed_key: Option<Key>,
     seed_value: Option<ByteView>,
@@ -569,6 +592,7 @@ impl QueueLiveVersionReplicationOperation {
     pub fn new(input: QueueLiveVersionReplicationInput) -> Self {
         Self {
             input,
+            reference_advance: None,
             state: QueueLiveVersionReplicationState::Init,
             seed_key: None,
             seed_value: None,
@@ -576,6 +600,11 @@ impl QueueLiveVersionReplicationOperation {
             abort_error: None,
             output: None,
         }
+    }
+
+    pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
+        self.reference_advance = Some(advance);
+        self
     }
 
     fn fail(&mut self, error: BlobReplicationQueueError) -> Effects {
@@ -593,13 +622,16 @@ impl QueueLiveVersionReplicationOperation {
             self.input.version_id,
             self.input.delete_marker,
         );
+        if let Some(advance) = self.reference_advance {
+            record = record.with_reference_advance(advance);
+        }
         record.continuation = Some(LiveReplicationContinuation::default());
         record
     }
 
     fn start_obligation(&mut self) -> Effects {
         let record = self.seed_record();
-        let (_, key, value) = match live_replication_obligation_write_entry(&record) {
+        let (_, key, value) = match live_obligation_entry(&record) {
             Ok(entry) => entry,
             Err(error) => return self.fail(error.into()),
         };
@@ -1314,12 +1346,31 @@ async fn emit_sync_watch(
     .await;
 }
 
+fn job_source_auth<'a>(
+    job: &'a BlobReplicationJobRecord,
+    creator: &'a AuthContext,
+) -> &'a AuthContext {
+    if job.reference_advance.is_some()
+        && job
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.hop_count == 0)
+    {
+        &job.input.auth_context
+    } else {
+        creator
+    }
+}
+
 async fn process_blob_replication_job(
     context: &DriverContext,
     job: &BlobReplicationJobRecord,
     stored_relationship: Option<SyncRelationship>,
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
 ) -> Result<BlobReplicationJobOutcome, String> {
+    if job.reference_advance.is_some() && job.relationship_id.is_none() {
+        return Ok(BlobReplicationJobOutcome::TerminalFailure);
+    }
     let routing = match quota_marked_routing(context).await {
         Ok(routing) => routing,
         // Retrying a record that will never decode only pins the queue at its
@@ -1348,6 +1399,12 @@ async fn process_blob_replication_job(
             );
             return Ok(BlobReplicationJobOutcome::Succeeded);
         }
+        if job.reference_advance.is_some()
+            && relationship.mode != SyncMode::Reference
+            && relationship.reference_handling != ReferenceHandling::Preserve
+        {
+            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        }
         let Some(bucket) = relationship.source.bucket() else {
             return Ok(BlobReplicationJobOutcome::TerminalFailure);
         };
@@ -1356,9 +1413,10 @@ async fn process_blob_replication_job(
             realm_id: relationship.created_by.realm_id,
             path_restrictions: None,
         };
+        let source_auth_context = job_source_auth(job, &creator).clone();
         let source_authorization = match load_source_authorization(
             context,
-            creator.clone(),
+            source_auth_context,
             relationship.source.node_id,
             bucket,
         )
@@ -1369,6 +1427,9 @@ async fn process_blob_replication_job(
                 authorization
             }
             Err((SourceAuthorizationError::Denied, group_id)) => {
+                if job.reference_advance.is_some() {
+                    return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                }
                 let mut relationship = relationship;
                 relationship.state = SyncState::Failed {
                     reason: "access_denied".to_string(),
@@ -1393,16 +1454,22 @@ async fn process_blob_replication_job(
                 return Err(error);
             }
         };
-        // The durable job pins the original writer's scope; the relationship
-        // creator only authorizes the source-side read.
+        let writer_auth_context = if job.reference_advance.is_some() {
+            None
+        } else {
+            job.writer_auth_context.clone().or(Some(creator))
+        };
         operation = operation
             .with_relationship(
                 relationship.clone(),
                 job.origin.clone(),
                 job.upstream_sources.clone(),
-                job.writer_auth_context.clone().or(Some(creator)),
+                writer_auth_context,
             )
             .with_source_authorization(source_authorization);
+        if let Some(advance) = job.reference_advance {
+            operation = operation.with_reference_advance(advance);
+        }
         Some(relationship)
     } else {
         let Some(writer) = job.writer_auth_context.as_ref() else {
@@ -1449,6 +1516,11 @@ async fn process_blob_replication_job(
         }
         Ok(Some(Ok(result))) => {
             if result.last_error.as_deref().is_some_and(is_writer_denied) {
+                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+            }
+            if job.reference_advance.is_some()
+                && result.last_error.as_deref().is_some_and(is_access_denied)
+            {
                 return Ok(BlobReplicationJobOutcome::TerminalFailure);
             }
             if result.replicated > 0
@@ -1637,7 +1709,10 @@ async fn process_live_obligations(
     }
     let mut config_cache = HashMap::new();
     for (_, obligation) in &obligations {
-        if obligation.origin.is_none() && !config_cache.contains_key(&obligation.bucket) {
+        if obligation.origin.is_none()
+            && obligation.reference_advance.is_none()
+            && !config_cache.contains_key(&obligation.bucket)
+        {
             config_cache.insert(
                 obligation.bucket.clone(),
                 read_bucket_replication_config(&context.storage_handle, &obligation.bucket).await?,
@@ -1780,7 +1855,7 @@ async fn write_live_obligation(
     storage: &StorageHandle,
     record: &LiveReplicationObligationRecord,
 ) -> Result<(), BlobReplicationQueueError> {
-    let (key_space, key, value) = live_replication_obligation_write_entry(record)?;
+    let (key_space, key, value) = live_obligation_entry(record)?;
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -1983,6 +2058,12 @@ async fn write_live_jobs(
             }
             found = true;
             cursor.relationship_after = Some(key.clone());
+            if obligation.reference_advance.is_some()
+                && relationship.mode != SyncMode::Reference
+                && relationship.reference_handling != ReferenceHandling::Preserve
+            {
+                continue;
+            }
             let target = relationship
                 .target
                 .bucket()
@@ -1999,8 +2080,15 @@ async fn write_live_jobs(
                 obligation.origin.as_ref(),
                 &upstream_sources,
             )
-            .map(|job| job.with_writer_auth(obligation.auth_context.clone()))
-            {
+            .map(|mut job| {
+                if let Some(advance) = obligation.reference_advance {
+                    job.input.auth_context = obligation.auth_context.clone();
+                    job.writer_auth_context = None;
+                    job.with_reference_advance(advance)
+                } else {
+                    job.with_writer_auth(obligation.auth_context.clone())
+                }
+            }) {
                 if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
                     complete = false;
                     break;
@@ -2037,6 +2125,7 @@ async fn write_live_jobs(
     let mut continuation = (!cursor.relationships_complete).then(|| cursor.clone());
     if cursor.relationships_complete
         && obligation.origin.is_none()
+        && obligation.reference_advance.is_none()
         && let Some(config) = config
     {
         let config = filter_config(config.clone(), &relationship_targets);
@@ -2604,6 +2693,7 @@ async fn reschedule_blob_replication_job(
         origin: job.origin.clone(),
         upstream_sources: job.upstream_sources.clone(),
         writer_auth_context: job.writer_auth_context.clone(),
+        reference_advance: job.reference_advance,
     };
     match storage
         .send_storage_effect(StorageEffect::Write {
@@ -2738,9 +2828,9 @@ mod tests {
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget, Group,
-        GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        ReferenceHandling, SyncStatusSnapshot, VersionKey, blob_object_permission_path,
-        sync_relationship_key,
+        GroupAuthorizationDocument, PathRestriction, Permission, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, ReferenceHandling, SyncStatusSnapshot, VersionKey,
+        blob_object_permission_path, sync_relationship_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -2764,6 +2854,13 @@ mod tests {
             user_id: user(),
             realm_id: realm(),
             path_restrictions: None,
+        }
+    }
+
+    fn reference_advance() -> ReferenceAdvance {
+        ReferenceAdvance {
+            generation: 2,
+            predecessor: Ulid::from_parts(1, 1),
         }
     }
 
@@ -3274,6 +3371,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_keeps_advance() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let advance = reference_advance();
+        let mut job = BlobReplicationJobRecord::new_relationship(
+            on_demand_input(),
+            None,
+            Ulid::from_parts(78, 1),
+            42,
+        )
+        .with_reference_advance(advance);
+        job.writer_auth_context = None;
+        let key = blob_replication_job_key(&job).unwrap().to_vec();
+
+        reschedule_blob_replication_job(&storage, key, &job, "retry".to_string())
+            .await
+            .unwrap();
+
+        let jobs = read_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1.reference_advance, Some(advance));
+        assert_eq!(jobs[0].1.writer_auth_context, None);
+    }
+
+    #[tokio::test]
     async fn missing_relationship_skips() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -3601,6 +3724,7 @@ mod tests {
             origin: None,
             upstream_sources: Vec::new(),
             writer_auth_context: Some(auth_context()),
+            reference_advance: None,
         };
         let (key_space, key, value) = blob_replication_job_write_entry(&future_job).unwrap();
         match storage
@@ -3647,6 +3771,12 @@ mod tests {
         record.writer_auth_context = None;
         let bytes = record.to_bytes().unwrap();
         assert!(BlobReplicationJobRecord::from_bytes(&bytes).is_err());
+        record.reference_advance = Some(reference_advance());
+        let bytes = record.to_bytes().unwrap();
+        assert_eq!(
+            BlobReplicationJobRecord::from_bytes(&bytes).unwrap(),
+            record
+        );
 
         let first = BlobReplicationJobRecord::new_relationship(
             on_demand_input(),
@@ -3667,6 +3797,87 @@ mod tests {
         assert!(is_access_denied("Replication requires WRITE permission"));
         assert!(is_access_denied("access_denied"));
         assert!(!is_access_denied("quota"));
+    }
+
+    #[test]
+    fn advance_auth_hops() {
+        let mut input = on_demand_input();
+        input.auth_context.path_restrictions = Some(vec![PathRestriction {
+            pattern: "**".to_string(),
+            permission: Permission::READ,
+        }]);
+        let reader = input.auth_context.clone();
+        let creator = auth_context();
+        let mut job =
+            BlobReplicationJobRecord::new_relationship(input, None, Ulid::from_parts(3, 3), 42)
+                .with_origin(Some(SyncOrigin {
+                    relationship_id: Ulid::from_parts(3, 3),
+                    hop_count: 0,
+                }))
+                .with_reference_advance(reference_advance());
+        job.writer_auth_context = None;
+
+        assert_eq!(job_source_auth(&job, &creator), &reader);
+        job.origin.as_mut().unwrap().hop_count = 1;
+        assert_eq!(job_source_auth(&job, &creator), &creator);
+        assert_eq!(job.input.auth_context, reader);
+        job.reference_advance = None;
+        assert_eq!(job_source_auth(&job, &creator), &creator);
+    }
+
+    #[test]
+    fn job_rejects_malformed() {
+        // Greenfield: pre-advance record bytes decode strictly or not at all.
+        let record = BlobReplicationJobRecord::new(on_demand_input(), None, 42);
+        let encoded = record.to_bytes().unwrap();
+        assert_eq!(
+            BlobReplicationJobRecord::from_bytes(&encoded).unwrap(),
+            record
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0xff);
+        assert!(BlobReplicationJobRecord::from_bytes(&trailing).is_err());
+        let mut short = encoded;
+        short.pop().unwrap();
+        assert!(BlobReplicationJobRecord::from_bytes(&short).is_err());
+        let mut truncated = record
+            .with_reference_advance(reference_advance())
+            .to_bytes()
+            .unwrap();
+        truncated.pop().unwrap();
+        assert!(BlobReplicationJobRecord::from_bytes(&truncated).is_err());
+    }
+
+    #[test]
+    fn obligation_rejects_malformed() {
+        // Greenfield: pre-advance record bytes decode strictly or not at all.
+        let record = LiveReplicationObligationRecord::new(
+            node(1),
+            auth_context(),
+            "bucket".to_string(),
+            "key".to_string(),
+            Ulid::from_parts(2, 2),
+            false,
+        );
+        let encoded = record.to_bytes().unwrap();
+        assert_eq!(
+            LiveReplicationObligationRecord::from_bytes(&encoded).unwrap(),
+            record
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0xff);
+        assert!(LiveReplicationObligationRecord::from_bytes(&trailing).is_err());
+        let mut short = encoded;
+        short.pop().unwrap();
+        assert!(LiveReplicationObligationRecord::from_bytes(&short).is_err());
+        let mut truncated = record
+            .with_reference_advance(reference_advance())
+            .to_bytes()
+            .unwrap();
+        truncated.pop().unwrap();
+        assert!(LiveReplicationObligationRecord::from_bytes(&truncated).is_err());
     }
 
     #[test]
@@ -4004,6 +4215,64 @@ mod tests {
             .map(|(_, job)| job)
             .unwrap();
         assert_eq!(legacy_job.relationship_id, None);
+    }
+
+    #[tokio::test]
+    async fn advance_filters_targets() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let reader = AuthContext {
+            user_id: user(),
+            realm_id: realm(),
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: "**".to_string(),
+                permission: Permission::READ,
+            }]),
+        };
+        let skipped = relationship(6, 2, None, true);
+        let mut included = relationship(7, 4, None, true);
+        included.set_reference_handling(ReferenceHandling::Preserve);
+        write_relationship(&storage, &skipped).await;
+        write_relationship(&storage, &included).await;
+        write_replication_config(&storage, "bucket").await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let advance = reference_advance();
+
+        drive(
+            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+                local_node_id: node(1),
+                auth_context: reader.clone(),
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+                version_id: Ulid::from_parts(34, 1),
+                delete_marker: false,
+            })
+            .with_reference_advance(advance),
+            &context,
+        )
+        .await
+        .expect("advance queue succeeds");
+
+        let obligations = read_obligations(&storage).await;
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].auth_context, reader);
+        assert_eq!(obligations[0].reference_advance, Some(advance));
+        repair_live(&storage).await;
+        let jobs = read_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0].1;
+        assert_eq!(job.relationship_id, Some(included.id));
+        assert_eq!(job.input.auth_context, obligations[0].auth_context);
+        assert_eq!(job.writer_auth_context, None);
+        assert_eq!(job.reference_advance, Some(advance));
     }
 
     #[tokio::test]

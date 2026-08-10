@@ -418,7 +418,9 @@ async fn acquire_source(
                     range: None,
                     group_id: bucket_info.group_id,
                     user_identity: spec.auth_context.user_id,
-                }),
+                    node_id: ctx.owner_node_id,
+                })
+                .with_restrictions(spec.auth_context.path_restrictions.clone()),
                 &ctx.driver,
             )
             .await
@@ -1723,7 +1725,13 @@ fn classify_get(error: GetObjectError) -> ImportFailure {
         | GetObjectError::NoSuchKey
         | GetObjectError::NoSuchVersion
         | GetObjectError::DeleteMarker
-        | GetObjectError::InvalidRange => true,
+        | GetObjectError::InvalidRange
+        // Retrying cannot recover an observation the source no longer serves,
+        // and only an explicit rebind clears an exhausted binding.
+        | GetObjectError::HistoricalReferenceUnavailable
+        | GetObjectError::ReferenceAdvanceExhausted => true,
+        // A drifting source can stabilize; the job attempt cap bounds the retries.
+        GetObjectError::ReferenceSourceChanged => false,
         GetObjectError::ResolveReferenceError(error) => permanent_resolve(error),
         GetObjectError::StagingSourceError(error) => permanent_staging(error),
         _ => false,
@@ -1928,6 +1936,24 @@ mod tests {
         assert!(!source_uses_eln(
             "exports/experiment.zip",
             Some("application/zip")
+        ));
+    }
+
+    // A source that keeps changing can settle, but a dropped historical
+    // observation and an exhausted binding never heal by retrying.
+    #[test]
+    fn classifies_reference_errors() {
+        assert!(matches!(
+            classify_get(GetObjectError::ReferenceSourceChanged),
+            ImportFailure::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_get(GetObjectError::HistoricalReferenceUnavailable),
+            ImportFailure::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_get(GetObjectError::ReferenceAdvanceExhausted),
+            ImportFailure::Permanent(_)
         ));
     }
 

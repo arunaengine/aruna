@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -22,6 +23,7 @@ pub trait InboundTaskHandler: Send + Sync {
 #[derive(Clone)]
 pub struct TaskHandle {
     command_tx: mpsc::Sender<TaskCommand>,
+    admission_closed: Arc<AtomicBool>,
 }
 
 enum TaskCommand {
@@ -60,9 +62,34 @@ enum TaskCommand {
         key: TaskKey,
         elapsed: Duration,
     },
+    StopAdmission {
+        response: oneshot::Sender<usize>,
+    },
+    AwaitDrained {
+        response: oneshot::Sender<()>,
+    },
+    AbortAllRunningHandlers {
+        response: oneshot::Sender<usize>,
+    },
+}
+
+/// Outcome of draining the scheduler on shutdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskShutdownReport {
+    /// Handlers still running when admission stopped.
+    pub in_flight: usize,
+    /// Handlers aborted because they outlived the drain deadline.
+    pub aborted: usize,
+}
+
+impl TaskShutdownReport {
+    pub fn drained(&self) -> bool {
+        self.aborted == 0
+    }
 }
 
 struct SchedulerState {
+    admission_closed: Arc<AtomicBool>,
     timers_by_key: HashMap<TaskKey, TimerEntry>,
     timers_by_deadline: BTreeMap<(Instant, u64), TaskKey>,
     running_by_id: HashMap<u64, RunningTaskEntry>,
@@ -70,6 +97,7 @@ struct SchedulerState {
     in_flight_keys: HashMap<TaskKey, usize>,
     refire_requested: HashSet<TaskKey>,
     inbound_handler: Option<Arc<dyn InboundTaskHandler>>,
+    drained_waiters: Vec<oneshot::Sender<()>>,
     next_timer_id: u64,
     next_run_id: u64,
 }
@@ -95,8 +123,9 @@ struct RunningTaskEntry {
 }
 
 impl SchedulerState {
-    fn new() -> Self {
+    fn new(admission_closed: Arc<AtomicBool>) -> Self {
         Self {
+            admission_closed,
             timers_by_key: HashMap::new(),
             timers_by_deadline: BTreeMap::new(),
             running_by_id: HashMap::new(),
@@ -104,6 +133,7 @@ impl SchedulerState {
             in_flight_keys: HashMap::new(),
             refire_requested: HashSet::new(),
             inbound_handler: None,
+            drained_waiters: Vec::new(),
             next_timer_id: 1,
             next_run_id: 1,
         }
@@ -185,6 +215,9 @@ impl SchedulerState {
         started_at: Instant,
         command_tx: &mpsc::WeakSender<TaskCommand>,
     ) {
+        if self.admission_closed.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(handler) = self.inbound_handler.clone() {
             let task = self.prepare_running_task(key, started_at);
             let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone());
@@ -375,6 +408,37 @@ impl SchedulerState {
         if self.release_in_flight_key(&entry.key) && self.refire_requested.remove(&entry.key) {
             self.spawn_handler_for_key(entry.key, Instant::now(), command_tx);
         }
+
+        self.notify_if_drained();
+    }
+
+    /// Stops new handler runs: without an inbound handler no timer can spawn
+    /// work, and pending timers stay durable in storage for the next boot.
+    fn stop_admission(&mut self) -> usize {
+        self.inbound_handler = None;
+        self.timers_by_key.clear();
+        self.timers_by_deadline.clear();
+        self.refire_requested.clear();
+        self.running_by_id.len()
+    }
+
+    fn abort_all_handlers(&mut self) -> usize {
+        let aborted = self.running_by_id.len();
+        for (_, entry) in self.running_by_id.drain() {
+            entry.task.abort();
+        }
+        self.running_warn_deadlines.clear();
+        self.in_flight_keys.clear();
+        self.notify_if_drained();
+        aborted
+    }
+
+    fn notify_if_drained(&mut self) {
+        if self.running_by_id.is_empty() {
+            for waiter in self.drained_waiters.drain(..) {
+                let _ = waiter.send(());
+            }
+        }
     }
 
     fn abort_running_handlers(&mut self, key: TaskKey) -> TaskEvent {
@@ -393,6 +457,7 @@ impl SchedulerState {
             }
         }
         self.refire_requested.remove(&key);
+        self.notify_if_drained();
 
         TaskEvent::RunningHandlersAborted {
             key,
@@ -442,6 +507,19 @@ impl SchedulerState {
                 key,
                 elapsed,
             } => self.complete_handler(run_id, key, elapsed, command_tx),
+            TaskCommand::StopAdmission { response } => {
+                let _ = response.send(self.stop_admission());
+            }
+            TaskCommand::AwaitDrained { response } => {
+                if self.running_by_id.is_empty() {
+                    let _ = response.send(());
+                } else {
+                    self.drained_waiters.push(response);
+                }
+            }
+            TaskCommand::AbortAllRunningHandlers { response } => {
+                let _ = response.send(self.abort_all_handlers());
+            }
         }
     }
 }
@@ -453,8 +531,9 @@ fn next_id(id: u64) -> u64 {
 async fn run_scheduler(
     mut command_rx: mpsc::Receiver<TaskCommand>,
     command_tx: mpsc::WeakSender<TaskCommand>,
+    admission_closed: Arc<AtomicBool>,
 ) {
-    let mut state = SchedulerState::new();
+    let mut state = SchedulerState::new(admission_closed);
 
     loop {
         state.dispatch_due_timers(&command_tx);
@@ -520,14 +599,22 @@ fn spawn_timer_handler(
 impl TaskHandle {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+        let admission_closed = Arc::new(AtomicBool::new(false));
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(run_scheduler(command_rx, command_tx.downgrade()));
+            handle.spawn(run_scheduler(
+                command_rx,
+                command_tx.downgrade(),
+                admission_closed.clone(),
+            ));
         } else {
             warn!("TaskHandle created without an active Tokio runtime; task scheduler unavailable");
         }
 
-        Self { command_tx }
+        Self {
+            command_tx,
+            admission_closed,
+        }
     }
 
     pub async fn set_inbound_handler(&self, handler: Arc<dyn InboundTaskHandler>) {
@@ -649,6 +736,78 @@ impl TaskHandle {
         result
             .await
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
+    }
+
+    /// Permanently stops new timer handlers without waiting for the scheduler.
+    pub fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::Release);
+    }
+
+    async fn stop_admission(&self) -> Option<usize> {
+        let (response, stopped) = oneshot::channel();
+        if self
+            .command_tx
+            .send(TaskCommand::StopAdmission { response })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Some(stopped.await.unwrap_or(0))
+    }
+
+    /// Stops admitting timer handlers, waits up to `drain` for the ones already
+    /// running, then aborts whatever is left. Pending timers are durable, so an
+    /// undrained handler is retried on the next boot rather than lost.
+    pub async fn shutdown(&self, drain: Duration) -> TaskShutdownReport {
+        self.close_admission();
+        let Some(in_flight) = self.stop_admission().await else {
+            return TaskShutdownReport {
+                in_flight: 0,
+                aborted: 0,
+            };
+        };
+        if in_flight == 0 {
+            return TaskShutdownReport {
+                in_flight: 0,
+                aborted: 0,
+            };
+        }
+
+        let (response, drained) = oneshot::channel();
+        if self
+            .command_tx
+            .send(TaskCommand::AwaitDrained { response })
+            .await
+            .is_ok()
+            && tokio::time::timeout(drain, drained).await.is_ok()
+        {
+            return TaskShutdownReport {
+                in_flight,
+                aborted: 0,
+            };
+        }
+
+        let (response, aborted) = oneshot::channel();
+        let aborted = if self
+            .command_tx
+            .send(TaskCommand::AbortAllRunningHandlers { response })
+            .await
+            .is_ok()
+        {
+            aborted.await.unwrap_or(0)
+        } else {
+            0
+        };
+        if aborted > 0 {
+            warn!(
+                aborted,
+                drain_ms = drain.as_millis(),
+                "Aborted timer handlers that outlived the shutdown drain deadline"
+            );
+        }
+
+        TaskShutdownReport { in_flight, aborted }
     }
 }
 
@@ -1060,6 +1219,123 @@ mod tests {
             panic!("expected timer scheduled event");
         };
         assert!(after > Duration::from_secs(3000));
+    }
+
+    // A handler that finishes inside the drain budget is joined, not cut.
+    #[tokio::test]
+    async fn shutdown_drains_handler() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate: gate.clone(),
+            }))
+            .await;
+        fire_timer(&handle, key).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("handler should start");
+
+        gate.add_permits(1);
+        let report = handle.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(report.in_flight, 1);
+        assert!(report.drained());
+    }
+
+    // A handler that ignores the deadline is aborted instead of hanging exit.
+    #[tokio::test]
+    async fn shutdown_aborts_stuck() {
+        let handle = TaskHandle::new();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(BlockingHandler {
+                started: started.clone(),
+                dropped: dropped.clone(),
+            }))
+            .await;
+        fire_timer(&handle, key).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("handler should start");
+
+        let report = handle.shutdown(Duration::from_millis(50)).await;
+
+        assert_eq!(report.aborted, 1);
+        assert!(!report.drained());
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("stuck handler future should be dropped");
+    }
+
+    // Admission stops first: timers that fire after shutdown find no handler.
+    #[tokio::test]
+    async fn shutdown_stops_admission() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate,
+            }))
+            .await;
+
+        let report = handle.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(report.in_flight, 0);
+
+        fire_timer(&handle, key.clone()).await;
+        let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers { key }))
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    // Admission closes on its own, before any drain wait: a timer that fires
+    // afterwards finds no handler even though nothing was waited on.
+    #[tokio::test]
+    async fn close_stops_handlers() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate,
+            }))
+            .await;
+        handle.close_admission();
+
+        fire_timer(&handle, key.clone()).await;
+        let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers { key }))
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
 
@@ -90,22 +91,45 @@ impl Server {
         ))
     }
 
-    pub async fn run(self) -> Result<(), ServerSetupError> {
+    pub async fn run(self, shutdown: CancellationToken) -> Result<(), ServerSetupError> {
         let listener = TcpListener::bind(self.config.http_addr).await?;
-        self.run_with_listener(listener).await
+        self.run_with_listener(listener, shutdown).await
     }
 
-    pub async fn run_with_listener(self, listener: TcpListener) -> Result<(), ServerSetupError> {
+    /// Serves until `shutdown` is cancelled: the listener stops accepting and
+    /// requests already in flight run to completion before this returns.
+    pub async fn run_with_listener(
+        self,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> Result<(), ServerSetupError> {
         let bound_addr = listener.local_addr()?;
         self.state
             .register_rest_interface_with_public_url(bound_addr, self.api_public_url.as_deref())
             .await;
-        let router = self.build_router();
+        let abort_requests = CancellationToken::new();
+        let request_abort = abort_requests.clone();
+        let _abort_requests = abort_requests.drop_guard();
+        let router = self
+            .build_router()
+            .layer(from_fn(move |request: Request, next: Next| {
+                let request_abort = request_abort.clone();
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = request_abort.cancelled() => {
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        }
+                        response = next.run(request) => response,
+                    }
+                }
+            }));
 
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
 

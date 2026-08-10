@@ -235,7 +235,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let app = Router::new().route(
                 "/folder/file.txt",
-                get(|| async { ([("content-type", "text/plain")], "snapshot-data") }),
+                get(|| async {
+                    (
+                        [("content-type", "text/plain"), ("etag", "\"snapshot-v1\"")],
+                        "snapshot-data",
+                    )
+                }),
             );
             axum::serve(listener, app).await.unwrap();
         });

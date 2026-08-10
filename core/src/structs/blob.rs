@@ -382,6 +382,39 @@ impl BlobLocationKey {
     }
 }
 
+/// Durable evidence that a stored copy failed hash/bao verification (§8.2). Keyed
+/// by (hash, backend) so re-detecting the same corrupt copy overwrites its row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlobQuarantineRecord {
+    pub blake3: [u8; 32],
+    pub backend: BackendRef,
+    pub reason: String,
+    pub detected_at_ms: u64,
+}
+
+impl BlobQuarantineRecord {
+    pub fn new(blake3: [u8; 32], backend: BackendRef, reason: String, detected_at_ms: u64) -> Self {
+        Self {
+            blake3,
+            backend,
+            reason,
+            detected_at_ms,
+        }
+    }
+
+    pub fn key(&self) -> Vec<u8> {
+        BlobLocationKey::new(self.blake3, self.backend.clone()).to_bytes()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct HiddenBlobKey {
     pub backend: BackendRef,
@@ -804,6 +837,7 @@ impl BlobVersion {
                 source,
                 cached_metadata,
                 last_refresh,
+                advance_count: 0,
             },
             metadata: HashMap::new(),
             published_by: None,
@@ -817,6 +851,15 @@ impl BlobVersion {
 
     pub fn with_publisher(mut self, node_id: NodeId) -> Self {
         self.published_by = Some(node_id);
+        self
+    }
+
+    /// Carries an existing advance count onto a reconstructed reference. Every
+    /// path that is not an explicit rebind must preserve the stored count.
+    pub fn with_advance_count(mut self, count: u16) -> Self {
+        if let BlobVersionState::Reference { advance_count, .. } = &mut self.state {
+            *advance_count = count;
+        }
         self
     }
 
@@ -844,6 +887,10 @@ impl BlobVersion {
         self.state.source_binding()
     }
 
+    pub fn advance_count(&self) -> Option<u16> {
+        self.state.advance_count()
+    }
+
     pub fn is_deleted(&self) -> bool {
         self.state.is_deleted()
     }
@@ -866,6 +913,9 @@ pub enum BlobVersionState {
         source: VersionSourceBinding,
         cached_metadata: SourceMetadata,
         last_refresh: SystemTime,
+        /// Automatic successors already minted for this explicit binding. Only a
+        /// WRITE or rebind restarts the count, so read-driven advances are bounded.
+        advance_count: u16,
     },
     Deleted,
 }
@@ -899,6 +949,13 @@ impl BlobVersionState {
             Self::Materialized { source, .. } => source.as_ref(),
             Self::Reference { source, .. } => Some(source),
             Self::Deleted => None,
+        }
+    }
+
+    pub fn advance_count(&self) -> Option<u16> {
+        match self {
+            Self::Reference { advance_count, .. } => Some(*advance_count),
+            Self::Materialized { .. } | Self::Deleted => None,
         }
     }
 

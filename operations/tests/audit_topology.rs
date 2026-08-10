@@ -14,13 +14,14 @@ use aruna_operations::create_metadata_document::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
-    AUDIT_DEADLINE_SECS, ListAuditOperation, ListAuditRequest, LocalAuditPageOperation,
-    MAX_AUDIT_PAGE_SIZE, list_audit,
+    AUDIT_DEADLINE_SECS, AuditAggregate, ListAuditOperation, ListAuditRequest,
+    LocalAuditPageOperation, MAX_AUDIT_PAGE_SIZE, list_audit,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
+use std::cell::RefCell;
 use ulid::Ulid;
 
-use topology::{TestNode, TestResult, Topology, wait_until};
+use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
@@ -66,16 +67,7 @@ async fn nonholder_audit_trail() -> TestResult<()> {
 
     // Read the trail from a node that holds none of the first document's bucket.
     let reader = realm.non_holder(&first_placement);
-    let full = list_audit(
-        reader.context.as_ref(),
-        realm.realm_id,
-        reader.node_id(),
-        Some(realm.bearer_token()),
-        request(group_id, None, None, DOCUMENTS * 4),
-        tokio::time::Instant::now() + std::time::Duration::from_secs(AUDIT_DEADLINE_SECS),
-    )
-    .await?;
-    assert!(!full.partial, "every node was reachable");
+    let full = read_page(&realm, reader, group_id, None, DOCUMENTS * 4).await?;
     assert_eq!(unique_documents(&full.records), DOCUMENTS);
 
     // Paging crosses the merge boundary without dropping or duplicating a record.
@@ -83,15 +75,7 @@ async fn nonholder_audit_trail() -> TestResult<()> {
     let mut seen = Vec::new();
     let mut pages = 0;
     loop {
-        let page = list_audit(
-            reader.context.as_ref(),
-            realm.realm_id,
-            reader.node_id(),
-            Some(realm.bearer_token()),
-            request(group_id, None, cursor.clone(), 2),
-            tokio::time::Instant::now() + std::time::Duration::from_secs(AUDIT_DEADLINE_SECS),
-        )
-        .await?;
+        let page = read_page(&realm, reader, group_id, cursor.clone(), 2).await?;
         assert!(page.records.len() <= 2, "page exceeded the requested limit");
         pages += 1;
         seen.extend(page.records.iter().map(|record| record.document_id));
@@ -122,28 +106,7 @@ async fn nonholder_audit_trail() -> TestResult<()> {
         .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
         .collect();
     peers.extend(dead.iter().copied());
-    // Unreachable peers are asked in one concurrent round, so the fan-out still
-    // answers well inside the request deadline instead of summing their waits.
-    let partial = tokio::time::timeout(
-        FAN_OUT_DEADLINE,
-        drive(
-            ListAuditOperation::new(
-                realm.realm_id,
-                reader.node_id(),
-                true,
-                group_id,
-                None,
-                peers,
-                None,
-                MAX_AUDIT_PAGE_SIZE,
-                Some(realm.bearer_token()),
-                realm.config.digest()?,
-            ),
-            reader.context.as_ref(),
-        ),
-    )
-    .await
-    .map_err(|_| "the audit fan-out exceeded the request deadline")??;
+    let partial = fan_out(&realm, reader, group_id, &peers, &dead).await?;
     assert!(partial.partial, "a dead node must mark the page partial");
     for node in &dead {
         assert!(
@@ -181,6 +144,87 @@ async fn nonholder_audit_trail() -> TestResult<()> {
 
     realm.shutdown().await;
     Ok(())
+}
+
+/// One complete audit page. A partial page withholds its cursor by design, so a
+/// peer that answered too late would read as the end of the trail rather than as
+/// the transport verdict it is; the same cursor is re-read instead.
+async fn read_page(
+    realm: &Topology,
+    reader: &TestNode,
+    group_id: Ulid,
+    cursor: Option<String>,
+    limit: usize,
+) -> TestResult<AuditAggregate> {
+    let page = RefCell::new(None);
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no audit read reached every node",
+        || async {
+            let candidate = list_audit(
+                reader.context.as_ref(),
+                realm.realm_id,
+                reader.node_id(),
+                Some(realm.bearer_token()),
+                request(group_id, None, cursor.clone(), limit),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(AUDIT_DEADLINE_SECS),
+            )
+            .await?;
+            let pending = candidate.missing_nodes.len() + usize::from(candidate.partial);
+            *page.borrow_mut() = Some(candidate);
+            Ok(pending)
+        },
+    )
+    .await?;
+    Ok(page.into_inner().ok_or("the audit read produced no page")?)
+}
+
+/// The dead-peer fan-out, re-driven until the dead nodes are the only ones
+/// missing. Every round asks all peers in one concurrent batch and must answer
+/// inside [`FAN_OUT_DEADLINE`] rather than summing their waits.
+async fn fan_out(
+    realm: &Topology,
+    reader: &TestNode,
+    group_id: Ulid,
+    peers: &[aruna_core::NodeId],
+    dead: &[aruna_core::NodeId],
+) -> TestResult<AuditAggregate> {
+    let page = RefCell::new(None);
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "a live peer never answered the audit fan-out",
+        || async {
+            let candidate = tokio::time::timeout(
+                FAN_OUT_DEADLINE,
+                drive(
+                    ListAuditOperation::new(
+                        realm.realm_id,
+                        reader.node_id(),
+                        true,
+                        group_id,
+                        None,
+                        peers.to_vec(),
+                        None,
+                        MAX_AUDIT_PAGE_SIZE,
+                        Some(realm.bearer_token()),
+                        realm.config.digest()?,
+                    ),
+                    reader.context.as_ref(),
+                ),
+            )
+            .await
+            .map_err(|_| "the audit fan-out exceeded the request deadline")??;
+            let pending = candidate
+                .missing_nodes
+                .iter()
+                .filter(|node| !dead.contains(node))
+                .count();
+            *page.borrow_mut() = Some(candidate);
+            Ok(pending)
+        },
+    )
+    .await?;
+    Ok(page
+        .into_inner()
+        .ok_or("the audit fan-out produced no page")?)
 }
 
 fn request(
