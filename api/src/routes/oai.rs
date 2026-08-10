@@ -460,11 +460,21 @@ fn resolve_window(
         ));
     }
     let from_ms = from.map(|(ms, _)| ms).unwrap_or(0);
-    let until_ms = until.map(|(ms, _)| ms).unwrap_or(u64::MAX);
+    // An omitted upper bound freezes at the current second instead of staying
+    // open, so records written during pagination cannot join the sequence the
+    // token is already walking.
+    let until_ms = until.map(|(ms, _)| ms).unwrap_or_else(current_second_end);
     if from_ms > until_ms {
         return Err(protocol("badArgument", "from must not be after until"));
     }
     Ok((from_ms, until_ms, None))
+}
+
+/// The last millisecond of the second in progress, at seconds granularity like
+/// every other bound this repository advertises.
+fn current_second_end() -> u64 {
+    let millis = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    millis - millis % 1000 + 999
 }
 
 /// Parses an OAI datestamp and returns its bound in milliseconds plus whether it
@@ -1054,6 +1064,46 @@ mod tests {
         )));
     }
 
+    // A sequence started before later writes must terminate on the window frozen
+    // at its first page, even across a generation flip.
+    #[tokio::test]
+    async fn frozen_window_ends_sequence() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, PAGE_SIZE as u64 + 1, true).await;
+        let first = list_page(&fixture, None).await.unwrap();
+        assert_eq!(first.matches("<header>").count(), PAGE_SIZE);
+        let token = token_from(&first).expect("a token continues the list");
+
+        let later = current_second_end() + 5_000;
+        let mut created = registry_record(&fixture, 500, true);
+        created.updated_at_ms = later;
+        store_record(&fixture, &created).await;
+        let mut moved = registry_record(&fixture, 0, true);
+        moved.updated_at_ms = later + 1;
+        store_record(&fixture, &moved).await;
+        rebuild_index(&fixture.ctx).await.unwrap();
+
+        let second = list_page(&fixture, Some(&token)).await.unwrap();
+        assert_eq!(second.matches("<header>").count(), 1);
+        assert!(second.contains("<resumptionToken />"));
+        assert!(!second.contains(&created.graph_iri));
+        assert!(!second.contains(&moved.graph_iri));
+
+        // A fresh request over a window that covers them does see both.
+        let params = OaiParams {
+            verb: Some("ListIdentifiers".to_string()),
+            metadata_prefix: Some(METADATA_PREFIX.to_string()),
+            from: Some(format_from(later).unwrap()),
+            until: Some(format_from(later + 60_000).unwrap()),
+            ..OaiParams::default()
+        };
+        let fresh = list(&fixture.state, &fixture.ctx, fixture.realm_id, &params, false)
+            .await
+            .unwrap();
+        assert!(fresh.contains(&created.graph_iri));
+        assert!(fresh.contains(&moved.graph_iri));
+    }
+
     #[tokio::test]
     async fn private_records_never_list() {
         let fixture = fixture(RoCrateLimits::default()).await;
@@ -1565,6 +1615,36 @@ mod tests {
             fault_code(resolve_window(&params).err().unwrap()),
             "badArgument"
         );
+    }
+
+    #[test]
+    fn omitted_until_freezes_now() {
+        let params = OaiParams {
+            verb: Some("ListRecords".to_string()),
+            metadata_prefix: Some(METADATA_PREFIX.to_string()),
+            ..OaiParams::default()
+        };
+        let before = current_second_end();
+        let (from_ms, until_ms, cursor) = resolve_window(&params).unwrap();
+        let after = current_second_end();
+        assert_eq!(from_ms, 0);
+        assert!(cursor.is_none());
+        assert_ne!(until_ms, u64::MAX);
+        assert!(until_ms >= before && until_ms <= after);
+        assert_eq!(until_ms % 1000, 999);
+    }
+
+    // A continuation carries the frozen bound through unchanged.
+    #[test]
+    fn token_preserves_frozen_until() {
+        let params = OaiParams {
+            verb: Some("ListRecords".to_string()),
+            resumption_token: Some(encode_token(1_700_000_000_999, vec![1, 2, 3])),
+            ..OaiParams::default()
+        };
+        let (_, until_ms, cursor) = resolve_window(&params).unwrap();
+        assert_eq!(until_ms, 1_700_000_000_999);
+        assert_eq!(cursor.unwrap().as_ref(), &[1, 2, 3]);
     }
 
     #[test]
