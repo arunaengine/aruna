@@ -17726,6 +17726,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quarantine_metadata_placement_rejects() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(75).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let actor = test_actor(
+            75,
+            UserId::local(Ulid::from_parts(2_150, 1), realm_id),
+            realm_id,
+        );
+        assert_eq!(actor.node_id, local_node);
+
+        let strategy_id = Ulid::from_parts(2_151, 1);
+        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_node, RealmNodeKind::Management);
+        config.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
+        config.strategies.push(PlacementStrategy {
+            strategy_id,
+            name: "placed".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        });
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        // A document whose stamped shard is not the one its id decodes to fails
+        // the placement fence permanently, on both the registry and create paths.
+        let document = |bucket: u16, seed: u64| {
+            MetaResourceId::from_parts(seed, handle, BucketId::new(bucket).unwrap(), 1)
+                .unwrap()
+                .as_ulid()
+        };
+        let group_id = Ulid::from_parts(2_152, 1);
+        let mismatched = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 9,
+        };
+        let matching = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 4,
+        };
+        let bad_document = document(4, 2_153);
+        let good_document = document(matching.shard as u16, 2_154);
+        let bad_event_id = Ulid::from_parts(2_155, 1);
+        let good_event_id = Ulid::from_parts(2_156, 1);
+
+        let mut bad_record = registry_record(
+            group_id,
+            bad_document,
+            "datasets/mismatched",
+            100,
+            bad_event_id,
+        );
+        bad_record.placement = mismatched;
+        let mut bad_create = metadata_create_event(group_id, bad_document, 100, bad_event_id, 75);
+        bad_create.record = bad_record.clone();
+        let mut good_record = registry_record(
+            group_id,
+            good_document,
+            "datasets/placed",
+            100,
+            good_event_id,
+        );
+        good_record.placement = matching;
+        let mut good_create =
+            metadata_create_event(group_id, good_document, 100, good_event_id, 75);
+        good_create.record = good_record.clone();
+
+        let registry_target = |document_id| DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        };
+        let create_target = |document_id, event_id| DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id,
+        };
+        let bad_topic = registry_target(bad_document).sync_topic_id(realm_id, &mismatched);
+        let good_topic = registry_target(good_document).sync_topic_id(realm_id, &matching);
+        service
+            .ensure_document_sync_topics(&[bad_topic, good_topic], Vec::new())
+            .expect("metadata shard topic genesis");
+        let change = |event_id, placement| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id,
+                actor: local_node,
+                updated_at_ms: 100,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+            placement,
+        };
+        let bad_registry_event = Ulid::from_parts(2_157, 1);
+        let good_registry_event = Ulid::from_parts(2_158, 1);
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: bad_registry_event,
+                        target: registry_target(bad_document),
+                        bytes: postcard::to_allocvec(&bad_record).expect("registry serializes"),
+                        change: change(bad_registry_event, mismatched),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: bad_event_id,
+                        target: create_target(bad_document, bad_event_id),
+                        bytes: postcard::to_allocvec(&bad_create).expect("create serializes"),
+                        change: change(bad_event_id, mismatched),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: good_registry_event,
+                        target: registry_target(good_document),
+                        bytes: postcard::to_allocvec(&good_record).expect("registry serializes"),
+                        change: change(good_registry_event, matching),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: good_event_id,
+                        target: create_target(good_document, good_event_id),
+                        bytes: postcard::to_allocvec(&good_create).expect("create serializes"),
+                        change: change(good_event_id, matching),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "metadata publish failed: {published:?}"
+        );
+
+        reset_cursor(&service, bad_topic).await;
+        reset_cursor(&service, good_topic).await;
+        let applied = service
+            .reconcile_document_topics([bad_topic, good_topic])
+            .await
+            .expect("mismatched placements are quarantined");
+
+        assert!(applied.targets.contains(&registry_target(good_document)));
+        assert!(
+            applied
+                .targets
+                .contains(&create_target(good_document, good_event_id))
+        );
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(
+            quarantined_reason(&records, bad_registry_event),
+            "metadata registry record has a mismatched placement configuration"
+        );
+        assert_eq!(
+            quarantined_reason(&records, bad_event_id),
+            "replicated metadata create has a mismatched placement configuration"
+        );
+        // The create-batch reject rides that function's own transaction.
+        assert!(cursor_advanced(&service, &storage, bad_topic).await);
+        assert!(cursor_advanced(&service, &storage, good_topic).await);
+        assert_eq!(quarantine_usage(&storage).await.records, 2);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn quarantine_capacity_holds_cursor() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
