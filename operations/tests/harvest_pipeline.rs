@@ -206,6 +206,27 @@ async fn seed_auth(
     .await
 }
 
+async fn read_value(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: Vec<u8>,
+) -> Result<Option<Vec<u8>>, BoxError> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: ByteView::from(key),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|bytes| bytes.as_ref().to_vec()))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        event => Err(format!("unexpected storage read event: {event:?}").into()),
+    }
+}
+
 async fn write_value(
     storage: &StorageHandle,
     key_space: &str,
@@ -416,6 +437,53 @@ async fn drain(fixture: &Fixture) -> Result<(), BoxError> {
             .map_err(|error| format!("{error:?}"))?;
     }
     Ok(())
+}
+
+/// Project the registry without materializing any graph, so a run sees a
+/// durable record whose graph is not readable yet.
+async fn project_only(fixture: &Fixture) -> Result<(), BoxError> {
+    replay_metadata_event_log(fixture.context.as_ref())
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(())
+}
+
+/// Make the routed metadata authority unreadable, handing back the exact bytes
+/// [`restore_config`] puts back: a freshly seeded config would not carry the
+/// placement the harvested documents were stamped with.
+async fn break_config(fixture: &Fixture) -> Result<Vec<u8>, BoxError> {
+    let saved = read_value(
+        &fixture.context.storage_handle,
+        REALM_CONFIG_KEYSPACE,
+        fixture.actor.realm_id.as_bytes().to_vec(),
+    )
+    .await?
+    .ok_or("realm config missing")?;
+    write_value(
+        &fixture.context.storage_handle,
+        REALM_CONFIG_KEYSPACE,
+        fixture.actor.realm_id.as_bytes().to_vec(),
+        vec![0xff; 8],
+    )
+    .await?;
+    Ok(saved)
+}
+
+async fn restore_config(fixture: &Fixture, saved: Vec<u8>) -> Result<(), BoxError> {
+    write_value(
+        &fixture.context.storage_handle,
+        REALM_CONFIG_KEYSPACE,
+        fixture.actor.realm_id.as_bytes().to_vec(),
+        saved,
+    )
+    .await
+}
+
+async fn record_present(fixture: &Fixture, document_id: Ulid) -> Result<bool, BoxError> {
+    Ok(load_metadata_record_by_document(&fixture.context, document_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        .is_some())
 }
 
 async fn run(fixture: &Fixture, source: &HarvestSource) -> JobRunOutcome {
@@ -779,6 +847,193 @@ async fn groups_keep_separate_provenance() -> Result<(), BoxError> {
     assert_ne!(left.meta_resource_id, right.meta_resource_id);
     assert_eq!(left.group_id, first.group_id);
     assert_eq!(right.group_id, second.group_id);
+
+    server.abort();
+    fixture.stop().await;
+    Ok(())
+}
+
+/// An upstream deletion delivered while the create is still unprojected, or
+/// while the routed authority is unreachable, must not retire the identity: the
+/// document is confirmed gone first, and replay converges without an orphan.
+#[tokio::test]
+async fn deletion_waits_for_confirmation() -> Result<(), BoxError> {
+    let fixture = build_fixture().await?;
+    let (provider, server) = serve_oai().await?;
+    let source = seed_source(&fixture, &provider.endpoint).await?;
+    provider.script("identify", identify_page());
+    provider.script(
+        "start",
+        list_page(
+            &[live_record(ALPHA, "2026-01-02T00:00:00Z", "Alpha v1")],
+            None,
+        ),
+    );
+
+    // Create and deliberately leave the registry projection behind.
+    assert_eq!(counts(&run(&fixture, &source).await), (1, 0, 0, 0));
+    let created = provenance(&fixture, source.group_id, ALPHA)
+        .await?
+        .ok_or("alpha provenance missing")?;
+    let alpha_id = created.meta_resource_id;
+    assert_eq!(created.state, HarvestRecordState::Live);
+    assert!(
+        !record_present(&fixture, alpha_id).await?,
+        "the local registry projection must still lag the create"
+    );
+
+    // The upstream withdrawal arrives during that lag. A fresh job context each
+    // time covers both the immediate retry and a restarted worker.
+    provider.script(
+        "start",
+        list_page(&[deleted_record(ALPHA, "2026-01-05T00:00:00Z")], None),
+    );
+    for attempt in 0..2 {
+        let outcome = run(&fixture, &source).await;
+        let error = failure(&outcome);
+        assert_eq!(
+            error.kind,
+            JobErrorKind::Retryable,
+            "attempt {attempt} must retry: {error:?}"
+        );
+        assert!(
+            error.message.contains("pending registry projection"),
+            "attempt {attempt} unexpected failure: {error:?}"
+        );
+        assert_eq!(
+            provenance(&fixture, source.group_id, ALPHA)
+                .await?
+                .ok_or("alpha provenance missing")?
+                .state,
+            HarvestRecordState::Live,
+            "provenance must not go terminal before the document is gone"
+        );
+    }
+
+    // Projection caught up, but the routed authority is unavailable.
+    drain(&fixture).await?;
+    assert!(record_present(&fixture, alpha_id).await?);
+    let saved_config = break_config(&fixture).await?;
+    let outcome = run(&fixture, &source).await;
+    let error = failure(&outcome);
+    assert_eq!(
+        error.kind,
+        JobErrorKind::Retryable,
+        "an unavailable authority must retry: {error:?}"
+    );
+    assert_eq!(
+        provenance(&fixture, source.group_id, ALPHA)
+            .await?
+            .ok_or("alpha provenance missing")?
+            .state,
+        HarvestRecordState::Live
+    );
+    assert!(
+        record_present(&fixture, alpha_id).await?,
+        "a failed withdrawal must leave the document alone"
+    );
+
+    // Authority restored: the same delivery now retires the identity.
+    restore_config(&fixture, saved_config).await?;
+    assert_eq!(counts(&run(&fixture, &source).await), (0, 0, 1, 0));
+    let tombstoned = provenance(&fixture, source.group_id, ALPHA)
+        .await?
+        .ok_or("alpha provenance missing")?;
+    assert_eq!(tombstoned.state, HarvestRecordState::Tombstoned);
+    assert!(
+        !record_present(&fixture, alpha_id).await?,
+        "a tombstoned identity must have no live document"
+    );
+
+    // Replaying the withdrawal changes nothing.
+    let stored = cursor(&fixture, &source).await?;
+    assert_eq!(counts(&run(&fixture, &stored).await), (0, 0, 0, 1));
+
+    // Revival allocates a successor and leaves no orphan behind it.
+    drain(&fixture).await?;
+    let stored = cursor(&fixture, &source).await?;
+    provider.script(
+        "start",
+        list_page(
+            &[live_record(ALPHA, "2026-01-07T00:00:00Z", "Alpha reborn")],
+            None,
+        ),
+    );
+    assert_eq!(counts(&run(&fixture, &stored).await), (1, 0, 0, 0));
+    let revived = provenance(&fixture, source.group_id, ALPHA)
+        .await?
+        .ok_or("alpha provenance missing")?;
+    assert_eq!(revived.state, HarvestRecordState::Live);
+    assert_ne!(revived.meta_resource_id, alpha_id);
+    assert_eq!(revived.predecessors, vec![alpha_id]);
+    assert!(!record_present(&fixture, alpha_id).await?);
+    drain(&fixture).await?;
+    assert!(record_present(&fixture, revived.meta_resource_id).await?);
+
+    server.abort();
+    fixture.stop().await;
+    Ok(())
+}
+
+/// A registry row durable before its graph materializes must never retire the
+/// source record. The harvest update path does not read the graph today, so the
+/// update lands straight away; if it ever does surface a missing graph, that
+/// failure has to stay retryable and the next run must still update the same
+/// identity. The classifier table test pins the retryability itself down.
+#[tokio::test]
+async fn unmaterialized_graph_retries() -> Result<(), BoxError> {
+    let fixture = build_fixture().await?;
+    let (provider, server) = serve_oai().await?;
+    let source = seed_source(&fixture, &provider.endpoint).await?;
+    provider.script("identify", identify_page());
+    provider.script(
+        "start",
+        list_page(
+            &[live_record(ALPHA, "2026-01-02T00:00:00Z", "Alpha v1")],
+            None,
+        ),
+    );
+    assert_eq!(counts(&run(&fixture, &source).await), (1, 0, 0, 0));
+    let created = provenance(&fixture, source.group_id, ALPHA)
+        .await?
+        .ok_or("alpha provenance missing")?;
+
+    // Registry visible, no graph materialized.
+    project_only(&fixture).await?;
+    assert!(record_present(&fixture, created.meta_resource_id).await?);
+    provider.script(
+        "start",
+        list_page(
+            &[live_record(ALPHA, "2026-01-04T00:00:00Z", "Alpha v2")],
+            None,
+        ),
+    );
+    let stored = cursor(&fixture, &source).await?;
+    match run(&fixture, &stored).await {
+        JobRunOutcome::Failed(error) => {
+            assert_eq!(
+                error.kind,
+                JobErrorKind::Retryable,
+                "a lagging graph must not retire the record: {error:?}"
+            );
+            // Materialization catches up and the retry applies the same record.
+            drain(&fixture).await?;
+            let stored = cursor(&fixture, &source).await?;
+            assert_eq!(counts(&run(&fixture, &stored).await), (0, 1, 0, 0));
+        }
+        applied => {
+            assert_eq!(counts(&applied), (0, 1, 0, 0));
+            drain(&fixture).await?;
+        }
+    }
+
+    let updated = provenance(&fixture, source.group_id, ALPHA)
+        .await?
+        .ok_or("alpha provenance missing")?;
+    assert_eq!(updated.state, HarvestRecordState::Live);
+    assert_eq!(updated.meta_resource_id, created.meta_resource_id);
+    assert!(updated.source_datestamp_ms > created.source_datestamp_ms);
+    assert!(record_present(&fixture, created.meta_resource_id).await?);
 
     server.abort();
     fixture.stop().await;
