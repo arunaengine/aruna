@@ -901,11 +901,13 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
             key: ByteView::from(Vec::new()),
         }));
-        let [Effect::Storage(StorageEffect::Delete {
-            key_space,
-            key,
-            txn_id: effect_txn,
-        })] = effects.as_slice()
+        let [
+            Effect::Storage(StorageEffect::Delete {
+                key_space,
+                key,
+                txn_id: effect_txn,
+            }),
+        ] = effects.as_slice()
         else {
             panic!("expected an updated-index delete, got {effects:?}");
         };

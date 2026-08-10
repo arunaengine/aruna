@@ -27,7 +27,9 @@ use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
 };
 use aruna_operations::metadata::forward::export_rocrate_routed;
-use aruna_operations::metadata::visibility_index::{VisibilityError, earliest_visible, visible_page};
+use aruna_operations::metadata::visibility_index::{
+    VisibilityError, earliest_visible, visible_page,
+};
 
 use crate::forwarded::external_base_url;
 use crate::server_state::ServerState;
@@ -990,8 +992,10 @@ mod tests {
     // hands the caller a token at the last emitted cursor.
     #[tokio::test]
     async fn budget_stops_before_overflow() {
-        let mut limits = RoCrateLimits::default();
-        limits.metadata_bytes = 100;
+        let limits = RoCrateLimits {
+            metadata_bytes: 100,
+            ..RoCrateLimits::default()
+        };
         let fixture = fixture(limits).await;
         seed_records(&fixture, 20, true).await;
         let body = list_page(&fixture, None).await.unwrap();
@@ -1003,8 +1007,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_record_is_unavailable() {
-        let mut limits = RoCrateLimits::default();
-        limits.metadata_bytes = 1;
+        let limits = RoCrateLimits {
+            metadata_bytes: 1,
+            ..RoCrateLimits::default()
+        };
         let fixture = fixture(limits).await;
         seed_records(&fixture, 3, true).await;
         assert!(matches!(
@@ -1074,7 +1080,9 @@ mod tests {
             .unwrap();
         assert!(body.contains("<baseURL>https://example.test/api/v1/oai</baseURL>"));
         let earliest = format_from(1_000).unwrap();
-        assert!(body.contains(&format!("<earliestDatestamp>{earliest}</earliestDatestamp>")));
+        assert!(body.contains(&format!(
+            "<earliestDatestamp>{earliest}</earliestDatestamp>"
+        )));
     }
 
     async fn call(fixture: &Fixture, request: axum::http::Request<Body>) -> (StatusCode, String) {
@@ -1091,7 +1099,10 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
-    fn peer_request(builder: axum::http::request::Builder, body: Body) -> axum::http::Request<Body> {
+    fn peer_request(
+        builder: axum::http::request::Builder,
+        body: Body,
+    ) -> axum::http::Request<Body> {
         let mut request = builder.body(body).unwrap();
         request.extensions_mut().insert(ConnectInfo(
             "127.0.0.1:9000".parse::<std::net::SocketAddr>().unwrap(),
@@ -1128,7 +1139,10 @@ mod tests {
                 "ListIdentifiers",
             ),
             ("verb=ListRecords&metadataPrefix=marc", "error"),
-            ("verb=GetRecord&metadataPrefix=oai_dc&identifier=nope", "error"),
+            (
+                "verb=GetRecord&metadataPrefix=oai_dc&identifier=nope",
+                "error",
+            ),
             ("verb=Bogus", "error"),
         ];
         for (query, payload) in cases {
@@ -1352,9 +1366,12 @@ mod tests {
         // Identify takes no selective arguments; GetRecord takes no window.
         assert_eq!(
             fault_code(
-                validate_pairs(&params(&[("verb", "Identify"), ("metadataPrefix", "oai_dc")]))
-                    .err()
-                    .unwrap()
+                validate_pairs(&params(&[
+                    ("verb", "Identify"),
+                    ("metadataPrefix", "oai_dc")
+                ]))
+                .err()
+                .unwrap()
             ),
             "badArgument"
         );
@@ -1410,7 +1427,10 @@ mod tests {
     fn form_pairs_keep_duplicates() {
         let pairs = parse_pairs(b"verb=ListRecords&from=a&from=b");
         assert_eq!(pairs.len(), 3);
-        assert_eq!(fault_code(validate_pairs(&pairs).err().unwrap()), "badArgument");
+        assert_eq!(
+            fault_code(validate_pairs(&pairs).err().unwrap()),
+            "badArgument"
+        );
     }
 
     #[test]
@@ -1428,7 +1448,7 @@ mod tests {
             .timestamp_millis() as u64;
         assert_eq!(until_ms, second + 999);
         // .000, .001 and .999 of that second all fall inside the bound.
-        assert!(second <= until_ms && second + 1 <= until_ms && second + 999 <= until_ms);
+        assert!(second < until_ms && second + 999 <= until_ms);
     }
 
     #[test]

@@ -4025,8 +4025,9 @@ async fn apply_metadata_registry_upsert_to_storage(
                 )
                 .await
                 {
-                    Ok(value) => value
-                        .and_then(|value| postcard::from_bytes::<MetadataRegistryRecord>(&value).ok()),
+                    Ok(value) => value.and_then(|value| {
+                        postcard::from_bytes::<MetadataRegistryRecord>(&value).ok()
+                    }),
                     Err(error) => {
                         let _ = storage
                             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -4034,8 +4035,7 @@ async fn apply_metadata_registry_upsert_to_storage(
                         return Err(error);
                     }
                 };
-                let deletes =
-                    metadata_registry_delete_entries(stale.as_ref().unwrap_or(&record));
+                let deletes = metadata_registry_delete_entries(stale.as_ref().unwrap_or(&record));
                 match storage_batch_delete_and_write_in_transaction(
                     storage,
                     txn_id,
@@ -5760,11 +5760,15 @@ async fn record_fenced_txn(
     txn_id: TxnId,
 ) -> Result<bool> {
     if let Some(delete) = delete_record_txn(storage, record.document_id, txn_id).await? {
-        return Ok(
-            !registry_live_txn(storage, record.group_id, record.document_id, &delete, txn_id)
-                .await?
-                .0,
-        );
+        return Ok(!registry_live_txn(
+            storage,
+            record.group_id,
+            record.document_id,
+            &delete,
+            txn_id,
+        )
+        .await?
+        .0);
     }
     Ok(graph_record_txn(storage, &record.graph_iri, txn_id)
         .await?

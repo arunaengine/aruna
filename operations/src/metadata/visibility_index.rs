@@ -110,8 +110,10 @@ fn record_visible(record: &MetadataRegistryRecord, evaluators: &Evaluators) -> b
         .is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
 }
 
-type Evaluators =
-    std::collections::HashMap<(aruna_core::structs::RealmId, aruna_core::types::GroupId), PolicyEvaluator>;
+type Evaluators = std::collections::HashMap<
+    (aruna_core::structs::RealmId, aruna_core::types::GroupId),
+    PolicyEvaluator,
+>;
 
 async fn load_evaluators(
     context: &DriverContext,
@@ -142,7 +144,10 @@ pub async fn anon_readable(
 
 /// Maintenance variant: one group whose policy state cannot be read is left out
 /// of the index instead of blocking every other group's records from it.
-async fn build_evaluators(context: &DriverContext, records: &[MetadataRegistryRecord]) -> Evaluators {
+async fn build_evaluators(
+    context: &DriverContext,
+    records: &[MetadataRegistryRecord],
+) -> Evaluators {
     if let Ok(evaluators) = load_evaluators(context, records).await {
         return evaluators;
     }
@@ -171,8 +176,9 @@ async fn read_state(context: &DriverContext) -> Result<Option<VisibilityState>, 
         }))
         .await;
     match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .and_then(|value| postcard::from_bytes::<VisibilityState>(value.as_ref()).ok())),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(
+            value.and_then(|value| postcard::from_bytes::<VisibilityState>(value.as_ref()).ok())
+        ),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(StorageError::ReadError)),
     }
@@ -211,7 +217,10 @@ fn scan_effect(start: IterStart, limit: usize) -> Effect {
     })
 }
 
-fn parse_scan(event: Event) -> Result<(Vec<(Key, Value)>, Option<Key>), StorageReadError> {
+/// A scanned index batch: its entries and the storage cursor to resume after.
+type IndexBatch = (Vec<(Key, Value)>, Option<Key>);
+
+fn parse_scan(event: Event) -> Result<IndexBatch, StorageReadError> {
     match event {
         Event::Storage(StorageEvent::IterResult {
             values,
@@ -240,12 +249,17 @@ pub async fn visible_page(
     after: Option<Key>,
     limit: usize,
 ) -> Result<VisiblePage, VisibilityError> {
-    let state = read_state(context).await?.ok_or(VisibilityError::Unavailable)?;
+    let state = read_state(context)
+        .await?
+        .ok_or(VisibilityError::Unavailable)?;
     if !state.ready {
         return Err(VisibilityError::Unavailable);
     }
     let generation = state.generation;
-    let mut start = match after.as_ref().and_then(|key| rebase_cursor(key, generation)) {
+    let mut start = match after
+        .as_ref()
+        .and_then(|key| rebase_cursor(key, generation))
+    {
         Some(cursor) => IterStart::After(cursor),
         None => IterStart::At(index_key(generation, from_ms, Ulid::nil())),
     };
@@ -325,10 +339,7 @@ pub async fn visible_page(
 /// The datestamp of the oldest anonymously visible record, for `earliestDatestamp`.
 pub async fn earliest_visible(context: &DriverContext) -> Result<Option<u64>, VisibilityError> {
     let page = visible_page(context, 0, u64::MAX, None, 1).await?;
-    Ok(page
-        .entries
-        .first()
-        .map(|(_, record)| record.updated_at_ms))
+    Ok(page.entries.first().map(|(_, record)| record.updated_at_ms))
 }
 
 /// Rebuilds the index into the next generation and publishes it atomically by
@@ -505,7 +516,12 @@ mod tests {
         }
     }
 
-    fn record(group_id: Ulid, document_id: Ulid, updated_at_ms: u64, public: bool) -> MetadataRegistryRecord {
+    fn record(
+        group_id: Ulid,
+        document_id: Ulid,
+        updated_at_ms: u64,
+        public: bool,
+    ) -> MetadataRegistryRecord {
         MetadataRegistryRecord {
             realm_id: REALM,
             group_id,
@@ -697,7 +713,11 @@ mod tests {
         let group_id = Ulid::from_bytes([41; 16]);
         seed_realm(&context, Vec::new()).await;
         seed_group(&context, group_id, Vec::new()).await;
-        seed_record(&context, &record(group_id, Ulid::from_bytes([42; 16]), 100, true)).await;
+        seed_record(
+            &context,
+            &record(group_id, Ulid::from_bytes([42; 16]), 100, true),
+        )
+        .await;
 
         assert!(matches!(
             visible_page(&context, 0, u64::MAX, None, 10).await,
@@ -716,7 +736,11 @@ mod tests {
         let group_id = Ulid::from_bytes([51; 16]);
         seed_realm(&context, Vec::new()).await;
         seed_group(&context, group_id, Vec::new()).await;
-        seed_record(&context, &record(group_id, Ulid::from_bytes([52; 16]), 100, true)).await;
+        seed_record(
+            &context,
+            &record(group_id, Ulid::from_bytes([52; 16]), 100, true),
+        )
+        .await;
         rebuild_index(&context).await.unwrap();
 
         let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id: REALM };
@@ -745,8 +769,16 @@ mod tests {
         let group_id = Ulid::from_bytes([61; 16]);
         seed_realm(&context, Vec::new()).await;
         seed_group(&context, group_id, Vec::new()).await;
-        seed_record(&context, &record(group_id, Ulid::from_bytes([62; 16]), 50, false)).await;
-        seed_record(&context, &record(group_id, Ulid::from_bytes([63; 16]), 400, true)).await;
+        seed_record(
+            &context,
+            &record(group_id, Ulid::from_bytes([62; 16]), 50, false),
+        )
+        .await;
+        seed_record(
+            &context,
+            &record(group_id, Ulid::from_bytes([63; 16]), 400, true),
+        )
+        .await;
         rebuild_index(&context).await.unwrap();
 
         assert_eq!(earliest_visible(&context).await.unwrap(), Some(400));
@@ -763,7 +795,12 @@ mod tests {
         for seed in 0..3u8 {
             seed_record(
                 &context,
-                &record(group_id, Ulid::from_bytes([80 + seed; 16]), 100 + seed as u64, true),
+                &record(
+                    group_id,
+                    Ulid::from_bytes([80 + seed; 16]),
+                    100 + seed as u64,
+                    true,
+                ),
             )
             .await;
         }
@@ -772,7 +809,9 @@ mod tests {
         let cursor = first.entries.last().map(|(key, _)| key.clone());
 
         assert_eq!(rebuild_index(&context).await.unwrap(), 2);
-        let page = visible_page(&context, 0, u64::MAX, cursor, 10).await.unwrap();
+        let page = visible_page(&context, 0, u64::MAX, cursor, 10)
+            .await
+            .unwrap();
         assert_eq!(page.entries.len(), 2);
     }
 
@@ -780,7 +819,10 @@ mod tests {
     fn index_key_round_trips() {
         let document_id = Ulid::from_bytes([3; 16]);
         let key = index_key(7, 1_234, document_id);
-        assert_eq!(parse_index_key(key.as_ref()).unwrap(), (7, 1_234, document_id));
+        assert_eq!(
+            parse_index_key(key.as_ref()).unwrap(),
+            (7, 1_234, document_id)
+        );
         assert!(parse_index_key(&[0u8; 24]).is_err());
     }
 
@@ -797,7 +839,9 @@ mod tests {
     #[test]
     fn keys_order_by_generation() {
         let document_id = Ulid::from_bytes([5; 16]);
-        assert!(index_key(1, u64::MAX, document_id).as_ref() < index_key(2, 0, document_id).as_ref());
+        assert!(
+            index_key(1, u64::MAX, document_id).as_ref() < index_key(2, 0, document_id).as_ref()
+        );
         assert!(index_key(2, 1, document_id).as_ref() < index_key(2, 2, document_id).as_ref());
     }
 }
