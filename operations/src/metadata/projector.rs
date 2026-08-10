@@ -444,10 +444,7 @@ pub async fn project_metadata_create_events(
                 }
             };
             let stale_record = existing_registry.as_ref().unwrap_or(&event.record);
-            repair_deletes.extend(metadata_registry_delete_entries(
-                stale_record.group_id,
-                stale_record.document_id,
-            ));
+            repair_deletes.extend(metadata_registry_delete_entries(stale_record));
             repaired_records.push(stale_record.clone());
             registry_cache.insert(document_id, None);
             status_cache.insert(document_id, None);

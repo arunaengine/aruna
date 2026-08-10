@@ -4015,7 +4015,27 @@ async fn apply_metadata_registry_upsert_to_storage(
         };
         match record_fenced_txn(storage, &record, txn_id).await {
             Ok(true) => {
-                let deletes = metadata_registry_delete_entries(record.group_id, record.document_id);
+                // The stale local row carries the timestamp half of its index
+                // key; the fenced incoming record may be stamped differently.
+                let stale = match storage_read_from_transaction(
+                    storage,
+                    target.storage_keyspace().to_string(),
+                    target.storage_key(),
+                    Some(txn_id),
+                )
+                .await
+                {
+                    Ok(value) => value
+                        .and_then(|value| postcard::from_bytes::<MetadataRegistryRecord>(&value).ok()),
+                    Err(error) => {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                };
+                let deletes =
+                    metadata_registry_delete_entries(stale.as_ref().unwrap_or(&record));
                 match storage_batch_delete_and_write_in_transaction(
                     storage,
                     txn_id,
@@ -4203,7 +4223,7 @@ async fn apply_metadata_graph_lifecycle_to_storage(
                 .await;
             return Ok(false);
         };
-        let registry_live = match registry_live_txn(
+        let (registry_live, registry_row) = match registry_live_txn(
             storage,
             record.group_id,
             record.document_id,
@@ -4226,7 +4246,10 @@ async fn apply_metadata_graph_lifecycle_to_storage(
                 .await;
             return Ok(false);
         }
-        let deletes = metadata_registry_delete_entries(record.group_id, record.document_id);
+        let deletes = registry_row
+            .as_ref()
+            .map(metadata_registry_delete_entries)
+            .unwrap_or_default();
         let writes = vec![(key_space.clone(), key.clone(), primary_bytes.clone().into())];
         match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
         {
@@ -5737,14 +5760,11 @@ async fn record_fenced_txn(
     txn_id: TxnId,
 ) -> Result<bool> {
     if let Some(delete) = delete_record_txn(storage, record.document_id, txn_id).await? {
-        return Ok(!registry_live_txn(
-            storage,
-            record.group_id,
-            record.document_id,
-            &delete,
-            txn_id,
-        )
-        .await?);
+        return Ok(
+            !registry_live_txn(storage, record.group_id, record.document_id, &delete, txn_id)
+                .await?
+                .0,
+        );
     }
     Ok(graph_record_txn(storage, &record.graph_iri, txn_id)
         .await?
@@ -5757,7 +5777,7 @@ async fn registry_live_txn(
     document_id: Ulid,
     delete: &MetadataDocumentDeleteRecord,
     txn_id: TxnId,
-) -> Result<bool> {
+) -> Result<(bool, Option<MetadataRegistryRecord>)> {
     let target = DocumentSyncTarget::MetadataRegistry {
         group_id,
         document_id,
@@ -5770,12 +5790,13 @@ async fn registry_live_txn(
     )
     .await?
     else {
-        return Ok(false);
+        return Ok((false, None));
     };
     let record: MetadataRegistryRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    Ok(record.updated_at_ms > delete.tombstone.updated_at_ms
-        || record.last_event_id > delete.deleted_after_event_id)
+    let live = record.updated_at_ms > delete.tombstone.updated_at_ms
+        || record.last_event_id > delete.deleted_after_event_id;
+    Ok((live, Some(record)))
 }
 
 async fn registry_cleanup_txn(
@@ -5811,7 +5832,7 @@ async fn registry_cleanup_txn(
     {
         return Ok(Vec::new());
     }
-    Ok(metadata_registry_delete_entries(group_id, document_id))
+    Ok(metadata_registry_delete_entries(&record))
 }
 
 async fn metadata_placement_fence_in_transaction(

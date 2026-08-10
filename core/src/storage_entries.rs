@@ -804,10 +804,19 @@ pub fn metadata_registry_write_entries(
     ])
 }
 
-pub fn metadata_registry_delete_entries(
-    group_id: GroupId,
-    document_id: Ulid,
-) -> Vec<(KeySpace, Key)> {
+/// The timestamp-index key of a record being removed. Only the record itself
+/// carries the `updated_at_ms` half of the key, so the row must be read before
+/// the delete batch is built or the key leaks with no later write to supersede it.
+pub fn metadata_updated_index_delete_entry(record: &MetadataRegistryRecord) -> (KeySpace, Key) {
+    (
+        METADATA_UPDATED_INDEX_KEYSPACE.to_string(),
+        metadata_updated_index_key(record.updated_at_ms, record.document_id),
+    )
+}
+
+pub fn metadata_registry_delete_entries(record: &MetadataRegistryRecord) -> Vec<(KeySpace, Key)> {
+    let group_id = record.group_id;
+    let document_id = record.document_id;
     vec![
         (
             METADATA_INDEX_KEYSPACE.to_string(),
@@ -821,6 +830,7 @@ pub fn metadata_registry_delete_entries(
             METADATA_HOLDERS_KEYSPACE.to_string(),
             metadata_registry_key(group_id, document_id),
         ),
+        metadata_updated_index_delete_entry(record),
     ]
 }
 

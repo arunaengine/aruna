@@ -837,11 +837,15 @@ async fn bystander_writes_forward() -> TestResult<()> {
     );
 
     let stale = realm.find(holders[0]);
+    let stale_record = load_metadata_record_by_document(stale.context.as_ref(), document_id)
+        .await
+        .map_err(|error| format!("registry read failed: {error:?}"))?
+        .ok_or("the holder must carry the registry row")?;
     let deleted = stale
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::BatchDelete {
-            deletes: metadata_registry_delete_entries(group_id, document_id),
+            deletes: metadata_registry_delete_entries(&stale_record),
             txn_id: None,
         })
         .await;

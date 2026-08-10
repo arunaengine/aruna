@@ -231,6 +231,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_removes_index_key() {
+        let (context, _dir) = context();
+        let record = record(Ulid::from_bytes([30; 16]), 700);
+        store(&context, &record).await;
+        let event = context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::BatchDelete {
+                deletes: aruna_core::storage_entries::metadata_registry_delete_entries(&record),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchDeleteResult { .. })
+        ));
+
+        let page = enumerate_updated(&context, 0, u64::MAX, None, 10)
+            .await
+            .unwrap();
+        assert!(page.records.is_empty());
+        // A leaked key would surface here as a stale key nothing can supersede.
+        assert!(page.stale_keys.is_empty());
+    }
+
+    #[tokio::test]
     async fn pagination_resumes_after_cursor() {
         let (context, _dir) = context();
         for seed in 0..5u8 {

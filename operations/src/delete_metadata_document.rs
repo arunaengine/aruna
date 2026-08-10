@@ -11,6 +11,7 @@ use aruna_core::metadata::{
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     graph_revision_change, metadata_document_lifecycle_revision_change,
+    metadata_updated_index_delete_entry,
 };
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
@@ -72,6 +73,7 @@ enum DeleteMetadataDocumentState {
     DeleteRegistry,
     DeleteDocumentIndex,
     DeleteHolders,
+    DeleteUpdatedIndex,
     WriteAudit,
     WriteDocumentLifecycleOutbox,
     WriteGraphLifecycleOutbox,
@@ -320,6 +322,17 @@ impl DeleteMetadataDocumentOperation {
     }
 }
 
+/// The timestamp-index key is only reconstructible from the record's own
+/// `updated_at_ms`, so it is deleted inside the same transaction as the row.
+fn delete_updated_index_effect(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -> Effect {
+    let (key_space, key) = metadata_updated_index_delete_entry(record);
+    Effect::Storage(StorageEffect::Delete {
+        key_space,
+        key,
+        txn_id,
+    })
+}
+
 const DELETE_CONFLICT_RETRIES: usize = 3;
 
 fn delete_retry_backoff(attempt: usize, document_id: Ulid) -> Duration {
@@ -558,6 +571,20 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
+                    self.state = DeleteMetadataDocumentState::DeleteUpdatedIndex;
+                    smallvec![delete_updated_index_effect(record, Some(txn_id))]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("holders delete result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::DeleteUpdatedIndex => match event {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
                     self.state = DeleteMetadataDocumentState::WriteAudit;
                     match write_audit_effect(
                         &self.audit_record(record),
@@ -571,7 +598,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("holders delete result", format!("{other:?}")),
+                other => self.unexpected_event("updated index delete result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::WriteAudit => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {

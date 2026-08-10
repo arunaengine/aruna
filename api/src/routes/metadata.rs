@@ -2893,7 +2893,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::BatchDelete {
-                deletes: metadata_registry_delete_entries(record.group_id, record.document_id),
+                deletes: metadata_registry_delete_entries(&record),
                 txn_id: None,
             })
             .await
