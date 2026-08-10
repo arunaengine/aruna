@@ -62,7 +62,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use convergence::{hang_cap, wait_for_convergence};
+pub use convergence::{hang_cap, wait_for_convergence};
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 

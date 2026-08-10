@@ -42,8 +42,9 @@ use aruna_operations::jobs::store::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::metadata::api::{
-    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiQueryMode,
-    MetadataDocumentQueryRequest, MetadataRoCrateExportView, query_metadata_document,
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiError,
+    MetadataApiQueryMode, MetadataDocumentQueryRequest, MetadataRoCrateExportView,
+    query_metadata_document,
 };
 use aruna_operations::metadata::forward::{
     create_metadata_document_routed, delete_metadata_document_routed, export_rocrate_routed,
@@ -52,9 +53,10 @@ use aruna_operations::metadata::forward::{
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::sync_placement::sort_node_ids;
 use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
+use std::cell::RefCell;
 use ulid::Ulid;
 
-use topology::{TestNode, TestResult, Topology, wait_until};
+use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
@@ -994,14 +996,7 @@ async fn document_export_routes() -> TestResult<()> {
         offset: None,
         after: None,
     };
-    let bearer = export_rocrate_routed(
-        &bystander.context,
-        realm.realm_id,
-        request(None),
-        Some(realm.bearer_token()),
-        aruna_core::structs::RoCrateLimits::default().metadata_bytes,
-    )
-    .await?;
+    let bearer = export_routed(&realm, bystander, request(None), realm.bearer_token()).await?;
     assert!(matches!(bearer, ExportMetadataRoCrateResult::Full { .. }));
 
     let principal = AuthContext {
@@ -1009,12 +1004,11 @@ async fn document_export_routes() -> TestResult<()> {
         realm_id: realm.realm_id,
         path_restrictions: None,
     };
-    let internal = export_rocrate_routed(
-        &bystander.context,
-        realm.realm_id,
+    let internal = export_routed(
+        &realm,
+        bystander,
         request(Some(principal.clone())),
-        Some(MetadataAuthToken::internal(principal)),
-        aruna_core::structs::RoCrateLimits::default().metadata_bytes,
+        MetadataAuthToken::internal(principal),
     )
     .await?;
     assert!(matches!(internal, ExportMetadataRoCrateResult::Full { .. }));
@@ -1080,6 +1074,42 @@ async fn user_create_forwards() -> TestResult<()> {
 
     realm.shutdown().await;
     Ok(())
+}
+
+/// A routed export, re-run while the fan-out reports it unavailable: the first
+/// request pays a cold metadata dial inside the fan-out's per-peer slot, which a
+/// starved machine can spend before the holder is reached at all.
+async fn export_routed(
+    realm: &Topology,
+    bystander: &TestNode,
+    request: ExportMetadataRoCrateRequest,
+    token: MetadataAuthToken,
+) -> TestResult<ExportMetadataRoCrateResult> {
+    let export = RefCell::new(None);
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed export reached a holder",
+        || async {
+            match export_rocrate_routed(
+                &bystander.context,
+                realm.realm_id,
+                request.clone(),
+                Some(token.clone()),
+                RoCrateLimits::default().metadata_bytes,
+            )
+            .await
+            {
+                Err(MetadataApiError::ServiceUnavailable) => Ok(1),
+                other => {
+                    *export.borrow_mut() = Some(other?);
+                    Ok(0)
+                }
+            }
+        },
+    )
+    .await?;
+    Ok(export
+        .into_inner()
+        .ok_or("the routed export produced no result")?)
 }
 
 fn document_config(
