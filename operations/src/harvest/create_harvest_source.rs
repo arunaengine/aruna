@@ -9,6 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::harvest::oai::request::DEFAULT_METADATA_PREFIX;
 use crate::harvest::repository::{StorageReadError, read_connector_effect, write_source_effect};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub enum CreateSourceError {
     EmptyNamespace,
     #[error("harvest target prefix must not be empty")]
     EmptyTargetPrefix,
+    #[error("unsupported harvest metadata prefix [{0}]: only [oai_dc] is mapped")]
+    UnsupportedMetadataPrefix(String),
     #[error("repository connector not found")]
     ConnectorNotFound,
     #[error("CreateHarvestSource failed")]
@@ -92,6 +95,16 @@ impl CreateSourceOperation {
         }
         if self.input.target_prefix.trim().is_empty() {
             return self.emit_error(CreateSourceError::EmptyTargetPrefix);
+        }
+        // The parser and the RO-Crate mapper are `oai_dc`-typed; any other
+        // prefix would silently import identifier-only records.
+        if let Some(prefix) = self.input.selector.metadata_prefix.as_deref()
+            && !prefix.trim().is_empty()
+            && prefix.trim() != DEFAULT_METADATA_PREFIX
+        {
+            return self.emit_error(CreateSourceError::UnsupportedMetadataPrefix(
+                prefix.to_string(),
+            ));
         }
         self.state = State::ReadConnector;
         smallvec![read_connector_effect(
@@ -237,6 +250,38 @@ mod tests {
             op.finalize().unwrap_err(),
             CreateSourceError::EmptyNamespace
         );
+    }
+
+    #[test]
+    fn foreign_metadata_prefix_is_rejected() {
+        for prefix in ["datacite", "marc21", "oai_datacite"] {
+            let mut op = CreateSourceOperation::new(CreateSourceInput {
+                selector: HarvestSelector {
+                    set: None,
+                    metadata_prefix: Some(prefix.to_string()),
+                },
+                ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
+            });
+            assert!(op.start().is_empty());
+            assert_eq!(
+                op.finalize().unwrap_err(),
+                CreateSourceError::UnsupportedMetadataPrefix(prefix.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_and_explicit_oai_dc_agree() {
+        for prefix in [None, Some("oai_dc".to_string()), Some(String::new())] {
+            let mut op = CreateSourceOperation::new(CreateSourceInput {
+                selector: HarvestSelector {
+                    set: None,
+                    metadata_prefix: prefix,
+                },
+                ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
+            });
+            assert_eq!(op.start().len(), 1);
+        }
     }
 
     #[test]
