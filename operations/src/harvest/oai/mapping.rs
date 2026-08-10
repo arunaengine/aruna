@@ -1,11 +1,15 @@
 use serde_json::{Map, Value};
 
-use crate::harvest::oai::parse::OaiRecord;
+use crate::harvest::oai::parse::{OaiRecord, parse_datestamp_ms};
 
 /// RO-Crate context the metadata registry validates against.
 const ROCRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
+/// Profile the descriptor must conform to for a checked import to be accepted.
+const ROCRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
 /// DCMI Elements 1.1 namespace; each element becomes `{DC_ELEMENTS}{element}`.
 const DC_ELEMENTS: &str = "http://purl.org/dc/elements/1.1/";
+/// Stand-in publication date when neither Dublin Core nor the header carries one.
+const UNKNOWN_DATE: &str = "1970-01-01";
 
 /// Map one `oai_dc` record to an RO-Crate JSON-LD document.
 ///
@@ -13,18 +17,29 @@ const DC_ELEMENTS: &str = "http://purl.org/dc/elements/1.1/";
 /// entity whose properties are the Dublin Core elements keyed by their DCMI term
 /// IRI. Repeated elements become arrays; `name` mirrors the first title so the
 /// document is human-labelled.
+///
+/// The `ro-crate-metadata.json` descriptor, `conformsTo`, `description` and a
+/// single `datePublished` are all mandatory for the checked create/replace seam,
+/// so each is synthesized when the record does not supply one.
 pub fn oai_dc_to_jsonld(record: &OaiRecord) -> String {
     let mut entity = Map::new();
     entity.insert("@id".to_string(), Value::String("./".to_string()));
     entity.insert("@type".to_string(), Value::String("Dataset".to_string()));
 
-    let name = record
-        .dc
-        .iter()
-        .find(|(element, _)| element == "title")
-        .map(|(_, value)| value.clone())
-        .unwrap_or_else(|| record.header.identifier.clone());
-    entity.insert("name".to_string(), Value::String(name));
+    entity.insert(
+        "name".to_string(),
+        Value::String(first_element(record, "title").unwrap_or_else(|| record.header.identifier.clone())),
+    );
+    entity.insert(
+        "description".to_string(),
+        Value::String(first_element(record, "description").unwrap_or_else(|| {
+            format!("Harvested OAI-PMH record {}", record.header.identifier)
+        })),
+    );
+    entity.insert(
+        "datePublished".to_string(),
+        Value::String(date_published(record)),
+    );
 
     for element in distinct_elements(record) {
         let values: Vec<Value> = record
@@ -44,9 +59,38 @@ pub fn oai_dc_to_jsonld(record: &OaiRecord) -> String {
 
     let document = serde_json::json!({
         "@context": ROCRATE_CONTEXT,
-        "@graph": [Value::Object(entity)],
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": ROCRATE_PROFILE},
+                "about": {"@id": "./"}
+            },
+            Value::Object(entity),
+        ],
     });
     document.to_string()
+}
+
+fn first_element(record: &OaiRecord, element: &str) -> Option<String> {
+    record
+        .dc
+        .iter()
+        .find(|(name, value)| name == element && !value.trim().is_empty())
+        .map(|(_, value)| value.clone())
+}
+
+/// Exactly one `datePublished` is required and it must parse, so an unparseable
+/// Dublin Core `date` falls back to the header datestamp and then to the epoch.
+fn date_published(record: &OaiRecord) -> String {
+    record
+        .dc
+        .iter()
+        .filter(|(name, _)| name == "date")
+        .map(|(_, value)| value.clone())
+        .chain(std::iter::once(record.header.datestamp.clone()))
+        .find(|value| parse_datestamp_ms(value).is_some())
+        .unwrap_or_else(|| UNKNOWN_DATE.to_string())
 }
 
 /// Element local names in first-seen order, without duplicates.
@@ -247,13 +291,32 @@ mod tests {
         }
     }
 
+    fn root(jsonld: &str) -> Value {
+        let value: Value = serde_json::from_str(jsonld).unwrap();
+        value["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entity| entity["@id"] == "./")
+            .unwrap()
+            .clone()
+    }
+
+    fn descriptor(jsonld: &str) -> Value {
+        let value: Value = serde_json::from_str(jsonld).unwrap();
+        value["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+            .unwrap()
+            .clone()
+    }
+
     #[test]
     fn maps_elements_to_dcmi_iris_and_arrays_repeats() {
-        let jsonld = oai_dc_to_jsonld(&record());
-        let value: Value = serde_json::from_str(&jsonld).unwrap();
-        let entity = &value["@graph"][0];
+        let entity = root(&oai_dc_to_jsonld(&record()));
 
-        assert_eq!(entity["@id"], "./");
         assert_eq!(entity["@type"], "Dataset");
         assert_eq!(entity["name"], "A dataset");
         assert_eq!(entity["http://purl.org/dc/elements/1.1/title"], "A dataset");
@@ -264,11 +327,46 @@ mod tests {
     }
 
     #[test]
-    fn name_falls_back_to_identifier() {
+    fn descriptor_points_at_root() {
+        let jsonld = oai_dc_to_jsonld(&record());
+        let entity = descriptor(&jsonld);
+        assert_eq!(entity["@type"], "CreativeWork");
+        assert_eq!(entity["about"]["@id"], "./");
+        assert_eq!(entity["conformsTo"]["@id"], ROCRATE_PROFILE);
+    }
+
+    #[test]
+    fn mandatory_root_properties_are_present() {
         let mut record = record();
         record.dc.clear();
-        let value: Value = serde_json::from_str(&oai_dc_to_jsonld(&record)).unwrap();
-        assert_eq!(value["@graph"][0]["name"], "oai:example.org:1");
+        let entity = root(&oai_dc_to_jsonld(&record));
+        assert_eq!(entity["name"], "oai:example.org:1");
+        assert!(
+            entity["description"]
+                .as_str()
+                .unwrap()
+                .contains("oai:example.org:1")
+        );
+        assert_eq!(entity["datePublished"], "2026-01-02");
+    }
+
+    #[test]
+    fn unparseable_dates_fall_back() {
+        let mut record = record();
+        record.dc.push(("date".to_string(), "circa 1900".to_string()));
+        assert_eq!(root(&oai_dc_to_jsonld(&record))["datePublished"], "2026-01-02");
+
+        record.header.datestamp = "whenever".to_string();
+        assert_eq!(root(&oai_dc_to_jsonld(&record))["datePublished"], UNKNOWN_DATE);
+    }
+
+    #[test]
+    fn dublin_core_date_wins_over_datestamp() {
+        let mut record = record();
+        record
+            .dc
+            .push(("date".to_string(), "2020-05-06".to_string()));
+        assert_eq!(root(&oai_dc_to_jsonld(&record))["datePublished"], "2020-05-06");
     }
 
     #[test]
