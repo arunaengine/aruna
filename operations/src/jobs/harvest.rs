@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime};
 
@@ -37,7 +38,11 @@ use crate::metadata::forward::{
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
-const MAX_HARVEST_PAGES: u32 = 100_000;
+/// Operationally generous at a typical page size, and small enough that a
+/// pathological provider cannot hold a worker for the life of the node.
+const MAX_HARVEST_PAGES: u32 = 10_000;
+/// Total wall clock one harvest run may spend paging.
+const HARVEST_RUN_DEADLINE: Duration = Duration::from_secs(1800);
 /// Budget for a harvested document's normalized metadata path.
 const HARVEST_PATH_BYTES: usize = 512;
 /// `b3-` plus 64 hex characters: the shortest segment any identifier can take.
@@ -127,9 +132,17 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
     // One restart per run at most: a provider that keeps rejecting its own
     // tokens must not be able to loop the listing back to the start forever.
     let mut restarted = false;
+    let mut seen_tokens: HashSet<[u8; 32]> = HashSet::new();
+    let started = tokio::time::Instant::now();
 
-    for _ in 0..MAX_HARVEST_PAGES {
+    for page_index in 0..MAX_HARVEST_PAGES {
         check_signals(ctx)?;
+        if page_index + 1 == MAX_HARVEST_PAGES || started.elapsed() > HARVEST_RUN_DEADLINE {
+            // Budget exhaustion is not a defect in the source: keep the position
+            // so the next run continues where this one stopped.
+            persist_cursor(ctx, &source, original_last, resumption_token).await?;
+            return Err(retryable("harvest exhausted its paging or time budget"));
+        }
         let resumed = resumption_token.clone();
         let url = list_records_url(
             &connector.endpoint,
@@ -176,16 +189,20 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
         ctx.progress.advance(page.records.len() as u64);
 
         resumption_token = page.resumption_token.clone();
-        if resumption_token.is_none() {
+        let Some(token) = resumption_token.clone() else {
             // Complete: advance the window so the next harvest is incremental.
             persist_cursor(ctx, &source, overall_max, None).await?;
             return Ok(counts);
+        };
+        if !seen_tokens.insert(*blake3::hash(token.as_bytes()).as_bytes()) {
+            persist_cursor(ctx, &source, original_last, None).await?;
+            return Err(retryable("OAI provider returned a resumption token twice"));
         }
         // Mid-list: keep the window fixed and store the token so a re-run resumes.
-        persist_cursor(ctx, &source, original_last, resumption_token.clone()).await?;
+        persist_cursor(ctx, &source, original_last, Some(token)).await?;
     }
 
-    Err(permanent("harvest exceeded resumption page bound"))
+    Err(retryable("harvest exhausted its paging budget"))
 }
 
 fn is_bad_token(error: &OaiParseError) -> bool {
