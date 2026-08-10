@@ -884,6 +884,46 @@ mod tests {
         assert_eq!(event.deleted_after_event_id, record.last_event_id);
     }
 
+    #[test]
+    fn delete_drops_updated_index() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation = DeleteMetadataDocumentOperation::new(
+            actor.clone(),
+            record.group_id,
+            record.document_id,
+        );
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(txn_id);
+        operation.state = DeleteMetadataDocumentState::DeleteHolders;
+
+        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: ByteView::from(Vec::new()),
+        }));
+        let [Effect::Storage(StorageEffect::Delete {
+            key_space,
+            key,
+            txn_id: effect_txn,
+        })] = effects.as_slice()
+        else {
+            panic!("expected an updated-index delete, got {effects:?}");
+        };
+        assert_eq!(
+            key_space,
+            aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE
+        );
+        assert_eq!(
+            key.as_ref(),
+            aruna_core::storage_entries::metadata_updated_index_key(
+                record.updated_at_ms,
+                record.document_id
+            )
+            .as_ref()
+        );
+        assert_eq!(*effect_txn, Some(txn_id));
+    }
+
     // Every record of a document rides the bucket its create stamped, so all
     // three tombstones land on the topic the document itself lives on.
     #[test]
