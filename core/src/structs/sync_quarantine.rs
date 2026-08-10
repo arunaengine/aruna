@@ -202,6 +202,10 @@ pub struct SyncQuarantineInput<'a> {
     pub replaced_bytes: Option<u64>,
 }
 
+/// `entries` is the evidence row followed by the usage row. Several rejects in
+/// one batch chain `usage` into the next call and fold every entry into the same
+/// transaction: the repeated usage key resolves to the last write, which is the
+/// batch's final accounting.
 #[derive(Debug)]
 pub struct SyncQuarantineWrite {
     pub record: SyncQuarantineRecord,

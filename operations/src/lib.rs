@@ -87,6 +87,7 @@ pub mod startup;
 pub mod status;
 pub mod sync_mirror_repair;
 pub mod sync_placement;
+pub mod sync_quarantine;
 pub mod sync_relationship;
 pub mod task_incoming;
 pub mod task_persistence;
