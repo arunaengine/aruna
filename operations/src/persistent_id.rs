@@ -5,7 +5,7 @@
 //! compare-and-set inside one storage transaction that also enqueues the durable
 //! sync publish, so a frozen holder converges on the same row and a withdrawal can
 //! never be overwritten by an accepted-but-not-yet-executed mint job. Callers
-//! reach these from a document holder only; routing lives in
+//! reach these on the document's single authority only; routing lives in
 //! [`crate::metadata::forward`].
 
 use std::sync::Arc;

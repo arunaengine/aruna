@@ -1,11 +1,12 @@
 //! w3id persistent-identifier landing resolution.
 //!
 //! A PID is the document graph IRI `https://w3id.org/aruna/{document_id}`. Every
-//! operation routes to a holder of the document's metadata placement, which is the
-//! mapping's authority: resolution redirects only while the document is
-//! anonymously readable, a withdrawn mapping is a permanent 410 whatever the
-//! document's visibility, and everything else is indistinguishable from unminted.
-//! A node that cannot reach the authority reports 503, never a local 404.
+//! operation routes to one deterministic authority — the rank-0 current holder of
+//! the placement derived from the structured document id — which alone reads and
+//! writes the mapping: resolution redirects only while the document is anonymously
+//! readable, a withdrawn mapping is a permanent 410 whatever the document's
+//! visibility, and everything else is indistinguishable from unminted. A node that
+//! cannot reach the authority reports 503, never a local 404.
 //!
 //! DEPLOYMENT: the external `w3id.org/aruna/{id}` redirect (currently pointed at
 //! the v2 API) should target `/api/v1/pid/{id}`; that is a deployment change, not

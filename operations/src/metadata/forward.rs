@@ -7,7 +7,9 @@ use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
+use aruna_core::keyspaces::{
+    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+};
 use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
 use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
@@ -1161,34 +1163,41 @@ async fn withdraw_pid_for_deleted(
     }
 }
 
-/// Holders of a document's PID mapping: its metadata placement, resolved from the
-/// structured id and the realm config rather than from the registry row, which a
-/// delete removes while the mapping must survive to serve a permanent 410.
+/// The one node that owns a document's PID state: the rank-0 current holder of
+/// the placement derived from the structured id, never from the registry row,
+/// which a delete removes while the mapping must survive to serve a permanent
+/// 410. Every node derives the same node from the same replicated config, so
+/// transitions and landing answers have a single source and cannot disagree.
+pub(crate) fn pid_authority_node(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> Option<NodeId> {
+    let placement = resolve_metadata_id(config, realm_id, None, document_id).ok()?;
+    resolve_shard_holders(config, &placement).first().copied()
+}
+
 async fn pid_authority(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     document_id: Ulid,
-) -> Result<(RealmConfigDocument, Vec<NodeId>), MetadataApiError> {
+) -> Result<(RealmConfigDocument, NodeId), MetadataApiError> {
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let placement = resolve_metadata_id(&config, realm_id, None, document_id)
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_shard_holders(&config, &placement);
-    if holders.is_empty() {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    Ok((config, holders))
+    let authority = pid_authority_node(&config, realm_id, document_id)
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    Ok((config, authority))
 }
 
-fn holds_pid_authority(context: &Arc<DriverContext>, holders: &[NodeId]) -> bool {
+fn is_local_node(context: &Arc<DriverContext>, node_id: NodeId) -> bool {
     context
         .net_handle
         .as_ref()
-        .is_some_and(|net| holders.contains(&net.node_id()))
+        .is_some_and(|net| net.node_id() == node_id)
 }
 
-/// Mint through the document's authority. A non-holder forwards; it never mints
+/// Mint through the document's authority. Every other node forwards; none mints
 /// into its own store, so one document has exactly one mapping row lineage.
 pub async fn mint_pid_routed(
     context: &Arc<DriverContext>,
@@ -1209,8 +1218,8 @@ pub async fn mint_pid_routed(
         .await
         .map_err(pid_error);
     }
-    let (config, holders) = pid_authority(context, realm_id, document_id).await?;
-    if holds_pid_authority(context, &holders) {
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
         return crate::persistent_id::mint_persistent_id(
             context.as_ref(),
             realm_id,
@@ -1224,7 +1233,7 @@ pub async fn mint_pid_routed(
     let outcome = forward_pid(
         context,
         &config,
-        &holders,
+        authority,
         document_id,
         PersistentIdRequest::Mint {
             minted_by,
@@ -1258,8 +1267,8 @@ pub async fn withdraw_pid_routed(
         .map(|(mapping, _)| mapping)
         .map_err(pid_error);
     }
-    let (config, holders) = pid_authority(context, realm_id, document_id).await?;
-    if holds_pid_authority(context, &holders) {
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
         return crate::persistent_id::withdraw_persistent_id(
             context.as_ref(),
             realm_id,
@@ -1273,7 +1282,7 @@ pub async fn withdraw_pid_routed(
     let outcome = forward_pid(
         context,
         &config,
-        &holders,
+        authority,
         document_id,
         PersistentIdRequest::Withdraw { withdrawn_at_ms },
         auth_token,
@@ -1285,10 +1294,11 @@ pub async fn withdraw_pid_routed(
     }
 }
 
-/// Resolve a landing request against the document's holders. Answers are folded
-/// monotonically — `Gone` beats `Redirect` beats `Missing` — so a lagging replica
-/// can never turn a withdrawn PID back into a redirect or a 404. A non-holder
-/// with no reachable holder reports service unavailable, never a local 404.
+/// Resolve a landing request on the document's authority. Only that node answers:
+/// a replica's mapping row carries no version an outsider can compare, so folding
+/// several answers can promote a stale redirect over an up-to-date denial or a
+/// premature mapping over a live document. Every other node returns the
+/// authority's answer or service unavailable, never a local one.
 pub async fn resolve_pid_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -1297,85 +1307,22 @@ pub async fn resolve_pid_routed(
     if context.net_handle.is_none() {
         return local_pid_resolution(context, realm_id, document_id).await;
     }
-    let (config, holders) = pid_authority(context, realm_id, document_id).await?;
-    let config_digest = config
-        .digest()
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = capped_holders(&holders);
-    let holder_count = holders.len();
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let context = Arc::clone(context);
-    let metadata = context.metadata_handle.clone();
-    let (responses, timed_out) = read_holders(holders, move |holder| {
-        let context = context.clone();
-        let metadata = metadata.clone();
-        Box::pin(async move {
-            if Some(holder) == local_node {
-                return local_pid_resolution(&context, realm_id, document_id)
-                    .await
-                    .map_err(read_error);
-            }
-            let Some(metadata) = metadata else {
-                return Err(MetadataReadError::Unavailable);
-            };
-            match metadata
-                .request_forwarded_write(
-                    holder,
-                    MetadataTransportMessage::ForwardPersistentId {
-                        auth_token: None,
-                        config_digest,
-                        document_id,
-                        request: PersistentIdRequest::Resolve,
-                    },
-                )
-                .await
-            {
-                Ok(MetadataTransportMessage::ForwardedPersistentId {
-                    result: Ok(PersistentIdOutcome::Resolution(resolution)),
-                }) => Ok(resolution),
-                Ok(MetadataTransportMessage::ForwardedPersistentId { result: Err(error) }) => {
-                    Err(error)
-                }
-                _ => Err(MetadataReadError::Unavailable),
-            }
-        })
-    })
-    .await;
-
-    let mut unavailable = timed_out;
-    let mut answered = 0usize;
-    let mut resolution: Option<PersistentIdResolution> = None;
-    for (_, response) in responses {
-        match response {
-            Ok(answer) => {
-                answered += 1;
-                resolution = Some(match resolution.take() {
-                    Some(current) => stronger_resolution(current, answer),
-                    None => answer,
-                });
-            }
-            Err(_) => unavailable = true,
-        }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return local_pid_resolution(context, realm_id, document_id).await;
     }
-    match resolution {
-        Some(PersistentIdResolution::Missing) if unavailable || answered < holder_count => {
-            Err(MetadataApiError::ServiceUnavailable)
-        }
-        Some(resolution) => Ok(resolution),
-        None => Err(MetadataApiError::ServiceUnavailable),
-    }
-}
-
-fn stronger_resolution(
-    current: PersistentIdResolution,
-    incoming: PersistentIdResolution,
-) -> PersistentIdResolution {
-    match (&current, &incoming) {
-        (PersistentIdResolution::Gone { .. }, _) => current,
-        (_, PersistentIdResolution::Gone { .. }) => incoming,
-        (PersistentIdResolution::Redirect, _) => current,
-        (_, PersistentIdResolution::Redirect) => incoming,
-        _ => current,
+    let outcome = forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::Resolve,
+        None,
+    )
+    .await?;
+    match outcome {
+        PersistentIdOutcome::Resolution(resolution) => Ok(resolution),
+        _ => Err(MetadataApiError::ServiceUnavailable),
     }
 }
 
@@ -1399,10 +1346,15 @@ async fn local_pid_resolution(
     let record = load_metadata_record_by_document(context.as_ref(), document_id)
         .await
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    // A minted PID whose target is gone is a permanent 410, never a 404, even
-    // when the delete-time withdrawal has not landed on this holder yet.
+    // An active mapping without a registry row is a permanent 410 only once this
+    // node has evidence the document was created here and is gone. An unprojected
+    // create looks identical, and answering Gone for it would kill a live PID.
     let Some(record) = record else {
-        return Ok(PersistentIdResolution::Gone { pid: mapping.pid });
+        return if document_deleted_here(context, document_id).await? {
+            Ok(PersistentIdResolution::Gone { pid: mapping.pid })
+        } else {
+            Err(MetadataApiError::ServiceUnavailable)
+        };
     };
     if crate::metadata::api::can_read_record(context.as_ref(), realm_id, None, &record).await? {
         Ok(PersistentIdResolution::Redirect)
@@ -1414,7 +1366,7 @@ async fn local_pid_resolution(
 async fn forward_pid(
     context: &Arc<DriverContext>,
     config: &RealmConfigDocument,
-    holders: &[NodeId],
+    authority: NodeId,
     document_id: Ulid,
     request: PersistentIdRequest,
     auth_token: Option<MetadataAuthToken>,
@@ -1424,7 +1376,7 @@ async fn forward_pid(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let response = forward_to_holders(
         context,
-        holders,
+        &[authority],
         MetadataTransportMessage::ForwardPersistentId {
             auth_token,
             config_digest,
@@ -1477,7 +1429,7 @@ pub(crate) async fn apply_forwarded_pid(
     if config.digest().ok() != Some(config_digest) {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     }
-    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
+    if pid_authority_node(&config, realm_id, document_id) != Some(net_handle.node_id()) {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     }
     if let PersistentIdRequest::Resolve = request {
@@ -1500,9 +1452,6 @@ pub(crate) async fn apply_forwarded_pid(
         Err(error) => return reject(error),
     };
     match (&request, record.as_ref()) {
-        (PersistentIdRequest::Mint { .. }, None) => {
-            return MetadataTransportMessage::ForwardedWriteNotFound;
-        }
         (_, Some(record)) => {
             if let Err(error) =
                 authorize_write(context, auth.clone(), record.permission_path.clone()).await
@@ -1510,10 +1459,11 @@ pub(crate) async fn apply_forwarded_pid(
                 return forward_auth_error(error);
             }
         }
-        // A withdrawal outlives its authorization subject; the origin checked
-        // WRITE while the record still existed, and the peer is a realm node.
-        (PersistentIdRequest::Withdraw { .. }, None) => {}
-        (PersistentIdRequest::Resolve, None) => unreachable!("resolve returned above"),
+        // Without a registry row there is no permission path to check, so no
+        // transition is authorized: bare realm membership must never tombstone an
+        // arbitrary document id, and a withdrawal that outlived its own document
+        // was already written by the delete that removed it.
+        (_, None) => return MetadataTransportMessage::ForwardedWriteNotFound,
     }
 
     let outcome = match request {
@@ -1585,10 +1535,6 @@ async fn authorize_forwarded_pid(
         return Err(ForwardAuthError::Forbidden);
     }
     Ok(auth)
-}
-
-fn capped_holders(holders: &[NodeId]) -> Vec<NodeId> {
-    holders.iter().copied().take(MAX_READ_HOLDERS).collect()
 }
 
 fn pid_error(error: crate::persistent_id::PersistentIdError) -> MetadataApiError {
@@ -1836,6 +1782,45 @@ async fn accepted_create(
         other => Err(format!(
             "unexpected metadata create acceptance read result: {other:?}"
         )),
+    }
+}
+
+/// Whether this node has evidence that the document was created here and is now
+/// gone, rather than a create whose registry projection has not landed yet. The
+/// create acceptance survives the delete; a queued projection means the row is
+/// still on its way and no terminal answer may be derived from its absence.
+async fn document_deleted_here(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<bool, MetadataApiError> {
+    if projection_queued(context, document_id).await? {
+        return Ok(false);
+    }
+    accepted_create(context, document_id)
+        .await
+        .map(|accepted| accepted.is_some())
+        .map_err(|_| MetadataApiError::ServiceUnavailable)
+}
+
+/// Whether a committed metadata event for this document is still waiting to be
+/// projected into this node's registry.
+pub(crate) async fn projection_queued(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<bool, MetadataApiError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: Some(byteview::ByteView::from(document_id.to_bytes().to_vec())),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
+        _ => Err(MetadataApiError::ServiceUnavailable),
     }
 }
 
