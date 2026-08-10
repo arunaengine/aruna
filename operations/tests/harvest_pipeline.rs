@@ -13,7 +13,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::{
-    Actor, Backend, BackendConfig, Group, GroupAuthorizationDocument, HarvestJobSpec,
+    Actor, AuthContext, Backend, BackendConfig, Group, GroupAuthorizationDocument, HarvestJobSpec,
     HarvestProvenance, HarvestRecordState, HarvestSelector, HarvestSource, JobError, JobErrorKind,
     JobProgress, JobResultPayload, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     RealmNodeKind, RepositoryConnector, RepositoryConnectorKind,
@@ -30,7 +30,8 @@ use aruna_operations::harvest::repository::{
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::harvest::run_harvest_job;
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::forward::delete_metadata_document_routed;
+use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -486,6 +487,29 @@ async fn record_present(fixture: &Fixture, document_id: Ulid) -> Result<bool, Bo
             .map_err(|error| format!("{error:?}"))?
             .is_some(),
     )
+}
+
+/// Withdraw the document the way an owner would, straight through the metadata
+/// delete path, leaving the harvest provenance behind untouched.
+async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), BoxError> {
+    let record = load_metadata_record_by_document(&fixture.context, document_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        .ok_or("document missing before the delete")?;
+    delete_metadata_document_routed(
+        &fixture.context,
+        fixture.actor.clone(),
+        Some(&record),
+        document_id,
+        Some(MetadataAuthToken::internal(AuthContext {
+            user_id: fixture.actor.user_id,
+            realm_id: fixture.actor.realm_id,
+            path_restrictions: None,
+        })),
+    )
+    .await
+    .map_err(|error| format!("{error:?}"))?;
+    Ok(())
 }
 
 async fn run(fixture: &Fixture, source: &HarvestSource) -> JobRunOutcome {
@@ -971,6 +995,97 @@ async fn deletion_waits_for_confirmation() -> Result<(), BoxError> {
     assert!(!record_present(&fixture, alpha_id).await?);
     drain(&fixture).await?;
     assert!(record_present(&fixture, revived.meta_resource_id).await?);
+
+    server.abort();
+    fixture.stop().await;
+    Ok(())
+}
+
+/// A document deleted out of band while its provenance stays live must not wedge
+/// the source: an update can never land on what is gone, so the next upstream
+/// change retires that identity and mints a successor. A create still queued for
+/// projection is not the same condition and only waits.
+#[tokio::test]
+async fn deleted_document_revives() -> Result<(), BoxError> {
+    let fixture = build_fixture().await?;
+    let (provider, server) = serve_oai().await?;
+    let source = seed_source(&fixture, &provider.endpoint).await?;
+    provider.script("identify", identify_page());
+    provider.script(
+        "start",
+        list_page(
+            &[live_record(ALPHA, "2026-01-02T00:00:00Z", "Alpha v1")],
+            None,
+        ),
+    );
+    assert_eq!(counts(&run(&fixture, &source).await), (1, 0, 0, 0));
+    let created = provenance(&fixture, source.group_id, ALPHA)
+        .await?
+        .ok_or("alpha provenance missing")?;
+    let alpha_id = created.meta_resource_id;
+
+    // The create is not projected here yet, so an update in that window waits
+    // instead of mistaking the lag for a deletion.
+    assert!(!record_present(&fixture, alpha_id).await?);
+    provider.script(
+        "start",
+        list_page(
+            &[live_record(ALPHA, "2026-01-04T00:00:00Z", "Alpha v2")],
+            None,
+        ),
+    );
+    let outcome = run(&fixture, &source).await;
+    let error = failure(&outcome);
+    assert_eq!(error.kind, JobErrorKind::Retryable, "{error:?}");
+    assert!(
+        error.message.contains("pending registry projection"),
+        "unexpected failure: {error:?}"
+    );
+    assert_eq!(
+        provenance(&fixture, source.group_id, ALPHA)
+            .await?
+            .ok_or("alpha provenance missing")?
+            .meta_resource_id,
+        alpha_id
+    );
+
+    // The owner deletes the document; provenance still says live.
+    drain(&fixture).await?;
+    assert!(record_present(&fixture, alpha_id).await?);
+    delete_document(&fixture, alpha_id).await?;
+    drain(&fixture).await?;
+    assert!(!record_present(&fixture, alpha_id).await?);
+    assert_eq!(
+        provenance(&fixture, source.group_id, ALPHA)
+            .await?
+            .ok_or("alpha provenance missing")?
+            .state,
+        HarvestRecordState::Live
+    );
+
+    // The upstream change now lands on a successor identity.
+    let stored = cursor(&fixture, &source).await?;
+    provider.script(
+        "start",
+        list_page(
+            &[live_record(ALPHA, "2026-01-06T00:00:00Z", "Alpha v3")],
+            None,
+        ),
+    );
+    assert_eq!(counts(&run(&fixture, &stored).await), (1, 0, 0, 0));
+    let revived = provenance(&fixture, source.group_id, ALPHA)
+        .await?
+        .ok_or("alpha provenance missing")?;
+    assert_eq!(revived.state, HarvestRecordState::Live);
+    assert_ne!(revived.meta_resource_id, alpha_id);
+    assert_eq!(revived.predecessors, vec![alpha_id]);
+    drain(&fixture).await?;
+    assert!(record_present(&fixture, revived.meta_resource_id).await?);
+    assert!(!record_present(&fixture, alpha_id).await?);
+
+    // Replaying the same page converges instead of failing again.
+    let stored = cursor(&fixture, &source).await?;
+    assert_eq!(counts(&run(&fixture, &stored).await), (0, 0, 0, 1));
 
     server.abort();
     fixture.stop().await;

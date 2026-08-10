@@ -10,7 +10,7 @@ use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
 use aruna_core::structs::{
     Actor, AuthContext, HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance,
     HarvestRecordState, HarvestSource, IncomingRecord, JobError, JobResultPayload,
-    ProvenanceDecision, RealmId, RepositoryConnector, provenance_decision,
+    MetadataRegistryRecord, ProvenanceDecision, RealmId, RepositoryConnector, provenance_decision,
 };
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
@@ -281,11 +281,34 @@ async fn apply_record(
             counts.minted += 1;
         }
         ProvenanceDecision::Update { meta_resource_id } => {
-            update_document(ctx, source, actor, realm_id, meta_resource_id, record).await?;
-            row.meta_resource_id = meta_resource_id;
-            row.state = HarvestRecordState::Live;
-            write_provenance(ctx, &row).await?;
-            counts.updated += 1;
+            match read_stored(ctx, meta_resource_id).await? {
+                Some(stored) => {
+                    update_document(
+                        ctx,
+                        source,
+                        actor,
+                        realm_id,
+                        meta_resource_id,
+                        Some(&stored),
+                        record,
+                    )
+                    .await?;
+                    row.meta_resource_id = meta_resource_id;
+                    row.state = HarvestRecordState::Live;
+                    write_provenance(ctx, &row).await?;
+                    counts.updated += 1;
+                }
+                // Deleted out of band while the provenance stayed live: an
+                // update can never land on a document that is gone, so the
+                // identity is retired and a successor allocated, exactly as a
+                // revival does.
+                None => {
+                    confirm_absent(ctx, meta_resource_id).await?;
+                    row.predecessors.push(meta_resource_id);
+                    mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
+                    counts.minted += 1;
+                }
+            }
         }
         ProvenanceDecision::Tombstone { meta_resource_id } => {
             confirm_withdrawn(ctx, source, actor, realm_id, meta_resource_id).await?;
@@ -312,13 +335,9 @@ async fn confirm_withdrawn(
     realm_id: RealmId,
     document_id: Ulid,
 ) -> Result<(), HarvestFailure> {
-    let stored = load_metadata_record_by_document(&ctx.driver, document_id)
-        .await
-        .map_err(|error| retryable(format!("harvest record read: {error:?}")))?;
-    if stored.is_none() && projection_pending(ctx, document_id).await? {
-        return Err(retryable(format!(
-            "harvest deletion waits for the pending registry projection of {document_id}"
-        )));
+    let stored = read_stored(ctx, document_id).await?;
+    if stored.is_none() {
+        confirm_absent(ctx, document_id).await?;
     }
     match delete_metadata_document_routed(
         &ctx.driver,
@@ -334,6 +353,26 @@ async fn confirm_withdrawn(
         Ok(()) | Err(MetadataWriteError::NotFound) => Ok(()),
         Err(error) => Err(apply_failure(error)),
     }
+}
+
+async fn read_stored(
+    ctx: &JobContext,
+    document_id: Ulid,
+) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
+    load_metadata_record_by_document(&ctx.driver, document_id)
+        .await
+        .map_err(|error| retryable(format!("harvest record read: {error:?}")))
+}
+
+/// An empty registry read is only evidence of absence once nothing committed
+/// for the document is still queued for projection here.
+async fn confirm_absent(ctx: &JobContext, document_id: Ulid) -> Result<(), HarvestFailure> {
+    if projection_pending(ctx, document_id).await? {
+        return Err(retryable(format!(
+            "harvest waits for the pending registry projection of {document_id}"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether a committed metadata event for this document is still waiting to be
@@ -417,7 +456,17 @@ async fn create_document(
         // A create the pending identity already committed under a different
         // payload: the id is resolved, and the newer content lands as an update.
         Err(MetadataWriteError::Create(CreateMetadataDocumentError::DocumentAlreadyExists)) => {
-            update_document(ctx, source, actor, realm_id, document_id, record).await
+            let stored = read_stored(ctx, document_id).await?;
+            update_document(
+                ctx,
+                source,
+                actor,
+                realm_id,
+                document_id,
+                stored.as_ref(),
+                record,
+            )
+            .await
         }
         Err(error) => Err(apply_failure(error)),
     }
@@ -429,15 +478,13 @@ async fn update_document(
     actor: &Actor,
     realm_id: RealmId,
     document_id: Ulid,
+    stored: Option<&MetadataRegistryRecord>,
     record: &OaiRecord,
 ) -> Result<(), HarvestFailure> {
-    let stored = load_metadata_record_by_document(&ctx.driver, document_id)
-        .await
-        .map_err(|error| retryable(format!("harvest record read: {error:?}")))?;
     update_metadata_document_routed(
         &ctx.driver,
         actor.clone(),
-        stored.as_ref(),
+        stored,
         document_id,
         None,
         UpdateMetadataDocumentMutation::ReplaceRoCrate {
