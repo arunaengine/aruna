@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -22,6 +23,7 @@ pub trait InboundTaskHandler: Send + Sync {
 #[derive(Clone)]
 pub struct TaskHandle {
     command_tx: mpsc::Sender<TaskCommand>,
+    admission_closed: Arc<AtomicBool>,
 }
 
 enum TaskCommand {
@@ -87,6 +89,7 @@ impl TaskShutdownReport {
 }
 
 struct SchedulerState {
+    admission_closed: Arc<AtomicBool>,
     timers_by_key: HashMap<TaskKey, TimerEntry>,
     timers_by_deadline: BTreeMap<(Instant, u64), TaskKey>,
     running_by_id: HashMap<u64, RunningTaskEntry>,
@@ -120,8 +123,9 @@ struct RunningTaskEntry {
 }
 
 impl SchedulerState {
-    fn new() -> Self {
+    fn new(admission_closed: Arc<AtomicBool>) -> Self {
         Self {
+            admission_closed,
             timers_by_key: HashMap::new(),
             timers_by_deadline: BTreeMap::new(),
             running_by_id: HashMap::new(),
@@ -211,6 +215,9 @@ impl SchedulerState {
         started_at: Instant,
         command_tx: &mpsc::WeakSender<TaskCommand>,
     ) {
+        if self.admission_closed.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(handler) = self.inbound_handler.clone() {
             let task = self.prepare_running_task(key, started_at);
             let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone());
@@ -524,8 +531,9 @@ fn next_id(id: u64) -> u64 {
 async fn run_scheduler(
     mut command_rx: mpsc::Receiver<TaskCommand>,
     command_tx: mpsc::WeakSender<TaskCommand>,
+    admission_closed: Arc<AtomicBool>,
 ) {
-    let mut state = SchedulerState::new();
+    let mut state = SchedulerState::new(admission_closed);
 
     loop {
         state.dispatch_due_timers(&command_tx);
@@ -591,14 +599,22 @@ fn spawn_timer_handler(
 impl TaskHandle {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+        let admission_closed = Arc::new(AtomicBool::new(false));
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(run_scheduler(command_rx, command_tx.downgrade()));
+            handle.spawn(run_scheduler(
+                command_rx,
+                command_tx.downgrade(),
+                admission_closed.clone(),
+            ));
         } else {
             warn!("TaskHandle created without an active Tokio runtime; task scheduler unavailable");
         }
 
-        Self { command_tx }
+        Self {
+            command_tx,
+            admission_closed,
+        }
     }
 
     pub async fn set_inbound_handler(&self, handler: Arc<dyn InboundTaskHandler>) {
@@ -722,10 +738,12 @@ impl TaskHandle {
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
     }
 
-    /// Drops the inbound handler and every pending timer so no further handler
-    /// starts, and reports how many are still running. `None` means the
-    /// scheduler is already gone. Repeat calls are harmless.
-    pub async fn close_admission(&self) -> Option<usize> {
+    /// Permanently stops new timer handlers without waiting for the scheduler.
+    pub fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::Release);
+    }
+
+    async fn stop_admission(&self) -> Option<usize> {
         let (response, stopped) = oneshot::channel();
         if self
             .command_tx
@@ -742,7 +760,8 @@ impl TaskHandle {
     /// running, then aborts whatever is left. Pending timers are durable, so an
     /// undrained handler is retried on the next boot rather than lost.
     pub async fn shutdown(&self, drain: Duration) -> TaskShutdownReport {
-        let Some(in_flight) = self.close_admission().await else {
+        self.close_admission();
+        let Some(in_flight) = self.stop_admission().await else {
             return TaskShutdownReport {
                 in_flight: 0,
                 aborted: 0,
@@ -1306,7 +1325,7 @@ mod tests {
                 gate,
             }))
             .await;
-        assert_eq!(handle.close_admission().await, Some(0));
+        handle.close_admission();
 
         fire_timer(&handle, key.clone()).await;
         let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle

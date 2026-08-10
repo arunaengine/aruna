@@ -158,7 +158,7 @@ impl NodeShutdown {
 
         // 3. Every writer stops admitting before any of them is waited on: a
         //    phase that runs out of budget must not leave one still accepting.
-        self.task_handle.close_admission().await;
+        self.task_handle.close_admission();
         self.jobs_runtime.close_admission();
         self.shutdown.close_admission();
         if let Some(net_handle) = self.net_handle.as_ref() {
@@ -167,15 +167,19 @@ impl NodeShutdown {
         info!("Shutdown: writer admission closed");
 
         // 4. Timer handlers drain while the network still works.
-        let report = self
-            .task_handle
-            .shutdown(writer_budget(budget.remaining()))
-            .await;
-        info!(
-            in_flight = report.in_flight,
-            aborted = report.aborted,
-            "Shutdown: task scheduler drained"
-        );
+        let task_budget = writer_budget(budget.remaining());
+        let mut task_report = None;
+        phase("tasks", task_budget, async {
+            task_report = Some(self.task_handle.shutdown(task_budget).await);
+        })
+        .await;
+        if let Some(report) = task_report {
+            info!(
+                in_flight = report.in_flight,
+                aborted = report.aborted,
+                "Shutdown: task scheduler drained"
+            );
+        }
 
         // 5. Job workers write storage: drain them before the seal.
         let job_budget = writer_budget(budget.remaining());
@@ -669,7 +673,7 @@ mod tests {
         sequence.run().await;
 
         assert_eq!(jobs_runtime.available_slots(), 0);
-        assert_eq!(task_handle.close_admission().await, Some(0));
+        task_handle.close_admission();
         assert!(shutdown.is_triggered());
         let started = Arc::new(AtomicBool::new(false));
         let child_started = started.clone();
