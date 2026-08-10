@@ -9,6 +9,13 @@ pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 /// Time-ordered index of registry records by `updated_at_ms`, for OAI-PMH
 /// datestamp enumeration (#320). Written atomically with each registry record.
 pub const METADATA_UPDATED_INDEX_KEYSPACE: &str = "metadata_updated_index";
+/// Generation-scoped, timestamp-ordered index of the records an anonymous caller
+/// is currently authorized to read, so OAI-PMH enumeration never scans the
+/// registry. Maintained out of band; readers re-check authorization per record.
+pub const METADATA_VISIBILITY_INDEX_KEYSPACE: &str = "metadata_visibility_index";
+/// The single state row naming the servable visibility-index generation. Absent
+/// or not-ready means anonymous enumeration fails closed.
+pub const METADATA_VISIBILITY_STATE_KEYSPACE: &str = "metadata_visibility_state";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const METADATA_EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
 pub const METADATA_CREATE_ACCEPTANCE_KEYSPACE: &str = "metadata_create_acceptance";

@@ -16,6 +16,7 @@ mod search_enrichment;
 pub mod stats;
 mod summary_cache;
 pub mod timestamp_index;
+pub mod visibility_index;
 
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ pub use protocol::{MetadataAuthToken, MetadataAuthTokenError, MetadataPathWinner
 /// finds them warm. Never blocks startup.
 pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
     timestamp_index::spawn_index_sweep(Arc::clone(&context), shutdown);
+    visibility_index::spawn_visibility_index(Arc::clone(&context), shutdown);
     shutdown.spawn(async move {
         let Some(handle) = context.metadata_handle.clone() else {
             return;
