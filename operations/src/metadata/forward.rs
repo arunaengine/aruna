@@ -1219,13 +1219,13 @@ pub async fn submit_pid_job_routed(
     context: &Arc<DriverContext>,
     document_id: Ulid,
     minted_by: UserId,
-    owner_node_id: NodeId,
+    local_node_id: NodeId,
     retention_ms: u64,
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<(JobId, bool), MetadataApiError> {
     let realm_id = minted_by.realm_id;
     if context.net_handle.is_none() {
-        return submit_pid_job_local(context, document_id, minted_by, owner_node_id, retention_ms)
+        return submit_pid_job_local(context, document_id, minted_by, local_node_id, retention_ms)
             .await;
     }
     let (config, authority) = pid_authority(context, realm_id, document_id).await?;

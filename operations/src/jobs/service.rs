@@ -223,7 +223,7 @@ pub async fn submit_staging_job(
 pub async fn submit_mint_pid(
     context: &Arc<DriverContext>,
     spec: MintPersistentIdSpec,
-    owner_node_id: NodeId,
+    local_node_id: NodeId,
     retention_ms: u64,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
@@ -231,7 +231,7 @@ pub async fn submit_mint_pid(
         context,
         spec.document_id,
         spec.minted_by,
-        owner_node_id,
+        local_node_id,
         retention_ms,
         auth_token,
     )
