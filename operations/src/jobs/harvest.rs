@@ -23,7 +23,7 @@ use crate::harvest::oai::mapping::oai_dc_to_jsonld;
 use crate::harvest::oai::parse::{
     OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
 };
-use crate::harvest::oai::request::{format_from, identify_url, list_records_url};
+use crate::harvest::oai::request::{format_window, identify_url, list_records_url};
 use crate::harvest::repository::{
     StorageReadError, parse_connector_read, parse_provenance_read, parse_source_read,
     read_connector_effect, read_provenance_effect, read_source_effect, write_provenance_effect,
@@ -122,7 +122,7 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
             persist_source(ctx, &source).await?;
         }
     }
-    let from = format_from(original_last, source.granularity.unwrap_or_default());
+    let from = format_window(original_last, source.granularity.unwrap_or_default());
     let mut resumption_token = source
         .cursor
         .as_ref()
