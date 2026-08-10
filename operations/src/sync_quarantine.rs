@@ -590,6 +590,83 @@ mod tests {
         );
     }
 
+    /// A redelivery between the scan and the delete transaction replaces the
+    /// selected row with unacknowledged evidence. Prune re-reads every candidate
+    /// inside the transaction, so that evidence is neither deleted nor accounted
+    /// from the value the scan happened to see.
+    #[tokio::test]
+    async fn prune_revalidates_candidates() {
+        let (ctx, _dir) = context();
+        seed_rows(&ctx, 2).await;
+        acknowledge_quarantine_row(&ctx, &row_key(0)).await.unwrap();
+
+        let storage = &ctx.storage_handle;
+        let (values, _) = iter_page(storage, &QuarantinePageRequest::default(), 50)
+            .await
+            .unwrap();
+        let mut candidates = Vec::new();
+        for (key, value) in values {
+            if SyncQuarantineRecord::from_bytes(value.as_ref())
+                .unwrap()
+                .acknowledged
+            {
+                candidates.push(key);
+            }
+        }
+        assert_eq!(candidates.len(), 1);
+
+        // The same operation is rejected again and replaces its own row with
+        // longer, unacknowledged evidence.
+        let write = build_quarantine_entries(
+            SyncQuarantineInput {
+                identity: identity(0),
+                evidence: SyncQuarantineEvidence::from_event(&event(0)),
+                reason: "redelivered with a much longer explanation",
+                quarantined_at_ms: 99,
+                replaced_bytes: Some(
+                    read_row_value(storage, &row_key(0), None)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .len() as u64,
+                ),
+            },
+            read_usage_row(storage, None).await.unwrap(),
+            SyncQuarantineCapacity::default(),
+        )
+        .unwrap();
+        let txn_id = start_txn(storage).await.unwrap();
+        write_batch(
+            storage,
+            vec![write.row, quarantine_usage_entry(write.usage).unwrap()],
+            txn_id,
+        )
+        .await
+        .unwrap();
+        commit_txn(storage, txn_id).await.unwrap();
+
+        let txn_id = start_txn(storage).await.unwrap();
+        let (pruned, usage) = prune_in_txn(storage, candidates, txn_id).await.unwrap();
+        abort_txn(storage, txn_id).await;
+        assert_eq!(pruned, 0);
+        assert_eq!(usage, write.usage);
+
+        let stored = read_quarantine_record(&ctx, &row_key(0))
+            .await
+            .unwrap()
+            .expect("redelivered evidence survives");
+        assert!(!stored.acknowledged);
+        assert_eq!(stored.reason, "redelivered with a much longer explanation");
+        assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), write.usage);
+        assert_eq!(
+            prune_quarantine_records(&ctx, QuarantinePageRequest::default())
+                .await
+                .unwrap()
+                .pruned,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn prune_is_resumable() {
         let (ctx, _dir) = context();

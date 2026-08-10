@@ -18298,6 +18298,122 @@ mod tests {
         service.shutdown().await;
     }
 
+    /// `event_id` is payload-controlled, so it may repeat across publishers,
+    /// operations, and batches. Rows and usage follow transport identity: one
+    /// row per identity, counted exactly once however often it is rejected.
+    #[tokio::test]
+    async fn quarantine_batch_accounting() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([79; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(79).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+
+        let topic_id = topic(79);
+        let shared_event_id = Ulid::from_parts(3_300, 1);
+        let event = || DocumentSyncEvent::Upsert {
+            event_id: shared_event_id,
+            target: DocumentSyncTarget::RealmConfig { realm_id },
+            bytes: vec![3; 8],
+            change: DocumentSyncChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: 1,
+                    event_id: shared_event_id,
+                    actor: node(79),
+                    updated_at_ms: 1,
+                },
+                kind: DocumentSyncChangeKind::Upsert,
+                placement: PlacementRef::NIL,
+            },
+        };
+        let identity = |actor: u8, actor_seq: u64| SyncQuarantineIdentity {
+            topic: topic_id,
+            actor: irokle_crate::ActorId::from_bytes([actor; 32]),
+            actor_seq,
+        };
+        let commit = |rejections: Vec<SyncRejection>| {
+            let service = service.clone();
+            async move {
+                let txn_id = start_storage_transaction(&service.storage)
+                    .await
+                    .expect("transaction starts");
+                let entries = service
+                    .quarantine_entries(&rejections, txn_id)
+                    .await
+                    .expect("evidence builds")
+                    .expect("capacity is available");
+                storage_batch_delete_and_write_in_transaction(
+                    &service.storage,
+                    txn_id,
+                    Vec::new(),
+                    entries,
+                )
+                .await
+                .expect("evidence commits");
+            }
+        };
+
+        // One batch: one publisher's two operations, a second publisher reusing
+        // the same event id, and a repeat of the first key.
+        commit(vec![
+            SyncRejection::new(identity(1, 1), event(), "first"),
+            SyncRejection::new(identity(1, 2), event(), "second"),
+            SyncRejection::new(identity(2, 1), event(), "other publisher"),
+            SyncRejection::new(identity(1, 1), event(), "repeat in batch"),
+        ])
+        .await;
+        let stored_bytes = |records: &[SyncQuarantineRecord]| {
+            records
+                .iter()
+                .map(|record| record.to_bytes().expect("record serializes").len() as u64)
+                .sum::<u64>()
+        };
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 3, "{records:?}");
+        let usage = quarantine_usage(&storage).await;
+        assert_eq!(usage.records, 3);
+        assert_eq!(usage.bytes, stored_bytes(&records));
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.identity == identity(1, 1))
+                .expect("first identity")
+                .reason,
+            "repeat in batch",
+            "the batch's last write for a key is the stored one"
+        );
+
+        // Several batches: the same three identities redeliver, and a fourth
+        // operation reusing the same event id is the only new row.
+        commit(vec![
+            SyncRejection::new(identity(1, 1), event(), "redelivered"),
+            SyncRejection::new(identity(2, 1), event(), "redelivered"),
+        ])
+        .await;
+        commit(vec![
+            SyncRejection::new(identity(1, 2), event(), "redelivered"),
+            SyncRejection::new(identity(2, 2), event(), "new operation"),
+        ])
+        .await;
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 4, "{records:?}");
+        let usage = quarantine_usage(&storage).await;
+        assert_eq!(usage.records, 4);
+        assert_eq!(usage.bytes, stored_bytes(&records));
+
+        service.shutdown().await;
+    }
+
     /// A malformed envelope or payload from any metadata/PID family is
     /// permanent evidence, never a replayed error: the topic keeps moving and
     /// the valid successor behind the poison applies. While evidence cannot be
