@@ -28,13 +28,17 @@ pub fn oai_dc_to_jsonld(record: &OaiRecord) -> String {
 
     entity.insert(
         "name".to_string(),
-        Value::String(first_element(record, "title").unwrap_or_else(|| record.header.identifier.clone())),
+        Value::String(
+            first_element(record, "title").unwrap_or_else(|| record.header.identifier.clone()),
+        ),
     );
     entity.insert(
         "description".to_string(),
-        Value::String(first_element(record, "description").unwrap_or_else(|| {
-            format!("Harvested OAI-PMH record {}", record.header.identifier)
-        })),
+        Value::String(
+            first_element(record, "description").unwrap_or_else(|| {
+                format!("Harvested OAI-PMH record {}", record.header.identifier)
+            }),
+        ),
     );
     entity.insert(
         "datePublished".to_string(),
@@ -353,11 +357,19 @@ mod tests {
     #[test]
     fn unparseable_dates_fall_back() {
         let mut record = record();
-        record.dc.push(("date".to_string(), "circa 1900".to_string()));
-        assert_eq!(root(&oai_dc_to_jsonld(&record))["datePublished"], "2026-01-02");
+        record
+            .dc
+            .push(("date".to_string(), "circa 1900".to_string()));
+        assert_eq!(
+            root(&oai_dc_to_jsonld(&record))["datePublished"],
+            "2026-01-02"
+        );
 
         record.header.datestamp = "whenever".to_string();
-        assert_eq!(root(&oai_dc_to_jsonld(&record))["datePublished"], UNKNOWN_DATE);
+        assert_eq!(
+            root(&oai_dc_to_jsonld(&record))["datePublished"],
+            UNKNOWN_DATE
+        );
     }
 
     #[test]
@@ -366,7 +378,10 @@ mod tests {
         record
             .dc
             .push(("date".to_string(), "2020-05-06".to_string()));
-        assert_eq!(root(&oai_dc_to_jsonld(&record))["datePublished"], "2020-05-06");
+        assert_eq!(
+            root(&oai_dc_to_jsonld(&record))["datePublished"],
+            "2020-05-06"
+        );
     }
 
     #[test]

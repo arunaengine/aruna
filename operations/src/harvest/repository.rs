@@ -43,7 +43,11 @@ pub fn source_prefix(group_id: GroupId) -> Key {
 }
 
 pub fn provenance_key(group_id: GroupId, namespace: &str, source_record_id: &str) -> Key {
-    ByteView::from(harvest_provenance_key(group_id, namespace, source_record_id))
+    ByteView::from(harvest_provenance_key(
+        group_id,
+        namespace,
+        source_record_id,
+    ))
 }
 
 pub fn provenance_prefix(group_id: GroupId, namespace: &str) -> Key {

@@ -5,12 +5,12 @@ use std::time::{Duration, SystemTime};
 use aruna_blob::blob::BlobHandle;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::structured_id::StructuredId;
 use aruna_core::structs::{
     Actor, AuthContext, HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance,
     HarvestRecordState, HarvestSource, IncomingRecord, JobError, JobResultPayload,
     ProvenanceDecision, RealmId, RepositoryConnector, provenance_decision,
 };
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
@@ -163,6 +163,9 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
                 if !restarted && is_bad_token(&error) {
                     restarted = true;
                     resumption_token = None;
+                    // A restart is a fresh listing: the provider may legitimately
+                    // hand back the same token names again.
+                    seen_tokens.clear();
                     continue;
                 }
                 return Err(retryable(format!(
@@ -431,7 +434,10 @@ fn harvest_document_path(prefix: &str, identifier: &str) -> Result<String, Harve
     }
     let encoded = format!(
         "b64-{}",
-        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, identifier)
+        base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            identifier
+        )
     );
     let segment = if encoded.len() <= budget {
         encoded
@@ -589,7 +595,9 @@ async fn read_provenance(
     let event = ctx
         .driver
         .storage_handle
-        .send_effect(read_provenance_effect(group_id, namespace, identifier, None))
+        .send_effect(read_provenance_effect(
+            group_id, namespace, identifier, None,
+        ))
         .await;
     parse_provenance_read(event).map_err(read_failure)
 }

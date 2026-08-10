@@ -61,8 +61,7 @@ use super::metadata_class::MetadataFailure;
 use super::store::{list_job_entries, put_job_entry, put_rocrate_checkpoint, put_rocrate_plan};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
 use crate::driver::{bucket_snapshot, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
