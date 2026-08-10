@@ -31,6 +31,7 @@ pub use protocol::{MetadataAuthToken, MetadataAuthTokenError, MetadataPathWinner
 /// Primes the metadata caches off the boot path so the first user query
 /// finds them warm. Never blocks startup.
 pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
+    timestamp_index::spawn_index_sweep(Arc::clone(&context), shutdown);
     shutdown.spawn(async move {
         let Some(handle) = context.metadata_handle.clone() else {
             return;
