@@ -698,6 +698,7 @@ fn apply_failure(error: MetadataWriteError) -> HarvestFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harvest::target_path::DIGEST_SEGMENT_BYTES;
 
     fn path(identifier: &str) -> String {
         harvest_document_path("/imported/zenodo/", identifier).unwrap()
@@ -752,6 +753,22 @@ mod tests {
     #[test]
     fn oversized_prefix_is_rejected() {
         assert!(harvest_document_path(&"p".repeat(HARVEST_PATH_BYTES), "x").is_err());
+    }
+
+    /// Every prefix source creation accepts must yield a bounded path, and
+    /// padding must never move a record to a different one.
+    #[test]
+    fn accepted_prefixes_always_yield_a_path() {
+        let longest = "p".repeat(HARVEST_PATH_BYTES - DIGEST_SEGMENT_BYTES - 1);
+        for prefix in ["imported/zenodo", " /imported/zenodo/ ", longest.as_str()] {
+            assert!(normalize_target_prefix(prefix).is_some());
+            let encoded = harvest_document_path(prefix, "oai:example.org:1").unwrap();
+            assert!(encoded.len() <= HARVEST_PATH_BYTES);
+        }
+        assert_eq!(
+            path("oai:example.org:1"),
+            harvest_document_path(" /imported/zenodo/ ", "oai:example.org:1").unwrap()
+        );
     }
 
     #[test]

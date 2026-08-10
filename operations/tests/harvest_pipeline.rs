@@ -480,10 +480,12 @@ async fn restore_config(fixture: &Fixture, saved: Vec<u8>) -> Result<(), BoxErro
 }
 
 async fn record_present(fixture: &Fixture, document_id: Ulid) -> Result<bool, BoxError> {
-    Ok(load_metadata_record_by_document(&fixture.context, document_id)
-        .await
-        .map_err(|error| format!("{error:?}"))?
-        .is_some())
+    Ok(
+        load_metadata_record_by_document(&fixture.context, document_id)
+            .await
+            .map_err(|error| format!("{error:?}"))?
+            .is_some(),
+    )
 }
 
 async fn run(fixture: &Fixture, source: &HarvestSource) -> JobRunOutcome {

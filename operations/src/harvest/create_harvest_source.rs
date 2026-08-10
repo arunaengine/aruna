@@ -107,12 +107,13 @@ impl CreateSourceOperation {
         };
         // The parser and the RO-Crate mapper are `oai_dc`-typed; any other
         // prefix would silently import identifier-only records.
-        let metadata_prefix = match normalize_metadata_prefix(
-            self.input.selector.metadata_prefix.as_deref(),
-        ) {
-            Ok(prefix) => prefix,
-            Err(prefix) => return self.emit_error(CreateSourceError::UnsupportedMetadataPrefix(prefix)),
-        };
+        let metadata_prefix =
+            match normalize_metadata_prefix(self.input.selector.metadata_prefix.as_deref()) {
+                Ok(prefix) => prefix,
+                Err(prefix) => {
+                    return self.emit_error(CreateSourceError::UnsupportedMetadataPrefix(prefix));
+                }
+            };
         self.input.target_prefix = target_prefix;
         self.input.selector.metadata_prefix = Some(metadata_prefix);
         self.input.selector.set = normalize_set(self.input.selector.set.as_deref());
