@@ -38,7 +38,7 @@ use aruna_core::keyspaces::{
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    SYNC_QUARANTINE_USAGE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -62,10 +62,11 @@ use aruna_core::structs::{
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
     NodeUsageSnapshot, PersistentIdMapping, PlacementRef, PlacementScope, PoolAdmission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
-    SyncQuarantineRecord, User, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    admit_band_pool, coordinator_spans, group_owner_index_key, node_usage_key_node_id,
-    persistent_id_change, persistent_id_key, persistent_id_target, reserved_label,
-    sync_quarantine_key, watch_interest_dirty_key, watch_interest_key_node_id,
+    SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineInput,
+    SyncQuarantineUsage, User, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    admit_band_pool, build_quarantine_entries, coordinator_spans, group_owner_index_key,
+    node_usage_key_node_id, persistent_id_change, persistent_id_key, persistent_id_target,
+    reserved_label, sync_quarantine_key, watch_interest_dirty_key, watch_interest_key_node_id,
     watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
@@ -125,10 +126,36 @@ const SHARD_GENESIS_PROBE_CONCURRENCY: usize = 8;
 #[derive(Debug)]
 struct PendingMetadataCreateApply {
     topic_id: irokle_crate::TopicId,
+    /// The event exactly as received, so a reject in the create batch keeps the
+    /// genuine envelope instead of the payload the batch reconstructed.
+    event: DocumentSyncEvent,
     target: DocumentSyncTarget,
     record: MetadataCreateEventRecord,
     bytes: Vec<u8>,
     lifecycle_revision: Option<DocumentSyncChange>,
+}
+
+/// A permanently rejected sync event awaiting durable evidence. Evidence is
+/// materialized only when the topic cursor is about to advance past it, so both
+/// land in one transaction.
+struct SyncRejection {
+    topic_id: irokle_crate::TopicId,
+    event: DocumentSyncEvent,
+    reason: String,
+}
+
+impl SyncRejection {
+    fn new(
+        topic_id: irokle_crate::TopicId,
+        event: DocumentSyncEvent,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            topic_id,
+            event,
+            reason: reason.into(),
+        }
+    }
 }
 
 struct DocumentEventBatch {
@@ -2206,10 +2233,12 @@ impl DocumentSyncService {
         let mut pending_metadata_creates: Vec<PendingMetadataCreateApply> = Vec::new();
         let mut deferred_cursor_writes: Vec<(irokle_crate::TopicId, (String, ByteView, Value))> =
             Vec::new();
+        let mut deferred_rejections: Vec<SyncRejection> = Vec::new();
         while let Some(topic_id) = topic_queue.pop_front() {
             queued_topics.remove(&topic_id);
             pending_metadata_creates.retain(|pending| pending.topic_id != topic_id);
             deferred_cursor_writes.retain(|(pending_topic_id, _)| *pending_topic_id != topic_id);
+            deferred_rejections.retain(|rejection| rejection.topic_id != topic_id);
             let Some(topic) = self
                 .node
                 .storage()
@@ -2240,6 +2269,7 @@ impl DocumentSyncService {
             // Persist only this causal batch; anti-entropy will revisit the topic.
             cursor = batch.cursor;
             let mut deferred_creates = false;
+            let mut rejections: Vec<SyncRejection> = Vec::new();
             let mut deferred_admin_events = Vec::new();
             let mut satisfied_admin_dependencies = BTreeSet::new();
             let mut cross_topic_dependencies = BTreeSet::new();
@@ -2255,6 +2285,11 @@ impl DocumentSyncService {
                         %actor_id,
                         "Rejecting shard event from a publisher outside the current holder set"
                     );
+                    rejections.push(SyncRejection::new(
+                        topic_id,
+                        event,
+                        "shard publisher is outside the current holder set",
+                    ));
                     continue;
                 }
                 let target_topic_id = event
@@ -2266,14 +2301,19 @@ impl DocumentSyncService {
                         %target_topic_id,
                         "Skipping document sync event whose target does not match its topic"
                     );
+                    rejections.push(SyncRejection::new(
+                        topic_id,
+                        event,
+                        "event target does not match its topic",
+                    ));
                     continue;
                 }
                 match event {
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target: target @ DocumentSyncTarget::WatchSubscription { owner, watch_id },
                         bytes,
                         change,
-                        ..
                     } => {
                         let expected_actor = irokle_crate::actor_id_for(
                             topic_id,
@@ -2286,12 +2326,32 @@ impl DocumentSyncService {
                                 %watch_id,
                                 "Rejecting watch subscription whose revision actor is not its publisher"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                "watch subscription revision actor is not its publisher",
+                            ));
                             continue;
                         }
                         if let Err(reason) =
                             validate_watch_subscription_upsert(&target, &bytes, &change)
                         {
                             warn!(%topic_id, %owner, %watch_id, %reason, "Rejecting invalid watch subscription");
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                format!("invalid watch subscription: {reason}"),
+                            ));
                             continue;
                         }
                         if self
@@ -2302,6 +2362,7 @@ impl DocumentSyncService {
                         }
                     }
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target:
                             target @ DocumentSyncTarget::NodeUsage {
                                 node_id: snapshot_node,
@@ -2309,7 +2370,6 @@ impl DocumentSyncService {
                             },
                         bytes,
                         change,
-                        ..
                     } => {
                         // Node-usage snapshots ride a single shared realm topic
                         // that every realm publisher can write, so validate that
@@ -2328,6 +2388,16 @@ impl DocumentSyncService {
                                 node_id = %snapshot_node,
                                 "Rejecting node usage snapshot: publisher is not the owning node"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                "node usage publisher is not the owning node",
+                            ));
                             continue;
                         }
                         if let Err(reason) = validate_node_usage_upsert(&target, &bytes) {
@@ -2337,12 +2407,23 @@ impl DocumentSyncService {
                                 %reason,
                                 "Rejecting invalid node usage snapshot"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                format!("invalid node usage snapshot: {reason}"),
+                            ));
                             continue;
                         }
                         self.apply_upsert(target.clone(), bytes, change).await?;
                         applied_targets.push(target);
                     }
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target:
                             target @ DocumentSyncTarget::WatchInterest {
                                 realm_id,
@@ -2350,7 +2431,6 @@ impl DocumentSyncService {
                             },
                         bytes,
                         change,
-                        ..
                     } => {
                         // Watch-interest digests ride a single shared realm topic
                         // that every realm publisher can write, so validate that
@@ -2370,6 +2450,16 @@ impl DocumentSyncService {
                                 node_id = %interest_node,
                                 "Rejecting watch interest digest: publisher is not the owning node"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                "watch interest publisher is not the owning node",
+                            ));
                             continue;
                         }
                         if let Err(reason) = validate_watch_interest(&target, &bytes) {
@@ -2380,19 +2470,29 @@ impl DocumentSyncService {
                                 %reason,
                                 "Rejecting invalid watch interest digest"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                format!("invalid watch interest digest: {reason}"),
+                            ));
                             continue;
                         }
                         self.apply_upsert(target.clone(), bytes, change).await?;
                         applied_targets.push(target);
                     }
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target:
                             target @ DocumentSyncTarget::NodeInfo {
                                 node_id: info_node, ..
                             },
                         bytes,
                         change,
-                        ..
                     } => {
                         // Node info documents ride a single shared realm topic that
                         // every realm publisher can write, so validate that the
@@ -2408,6 +2508,16 @@ impl DocumentSyncService {
                                 node_id = %info_node,
                                 "Rejecting node info document: publisher is not the owning node"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                "node info publisher is not the owning node",
+                            ));
                             continue;
                         }
                         if let Err(reason) = validate_node_info_upsert(&target, &bytes) {
@@ -2417,19 +2527,30 @@ impl DocumentSyncService {
                                 %reason,
                                 "Rejecting invalid node info document"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target,
+                                    bytes,
+                                    change,
+                                },
+                                format!("invalid node info document: {reason}"),
+                            ));
                             continue;
                         }
                         self.apply_upsert(target.clone(), bytes, change).await?;
                         applied_targets.push(target);
                     }
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target:
                             target @ DocumentSyncTarget::MetadataRegistry {
                                 group_id,
                                 document_id,
                             },
                         bytes,
-                        ..
+                        change,
                     } => {
                         let record: MetadataRegistryRecord = postcard::from_bytes(&bytes)
                             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -2441,6 +2562,7 @@ impl DocumentSyncService {
                         }
                         let realm_id = record.realm_id;
                         let strategy_id = record.placement.strategy_id;
+                        let event_bytes = bytes.clone();
                         match self.apply_metadata_registry_upsert(record, bytes).await? {
                             MetadataPlacementOutcome::Accepted(()) => applied_targets.push(target),
                             MetadataPlacementOutcome::Deferred(dependency) => {
@@ -2453,13 +2575,25 @@ impl DocumentSyncService {
                                 );
                                 cross_topic_dependencies.insert(dependency);
                             }
-                            MetadataPlacementOutcome::Rejected => warn!(
-                                %topic_id,
-                                %realm_id,
-                                %document_id,
-                                %strategy_id,
-                                "Rejecting metadata registry record with mismatched placement configuration"
-                            ),
+                            MetadataPlacementOutcome::Rejected => {
+                                warn!(
+                                    %topic_id,
+                                    %realm_id,
+                                    %document_id,
+                                    %strategy_id,
+                                    "Rejecting metadata registry record with mismatched placement configuration"
+                                );
+                                rejections.push(SyncRejection::new(
+                                    topic_id,
+                                    DocumentSyncEvent::Upsert {
+                                        event_id,
+                                        target,
+                                        bytes: event_bytes,
+                                        change,
+                                    },
+                                    "metadata registry record has a mismatched placement configuration",
+                                ));
+                            }
                         }
                     }
                     event @ DocumentSyncEvent::Upsert {
@@ -2471,10 +2605,10 @@ impl DocumentSyncService {
                         deferred_creates = true;
                     }
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
                         bytes,
                         change,
-                        ..
                     } => {
                         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
                         let lifecycle: MetadataDocumentLifecycleRecord =
@@ -2489,14 +2623,20 @@ impl DocumentSyncService {
                         match lifecycle {
                             MetadataDocumentLifecycleRecord::Upsert { event: record } => {
                                 let record = *record;
-                                let bytes = postcard::to_allocvec(&record)
+                                let inner_bytes = postcard::to_allocvec(&record)
                                     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
                                 pending_metadata_creates.push(PendingMetadataCreateApply {
                                     topic_id,
+                                    event: DocumentSyncEvent::Upsert {
+                                        event_id,
+                                        target: target.clone(),
+                                        bytes,
+                                        change: change.clone(),
+                                    },
                                     target,
                                     lifecycle_revision: Some(change),
                                     record,
-                                    bytes,
+                                    bytes: inner_bytes,
                                 });
                                 deferred_creates = true;
                             }
@@ -2562,28 +2702,33 @@ impl DocumentSyncService {
                             applied_targets.push(target);
                         }
                     }
-                    DocumentSyncEvent::Delete {
-                        target: target @ DocumentSyncTarget::PersistentIdMapping { .. },
+                    event @ (DocumentSyncEvent::Delete {
+                        target: DocumentSyncTarget::PersistentIdMapping { .. },
                         ..
                     }
                     | DocumentSyncEvent::AdminOperation {
-                        target: target @ DocumentSyncTarget::PersistentIdMapping { .. },
+                        target: DocumentSyncTarget::PersistentIdMapping { .. },
                         ..
-                    } => {
+                    }) => {
                         // The mapping row is a permanent tombstone once written, so
                         // it only ever syncs as a monotone upsert. Skip rather than
                         // `?`-propagate so a hostile op cannot wedge the topic.
                         warn!(
                             %topic_id,
-                            ?target,
+                            target = ?event.target(),
                             "Skipping unsupported non-upsert persistent id mapping event"
                         );
+                        rejections.push(SyncRejection::new(
+                            topic_id,
+                            event,
+                            "unsupported non-upsert persistent id mapping event",
+                        ));
                         continue;
                     }
                     DocumentSyncEvent::Delete {
+                        event_id,
                         target: target @ DocumentSyncTarget::WatchSubscription { owner, watch_id },
                         change,
-                        ..
                     } => {
                         let expected_actor = irokle_crate::actor_id_for(
                             topic_id,
@@ -2596,10 +2741,28 @@ impl DocumentSyncService {
                                 %watch_id,
                                 "Rejecting watch subscription delete whose revision actor is not its publisher"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Delete {
+                                    event_id,
+                                    target,
+                                    change,
+                                },
+                                "watch subscription delete actor is not its publisher",
+                            ));
                             continue;
                         }
                         if let Err(reason) = validate_watch_subscription_delete(&target, &change) {
                             warn!(%topic_id, %owner, %watch_id, %reason, "Rejecting invalid watch subscription delete");
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::Delete {
+                                    event_id,
+                                    target,
+                                    change,
+                                },
+                                format!("invalid watch subscription delete: {reason}"),
+                            ));
                             continue;
                         }
                         if self
@@ -2609,18 +2772,18 @@ impl DocumentSyncService {
                             applied_targets.push(target);
                         }
                     }
-                    DocumentSyncEvent::Delete {
+                    event @ (DocumentSyncEvent::Delete {
                         target:
-                            target @ (DocumentSyncTarget::NodeUsage { .. }
-                            | DocumentSyncTarget::WatchInterest { .. }),
+                            DocumentSyncTarget::NodeUsage { .. }
+                            | DocumentSyncTarget::WatchInterest { .. },
                         ..
                     }
                     | DocumentSyncEvent::AdminOperation {
                         target:
-                            target @ (DocumentSyncTarget::NodeUsage { .. }
-                            | DocumentSyncTarget::WatchInterest { .. }),
+                            DocumentSyncTarget::NodeUsage { .. }
+                            | DocumentSyncTarget::WatchInterest { .. },
                         ..
-                    } => {
+                    }) => {
                         // Shared realm snapshots only ever sync as owner-validated
                         // upserts. A signed Delete or AdminOperation on the shared
                         // realm topic would otherwise `?`-propagate through the
@@ -2628,40 +2791,55 @@ impl DocumentSyncService {
                         // skip it and let the cursor advance past the hostile op.
                         warn!(
                             %topic_id,
-                            ?target,
+                            target = ?event.target(),
                             "Skipping unsupported non-upsert shared document event"
                         );
+                        rejections.push(SyncRejection::new(
+                            topic_id,
+                            event,
+                            "unsupported non-upsert shared realm document event",
+                        ));
                         continue;
                     }
-                    DocumentSyncEvent::Delete {
-                        target: target @ DocumentSyncTarget::NodeInfo { .. },
+                    event @ (DocumentSyncEvent::Delete {
+                        target: DocumentSyncTarget::NodeInfo { .. },
                         ..
                     }
                     | DocumentSyncEvent::AdminOperation {
-                        target: target @ DocumentSyncTarget::NodeInfo { .. },
+                        target: DocumentSyncTarget::NodeInfo { .. },
                         ..
-                    } => {
+                    }) => {
                         // Node info documents only ever sync as owner-validated
                         // upserts; skip any signed Delete/AdminOperation on the
                         // shared realm topic so it cannot wedge the reconcile loop.
                         warn!(
                             %topic_id,
-                            ?target,
+                            target = ?event.target(),
                             "Skipping unsupported non-upsert node info document event"
                         );
+                        rejections.push(SyncRejection::new(
+                            topic_id,
+                            event,
+                            "unsupported non-upsert node info document event",
+                        ));
                         continue;
                     }
-                    DocumentSyncEvent::Upsert { ref target, .. }
-                    | DocumentSyncEvent::Delete { ref target, .. }
-                        if admin_document_target_for_reduced_document(target).is_some() =>
+                    event @ (DocumentSyncEvent::Upsert { .. }
+                    | DocumentSyncEvent::Delete { .. })
+                        if admin_document_target_for_reduced_document(event.target()).is_some() =>
                     {
                         // apply_upsert/apply_delete refuse whole-document admin sync, so
                         // skip it here to let the cursor advance instead of wedging reconcile.
                         warn!(
                             %topic_id,
-                            ?target,
+                            target = ?event.target(),
                             "Skipping unsupported whole-document admin sync event"
                         );
+                        rejections.push(SyncRejection::new(
+                            topic_id,
+                            event,
+                            "unsupported whole-document admin sync event",
+                        ));
                         continue;
                     }
                     DocumentSyncEvent::AdminOperation {
@@ -2682,12 +2860,6 @@ impl DocumentSyncService {
                         {
                             AdminEventValidation::Accepted => {}
                             AdminEventValidation::Rejected(reason) => {
-                                self.quarantine_admin_event(
-                                    topic_id.as_bytes(),
-                                    event.as_ref(),
-                                    &reason,
-                                )
-                                .await;
                                 warn!(
                                     %topic_id,
                                     event_id = %event.event_id,
@@ -2695,6 +2867,15 @@ impl DocumentSyncService {
                                     %reason,
                                     "Rejecting invalid or unauthorized admin operation"
                                 );
+                                rejections.push(SyncRejection::new(
+                                    topic_id,
+                                    DocumentSyncEvent::AdminOperation {
+                                        target,
+                                        event,
+                                        placement,
+                                    },
+                                    reason,
+                                ));
                                 continue;
                             }
                             AdminEventValidation::Deferred { dependency, reason } => {
@@ -2760,14 +2941,21 @@ impl DocumentSyncService {
                             progressed = true;
                         }
                         AdminEventValidation::Rejected(reason) => {
-                            self.quarantine_admin_event(topic_id.as_bytes(), &event, &reason)
-                                .await;
                             warn!(
                                 %topic_id,
                                 event_id = %event.event_id,
                                 %reason,
                                 "Rejecting deferred admin operation after prerequisite replay"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::AdminOperation {
+                                    target,
+                                    event: Box::new(event),
+                                    placement,
+                                },
+                                reason,
+                            ));
                         }
                         AdminEventValidation::Deferred { dependency, reason } => {
                             retry.push((target, event, placement, actor_id, dependency, reason))
@@ -2775,18 +2963,25 @@ impl DocumentSyncService {
                     }
                 }
                 if !progressed {
-                    for (_, event, _, _, dependency, reason) in retry {
+                    for (target, event, placement, _, dependency, reason) in retry {
                         if let Some(dependency) = dependency {
                             cross_topic_dependencies.insert(dependency);
                         } else {
-                            self.quarantine_admin_event(topic_id.as_bytes(), &event, &reason)
-                                .await;
                             warn!(
                                 %topic_id,
                                 event_id = %event.event_id,
                                 reason = %reason,
                                 "Rejecting admin operation whose same-topic prerequisite is absent"
                             );
+                            rejections.push(SyncRejection::new(
+                                topic_id,
+                                DocumentSyncEvent::AdminOperation {
+                                    target,
+                                    event: Box::new(event),
+                                    placement,
+                                },
+                                reason,
+                            ));
                         }
                     }
                     break;
@@ -2819,6 +3014,7 @@ impl DocumentSyncService {
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?,
             );
             if deferred_creates {
+                deferred_rejections.append(&mut rejections);
                 deferred_cursor_writes.push((
                     topic_id,
                     (
@@ -2827,13 +3023,26 @@ impl DocumentSyncService {
                         value,
                     ),
                 ));
-            } else {
+            } else if rejections.is_empty() {
                 self.storage_write(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key,
                     value,
                 )
                 .await?;
+            } else if !self
+                .commit_cursor_evidence(
+                    &rejections,
+                    (
+                        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                        cursor_key,
+                        value,
+                    ),
+                )
+                .await?
+            {
+                // Fail closed: the events redeliver once evidence fits again.
+                continue;
             }
             let retry_topics = {
                 remove_deferred_topic(&mut deferred_topics, topic_id);
@@ -2860,6 +3069,7 @@ impl DocumentSyncService {
         self.apply_metadata_create_batch(
             pending_metadata_creates,
             deferred_cursor_writes,
+            deferred_rejections,
             &mut deferred_topics,
             &mut applied_targets,
             &mut metadata_create_events,
@@ -3068,7 +3278,7 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         event: DocumentSyncEvent,
     ) -> Result<PendingMetadataCreateApply> {
-        let (document_id, target_event_id, bytes) = match event {
+        let (document_id, target_event_id, bytes) = match &event {
             DocumentSyncEvent::Upsert {
                 target:
                     DocumentSyncTarget::MetadataCreateEvent {
@@ -3077,7 +3287,7 @@ impl DocumentSyncService {
                     },
                 bytes,
                 ..
-            } => (document_id, target_event_id, bytes),
+            } => (*document_id, *target_event_id, bytes.clone()),
             _ => unreachable!(
                 "metadata create apply helper is only called for metadata create upserts"
             ),
@@ -3092,6 +3302,7 @@ impl DocumentSyncService {
         }
         Ok(PendingMetadataCreateApply {
             topic_id,
+            event,
             target: DocumentSyncTarget::MetadataCreateEvent {
                 document_id,
                 event_id: target_event_id,
@@ -3106,11 +3317,12 @@ impl DocumentSyncService {
         &self,
         pending: Vec<PendingMetadataCreateApply>,
         cursor_writes: Vec<(irokle_crate::TopicId, (String, ByteView, Value))>,
+        mut rejections: Vec<SyncRejection>,
         deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
         applied_targets: &mut Vec<DocumentSyncTarget>,
         metadata_create_events: &mut Vec<MetadataCreateEventRecord>,
     ) -> Result<()> {
-        if pending.is_empty() && cursor_writes.is_empty() {
+        if pending.is_empty() && cursor_writes.is_empty() && rejections.is_empty() {
             return Ok(());
         }
         let mut candidates = Vec::with_capacity(pending.len());
@@ -3122,6 +3334,11 @@ impl DocumentSyncService {
                     %error,
                     "Rejecting replicated metadata event with inconsistent identity"
                 );
+                rejections.push(SyncRejection::new(
+                    apply.topic_id,
+                    apply.event,
+                    format!("replicated metadata event has an inconsistent identity: {error}"),
+                ));
                 continue;
             }
             let mut entries = Vec::new();
@@ -3226,6 +3443,11 @@ impl DocumentSyncService {
                         strategy_id = %apply.record.record.placement.strategy_id,
                         "Rejecting replicated metadata create with mismatched placement configuration"
                     );
+                    rejections.push(SyncRejection::new(
+                        apply.topic_id,
+                        apply.event,
+                        "replicated metadata create has a mismatched placement configuration",
+                    ));
                     continue;
                 }
                 Err(error) => {
@@ -3302,6 +3524,11 @@ impl DocumentSyncService {
                         %document_id,
                         "Rejecting divergent replicated metadata create"
                     );
+                    rejections.push(SyncRejection::new(
+                        apply.topic_id,
+                        apply.event,
+                        "divergent replicated metadata create",
+                    ));
                     continue;
                 }
                 create_acceptances
@@ -3323,6 +3550,11 @@ impl DocumentSyncService {
                     %document_id,
                     "Rejecting replicated metadata update with mismatched accepted create"
                 );
+                rejections.push(SyncRejection::new(
+                    apply.topic_id,
+                    apply.event,
+                    "replicated metadata update has a mismatched accepted create",
+                ));
                 continue;
             }
             accepted_candidates.push((apply, entries));
@@ -3330,6 +3562,17 @@ impl DocumentSyncService {
         for (apply, entries) in accepted_candidates {
             writes.extend(entries);
             accepted.push(apply);
+        }
+        match self.quarantine_entries(&rejections, txn_id).await {
+            Ok(Some(entries)) => writes.extend(entries),
+            Ok(None) => {
+                // Fail closed: no topic may advance past evidence that does not fit.
+                deferred_cursor_topics.extend(rejections.iter().map(|reject| reject.topic_id));
+            }
+            Err(error) => {
+                self.abort_transaction(txn_id).await;
+                return Err(error);
+            }
         }
         writes.extend(cursor_writes.into_iter().filter_map(|(topic_id, write)| {
             (!deferred_cursor_topics.contains(&topic_id)).then_some(write)
@@ -3600,50 +3843,113 @@ impl DocumentSyncService {
         storage_batch_write_to(&self.storage, writes).await
     }
 
-    /// Durably retain a permanently-rejected admin sync event for inspection
-    /// instead of only logging it, so the topic can advance without losing the
-    /// poison event. Best-effort: a persistence failure is logged, not fatal.
-    async fn quarantine_admin_event(&self, topic: &[u8], event: &AdminDocumentEvent, reason: &str) {
-        let record = quarantine_record(topic, event, reason, unix_timestamp_millis());
-        let value = match record.to_bytes() {
-            Ok(bytes) => bytes,
+    /// Evidence rows for permanently rejected events, chained through the usage
+    /// row so the batch's repeated usage key resolves to its final accounting.
+    /// `None` means the store is at capacity: the caller must leave the affected
+    /// cursors unwritten so the events are redelivered.
+    async fn quarantine_entries(
+        &self,
+        rejections: &[SyncRejection],
+        txn_id: TxnId,
+    ) -> Result<Option<Vec<(String, ByteView, Value)>>> {
+        if rejections.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut usage = match storage_read_from_transaction(
+            &self.storage,
+            SYNC_QUARANTINE_USAGE_KEYSPACE.to_string(),
+            ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+            Some(txn_id),
+        )
+        .await?
+        {
+            Some(value) => SyncQuarantineUsage::from_bytes(value.as_ref())
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            None => SyncQuarantineUsage::default(),
+        };
+        let quarantined_at_ms = unix_timestamp_millis();
+        let mut entries = Vec::with_capacity(rejections.len() * 2);
+        for rejection in rejections {
+            let topic = rejection.topic_id.as_bytes();
+            let event_id = rejection.event.event_id();
+            // A redelivered poison event replaces its own row, so its bytes are
+            // swapped rather than added to the usage total.
+            let replaced_bytes = storage_read_from_transaction(
+                &self.storage,
+                SYNC_QUARANTINE_KEYSPACE.to_string(),
+                ByteView::from(sync_quarantine_key(topic, event_id)),
+                Some(txn_id),
+            )
+            .await?
+            .map(|value| value.len() as u64);
+            match build_quarantine_entries(
+                SyncQuarantineInput {
+                    topic,
+                    event: &rejection.event,
+                    reason: &rejection.reason,
+                    quarantined_at_ms,
+                    replaced_bytes,
+                },
+                usage,
+                SyncQuarantineCapacity::default(),
+            ) {
+                Ok(write) => {
+                    usage = write.usage;
+                    entries.extend(write.entries);
+                }
+                Err(SyncQuarantineError::AtCapacity { .. }) => {
+                    warn!(
+                        topic_id = %rejection.topic_id,
+                        %event_id,
+                        records = usage.records,
+                        bytes = usage.bytes,
+                        "Holding the sync cursor: the quarantine store is at capacity"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(NetError::Bootstrap(error.to_string())),
+            }
+        }
+        Ok(Some(entries))
+    }
+
+    /// Commit rejection evidence and the topic cursor in one transaction so the
+    /// cursor can never move past evidence that is not durable. `false` means
+    /// the store is at capacity and nothing was written.
+    async fn commit_cursor_evidence(
+        &self,
+        rejections: &[SyncRejection],
+        cursor_write: (String, ByteView, Value),
+    ) -> Result<bool> {
+        let txn_id = start_storage_transaction(&self.storage).await?;
+        let mut writes = match self.quarantine_entries(rejections, txn_id).await {
+            Ok(Some(entries)) => entries,
+            Ok(None) => {
+                self.abort_transaction(txn_id).await;
+                return Ok(false);
+            }
             Err(error) => {
-                warn!(%error, "failed to encode sync quarantine record");
-                return;
+                self.abort_transaction(txn_id).await;
+                return Err(error);
             }
         };
-        let key = ByteView::from(sync_quarantine_key(topic, event.event_id));
-        if let Err(error) = self
-            .storage_batch_write(vec![(
-                SYNC_QUARANTINE_KEYSPACE.to_string(),
-                key,
-                value.into(),
-            )])
-            .await
+        writes.push(cursor_write);
+        if let Err(error) =
+            storage_batch_delete_and_write_in_transaction(&self.storage, txn_id, Vec::new(), writes)
+                .await
         {
-            warn!(%error, event_id = %event.event_id, "failed to quarantine rejected sync event");
+            self.abort_transaction(txn_id).await;
+            return Err(error);
         }
+        Ok(true)
     }
-}
 
-/// Build the durable record for a permanently-rejected admin sync event. The
-/// event is preserved verbatim in `event_bytes` for later inspection.
-fn quarantine_record(
-    topic: &[u8],
-    event: &AdminDocumentEvent,
-    reason: &str,
-    quarantined_at_ms: u64,
-) -> SyncQuarantineRecord {
-    SyncQuarantineRecord::from_event(
-        topic,
-        &DocumentSyncEvent::AdminOperation {
-            target: aruna_core::structs::admin_sync_target(&event.target),
-            event: Box::new(event.clone()),
-            placement: PlacementRef::NIL,
-        },
-        reason,
-        quarantined_at_ms,
-    )
+    async fn abort_transaction(&self, txn_id: TxnId) {
+        let _ = self
+            .storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+    }
 }
 
 fn target_write_entry(target: DocumentSyncTarget, value: Value) -> (String, ByteView, Value) {
@@ -8798,33 +9104,6 @@ mod tests {
             actor: actor.clone(),
             op,
         }
-    }
-
-    #[test]
-    fn quarantine_record_preserves_the_event() {
-        // A rejected admin event is retained verbatim for later inspection (#338).
-        let realm_id = RealmId::from_bytes([42; 32]);
-        let user_id = UserId::local(Ulid::from_bytes([3; 16]), realm_id);
-        let actor = test_actor(4, user_id, realm_id);
-        let event_id = Ulid::from_bytes([7; 16]);
-        let event = test_admin_event(
-            event_id,
-            AdminDocumentTarget::User { user_id },
-            &actor,
-            1,
-            AdminDocumentOperation::UserNameSet {
-                name: "Mallory".to_string(),
-            },
-        );
-
-        let record = quarantine_record(&[9u8; 32], &event, "unauthorized", 55);
-
-        assert_eq!(record.event_id, event_id);
-        assert_eq!(record.origin_node_id, actor.node_id);
-        assert_eq!(record.reason, "unauthorized");
-        assert_eq!(record.quarantined_at_ms, 55);
-        let decoded: AdminDocumentEvent = postcard::from_bytes(&record.event_bytes).unwrap();
-        assert_eq!(decoded, event);
     }
 
     async fn apply_conflicting_user_name_and_attribute(
