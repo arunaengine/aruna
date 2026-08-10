@@ -1765,7 +1765,7 @@ fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError 
 
 /// The caller's own bearer token, carried to the holder a write is forwarded to
 /// so it re-runs the same permission checks under the same authority.
-fn forwarded_auth_token(
+pub(crate) fn forwarded_auth_token(
     bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
 ) -> ServerResult<Option<aruna_operations::metadata::MetadataAuthToken>> {
     forwarded_bearer(bearer_token_to_string(bearer_token).as_deref())

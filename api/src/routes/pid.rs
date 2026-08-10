@@ -1,9 +1,11 @@
 //! w3id persistent-identifier landing resolution.
 //!
-//! A PID is the document graph IRI `https://w3id.org/aruna/{document_id}`.
-//! Resolution consults the mapping: Active resolves to the RO-Crate read (which
-//! enforces its own visibility), Withdrawn is a permanent 410, and an unminted id
-//! 404s here without affecting the normal metadata read.
+//! A PID is the document graph IRI `https://w3id.org/aruna/{document_id}`. Every
+//! operation routes to a holder of the document's metadata placement, which is the
+//! mapping's authority: resolution redirects only while the document is
+//! anonymously readable, a withdrawn mapping is a permanent 410 whatever the
+//! document's visibility, and everything else is indistinguishable from unminted.
+//! A node that cannot reach the authority reports 503, never a local 404.
 //!
 //! DEPLOYMENT: the external `w3id.org/aruna/{id}` redirect (currently pointed at
 //! the v2 API) should target `/api/v1/pid/{id}`; that is a deployment change, not
@@ -26,10 +28,15 @@ use aruna_core::structs::{
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::jobs::service::submit_mint_pid;
-use aruna_operations::persistent_id::{read_mapping, withdraw_persistent_id};
+use aruna_operations::metadata::PersistentIdResolution;
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::forward::{resolve_pid_routed, withdraw_pid_routed};
 
-use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
+};
 use crate::error::{ServerError, ServerResult};
+use crate::routes::metadata::{forwarded_auth_token, map_metadata_api_error};
 use crate::server_state::ServerState;
 
 pub fn router() -> Router<Arc<ServerState>> {
@@ -51,24 +58,12 @@ async fn resolve_pid(
         return StatusCode::NOT_FOUND.into_response();
     };
     let ctx = state.get_ctx();
-
-    let mapping = match read_mapping(&ctx, document_id).await {
-        Ok(Some(mapping)) => mapping,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    match mapping.status {
-        PersistentIdStatus::Withdrawn => gone(&mapping.pid),
-        PersistentIdStatus::Active => {
-            match load_metadata_record_by_document(&ctx, document_id).await {
-                Ok(Some(_)) => redirect(&rocrate_location(document_id)),
-                // Safety net: a minted PID whose target is gone is a permanent 410,
-                // never a 404, even if the delete-time withdrawal did not persist.
-                Ok(None) => gone(&mapping.pid),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-        }
+    match resolve_pid_routed(&ctx, state.get_realm_id(), document_id).await {
+        Ok(PersistentIdResolution::Redirect) => redirect(&rocrate_location(document_id)),
+        Ok(PersistentIdResolution::Gone { pid }) => gone(&pid),
+        Ok(PersistentIdResolution::Missing) => StatusCode::NOT_FOUND.into_response(),
+        Err(MetadataApiError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -133,12 +128,14 @@ async fn mint_pid(
     ))
 }
 
-/// Explicit admin withdrawal: flip a minted PID to a permanent 410 tombstone.
-/// Deletion and harvest-tombstoning withdraw automatically; this is the manual
-/// path. Idempotent.
+/// Explicit admin withdrawal: flip a document's PID to a permanent 410 tombstone,
+/// writing the tombstone even when nothing was ever minted so an accepted mint job
+/// cannot land after it. Deletion withdraws automatically; this is the manual
+/// path. Idempotent, and 204 only once the transition is durable on the authority.
 async fn withdraw_pid(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
@@ -155,9 +152,18 @@ async fn withdraw_pid(
         Permission::WRITE,
     )
     .await?;
-    withdraw_persistent_id(&ctx, document_id, unix_timestamp_millis())
-        .await
-        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?;
+    let mapping = withdraw_pid_routed(
+        &ctx,
+        state.get_realm_id(),
+        document_id,
+        unix_timestamp_millis(),
+        forwarded_auth_token(bearer_token)?,
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    if mapping.status != PersistentIdStatus::Withdrawn {
+        return Err(ServerError::ServiceUnavailable);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

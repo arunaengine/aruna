@@ -2591,7 +2591,7 @@ async fn ensure_record_readable(
     }
 }
 
-async fn can_read_record(
+pub(crate) async fn can_read_record(
     context: &DriverContext,
     realm_id: RealmId,
     auth: Option<&AuthContext>,
