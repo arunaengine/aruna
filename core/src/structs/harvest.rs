@@ -120,6 +120,38 @@ pub struct HarvestSelector {
     pub metadata_prefix: Option<String>,
 }
 
+/// Datestamp precision an OAI-PMH repository advertises through `Identify`.
+/// A day-granularity repository answers `badArgument` to a second-granularity
+/// `from`, so a discovered value is persisted and every later window is
+/// formatted at exactly that precision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum HarvestGranularity {
+    /// `YYYY-MM-DD`, the OAI-PMH baseline every repository must support.
+    #[default]
+    Day,
+    /// `YYYY-MM-DDThh:mm:ssZ`.
+    Second,
+}
+
+impl HarvestGranularity {
+    /// Recognize the two `Identify` granularity strings; anything else is
+    /// unknown and leaves the caller on the baseline.
+    pub fn parse(advertised: &str) -> Option<Self> {
+        match advertised.trim() {
+            "YYYY-MM-DD" => Some(Self::Day),
+            "YYYY-MM-DDThh:mm:ssZ" => Some(Self::Second),
+            _ => None,
+        }
+    }
+
+    pub const fn format(self) -> &'static str {
+        match self {
+            Self::Day => "%Y-%m-%d",
+            Self::Second => "%Y-%m-%dT%H:%M:%SZ",
+        }
+    }
+}
+
 /// Incremental harvest position, advanced only after records are applied so a
 /// re-run resumes rather than restarts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -145,6 +177,9 @@ pub struct HarvestSource {
     pub selector: HarvestSelector,
     /// Re-harvest spacing; `None` harvests once on demand.
     pub schedule_interval_ms: Option<u64>,
+    /// Granularity discovered from the provider's `Identify`; `None` until the
+    /// first successful discovery.
+    pub granularity: Option<HarvestGranularity>,
     pub cursor: Option<HarvestCursor>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -172,6 +207,7 @@ impl HarvestSource {
             target_prefix,
             selector,
             schedule_interval_ms,
+            granularity: None,
             cursor: None,
             created_at,
             updated_at: created_at,

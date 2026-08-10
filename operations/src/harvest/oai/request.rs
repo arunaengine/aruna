@@ -1,6 +1,6 @@
 use url::Url;
 
-use aruna_core::structs::HarvestSelector;
+use aruna_core::structs::{HarvestGranularity, HarvestSelector};
 
 /// Default OAI-PMH metadata schema when a source does not pin one.
 pub const DEFAULT_METADATA_PREFIX: &str = "oai_dc";
@@ -40,12 +40,31 @@ pub fn list_records_url(
     Ok(url)
 }
 
-/// Format Unix milliseconds as an inclusive OAI-PMH `from` datestamp (UTC, second
-/// granularity). Re-fetched boundary records are rejected by provenance staleness.
-pub fn format_from(datestamp_ms: u64) -> Option<String> {
+/// Build an Identify request URL.
+pub fn identify_url(endpoint: &str) -> Result<Url, url::ParseError> {
+    let mut url = Url::parse(endpoint)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.clear();
+        query.append_pair("verb", "Identify");
+    }
+    Ok(url)
+}
+
+/// Format Unix milliseconds as an inclusive OAI-PMH `from` datestamp (UTC) at
+/// the provider's advertised granularity. Re-fetched boundary records are
+/// rejected by provenance staleness.
+///
+/// The epoch is not a harvest position but the absence of one: sending it would
+/// make every first harvest carry a `from`, which a day-granularity repository
+/// answers with `badArgument`.
+pub fn format_from(datestamp_ms: u64, granularity: HarvestGranularity) -> Option<String> {
+    if datestamp_ms == 0 {
+        return None;
+    }
     let seconds = i64::try_from(datestamp_ms / 1000).ok()?;
     let instant = chrono::DateTime::from_timestamp(seconds, 0)?;
-    Some(instant.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    Some(instant.format(granularity.format()).to_string())
 }
 
 #[cfg(test)]
@@ -99,7 +118,29 @@ mod tests {
     }
 
     #[test]
-    fn from_formats_utc_second_granularity() {
-        assert_eq!(format_from(1000).as_deref(), Some("1970-01-01T00:00:01Z"));
+    fn from_formats_at_advertised_granularity() {
+        assert_eq!(
+            format_from(1000, HarvestGranularity::Second).as_deref(),
+            Some("1970-01-01T00:00:01Z")
+        );
+        assert_eq!(
+            format_from(1000, HarvestGranularity::Day).as_deref(),
+            Some("1970-01-01")
+        );
+    }
+
+    #[test]
+    fn epoch_cursor_sends_no_from() {
+        for granularity in [HarvestGranularity::Day, HarvestGranularity::Second] {
+            assert!(format_from(0, granularity).is_none());
+        }
+        let url = list_records_url("https://ex.org/oai", &selector(), None, None).unwrap();
+        assert!(!url.query().unwrap().contains("from="));
+    }
+
+    #[test]
+    fn identify_url_carries_only_the_verb() {
+        let url = identify_url("https://ex.org/oai?stale=1").unwrap();
+        assert_eq!(url.query(), Some("verb=Identify"));
     }
 }

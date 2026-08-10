@@ -5,9 +5,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::structs::{
-    Actor, AuthContext, HarvestCursor, HarvestJobSpec, HarvestProvenance, HarvestRecordState,
-    HarvestSource, IncomingRecord, JobError, JobResultPayload, ProvenanceDecision, RealmId,
-    RepositoryConnector, provenance_decision,
+    Actor, AuthContext, HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance,
+    HarvestRecordState, HarvestSource, IncomingRecord, JobError, JobResultPayload,
+    ProvenanceDecision, RealmId, RepositoryConnector, provenance_decision,
 };
 use aruna_core::types::GroupId;
 use ulid::Ulid;
@@ -18,8 +18,8 @@ use crate::create_metadata_document::{
 };
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::harvest::oai::mapping::oai_dc_to_jsonld;
-use crate::harvest::oai::parse::{OaiRecord, parse_datestamp_ms, parse_list_page};
-use crate::harvest::oai::request::{format_from, list_records_url};
+use crate::harvest::oai::parse::{OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page};
+use crate::harvest::oai::request::{format_from, identify_url, list_records_url};
 use crate::harvest::repository::{
     StorageReadError, parse_connector_read, parse_provenance_read, parse_source_read,
     read_connector_effect, read_provenance_effect, read_source_effect, write_provenance_effect,
@@ -74,7 +74,7 @@ pub async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunO
 }
 
 async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCounts, HarvestFailure> {
-    let source = read_source(ctx, spec.group_id, spec.source_id)
+    let mut source = read_source(ctx, spec.group_id, spec.source_id)
         .await?
         .ok_or_else(|| permanent("harvest source not found"))?;
     let connector = read_connector(ctx, source.group_id, source.connector_id)
@@ -103,7 +103,13 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
         .as_ref()
         .map(|cursor| cursor.last_datestamp_ms)
         .unwrap_or(0);
-    let from = format_from(original_last);
+    if source.granularity.is_none() {
+        source.granularity = discover_granularity(ctx, blob, &connector.endpoint).await;
+        if source.granularity.is_some() {
+            persist_source(ctx, &source).await?;
+        }
+    }
+    let from = format_from(original_last, source.granularity.unwrap_or_default());
     let mut resumption_token = source
         .cursor
         .as_ref()
@@ -122,7 +128,7 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
         )
         .map_err(|error| permanent(format!("invalid OAI endpoint URL: {error}")))?;
 
-        let body = fetch(blob, url).await?;
+        let body = fetch(ctx, blob, url).await?;
         let page = match parse_list_page(&body) {
             Ok(page) => page,
             // A token the provider no longer honours would be replayed by every
@@ -408,13 +414,36 @@ async fn persist_cursor(
         last_datestamp_ms,
         resumption_token,
     });
+    persist_source(ctx, &updated).await
+}
+
+async fn persist_source(ctx: &JobContext, source: &HarvestSource) -> Result<(), HarvestFailure> {
+    let mut updated = source.clone();
     updated.updated_at = SystemTime::now();
     let effect = write_source_effect(&updated, None)
         .map_err(|error| permanent(format!("harvest source encode: {error}")))?;
     expect_write(ctx.driver.storage_handle.send_effect(effect).await)
 }
 
-async fn fetch(blob: &BlobHandle, url: url::Url) -> Result<String, HarvestFailure> {
+/// Ask the provider once which datestamp precision it accepts. `Identify` is a
+/// hint, not a gate: an unreachable or unparseable answer leaves this run on the
+/// baseline and is rediscovered next run.
+async fn discover_granularity(
+    ctx: &JobContext,
+    blob: &BlobHandle,
+    endpoint: &str,
+) -> Option<HarvestGranularity> {
+    let url = identify_url(endpoint).ok()?;
+    let body = fetch(ctx, blob, url).await.ok()?;
+    parse_granularity(&body)
+}
+
+async fn fetch(
+    ctx: &JobContext,
+    blob: &BlobHandle,
+    url: url::Url,
+) -> Result<String, HarvestFailure> {
+    let _ = ctx;
     let request = blob
         .egress_request(url)
         .map_err(|error| permanent(format!("egress screen: {error}")))?;

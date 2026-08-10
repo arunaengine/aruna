@@ -1,3 +1,4 @@
+use aruna_core::structs::HarvestGranularity;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use thiserror::Error;
@@ -230,6 +231,28 @@ fn attribute(element: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, Oai
     Ok(None)
 }
 
+/// Read the advertised granularity out of an `Identify` response. An
+/// unrecognized or missing value leaves the caller on the baseline rather than
+/// failing the harvest, since the verb is only a hint.
+pub fn parse_granularity(xml: &str) -> Option<HarvestGranularity> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut in_granularity = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                in_granularity = local_name(&element) == b"granularity";
+            }
+            Ok(Event::Text(chunk)) if in_granularity => {
+                let raw = std::str::from_utf8(chunk.as_ref()).ok()?;
+                return HarvestGranularity::parse(raw);
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
 /// Convert an OAI-PMH datestamp (`YYYY-MM-DD` or RFC 3339) to Unix milliseconds.
 pub fn parse_datestamp_ms(datestamp: &str) -> Option<u64> {
     if let Ok(instant) = chrono::DateTime::parse_from_rfc3339(datestamp) {
@@ -349,6 +372,27 @@ mod tests {
             page.records[0].dc[0],
             ("title".to_string(), "a & b & c d\u{e9}".to_string())
         );
+    }
+
+    #[test]
+    fn identify_granularity_is_read() {
+        let identify = |value: &str| {
+            format!(
+                r#"<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><Identify>
+                <repositoryName>Ex</repositoryName>
+                <granularity>{value}</granularity></Identify></OAI-PMH>"#
+            )
+        };
+        assert_eq!(
+            parse_granularity(&identify("YYYY-MM-DD")),
+            Some(HarvestGranularity::Day)
+        );
+        assert_eq!(
+            parse_granularity(&identify("YYYY-MM-DDThh:mm:ssZ")),
+            Some(HarvestGranularity::Second)
+        );
+        assert_eq!(parse_granularity(&identify("nonsense")), None);
+        assert_eq!(parse_granularity("<OAI-PMH/>"), None);
     }
 
     #[test]
