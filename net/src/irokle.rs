@@ -3634,14 +3634,16 @@ fn quarantine_record(
     reason: &str,
     quarantined_at_ms: u64,
 ) -> SyncQuarantineRecord {
-    SyncQuarantineRecord {
-        topic: topic.to_vec(),
-        event_id: event.event_id,
-        origin_node_id: event.origin_node_id,
-        reason: reason.to_string(),
+    SyncQuarantineRecord::from_event(
+        topic,
+        &DocumentSyncEvent::AdminOperation {
+            target: aruna_core::structs::admin_sync_target(&event.target),
+            event: Box::new(event.clone()),
+            placement: PlacementRef::NIL,
+        },
+        reason,
         quarantined_at_ms,
-        event_bytes: postcard::to_allocvec(event).unwrap_or_default(),
-    }
+    )
 }
 
 fn target_write_entry(target: DocumentSyncTarget, value: Value) -> (String, ByteView, Value) {
