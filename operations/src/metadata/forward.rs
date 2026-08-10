@@ -1818,10 +1818,26 @@ async fn held_record(
             placement.strategy_id, placement.shard
         )));
     }
-    let record = existing_record(context, document_id)
+    let record = match existing_record(context, document_id)
         .await
         .map_err(HeldRecordError::Unavailable)?
-        .ok_or(HeldRecordError::NotFound)?;
+    {
+        Some(record) => record,
+        // An empty registry read is not absence while this node still owes the
+        // projection of a committed create: reporting not-found would let a caller
+        // that polls every holder conclude the document never existed.
+        None => {
+            return Err(match projection_queued(context, document_id).await {
+                Ok(true) => HeldRecordError::Unavailable(format!(
+                    "metadata document `{document_id}` has a queued registry projection"
+                )),
+                Ok(false) => HeldRecordError::NotFound,
+                Err(_) => HeldRecordError::Unavailable(
+                    "pending metadata projection scan is unavailable".to_string(),
+                ),
+            });
+        }
+    };
     if !routed_record_matches(config, config.realm_id, document_id, &placement, &record) {
         return Err(HeldRecordError::Unavailable(
             "metadata registry record does not match its structured placement".to_string(),
