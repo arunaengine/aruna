@@ -77,12 +77,14 @@ fn storage_is_transient(error: &StorageError) -> bool {
     )
 }
 
+/// A missing graph is a durable registry row whose materialization has not
+/// caught up, which the read API already reports as service unavailable. Only a
+/// rejected document stays permanent.
 fn metadata_error_transient(error: &MetadataError) -> bool {
     match error {
         MetadataError::Validation(_)
         | MetadataError::InvalidInput(_)
-        | MetadataError::InvalidEffect
-        | MetadataError::GraphNotFound => false,
+        | MetadataError::InvalidEffect => false,
         MetadataError::Storage(error) => storage_is_transient(error),
         _ => true,
     }
@@ -163,9 +165,6 @@ mod tests {
                 expected: "e",
                 got: "g".to_string(),
             }),
-            update(UpdateMetadataDocumentError::MetadataError(
-                MetadataError::GraphNotFound,
-            )),
             delete(DeleteMetadataDocumentError::DocumentNotFound),
             delete(DeleteMetadataDocumentError::MissingTransaction),
             delete(DeleteMetadataDocumentError::UnexpectedEvent {
@@ -243,6 +242,15 @@ mod tests {
             delete(DeleteMetadataDocumentError::MetadataError(
                 MetadataError::Persist("disk".to_string()),
             )),
+            create(CreateMetadataDocumentError::MetadataError(
+                MetadataError::GraphNotFound,
+            )),
+            update(UpdateMetadataDocumentError::MetadataError(
+                MetadataError::GraphNotFound,
+            )),
+            delete(DeleteMetadataDocumentError::MetadataError(
+                MetadataError::GraphNotFound,
+            )),
         ];
         for error in retryable {
             let label = error.to_string();
@@ -251,6 +259,24 @@ mod tests {
                 "expected retryable: {label}"
             );
         }
+    }
+
+    /// A lagging graph must never retire a source record: the read API answers
+    /// the same condition with service unavailable.
+    #[test]
+    fn graph_not_found_is_unavailable() {
+        assert!(matches!(
+            classify_metadata(update(UpdateMetadataDocumentError::MetadataError(
+                MetadataError::GraphNotFound
+            ))),
+            MetadataFailure::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_metadata(update(UpdateMetadataDocumentError::MetadataError(
+                MetadataError::InvalidInput("not an iri".to_string())
+            ))),
+            MetadataFailure::Permanent(_)
+        ));
     }
 
     #[test]
