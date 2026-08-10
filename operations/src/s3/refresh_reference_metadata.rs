@@ -342,6 +342,7 @@ pub async fn refresh_reference_metadata_with_context(
             let BlobVersionState::Reference {
                 source,
                 last_refresh,
+                advance_count,
                 ..
             } = state
             else {
@@ -364,6 +365,7 @@ pub async fn refresh_reference_metadata_with_context(
                             refresh.refreshed_at,
                         )
                         .with_metadata(metadata)
+                        .with_advance_count(advance_count)
                     })
                     .to_bytes()
                     {
@@ -944,6 +946,7 @@ mod tests {
         test: &TestState,
         cached_metadata: SourceMetadata,
         last_refresh: SystemTime,
+        advance_count: u16,
     ) {
         let version = BlobVersion::reference(
             source_binding(),
@@ -955,7 +958,8 @@ mod tests {
         .with_metadata(std::collections::HashMap::from([(
             "mtime".to_string(),
             "1753272000.123456789".to_string(),
-        )]));
+        )]))
+        .with_advance_count(advance_count);
         match test
             .context
             .storage_handle
@@ -975,11 +979,7 @@ mod tests {
         }
     }
 
-    async fn assert_reference_state(
-        test: &TestState,
-        expected_metadata: &SourceMetadata,
-        expected_last_refresh: SystemTime,
-    ) {
+    async fn read_reference(test: &TestState) -> BlobVersion {
         let Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
         }) = test
@@ -997,7 +997,15 @@ mod tests {
         else {
             panic!("unexpected version read event");
         };
-        let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+        BlobVersion::from_bytes(value.as_ref()).unwrap()
+    }
+
+    async fn assert_reference_state(
+        test: &TestState,
+        expected_metadata: &SourceMetadata,
+        expected_last_refresh: SystemTime,
+    ) {
+        let version = read_reference(test).await;
         assert_eq!(
             version.metadata.get("mtime").map(String::as_str),
             Some("1753272000.123456789")
@@ -1053,7 +1061,7 @@ mod tests {
         let test = setup_state();
         let last_refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let original_metadata = source_metadata(10, "original");
-        write_reference_version(&test, original_metadata.clone(), last_refresh).await;
+        write_reference_version(&test, original_metadata.clone(), last_refresh, 0).await;
 
         crate::driver::drive(
             QueueReferenceMetadataRefreshOperation::new(refresh(
@@ -1080,7 +1088,7 @@ mod tests {
         let last_refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let new_metadata = source_metadata(20, "newer");
-        write_reference_version(&test, source_metadata(10, "original"), last_refresh).await;
+        write_reference_version(&test, source_metadata(10, "original"), last_refresh, 0).await;
 
         crate::driver::drive(
             QueueReferenceMetadataRefreshOperation::new(refresh(
@@ -1099,6 +1107,39 @@ mod tests {
         assert_reference_state(&test, &new_metadata, refreshed_at).await;
     }
 
+    // A metadata refresh is not a rebind, so it must not hand the binding a fresh
+    // automatic advance budget.
+    #[tokio::test]
+    async fn refresh_keeps_count() {
+        let test = setup_state();
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let new_metadata = source_metadata(20, "newer");
+        write_reference_version(
+            &test,
+            source_metadata(10, "original"),
+            SystemTime::UNIX_EPOCH,
+            7,
+        )
+        .await;
+
+        crate::driver::drive(
+            QueueReferenceMetadataRefreshOperation::new(refresh(
+                &test,
+                new_metadata.clone(),
+                refreshed_at,
+            )),
+            &test.context,
+        )
+        .await
+        .expect("queue succeeds");
+        process_reference_metadata_refresh_batch(&test.context)
+            .await
+            .expect("drain succeeds");
+
+        assert_reference_state(&test, &new_metadata, refreshed_at).await;
+        assert_eq!(read_reference(&test).await.advance_count(), Some(7));
+    }
+
     #[tokio::test]
     async fn duplicate_reference_metadata_refresh_keeps_newest_job() {
         let test = setup_state();
@@ -1106,7 +1147,7 @@ mod tests {
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let new_metadata = source_metadata(30, "newer");
-        write_reference_version(&test, source_metadata(1, "original"), last_refresh).await;
+        write_reference_version(&test, source_metadata(1, "original"), last_refresh, 0).await;
 
         crate::driver::drive(
             QueueReferenceMetadataRefreshOperation::new(refresh(

@@ -119,6 +119,8 @@ pub enum IncomingVersionReplicationError {
     MissingReferenceMetadata,
     #[error("Reference replication manifest is missing source binding")]
     MissingReferenceSource,
+    #[error("Reference replication manifest is missing its advance count")]
+    MissingReferenceAdvanceCount,
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
     #[error(transparent)]
@@ -442,7 +444,7 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn is_reference_item(&self) -> bool {
-        self.manifest.reference_intent && self.manifest.kind == ReplicationItemKind::Materialized
+        self.manifest.is_reference()
     }
 
     fn valid_advance_manifest(&self) -> bool {
@@ -487,16 +489,23 @@ impl IncomingVersionReplicationOperation {
         let (
             BlobVersionState::Reference {
                 source: previous_source,
+                advance_count: previous_count,
                 ..
             },
             BlobVersionState::Reference {
                 source: incoming_source,
+                advance_count: incoming_count,
                 ..
             },
         ) = (&previous.state, &incoming.state)
         else {
             return Err(IncomingVersionReplicationError::InvalidReferenceAdvance);
         };
+        // Each advance mints exactly one successor, so the count must be
+        // continuous: a gap or repeat would let the publisher reset the cap.
+        if previous_count.checked_add(1) != Some(*incoming_count) {
+            return Err(IncomingVersionReplicationError::InvalidReferenceAdvance);
+        }
         if previous.published_by != Some(self.publisher_node_id)
             || previous.created_by != incoming.created_by
             || previous.metadata != incoming.metadata
@@ -523,6 +532,10 @@ impl IncomingVersionReplicationOperation {
             .reference_metadata
             .clone()
             .ok_or(IncomingVersionReplicationError::MissingReferenceMetadata)?;
+        let advance_count = self
+            .manifest
+            .reference_advance_count
+            .ok_or(IncomingVersionReplicationError::MissingReferenceAdvanceCount)?;
         Ok(BlobVersion::reference(
             source,
             metadata,
@@ -531,6 +544,7 @@ impl IncomingVersionReplicationOperation {
             self.manifest.created_at,
         )
         .with_metadata(self.manifest.metadata.clone())
+        .with_advance_count(advance_count)
         .with_publisher(self.publisher_node_id))
     }
 
@@ -2643,6 +2657,7 @@ mod tests {
             reference_metadata: None,
             metadata: HashMap::new(),
             reference_advance: None,
+            reference_advance_count: None,
         }
     }
 
@@ -2680,6 +2695,7 @@ mod tests {
             last_modified: Some(manifest.created_at),
             source_version: None,
         });
+        manifest.reference_advance_count = Some(0);
         manifest
     }
 
@@ -2702,6 +2718,7 @@ mod tests {
             generation: 8,
             predecessor,
         });
+        manifest.reference_advance_count = Some(1);
         manifest
             .source
             .as_mut()
@@ -3093,6 +3110,46 @@ mod tests {
             panic!("expected successor version write")
         };
         assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+    }
+
+    // One advance mints exactly one successor: a repeated, skipped or overflowing
+    // count would let a publisher reset the cap by replaying advances.
+    #[test]
+    fn advance_rejects_counts() {
+        let (manifest, previous, publisher) = advance_fixture();
+        for count in [Some(0), Some(2), None] {
+            let mut replayed = manifest.clone();
+            replayed.reference_advance_count = count;
+            let op = advance_operation(replayed, publisher);
+            assert!(op.validate_advance(&previous).is_err());
+        }
+
+        let mut exhausted = previous.clone();
+        exhausted.state = BlobVersionState::Reference {
+            source: manifest.source.clone().unwrap(),
+            cached_metadata: manifest.reference_metadata.clone().unwrap(),
+            last_refresh: SystemTime::UNIX_EPOCH,
+            advance_count: u16::MAX,
+        };
+        assert_advance_invalid(manifest, publisher, exhausted);
+    }
+
+    // Repair and snapshot replication reconstruct the reference with the cap the
+    // manifest carries, and refuse a manifest that omits it.
+    #[test]
+    fn reference_keeps_count() {
+        let mut manifest = make_reference_manifest();
+        manifest.reference_advance_count = Some(12);
+        let publisher = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
+        let op = advance_operation(manifest.clone(), publisher);
+        assert_eq!(op.reference_version().unwrap().advance_count(), Some(12));
+
+        manifest.reference_advance_count = None;
+        let op = advance_operation(manifest, publisher);
+        assert_eq!(
+            op.reference_version().unwrap_err(),
+            IncomingVersionReplicationError::MissingReferenceAdvanceCount
+        );
     }
 
     #[test]

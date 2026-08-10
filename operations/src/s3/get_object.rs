@@ -30,12 +30,18 @@ use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::warn;
 
 /// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ADVANCE_ATTEMPTS: u8 = 3;
+/// Minimum age of the current reference version before a read may mint another
+/// successor. Rate-limits a READ-only caller pointing at a source they control.
+pub const MIN_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
+/// Hard bound on automatic successors per explicit binding: the interval only
+/// slows growth, this stops it. Only a WRITE or rebind starts a fresh count.
+pub const MAX_AUTO_ADVANCES: u16 = 100;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +57,7 @@ pub enum GetObjectState {
     HeadReferenceSource,
     StartAdvanceTransaction,
     ReadHeadForAdvance,
+    ReadCurrentForAdvance,
     WriteSuccessor,
     UpdateReferenceUsage,
     CommitAdvance,
@@ -93,6 +100,10 @@ pub enum GetObjectError {
     ReferenceSourceChanged,
     #[error("The historical reference version is no longer available.")]
     HistoricalReferenceUnavailable,
+    #[error(
+        "The reference binding reached its automatic advance limit; rebind it with an explicit write."
+    )]
+    ReferenceAdvanceExhausted,
     #[error(transparent)]
     UsageError(#[from] UsageUpdateError),
     #[error(transparent)]
@@ -207,6 +218,10 @@ pub struct GetObjectOperation {
     reference_creator: Option<UserId>,
     /// Publisher-attested predecessor lineage for the successor.
     reference_advance: Option<ReferenceAdvance>,
+    /// Head pointer revalidated inside the advance transaction.
+    advance_pointer: Option<CurrentVersionPointer>,
+    /// Injected wall clock for the advance interval check; tests set it.
+    now_override: Option<SystemTime>,
     metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
@@ -238,6 +253,8 @@ impl GetObjectOperation {
             restrictions: None,
             reference_creator: None,
             reference_advance: None,
+            advance_pointer: None,
+            now_override: None,
             metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
@@ -269,6 +286,17 @@ impl GetObjectOperation {
         self.state = GetObjectState::Error;
         self.output = Some(Err(error));
         smallvec![]
+    }
+
+    /// Fails the read and releases the advance transaction it holds, so a policy
+    /// rejection never leaves a write transaction open.
+    fn abort_with_error(&mut self, error: GetObjectError) -> Effects {
+        let effects = self.txn_id.take().map_or_else(SmallVec::new, |txn_id| {
+            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        });
+        self.state = GetObjectState::Error;
+        self.output = Some(Err(error));
+        effects
     }
 
     pub fn handle_init(&mut self) -> Effects {
@@ -414,6 +442,7 @@ impl GetObjectOperation {
                 source,
                 cached_metadata,
                 last_refresh,
+                ..
             } => {
                 // The access-driven successor-on-drift core (#256) lands on this
                 // path. Deferred as enhancements: verified cache + singleflight
@@ -710,19 +739,71 @@ impl GetObjectOperation {
         if Some(pointer.version_id) != self.resolved_version_id {
             return self.restart_after_conflict();
         }
-        let (Some(observation), Some(source_binding), Some(creator), Some(txn_id)) = (
+        let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
+            .to_bytes()
+        {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        self.advance_pointer = Some(pointer);
+        self.state = GetObjectState::ReadCurrentForAdvance;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Enforces the durable advance bounds against the reread current version and
+    /// writes the successor in the same transaction.
+    fn handle_advance_version(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let Some(value) = value else {
+            return self.restart_after_conflict();
+        };
+        let current = match BlobVersion::from_bytes(value.as_ref()) {
+            Ok(current) => current,
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        let Some(advance_count) = current.advance_count() else {
+            return self.restart_after_conflict();
+        };
+        if advance_count >= MAX_AUTO_ADVANCES {
+            return self.abort_with_error(GetObjectError::ReferenceAdvanceExhausted);
+        }
+        let now = self.now_override.unwrap_or_else(SystemTime::now);
+        // A backwards clock makes `duration_since` fail, which fails the advance
+        // closed rather than granting an unbounded budget.
+        if !now
+            .duration_since(current.created_at)
+            .is_ok_and(|elapsed| elapsed >= MIN_ADVANCE_INTERVAL)
+        {
+            return self.abort_with_error(GetObjectError::ReferenceSourceChanged);
+        }
+        let Some(successor_count) = advance_count.checked_add(1) else {
+            return self.abort_with_error(GetObjectError::ReferenceAdvanceExhausted);
+        };
+
+        let (Some(observation), Some(source_binding), Some(creator), Some(txn_id), Some(pointer)) = (
             self.advance_observation.clone(),
             self.source_binding.clone(),
             self.reference_creator,
             self.txn_id,
+            self.advance_pointer.clone(),
         ) else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
 
         let new_version_id = Ulid::generate();
-        let now = SystemTime::now();
         let successor = BlobVersion::reference(source_binding, observation, now, creator, now)
-            .with_metadata(self.metadata.clone());
+            .with_metadata(self.metadata.clone())
+            .with_advance_count(successor_count);
         let version_key =
             match VersionKey::new(&self.input.bucket, &self.input.key, new_version_id).to_bytes() {
                 Ok(key) => key.into(),
@@ -938,6 +1019,7 @@ impl GetObjectOperation {
         self.reference_last_refresh = None;
         self.reference_creator = None;
         self.reference_advance = None;
+        self.advance_pointer = None;
         self.source_metadata = None;
         self.advance_observation = None;
         self.usage_update = None;
@@ -1057,6 +1139,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::HeadReferenceSource => self.handle_reference_source_head(event),
             GetObjectState::StartAdvanceTransaction => self.handle_advance_started(event),
             GetObjectState::ReadHeadForAdvance => self.handle_advance_head(event),
+            GetObjectState::ReadCurrentForAdvance => self.handle_advance_version(event),
             GetObjectState::WriteSuccessor => self.handle_successor_written(event),
             GetObjectState::UpdateReferenceUsage => self.handle_advance_usage(event),
             GetObjectState::CommitAdvance => self.handle_advance_committed(event),
@@ -1096,8 +1179,8 @@ mod test {
     use crate::replication::protocol::ReferenceAdvance;
     use crate::replication::queue::LiveReplicationObligationRecord;
     use crate::s3::get_object::{
-        GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState,
-        MAX_DRIFT_ADVANCE_ATTEMPTS, ObjectRangeRequest,
+        GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, MAX_AUTO_ADVANCES,
+        MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
     };
     use crate::usage_stats::UsageCounterUpdate;
     use aruna_blob::blob::BlobHandler;
@@ -1126,7 +1209,7 @@ mod test {
     use futures_util::{StreamExt, stream};
     use std::collections::HashMap;
     use std::path::Path;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use ulid::Ulid;
@@ -2064,6 +2147,21 @@ mod test {
         }
     }
 
+    fn reference_source() -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        }
+    }
+
     /// A current-version read whose head observation already drifted.
     fn drifted_operation() -> GetObjectOperation {
         let mut operation = GetObjectOperation::new(GetObjectInput {
@@ -2075,20 +2173,8 @@ mod test {
             user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId([0u8; 32])),
             node_id: test_node_id(),
         });
-        let source = VersionSourceBinding {
-            strategy: StagingStrategy::Reference,
-            descriptor: PortableSourceDescriptor {
-                kind: SourceConnectorKind::Http,
-                public_config: HashMap::new(),
-                source_path: "folder/file.txt".to_string(),
-                version_selector: None,
-                capabilities: Vec::new(),
-                origin_node_id: None,
-            },
-            connector_id: Some(Ulid::generate()),
-        };
         let version = BlobVersion::reference(
-            source,
+            reference_source(),
             observation(4),
             SystemTime::UNIX_EPOCH,
             UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
@@ -2117,6 +2203,48 @@ mod test {
                 .into(),
             value: Some(CurrentVersionPointer::new(value).to_bytes().unwrap().into()),
         })
+    }
+
+    /// The stored current reference the advance transaction rereads.
+    fn current_version(created_at: SystemTime, advance_count: u16) -> Event {
+        let version = BlobVersion::reference(
+            reference_source(),
+            observation(4),
+            created_at,
+            UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+            created_at,
+        )
+        .with_metadata(HashMap::from([(
+            "label".to_string(),
+            "preserved".to_string(),
+        )]))
+        .with_advance_count(advance_count);
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"version".to_vec().into(),
+            value: Some(version.to_bytes().unwrap().into()),
+        })
+    }
+
+    /// Drives a drifted read through the head CAS up to the version reread.
+    fn advance_to_reread(operation: &mut GetObjectOperation, headed: Ulid) -> Ulid {
+        let txn_id = Ulid::generate();
+        operation.resolved_version_id = Some(headed);
+        operation.txn_id = Some(txn_id);
+        operation.state = GetObjectState::ReadHeadForAdvance;
+        let effects = operation.step(head_read(headed));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        assert_eq!(operation.state, GetObjectState::ReadCurrentForAdvance);
+        txn_id
+    }
+
+    fn written_successor(effects: &[Effect]) -> BlobVersion {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects else {
+            panic!("expected a single batch write, got {effects:?}")
+        };
+        BlobVersion::from_bytes(writes[0].2.as_ref()).unwrap()
     }
 
     fn source_read(metadata: SourceMetadata) -> Event {
@@ -2165,11 +2293,9 @@ mod test {
         let creator = operation.reference_creator.unwrap();
         let reader_auth = operation.auth_context();
         let headed = Ulid::generate();
-        operation.resolved_version_id = Some(headed);
-        operation.txn_id = Some(Ulid::generate());
-        operation.state = GetObjectState::ReadHeadForAdvance;
+        advance_to_reread(&mut operation, headed);
 
-        let effects = operation.step(head_read(headed));
+        let effects = operation.step(current_version(SystemTime::UNIX_EPOCH, 0));
 
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected a single batch write, got {effects:?}")
@@ -2203,6 +2329,104 @@ mod test {
                 generation: next_pointer.generation,
                 predecessor: headed,
             })
+        );
+    }
+
+    // The cooldown is measured against the current version's immutable
+    // `created_at`, and the exact interval is already old enough to advance.
+    #[test]
+    fn advance_at_boundary() {
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut operation = drifted_operation();
+        operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL);
+        advance_to_reread(&mut operation, Ulid::generate());
+
+        let effects = operation.step(current_version(created_at, 7));
+
+        let successor = written_successor(effects.as_slice());
+        assert_eq!(successor.created_at, created_at + MIN_ADVANCE_INTERVAL);
+        assert_eq!(successor.advance_count(), Some(8));
+    }
+
+    // One second inside the cooldown fails closed and releases the transaction
+    // instead of minting another durable successor.
+    #[test]
+    fn advance_rejects_early() {
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut operation = drifted_operation();
+        operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL - Duration::from_secs(1));
+        let txn_id = advance_to_reread(&mut operation, Ulid::generate());
+
+        let effects = operation.step(current_version(created_at, 0));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::ReferenceSourceChanged)
+        );
+    }
+
+    // A backwards clock must not grant an unbounded advance budget.
+    #[test]
+    fn advance_rejects_rollback() {
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut operation = drifted_operation();
+        operation.now_override = Some(created_at - Duration::from_secs(3_600));
+        advance_to_reread(&mut operation, Ulid::generate());
+
+        let effects = operation.step(current_version(created_at, 0));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::ReferenceSourceChanged)
+        );
+    }
+
+    // Count 99 may still mint the hundredth successor.
+    #[test]
+    fn advance_at_cap() {
+        let created_at = SystemTime::UNIX_EPOCH;
+        let mut operation = drifted_operation();
+        operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL);
+        advance_to_reread(&mut operation, Ulid::generate());
+
+        let effects = operation.step(current_version(created_at, MAX_AUTO_ADVANCES - 1));
+
+        assert_eq!(
+            written_successor(effects.as_slice()).advance_count(),
+            Some(MAX_AUTO_ADVANCES)
+        );
+    }
+
+    // At the cap the read fails immediately with its own variant: no retry of the
+    // per-request drift attempts, and the cooldown is never consulted.
+    #[test]
+    fn advance_rejects_exhausted() {
+        let created_at = SystemTime::UNIX_EPOCH;
+        let mut operation = drifted_operation();
+        operation.now_override = Some(created_at + Duration::from_secs(86_400));
+        let txn_id = advance_to_reread(&mut operation, Ulid::generate());
+        let attempts = operation.drift_attempts;
+
+        let effects = operation.step(current_version(created_at, MAX_AUTO_ADVANCES));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ));
+        assert_eq!(operation.drift_attempts, attempts);
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::ReferenceAdvanceExhausted)
         );
     }
 

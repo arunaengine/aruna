@@ -192,6 +192,7 @@ enum ReplicationVersion {
         cached_metadata: SourceMetadata,
         last_refresh: SystemTime,
         metadata: HashMap<String, String>,
+        advance_count: u16,
     },
     Deleted {
         created_at: SystemTime,
@@ -1595,6 +1596,13 @@ impl ReplicateObjectVersionOperation {
                 current_version_pointer.map(|pointer| pointer.generation),
             ),
         };
+        // A materialized version exported as a reference starts a fresh binding at
+        // the target; a reference carries its own count so the cap survives repair.
+        let reference_advance_count = match &version {
+            ReplicationVersion::Reference { advance_count, .. } => Some(*advance_count),
+            ReplicationVersion::Materialized { .. } if reference_intent => Some(0),
+            _ => None,
+        };
         let (kind, created_at, created_by, blob, source, reference, metadata) = match version {
             ReplicationVersion::Materialized {
                 created_at,
@@ -1735,6 +1743,7 @@ impl ReplicateObjectVersionOperation {
             reference_metadata: reference,
             metadata,
             reference_advance: self.reference_advance,
+            reference_advance_count,
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -1930,6 +1939,7 @@ impl Operation for ReplicateObjectVersionOperation {
                         source,
                         cached_metadata,
                         last_refresh,
+                        advance_count,
                     } => {
                         self.pending_materialized_version = None;
                         self.resolve_reference_or_skip(ReplicationVersion::Reference {
@@ -1939,6 +1949,7 @@ impl Operation for ReplicateObjectVersionOperation {
                             cached_metadata,
                             last_refresh,
                             metadata,
+                            advance_count,
                         })
                     }
                 }
@@ -3191,6 +3202,28 @@ mod tests {
         assert_eq!(manifest.reference_advance, Some(advance));
     }
 
+    // Normal reference replication carries the stored cap, so repair and snapshot
+    // transfers cannot hand the target a fresh advance budget.
+    #[test]
+    fn manifest_carries_count() {
+        let mut op = ReplicateObjectVersionOperation::new(version_request(Ulid::generate()))
+            .with_sync(reference_sync());
+        op.preserve_reference = true;
+        op.replication_version = Some(ReplicationVersion::Reference {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+            source: reference_source_binding(),
+            cached_metadata: reference_cached_metadata(),
+            last_refresh: SystemTime::now(),
+            metadata: HashMap::new(),
+            advance_count: 5,
+        });
+
+        op.build_manifest(None).unwrap();
+
+        assert_eq!(op.manifest.unwrap().reference_advance_count, Some(5));
+    }
+
     #[test]
     fn advance_rejects_nonreference() {
         let advance = ReferenceAdvance {
@@ -3314,6 +3347,8 @@ mod tests {
                 source_version: None,
             })
         );
+        // A native version exported as a reference is a fresh binding at the target.
+        assert_eq!(manifest.reference_advance_count, Some(0));
         let source = manifest.source.expect("reference binding");
         assert_eq!(source.strategy, StagingStrategy::Reference);
         assert_eq!(source.connector_id, None);
@@ -3425,6 +3460,7 @@ mod tests {
             cached_metadata,
             last_refresh,
             metadata: HashMap::new(),
+            advance_count: 0,
         });
 
         assert_eq!(

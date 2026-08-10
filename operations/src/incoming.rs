@@ -1227,6 +1227,7 @@ mod tests {
                 generation: 2,
                 predecessor: Ulid::generate(),
             }),
+            reference_advance_count: Some(0),
         };
 
         assert_eq!(

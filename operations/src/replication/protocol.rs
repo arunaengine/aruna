@@ -1,3 +1,4 @@
+use crate::s3::get_object::MAX_AUTO_ADVANCES;
 use aruna_blob::hash::Hasher;
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
@@ -52,9 +53,17 @@ pub struct VersionReplicationManifest {
     pub metadata: HashMap<String, String>,
     #[serde(skip)]
     pub reference_advance: Option<ReferenceAdvance>,
+    /// Automatic advance count of the reference this manifest carries, so repair
+    /// and snapshot replication preserve the cap instead of resetting it.
+    pub reference_advance_count: Option<u16>,
 }
 
 impl VersionReplicationManifest {
+    /// A manifest the target reconstructs as a reference version.
+    pub fn is_reference(&self) -> bool {
+        self.reference_intent && self.kind == ReplicationItemKind::Materialized
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ConversionError> {
         let mut budget = ManifestBudget::default();
         check_text(&mut budget, &self.bucket, MAX_REPLICATION_VALUE_BYTES)?;
@@ -158,6 +167,16 @@ impl VersionReplicationManifest {
         {
             return Err(ConversionError::FromStrError(
                 "replication manifest reference advance is invalid".to_string(),
+            ));
+        }
+
+        let count_valid = match self.reference_advance_count {
+            Some(count) => self.is_reference() && count <= MAX_AUTO_ADVANCES,
+            None => !self.is_reference(),
+        };
+        if !count_valid {
+            return Err(ConversionError::FromStrError(
+                "replication manifest reference advance count is invalid".to_string(),
             ));
         }
 
@@ -559,6 +578,7 @@ mod tests {
             reference_metadata: None,
             metadata: HashMap::new(),
             reference_advance: None,
+            reference_advance_count: None,
         }
     }
 
@@ -594,6 +614,7 @@ mod tests {
             generation: 2,
             predecessor: Ulid::from(1u128),
         });
+        manifest.reference_advance_count = Some(1);
         manifest
     }
 
@@ -737,7 +758,12 @@ mod tests {
         let (legacy, remainder) = postcard::take_from_bytes::<LegacyMessage>(payload).unwrap();
         let LegacyMessage::VersionManifest(legacy) = legacy;
 
-        assert!(remainder.is_empty());
+        // The advance count is strictly trailing, so every earlier field keeps
+        // its position on the wire.
+        assert_eq!(
+            remainder,
+            postcard::to_allocvec(&manifest.reference_advance_count).unwrap()
+        );
         assert_eq!(legacy.bucket, manifest.bucket);
     }
 
@@ -809,6 +835,30 @@ mod tests {
                 VersionReplicationMessage::from_bytes(&message.to_bytes().unwrap()).unwrap_err(),
                 ConversionError::FromStrError(
                     "replication manifest reference advance is invalid".to_string()
+                )
+            );
+        }
+    }
+
+    // The cap only survives replication if every reference manifest carries a
+    // count in range and no other manifest carries one at all.
+    #[test]
+    fn rejects_invalid_counts() {
+        let mut missing = make_advance();
+        missing.reference_advance_count = None;
+        let mut over_cap = make_advance();
+        over_cap.reference_advance_count = Some(super::MAX_AUTO_ADVANCES + 1);
+        let mut not_reference = make_manifest();
+        not_reference.reference_advance_count = Some(0);
+
+        for manifest in [missing, over_cap, not_reference] {
+            let bytes = VersionReplicationMessage::VersionManifest(manifest)
+                .to_bytes()
+                .unwrap();
+            assert_eq!(
+                VersionReplicationMessage::from_bytes(&bytes).unwrap_err(),
+                ConversionError::FromStrError(
+                    "replication manifest reference advance count is invalid".to_string()
                 )
             );
         }

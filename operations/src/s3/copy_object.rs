@@ -232,7 +232,7 @@ pub async fn copy_object(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::s3::get_object::GetObjectOperation;
+    use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::egress::EgressPolicy;
@@ -575,6 +575,81 @@ mod test {
             read_buffer.extend_from_slice(&bytes);
         }
         assert_eq!(read_buffer, b"reference-bytes");
+    }
+
+    // A copy reading a capped reference must surface the exact variant, so the
+    // caller learns that only an explicit rebind heals it.
+    #[tokio::test]
+    async fn copy_reports_exhausted() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+
+        let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        };
+        write_version(
+            &context,
+            "bucket",
+            "capped.txt",
+            BlobVersion::reference(
+                source,
+                SourceMetadata {
+                    content_length: 1,
+                    content_type: Some("text/plain".to_string()),
+                    etag: Some("stale-etag".to_string()),
+                    last_modified: Some(SystemTime::UNIX_EPOCH),
+                    source_version: None,
+                },
+                SystemTime::UNIX_EPOCH,
+                UserId::local(Ulid::generate(), realm_id),
+                SystemTime::UNIX_EPOCH,
+            )
+            .with_advance_count(MAX_AUTO_ADVANCES),
+        )
+        .await;
+
+        let error = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "capped.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            error,
+            CopyObjectError::Get(GetObjectError::ReferenceAdvanceExhausted)
+        );
     }
 
     #[tokio::test]
