@@ -34,7 +34,9 @@ const BUILD_BATCH: usize = 256;
 const SCAN_BATCH: usize = 256;
 /// Index rows a single reader request may inspect before it must stop and hand
 /// the caller a cursor. Bounds request work independently of registry size.
-const CANDIDATE_BUDGET: usize = 512;
+pub const CANDIDATE_BUDGET: usize = 512;
+/// Continuations `earliest_visible` may follow through denied candidates.
+const EARLIEST_PAGES: usize = 64;
 const PRUNE_BATCH: usize = 256;
 const REBUILD_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -63,8 +65,15 @@ impl From<StorageReadError> for VisibilityError {
 /// caller stopping early can resume at exactly the record it emitted last.
 pub struct VisiblePage {
     pub entries: Vec<(Key, MetadataRegistryRecord)>,
-    /// The scan stopped on the candidate budget rather than on `limit` or index
-    /// exhaustion, so more records may match beyond the last entry.
+    /// Index cursor to resume after. It names the last key the scan inspected,
+    /// which may be a candidate the policy re-check discarded, so a page emptied
+    /// by authorization still continues instead of ending the enumeration.
+    pub next_after: Option<Key>,
+    /// Index rows remain inside the window beyond `next_after`. False only when
+    /// the window is genuinely exhausted.
+    pub more: bool,
+    /// The scan stopped on the candidate budget rather than on `limit` or the end
+    /// of the window.
     pub budget_hit: bool,
 }
 
@@ -264,29 +273,32 @@ pub async fn visible_page(
         None => IterStart::At(index_key(generation, from_ms, Ulid::nil())),
     };
 
-    let mut candidates: Vec<(Key, MetadataRegistryRecord)> = Vec::new();
+    let mut entries: Vec<(Key, MetadataRegistryRecord)> = Vec::new();
+    let mut pending: Vec<(Key, MetadataRegistryRecord)> = Vec::new();
+    let mut cursor: Option<Key> = None;
     let mut scanned = 0usize;
     let mut budget_hit = false;
-    let mut exhausted = false;
+    let mut more = true;
 
     'scan: loop {
         let event = context
             .storage_handle
             .send_effect(scan_effect(start.clone(), SCAN_BATCH))
             .await;
-        let (entries, next) = parse_scan(event)?;
-        if entries.is_empty() {
-            exhausted = true;
+        let (batch, next) = parse_scan(event)?;
+        if batch.is_empty() {
+            more = false;
             break;
         }
-        for (key, _) in entries {
+        for (key, _) in batch {
             let (key_generation, updated_at_ms, document_id) =
                 parse_index_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
             if key_generation != generation || updated_at_ms > until_ms {
-                exhausted = true;
+                more = false;
                 break 'scan;
             }
             scanned += 1;
+            cursor = Some(key.clone());
             if updated_at_ms >= from_ms
                 && let Some(record) =
                     crate::get_metadata_document::load_metadata_record_by_document(
@@ -296,8 +308,13 @@ pub async fn visible_page(
                     .await?
                 && record.updated_at_ms == updated_at_ms
             {
-                candidates.push((key, record));
-                if candidates.len() >= limit {
+                pending.push((key, record));
+            }
+            // Re-check as soon as the candidates in hand could fill the page, so
+            // denied leading candidates are replaced instead of ending the page.
+            if entries.len() + pending.len() >= limit {
+                admit_visible(context, &mut pending, &mut entries).await?;
+                if entries.len() >= limit {
                     break 'scan;
                 }
             }
@@ -309,37 +326,72 @@ pub async fn visible_page(
         match next {
             Some(next) => start = IterStart::After(next),
             None => {
-                exhausted = true;
+                more = false;
                 break;
             }
         }
     }
+    admit_visible(context, &mut pending, &mut entries).await?;
 
-    let records: Vec<MetadataRegistryRecord> = candidates
+    // A batch that authorized past `limit` resumes at the last kept entry; the
+    // surplus is served by the next request rather than dropped.
+    if entries.len() > limit {
+        entries.truncate(limit);
+        cursor = entries.last().map(|(key, _)| key.clone());
+        more = true;
+    }
+    Ok(VisiblePage {
+        entries,
+        next_after: cursor,
+        more,
+        budget_hit,
+    })
+}
+
+/// Applies the anonymous policy re-check to the candidates in hand and moves the
+/// survivors into `entries`.
+async fn admit_visible(
+    context: &DriverContext,
+    pending: &mut Vec<(Key, MetadataRegistryRecord)>,
+    entries: &mut Vec<(Key, MetadataRegistryRecord)>,
+) -> Result<(), VisibilityError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let records: Vec<MetadataRegistryRecord> = pending
         .iter()
         .map(|(_, record)| record.clone())
         .collect();
     let evaluators = load_evaluators(context, &records).await?;
-    let entries: Vec<(Key, MetadataRegistryRecord)> = candidates
-        .into_iter()
-        .filter(|(_, record)| record_visible(record, &evaluators))
-        .collect();
-
-    // Nothing survived a fully-consumed budget: continuing would need an
-    // unbounded scan, so the request fails instead of under-listing silently.
-    if entries.is_empty() && budget_hit {
-        return Err(VisibilityError::Unavailable);
-    }
-    Ok(VisiblePage {
-        entries,
-        budget_hit: budget_hit && !exhausted,
-    })
+    entries.extend(
+        pending
+            .drain(..)
+            .filter(|(_, record)| record_visible(record, &evaluators)),
+    );
+    Ok(())
 }
 
 /// The datestamp of the oldest anonymously visible record, for `earliestDatestamp`.
+///
+/// Follows continuations so a run of denied leading candidates cannot report a
+/// repository as empty, and fails closed rather than reporting a datestamp that
+/// is not the oldest once the walk budget is spent.
 pub async fn earliest_visible(context: &DriverContext) -> Result<Option<u64>, VisibilityError> {
-    let page = visible_page(context, 0, u64::MAX, None, 1).await?;
-    Ok(page.entries.first().map(|(_, record)| record.updated_at_ms))
+    let mut after = None;
+    for _ in 0..EARLIEST_PAGES {
+        let page = visible_page(context, 0, u64::MAX, after, 1).await?;
+        if let Some((_, record)) = page.entries.first() {
+            return Ok(Some(record.updated_at_ms));
+        }
+        if !page.more {
+            return Ok(None);
+        }
+        after = page.next_after;
+        if after.is_none() {
+            return Ok(None);
+        }
+    }
+    Err(VisibilityError::Unavailable)
 }
 
 /// Rebuilds the index into the next generation and publishes it atomically by
@@ -640,6 +692,81 @@ mod tests {
             create_records_and_outbox_write_entries(record, &audit(record), Ulid::generate(), None)
                 .unwrap();
         write(context, writes).await;
+    }
+
+    async fn seed_many(context: &DriverContext, group_id: Ulid, range: std::ops::Range<u64>) {
+        for index in range {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&index.to_be_bytes());
+            seed_record(
+                context,
+                &record(group_id, Ulid::from_bytes(bytes), 100 + index, true),
+            )
+            .await;
+        }
+    }
+
+    // More than one budget of leading candidates denied after publication must
+    // not end the scan: the page continues and the later group still enumerates.
+    #[tokio::test]
+    async fn scan_passes_denied_prefix() {
+        let (context, _dir) = context();
+        let denied = Ulid::from_bytes([91; 16]);
+        let allowed = Ulid::from_bytes([92; 16]);
+        seed_realm(&context, Vec::new()).await;
+        seed_group(&context, denied, Vec::new()).await;
+        seed_group(&context, allowed, Vec::new()).await;
+        seed_many(&context, denied, 0..(CANDIDATE_BUDGET as u64 + 8)).await;
+        let first_allowed = CANDIDATE_BUDGET as u64 + 8;
+        seed_many(&context, allowed, first_allowed..first_allowed + 3).await;
+        rebuild_index(&context).await.unwrap();
+
+        seed_group(
+            &context,
+            denied,
+            vec![deny_policy("operation == 'metadata.read'")],
+        )
+        .await;
+
+        let first = visible_page(&context, 0, u64::MAX, None, 10).await.unwrap();
+        assert!(first.entries.is_empty());
+        assert!(first.more);
+        assert!(first.budget_hit);
+        assert!(first.next_after.is_some());
+
+        let second = visible_page(&context, 0, u64::MAX, first.next_after, 10)
+            .await
+            .unwrap();
+        assert_eq!(second.entries.len(), 3);
+        assert!(!second.more);
+        assert_eq!(
+            earliest_visible(&context).await.unwrap(),
+            Some(100 + first_allowed)
+        );
+    }
+
+    // A page cut at `limit` inside one re-check batch must resume at its last
+    // kept entry, so the surplus is served next instead of being skipped.
+    #[tokio::test]
+    async fn limit_cut_keeps_surplus() {
+        let (context, _dir) = context();
+        let group_id = Ulid::from_bytes([93; 16]);
+        seed_realm(&context, Vec::new()).await;
+        seed_group(&context, group_id, Vec::new()).await;
+        seed_many(&context, group_id, 0..6).await;
+        rebuild_index(&context).await.unwrap();
+
+        let mut after = None;
+        let mut stamps = Vec::new();
+        for _ in 0..6 {
+            let page = visible_page(&context, 0, u64::MAX, after, 2).await.unwrap();
+            stamps.extend(page.entries.iter().map(|(_, record)| record.updated_at_ms));
+            after = page.next_after;
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(stamps, vec![100, 101, 102, 103, 104, 105]);
     }
 
     #[tokio::test]

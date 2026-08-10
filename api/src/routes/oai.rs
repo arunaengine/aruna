@@ -345,7 +345,9 @@ async fn list(
     let page = visible_page(ctx.as_ref(), from_ms, until_ms, start_cursor, PAGE_SIZE + 1)
         .await
         .map_err(visibility_fault)?;
-    if page.entries.is_empty() {
+    // An authorization-emptied or budget-stopped batch is a continuation, not the
+    // end of the enumeration; only an exhausted window has no records.
+    if page.entries.is_empty() && !page.more {
         return Err(protocol("noRecordsMatch", "No records match the request"));
     }
 
@@ -361,7 +363,6 @@ async fn list(
     let mut body = format!("<{tag}>");
     let mut emitted = 0usize;
     let mut last_cursor = None;
-    let mut budget_stopped = false;
     for (cursor, record) in page.entries.iter().take(PAGE_SIZE) {
         let rendered = if include_metadata {
             render_record(state, ctx, realm_id, record).await?
@@ -372,7 +373,6 @@ async fn list(
             if emitted == 0 {
                 return Err(OaiFault::Unavailable);
             }
-            budget_stopped = true;
             break;
         }
         body.push_str(&rendered);
@@ -380,9 +380,16 @@ async fn list(
         last_cursor = Some(cursor.clone());
     }
 
-    let more = budget_stopped || page.entries.len() > emitted || page.budget_hit;
-    if more {
-        let cursor = last_cursor.expect("a token needs an emitted record");
+    // Records held back here resume at the last emitted cursor; a fully emitted
+    // page resumes past the last key the scan inspected.
+    let cursor = if emitted < page.entries.len() {
+        last_cursor
+    } else if page.more {
+        page.next_after.clone().or(last_cursor)
+    } else {
+        None
+    };
+    if let Some(cursor) = cursor {
         body.push_str(&format!(
             "<resumptionToken>{}</resumptionToken>",
             escape_xml(&encode_token(until_ms, cursor.as_ref().to_vec()))
@@ -733,13 +740,14 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, MetadataAuditOperation, MetadataAuditRecord,
         PlacementRef, RealmConfigDocument, RoCrateLimits,
     };
     use aruna_core::types::{Key, Value};
     use aruna_operations::metadata::repository::create_records_and_outbox_write_entries;
-    use aruna_operations::metadata::visibility_index::rebuild_index;
+    use aruna_operations::metadata::visibility_index::{CANDIDATE_BUDGET, rebuild_index};
     use std::collections::{HashMap, HashSet};
 
     struct Fixture {
@@ -815,9 +823,22 @@ mod tests {
 
     async fn seed_scopes(fixture: &Fixture) {
         let realm_id = fixture.realm_id;
-        let group_id = fixture.group_id;
         let config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
         let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id };
+        store(
+            &fixture.ctx,
+            vec![(
+                target.storage_keyspace().to_string(),
+                target.storage_key(),
+                config.to_bytes(&actor(realm_id)).unwrap().into(),
+            )],
+        )
+        .await;
+        seed_group(fixture, fixture.group_id, Vec::new()).await;
+    }
+
+    async fn seed_group(fixture: &Fixture, group_id: Ulid, policies: Vec<RequestPolicy>) {
+        let realm_id = fixture.realm_id;
         let group = Group {
             display_name: "g".to_string(),
             group_id,
@@ -828,16 +849,11 @@ mod tests {
         let auth = GroupAuthorizationDocument {
             group_id,
             roles: HashMap::new(),
-            policies: Vec::new(),
+            policies,
         };
         store(
             &fixture.ctx,
             vec![
-                (
-                    target.storage_keyspace().to_string(),
-                    target.storage_key(),
-                    config.to_bytes(&actor(realm_id)).unwrap().into(),
-                ),
                 (
                     GROUP_KEYSPACE.to_string(),
                     byteview::ByteView::from(group_id.to_bytes().to_vec()),
@@ -853,21 +869,41 @@ mod tests {
         .await;
     }
 
+    fn deny_read() -> RequestPolicy {
+        RequestPolicy {
+            policy_id: Ulid::from_bytes([6u8; 16]),
+            name: "oai".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "operation == 'metadata.read'".to_string(),
+            enabled: true,
+        }
+    }
+
     fn registry_record(fixture: &Fixture, index: u64, public: bool) -> MetadataRegistryRecord {
+        record_in(fixture, fixture.group_id, index, public)
+    }
+
+    fn record_in(
+        fixture: &Fixture,
+        group_id: Ulid,
+        index: u64,
+        public: bool,
+    ) -> MetadataRegistryRecord {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&index.to_be_bytes());
         let document_id = Ulid::from_bytes(bytes);
         let path = format!("doc/{index}");
         MetadataRegistryRecord {
             realm_id: fixture.realm_id,
-            group_id: fixture.group_id,
+            group_id,
             document_id,
             document_path: path.clone(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public,
             permission_path: MetadataRegistryRecord::permission_path_for(
                 &fixture.realm_id,
-                fixture.group_id,
+                group_id,
                 &path,
                 document_id,
             ),
@@ -884,24 +920,26 @@ mod tests {
         }
     }
 
+    async fn store_record(fixture: &Fixture, record: &MetadataRegistryRecord) {
+        let audit = MetadataAuditRecord {
+            realm_id: record.realm_id,
+            group_id: record.group_id,
+            document_id: record.document_id,
+            graph_iri: record.graph_iri.clone(),
+            user_id: Default::default(),
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            operation: MetadataAuditOperation::Create,
+            occurred_at_ms: record.updated_at_ms,
+            details: None,
+        };
+        let writes = create_records_and_outbox_write_entries(record, &audit, Ulid::generate(), None)
+            .unwrap();
+        store(&fixture.ctx, writes).await;
+    }
+
     async fn seed_records(fixture: &Fixture, count: u64, public: bool) {
         for index in 0..count {
-            let record = registry_record(fixture, index, public);
-            let audit = MetadataAuditRecord {
-                realm_id: record.realm_id,
-                group_id: record.group_id,
-                document_id: record.document_id,
-                graph_iri: record.graph_iri.clone(),
-                user_id: Default::default(),
-                node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-                operation: MetadataAuditOperation::Create,
-                occurred_at_ms: record.updated_at_ms,
-                details: None,
-            };
-            let writes =
-                create_records_and_outbox_write_entries(&record, &audit, Ulid::generate(), None)
-                    .unwrap();
-            store(&fixture.ctx, writes).await;
+            store_record(fixture, &registry_record(fixture, index, public)).await;
         }
         rebuild_index(&fixture.ctx).await.unwrap();
     }
@@ -964,6 +1002,56 @@ mod tests {
         let second = list_page(&fixture, Some(&token)).await.unwrap();
         assert_eq!(second.matches("<header>").count(), 1);
         assert!(second.contains("<resumptionToken />"));
+    }
+
+    // Leading candidates denied after publication must continue the enumeration
+    // through a token; reporting noRecordsMatch would drop the later group.
+    #[tokio::test]
+    async fn denied_prefix_continues_list() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        let denied = Ulid::from_bytes([31; 16]);
+        seed_group(&fixture, denied, Vec::new()).await;
+        let tail = CANDIDATE_BUDGET as u64 + 8;
+        for index in 0..tail {
+            store_record(&fixture, &record_in(&fixture, denied, index, true)).await;
+        }
+        for index in tail..tail + 3 {
+            store_record(&fixture, &registry_record(&fixture, index, true)).await;
+        }
+        rebuild_index(&fixture.ctx).await.unwrap();
+        seed_group(&fixture, denied, vec![deny_read()]).await;
+
+        let first = list_page(&fixture, None).await.unwrap();
+        assert_eq!(first.matches("<header>").count(), 0);
+        let token = token_from(&first).expect("a denied batch continues the list");
+
+        let second = list_page(&fixture, Some(&token)).await.unwrap();
+        assert_eq!(second.matches("<header>").count(), 3);
+        assert!(second.contains("<resumptionToken />"));
+    }
+
+    // The oldest visible datestamp must survive a denied prefix longer than one
+    // candidate budget.
+    #[tokio::test]
+    async fn earliest_skips_denied_prefix() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        let denied = Ulid::from_bytes([32; 16]);
+        seed_group(&fixture, denied, Vec::new()).await;
+        let tail = CANDIDATE_BUDGET as u64 + 8;
+        for index in 0..tail {
+            store_record(&fixture, &record_in(&fixture, denied, index, true)).await;
+        }
+        store_record(&fixture, &registry_record(&fixture, tail, true)).await;
+        rebuild_index(&fixture.ctx).await.unwrap();
+        seed_group(&fixture, denied, vec![deny_read()]).await;
+
+        let body = identify(&fixture.ctx, "https://example.test/api/v1/oai")
+            .await
+            .unwrap();
+        let earliest = format_from(1_000 + tail).unwrap();
+        assert!(body.contains(&format!(
+            "<earliestDatestamp>{earliest}</earliestDatestamp>"
+        )));
     }
 
     #[tokio::test]
