@@ -199,25 +199,34 @@ fn now_ms() -> u64 {
     aruna_core::util::unix_timestamp_millis()
 }
 
+/// Waits for `want` on a lost-progress window, not a wall-clock budget: the
+/// supervisor's lease heartbeat ticks `updated_at_ms` while an attempt is alive,
+/// so only a record that stopped advancing fails the wait.
 async fn wait_state(
     ctx: &DriverContext,
     job_id: JobId,
     want: JobState,
-    timeout: Duration,
+    idle: Duration,
 ) -> JobState {
-    let deadline = Instant::now() + timeout;
+    let mut progress = None;
+    let mut deadline = Instant::now() + idle;
     loop {
-        if let Ok(Some(record)) = read_job_record(&ctx.storage_handle, job_id, None).await
+        let record = read_job_record(&ctx.storage_handle, job_id, None)
+            .await
+            .ok()
+            .flatten();
+        if let Some(record) = &record
             && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
         {
             return record.state;
         }
+        let observed = record.map(|record| (record.state, record.updated_at_ms));
+        if observed != progress {
+            progress = observed;
+            deadline = Instant::now() + idle;
+        }
         if Instant::now() >= deadline {
-            let state = read_job_record(&ctx.storage_handle, job_id, None)
-                .await
-                .ok()
-                .flatten()
-                .map(|r| r.state);
+            let state = progress.map(|(state, _)| state);
             panic!("timed out waiting for {want:?}, last state {state:?}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
