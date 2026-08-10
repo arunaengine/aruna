@@ -232,4 +232,26 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
+
+    // The mint job is queued on the document's authority, so that node's answer
+    // about the document is the client's answer, not a fault of this one.
+    #[test]
+    fn mint_maps_submit_errors() {
+        assert!(matches!(
+            mint_submit_error(SubmitJobError::DocumentMissing),
+            ServerError::NotFound
+        ));
+        assert!(matches!(
+            mint_submit_error(SubmitJobError::AuthorityDenied),
+            ServerError::Forbidden
+        ));
+        assert!(matches!(
+            mint_submit_error(SubmitJobError::PlacementUnavailable("down".to_string())),
+            ServerError::ServiceUnavailable
+        ));
+        assert!(matches!(
+            mint_submit_error(SubmitJobError::InvalidWorkspace("bad".to_string())),
+            ServerError::InternalError(_)
+        ));
+    }
 }

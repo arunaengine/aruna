@@ -745,8 +745,10 @@ impl Operation for DeleteMetadataDocumentOperation {
                         "persistent id withdrawal write failed: {error}"
                     )))
                 }
-                other => self
-                    .unexpected_event("persistent id withdrawal write result", format!("{other:?}")),
+                other => self.unexpected_event(
+                    "persistent id withdrawal write result",
+                    format!("{other:?}"),
+                ),
             },
             DeleteMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -868,10 +870,13 @@ mod tests {
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-        METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
     };
     use aruna_core::storage_entries::document_sync_revision_key;
-    use aruna_core::structs::{PlacementStrategy, RealmId, RealmNodeKind};
+    use aruna_core::structs::{
+        PersistentIdMapping, PersistentIdStatus, PlacementStrategy, RealmId, RealmNodeKind,
+        persistent_id_key,
+    };
 
     fn actor() -> aruna_core::structs::Actor {
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -1286,6 +1291,67 @@ mod tests {
             operation.finalize(),
             Err(DeleteMetadataDocumentError::DocumentNotFound)
         );
+    }
+
+    // The PID tombstone is part of the delete, not a follow-up: a crash after the
+    // commit must not be able to leave a deleted document's mapping Active.
+    #[test]
+    fn delete_tombstones_pid() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation =
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(txn_id);
+        operation.state = DeleteMetadataDocumentState::WriteDeleteOutbox;
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: ByteView::from(record.document_id.to_bytes().to_vec()),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: Some(read_txn_id),
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a persistent id mapping read, got {effects:?}");
+        };
+        assert_eq!(key_space, PERSISTENT_ID_MAPPING_KEYSPACE);
+        assert_eq!(*read_txn_id, txn_id);
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(persistent_id_key(record.document_id)),
+            value: None,
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a persistent id withdrawal batch, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+        let mapping = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == PERSISTENT_ID_MAPPING_KEYSPACE)
+            .map(|(_, _, value)| PersistentIdMapping::from_bytes(value).expect("mapping decodes"))
+            .expect("the batch carries the mapping row");
+        assert_eq!(mapping.target, record.document_id);
+        assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
+                if *commit_txn == txn_id
+        ));
     }
 
     #[test]

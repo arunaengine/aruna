@@ -33,13 +33,15 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, DocumentClass, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
-    PlacementBinding, PlacementRef, PlacementScope, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims, band_start,
+    Actor, AuthContext, DocumentClass, GroupAuthorizationDocument, HandleRange,
+    MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementRef, PlacementScope,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+    band_start,
 };
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
@@ -208,12 +210,81 @@ impl Topology {
         MetadataAuthToken::bearer(self.bearer_string()).expect("token is within the length bound")
     }
 
+    /// A bearer token for another realm principal, for fixtures that need a second
+    /// authorized caller.
+    pub fn bearer_for(&self, user_id: UserId) -> MetadataAuthToken {
+        MetadataAuthToken::bearer(self.bearer_string_for(user_id))
+            .expect("token is within the length bound")
+    }
+
+    pub fn auth_for(&self, user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: self.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    /// Adds `user_id` to the group's `user` role, which carries WRITE on the
+    /// group's metadata paths, and waits for the change to replicate.
+    pub async fn grant_group_user(&self, group_id: Ulid, user_id: UserId) -> TestResult<()> {
+        let bytes = read_group_auth(self.node(0), group_id)
+            .await?
+            .ok_or("the seeded group has an authorization document")?;
+        let auth_doc: GroupAuthorizationDocument = postcard::from_bytes(&bytes)?;
+        let role_ids = auth_doc
+            .roles
+            .iter()
+            .filter_map(|(role_id, role)| (role.name == "user").then_some(*role_id))
+            .collect::<HashSet<_>>();
+        hang_cap(
+            "grant_group_user",
+            drive(
+                AddUserToGroupOperation::new(AddUserToGroupInput {
+                    actor: self.actor(self.node(0)),
+                    group_id,
+                    user_id,
+                    role_ids,
+                }),
+                self.node(0).context.as_ref(),
+            ),
+        )
+        .await?;
+        wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+            "the group grant never reached every sync-eligible node",
+            || async {
+                let mut pending = 0;
+                for node in self.nodes.iter().filter(|node| node.is_sync_eligible()) {
+                    let visible = match read_group_auth(node, group_id).await? {
+                        Some(bytes) => postcard::from_bytes::<GroupAuthorizationDocument>(&bytes)
+                            .is_ok_and(|doc| {
+                                doc.roles
+                                    .values()
+                                    .any(|role| role.assigned_users.contains(&user_id))
+                            }),
+                        None => false,
+                    };
+                    if !visible {
+                        pending += 1;
+                    }
+                }
+                Ok(pending)
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     /// The raw signed JWT backing [`Topology::bearer_token`], for callers that pass
     /// a bearer string rather than a [`MetadataAuthToken`].
     pub fn bearer_string(&self) -> String {
+        self.bearer_string_for(self.user_id)
+    }
+
+    fn bearer_string_for(&self, user_id: UserId) -> String {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let claims = TokenClaims {
-            sub: self.user_id.to_string(),
+            sub: user_id.to_string(),
             iss: self.realm_id.to_string(),
             iat: now,
             exp: now + 600,

@@ -12,19 +12,28 @@
 mod topology;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::{MintPersistentIdSpec, PersistentIdStatus, PlacementRef, pid_dedup_key};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::{METADATA_PENDING_PROJECTION_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
+use aruna_core::storage_entries::metadata_pending_projection_key;
+use aruna_core::structs::{
+    MintPersistentIdSpec, PersistentIdMapping, PersistentIdRevision, PersistentIdStatus,
+    PlacementRef, persistent_id_key, pid_dedup_key,
+};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
-use aruna_operations::jobs::service::submit_mint_pid;
-use aruna_operations::jobs::store::find_dedup_job;
+use aruna_operations::jobs::service::{read_job_routed, submit_mint_pid};
+use aruna_operations::jobs::store::{find_dedup_job, read_job_record};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
-    delete_metadata_document_routed, mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
+    MetadataWriteError, delete_metadata_document_routed, mint_pid_routed, resolve_pid_routed,
+    withdraw_pid_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::persistent_id::read_mapping;
@@ -131,8 +140,9 @@ async fn withdraw_precedes_mint() -> TestResult<()> {
     Ok(())
 }
 
-/// Deleting the document withdraws its mapping on the holder that removed the
-/// registry row, and the mapping outlives that row so the PID stays a 410.
+/// Deleting the document withdraws its mapping inside the transaction that
+/// removes the registry row, and the mapping outlives that row so the PID stays a
+/// 410 — including on an authority that has only the delete, not the tombstone.
 #[tokio::test]
 async fn delete_withdraws_mapping() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -165,6 +175,14 @@ async fn delete_withdraws_mapping() -> TestResult<()> {
     assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
     assert!(mapping.minted_at_ms.is_some());
     assert!(registry_record(holder, document_id).await.is_none());
+    assert!(matches!(
+        resolve_until_answer(&realm, holder, document_id).await?,
+        PersistentIdResolution::Gone { .. }
+    ));
+
+    // The create this node accepted is durable evidence the document existed, so
+    // even an active mapping resolves Gone once the row is gone.
+    write_mapping(holder, active_mapping(document_id, realm.user_id)).await?;
     assert!(matches!(
         resolve_until_answer(&realm, holder, document_id).await?,
         PersistentIdResolution::Gone { .. }
@@ -233,47 +251,106 @@ async fn holder_loss_unavailable() -> TestResult<()> {
     Ok(())
 }
 
-/// Two authorized users minting the same document produce one job identity: the
-/// dedup row is keyed by the document, not by the submitting user.
+/// With the authority down but its replicas up, every other node must report the
+/// PID unavailable. A surviving replica answering in its stead is exactly the
+/// disagreement that turns a stale row into a redirect or a permanent 410.
 #[tokio::test]
-async fn mint_dedups_users() -> TestResult<()> {
+async fn authority_loss_unavailable() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    let (document_id, _) = seed_document(&realm, group_id, "datasets/shared", true).await?;
-    let ingress = realm.node(0);
+    let (document_id, placement) =
+        seed_document(&realm, group_id, "datasets/partitioned", true).await?;
+    let authority = realm.holder(&placement);
+    let replicas: Vec<_> = realm
+        .holders(&placement)
+        .into_iter()
+        .filter(|holder| *holder != authority.node_id())
+        .collect();
+
+    mint_routed(&realm, authority, document_id).await?;
+    for replica in &replicas {
+        let node = realm.find(*replica);
+        wait_until("mint reaches every replica", node.node_id(), || {
+            mapping_active(node, document_id)
+        })
+        .await?;
+    }
+    authority.net.shutdown().await;
+
+    for node in realm
+        .nodes
+        .iter()
+        .filter(|node| node.node_id() != authority.node_id())
+    {
+        assert!(
+            matches!(
+                resolve_pid_routed(&node.context, realm.realm_id, document_id).await,
+                Err(MetadataApiError::ServiceUnavailable)
+            ),
+            "a replica may not answer for the authority"
+        );
+    }
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+/// Two authorized users minting the same document through two ingress nodes get
+/// one job on one owner. A node-local dedup row would let alternating ingress
+/// open a job each, and the handle each caller receives must be readable by that
+/// caller — an owner-scoped id its holder cannot inspect is not a handle.
+#[tokio::test]
+async fn mint_dedups_ingress() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let (document_id, placement) = seed_document(&realm, group_id, "datasets/shared", true).await?;
     let other = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
+    realm.grant_group_user(group_id, other).await?;
+
+    let authority = realm.holder(&placement);
+    let ingress = realm.non_holder_ids(&placement);
+    let (first_node, second_node) = (realm.find(ingress[0]), realm.find(ingress[1]));
 
     let first = submit_mint_pid(
-        &ingress.context,
+        &first_node.context,
         MintPersistentIdSpec {
             document_id,
             minted_by: realm.user_id,
         },
-        ingress.node_id(),
+        first_node.node_id(),
         JOB_RETENTION_MS,
         Some(realm.bearer_token()),
     )
     .await?;
     let second = submit_mint_pid(
-        &ingress.context,
+        &second_node.context,
         MintPersistentIdSpec {
             document_id,
             minted_by: other,
         },
-        ingress.node_id(),
+        second_node.node_id(),
         JOB_RETENTION_MS,
-        Some(realm.bearer_token()),
+        Some(realm.bearer_for(other)),
     )
     .await?;
 
     assert!(first.created);
     assert!(!second.created, "the second user joins the first job");
     assert_eq!(first.job_id, second.job_id);
+
+    for node in realm.nodes.iter() {
+        let stored = read_job_record(&node.context.storage_handle, first.job_id, None).await?;
+        assert_eq!(
+            stored.is_some(),
+            node.node_id() == authority.node_id(),
+            "only the authority may own the mint job"
+        );
+    }
     // Either user resolves the reservation, which is what makes it document-global.
     for user in [realm.user_id, other] {
         assert_eq!(
             find_dedup_job(
-                &ingress.context.storage_handle,
+                &authority.context.storage_handle,
                 user,
                 &pid_dedup_key(document_id),
                 None,
@@ -283,8 +360,276 @@ async fn mint_dedups_users() -> TestResult<()> {
         );
     }
 
+    let owner = read_job_routed(
+        first_node.context.as_ref(),
+        &realm.auth_context(),
+        first.job_id,
+        Some(realm.bearer_token()),
+    )
+    .await?;
+    assert_eq!(owner.job.created_by, realm.user_id);
+    let joiner = read_job_routed(
+        second_node.context.as_ref(),
+        &realm.auth_for(other),
+        second.job_id,
+        Some(realm.bearer_for(other)),
+    )
+    .await?;
+    assert_eq!(
+        joiner.job.created_by, other,
+        "a joined handle is served to its own caller, never as the first submitter"
+    );
+    assert_eq!(joiner.job.job_id, first.job_id);
+
     realm.shutdown().await;
     Ok(())
+}
+
+/// A mapping row on a node that is not the authority carries no version anyone
+/// can compare, so it may neither create a redirect nor a tombstone. Both
+/// directions are checked: a fabricated Active row must not redirect an unminted
+/// document, and a fabricated Withdrawn row must not retire a live one.
+#[tokio::test]
+async fn replica_mapping_ignored() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let (unminted_id, unminted_placement) =
+        seed_document(&realm, group_id, "datasets/unminted", true).await?;
+    let (minted_id, minted_placement) =
+        seed_document(&realm, group_id, "datasets/minted-live", true).await?;
+
+    for node_id in realm.non_holder_ids(&unminted_placement) {
+        write_mapping(
+            realm.find(node_id),
+            active_mapping(unminted_id, realm.user_id),
+        )
+        .await?;
+    }
+    let authority = realm.holder(&minted_placement);
+    assert!(mint_routed(&realm, authority, minted_id).await?.1);
+    for node_id in realm.non_holder_ids(&minted_placement) {
+        write_mapping(realm.find(node_id), withdrawn_mapping(minted_id)).await?;
+    }
+
+    for node in realm.nodes.iter() {
+        assert_eq!(
+            resolve_until_answer(&realm, node, unminted_id).await?,
+            PersistentIdResolution::Missing,
+            "a replica's mapping must not mint a redirect"
+        );
+        assert_eq!(
+            resolve_until_answer(&realm, node, minted_id).await?,
+            PersistentIdResolution::Redirect,
+            "a replica's tombstone must not retire a live PID"
+        );
+    }
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+/// An active mapping that reached the authority before the document did is not
+/// evidence of deletion. Answering Gone from that state emits a permanent 410 for
+/// a live document, so the authority reports unavailable until it can tell the
+/// two apart.
+#[tokio::test]
+async fn premature_mapping_unavailable() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let origin = realm.node(0);
+    let path = "datasets/unprojected";
+    let document_id =
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let placement = realm
+        .origin_placement(origin, group_id, document_id, path)
+        .ok_or("a Management node holds buckets")?;
+
+    let authority = realm.holder(&placement);
+    write_mapping(authority, active_mapping(document_id, realm.user_id)).await?;
+
+    assert!(
+        matches!(
+            resolve_pid_routed(&authority.context, realm.realm_id, document_id).await,
+            Err(MetadataApiError::ServiceUnavailable)
+        ),
+        "an unexplained active mapping is unavailable, never a false 410"
+    );
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+/// A forwarded withdrawal is a document operation, so the authority re-runs the
+/// document's WRITE check. Without a registry row there is no permission path to
+/// check at all, and bare realm membership must not be able to tombstone an
+/// arbitrary id: mint never replaces a tombstone, so that would brick the PID.
+#[tokio::test]
+async fn withdraw_needs_write() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let (document_id, placement) =
+        seed_document(&realm, group_id, "datasets/guarded", true).await?;
+    let outsider = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
+    let sender = realm.non_holder(&placement);
+
+    let denied = withdraw_pid_routed(
+        &sender.context,
+        realm.realm_id,
+        document_id,
+        aruna_core::util::unix_timestamp_millis(),
+        Some(realm.bearer_for(outsider)),
+    )
+    .await;
+    assert!(
+        matches!(denied, Err(MetadataApiError::Forbidden)),
+        "a realm member without document WRITE may not withdraw it: {denied:?}"
+    );
+
+    let never_created = mint_local_document(
+        &realm.config,
+        &realm.actor(realm.node(0)),
+        group_id,
+        "datasets/ghost",
+    )?
+    .as_ulid();
+    let absent = withdraw_pid_routed(
+        &sender.context,
+        realm.realm_id,
+        never_created,
+        aruna_core::util::unix_timestamp_millis(),
+        Some(realm.bearer_for(outsider)),
+    )
+    .await;
+    assert!(
+        matches!(absent, Err(MetadataApiError::NotFound)),
+        "an id with no registry row has no withdrawal to authorize: {absent:?}"
+    );
+
+    for node in realm.nodes.iter() {
+        for id in [document_id, never_created] {
+            assert!(
+                read_mapping(node.context.as_ref(), id).await?.is_none(),
+                "no tombstone may be written by an unauthorized withdrawal"
+            );
+        }
+    }
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+/// A holder that still owes a create's registry projection may not answer a
+/// routed delete with absence: with every holder lagging, the harvest deletion
+/// path would take that fan-out as proof the document never existed and go
+/// terminal over a live document.
+#[tokio::test]
+async fn delete_waits_projection() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let origin = realm.node(0);
+    let path = "datasets/lagging";
+    let document_id =
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let placement = realm
+        .origin_placement(origin, group_id, document_id, path)
+        .ok_or("a Management node holds buckets")?;
+    let sender = realm.non_holder(&placement);
+
+    // Every holder reachable and empty: absence is then a definitive answer.
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "the routed delete never reached every holder",
+        || async {
+            match routed_delete(&realm, sender, document_id).await {
+                Err(MetadataWriteError::NotFound) => Ok(0),
+                _ => Ok(1),
+            }
+        },
+    )
+    .await?;
+
+    queue_projection(realm.holder(&placement), document_id).await?;
+    let pending = routed_delete(&realm, sender, document_id).await;
+    assert!(
+        matches!(pending, Err(MetadataWriteError::Undeliverable(_))),
+        "a queued projection makes the holder's answer retryable: {pending:?}"
+    );
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+async fn routed_delete(
+    realm: &Topology,
+    node: &TestNode,
+    document_id: Ulid,
+) -> Result<(), MetadataWriteError> {
+    delete_metadata_document_routed(
+        &node.context,
+        realm.actor(node),
+        None,
+        document_id,
+        Some(realm.bearer_token()),
+    )
+    .await
+}
+
+fn revision(occurred_at_ms: u64) -> PersistentIdRevision {
+    PersistentIdRevision {
+        event_id: Ulid::generate(),
+        actor: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        occurred_at_ms,
+    }
+}
+
+fn active_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
+    PersistentIdMapping::conceptual(document_id, minted_by, revision(1))
+}
+
+fn withdrawn_mapping(document_id: Ulid) -> PersistentIdMapping {
+    PersistentIdMapping::tombstone(document_id, revision(2))
+}
+
+/// Writes a mapping row straight into one node's store, which is what a delayed
+/// or forged replication would leave behind.
+async fn write_mapping(node: &TestNode, mapping: PersistentIdMapping) -> TestResult<()> {
+    write_entry(
+        node,
+        PERSISTENT_ID_MAPPING_KEYSPACE,
+        persistent_id_key(mapping.target),
+        mapping.to_bytes()?,
+    )
+    .await
+}
+
+/// Marks a committed create as still unprojected on one node.
+async fn queue_projection(node: &TestNode, document_id: Ulid) -> TestResult<()> {
+    write_entry(
+        node,
+        METADATA_PENDING_PROJECTION_KEYSPACE,
+        metadata_pending_projection_key(document_id, Ulid::generate()).to_vec(),
+        Vec::new(),
+    )
+    .await
+}
+
+async fn write_entry(
+    node: &TestNode,
+    key_space: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> TestResult<()> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![(key_space.to_string(), key.into(), value.into())],
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected fixture write event: {other:?}").into()),
+    }
 }
 
 async fn mint_routed(
