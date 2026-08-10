@@ -25,6 +25,7 @@ pub mod search;
 pub mod staging;
 pub mod storage_routing;
 pub mod sync;
+pub mod sync_quarantine;
 pub mod tes;
 pub mod tokens;
 pub mod users;
@@ -40,6 +41,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(group_backends::router())
         .merge(storage_routing::router())
         .merge(sync::router())
+        .merge(sync_quarantine::router())
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())
