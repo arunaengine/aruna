@@ -658,6 +658,13 @@ impl JobPayload {
         )
     }
 
+    /// Whether the dedup row is reclaimed when the job is pruned rather than when
+    /// it reaches a terminal state. Replaying the request while the job is still
+    /// retained must resolve to the same job identity and the same result.
+    pub fn dedup_until_prune(&self) -> bool {
+        self.is_rocrate() || matches!(self, JobPayload::MintPersistentId(_))
+    }
+
     pub fn rocrate_limits(&self) -> Option<&RoCrateLimits> {
         match self {
             JobPayload::ImportRoCrate(spec) => Some(&spec.limits),
@@ -1274,6 +1281,22 @@ pub fn cleanup_job_id(job_id: JobId) -> JobId {
 
 pub fn workspace_credential_id(job_id: JobId) -> String {
     format!("ws{job_id}")
+}
+
+/// Marker of a dedup key whose scope is the subject it names rather than the
+/// submitting user. `job_dedup_index_key` leaves these unprefixed, so two users
+/// asking for the same thing join one job identity. `user_dedup_key` always
+/// namespaces under `user/`, so a caller can never reach this subspace.
+pub const GLOBAL_DEDUP_PREFIX: &[u8] = b"global/";
+
+/// Dedup key of a PID mint: the document alone, so a concurrent mint by another
+/// user joins the same job rather than creating a second one.
+pub fn pid_dedup_key(document_id: Ulid) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(GLOBAL_DEDUP_PREFIX.len() + 4 + 16);
+    bytes.extend_from_slice(GLOBAL_DEDUP_PREFIX);
+    bytes.extend_from_slice(b"pid/");
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes
 }
 
 /// Dedup key of a user-supplied idempotency key: namespaced under `user/` and
