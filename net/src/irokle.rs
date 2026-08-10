@@ -8374,8 +8374,8 @@ mod tests {
         MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
         PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
         RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
-        band_start,
+        RealmNodeKind, Role, SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding,
+        SyncQuarantineFamily, SyncQuarantineRecord, UserGroupCapOverride, band_start,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId, UserId};
@@ -17254,6 +17254,502 @@ mod tests {
             cursor.dominates(&topic_clock),
             "cursor must advance past the hostile op"
         );
+
+        service.shutdown().await;
+    }
+
+    async fn quarantine_rows(storage: &StorageHandle) -> Vec<SyncQuarantineRecord> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 256,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| {
+                    SyncQuarantineRecord::from_bytes(value.as_ref()).expect("record decodes")
+                })
+                .collect(),
+            other => panic!("unexpected storage iteration event: {other:?}"),
+        }
+    }
+
+    async fn quarantine_usage(storage: &StorageHandle) -> SyncQuarantineUsage {
+        match read_storage_value(
+            storage,
+            SYNC_QUARANTINE_USAGE_KEYSPACE,
+            ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+        )
+        .await
+        {
+            Some(bytes) => SyncQuarantineUsage::from_bytes(bytes.as_ref()).expect("usage decodes"),
+            None => SyncQuarantineUsage::default(),
+        }
+    }
+
+    async fn write_usage(storage: &StorageHandle, usage: SyncQuarantineUsage) {
+        storage_batch_write_to(
+            storage,
+            vec![(
+                SYNC_QUARANTINE_USAGE_KEYSPACE.to_string(),
+                ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+                ByteView::from(usage.to_bytes().expect("usage serializes")),
+            )],
+        )
+        .await
+        .expect("usage row writes");
+    }
+
+    async fn reset_cursor(service: &DocumentSyncService, topic_id: irokle_crate::TopicId) {
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+    }
+
+    async fn cursor_advanced(
+        service: &DocumentSyncService,
+        storage: &StorageHandle,
+        topic_id: irokle_crate::TopicId,
+    ) -> bool {
+        let Some(bytes) = read_storage_value(
+            storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        else {
+            return false;
+        };
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        cursor.dominates(&topic_clock)
+    }
+
+    fn quarantined_reason(records: &[SyncQuarantineRecord], event_id: Ulid) -> String {
+        records
+            .iter()
+            .find(|record| record.event_id == event_id)
+            .unwrap_or_else(|| panic!("event {event_id} is quarantined"))
+            .reason
+            .clone()
+    }
+
+    fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
+        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization};
+
+        NodeInfoDocument {
+            node_id,
+            executors: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 1,
+                documents_held: None,
+                load_permille: None,
+                heartbeat_at_ms: updated_at_ms,
+            },
+            updated_at_ms,
+        }
+        .to_bytes()
+        .expect("node info serializes")
+    }
+
+    #[tokio::test]
+    async fn quarantine_retains_rejected_families() {
+        use aruna_core::structs::{WatchEventKind, WatchEventMask};
+
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([70u8; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(70).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let forged_node = node(71);
+        let owner = UserId::local(Ulid::from_bytes([3; 16]), realm_id);
+
+        let change = |actor, generation, kind| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation,
+                event_id: Ulid::generate(),
+                actor,
+                updated_at_ms: 1,
+            },
+            kind,
+            placement: PlacementRef::NIL,
+        };
+
+        // Same family, invalid then valid: an unusable path prefix, a delete
+        // signed by a node that is not the revision's actor, then a good upsert.
+        let invalid_watch = WatchSubscription::new(
+            owner,
+            "/leading-slash".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            1,
+        );
+        let deleted_watch = WatchSubscription::new(
+            owner,
+            "deleted".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            1,
+        );
+        let valid_watch = WatchSubscription::new(
+            owner,
+            "documents".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            1,
+        );
+        let watch_target = |watch: &WatchSubscription| DocumentSyncTarget::WatchSubscription {
+            owner,
+            watch_id: watch.watch_id,
+        };
+        let watch_topic = watch_target(&valid_watch).sync_topic_id(realm_id, &PlacementRef::NIL);
+
+        let info_target = DocumentSyncTarget::NodeInfo {
+            realm_id,
+            node_id: local_node,
+        };
+        let info_topic = info_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+
+        let invalid_watch_event = Ulid::generate();
+        let forged_delete_event = Ulid::generate();
+        let valid_watch_event = Ulid::generate();
+        let invalid_info_event = Ulid::generate();
+        let valid_info_event = Ulid::generate();
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: invalid_watch_event,
+                        target: watch_target(&invalid_watch),
+                        bytes: invalid_watch.to_bytes().expect("subscription serializes"),
+                        change: change(local_node, 1, DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Delete {
+                        event_id: forged_delete_event,
+                        target: watch_target(&deleted_watch),
+                        change: change(forged_node, 2, DocumentSyncChangeKind::Delete),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: valid_watch_event,
+                        target: watch_target(&valid_watch),
+                        bytes: valid_watch.to_bytes().expect("subscription serializes"),
+                        change: change(local_node, 1, DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: invalid_info_event,
+                        target: info_target.clone(),
+                        bytes: node_info_bytes(forged_node, 5),
+                        change: change(local_node, 1, DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: valid_info_event,
+                        target: info_target.clone(),
+                        bytes: node_info_bytes(local_node, 6),
+                        change: change(local_node, 2, DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        reset_cursor(&service, watch_topic).await;
+        reset_cursor(&service, info_topic).await;
+        service
+            .reconcile_document_topics([watch_topic, info_topic])
+            .await
+            .expect("rejected events are quarantined");
+
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert!(
+            quarantined_reason(&records, invalid_watch_event)
+                .starts_with("invalid watch subscription:")
+        );
+        assert_eq!(
+            quarantined_reason(&records, forged_delete_event),
+            "watch subscription delete actor is not its publisher"
+        );
+        assert!(
+            quarantined_reason(&records, invalid_info_event)
+                .starts_with("invalid node info document:")
+        );
+        // The complete received envelope survives, target included.
+        let invalid_watch_record = records
+            .iter()
+            .find(|record| record.event_id == invalid_watch_event)
+            .expect("watch evidence");
+        assert_eq!(invalid_watch_record.family, SyncQuarantineFamily::Upsert);
+        assert_eq!(
+            invalid_watch_record.target,
+            watch_target(&invalid_watch),
+            "evidence keeps the real target, not a placeholder"
+        );
+        assert_eq!(invalid_watch_record.origin_node_id, local_node);
+        assert_eq!(invalid_watch_record.topic, watch_topic.as_bytes().to_vec());
+        match invalid_watch_record.decode_event().expect("event decodes") {
+            DocumentSyncEvent::Upsert {
+                event_id, bytes, ..
+            } => {
+                assert_eq!(event_id, invalid_watch_event);
+                assert_eq!(
+                    WatchSubscription::from_bytes(&bytes).expect("subscription decodes"),
+                    invalid_watch
+                );
+            }
+            other => panic!("unexpected quarantined event: {other:?}"),
+        }
+        let forged_delete_record = records
+            .iter()
+            .find(|record| record.event_id == forged_delete_event)
+            .expect("delete evidence");
+        assert_eq!(forged_delete_record.family, SyncQuarantineFamily::Delete);
+        assert_eq!(forged_delete_record.origin_node_id, forged_node);
+
+        // The valid successors of both families applied.
+        assert!(
+            read_storage_value(
+                &storage,
+                watch_target(&valid_watch).storage_keyspace(),
+                watch_target(&valid_watch).storage_key(),
+            )
+            .await
+            .is_some()
+        );
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                info_target.storage_keyspace(),
+                info_target.storage_key(),
+            )
+            .await
+            .expect("node info applied")
+            .as_ref(),
+            node_info_bytes(local_node, 6).as_slice()
+        );
+        assert!(cursor_advanced(&service, &storage, watch_topic).await);
+        assert!(cursor_advanced(&service, &storage, info_topic).await);
+
+        let usage = quarantine_usage(&storage).await;
+        assert_eq!(usage.records, 3);
+        assert_eq!(
+            usage.bytes,
+            records
+                .iter()
+                .map(|record| record.to_bytes().expect("record serializes").len() as u64)
+                .sum::<u64>()
+        );
+
+        // Replay: the same evidence, no duplicate rows and no usage growth.
+        reset_cursor(&service, watch_topic).await;
+        reset_cursor(&service, info_topic).await;
+        service
+            .reconcile_document_topics([watch_topic, info_topic])
+            .await
+            .expect("replay reconciles");
+        let replayed = quarantine_rows(&storage).await;
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(quarantine_usage(&storage).await, usage);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn quarantine_keeps_shard_placement() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([72u8; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(72).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_parts(7_200, 1),
+            epoch: 0,
+            shard: 5,
+        };
+        let target = DocumentSyncTarget::PersistentIdMapping {
+            document_id: Ulid::from_parts(7_201, 1),
+        };
+        let topic_id = target.sync_topic_id(realm_id, &placement);
+        service
+            .ensure_document_sync_topics(&[topic_id], Vec::new())
+            .expect("mapping shard topic genesis");
+        let event_id = Ulid::generate();
+        let published = service
+            .publish_documents(
+                vec![DocumentSyncPublish::Delete {
+                    event_id,
+                    target: target.clone(),
+                    change: DocumentSyncChange {
+                        base: None,
+                        current: DocumentSyncRevision {
+                            generation: 1,
+                            event_id: Ulid::generate(),
+                            actor: local_node,
+                            updated_at_ms: 1,
+                        },
+                        kind: DocumentSyncChangeKind::Delete,
+                        placement,
+                    },
+                    allow_genesis: true,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        reset_cursor(&service, topic_id).await;
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("unsupported mapping delete is quarantined");
+
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].reason,
+            "unsupported non-upsert persistent id mapping event"
+        );
+        assert_eq!(records[0].target, target);
+        // The stopgap re-wrapped rejects with a NIL placement; the real one rides along.
+        assert_eq!(
+            records[0]
+                .decode_event()
+                .expect("event decodes")
+                .placement(),
+            placement
+        );
+        assert!(cursor_advanced(&service, &storage, topic_id).await);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn quarantine_capacity_holds_cursor() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([73u8; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(73).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+
+        let target = DocumentSyncTarget::NodeInfo {
+            realm_id,
+            node_id: local_node,
+        };
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let published = service
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: Ulid::generate(),
+                    target: target.clone(),
+                    bytes: node_info_bytes(node(74), 5),
+                    change: DocumentSyncChange {
+                        base: None,
+                        current: DocumentSyncRevision {
+                            generation: 1,
+                            event_id: Ulid::generate(),
+                            actor: local_node,
+                            updated_at_ms: 1,
+                        },
+                        kind: DocumentSyncChangeKind::Upsert,
+                        placement: PlacementRef::NIL,
+                    },
+                    allow_genesis: true,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        // A full store fails the write closed: no evidence, no cursor movement.
+        let full = SyncQuarantineUsage {
+            records: SYNC_QUARANTINE_MAX_RECORDS,
+            bytes: 0,
+        };
+        write_usage(&storage, full).await;
+        reset_cursor(&service, topic_id).await;
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("a full quarantine store is not a reconcile failure");
+        assert!(quarantine_rows(&storage).await.is_empty());
+        assert_eq!(quarantine_usage(&storage).await, full);
+        assert!(!cursor_advanced(&service, &storage, topic_id).await);
+
+        // Reclaimed capacity lets the redelivered event persist and advance.
+        write_usage(&storage, SyncQuarantineUsage::default()).await;
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("the redelivered event is quarantined");
+        assert_eq!(quarantine_rows(&storage).await.len(), 1);
+        assert_eq!(quarantine_usage(&storage).await.records, 1);
+        assert!(cursor_advanced(&service, &storage, topic_id).await);
 
         service.shutdown().await;
     }
