@@ -173,7 +173,7 @@ async fn apply_record(
         counts.skipped += 1;
         return Ok(());
     }
-    let existing = read_provenance(ctx, &source.namespace, identifier).await?;
+    let existing = read_provenance(ctx, source.group_id, &source.namespace, identifier).await?;
     let incoming = IncomingRecord {
         datestamp_ms,
         deleted: record.header.deleted,
@@ -339,6 +339,7 @@ async fn write_provenance(
     tombstoned: bool,
 ) -> Result<(), HarvestFailure> {
     let provenance = HarvestProvenance {
+        group_id: source.group_id,
         namespace: source.namespace.clone(),
         source_record_id: identifier.to_string(),
         meta_resource_id,
@@ -417,13 +418,14 @@ async fn read_connector(
 
 async fn read_provenance(
     ctx: &JobContext,
+    group_id: GroupId,
     namespace: &str,
     identifier: &str,
 ) -> Result<Option<HarvestProvenance>, HarvestFailure> {
     let event = ctx
         .driver
         .storage_handle
-        .send_effect(read_provenance_effect(namespace, identifier, None))
+        .send_effect(read_provenance_effect(group_id, namespace, identifier, None))
         .await;
     parse_provenance_read(event).map_err(read_failure)
 }
@@ -485,6 +487,7 @@ mod tests {
     fn next_version_increments_or_starts_at_one() {
         assert_eq!(next_version(None), 1);
         let provenance = HarvestProvenance {
+            group_id: Ulid::nil(),
             namespace: "ns".to_string(),
             source_record_id: "r".to_string(),
             meta_resource_id: Ulid::nil(),

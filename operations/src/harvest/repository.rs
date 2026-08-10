@@ -42,12 +42,12 @@ pub fn source_prefix(group_id: GroupId) -> Key {
     ByteView::from(group_id.to_bytes().to_vec())
 }
 
-pub fn provenance_key(namespace: &str, source_record_id: &str) -> Key {
-    ByteView::from(harvest_provenance_key(namespace, source_record_id))
+pub fn provenance_key(group_id: GroupId, namespace: &str, source_record_id: &str) -> Key {
+    ByteView::from(harvest_provenance_key(group_id, namespace, source_record_id))
 }
 
-pub fn provenance_prefix(namespace: &str) -> Key {
-    ByteView::from(harvest_provenance_prefix(namespace))
+pub fn provenance_prefix(group_id: GroupId, namespace: &str) -> Key {
+    ByteView::from(harvest_provenance_prefix(group_id, namespace))
 }
 
 pub fn read_connector_effect(
@@ -83,13 +83,14 @@ pub fn write_source_effect(
 }
 
 pub fn read_provenance_effect(
+    group_id: GroupId,
     namespace: &str,
     source_record_id: &str,
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: HARVEST_PROVENANCE_KEYSPACE.to_string(),
-        key: provenance_key(namespace, source_record_id),
+        key: provenance_key(group_id, namespace, source_record_id),
         txn_id,
     })
 }
@@ -100,20 +101,21 @@ pub fn write_provenance_effect(
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: HARVEST_PROVENANCE_KEYSPACE.to_string(),
-        key: provenance_key(&record.namespace, &record.source_record_id),
+        key: provenance_key(record.group_id, &record.namespace, &record.source_record_id),
         value: record.to_bytes()?.into(),
         txn_id,
     }))
 }
 
 pub fn iter_provenance_effect(
+    group_id: GroupId,
     namespace: &str,
     start_after: Option<Key>,
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Iter {
         key_space: HARVEST_PROVENANCE_KEYSPACE.to_string(),
-        prefix: Some(provenance_prefix(namespace)),
+        prefix: Some(provenance_prefix(group_id, namespace)),
         start: start_after.map(IterStart::After),
         limit: HARVEST_SCAN_PAGE_SIZE,
         txn_id,
@@ -187,8 +189,16 @@ mod tests {
     }
 
     #[test]
-    fn provenance_key_scans_within_namespace() {
-        let key = provenance_key("ns", "rec-1");
-        assert!(key.as_ref().starts_with(provenance_prefix("ns").as_ref()));
+    fn provenance_key_scans_within_group() {
+        let group = Ulid::from_bytes([3u8; 16]);
+        let key = provenance_key(group, "ns", "rec-1");
+        assert!(
+            key.as_ref()
+                .starts_with(provenance_prefix(group, "ns").as_ref())
+        );
+        assert!(
+            !key.as_ref()
+                .starts_with(provenance_prefix(Ulid::from_bytes([4u8; 16]), "ns").as_ref())
+        );
     }
 }

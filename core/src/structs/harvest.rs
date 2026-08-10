@@ -204,6 +204,7 @@ pub enum HarvestRecordState {
 /// across re-harvests, deletions and revivals.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HarvestProvenance {
+    pub group_id: GroupId,
     pub namespace: String,
     pub source_record_id: String,
     pub meta_resource_id: Ulid,
@@ -223,18 +224,24 @@ impl HarvestProvenance {
     }
 }
 
-/// The provenance keyspace key is `len(namespace) || namespace || record_id`,
-/// so a namespace's records scan together and the two string fields cannot be
-/// confused across a boundary.
-pub fn harvest_provenance_prefix(namespace: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(4 + namespace.len());
+/// The provenance keyspace key is
+/// `group_id || len(namespace) || namespace || record_id`, so a group's records
+/// scan together, two groups naming the same source never share a row, and the
+/// two string fields cannot be confused across a boundary.
+pub fn harvest_provenance_prefix(group_id: GroupId, namespace: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(20 + namespace.len());
+    key.extend_from_slice(&group_id.to_bytes());
     key.extend_from_slice(&(namespace.len() as u32).to_be_bytes());
     key.extend_from_slice(namespace.as_bytes());
     key
 }
 
-pub fn harvest_provenance_key(namespace: &str, source_record_id: &str) -> Vec<u8> {
-    let mut key = harvest_provenance_prefix(namespace);
+pub fn harvest_provenance_key(
+    group_id: GroupId,
+    namespace: &str,
+    source_record_id: &str,
+) -> Vec<u8> {
+    let mut key = harvest_provenance_prefix(group_id, namespace);
     key.extend_from_slice(source_record_id.as_bytes());
     key
 }
@@ -322,8 +329,13 @@ mod tests {
         UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))
     }
 
+    fn group(seed: u8) -> GroupId {
+        Ulid::from_bytes([seed; 16])
+    }
+
     fn live(id: u8, datestamp_ms: u64) -> HarvestProvenance {
         HarvestProvenance {
+            group_id: group(1),
             namespace: "ns".to_string(),
             source_record_id: "rec-1".to_string(),
             meta_resource_id: Ulid::from_bytes([id; 16]),
@@ -409,11 +421,23 @@ mod tests {
     fn provenance_key_disambiguates_namespace_boundary() {
         // "a" + "bc" and "ab" + "c" must not collide on the same key bytes.
         assert_ne!(
-            harvest_provenance_key("a", "bc"),
-            harvest_provenance_key("ab", "c")
+            harvest_provenance_key(group(1), "a", "bc"),
+            harvest_provenance_key(group(1), "ab", "c")
         );
-        let key = harvest_provenance_key("ns", "rec-1");
-        assert!(key.starts_with(&harvest_provenance_prefix("ns")));
+        let key = harvest_provenance_key(group(1), "ns", "rec-1");
+        assert!(key.starts_with(&harvest_provenance_prefix(group(1), "ns")));
+    }
+
+    #[test]
+    fn provenance_key_separates_groups() {
+        assert_ne!(
+            harvest_provenance_key(group(1), "zenodo", "rec-1"),
+            harvest_provenance_key(group(2), "zenodo", "rec-1")
+        );
+        assert!(
+            !harvest_provenance_key(group(2), "zenodo", "rec-1")
+                .starts_with(&harvest_provenance_prefix(group(1), "zenodo"))
+        );
     }
 
     #[test]
