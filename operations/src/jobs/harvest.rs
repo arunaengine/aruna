@@ -19,7 +19,9 @@ use crate::create_metadata_document::{
 };
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::harvest::oai::mapping::oai_dc_to_jsonld;
-use crate::harvest::oai::parse::{OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page};
+use crate::harvest::oai::parse::{
+    OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
+};
 use crate::harvest::oai::request::{format_from, identify_url, list_records_url};
 use crate::harvest::repository::{
     StorageReadError, parse_connector_read, parse_provenance_read, parse_source_read,
@@ -122,6 +124,10 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
     let mut overall_max = original_last;
     let mut counts = HarvestCounts::default();
 
+    // One restart per run at most: a provider that keeps rejecting its own
+    // tokens must not be able to loop the listing back to the start forever.
+    let mut restarted = false;
+
     for _ in 0..MAX_HARVEST_PAGES {
         check_signals(ctx)?;
         let resumed = resumption_token.clone();
@@ -136,15 +142,20 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
         let body = fetch(ctx, blob, url).await?;
         let page = match parse_list_page(&body) {
             Ok(page) => page,
-            // A token the provider no longer honours would be replayed by every
-            // later run, so drop it and let the next run restart the window.
             Err(error) if resumed.is_some() => {
                 persist_cursor(ctx, &source, original_last, None).await?;
+                // The provider disowned its own token. Restart the same window
+                // once in this run; a second rejection is the provider's fault.
+                if !restarted && is_bad_token(&error) {
+                    restarted = true;
+                    resumption_token = None;
+                    continue;
+                }
                 return Err(retryable(format!(
                     "OAI resumption token rejected, listing restarts next run: {error}"
                 )));
             }
-            Err(error) => return Err(permanent(format!("OAI response: {error}"))),
+            Err(error) => return Err(classify_parse(error)),
         };
 
         for record in &page.records {
@@ -175,6 +186,19 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
     }
 
     Err(permanent("harvest exceeded resumption page bound"))
+}
+
+fn is_bad_token(error: &OaiParseError) -> bool {
+    matches!(error, OaiParseError::Protocol { code, .. } if code == "badResumptionToken")
+}
+
+/// A malformed body is upstream junk that a retry can clear; an OAI protocol
+/// rejection of a well-formed request is a configuration fault that will not.
+fn classify_parse(error: OaiParseError) -> HarvestFailure {
+    match error {
+        OaiParseError::Xml(_) => retryable(format!("OAI response: {error}")),
+        OaiParseError::Protocol { .. } => permanent(format!("OAI response: {error}")),
+    }
 }
 
 async fn apply_record(
