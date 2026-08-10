@@ -21,6 +21,7 @@ use aruna_core::structs::{MetadataRegistryRecord, Permission};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -38,13 +39,74 @@ pub const CANDIDATE_BUDGET: usize = 512;
 /// Continuations `earliest_visible` may follow through denied candidates.
 const EARLIEST_PAGES: usize = 64;
 const PRUNE_BATCH: usize = 256;
+/// Registry batches one maintenance pass may walk before it yields, so shutdown
+/// is observed within a fixed amount of work.
+const PASS_BATCHES: usize = 4;
+/// Passes `rebuild_index` may drive before giving up on reaching a quiet state.
+const DRIVE_PASSES: usize = 100_000;
 const REBUILD_INTERVAL: Duration = Duration::from_secs(60);
+/// Pacing between the passes of a cycle that still has work to do.
+const WORK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The single row naming the generation readers may serve.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// The single row naming the generation readers may serve, plus the resumable
+/// state of the maintenance cycle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct VisibilityState {
     generation: u64,
     ready: bool,
+    /// Fingerprint of the visible set the published generation was built from.
+    /// A pass whose fingerprint matches it publishes nothing.
+    digest: [u8; 32],
+    /// The registry walk in flight, if any.
+    pass: Option<PassState>,
+    /// Superseded generations may still hold rows; resume deleting after this key.
+    prune_after: Option<Vec<u8>>,
+    pruning: bool,
+}
+
+/// A resumable registry walk. It compares the registry against the published
+/// generation until a difference shows up, and only then writes a new one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PassState {
+    /// Timestamp-index cursor to resume the walk after.
+    cursor: Option<Vec<u8>>,
+    /// Fingerprint accumulated so far.
+    digest: [u8; 32],
+    /// The generation being written; `None` while the walk only compares.
+    building: Option<u64>,
+}
+
+/// What one bounded maintenance pass accomplished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassOutcome {
+    /// Work remains; run the next pass without waiting out the idle interval.
+    Continue,
+    /// The published generation matches the registry and nothing is left to prune.
+    Idle,
+    /// Shutdown was observed; no further storage mutation was attempted.
+    Cancelled,
+}
+
+/// Per-pass work limits, so cancellation latency stays independent of registry
+/// size. Tests shrink them to drive many passes over a small registry.
+#[derive(Debug, Clone, Copy)]
+struct PassBounds {
+    /// Registry records per scan batch.
+    batch: usize,
+    /// Scan batches per pass.
+    batches: usize,
+    /// Index rows inspected per prune pass.
+    prune: usize,
+}
+
+impl Default for PassBounds {
+    fn default() -> Self {
+        Self {
+            batch: BUILD_BATCH,
+            batches: PASS_BATCHES,
+            prune: PRUNE_BATCH,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -195,9 +257,9 @@ async fn read_state(context: &DriverContext) -> Result<Option<VisibilityState>, 
 
 async fn write_state(
     context: &DriverContext,
-    state: VisibilityState,
+    state: &VisibilityState,
 ) -> Result<(), StorageReadError> {
-    let value: Value = postcard::to_allocvec(&state)
+    let value: Value = postcard::to_allocvec(state)
         .map_err(|error| StorageReadError::Conversion(ConversionError::PostcardError(error)))?
         .into();
     let event = context
@@ -394,99 +456,221 @@ pub async fn earliest_visible(context: &DriverContext) -> Result<Option<u64>, Vi
     Err(VisibilityError::Unavailable)
 }
 
-/// Rebuilds the index into the next generation and publishes it atomically by
-/// flipping the state row, then prunes the superseded generations.
-pub async fn rebuild_index(context: &DriverContext) -> Result<u64, VisibilityError> {
-    let previous = read_state(context).await?;
-    let generation = previous.map(|state| state.generation + 1).unwrap_or(1);
+/// Folds one visible record into a pass fingerprint. XOR keeps the fold
+/// order-independent and resumable, so a pass can persist it and continue later.
+fn fold_visible(digest: &mut [u8; 32], updated_at_ms: u64, document_id: Ulid) {
+    let mut bytes = [0u8; 24];
+    bytes[..8].copy_from_slice(&updated_at_ms.to_be_bytes());
+    bytes[8..].copy_from_slice(&document_id.to_bytes());
+    for (slot, byte) in digest.iter_mut().zip(blake3::hash(&bytes).as_bytes()) {
+        *slot ^= byte;
+    }
+}
 
-    let mut cursor = None;
-    loop {
-        let page = enumerate_updated(context, 0, u64::MAX, cursor.clone(), BUILD_BATCH).await?;
-        if page.records.is_empty() && page.next_after.is_none() {
-            break;
+/// One bounded step of index maintenance.
+///
+/// A cycle walks the registry comparing it against the published generation and
+/// writes a new one only once the visible set actually differs, so a steady-state
+/// pass rewrites nothing. Every storage mutation is gated on `token`, and the
+/// walk keeps a persisted cursor so a pass never spans the whole registry.
+pub async fn visibility_pass(
+    context: &DriverContext,
+    token: &CancellationToken,
+) -> Result<PassOutcome, VisibilityError> {
+    pass_bounded(context, token, PassBounds::default()).await
+}
+
+async fn pass_bounded(
+    context: &DriverContext,
+    token: &CancellationToken,
+    bounds: PassBounds,
+) -> Result<PassOutcome, VisibilityError> {
+    if token.is_cancelled() {
+        return Ok(PassOutcome::Cancelled);
+    }
+    let mut state = read_state(context).await?.unwrap_or_default();
+    if state.pruning {
+        return prune_pass(context, token, state, bounds).await;
+    }
+    let mut pass = state.pass.clone().unwrap_or_else(|| PassState {
+        cursor: None,
+        digest: [0u8; 32],
+        // Nothing is published yet, so there is nothing to compare against.
+        building: (!state.ready).then_some(state.generation + 1),
+    });
+
+    for _ in 0..bounds.batches {
+        if token.is_cancelled() {
+            return Ok(PassOutcome::Cancelled);
         }
+        let cursor = pass.cursor.clone().map(Key::from);
+        let page = enumerate_updated(context, 0, u64::MAX, cursor, bounds.batch).await?;
         let evaluators = build_evaluators(context, &page.records).await;
-        let writes: Vec<(String, Key, Value)> = page
+        let visible: Vec<&MetadataRegistryRecord> = page
             .records
             .iter()
             .filter(|record| record_visible(record, &evaluators))
-            .map(|record| {
-                (
-                    METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
-                    index_key(generation, record.updated_at_ms, record.document_id),
-                    ByteView::from(Vec::new()),
-                )
-            })
             .collect();
-        if !writes.is_empty() {
-            let event = context
-                .storage_handle
-                .send_effect(Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: None,
-                }))
-                .await;
-            match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-                Event::Storage(StorageEvent::Error { error }) => {
-                    return Err(StorageReadError::Storage(error).into());
+        for record in &visible {
+            fold_visible(&mut pass.digest, record.updated_at_ms, record.document_id);
+        }
+        if let Some(generation) = pass.building {
+            let writes: Vec<(String, Key, Value)> = visible
+                .iter()
+                .map(|record| {
+                    (
+                        METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+                        index_key(generation, record.updated_at_ms, record.document_id),
+                        ByteView::from(Vec::new()),
+                    )
+                })
+                .collect();
+            if !writes.is_empty() {
+                if token.is_cancelled() {
+                    return Ok(PassOutcome::Cancelled);
                 }
-                _ => return Err(StorageReadError::Storage(StorageError::WriteError).into()),
+                write_index_keys(context, writes).await?;
             }
         }
         match page.next_after {
-            Some(next) => cursor = Some(next),
-            None => break,
+            Some(next) => pass.cursor = Some(next.as_ref().to_vec()),
+            None => return finish_pass(context, token, state, pass).await,
         }
     }
 
-    write_state(
-        context,
-        VisibilityState {
-            generation,
-            ready: true,
-        },
-    )
-    .await?;
-    prune_old_generations(context, generation).await?;
-    Ok(generation)
+    if token.is_cancelled() {
+        return Ok(PassOutcome::Cancelled);
+    }
+    state.pass = Some(pass);
+    write_state(context, &state).await?;
+    Ok(PassOutcome::Continue)
 }
 
-/// Deletes every index key outside the published generation in bounded batches.
-async fn prune_old_generations(
+/// Closes a walk that reached the end of the registry: publish what it built,
+/// start building when the comparison found a difference, or go quiet.
+async fn finish_pass(
     context: &DriverContext,
-    generation: u64,
-) -> Result<usize, StorageReadError> {
-    let mut start = IterStart::At(index_key(0, 0, Ulid::nil()));
-    let mut stale = Vec::new();
-    let mut deleted = 0usize;
-    loop {
-        let event = context
-            .storage_handle
-            .send_effect(scan_effect(start.clone(), SCAN_BATCH))
-            .await;
-        let (entries, next) = parse_scan(event)?;
-        if entries.is_empty() {
-            break;
+    token: &CancellationToken,
+    mut state: VisibilityState,
+    pass: PassState,
+) -> Result<PassOutcome, VisibilityError> {
+    if token.is_cancelled() {
+        return Ok(PassOutcome::Cancelled);
+    }
+    match pass.building {
+        Some(generation) => {
+            state.generation = generation;
+            state.ready = true;
+            state.digest = pass.digest;
+            state.pass = None;
+            state.pruning = true;
+            state.prune_after = None;
+            write_state(context, &state).await?;
+            Ok(PassOutcome::Continue)
         }
-        for (key, _) in entries {
-            let (key_generation, _, _) =
-                parse_index_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
-            if key_generation != generation {
-                stale.push(key);
+        None if pass.digest == state.digest => {
+            if state.pass.is_some() {
+                state.pass = None;
+                write_state(context, &state).await?;
             }
-            if stale.len() >= PRUNE_BATCH {
-                deleted += delete_index_keys(context, std::mem::take(&mut stale)).await?;
-            }
+            Ok(PassOutcome::Idle)
         }
-        match next {
-            Some(next) => start = IterStart::After(next),
-            None => break,
+        None => {
+            state.pass = Some(PassState {
+                cursor: None,
+                digest: [0u8; 32],
+                building: Some(state.generation + 1),
+            });
+            write_state(context, &state).await?;
+            Ok(PassOutcome::Continue)
         }
     }
-    deleted += delete_index_keys(context, stale).await?;
-    Ok(deleted)
+}
+
+/// Deletes one bounded batch of index rows outside the published generation.
+async fn prune_pass(
+    context: &DriverContext,
+    token: &CancellationToken,
+    mut state: VisibilityState,
+    bounds: PassBounds,
+) -> Result<PassOutcome, VisibilityError> {
+    let start = match state.prune_after.clone() {
+        Some(cursor) => IterStart::After(Key::from(cursor)),
+        None => IterStart::At(index_key(0, 0, Ulid::nil())),
+    };
+    let event = context
+        .storage_handle
+        .send_effect(scan_effect(start, bounds.prune))
+        .await;
+    let (batch, next) = parse_scan(event)?;
+    let mut stale = Vec::new();
+    for (key, _) in batch {
+        let (key_generation, _, _) =
+            parse_index_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
+        if key_generation != state.generation {
+            stale.push(key);
+        }
+    }
+    if token.is_cancelled() {
+        return Ok(PassOutcome::Cancelled);
+    }
+    delete_index_keys(context, stale).await?;
+    match next {
+        Some(next) => state.prune_after = Some(next.as_ref().to_vec()),
+        None => {
+            state.pruning = false;
+            state.prune_after = None;
+        }
+    }
+    if token.is_cancelled() {
+        return Ok(PassOutcome::Cancelled);
+    }
+    write_state(context, &state).await?;
+    Ok(if state.pruning {
+        PassOutcome::Continue
+    } else {
+        PassOutcome::Idle
+    })
+}
+
+/// Drives maintenance to a quiet state and returns the published generation.
+/// Bootstrap and test helper; the background task runs one pass per tick.
+pub async fn rebuild_index(context: &DriverContext) -> Result<u64, VisibilityError> {
+    drive_index(context, &CancellationToken::new(), PassBounds::default()).await
+}
+
+async fn drive_index(
+    context: &DriverContext,
+    token: &CancellationToken,
+    bounds: PassBounds,
+) -> Result<u64, VisibilityError> {
+    for _ in 0..DRIVE_PASSES {
+        if pass_bounded(context, token, bounds).await? != PassOutcome::Continue {
+            break;
+        }
+    }
+    Ok(read_state(context)
+        .await?
+        .map(|state| state.generation)
+        .unwrap_or(0))
+}
+
+async fn write_index_keys(
+    context: &DriverContext,
+    writes: Vec<(String, Key, Value)>,
+) -> Result<(), StorageReadError> {
+    let event = context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        }))
+        .await;
+    match event {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(StorageError::WriteError)),
+    }
 }
 
 async fn delete_index_keys(
@@ -515,19 +699,26 @@ async fn delete_index_keys(
     }
 }
 
-/// Keeps the index current on the shutdown supervisor. A record whose visibility
-/// or governing policy changed is picked up by the next pass; until then the
-/// reader's per-record re-check keeps a newly-hidden record from being served.
+/// Keeps the index current on the shutdown supervisor, one bounded pass per tick.
+/// A record whose visibility or governing policy changed is picked up by the next
+/// cycle; until then the reader's per-record re-check keeps a newly-hidden record
+/// from being served.
 pub fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) {
     let token = shutdown.token();
     shutdown.spawn(async move {
         loop {
-            if let Err(error) = rebuild_index(&context).await {
-                warn!(error = ?error, "Anonymous visibility index rebuild failed");
-            }
+            let delay = match visibility_pass(&context, &token).await {
+                Ok(PassOutcome::Continue) => WORK_INTERVAL,
+                Ok(PassOutcome::Idle) => REBUILD_INTERVAL,
+                Ok(PassOutcome::Cancelled) => return,
+                Err(error) => {
+                    warn!(error = ?error, "Anonymous visibility index pass failed");
+                    REBUILD_INTERVAL
+                }
+            };
             tokio::select! {
                 _ = token.cancelled() => return,
-                _ = tokio::time::sleep(REBUILD_INTERVAL) => {}
+                _ = tokio::time::sleep(delay) => {}
             }
         }
     });
@@ -935,11 +1126,177 @@ mod tests {
         let first = visible_page(&context, 0, u64::MAX, None, 1).await.unwrap();
         let cursor = first.entries.last().map(|(key, _)| key.clone());
 
+        seed_record(
+            &context,
+            &record(group_id, Ulid::from_bytes([83; 16]), 103, true),
+        )
+        .await;
         assert_eq!(rebuild_index(&context).await.unwrap(), 2);
         let page = visible_page(&context, 0, u64::MAX, cursor, 10)
             .await
             .unwrap();
-        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries.len(), 3);
+    }
+
+    fn small_bounds() -> PassBounds {
+        PassBounds {
+            batch: 4,
+            batches: 1,
+            prune: 4,
+        }
+    }
+
+    async fn index_keys(context: &DriverContext) -> Vec<Vec<u8>> {
+        let mut start = IterStart::At(index_key(0, 0, Ulid::nil()));
+        let mut keys = Vec::new();
+        loop {
+            let event = context
+                .storage_handle
+                .send_effect(scan_effect(start.clone(), SCAN_BATCH))
+                .await;
+            let (batch, next) = parse_scan(event).unwrap();
+            keys.extend(batch.into_iter().map(|(key, _)| key.as_ref().to_vec()));
+            match next {
+                Some(next) => start = IterStart::After(next),
+                None => break,
+            }
+        }
+        keys
+    }
+
+    async fn seed_realm_group(context: &DriverContext, group_id: Ulid, count: u64) {
+        seed_realm(context, Vec::new()).await;
+        seed_group(context, group_id, Vec::new()).await;
+        seed_many(context, group_id, 0..count).await;
+    }
+
+    // One pass yields at its bound instead of walking the whole registry, so
+    // cancellation is observed within a fixed amount of work.
+    #[tokio::test]
+    async fn pass_yields_at_bound() {
+        let (context, _dir) = context();
+        let group_id = Ulid::from_bytes([94; 16]);
+        seed_realm_group(&context, group_id, 20).await;
+
+        let token = CancellationToken::new();
+        assert_eq!(
+            pass_bounded(&context, &token, small_bounds())
+                .await
+                .unwrap(),
+            PassOutcome::Continue
+        );
+        let state = read_state(&context).await.unwrap().unwrap();
+        assert!(!state.ready);
+        assert!(state.pass.is_some_and(|pass| pass.cursor.is_some()));
+        assert!(matches!(
+            visible_page(&context, 0, u64::MAX, None, 10).await,
+            Err(VisibilityError::Unavailable)
+        ));
+    }
+
+    // A cancelled token stops the build before any further storage mutation.
+    #[tokio::test]
+    async fn build_stops_on_cancel() {
+        let (context, _dir) = context();
+        let group_id = Ulid::from_bytes([95; 16]);
+        seed_realm_group(&context, group_id, 20).await;
+
+        let token = CancellationToken::new();
+        pass_bounded(&context, &token, small_bounds())
+            .await
+            .unwrap();
+        let before = index_keys(&context).await;
+        assert!(!before.is_empty());
+
+        token.cancel();
+        for _ in 0..4 {
+            assert_eq!(
+                pass_bounded(&context, &token, small_bounds())
+                    .await
+                    .unwrap(),
+                PassOutcome::Cancelled
+            );
+        }
+        assert_eq!(index_keys(&context).await, before);
+    }
+
+    // The same holds once the cycle has moved on to deleting superseded rows.
+    #[tokio::test]
+    async fn prune_stops_on_cancel() {
+        let (context, _dir) = context();
+        let group_id = Ulid::from_bytes([96; 16]);
+        seed_realm_group(&context, group_id, 20).await;
+        let token = CancellationToken::new();
+        drive_index(&context, &token, small_bounds()).await.unwrap();
+
+        seed_many(&context, group_id, 20..24).await;
+        let mut pruning = false;
+        for _ in 0..64 {
+            pass_bounded(&context, &token, small_bounds())
+                .await
+                .unwrap();
+            if read_state(&context).await.unwrap().unwrap().pruning {
+                pruning = true;
+                break;
+            }
+        }
+        assert!(pruning);
+
+        let before = index_keys(&context).await;
+        token.cancel();
+        assert_eq!(
+            pass_bounded(&context, &token, small_bounds())
+                .await
+                .unwrap(),
+            PassOutcome::Cancelled
+        );
+        assert_eq!(index_keys(&context).await, before);
+        assert!(read_state(&context).await.unwrap().unwrap().pruning);
+    }
+
+    // A pass over an unchanged registry must publish nothing, so steady state
+    // costs no index writes at all.
+    #[tokio::test]
+    async fn steady_pass_rewrites_nothing() {
+        let (context, _dir) = context();
+        let group_id = Ulid::from_bytes([97; 16]);
+        seed_realm_group(&context, group_id, 20).await;
+        let generation = rebuild_index(&context).await.unwrap();
+        let before = index_keys(&context).await;
+        assert_eq!(before.len(), 20);
+
+        assert_eq!(rebuild_index(&context).await.unwrap(), generation);
+        assert_eq!(index_keys(&context).await, before);
+
+        // A real change still publishes, and the superseded rows are pruned.
+        seed_many(&context, group_id, 20..21).await;
+        assert_eq!(rebuild_index(&context).await.unwrap(), generation + 1);
+        let after = index_keys(&context).await;
+        assert_eq!(after.len(), 21);
+        assert!(
+            after
+                .iter()
+                .all(|key| parse_index_key(key).unwrap().0 == generation + 1)
+        );
+    }
+
+    // A policy change alone is a change of the visible set.
+    #[tokio::test]
+    async fn policy_change_republishes() {
+        let (context, _dir) = context();
+        let group_id = Ulid::from_bytes([98; 16]);
+        seed_realm_group(&context, group_id, 5).await;
+        let generation = rebuild_index(&context).await.unwrap();
+        assert_eq!(index_keys(&context).await.len(), 5);
+
+        seed_group(
+            &context,
+            group_id,
+            vec![deny_policy("operation == 'metadata.read'")],
+        )
+        .await;
+        assert_eq!(rebuild_index(&context).await.unwrap(), generation + 1);
+        assert!(index_keys(&context).await.is_empty());
     }
 
     #[test]
