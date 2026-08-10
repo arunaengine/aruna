@@ -158,16 +158,20 @@ impl NodeShutdown {
         );
 
         // 4. Job workers write storage: drain them before the seal.
-        let job_grace = JOB_SHUTDOWN_GRACE.min(tail_reserved(
-            budget.remaining(),
-            tail_reserve,
-            TAIL_PHASE_COUNT,
-        ));
-        let job_report = self
-            .jobs_runtime
-            .shutdown(&self.storage_handle, job_grace)
-            .await;
-        info!(?job_report, "Shutdown: job runtime drained");
+        let job_budget = tail_reserved(budget.remaining(), tail_reserve, TAIL_PHASE_COUNT);
+        let job_grace = JOB_SHUTDOWN_GRACE.min(job_budget);
+        let mut job_report = None;
+        phase("jobs", job_budget, async {
+            job_report = Some(
+                self.jobs_runtime
+                    .shutdown(&self.storage_handle, job_grace)
+                    .await,
+            );
+        })
+        .await;
+        if let Some(job_report) = job_report {
+            info!(?job_report, "Shutdown: job runtime drained");
+        }
 
         // 5. Background children write metadata and storage: join them.
         let mut background_drained = false;
@@ -419,7 +423,7 @@ mod tests {
     async fn phase_honors_budget() {
         let mut completed = false;
 
-        phase("stuck", Duration::from_millis(50), async {
+        phase("stuck", Duration::ZERO, async {
             std::future::pending::<()>().await;
             completed = true;
         })
