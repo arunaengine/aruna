@@ -29,6 +29,7 @@ use crate::harvest::repository::{
     read_connector_effect, read_provenance_effect, read_source_effect, write_provenance_effect,
     write_source_effect,
 };
+use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::MetadataAuthToken;
@@ -44,10 +45,6 @@ use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 const MAX_HARVEST_PAGES: u32 = 10_000;
 /// Total wall clock one harvest run may spend paging.
 const HARVEST_RUN_DEADLINE: Duration = Duration::from_secs(1800);
-/// Budget for a harvested document's normalized metadata path.
-const HARVEST_PATH_BYTES: usize = 512;
-/// `b3-` plus 64 hex characters: the shortest segment any identifier can take.
-const DIGEST_SEGMENT_BYTES: usize = 67;
 /// Hard cap on one decoded OAI-PMH response body.
 const HARVEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Total wall clock one fetch may take, connect through last byte.
@@ -425,13 +422,12 @@ fn next_version(existing: Option<&HarvestProvenance>) -> u64 {
 /// full 256-bit BLAKE3 digest of anything longer. Provenance keeps the raw
 /// identifier, so the encoding never has to be reversed.
 fn harvest_document_path(prefix: &str, identifier: &str) -> Result<String, HarvestFailure> {
-    let prefix = prefix.trim_matches('/');
-    let budget = HARVEST_PATH_BYTES.saturating_sub(prefix.len() + 1);
-    if budget < DIGEST_SEGMENT_BYTES {
+    let Some(prefix) = normalize_target_prefix(prefix) else {
         return Err(permanent(format!(
             "harvest target prefix leaves no room for an encoded identifier: {prefix}"
         )));
-    }
+    };
+    let budget = HARVEST_PATH_BYTES - prefix.len() - 1;
     let encoded = format!(
         "b64-{}",
         base64::Engine::encode(

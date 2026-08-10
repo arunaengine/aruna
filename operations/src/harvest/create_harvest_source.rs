@@ -9,8 +9,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::harvest::oai::request::DEFAULT_METADATA_PREFIX;
+use crate::harvest::oai::request::{normalize_metadata_prefix, normalize_set};
 use crate::harvest::repository::{StorageReadError, read_connector_effect, write_source_effect};
+use crate::harvest::target_path::{normalize_target_prefix, target_prefix_is_blank};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateSourceInput {
@@ -42,6 +43,8 @@ pub enum CreateSourceError {
     EmptyNamespace,
     #[error("harvest target prefix must not be empty")]
     EmptyTargetPrefix,
+    #[error("harvest target prefix [{0}] leaves no room for a record identifier")]
+    TargetPrefixTooLong(String),
     #[error("unsupported harvest metadata prefix [{0}]: only [oai_dc] is mapped")]
     UnsupportedMetadataPrefix(String),
     #[error("repository connector not found")]
@@ -89,23 +92,30 @@ impl CreateSourceOperation {
         smallvec![]
     }
 
+    /// Validate and canonicalize the input, so only values the request builder
+    /// and the path encoder can use are ever stored.
     fn handle_init(&mut self) -> Effects {
         if self.input.namespace.trim().is_empty() {
             return self.emit_error(CreateSourceError::EmptyNamespace);
         }
-        if self.input.target_prefix.trim().is_empty() {
-            return self.emit_error(CreateSourceError::EmptyTargetPrefix);
-        }
+        let Some(target_prefix) = normalize_target_prefix(&self.input.target_prefix) else {
+            return self.emit_error(if target_prefix_is_blank(&self.input.target_prefix) {
+                CreateSourceError::EmptyTargetPrefix
+            } else {
+                CreateSourceError::TargetPrefixTooLong(self.input.target_prefix.clone())
+            });
+        };
         // The parser and the RO-Crate mapper are `oai_dc`-typed; any other
         // prefix would silently import identifier-only records.
-        if let Some(prefix) = self.input.selector.metadata_prefix.as_deref()
-            && !prefix.trim().is_empty()
-            && prefix.trim() != DEFAULT_METADATA_PREFIX
-        {
-            return self.emit_error(CreateSourceError::UnsupportedMetadataPrefix(
-                prefix.to_string(),
-            ));
-        }
+        let metadata_prefix = match normalize_metadata_prefix(
+            self.input.selector.metadata_prefix.as_deref(),
+        ) {
+            Ok(prefix) => prefix,
+            Err(prefix) => return self.emit_error(CreateSourceError::UnsupportedMetadataPrefix(prefix)),
+        };
+        self.input.target_prefix = target_prefix;
+        self.input.selector.metadata_prefix = Some(metadata_prefix);
+        self.input.selector.set = normalize_set(self.input.selector.set.as_deref());
         self.state = State::ReadConnector;
         smallvec![read_connector_effect(
             self.input.group_id,
@@ -220,6 +230,7 @@ mod tests {
         CreateConnectorInput, CreateConnectorOperation,
     };
     use crate::harvest::repository::{parse_source_read, read_source_effect};
+    use crate::harvest::target_path::{DIGEST_SEGMENT_BYTES, HARVEST_PATH_BYTES};
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::structs::RepositoryConnectorKind;
@@ -270,17 +281,75 @@ mod tests {
         }
     }
 
+    /// Omitted, empty, whitespace, padded and exact prefixes are one source
+    /// configuration, stored in exactly one form.
     #[test]
     fn omitted_and_explicit_oai_dc_agree() {
-        for prefix in [None, Some("oai_dc".to_string()), Some(String::new())] {
+        for prefix in [
+            None,
+            Some("oai_dc".to_string()),
+            Some(String::new()),
+            Some("   ".to_string()),
+            Some(" oai_dc ".to_string()),
+        ] {
             let mut op = CreateSourceOperation::new(CreateSourceInput {
                 selector: HarvestSelector {
-                    set: None,
+                    set: Some("  ".to_string()),
                     metadata_prefix: prefix,
                 },
                 ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
             });
             assert_eq!(op.start().len(), 1);
+            assert_eq!(op.input.selector.metadata_prefix.as_deref(), Some("oai_dc"));
+            assert_eq!(op.input.selector.set, None);
+        }
+    }
+
+    #[test]
+    fn target_prefix_is_stored_canonical() {
+        let mut op = CreateSourceOperation::new(CreateSourceInput {
+            target_prefix: "  /imported/zenodo/  ".to_string(),
+            ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
+        });
+        assert_eq!(op.start().len(), 1);
+        assert_eq!(op.input.target_prefix, "imported/zenodo");
+    }
+
+    /// A prefix one byte past the path budget makes every record fail later, so
+    /// it is refused at creation; the longest usable prefix is still accepted.
+    #[test]
+    fn target_prefix_budget_is_enforced() {
+        let longest = HARVEST_PATH_BYTES - DIGEST_SEGMENT_BYTES - 1;
+        let mut accepted = CreateSourceOperation::new(CreateSourceInput {
+            target_prefix: "p".repeat(longest),
+            ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
+        });
+        assert_eq!(accepted.start().len(), 1);
+
+        let too_long = "p".repeat(longest + 1);
+        let mut refused = CreateSourceOperation::new(CreateSourceInput {
+            target_prefix: too_long.clone(),
+            ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
+        });
+        assert!(refused.start().is_empty());
+        assert_eq!(
+            refused.finalize().unwrap_err(),
+            CreateSourceError::TargetPrefixTooLong(too_long)
+        );
+    }
+
+    #[test]
+    fn blank_target_prefix_is_rejected() {
+        for prefix in ["", " ", "/", "  //  "] {
+            let mut op = CreateSourceOperation::new(CreateSourceInput {
+                target_prefix: prefix.to_string(),
+                ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
+            });
+            assert!(op.start().is_empty());
+            assert_eq!(
+                op.finalize().unwrap_err(),
+                CreateSourceError::EmptyTargetPrefix
+            );
         }
     }
 
@@ -329,7 +398,14 @@ mod tests {
         .connector;
 
         let source = drive(
-            CreateSourceOperation::new(input(connector.group_id, connector.connector_id)),
+            CreateSourceOperation::new(CreateSourceInput {
+                target_prefix: " /imported/zenodo/ ".to_string(),
+                selector: HarvestSelector {
+                    set: Some(" ".to_string()),
+                    metadata_prefix: Some(" oai_dc ".to_string()),
+                },
+                ..input(connector.group_id, connector.connector_id)
+            }),
             &context,
         )
         .await
@@ -339,6 +415,10 @@ mod tests {
             .storage_handle
             .send_effect(read_source_effect(source.group_id, source.source_id, None))
             .await;
-        assert_eq!(parse_source_read(stored).unwrap().unwrap(), source);
+        let stored = parse_source_read(stored).unwrap().unwrap();
+        assert_eq!(stored, source);
+        assert_eq!(stored.target_prefix, "imported/zenodo");
+        assert_eq!(stored.selector.metadata_prefix.as_deref(), Some("oai_dc"));
+        assert_eq!(stored.selector.set, None);
     }
 }
