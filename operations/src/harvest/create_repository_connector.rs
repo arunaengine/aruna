@@ -12,6 +12,7 @@ use aruna_core::types::{Effects, GroupId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 
+use crate::endpoint;
 use crate::harvest::repository::connector_writes;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +50,8 @@ pub enum CreateConnectorError {
     EmptyName,
     #[error("connector endpoint must not be empty")]
     EmptyEndpoint,
+    #[error("endpoint `{0}` must be spelled as the http client parses it")]
+    AmbiguousEndpoint(String),
     #[error("CreateRepositoryConnector failed")]
     Failed,
     #[error("state [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
@@ -91,6 +94,13 @@ impl CreateConnectorOperation {
         }
         if self.input.endpoint.trim().is_empty() {
             return self.emit_error(CreateConnectorError::EmptyEndpoint);
+        }
+        // Every harvest fetch is built from this string, so a spelling the http
+        // client reads as another host fails here rather than at first use.
+        if !endpoint::is_canonical(&self.input.endpoint) {
+            return self.emit_error(CreateConnectorError::AmbiguousEndpoint(
+                self.input.endpoint.clone(),
+            ));
         }
 
         let now = SystemTime::now();
@@ -212,6 +222,45 @@ mod tests {
         assert!(op.start().is_empty());
         assert!(op.is_complete());
         assert_eq!(op.finalize().unwrap_err(), CreateConnectorError::EmptyName);
+    }
+
+    #[test]
+    fn respelled_endpoint_errors() {
+        // Each of these parses into a link-local or loopback address, and the
+        // last two are read as a different host than an operator reads back.
+        for endpoint in [
+            "https://2852039166",
+            "https://0xa9fea9fe",
+            "https://169.254.169.254.",
+            "https://good.example\\@169.254.169.254",
+            "https://Zenodo.ORG/oai2d",
+            "zenodo.org/oai2d",
+        ] {
+            let mut op = CreateConnectorOperation::new(CreateConnectorInput {
+                endpoint: endpoint.to_string(),
+                ..input()
+            });
+            assert!(op.start().is_empty(), "{endpoint}");
+            assert_eq!(
+                op.finalize().unwrap_err(),
+                CreateConnectorError::AmbiguousEndpoint(endpoint.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_endpoint_writes() {
+        for endpoint in [
+            "https://zenodo.org/oai2d",
+            "https://oai.example.org:9000/oai",
+            "http://127.0.0.1/oai",
+        ] {
+            let mut op = CreateConnectorOperation::new(CreateConnectorInput {
+                endpoint: endpoint.to_string(),
+                ..input()
+            });
+            assert_eq!(op.start().len(), 1, "{endpoint}");
+        }
     }
 
     #[test]
