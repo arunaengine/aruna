@@ -673,7 +673,11 @@ fn unread_count_stream(
             }
             if !state.initial_done {
                 state.initial_done = true;
-                if let Some((count, capped)) = fetch_unread_count(&state).await {
+                let fetched = state
+                    .shutdown
+                    .run_until_cancelled(fetch_unread_count(&state))
+                    .await?;
+                if let Some((count, capped)) = fetched {
                     state.last_emitted = Some(count);
                     return Some(((count, capped), state));
                 }
@@ -683,8 +687,7 @@ fn unread_count_stream(
             let remote_poll = state.remote_poll;
             let recheck_deadline = state.next_holder_recheck;
             let shutdown = state.shutdown.clone();
-            // The wake wait and the remote poll are the open-ended awaits: the
-            // ingress drain waits for this response, so shutdown must end them.
+            // Ingress drain waits for this response, so shutdown must end each wait.
             let step = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => StreamStep::End,
@@ -712,9 +715,14 @@ fn unread_count_stream(
                         // poll if it moved off this node; a resolution failure is a
                         // transient skip. Then refetch as a missed-wake backstop.
                         state.next_holder_recheck = Instant::now() + state.local_recheck;
-                        match resolve_inbox_holder_for_user(state.context.as_ref(), state.recipient)
-                            .await
-                        {
+                        let resolved = state
+                            .shutdown
+                            .run_until_cancelled(resolve_inbox_holder_for_user(
+                                state.context.as_ref(),
+                                state.recipient,
+                            ))
+                            .await?;
+                        match resolved {
                             Ok(holder) if holder != state.local_node_id => {
                                 state.mode = UnreadStreamMode::Remote;
                             }
@@ -722,7 +730,11 @@ fn unread_count_stream(
                             Err(_) => continue,
                         }
                     }
-                    let Some((count, capped)) = fetch_unread_count(&state).await else {
+                    let fetched = state
+                        .shutdown
+                        .run_until_cancelled(fetch_unread_count(&state))
+                        .await?;
+                    let Some((count, capped)) = fetched else {
                         continue;
                     };
                     // Wakes emit unconditionally (the bell refetches the list); the
