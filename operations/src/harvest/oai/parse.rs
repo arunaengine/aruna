@@ -78,6 +78,13 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
                         .as_ref(),
                 );
             }
+            // CDATA is literal by definition: append it verbatim, no unescaping.
+            Ok(Event::CData(chunk)) => {
+                text.push_str(
+                    std::str::from_utf8(chunk.as_ref())
+                        .map_err(|error| OaiParseError::Xml(error.to_string()))?,
+                );
+            }
             Ok(Event::GeneralRef(reference)) => {
                 let name = std::str::from_utf8(reference.as_ref())
                     .map_err(|error| OaiParseError::Xml(error.to_string()))?
@@ -315,6 +322,32 @@ mod tests {
                 code: "badArgument".to_string(),
                 message: "bad".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn cdata_values_are_preserved() {
+        let xml = LIST.replace(
+            "<dc:title>First &amp; only</dc:title>",
+            "<dc:title><![CDATA[Raw <b>&amp; markup</b>]]></dc:title>",
+        );
+        let page = parse_list_page(&xml).unwrap();
+        assert_eq!(
+            page.records[0].dc[0],
+            ("title".to_string(), "Raw <b>&amp; markup</b>".to_string())
+        );
+    }
+
+    #[test]
+    fn mixed_text_and_cdata_concatenates() {
+        let xml = LIST.replace(
+            "<dc:title>First &amp; only</dc:title>",
+            "<dc:title>a &amp; <![CDATA[b & c]]> d\u{e9}</dc:title>",
+        );
+        let page = parse_list_page(&xml).unwrap();
+        assert_eq!(
+            page.records[0].dc[0],
+            ("title".to_string(), "a & b & c d\u{e9}".to_string())
         );
     }
 
