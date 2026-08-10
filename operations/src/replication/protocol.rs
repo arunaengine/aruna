@@ -153,6 +153,7 @@ impl VersionReplicationManifest {
                 || self.multipart.is_some()
                 || self.source.is_none()
                 || self.reference_metadata.is_none()
+                || self.origin.is_none()
                 || self.writer_auth_context.is_some())
         {
             return Err(ConversionError::FromStrError(
@@ -585,6 +586,10 @@ mod tests {
             last_modified: None,
             source_version: None,
         });
+        manifest.origin = Some(SyncOrigin {
+            relationship_id: Ulid::generate(),
+            hop_count: 0,
+        });
         manifest.reference_advance = Some(ReferenceAdvance {
             generation: 2,
             predecessor: Ulid::from(1u128),
@@ -762,7 +767,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_advances() {
-        let invalidators: [fn(&mut VersionReplicationManifest); 11] = [
+        let invalidators: [fn(&mut VersionReplicationManifest); 12] = [
             |manifest| manifest.current_version = false,
             |manifest| manifest.current_version_generation = None,
             |manifest| {
@@ -789,6 +794,7 @@ mod tests {
             },
             |manifest| manifest.source = None,
             |manifest| manifest.reference_metadata = None,
+            |manifest| manifest.origin = None,
             |manifest| manifest.writer_auth_context = Some(manifest.auth_context.clone()),
         ];
 

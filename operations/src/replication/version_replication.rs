@@ -1177,6 +1177,16 @@ impl ReplicateObjectVersionOperation {
         smallvec![]
     }
 
+    fn reference_matches(&self, metadata: &SourceMetadata) -> Option<bool> {
+        let ReplicationVersion::Reference {
+            cached_metadata, ..
+        } = self.replication_version.as_ref()?
+        else {
+            return None;
+        };
+        Some(cached_metadata.observation_fingerprint() == metadata.observation_fingerprint())
+    }
+
     fn resolve_reference_or_skip(&mut self, version: ReplicationVersion) -> Effects {
         if self.sync.is_none() && self.request.mode != ReplicationMode::OnDemand {
             return self.skip_version();
@@ -1195,6 +1205,10 @@ impl ReplicateObjectVersionOperation {
         let ReplicationVersion::Reference { source, .. } = &version else {
             return self.fail(ReplicateObjectVersionError::VersionNotFound);
         };
+        if self.preserve_reference {
+            self.replication_version = Some(version);
+            return self.read_current_lookup();
+        }
         let source = source.clone();
 
         debug!(
@@ -1286,6 +1300,11 @@ impl ReplicateObjectVersionOperation {
     fn handle_reference_head(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
+                match self.reference_matches(&metadata) {
+                    Some(true) => {}
+                    Some(false) => return self.skip_version(),
+                    None => return self.fail(ReplicateObjectVersionError::VersionNotFound),
+                }
                 self.reference_metadata = Some(metadata);
                 let key = match self.reference_state_key() {
                     Ok(key) => key,
@@ -1340,15 +1359,6 @@ impl ReplicateObjectVersionOperation {
             .is_some_and(|(value, fingerprint)| value.as_ref() == fingerprint);
         if unchanged {
             return self.skip_version();
-        }
-        if let (
-            Some(metadata),
-            Some(ReplicationVersion::Reference {
-                cached_metadata, ..
-            }),
-        ) = (current, self.replication_version.as_mut())
-        {
-            *cached_metadata = metadata;
         }
         if self.preserve_reference {
             return self.read_current_lookup();
@@ -1433,6 +1443,11 @@ impl ReplicateObjectVersionOperation {
                 metadata: source_metadata,
                 stream,
             }) => {
+                match self.reference_matches(&source_metadata) {
+                    Some(true) => {}
+                    Some(false) => return self.skip_version(),
+                    None => return self.fail(ReplicateObjectVersionError::VersionNotFound),
+                }
                 let Some(ReplicationVersion::Reference { created_by, .. }) =
                     self.replication_version.as_ref()
                 else {
@@ -2327,7 +2342,8 @@ mod tests {
     };
     use crate::driver::DriverContext;
     use crate::replication::protocol::{
-        ReferenceAdvance, ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
+        ReferenceAdvance, ReplicationMode, SyncOrigin, VersionReplicationMessage,
+        VersionReplicationRequest,
     };
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
@@ -2337,7 +2353,6 @@ mod tests {
     };
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        SYNC_REFERENCE_STATE_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
@@ -3110,11 +3125,14 @@ mod tests {
         }]);
         let scoped_auth = input.auth_context.clone();
         let persisted = reference_cached_metadata();
-        let mut fresh = persisted.clone();
-        fresh.etag = Some("etag-2".to_string());
         let mut scope = ReplicateScopeOperation::new(input).with_reference_advance(advance);
         scope.source_group_id = Some(Ulid::generate());
-        scope.sync = Some(reference_sync());
+        let mut sync = reference_sync();
+        sync.origin = Some(SyncOrigin {
+            relationship_id: sync.relationship_id,
+            hop_count: 0,
+        });
+        scope.sync = Some(sync);
         scope
             .enqueue_version_request(VersionKey::new("bucket", "dir/file.txt", version_id))
             .unwrap();
@@ -3127,34 +3145,19 @@ mod tests {
         assert!(scope.reference_advance.is_none());
 
         operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
             value: Some(reference_blob_version().to_bytes().unwrap().into()),
         }));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved {
-                result: Ok(ResolvedSourceAccess::OpenDal {
-                    kind: SourceConnectorKind::Http,
-                    config: HashMap::new(),
-                    path: "ref/file.txt".to_string(),
-                    version: None,
-                }),
-            },
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_HEAD_KEYSPACE
         ));
-        operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-            metadata: fresh.clone(),
-        }));
-        let fingerprint = super::reference_fingerprint(&fresh, ReferenceHandling::Preserve)
-            .unwrap()
-            .to_vec();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![2u8].into(),
-            value: Some(fingerprint.into()),
-        }));
         let newer =
             CurrentVersionPointer::new_with_generation(Ulid::generate(), advance.generation + 1);
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![3u8].into(),
+            key: vec![2u8].into(),
             value: Some(newer.to_bytes().unwrap().into()),
         }));
         assert!(matches!(
@@ -3445,48 +3448,24 @@ mod tests {
             key: vec![1u8].into(),
             value: Some(reference_blob_version().to_bytes().unwrap().into()),
         }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-
-        let access = ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::Http,
-            config: HashMap::new(),
-            path: "ref/file.txt".to_string(),
-            version: None,
-        };
-        let effects = op.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved {
-                result: Ok(access.clone()),
-            },
-        ));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Head { access: emitted })]
-                if emitted == &access
-        ));
-        let effects = op.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-            metadata: cached_metadata.clone(),
-        }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == SYNC_REFERENCE_STATE_KEYSPACE
+                if key_space == BLOB_HEAD_KEYSPACE
         ));
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![2u8].into(),
             value: None,
         }));
-
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == BLOB_HEAD_KEYSPACE
+            [Effect::Blob(BlobEffect::OpenConnection { .. })]
         ));
         assert!(matches!(
             op.replication_version,
             Some(ReplicationVersion::Reference { .. })
         ));
 
-        op.build_manifest(None).unwrap();
         let manifest = op.manifest.expect("manifest built");
         assert!(manifest.blob.is_none());
         assert_eq!(manifest.reference_metadata, Some(cached_metadata));
@@ -3497,14 +3476,15 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_reference_skips() {
+    fn stale_reference_skips() {
         let version_id = Ulid::generate();
-        let metadata = reference_cached_metadata();
+        let mut sync = reference_sync();
+        sync.reference_intent = false;
         let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
         ))
-        .with_sync(reference_sync());
+        .with_sync(sync);
 
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
@@ -3520,15 +3500,60 @@ mod tests {
         op.step(Event::SubOperation(
             SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
         ));
+        let mut stale = reference_cached_metadata();
+        stale.etag = Some("etag-2".to_string());
+        let effects = op.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: stale,
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(op.state, super::ReplicateObjectVersionState::Finish);
+        assert_eq!(
+            op.finalize(),
+            Ok(Ok(ReplicationSuboperationResult::Skipped))
+        );
+    }
+
+    #[test]
+    fn read_drift_skips() {
+        let version_id = Ulid::generate();
+        let mut sync = reference_sync();
+        sync.reference_intent = false;
+        let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
+            version_id,
+            ReplicationMode::OnDemand,
+        ))
+        .with_sync(sync);
+
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::new(),
+            path: "ref/file.txt".to_string(),
+            version: None,
+        };
+        op.step(Event::SubOperation(
+            SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
+        ));
+        let metadata = reference_cached_metadata();
         op.step(Event::StagingSource(StagingSourceEvent::HeadResult {
             metadata: metadata.clone(),
         }));
-        let fingerprint = super::reference_fingerprint(&metadata, ReferenceHandling::Preserve)
-            .unwrap()
-            .to_vec();
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![2u8].into(),
-            value: Some(fingerprint.into()),
+            value: None,
+        }));
+        load_routing(&mut op);
+
+        let mut stale = metadata;
+        stale.etag = Some("etag-2".to_string());
+        let effects = op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata: stale,
+            stream: BackendStream::new(stream::empty::<Result<Bytes, std::io::Error>>()),
         }));
 
         assert!(effects.is_empty());
@@ -3631,13 +3656,7 @@ mod tests {
         ));
 
         let effects = op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
-            metadata: SourceMetadata {
-                content_length: 3,
-                content_type: Some("text/plain".to_string()),
-                etag: Some("etag-2".to_string()),
-                last_modified: None,
-                source_version: None,
-            },
+            metadata: reference_cached_metadata(),
             stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
                 Bytes::from_static(b"abc"),
             )])),
@@ -3698,13 +3717,7 @@ mod tests {
         ));
         load_routing(&mut op);
         op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
-            metadata: SourceMetadata {
-                content_length: 3,
-                content_type: Some("text/plain".to_string()),
-                etag: Some("etag-2".to_string()),
-                last_modified: None,
-                source_version: None,
-            },
+            metadata: reference_cached_metadata(),
             stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
                 Bytes::from_static(b"abc"),
             )])),
@@ -3751,13 +3764,7 @@ mod tests {
         ));
         load_routing(&mut op);
         op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
-            metadata: SourceMetadata {
-                content_length: 3,
-                content_type: Some("text/plain".to_string()),
-                etag: Some("etag-2".to_string()),
-                last_modified: None,
-                source_version: None,
-            },
+            metadata: reference_cached_metadata(),
             stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
                 Bytes::from_static(b"abc"),
             )])),

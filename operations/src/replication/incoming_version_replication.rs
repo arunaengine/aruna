@@ -2694,6 +2694,10 @@ mod tests {
         manifest.auth_context = AuthContext::anonymous(test_realm_id());
         manifest.writer_auth_context = None;
         manifest.metadata = HashMap::from([("s3-key".to_string(), "value".to_string())]);
+        manifest.origin = Some(SyncOrigin {
+            relationship_id: Ulid::from_bytes([26u8; 16]),
+            hop_count: 1,
+        });
         manifest.reference_advance = Some(ReferenceAdvance {
             generation: 8,
             predecessor,
