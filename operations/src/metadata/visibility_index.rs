@@ -127,6 +127,19 @@ async fn load_evaluators(
     .map_err(|_| VisibilityError::Unavailable)
 }
 
+/// Whether an anonymous caller may read one record right now, for the read-by-id
+/// path that does not go through the index.
+pub async fn anon_readable(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<bool, VisibilityError> {
+    if !record.public {
+        return Ok(false);
+    }
+    let evaluators = load_evaluators(context, std::slice::from_ref(record)).await?;
+    Ok(record_visible(record, &evaluators))
+}
+
 /// Maintenance variant: one group whose policy state cannot be read is left out
 /// of the index instead of blocking every other group's records from it.
 async fn build_evaluators(context: &DriverContext, records: &[MetadataRegistryRecord]) -> Evaluators {

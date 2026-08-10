@@ -175,7 +175,13 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "oai.rs",
         "handle_oai",
-        "public OAI-PMH provider by protocol; serves only public documents",
+        "public OAI-PMH provider by protocol; enumerates only the anonymous \
+         visibility index and re-checks anonymous metadata.read per record",
+    ),
+    (
+        "oai.rs",
+        "handle_oai_post",
+        "public OAI-PMH provider by protocol; same gate as the GET transport",
     ),
     (
         "onboarding.rs",
