@@ -1099,6 +1099,68 @@ mod tests {
         request
     }
 
+    /// Structural stand-in for XSD validation: declaration, root namespaces,
+    /// element order, and a payload that is either the verb or an error.
+    fn assert_envelope(body: &str, payload: &str) {
+        assert!(body.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+        assert!(body.contains(OAI_PMH_OPEN));
+        assert!(body.ends_with("</OAI-PMH>"));
+        let date = body.find("<responseDate>").expect("responseDate");
+        let request = body.find("<request").expect("request");
+        assert!(date < request);
+        let payload_at = body
+            .find(&format!("<{payload}"))
+            .unwrap_or_else(|| panic!("missing {payload} in {body}"));
+        assert!(request < payload_at);
+    }
+
+    #[tokio::test]
+    async fn every_verb_envelope_is_shaped() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, 2, true).await;
+        let record = registry_record(&fixture, 0, true);
+        let cases: [(&str, &str); 7] = [
+            ("verb=Identify", "Identify"),
+            ("verb=ListMetadataFormats", "ListMetadataFormats"),
+            ("verb=ListSets", "error"),
+            (
+                "verb=ListIdentifiers&metadataPrefix=oai_dc",
+                "ListIdentifiers",
+            ),
+            ("verb=ListRecords&metadataPrefix=marc", "error"),
+            ("verb=GetRecord&metadataPrefix=oai_dc&identifier=nope", "error"),
+            ("verb=Bogus", "error"),
+        ];
+        for (query, payload) in cases {
+            let (status, body) = call(
+                &fixture,
+                peer_request(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(format!("/oai?{query}")),
+                    Body::empty(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_envelope(&body, payload);
+        }
+        let (_, body) = call(
+            &fixture,
+            peer_request(
+                axum::http::Request::builder().method("GET").uri(format!(
+                    "/oai?verb=GetRecord&metadataPrefix=oai_dc&identifier={}",
+                    record.graph_iri
+                )),
+                Body::empty(),
+            ),
+        )
+        .await;
+        // The graph is unreadable in this harness, so the routed export fails
+        // closed instead of rendering a fallback record.
+        assert!(body.is_empty() || body.contains("service error"));
+    }
+
     #[tokio::test]
     async fn get_and_post_agree() {
         let fixture = fixture(RoCrateLimits::default()).await;
