@@ -5,12 +5,13 @@ use crate::errors::ConversionError;
 use crate::keyspaces::{SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE};
 use crate::types::{Key, KeySpace, Value};
 use byteview::ByteView;
+use irokle::{ActorId, TopicId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
 /// Single row of the usage keyspace; the quarantine keyspace itself stays a pure
-/// `topic || event_id` prefix scan.
+/// `topic || actor || actor_seq` prefix scan.
 pub const SYNC_QUARANTINE_USAGE_KEY: &[u8] = b"usage";
 
 /// Hard defaults for [`SyncQuarantineCapacity`].
@@ -36,44 +37,100 @@ impl SyncQuarantineFamily {
     }
 }
 
+/// Immutable transport identity of a rejected operation: the topic it arrived
+/// on, the signed publisher actor, and that actor's sequence. No payload field
+/// takes part, so two publishers reusing one `event_id` keep distinct rows and
+/// a redelivery replaces exactly its own row.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SyncQuarantineIdentity {
+    pub topic: TopicId,
+    pub actor: ActorId,
+    pub actor_seq: u64,
+}
+
+impl SyncQuarantineIdentity {
+    pub fn from_parts(topic: [u8; 32], actor: [u8; 32], actor_seq: u64) -> Self {
+        Self {
+            topic: TopicId::from_bytes(topic),
+            actor: ActorId::from_bytes(actor),
+            actor_seq,
+        }
+    }
+
+    pub fn storage_key(&self) -> Vec<u8> {
+        sync_quarantine_key(self)
+    }
+}
+
+/// What the rejected operation carried. A payload that cannot be decoded into a
+/// `DocumentSyncEvent` at all is retained raw, so a poison op is still evidence
+/// instead of an error that replays forever.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SyncQuarantineEvidence {
+    Event {
+        event_id: Ulid,
+        family: SyncQuarantineFamily,
+        target: DocumentSyncTarget,
+        /// `Upsert`/`Delete` carry their actor in the revision, `AdminOperation` its origin.
+        origin_node_id: NodeId,
+        /// The postcard-encoded complete `DocumentSyncEvent`.
+        bytes: Vec<u8>,
+    },
+    Raw {
+        /// The undecodable transport payload exactly as it arrived.
+        bytes: Vec<u8>,
+    },
+}
+
+impl SyncQuarantineEvidence {
+    pub fn from_event(event: &DocumentSyncEvent) -> Self {
+        Self::Event {
+            event_id: event.event_id(),
+            family: event_family(event),
+            target: event.target().clone(),
+            origin_node_id: event_origin(event),
+            bytes: postcard::to_allocvec(event).unwrap_or_default(),
+        }
+    }
+
+    pub fn raw(bytes: Vec<u8>) -> Self {
+        Self::Raw { bytes }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Event { bytes, .. } | Self::Raw { bytes } => bytes,
+        }
+    }
+}
+
 /// A replicated sync event that failed permanent validation, retained for
 /// inspection instead of being silently dropped (#338). Evidence is committed in
 /// the same transaction as the cursor that advances past it, so a topic never
 /// moves ahead of an unpersisted rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncQuarantineRecord {
-    /// Raw sync-topic bytes the event arrived on.
-    pub topic: Vec<u8>,
-    pub event_id: Ulid,
-    pub family: SyncQuarantineFamily,
-    pub target: DocumentSyncTarget,
-    /// `Upsert`/`Delete` carry their actor in the revision, `AdminOperation` its origin.
-    pub origin_node_id: NodeId,
+    pub identity: SyncQuarantineIdentity,
     pub reason: String,
     pub quarantined_at_ms: u64,
     /// Set by an operator through the admin surface; only acknowledged rows are prunable.
     pub acknowledged: bool,
-    /// The postcard-encoded complete `DocumentSyncEvent`, for out-of-band inspection.
-    pub event_bytes: Vec<u8>,
+    pub evidence: SyncQuarantineEvidence,
 }
 
 impl SyncQuarantineRecord {
-    pub fn from_event(
-        topic: &[u8],
-        event: &DocumentSyncEvent,
+    pub fn new(
+        identity: SyncQuarantineIdentity,
+        evidence: SyncQuarantineEvidence,
         reason: &str,
         quarantined_at_ms: u64,
     ) -> Self {
         Self {
-            topic: topic.to_vec(),
-            event_id: event.event_id(),
-            family: event_family(event),
-            target: event.target().clone(),
-            origin_node_id: event_origin(event),
+            identity,
             reason: reason.to_string(),
             quarantined_at_ms,
             acknowledged: false,
-            event_bytes: postcard::to_allocvec(event).unwrap_or_default(),
+            evidence,
         }
     }
 
@@ -85,21 +142,55 @@ impl SyncQuarantineRecord {
         Ok(postcard::from_bytes(bytes)?)
     }
 
-    pub fn decode_event(&self) -> Result<DocumentSyncEvent, ConversionError> {
-        Ok(postcard::from_bytes(&self.event_bytes)?)
+    /// `None` for raw evidence, which by definition has no decodable event.
+    pub fn decoded_event(&self) -> Option<DocumentSyncEvent> {
+        match &self.evidence {
+            SyncQuarantineEvidence::Event { bytes, .. } => postcard::from_bytes(bytes).ok(),
+            SyncQuarantineEvidence::Raw { .. } => None,
+        }
+    }
+
+    pub fn event_id(&self) -> Option<Ulid> {
+        match &self.evidence {
+            SyncQuarantineEvidence::Event { event_id, .. } => Some(*event_id),
+            SyncQuarantineEvidence::Raw { .. } => None,
+        }
+    }
+
+    pub fn family(&self) -> Option<SyncQuarantineFamily> {
+        match &self.evidence {
+            SyncQuarantineEvidence::Event { family, .. } => Some(*family),
+            SyncQuarantineEvidence::Raw { .. } => None,
+        }
+    }
+
+    pub fn target(&self) -> Option<&DocumentSyncTarget> {
+        match &self.evidence {
+            SyncQuarantineEvidence::Event { target, .. } => Some(target),
+            SyncQuarantineEvidence::Raw { .. } => None,
+        }
+    }
+
+    pub fn origin(&self) -> Option<NodeId> {
+        match &self.evidence {
+            SyncQuarantineEvidence::Event { origin_node_id, .. } => Some(*origin_node_id),
+            SyncQuarantineEvidence::Raw { .. } => None,
+        }
     }
 
     pub fn storage_key(&self) -> Vec<u8> {
-        sync_quarantine_key(&self.topic, self.event_id)
+        self.identity.storage_key()
     }
 }
 
-/// Key: `topic || event_id`. Re-delivery of the same poison event overwrites its
-/// own row, so the store is bounded by the count of distinct invalid events.
-pub fn sync_quarantine_key(topic: &[u8], event_id: Ulid) -> Vec<u8> {
-    let mut key = Vec::with_capacity(topic.len() + 16);
-    key.extend_from_slice(topic);
-    key.extend_from_slice(&event_id.to_bytes());
+/// Key: `topic || actor || actor_seq`, all immutable transport identity. The
+/// sequence is big-endian so a topic's rows sort by publisher and delivery
+/// order, and a redelivery of the same op overwrites exactly its own row.
+pub fn sync_quarantine_key(identity: &SyncQuarantineIdentity) -> Vec<u8> {
+    let mut key = Vec::with_capacity(TopicId::LEN + ActorId::LEN + 8);
+    key.extend_from_slice(identity.topic.as_bytes());
+    key.extend_from_slice(identity.actor.as_bytes());
+    key.extend_from_slice(&identity.actor_seq.to_be_bytes());
     key
 }
 
@@ -193,37 +284,37 @@ pub enum SyncQuarantineError {
 }
 
 pub struct SyncQuarantineInput<'a> {
-    pub topic: &'a [u8],
-    pub event: &'a DocumentSyncEvent,
+    pub identity: SyncQuarantineIdentity,
+    pub evidence: SyncQuarantineEvidence,
     pub reason: &'a str,
     pub quarantined_at_ms: u64,
-    /// Encoded length of the row already stored under this key. A re-delivered
-    /// poison event replaces its own row, so its bytes are swapped, not added.
+    /// Encoded length of the value already held under this key, whether already
+    /// stored or pending earlier in the same batch. A redelivery replaces its
+    /// own row, so its bytes are swapped, not added.
     pub replaced_bytes: Option<u64>,
 }
 
-/// `entries` is the evidence row followed by the usage row. Several rejects in
-/// one batch chain `usage` into the next call and fold every entry into the same
-/// transaction: the repeated usage key resolves to the last write, which is the
-/// batch's final accounting.
+/// One evidence row plus the usage total it produces. Several rejects in one
+/// batch chain `usage` into the next call, so the batch's last usage value is
+/// its complete accounting.
 #[derive(Debug)]
 pub struct SyncQuarantineWrite {
     pub record: SyncQuarantineRecord,
     pub usage: SyncQuarantineUsage,
-    pub entries: Vec<(KeySpace, Key, Value)>,
+    pub row: (KeySpace, Key, Value),
 }
 
-/// Build the evidence row and the matching usage row for one permanently
-/// rejected event. Fails closed at capacity: the caller must leave the topic
-/// cursor unpersisted rather than drop the evidence or grow the store.
+/// Build the evidence row for one permanently rejected operation and the usage
+/// total it leaves behind. Fails closed at capacity: the caller must leave the
+/// topic cursor unpersisted rather than drop the evidence or grow the store.
 pub fn build_quarantine_entries(
     input: SyncQuarantineInput<'_>,
     usage: SyncQuarantineUsage,
     capacity: SyncQuarantineCapacity,
 ) -> Result<SyncQuarantineWrite, SyncQuarantineError> {
-    let record = SyncQuarantineRecord::from_event(
-        input.topic,
-        input.event,
+    let record = SyncQuarantineRecord::new(
+        input.identity,
+        input.evidence,
         input.reason,
         input.quarantined_at_ms,
     );
@@ -240,14 +331,11 @@ pub fn build_quarantine_entries(
     check_quarantine_capacity(usage, capacity)?;
 
     Ok(SyncQuarantineWrite {
-        entries: vec![
-            (
-                SYNC_QUARANTINE_KEYSPACE.to_string(),
-                ByteView::from(record.storage_key()),
-                ByteView::from(value),
-            ),
-            quarantine_usage_entry(usage)?,
-        ],
+        row: (
+            SYNC_QUARANTINE_KEYSPACE.to_string(),
+            ByteView::from(record.storage_key()),
+            ByteView::from(value),
+        ),
         record,
         usage,
     })
@@ -357,34 +445,67 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn record_roundtrips_families() {
-        for event in families() {
-            let record = SyncQuarantineRecord::from_event(&[7u8; 32], &event, "invalid", 42);
-            let decoded = SyncQuarantineRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
-            assert_eq!(decoded, record);
-            assert!(!decoded.acknowledged);
-            assert_eq!(decoded.event_id, event.event_id());
-            assert_eq!(&decoded.target, event.target());
-            assert_eq!(decoded.origin_node_id, node());
-            assert_eq!(decoded.decode_event().unwrap(), event);
+    fn identity(actor_seq: u64) -> SyncQuarantineIdentity {
+        SyncQuarantineIdentity {
+            topic: TopicId::from_bytes([7; 32]),
+            actor: ActorId::from_bytes([8; 32]),
+            actor_seq,
         }
     }
 
     #[test]
-    fn key_prefixes_topic() {
-        let record = SyncQuarantineRecord::from_event(&[7u8; 32], &families()[0], "invalid", 42);
-        let key = record.storage_key();
-        assert!(key.starts_with(&record.topic));
-        assert_eq!(key.len(), record.topic.len() + 16);
+    fn record_roundtrips_families() {
+        for event in families() {
+            let record = SyncQuarantineRecord::new(
+                identity(1),
+                SyncQuarantineEvidence::from_event(&event),
+                "invalid",
+                42,
+            );
+            let decoded = SyncQuarantineRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
+            assert_eq!(decoded, record);
+            assert!(!decoded.acknowledged);
+            assert_eq!(decoded.event_id(), Some(event.event_id()));
+            assert_eq!(decoded.target(), Some(event.target()));
+            assert_eq!(decoded.origin(), Some(node()));
+            assert_eq!(decoded.decoded_event().unwrap(), event);
+        }
     }
 
     #[test]
-    fn build_emits_entries() {
+    fn raw_record_keeps_bytes() {
+        let record = SyncQuarantineRecord::new(
+            identity(3),
+            SyncQuarantineEvidence::raw(vec![9, 9, 9]),
+            "undecodable",
+            42,
+        );
+        let decoded = SyncQuarantineRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded.evidence.bytes(), &[9, 9, 9]);
+        assert_eq!(decoded.event_id(), None);
+        assert_eq!(decoded.family(), None);
+        assert_eq!(decoded.target(), None);
+        assert!(decoded.decoded_event().is_none());
+    }
+
+    #[test]
+    fn key_is_transport_identity() {
+        let key = identity(5).storage_key();
+        assert_eq!(key.len(), 72);
+        assert!(key.starts_with(&[7u8; 32]));
+        assert_eq!(&key[32..64], &[8u8; 32]);
+        assert_eq!(&key[64..], &5u64.to_be_bytes());
+        // The payload never enters the key, and the sequence orders the rows.
+        assert_ne!(identity(5).storage_key(), identity(6).storage_key());
+        assert!(identity(5).storage_key() < identity(6).storage_key());
+    }
+
+    #[test]
+    fn build_emits_row() {
         let write = build_quarantine_entries(
             SyncQuarantineInput {
-                topic: &[7u8; 32],
-                event: &families()[0],
+                identity: identity(1),
+                evidence: SyncQuarantineEvidence::from_event(&families()[0]),
                 reason: "invalid",
                 quarantined_at_ms: 42,
                 replaced_bytes: None,
@@ -393,11 +514,14 @@ mod tests {
             SyncQuarantineCapacity::default(),
         )
         .unwrap();
-        assert_eq!(write.entries.len(), 2);
-        assert_eq!(write.entries[0].0, SYNC_QUARANTINE_KEYSPACE);
-        assert_eq!(write.entries[1].0, SYNC_QUARANTINE_USAGE_KEYSPACE);
+        assert_eq!(write.row.0, SYNC_QUARANTINE_KEYSPACE);
+        assert_eq!(write.row.1.as_ref(), identity(1).storage_key());
         assert_eq!(write.usage.records, 1);
-        assert_eq!(write.usage.bytes, write.entries[0].2.len() as u64);
+        assert_eq!(write.usage.bytes, write.row.2.len() as u64);
+        assert_eq!(
+            quarantine_usage_entry(write.usage).unwrap().0,
+            SYNC_QUARANTINE_USAGE_KEYSPACE
+        );
     }
 
     #[test]
@@ -408,8 +532,8 @@ mod tests {
         };
         let error = build_quarantine_entries(
             SyncQuarantineInput {
-                topic: &[7u8; 32],
-                event: &families()[0],
+                identity: identity(1),
+                evidence: SyncQuarantineEvidence::from_event(&families()[0]),
                 reason: "invalid",
                 quarantined_at_ms: 42,
                 replaced_bytes: None,
@@ -431,8 +555,8 @@ mod tests {
     fn redelivery_reuses_usage() {
         let event = families().remove(2);
         let input = |replaced| SyncQuarantineInput {
-            topic: &[7u8; 32],
-            event: &event,
+            identity: identity(2),
+            evidence: SyncQuarantineEvidence::from_event(&event),
             reason: "invalid",
             quarantined_at_ms: 42,
             replaced_bytes: replaced,
@@ -446,5 +570,38 @@ mod tests {
         let again = build_quarantine_entries(input(Some(first.usage.bytes)), first.usage, capacity)
             .unwrap();
         assert_eq!(again.usage, first.usage);
+    }
+
+    /// One `event_id` from two publishers is two rows, and the same op from one
+    /// publisher is one row whose bytes are swapped rather than added.
+    #[test]
+    fn identity_separates_publishers() {
+        let event = families().remove(0);
+        let other = SyncQuarantineIdentity {
+            actor: ActorId::from_bytes([9; 32]),
+            ..identity(1)
+        };
+        let build = |identity, usage, replaced| {
+            build_quarantine_entries(
+                SyncQuarantineInput {
+                    identity,
+                    evidence: SyncQuarantineEvidence::from_event(&event),
+                    reason: "invalid",
+                    quarantined_at_ms: 42,
+                    replaced_bytes: replaced,
+                },
+                usage,
+                SyncQuarantineCapacity::default(),
+            )
+            .unwrap()
+        };
+        let first = build(identity(1), SyncQuarantineUsage::default(), None);
+        let second = build(other, first.usage, None);
+        assert_ne!(first.row.1, second.row.1);
+        assert_eq!(second.usage.records, 2);
+
+        let replayed = build(identity(1), second.usage, Some(first.row.2.len() as u64));
+        assert_eq!(replayed.row.1, first.row.1);
+        assert_eq!(replayed.usage, second.usage);
     }
 }

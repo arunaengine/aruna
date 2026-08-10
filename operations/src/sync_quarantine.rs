@@ -37,6 +37,8 @@ pub enum QuarantineAdminError {
 pub struct QuarantinePageRequest {
     /// Exclusive cursor: the last key of the previous page.
     pub start_after: Option<Vec<u8>>,
+    /// Restrict the page to one sync topic, the key's leading component.
+    pub topic: Option<Vec<u8>>,
     pub limit: Option<usize>,
 }
 
@@ -63,14 +65,17 @@ fn bounded_limit(limit: Option<usize>) -> usize {
 
 async fn iter_page(
     storage: &StorageHandle,
-    start_after: Option<&[u8]>,
+    request: &QuarantinePageRequest,
     limit: usize,
 ) -> Result<(Vec<(Key, Value)>, Option<Key>), QuarantineAdminError> {
-    let start = start_after.map(|key| IterStart::After(ByteView::from(key)));
+    let start = request
+        .start_after
+        .as_deref()
+        .map(|key| IterStart::After(ByteView::from(key)));
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
-            prefix: None,
+            prefix: request.topic.as_deref().map(ByteView::from),
             start,
             limit,
             txn_id: None,
@@ -113,11 +118,12 @@ async fn read_usage_row(
     }
 }
 
-async fn read_row(
+/// The stored value, so accounting uses the exact bytes this read observed.
+async fn read_row_value(
     storage: &StorageHandle,
     key: &[u8],
     txn_id: Option<TxnId>,
-) -> Result<Option<SyncQuarantineRecord>, QuarantineAdminError> {
+) -> Result<Option<Value>, QuarantineAdminError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
@@ -126,16 +132,25 @@ async fn read_row(
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| SyncQuarantineRecord::from_bytes(bytes.as_ref()))
-            .transpose()
-            .map_err(QuarantineAdminError::Conversion),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         got => Err(QuarantineAdminError::Unexpected {
             expected: "storage read result",
             got: format!("{got:?}"),
         }),
     }
+}
+
+async fn read_row(
+    storage: &StorageHandle,
+    key: &[u8],
+    txn_id: Option<TxnId>,
+) -> Result<Option<SyncQuarantineRecord>, QuarantineAdminError> {
+    read_row_value(storage, key, txn_id)
+        .await?
+        .map(|bytes| SyncQuarantineRecord::from_bytes(bytes.as_ref()))
+        .transpose()
+        .map_err(QuarantineAdminError::Conversion)
 }
 
 async fn start_txn(storage: &StorageHandle) -> Result<TxnId, QuarantineAdminError> {
@@ -220,17 +235,14 @@ pub async fn read_quarantine_usage(
     read_usage_row(&ctx.storage_handle, None).await
 }
 
-/// One bounded page of quarantine evidence in key order (`topic || event_id`).
+/// One bounded page of quarantine evidence in key order
+/// (`topic || actor || actor_seq`).
 pub async fn list_quarantine_records(
     ctx: &DriverContext,
     request: QuarantinePageRequest,
 ) -> Result<QuarantinePage, QuarantineAdminError> {
-    let (values, next_start_after) = iter_page(
-        &ctx.storage_handle,
-        request.start_after.as_deref(),
-        bounded_limit(request.limit),
-    )
-    .await?;
+    let (values, next_start_after) =
+        iter_page(&ctx.storage_handle, &request, bounded_limit(request.limit)).await?;
     let records = values
         .into_iter()
         .map(|(_, value)| SyncQuarantineRecord::from_bytes(value.as_ref()))
@@ -299,29 +311,28 @@ async fn acknowledge_in_txn(
 /// Delete acknowledged rows in one bounded pass, decrementing the usage row in
 /// the same transaction so reclaimed capacity survives a crash. Resumable: the
 /// returned cursor continues the scan even when the pass deleted nothing.
+///
+/// The scan only proposes candidates. Every one is re-read and re-validated
+/// inside the delete transaction, so a redelivery that replaced a selected row
+/// with unacknowledged evidence between scan and commit is neither deleted nor
+/// accounted from its stale value.
 pub async fn prune_quarantine_records(
     ctx: &DriverContext,
     request: QuarantinePageRequest,
 ) -> Result<QuarantinePruneResult, QuarantineAdminError> {
     let storage = &ctx.storage_handle;
-    let (values, next_start_after) = iter_page(
-        storage,
-        request.start_after.as_deref(),
-        bounded_limit(request.limit),
-    )
-    .await?;
+    let (values, next_start_after) =
+        iter_page(storage, &request, bounded_limit(request.limit)).await?;
     let scanned = values.len();
-    let mut deletes = Vec::new();
-    let mut released = 0u64;
+    let mut candidates = Vec::new();
     for (key, value) in values {
         if SyncQuarantineRecord::from_bytes(value.as_ref())?.acknowledged {
-            released = released.saturating_add(value.len() as u64);
-            deletes.push((SYNC_QUARANTINE_KEYSPACE.to_string(), key));
+            candidates.push(key);
         }
     }
 
     let next_start_after = next_start_after.map(|key| key.as_ref().to_vec());
-    if deletes.is_empty() {
+    if candidates.is_empty() {
         return Ok(QuarantinePruneResult {
             pruned: 0,
             scanned,
@@ -330,10 +341,18 @@ pub async fn prune_quarantine_records(
         });
     }
 
-    let pruned = deletes.len();
     let txn_id = start_txn(storage).await?;
-    match prune_in_txn(storage, deletes, released, txn_id).await {
-        Ok(usage) => {
+    match prune_in_txn(storage, candidates, txn_id).await {
+        Ok((0, usage)) => {
+            abort_txn(storage, txn_id).await;
+            Ok(QuarantinePruneResult {
+                pruned: 0,
+                scanned,
+                next_start_after,
+                usage,
+            })
+        }
+        Ok((pruned, usage)) => {
             commit_txn(storage, txn_id).await?;
             Ok(QuarantinePruneResult {
                 pruned,
@@ -351,15 +370,30 @@ pub async fn prune_quarantine_records(
 
 async fn prune_in_txn(
     storage: &StorageHandle,
-    deletes: Vec<(String, Key)>,
-    released: u64,
+    candidates: Vec<Key>,
     txn_id: TxnId,
-) -> Result<SyncQuarantineUsage, QuarantineAdminError> {
+) -> Result<(usize, SyncQuarantineUsage), QuarantineAdminError> {
+    let mut deletes = Vec::new();
+    let mut released = 0u64;
+    for key in candidates {
+        let Some(value) = read_row_value(storage, key.as_ref(), Some(txn_id)).await? else {
+            continue;
+        };
+        if !SyncQuarantineRecord::from_bytes(value.as_ref())?.acknowledged {
+            continue;
+        }
+        released = released.saturating_add(value.len() as u64);
+        deletes.push((SYNC_QUARANTINE_KEYSPACE.to_string(), key));
+    }
     let mut usage = read_usage_row(storage, Some(txn_id)).await?;
-    usage.release(deletes.len() as u64, released);
+    if deletes.is_empty() {
+        return Ok((0, usage));
+    }
+    let pruned = deletes.len();
+    usage.release(pruned as u64, released);
     delete_batch(storage, deletes, txn_id).await?;
     write_batch(storage, vec![quarantine_usage_entry(usage)?], txn_id).await?;
-    Ok(usage)
+    Ok((pruned, usage))
 }
 
 #[cfg(test)]
@@ -371,8 +405,8 @@ mod tests {
         DocumentSyncTarget,
     };
     use aruna_core::structs::{
-        PlacementRef, RealmId, SyncQuarantineCapacity, SyncQuarantineInput, SyncQuarantineUsage,
-        build_quarantine_entries,
+        PlacementRef, RealmId, SyncQuarantineCapacity, SyncQuarantineEvidence,
+        SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
     };
     use aruna_storage::storage;
     use ulid::Ulid;
@@ -412,14 +446,17 @@ mod tests {
         }
     }
 
+    fn identity(index: u8) -> SyncQuarantineIdentity {
+        SyncQuarantineIdentity::from_parts([7; 32], [8; 32], u64::from(index) + 1)
+    }
+
     async fn seed_rows(ctx: &DriverContext, count: u8) -> SyncQuarantineUsage {
         let mut usage = SyncQuarantineUsage::default();
         for index in 0..count {
-            let event = event(index);
             let write = build_quarantine_entries(
                 SyncQuarantineInput {
-                    topic: &[7u8; 32],
-                    event: &event,
+                    identity: identity(index),
+                    evidence: SyncQuarantineEvidence::from_event(&event(index)),
                     reason: "invalid",
                     quarantined_at_ms: 42,
                     replaced_bytes: None,
@@ -430,16 +467,20 @@ mod tests {
             .unwrap();
             usage = write.usage;
             let txn_id = start_txn(&ctx.storage_handle).await.unwrap();
-            write_batch(&ctx.storage_handle, write.entries, txn_id)
-                .await
-                .unwrap();
+            write_batch(
+                &ctx.storage_handle,
+                vec![write.row, quarantine_usage_entry(usage).unwrap()],
+                txn_id,
+            )
+            .await
+            .unwrap();
             commit_txn(&ctx.storage_handle, txn_id).await.unwrap();
         }
         usage
     }
 
     fn row_key(index: u8) -> Vec<u8> {
-        aruna_core::structs::sync_quarantine_key(&[7u8; 32], Ulid::from_bytes([index; 16]))
+        identity(index).storage_key()
     }
 
     #[tokio::test]
@@ -449,6 +490,7 @@ mod tests {
         let first = list_quarantine_records(
             &ctx,
             QuarantinePageRequest {
+                topic: None,
                 start_after: None,
                 limit: Some(2),
             },
@@ -462,6 +504,7 @@ mod tests {
         let second = list_quarantine_records(
             &ctx,
             QuarantinePageRequest {
+                topic: None,
                 start_after: first.next_start_after.clone(),
                 limit: Some(2),
             },
@@ -469,7 +512,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second.records.len(), 2);
-        assert_ne!(second.records[0].event_id, first.records[0].event_id);
+        assert_ne!(second.records[0].event_id(), first.records[0].event_id());
     }
 
     #[tokio::test]
@@ -480,7 +523,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(record.decode_event().unwrap(), event(1));
+        assert_eq!(record.decoded_event().unwrap(), event(1));
         assert!(
             read_quarantine_record(&ctx, &row_key(9))
                 .await
@@ -563,6 +606,7 @@ mod tests {
             let result = prune_quarantine_records(
                 &ctx,
                 QuarantinePageRequest {
+                    topic: None,
                     start_after: cursor,
                     limit: Some(1),
                 },
@@ -591,11 +635,10 @@ mod tests {
             max_bytes: u64::MAX,
         };
         let usage = seed_rows(&ctx, 2).await;
-        let next = event(2);
         let error = build_quarantine_entries(
             SyncQuarantineInput {
-                topic: &[7u8; 32],
-                event: &next,
+                identity: identity(2),
+                evidence: SyncQuarantineEvidence::from_event(&event(2)),
                 reason: "invalid",
                 quarantined_at_ms: 42,
                 replaced_bytes: None,
@@ -616,8 +659,8 @@ mod tests {
         assert!(
             build_quarantine_entries(
                 SyncQuarantineInput {
-                    topic: &[7u8; 32],
-                    event: &next,
+                    identity: identity(2),
+                    evidence: SyncQuarantineEvidence::from_event(&event(2)),
                     reason: "invalid",
                     quarantined_at_ms: 42,
                     replaced_bytes: None,

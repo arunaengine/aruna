@@ -58,6 +58,9 @@ pub struct QuarantineQuery {
     /// Opaque continuation token from a previous page.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Hex sync topic; restricts the page to that topic's evidence.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Page size (default 50, clamped to 1..=200).
     #[serde(default)]
     pub limit: Option<usize>,
@@ -73,13 +76,20 @@ pub struct QuarantineUsageResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuarantineRecordResponse {
-    /// Opaque row id: hex of `topic || event_id`.
+    /// Opaque row id: hex of `topic || actor || actor_seq`.
     pub id: String,
     pub topic: String,
-    pub event_id: String,
-    pub family: String,
-    pub target: String,
-    pub origin_node_id: String,
+    pub actor: String,
+    pub actor_seq: u64,
+    /// Absent when the payload never decoded into an event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
     pub reason: String,
     pub quarantined_at_ms: u64,
     pub acknowledged: bool,
@@ -136,13 +146,10 @@ fn map_admin_error(error: QuarantineAdminError) -> ServerError {
 }
 
 fn page_request(query: &QuarantineQuery) -> ServerResult<QuarantinePageRequest> {
-    let start_after = query
-        .cursor
-        .as_deref()
-        .map(|cursor| hex::decode(cursor).map_err(|_| ServerError::BadRequest))
-        .transpose()?;
+    let decode = |value: &str| hex::decode(value).map_err(|_| ServerError::BadRequest);
     Ok(QuarantinePageRequest {
-        start_after,
+        start_after: query.cursor.as_deref().map(decode).transpose()?,
+        topic: query.topic.as_deref().map(decode).transpose()?,
         limit: query.limit,
     })
 }
@@ -160,15 +167,17 @@ fn map_usage(usage: SyncQuarantineUsage) -> QuarantineUsageResponse {
 fn map_record(record: &SyncQuarantineRecord) -> QuarantineRecordResponse {
     QuarantineRecordResponse {
         id: hex::encode(record.storage_key()),
-        topic: hex::encode(&record.topic),
-        event_id: record.event_id.to_string(),
-        family: record.family.as_str().to_string(),
-        target: format!("{:?}", record.target),
-        origin_node_id: record.origin_node_id.to_string(),
+        topic: record.identity.topic.to_string(),
+        actor: record.identity.actor.to_string(),
+        actor_seq: record.identity.actor_seq,
+        event_id: record.event_id().map(|event_id| event_id.to_string()),
+        family: record.family().map(|family| family.as_str().to_string()),
+        target: record.target().map(|target| format!("{target:?}")),
+        origin_node_id: record.origin().map(|origin| origin.to_string()),
         reason: record.reason.clone(),
         quarantined_at_ms: record.quarantined_at_ms,
         acknowledged: record.acknowledged,
-        event_bytes: record.event_bytes.len(),
+        event_bytes: record.evidence.bytes().len(),
     }
 }
 
@@ -187,6 +196,7 @@ fn event_summary(event: &DocumentSyncEvent) -> String {
     tag = "sync-quarantine",
     params(
         ("cursor" = Option<String>, Query, description = "Continuation token"),
+        ("topic" = Option<String>, Query, description = "Hex sync topic filter"),
         ("limit" = Option<usize>, Query, description = "Page size (max 200)")
     ),
     responses(
@@ -247,7 +257,7 @@ pub async fn inspect_quarantine(
         StatusCode::OK,
         Json(QuarantineInspectResponse {
             record: map_record(&record),
-            event: record.decode_event().ok().as_ref().map(event_summary),
+            event: record.decoded_event().as_ref().map(event_summary),
         }),
     ))
 }
@@ -287,6 +297,7 @@ pub async fn acknowledge_quarantine(
     tag = "sync-quarantine",
     params(
         ("cursor" = Option<String>, Query, description = "Continuation token"),
+        ("topic" = Option<String>, Query, description = "Hex sync topic filter"),
         ("limit" = Option<usize>, Query, description = "Rows scanned this pass (max 200)")
     ),
     responses(
@@ -327,8 +338,9 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::{
-        Actor, NodeCapabilities, PlacementRef, RealmId, SyncQuarantineInput, SyncQuarantineUsage,
-        build_quarantine_entries,
+        Actor, NodeCapabilities, PlacementRef, RealmId, SyncQuarantineEvidence,
+        SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
+        quarantine_usage_entry,
     };
     use aruna_core::types::UserId;
     use aruna_operations::claim_initial_realm_admin::{
@@ -433,15 +445,18 @@ mod tests {
         }
     }
 
+    fn identity(index: u8) -> SyncQuarantineIdentity {
+        SyncQuarantineIdentity::from_parts([7; 32], [8; 32], u64::from(index) + 1)
+    }
+
     async fn seed_rows(fx: &Fixture, count: u8) {
         let ctx = fx.state.get_ctx();
         let mut usage = SyncQuarantineUsage::default();
         for index in 0..count {
-            let event = event(index);
             let write = build_quarantine_entries(
                 SyncQuarantineInput {
-                    topic: &[7u8; 32],
-                    event: &event,
+                    identity: identity(index),
+                    evidence: SyncQuarantineEvidence::from_event(&event(index)),
                     reason: "unauthorized",
                     quarantined_at_ms: 42,
                     replaced_bytes: None,
@@ -453,7 +468,7 @@ mod tests {
             usage = write.usage;
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::BatchWrite {
-                    writes: write.entries,
+                    writes: vec![write.row, quarantine_usage_entry(usage).unwrap()],
                     txn_id: None,
                 })
                 .await;
@@ -470,6 +485,7 @@ mod tests {
             Extension(Some(fx.admin.clone())),
             Query(QuarantineQuery {
                 cursor: None,
+                topic: None,
                 limit: Some(2),
             }),
         )
@@ -478,7 +494,7 @@ mod tests {
         assert_eq!(page.records.len(), 2);
         assert_eq!(page.usage.records, 3);
         assert!(page.next_cursor.is_some());
-        assert_eq!(page.records[0].family, "delete");
+        assert_eq!(page.records[0].family.as_deref(), Some("delete"));
 
         let (_, Json(inspected)) = inspect_quarantine(
             State(fx.state.clone()),

@@ -17,8 +17,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use aruna_core::structs::{
     NodeInfoDocument, NodeUrls, NodeUtilization, PlacementRef, RealmId,
-    SYNC_QUARANTINE_MAX_RECORDS, SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry,
-    quarantine_usage_entry, sync_quarantine_key,
+    SYNC_QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity,
+    SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
 use aruna_core::types::Value;
 use aruna_net::document_sync::DocumentSyncService;
@@ -99,9 +99,9 @@ async fn fill_store(storage: &StorageHandle) -> SyncQuarantineUsage {
     let mut usage = SyncQuarantineUsage::default();
     let mut writes = Vec::new();
     for index in 0..SYNC_QUARANTINE_MAX_RECORDS {
-        let record = SyncQuarantineRecord::from_event(
-            &[7u8; 32],
-            &seed_event(index),
+        let record = SyncQuarantineRecord::new(
+            SyncQuarantineIdentity::from_parts([7; 32], [8; 32], index + 1),
+            SyncQuarantineEvidence::from_event(&seed_event(index)),
             "seeded evidence",
             index,
         );
@@ -210,65 +210,62 @@ async fn capacity_blocks_then_releases() {
         "publish failed: {published:?}"
     );
 
-    let evidence_key = sync_quarantine_key(topic_id.as_bytes(), event_id);
+    // Evidence rows are keyed by transport identity, so the tested topic's
+    // rows are exactly the ones under its own key prefix.
+    let topic_page = || QuarantinePageRequest {
+        start_after: None,
+        topic: Some(topic_id.as_bytes().to_vec()),
+        limit: Some(4),
+    };
     reset_cursor(&storage, topic_id.as_bytes()).await;
     service.reconcile_documents_event().await;
     assert!(
-        read_quarantine_record(&ctx, &evidence_key)
+        list_quarantine_records(&ctx, topic_page())
             .await
             .unwrap()
-            .is_none(),
+            .records
+            .is_empty(),
         "a full store must not write evidence"
     );
     assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), seeded);
 
     // Reclaim one slot: only acknowledged rows are prunable.
-    let page = list_quarantine_records(
-        &ctx,
-        QuarantinePageRequest {
-            start_after: None,
-            limit: Some(1),
-        },
-    )
-    .await
-    .unwrap();
+    let seeded_page = || QuarantinePageRequest {
+        start_after: None,
+        topic: Some(vec![7u8; 32]),
+        limit: Some(1),
+    };
+    let page = list_quarantine_records(&ctx, seeded_page()).await.unwrap();
     let oldest = page.records.first().expect("seeded evidence").storage_key();
-    let pruned = prune_quarantine_records(
-        &ctx,
-        QuarantinePageRequest {
-            start_after: None,
-            limit: Some(1),
-        },
-    )
-    .await
-    .unwrap();
+    let pruned = prune_quarantine_records(&ctx, seeded_page()).await.unwrap();
     assert_eq!(pruned.pruned, 0, "unacknowledged evidence is never pruned");
     acknowledge_quarantine_row(&ctx, &oldest)
         .await
         .unwrap()
         .expect("row is acknowledged");
-    let pruned = prune_quarantine_records(
-        &ctx,
-        QuarantinePageRequest {
-            start_after: None,
-            limit: Some(1),
-        },
-    )
-    .await
-    .unwrap();
+    let pruned = prune_quarantine_records(&ctx, seeded_page()).await.unwrap();
     assert_eq!(pruned.pruned, 1);
     assert_eq!(pruned.usage.records, SYNC_QUARANTINE_MAX_RECORDS - 1);
 
     // The event was never applied and its cursor never advanced, so the next
     // reconcile redelivers it and the reclaimed slot takes the evidence.
     service.reconcile_documents_event().await;
-    let record = read_quarantine_record(&ctx, &evidence_key)
-        .await
-        .unwrap()
+    let redelivered = list_quarantine_records(&ctx, topic_page()).await.unwrap();
+    let record = redelivered
+        .records
+        .first()
         .expect("redelivered evidence persists");
-    assert_eq!(record.event_id, event_id);
+    assert_eq!(redelivered.records.len(), 1);
+    assert_eq!(record.event_id(), Some(event_id));
     assert!(record.reason.starts_with("invalid node info document:"));
-    assert_eq!(record.target, target);
+    assert_eq!(record.target(), Some(&target));
+    assert_eq!(
+        read_quarantine_record(&ctx, &record.storage_key())
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(record)
+    );
     assert_eq!(
         read_quarantine_usage(&ctx).await.unwrap().records,
         SYNC_QUARANTINE_MAX_RECORDS
