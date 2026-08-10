@@ -18,7 +18,7 @@ use aruna_core::structs::{
     JobProgress, JobResultPayload, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     RealmNodeKind, RepositoryConnector, RepositoryConnectorKind,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
@@ -529,6 +529,11 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
         .ok_or("alpha provenance missing")?;
     assert_eq!(alpha.state, HarvestRecordState::Live);
     let alpha_id = alpha.meta_resource_id;
+    // A random ULID would not decode, and the create would never resolve a placement.
+    assert!(
+        MetaResourceId::from_bytes(alpha_id.to_bytes()).is_ok(),
+        "harvest must mint a structured metadata id"
+    );
     drain(&fixture).await?;
     let stored = cursor(&fixture, &source).await?;
     assert_eq!(
