@@ -15517,6 +15517,17 @@ mod tests {
             "cursor must advance past the hostile ops"
         );
 
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 2, "{records:?}");
+        for record in &records {
+            assert_eq!(record.reason, "unsupported whole-document admin sync event");
+            assert_eq!(record.target, target);
+            assert_eq!(
+                record.decode_event().expect("event decodes").placement(),
+                placement
+            );
+        }
+
         service.shutdown().await;
     }
 
@@ -16553,6 +16564,19 @@ mod tests {
             "cursor must advance past rejected admin events"
         );
 
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 4, "{records:?}");
+        for record in &records {
+            assert_eq!(record.family, SyncQuarantineFamily::AdminOperation);
+            assert_eq!(record.target, target);
+            assert!(!record.reason.is_empty());
+            assert!(matches!(
+                record.decode_event().expect("event decodes"),
+                DocumentSyncEvent::AdminOperation { .. }
+            ));
+        }
+        assert_eq!(quarantine_usage(&storage).await.records, 4);
+
         service.shutdown().await;
     }
 
@@ -16962,6 +16986,14 @@ mod tests {
             "cursor must advance past the forged upsert"
         );
 
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].reason,
+            "watch interest publisher is not the owning node"
+        );
+        assert_eq!(records[0].target, forged_target);
+
         service.shutdown().await;
     }
 
@@ -17124,6 +17156,15 @@ mod tests {
             "cursor must advance past the forged non-upserts"
         );
 
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 2, "{records:?}");
+        for record in &records {
+            assert_eq!(
+                record.reason,
+                "unsupported non-upsert shared realm document event"
+            );
+        }
+
         service.shutdown().await;
     }
 
@@ -17254,6 +17295,14 @@ mod tests {
             cursor.dominates(&topic_clock),
             "cursor must advance past the hostile op"
         );
+
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].reason,
+            "unsupported non-upsert shared realm document event"
+        );
+        assert_eq!(records[0].family, SyncQuarantineFamily::Delete);
 
         service.shutdown().await;
     }
@@ -18137,6 +18186,22 @@ mod tests {
             retained_events, 1,
             "membership changes retain event history"
         );
+
+        let records = quarantine_rows(&receiver_storage).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].reason,
+            "shard publisher is outside the current holder set"
+        );
+        assert_eq!(records[0].target, restart_target());
+        assert_eq!(
+            records[0]
+                .decode_event()
+                .expect("event decodes")
+                .placement(),
+            restart_placement()
+        );
+        assert_eq!(quarantine_usage(&receiver_storage).await.records, 1);
 
         publisher.shutdown().await;
         receiver.shutdown().await;
