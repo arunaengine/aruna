@@ -727,6 +727,386 @@ fn decode_token(token: &str) -> Option<TokenPayload> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::structs::{
+        Actor, Group, GroupAuthorizationDocument, MetadataAuditOperation, MetadataAuditRecord,
+        PlacementRef, RealmConfigDocument, RoCrateLimits,
+    };
+    use aruna_core::types::{Key, Value};
+    use aruna_operations::metadata::repository::create_records_and_outbox_write_entries;
+    use aruna_operations::metadata::visibility_index::rebuild_index;
+    use std::collections::{HashMap, HashSet};
+
+    struct Fixture {
+        state: Arc<ServerState>,
+        ctx: Arc<DriverContext>,
+        realm_id: RealmId,
+        group_id: Ulid,
+        _dir: tempfile::TempDir,
+    }
+
+    fn actor(realm_id: RealmId) -> Actor {
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    async fn fixture(limits: RoCrateLimits) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let state = ServerState::new(
+            Arc::clone(&ctx),
+            realm_id,
+            node_id,
+            aruna_core::structs::NodeCapabilities::local_node(realm_id).unwrap(),
+            false,
+            None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await
+        .with_rocrate_limits(limits);
+        let group_id = Ulid::from_bytes([9; 16]);
+        let fixture = Fixture {
+            state: Arc::new(state),
+            ctx,
+            realm_id,
+            group_id,
+            _dir: dir,
+        };
+        seed_scopes(&fixture).await;
+        fixture
+    }
+
+    async fn store(ctx: &DriverContext, writes: Vec<(String, Key, Value)>) {
+        let event = ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn seed_scopes(fixture: &Fixture) {
+        let realm_id = fixture.realm_id;
+        let group_id = fixture.group_id;
+        let config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id };
+        let group = Group {
+            display_name: "g".to_string(),
+            group_id,
+            realm_id,
+            roles: HashSet::new(),
+            owner: actor(realm_id).user_id,
+        };
+        let auth = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::new(),
+            policies: Vec::new(),
+        };
+        store(
+            &fixture.ctx,
+            vec![
+                (
+                    target.storage_keyspace().to_string(),
+                    target.storage_key(),
+                    config.to_bytes(&actor(realm_id)).unwrap().into(),
+                ),
+                (
+                    GROUP_KEYSPACE.to_string(),
+                    byteview::ByteView::from(group_id.to_bytes().to_vec()),
+                    group.to_bytes(&actor(realm_id)).unwrap().into(),
+                ),
+                (
+                    AUTH_KEYSPACE.to_string(),
+                    byteview::ByteView::from(group_id.to_bytes().to_vec()),
+                    postcard::to_allocvec(&auth).unwrap().into(),
+                ),
+            ],
+        )
+        .await;
+    }
+
+    fn registry_record(fixture: &Fixture, index: u64, public: bool) -> MetadataRegistryRecord {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&index.to_be_bytes());
+        let document_id = Ulid::from_bytes(bytes);
+        let path = format!("doc/{index}");
+        MetadataRegistryRecord {
+            realm_id: fixture.realm_id,
+            group_id: fixture.group_id,
+            document_id,
+            document_path: path.clone(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &fixture.realm_id,
+                fixture.group_id,
+                &path,
+                document_id,
+            ),
+            placement: PlacementRef {
+                strategy_id: Ulid::nil(),
+                epoch: 0,
+                shard: 0,
+            },
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1_000 + index,
+            establishing_event_id: Ulid::from_bytes([8; 16]),
+            last_event_id: Ulid::from_bytes([9; 16]),
+        }
+    }
+
+    async fn seed_records(fixture: &Fixture, count: u64, public: bool) {
+        for index in 0..count {
+            let record = registry_record(fixture, index, public);
+            let audit = MetadataAuditRecord {
+                realm_id: record.realm_id,
+                group_id: record.group_id,
+                document_id: record.document_id,
+                graph_iri: record.graph_iri.clone(),
+                user_id: Default::default(),
+                node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+                operation: MetadataAuditOperation::Create,
+                occurred_at_ms: record.updated_at_ms,
+                details: None,
+            };
+            let writes =
+                create_records_and_outbox_write_entries(&record, &audit, Ulid::generate(), None)
+                    .unwrap();
+            store(&fixture.ctx, writes).await;
+        }
+        rebuild_index(&fixture.ctx).await.unwrap();
+    }
+
+    fn list_params(token: Option<&str>) -> OaiParams {
+        OaiParams {
+            verb: Some("ListIdentifiers".to_string()),
+            metadata_prefix: token.is_none().then(|| METADATA_PREFIX.to_string()),
+            resumption_token: token.map(|token| token.to_string()),
+            ..OaiParams::default()
+        }
+    }
+
+    fn token_from(body: &str) -> Option<String> {
+        let start = body.find("<resumptionToken>")? + "<resumptionToken>".len();
+        let end = body[start..].find("</resumptionToken>")? + start;
+        Some(body[start..end].to_string())
+    }
+
+    async fn list_page(fixture: &Fixture, token: Option<&str>) -> Result<String, OaiFault> {
+        list(
+            &fixture.state,
+            &fixture.ctx,
+            fixture.realm_id,
+            &list_params(token),
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn full_page_emits_no_token() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, PAGE_SIZE as u64, true).await;
+        let body = list_page(&fixture, None).await.unwrap();
+        assert_eq!(body.matches("<header>").count(), PAGE_SIZE);
+        assert!(token_from(&body).is_none());
+        assert!(!body.contains("<resumptionToken"));
+    }
+
+    #[tokio::test]
+    async fn short_page_emits_no_token() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, PAGE_SIZE as u64 - 1, true).await;
+        let body = list_page(&fixture, None).await.unwrap();
+        assert_eq!(body.matches("<header>").count(), PAGE_SIZE - 1);
+        assert!(!body.contains("<resumptionToken"));
+    }
+
+    // 101 visible records: the lookahead exists, so a token is issued, and the
+    // token-driven final page carries the empty terminal element.
+    #[tokio::test]
+    async fn overflow_page_carries_token() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, PAGE_SIZE as u64 + 1, true).await;
+        let first = list_page(&fixture, None).await.unwrap();
+        assert_eq!(first.matches("<header>").count(), PAGE_SIZE);
+        let token = token_from(&first).expect("a token continues the list");
+
+        let second = list_page(&fixture, Some(&token)).await.unwrap();
+        assert_eq!(second.matches("<header>").count(), 1);
+        assert!(second.contains("<resumptionToken />"));
+    }
+
+    #[tokio::test]
+    async fn private_records_never_list() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, 5, false).await;
+        assert!(matches!(
+            list_page(&fixture, None).await,
+            Err(OaiFault::Protocol {
+                code: "noRecordsMatch",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unbuilt_index_is_unavailable() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        assert!(matches!(
+            list_page(&fixture, None).await,
+            Err(OaiFault::Unavailable)
+        ));
+    }
+
+    // The page stops before the record that would breach the aggregate budget and
+    // hands the caller a token at the last emitted cursor.
+    #[tokio::test]
+    async fn budget_stops_before_overflow() {
+        let mut limits = RoCrateLimits::default();
+        limits.metadata_bytes = 100;
+        let fixture = fixture(limits).await;
+        seed_records(&fixture, 20, true).await;
+        let body = list_page(&fixture, None).await.unwrap();
+        let emitted = body.matches("<header>").count();
+        assert!(emitted > 0 && emitted < 20);
+        assert!(body.len() <= 100 * XML_ESCAPE_FACTOR as usize + "</ListIdentifiers>".len() + 200);
+        assert!(token_from(&body).is_some());
+    }
+
+    #[tokio::test]
+    async fn oversized_record_is_unavailable() {
+        let mut limits = RoCrateLimits::default();
+        limits.metadata_bytes = 1;
+        let fixture = fixture(limits).await;
+        seed_records(&fixture, 3, true).await;
+        assert!(matches!(
+            list_page(&fixture, None).await,
+            Err(OaiFault::Unavailable)
+        ));
+    }
+
+    // A record whose graph cannot be exported must fail the request, never fall
+    // back to a synthesized title-only crosswalk.
+    #[tokio::test]
+    async fn export_failure_never_falls_back() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, 1, true).await;
+        let record = registry_record(&fixture, 0, true);
+        let rendered = render_record(&fixture.state, &fixture.ctx, fixture.realm_id, &record).await;
+        assert!(matches!(rendered, Err(OaiFault::Unavailable)));
+    }
+
+    #[tokio::test]
+    async fn get_record_guards_realm() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, 1, true).await;
+        let record = registry_record(&fixture, 0, true);
+        let params = OaiParams {
+            verb: Some("GetRecord".to_string()),
+            metadata_prefix: Some(METADATA_PREFIX.to_string()),
+            identifier: Some(record.graph_iri.clone()),
+            ..OaiParams::default()
+        };
+        let other = RealmId::from_bytes([2; 32]);
+        assert!(matches!(
+            get_record(&fixture.state, &fixture.ctx, other, &params).await,
+            Err(OaiFault::Protocol {
+                code: "idDoesNotExist",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_record_hides_private() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, 1, false).await;
+        let record = registry_record(&fixture, 0, false);
+        let params = OaiParams {
+            verb: Some("GetRecord".to_string()),
+            metadata_prefix: Some(METADATA_PREFIX.to_string()),
+            identifier: Some(record.graph_iri.clone()),
+            ..OaiParams::default()
+        };
+        assert!(matches!(
+            get_record(&fixture.state, &fixture.ctx, fixture.realm_id, &params).await,
+            Err(OaiFault::Protocol {
+                code: "idDoesNotExist",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn identify_uses_visible_earliest() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, 3, true).await;
+        let body = identify(&fixture.ctx, "https://example.test/api/v1/oai")
+            .await
+            .unwrap();
+        assert!(body.contains("<baseURL>https://example.test/api/v1/oai</baseURL>"));
+        let earliest = format_from(1_000).unwrap();
+        assert!(body.contains(&format!("<earliestDatestamp>{earliest}</earliestDatestamp>")));
+    }
+
+    // The advertised endpoint comes from the configured public URL, never from a
+    // Host header an untrusted caller controls.
+    #[tokio::test]
+    async fn base_url_uses_configured() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        fixture
+            .state
+            .register_rest_interface_with_public_url(
+                "127.0.0.1:8080".parse().unwrap(),
+                Some("https://public.test"),
+            )
+            .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("evil.test"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("forwarded.test"),
+        );
+        let url = base_url(&fixture.state, "127.0.0.1".parse().unwrap(), &headers).await;
+        assert_eq!(url, "https://public.test/api/v1/oai");
+    }
+
+    #[tokio::test]
+    async fn base_url_ignores_host() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("evil.test"));
+        let url = base_url(&fixture.state, "127.0.0.1".parse().unwrap(), &headers).await;
+        assert_eq!(url, BASE_URL_FALLBACK);
+    }
 
     fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
