@@ -60,7 +60,8 @@ use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
     HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
-    NodeUsageSnapshot, PersistentIdMapping, PlacementRef, PlacementScope, PoolAdmission,
+    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdStatus, PlacementRef,
+    PlacementScope, PoolAdmission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
     SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
     SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User, WatchEventMask,
@@ -2710,22 +2711,85 @@ impl DocumentSyncService {
                         }
                     }
                     DocumentSyncEvent::Upsert {
+                        event_id,
                         target: DocumentSyncTarget::PersistentIdMapping { document_id },
                         bytes,
                         change,
-                        ..
                     } => {
                         let target = DocumentSyncTarget::PersistentIdMapping { document_id };
-                        let mapping: PersistentIdMapping = postcard::from_bytes(&bytes)
-                            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                        if mapping.target != document_id {
-                            return Err(NetError::Bootstrap(format!(
-                                "replicated persistent id mapping target {document_id} does not match payload document {}",
-                                mapping.target
-                            )));
+                        let reject = |reason: String| {
+                            SyncRejection::new(
+                                identity,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target: DocumentSyncTarget::PersistentIdMapping {
+                                        document_id,
+                                    },
+                                    bytes: bytes.clone(),
+                                    change,
+                                },
+                                reason,
+                            )
+                        };
+                        let mapping = match postcard::from_bytes::<PersistentIdMapping>(&bytes) {
+                            Ok(mapping) => mapping,
+                            Err(error) => {
+                                warn!(%topic_id, %document_id, %error, "Rejecting undecodable persistent id mapping");
+                                rejections.push(reject(format!(
+                                    "undecodable persistent id mapping: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        if let Err(reason) = validate_pid_mapping(document_id, &mapping, &change) {
+                            warn!(%topic_id, %document_id, %reason, "Rejecting invalid persistent id mapping");
+                            rejections
+                                .push(reject(format!("invalid persistent id mapping: {reason}")));
+                            continue;
                         }
-                        if self.apply_pid_mapping(&mapping, change.placement).await? {
-                            applied_targets.push(target);
+                        // The revision actor is the node that took the transition
+                        // and the only node that publishes it, so a mapping signed
+                        // by anyone else is a forgery.
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&mapping.revision.actor),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                %document_id,
+                                "Rejecting persistent id mapping whose revision actor is not its publisher"
+                            );
+                            rejections.push(reject(
+                                "persistent id mapping revision actor is not its publisher"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+                        match self.apply_pid_mapping(&mapping, change.placement).await? {
+                            MetadataPlacementOutcome::Accepted(true) => {
+                                applied_targets.push(target)
+                            }
+                            MetadataPlacementOutcome::Accepted(false) => {}
+                            MetadataPlacementOutcome::Deferred(dependency) => {
+                                warn!(
+                                    %topic_id,
+                                    %document_id,
+                                    "Deferring persistent id mapping until its placement configuration is available"
+                                );
+                                cross_topic_dependencies.insert(dependency);
+                            }
+                            MetadataPlacementOutcome::Rejected => {
+                                warn!(
+                                    %topic_id,
+                                    %document_id,
+                                    "Rejecting persistent id mapping stamped with a placement its document id does not decode to"
+                                );
+                                rejections.push(reject(
+                                    "persistent id mapping has a mismatched placement configuration"
+                                        .to_string(),
+                                ));
+                            }
                         }
                     }
                     event @ (DocumentSyncEvent::Delete {
@@ -3724,18 +3788,18 @@ impl DocumentSyncService {
         if let DocumentSyncTarget::PersistentIdMapping { document_id } = target {
             let mapping: PersistentIdMapping = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if mapping.target != document_id {
-                return Err(NetError::Bootstrap(format!(
-                    "replicated persistent id mapping target {document_id} does not match payload document {}",
-                    mapping.target
-                )));
-            }
+            validate_pid_mapping(document_id, &mapping, &change).map_err(NetError::Bootstrap)?;
             // The generic write below would clobber a local tombstone with a
             // replayed Active row, so the mapping always goes through its merge.
-            return self
-                .apply_pid_mapping(&mapping, change.placement)
-                .await
-                .map(|_| ());
+            return match self.apply_pid_mapping(&mapping, change.placement).await? {
+                MetadataPlacementOutcome::Accepted(_) => Ok(()),
+                MetadataPlacementOutcome::Deferred(_) => Err(NetError::Dht(
+                    "persistent id mapping placement configuration is unavailable".to_string(),
+                )),
+                MetadataPlacementOutcome::Rejected => Err(NetError::Bootstrap(
+                    "persistent id mapping has a mismatched placement configuration".to_string(),
+                )),
+            };
         }
         if let DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } = target {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
@@ -3816,8 +3880,8 @@ impl DocumentSyncService {
         &self,
         mapping: &PersistentIdMapping,
         placement: PlacementRef,
-    ) -> Result<bool> {
-        store_pid_mapping(&self.storage, mapping, placement).await
+    ) -> Result<MetadataPlacementOutcome<bool>> {
+        store_pid_mapping(&self.storage, self.realm_id, mapping, placement).await
     }
 
     async fn apply_delete(
@@ -4807,20 +4871,55 @@ async fn apply_metadata_document_lifecycle_to_storage(
 /// entirely from the two rows, so replay, reordering, and a frozen holder catching
 /// up all converge on the same state and the same manifest revision — and an
 /// Active row can never overwrite a local Withdrawn tombstone.
+///
+/// The same transaction fences the stamped placement against the one the
+/// document id decodes to, so a publisher authorized for one shard can neither
+/// stamp a document belonging to another shard nor write that shard's manifest.
 async fn store_pid_mapping(
     storage: &StorageHandle,
+    realm_id: RealmId,
     incoming: &PersistentIdMapping,
     placement: PlacementRef,
-) -> Result<bool> {
+) -> Result<MetadataPlacementOutcome<bool>> {
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
+        match derive_metadata_placement_txn(
+            storage,
+            realm_id,
+            None,
+            incoming.target,
+            placement,
+            txn_id,
+        )
+        .await
+        {
+            Ok(MetadataPlacementOutcome::Accepted(_)) => {}
+            Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Deferred(dependency));
+            }
+            Ok(MetadataPlacementOutcome::Rejected) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Rejected);
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
         let merged = match pid_merge_txn(storage, incoming, txn_id).await {
             Ok(Some(merged)) => merged,
             Ok(None) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Ok(false);
+                return Ok(MetadataPlacementOutcome::Accepted(false));
             }
             Err(error) => {
                 let _ = storage
@@ -4852,7 +4951,7 @@ async fn store_pid_mapping(
         match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), writes)
             .await
         {
-            Ok(()) => return Ok(true),
+            Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
             Err(NetError::Dht(message))
                 if message == StorageError::TransactionConflict.to_string() =>
             {
@@ -6371,16 +6470,49 @@ async fn metadata_placement_fence_in_transaction(
     record: &MetadataRegistryRecord,
     txn_id: TxnId,
 ) -> Result<MetadataPlacementOutcome<MetadataPlacementFence>> {
+    Ok(
+        match derive_metadata_placement_txn(
+            storage,
+            record.realm_id,
+            Some(record.group_id),
+            record.document_id,
+            record.placement,
+            txn_id,
+        )
+        .await?
+        {
+            MetadataPlacementOutcome::Accepted(_) => {
+                MetadataPlacementOutcome::Accepted(MetadataPlacementFence)
+            }
+            MetadataPlacementOutcome::Deferred(dependency) => {
+                MetadataPlacementOutcome::Deferred(dependency)
+            }
+            MetadataPlacementOutcome::Rejected => MetadataPlacementOutcome::Rejected,
+        },
+    )
+}
+
+/// The placement a structured metadata id must ride, derived from the realm
+/// config inside the caller's transaction and compared against the `placement`
+/// the publisher stamped. The transactional config read is the whole fence: a
+/// concurrent config mutation conflicts the commit. `group_id` is compared only
+/// when the caller knows it; a PID mapping target carries no group.
+async fn derive_metadata_placement_txn(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    group_id: Option<Ulid>,
+    document_id: Ulid,
+    placement: PlacementRef,
+    txn_id: TxnId,
+) -> Result<MetadataPlacementOutcome<PlacementRef>> {
     let dependency = DocumentSyncDependency::PlacementStrategy {
-        realm_id: record.realm_id,
-        strategy_id: record.placement.strategy_id,
+        realm_id,
+        strategy_id: placement.strategy_id,
     };
-    if record.placement == PlacementRef::NIL || record.placement.strategy_id.is_nil() {
+    if placement == PlacementRef::NIL || placement.strategy_id.is_nil() {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    let target = DocumentSyncTarget::RealmConfig {
-        realm_id: record.realm_id,
-    };
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
     let value = storage_read_from_transaction(
         storage,
         REALM_CONFIG_KEYSPACE.to_string(),
@@ -6390,15 +6522,15 @@ async fn metadata_placement_fence_in_transaction(
     .await?;
     let Some(value) = value else {
         return Ok(MetadataPlacementOutcome::Deferred(
-            DocumentSyncDependency::RealmConfig(record.realm_id),
+            DocumentSyncDependency::RealmConfig(realm_id),
         ));
     };
     let config = RealmConfigDocument::from_bytes(&value)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if config.realm_id != record.realm_id {
+    if config.realm_id != realm_id {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    let id = match MetaResourceId::from_bytes(record.document_id.to_bytes()) {
+    let id = match MetaResourceId::from_bytes(document_id.to_bytes()) {
         Ok(id) => id,
         Err(_) => return Ok(MetadataPlacementOutcome::Rejected),
     };
@@ -6413,7 +6545,7 @@ async fn metadata_placement_fence_in_transaction(
         }
         Err(BindingError::Unknown(_)) => {
             return Ok(MetadataPlacementOutcome::Deferred(
-                DocumentSyncDependency::RealmConfig(record.realm_id),
+                DocumentSyncDependency::RealmConfig(realm_id),
             ));
         }
         Err(BindingError::Conflicted(_) | BindingError::BucketOutOfRange(_)) => {
@@ -6421,21 +6553,18 @@ async fn metadata_placement_fence_in_transaction(
         }
     };
     let scope_matches = match resolved.scope {
-        PlacementScope::Realm(realm_id) => realm_id == record.realm_id,
-        PlacementScope::Group(group_id) => group_id == record.group_id,
+        PlacementScope::Realm(scope_realm) => scope_realm == realm_id,
+        PlacementScope::Group(scope_group) => group_id.is_none_or(|group| scope_group == group),
     };
     let derived = PlacementRef {
         strategy_id: resolved.strategy_id,
         epoch: 0,
         shard: u32::from(resolved.bucket.get()),
     };
-    if resolved.document_class != DocumentClass::Metadata
-        || !scope_matches
-        || derived != record.placement
-    {
+    if resolved.document_class != DocumentClass::Metadata || !scope_matches || derived != placement {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence))
+    Ok(MetadataPlacementOutcome::Accepted(derived))
 }
 
 async fn storage_read_from(
@@ -7941,6 +8070,51 @@ fn validate_node_info_upsert(
             "node info document node id {} does not match target node id {node_id}",
             document.node_id
         ));
+    }
+    Ok(())
+}
+
+/// Validates a replicated PID mapping against its sync target and change: the
+/// canonical PID for the target document, a consistent kind/status/provenance
+/// triple, and a change that is exactly the one the mapping row derives. The
+/// caller enforces the publisher identity against the signed actor.
+fn validate_pid_mapping(
+    document_id: Ulid,
+    mapping: &PersistentIdMapping,
+    change: &DocumentSyncChange,
+) -> std::result::Result<(), String> {
+    if mapping.target != document_id {
+        return Err(format!(
+            "mapping target {} does not match target document {document_id}",
+            mapping.target
+        ));
+    }
+    if mapping.pid != MetadataRegistryRecord::graph_iri_for(document_id) {
+        return Err(format!("mapping pid `{}` is not canonical", mapping.pid));
+    }
+    if !matches!(mapping.kind, PersistentIdKind::Conceptual) {
+        return Err("mapping kind is unsupported".to_string());
+    }
+    if mapping.minted_at_ms.is_some() != mapping.minted_by.is_some() {
+        return Err("mapping mint provenance is incomplete".to_string());
+    }
+    match mapping.status {
+        PersistentIdStatus::Active => {
+            if mapping.minted_at_ms.is_none() || mapping.withdrawn_at_ms.is_some() {
+                return Err("active mapping has inconsistent transition fields".to_string());
+            }
+        }
+        PersistentIdStatus::Withdrawn => {
+            if mapping.withdrawn_at_ms.is_none() {
+                return Err("withdrawn mapping has no withdrawal timestamp".to_string());
+            }
+        }
+    }
+    if change.kind != DocumentSyncChangeKind::Upsert {
+        return Err("mapping event is not an upsert".to_string());
+    }
+    if *change != persistent_id_change(mapping, change.placement) {
+        return Err("mapping revision does not match its sync change".to_string());
     }
     Ok(())
 }
@@ -17976,6 +18150,214 @@ mod tests {
         assert!(cursor_advanced(&service, &storage, bad_topic).await);
         assert!(cursor_advanced(&service, &storage, good_topic).await);
         assert_eq!(quarantine_usage(&storage).await.records, 2);
+
+        service.shutdown().await;
+    }
+
+    /// Only a correctly placed, structurally consistent, publisher-bound mapping
+    /// reaches the mapping row or the shard manifest: a holder of one shard may
+    /// not stamp a document that decodes to another, even when both shards share
+    /// this holder.
+    #[tokio::test]
+    async fn pid_mapping_placement_fence() {
+        use aruna_core::keyspaces::{PERSISTENT_ID_MAPPING_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
+        use aruna_core::storage_entries::shard_manifest_key;
+        use aruna_core::structs::PersistentIdRevision;
+
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([76; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(76).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let minted_by = UserId::local(Ulid::from_parts(3_100, 1), realm_id);
+        let actor = test_actor(76, minted_by, realm_id);
+        assert_eq!(actor.node_id, local_node);
+
+        let strategy_id = Ulid::from_parts(3_101, 1);
+        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_node, RealmNodeKind::Management);
+        config.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
+        config.strategies.push(PlacementStrategy {
+            strategy_id,
+            name: "placed".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        });
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let document = |bucket: u16, seed: u64| {
+            MetaResourceId::from_parts(seed, handle, BucketId::new(bucket).unwrap(), 1)
+                .unwrap()
+                .as_ulid()
+        };
+        let placed = |shard: u32| PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard,
+        };
+        let mapping = |document_id, actor, seed: u64| {
+            PersistentIdMapping::conceptual(
+                document_id,
+                minted_by,
+                PersistentIdRevision {
+                    event_id: Ulid::from_parts(seed, 1),
+                    actor,
+                    occurred_at_ms: 100 + seed,
+                },
+            )
+        };
+
+        let valid_document = document(4, 3_110);
+        let forged_document = document(4, 3_111);
+        let uncanonical_document = document(6, 3_112);
+        let forged_actor_document = document(6, 3_113);
+        let valid = mapping(valid_document, local_node, 3_120);
+        let forged = mapping(forged_document, local_node, 3_121);
+        let mut uncanonical = mapping(uncanonical_document, local_node, 3_122);
+        uncanonical.pid = "https://w3id.org/aruna/not-this-document".to_string();
+        let forged_actor = mapping(forged_actor_document, node(77), 3_123);
+
+        let valid_topic = persistent_id_target(valid_document).sync_topic_id(realm_id, &placed(4));
+        let forged_topic = persistent_id_target(forged_document).sync_topic_id(realm_id, &placed(9));
+        let other_topic =
+            persistent_id_target(uncanonical_document).sync_topic_id(realm_id, &placed(6));
+        service
+            .ensure_document_sync_topics(&[valid_topic, forged_topic, other_topic], Vec::new())
+            .expect("mapping shard topic genesis");
+
+        let publish = |mapping: &PersistentIdMapping, placement, event_id: u64| {
+            DocumentSyncPublish::Upsert {
+                event_id: Ulid::from_parts(event_id, 1),
+                target: persistent_id_target(mapping.target),
+                bytes: mapping.to_bytes().expect("mapping serializes"),
+                change: persistent_id_change(mapping, placement),
+                allow_genesis: true,
+            }
+        };
+        let published = service
+            .publish_documents(
+                vec![
+                    publish(&valid, placed(4), 3_130),
+                    publish(&forged, placed(9), 3_131),
+                    publish(&uncanonical, placed(6), 3_132),
+                    publish(&forged_actor, placed(6), 3_133),
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "mapping publish failed: {published:?}"
+        );
+
+        for topic_id in [valid_topic, forged_topic, other_topic] {
+            reset_cursor(&service, topic_id).await;
+        }
+        let applied = service
+            .reconcile_document_topics([valid_topic, forged_topic, other_topic])
+            .await
+            .expect("forged mappings are quarantined");
+
+        assert_eq!(
+            applied.targets,
+            vec![persistent_id_target(valid_document)],
+            "only the valid mapping applies"
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                PERSISTENT_ID_MAPPING_KEYSPACE,
+                ByteView::from(persistent_id_key(valid_document)),
+            )
+            .await
+            .is_some()
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                SHARD_MANIFEST_KEYSPACE,
+                shard_manifest_key(&placed(4), &persistent_id_target(valid_document)),
+            )
+            .await
+            .is_some()
+        );
+        for (document_id, placement) in [
+            (forged_document, placed(9)),
+            (uncanonical_document, placed(6)),
+            (forged_actor_document, placed(6)),
+        ] {
+            assert!(
+                read_storage_value(
+                    &storage,
+                    PERSISTENT_ID_MAPPING_KEYSPACE,
+                    ByteView::from(persistent_id_key(document_id)),
+                )
+                .await
+                .is_none(),
+                "rejected mapping {document_id} reached storage"
+            );
+            assert!(
+                read_storage_value(
+                    &storage,
+                    SHARD_MANIFEST_KEYSPACE,
+                    shard_manifest_key(&placement, &persistent_id_target(document_id)),
+                )
+                .await
+                .is_none(),
+                "rejected mapping {document_id} reached the shard manifest"
+            );
+        }
+
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert_eq!(
+            quarantined_reason(&records, Ulid::from_parts(3_131, 1)),
+            "persistent id mapping has a mismatched placement configuration"
+        );
+        assert_eq!(
+            quarantined_reason(&records, Ulid::from_parts(3_132, 1)),
+            "invalid persistent id mapping: mapping pid \
+             `https://w3id.org/aruna/not-this-document` is not canonical"
+        );
+        assert_eq!(
+            quarantined_reason(&records, Ulid::from_parts(3_133, 1)),
+            "persistent id mapping revision actor is not its publisher"
+        );
+        for topic_id in [valid_topic, forged_topic, other_topic] {
+            assert!(cursor_advanced(&service, &storage, topic_id).await);
+        }
 
         service.shutdown().await;
     }
