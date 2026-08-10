@@ -132,11 +132,33 @@ pub(crate) async fn read_staging_source(
 > {
     let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = head_staging_source(guard, access).await?;
-    let reader = match version {
-        Some(version) => operator.reader_with(path).version(version).await,
-        None => operator.reader(path).await,
+    let capability = operator.info().full_capability();
+    let mut reader = operator.reader_with(path);
+    // Pinning is preferred, not required: an unpinnable source reads unpinned
+    // with a warning so any source stays integrateable (user decision 2026-08-10).
+    let pinned_version = version
+        .or(metadata.source_version.as_deref())
+        .filter(|version| !version.is_empty());
+    let strong_etag = metadata
+        .etag
+        .as_deref()
+        .map(str::trim)
+        .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"));
+    if let Some(version) = pinned_version.filter(|_| capability.read_with_version) {
+        reader = reader.version(version);
+    } else if let Some(etag) = strong_etag.filter(|_| capability.read_with_if_match) {
+        reader = reader.if_match(etag);
+    } else {
+        tracing::warn!(
+            source = %path,
+            has_version = pinned_version.is_some(),
+            has_strong_etag = strong_etag.is_some(),
+            "reading a staging source unpinned; drift is only caught after the read"
+        );
     }
-    .map_err(|error| map_staging_source_error(error, false))?;
+    let reader = reader
+        .await
+        .map_err(|error| map_staging_source_error(error, false))?;
     let stream = match range {
         Some(range) => reader
             .into_bytes_stream(range)
@@ -325,7 +347,7 @@ mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
@@ -428,6 +450,130 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    struct SourceListener {
+        endpoint: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl SourceListener {
+        async fn bind(etag: Option<&'static str>, reject: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let received = requests.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut chunk = [0; 1024];
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            break;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    received.lock().await.push(request.clone());
+                    let response = if request.starts_with("head ") {
+                        match etag {
+                            Some(etag) => format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: {etag}\r\nConnection: close\r\n\r\n"
+                            ),
+                            None => {
+                                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+                                    .to_string()
+                            }
+                        }
+                    } else {
+                        if reject {
+                            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        } else if request.contains("range: bytes=1-3") {
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 1-3/5\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nell".to_string()
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nhello".to_string()
+                        }
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                endpoint,
+                requests,
+                task,
+            }
+        }
+
+        fn access(&self) -> ResolvedSourceAccess {
+            ResolvedSourceAccess::OpenDal {
+                kind: SourceConnectorKind::Http,
+                config: HashMap::from([("endpoint".to_string(), self.endpoint.clone())]),
+                path: "file.txt".to_string(),
+                version: None,
+            }
+        }
+    }
+
+    impl Drop for SourceListener {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn source_read_drift() {
+        let source = SourceListener::bind(Some("\"v1\""), true).await;
+
+        let (_, mut stream) = read_staging_source(&test_guard(), &source.access(), None)
+            .await
+            .unwrap();
+
+        assert!(stream.try_next().await.is_err());
+        let requests = source.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("if-match: \"v1\""));
+    }
+
+    #[tokio::test]
+    async fn source_read_unpinned() {
+        // Preferred pinning: a source without a strong validator still reads,
+        // unpinned and without an If-Match header.
+        for etag in [None, Some("W/\"v1\"")] {
+            let source = SourceListener::bind(etag, false).await;
+
+            let (_, stream) = read_staging_source(&test_guard(), &source.access(), None)
+                .await
+                .unwrap();
+            let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+
+            assert_eq!(chunks.concat(), b"hello");
+            let requests = source.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            assert!(!requests[1].contains("if-match"));
+        }
+    }
+
+    #[tokio::test]
+    async fn source_read_range() {
+        let source = SourceListener::bind(Some("\"v1\""), false).await;
+
+        let (_, stream) = read_staging_source(&test_guard(), &source.access(), Some(1..4))
+            .await
+            .unwrap();
+        let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+
+        assert_eq!(chunks.concat(), b"ell");
+        let requests = source.requests.lock().await;
+        assert!(requests[1].contains("if-match: \"v1\""));
+        assert!(requests[1].contains("range: bytes=1-3"));
     }
 
     #[tokio::test]
