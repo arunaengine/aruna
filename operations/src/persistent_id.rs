@@ -450,15 +450,19 @@ mod tests {
 
     fn context() -> (DriverContext, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+        let context = context_at(dir.path().to_str().unwrap());
+        (context, dir)
+    }
+
+    fn context_at(path: &str) -> DriverContext {
+        DriverContext {
+            storage_handle: storage::FjallStorage::open(path).unwrap(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
-        };
-        (context, dir)
+        }
     }
 
     fn realm() -> RealmId {
@@ -565,6 +569,33 @@ mod tests {
         assert!(!minted);
         assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
         assert_eq!(mapping.minted_at_ms, None);
+    }
+
+    // A restart re-reads the row it committed: the tombstone is durable, and the
+    // mint that reopens the store still cannot replace it.
+    #[tokio::test]
+    async fn mapping_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let id = Ulid::from_bytes([11; 16]);
+        {
+            let ctx = context_at(&path);
+            seed_record(&ctx, id).await;
+            mint_persistent_id(&ctx, realm(), id, user(), 1)
+                .await
+                .unwrap();
+            withdraw_persistent_id(&ctx, realm(), id, 4).await.unwrap();
+        }
+        let ctx = context_at(&path);
+        let mapping = read_mapping(&ctx, id).await.unwrap().unwrap();
+        assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+        assert_eq!(mapping.withdrawn_at_ms, Some(4));
+
+        let (after, minted) = mint_persistent_id(&ctx, realm(), id, user(), 9)
+            .await
+            .unwrap();
+        assert!(!minted);
+        assert_eq!(after, mapping);
     }
 
     #[tokio::test]

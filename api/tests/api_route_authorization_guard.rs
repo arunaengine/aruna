@@ -191,7 +191,8 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "pid.rs",
         "resolve_pid",
-        "public w3id landing: redirects to the guarded RO-Crate read or a 410 tombstone",
+        "public w3id landing: the authority re-checks anonymous metadata.read per \
+         record and answers 302, 404, or a 410 tombstone",
     ),
     (
         "rocrate_import.rs",

@@ -2142,8 +2142,9 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
         ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId,
-        ReasonCode, RoCrateLimits, parse_job_schedule_index_key,
+        ImportRoCrateSpec, ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload,
+        MintPersistentIdSpec, RealmId, ReasonCode, RoCrateLimits, parse_job_schedule_index_key,
+        pid_dedup_key,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
@@ -2362,6 +2363,57 @@ mod tests {
             JOB_DEDUP_INDEX_KEYSPACE.to_string(),
             job_dedup_index_key(record.created_by, b"import"),
         )));
+    }
+
+    fn pid_record(job_id: JobId, minted_by: UserId) -> JobRecord {
+        let document_id = Ulid::from_bytes([0x99u8; 16]);
+        JobRecord::new(
+            job_id,
+            JobPayload::MintPersistentId(MintPersistentIdSpec {
+                document_id,
+                minted_by,
+            }),
+            minted_by,
+            node_id(7),
+            1_000,
+            1_000,
+            Some(pid_dedup_key(document_id)),
+        )
+    }
+
+    #[test]
+    fn pid_dedup_index_is_global() {
+        let realm = RealmId([1u8; 32]);
+        let first = UserId::new(Ulid::from_bytes([2u8; 16]), realm);
+        let second = UserId::new(Ulid::from_bytes([3u8; 16]), realm);
+        let document_id = Ulid::from_bytes([0x99u8; 16]);
+
+        assert_eq!(
+            job_dedup_index_key(first, &pid_dedup_key(document_id)),
+            job_dedup_index_key(second, &pid_dedup_key(document_id)),
+        );
+        assert_ne!(
+            job_dedup_index_key(first, b"user/local"),
+            job_dedup_index_key(second, b"user/local"),
+        );
+    }
+
+    #[test]
+    fn prune_reclaims_pid_dedup() {
+        let minted_by = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let record = pid_record(JobId::from_bytes([0x58; 16]), minted_by);
+        let dedup_key = record
+            .dedup_key
+            .clone()
+            .expect("pid jobs carry a dedup key");
+
+        let deletes = job_prune_delete_entries(&record);
+
+        assert!(deletes.contains(&(
+            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            job_dedup_index_key(record.created_by, &dedup_key),
+        )));
+        assert!(record.payload.dedup_until_prune());
     }
 
     #[test]

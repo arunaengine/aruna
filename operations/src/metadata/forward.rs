@@ -1982,6 +1982,7 @@ async fn forward_to_holders(
         &message,
         MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
+            | MetadataTransportMessage::ForwardPersistentId { .. }
     );
 
     let mut failures: Vec<String> = Vec::new();

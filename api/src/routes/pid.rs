@@ -58,7 +58,15 @@ async fn resolve_pid(
         return StatusCode::NOT_FOUND.into_response();
     };
     let ctx = state.get_ctx();
-    match resolve_pid_routed(&ctx, state.get_realm_id(), document_id).await {
+    let resolved = resolve_pid_routed(&ctx, state.get_realm_id(), document_id).await;
+    landing_response(document_id, resolved)
+}
+
+fn landing_response(
+    document_id: Ulid,
+    resolved: Result<PersistentIdResolution, MetadataApiError>,
+) -> Response {
+    match resolved {
         Ok(PersistentIdResolution::Redirect) => redirect(&rocrate_location(document_id)),
         Ok(PersistentIdResolution::Gone { pid }) => gone(&pid),
         Ok(PersistentIdResolution::Missing) => StatusCode::NOT_FOUND.into_response(),
@@ -177,6 +185,36 @@ mod tests {
         assert_eq!(
             rocrate_location(id),
             format!("/api/v1/metadata/{id}/rocrate")
+        );
+    }
+
+    #[test]
+    fn landing_maps_every_resolution() {
+        let id = Ulid::from_bytes([1; 16]);
+        let status = |resolved| landing_response(id, resolved).status();
+
+        assert_eq!(
+            status(Ok(PersistentIdResolution::Redirect)),
+            StatusCode::FOUND
+        );
+        assert_eq!(
+            status(Ok(PersistentIdResolution::Gone {
+                pid: "pid".to_string()
+            })),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            status(Ok(PersistentIdResolution::Missing)),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(Err(MetadataApiError::NotFound)),
+            StatusCode::NOT_FOUND
+        );
+        // An unreachable authority is never a 404: that would turn a live PID dead.
+        assert_eq!(
+            status(Err(MetadataApiError::ServiceUnavailable)),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 }
