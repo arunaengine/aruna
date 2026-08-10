@@ -346,8 +346,11 @@ async fn list(
         .await
         .map_err(visibility_fault)?;
     // An authorization-emptied or budget-stopped batch is a continuation, not the
-    // end of the enumeration; only an exhausted window has no records.
-    if page.entries.is_empty() && !page.more {
+    // end of the enumeration; only an exhausted window has no records. And
+    // `noRecordsMatch` is legal only on the first request of a sequence: a
+    // continuation whose remaining records vanished closes with the empty
+    // terminal token, or a harvester discards the partial harvest.
+    if page.entries.is_empty() && !page.more && params.resumption_token.is_none() {
         return Err(protocol("noRecordsMatch", "No records match the request"));
     }
 
@@ -1063,6 +1066,30 @@ mod tests {
         assert!(body.contains(&format!(
             "<earliestDatestamp>{earliest}</earliestDatestamp>"
         )));
+    }
+
+    // A continuation whose remaining records disappeared must close the sequence
+    // with the empty terminal token, never with a protocol error.
+    #[tokio::test]
+    async fn empty_continuation_terminates() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        seed_records(&fixture, PAGE_SIZE as u64 + 1, true).await;
+        let first = list_page(&fixture, None).await.unwrap();
+        let token = token_from(&first).expect("a token continues the list");
+
+        // The only record left in the window turns private mid-sequence.
+        store_record(
+            &fixture,
+            &registry_record(&fixture, PAGE_SIZE as u64, false),
+        )
+        .await;
+        rebuild_index(&fixture.ctx).await.unwrap();
+
+        let second = list_page(&fixture, Some(&token)).await.unwrap();
+        assert_eq!(
+            second,
+            "<ListIdentifiers><resumptionToken /></ListIdentifiers>"
+        );
     }
 
     // A sequence started before later writes must terminate on the window frozen
