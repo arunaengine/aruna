@@ -2631,7 +2631,7 @@ impl DocumentSyncService {
                                         event_id,
                                         target: target.clone(),
                                         bytes,
-                                        change: change.clone(),
+                                        change,
                                     },
                                     target,
                                     lifecycle_revision: Some(change),
