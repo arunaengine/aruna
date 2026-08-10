@@ -14,8 +14,10 @@ use aruna_core::metadata::{
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
 use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::PlacementRef;
 use aruna_core::structs::RealmId;
+use aruna_core::structs::persistent_id_change;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
 use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
@@ -338,6 +340,17 @@ impl AnnounceTopicOperation {
                     kind: DocumentSyncChangeKind::Upsert,
                     placement: self.placement,
                 })
+            }
+            DocumentSyncTarget::PersistentIdMapping { document_id } => {
+                let mapping = PersistentIdMapping::from_bytes(bytes)
+                    .map_err(AnnounceTopicError::ConversionError)?;
+                if mapping.target != *document_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "persistent id mapping target {document_id} does not match payload document {}",
+                        mapping.target
+                    )));
+                }
+                Ok(persistent_id_change(&mapping, self.placement))
             }
             // Node usage snapshots, watch-interest digests, and node info/heartbeat
             // documents are single-writer per key and applied as plain upserts

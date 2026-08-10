@@ -9,8 +9,8 @@ use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
     NODE_INFO_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE,
-    USER_KEYSPACE,
+    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
 use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
 use crate::storage_entries::{
@@ -18,7 +18,7 @@ use crate::storage_entries::{
 };
 use crate::structs::{
     PlacementRef, RealmId, node_info_storage_key, node_usage_global_key, node_usage_group_key,
-    watch_interest_node_key, watch_subscription_key,
+    persistent_id_key, watch_interest_node_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
@@ -53,6 +53,13 @@ pub enum DocumentSyncTarget {
     },
     MetadataGraphLifecycle {
         graph_iri: String,
+    },
+    /// The document's w3id PID mapping. Rides the document-lifecycle placement so
+    /// the PID authority is co-located with the document's holders, but keeps its
+    /// own keyspace: the registry row is deleted with the document while the
+    /// mapping must survive it to serve a permanent 410.
+    PersistentIdMapping {
+        document_id: Ulid,
     },
     NodeUsage {
         realm_id: RealmId,
@@ -328,7 +335,8 @@ impl DocumentSyncTarget {
             Self::User { user_id } => TopicId::users(user_id.realm_id),
             Self::MetadataRegistry { document_id, .. }
             | Self::MetadataCreateEvent { document_id, .. }
-            | Self::MetadataDocumentLifecycle { document_id } => TopicId::metadata(*document_id),
+            | Self::MetadataDocumentLifecycle { document_id }
+            | Self::PersistentIdMapping { document_id } => TopicId::metadata(*document_id),
             Self::MetadataGraphLifecycle { graph_iri } => {
                 TopicId::metadata(metadata_graph_lifecycle_topic_id(graph_iri))
             }
@@ -349,6 +357,7 @@ impl DocumentSyncTarget {
             Self::MetadataCreateEvent { .. } => METADATA_EVENT_LOG_KEYSPACE,
             Self::MetadataDocumentLifecycle { .. } => METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
             Self::MetadataGraphLifecycle { .. } => METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+            Self::PersistentIdMapping { .. } => PERSISTENT_ID_MAPPING_KEYSPACE,
             Self::NodeUsage { .. } => USAGE_NODE_STATS_KEYSPACE,
             Self::WatchInterest { .. } => NOTIFICATION_WATCH_INTEREST_KEYSPACE,
             Self::WatchSubscription { .. } => NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
@@ -382,6 +391,9 @@ impl DocumentSyncTarget {
                 metadata_document_lifecycle_key(*document_id)
             }
             Self::MetadataGraphLifecycle { graph_iri } => metadata_graph_lifecycle_key(graph_iri),
+            Self::PersistentIdMapping { document_id } => {
+                ByteView::from(persistent_id_key(*document_id))
+            }
             Self::NodeUsage {
                 node_id, group_id, ..
             } => match group_id {
@@ -412,6 +424,7 @@ impl DocumentSyncTarget {
                 | Self::MetadataCreateEvent { .. }
                 | Self::MetadataDocumentLifecycle { .. }
                 | Self::MetadataGraphLifecycle { .. }
+                | Self::PersistentIdMapping { .. }
         )
     }
 

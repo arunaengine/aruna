@@ -36,8 +36,9 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
+    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -59,11 +60,13 @@ use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
     HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
-    NodeUsageSnapshot, PlacementRef, PlacementScope, PoolAdmission, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, Role, SyncQuarantineRecord, User, WatchEventMask,
-    WatchInterestDigest, WatchSubscription, admit_band_pool, coordinator_spans,
-    group_owner_index_key, node_usage_key_node_id, reserved_label, sync_quarantine_key,
-    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
+    NodeUsageSnapshot, PersistentIdMapping, PlacementRef, PlacementScope, PoolAdmission,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
+    SyncQuarantineRecord, User, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    admit_band_pool, coordinator_spans, group_owner_index_key, node_usage_key_node_id,
+    persistent_id_change, persistent_id_key, persistent_id_target, reserved_label,
+    sync_quarantine_key, watch_interest_dirty_key, watch_interest_key_node_id,
+    watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -2540,6 +2543,46 @@ impl DocumentSyncService {
                             applied_targets.push(target);
                         }
                     }
+                    DocumentSyncEvent::Upsert {
+                        target: DocumentSyncTarget::PersistentIdMapping { document_id },
+                        bytes,
+                        change,
+                        ..
+                    } => {
+                        let target = DocumentSyncTarget::PersistentIdMapping { document_id };
+                        let mapping: PersistentIdMapping = postcard::from_bytes(&bytes)
+                            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        if mapping.target != document_id {
+                            return Err(NetError::Bootstrap(format!(
+                                "replicated persistent id mapping target {document_id} does not match payload document {}",
+                                mapping.target
+                            )));
+                        }
+                        if self
+                            .apply_persistent_id_mapping(&mapping, change.placement)
+                            .await?
+                        {
+                            applied_targets.push(target);
+                        }
+                    }
+                    DocumentSyncEvent::Delete {
+                        target: target @ DocumentSyncTarget::PersistentIdMapping { .. },
+                        ..
+                    }
+                    | DocumentSyncEvent::AdminOperation {
+                        target: target @ DocumentSyncTarget::PersistentIdMapping { .. },
+                        ..
+                    } => {
+                        // The mapping row is a permanent tombstone once written, so
+                        // it only ever syncs as a monotone upsert. Skip rather than
+                        // `?`-propagate so a hostile op cannot wedge the topic.
+                        warn!(
+                            %topic_id,
+                            ?target,
+                            "Skipping unsupported non-upsert persistent id mapping event"
+                        );
+                        continue;
+                    }
                     DocumentSyncEvent::Delete {
                         target: target @ DocumentSyncTarget::WatchSubscription { owner, watch_id },
                         change,
@@ -3395,6 +3438,22 @@ impl DocumentSyncService {
             self.apply_metadata_registry_upsert(record, bytes).await?;
             return Ok(());
         }
+        if let DocumentSyncTarget::PersistentIdMapping { document_id } = target {
+            let mapping: PersistentIdMapping = postcard::from_bytes(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if mapping.target != document_id {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated persistent id mapping target {document_id} does not match payload document {}",
+                    mapping.target
+                )));
+            }
+            // The generic write below would clobber a local tombstone with a
+            // replayed Active row, so the mapping always goes through its merge.
+            return self
+                .apply_persistent_id_mapping(&mapping, change.placement)
+                .await
+                .map(|_| ());
+        }
         if let DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } = target {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -3470,6 +3529,14 @@ impl DocumentSyncService {
         apply_metadata_graph_lifecycle_to_storage(&self.storage, &record, primary_bytes).await
     }
 
+    async fn apply_persistent_id_mapping(
+        &self,
+        mapping: &PersistentIdMapping,
+        placement: PlacementRef,
+    ) -> Result<bool> {
+        apply_persistent_id_to_storage(&self.storage, mapping, placement).await
+    }
+
     async fn apply_delete(
         &self,
         target: DocumentSyncTarget,
@@ -3484,6 +3551,11 @@ impl DocumentSyncService {
             return Ok(());
         }
         if let DocumentSyncTarget::MetadataDocumentLifecycle { .. } = target {
+            return Ok(());
+        }
+        // A minted PID is a permanent identity: the row is never removed, only
+        // flipped to Withdrawn, so a delete for it is a no-op rather than an error.
+        if let DocumentSyncTarget::PersistentIdMapping { .. } = target {
             return Ok(());
         }
         if let DocumentSyncTarget::MetadataRegistry {
@@ -4368,6 +4440,101 @@ async fn apply_metadata_document_lifecycle_to_storage(
     Err(NetError::Dht(
         "metadata document lifecycle conflicted twice".to_string(),
     ))
+}
+
+/// Fold a replicated PID mapping into the local row inside one transaction, with
+/// its sync sidecar and shard-manifest entry. The merge is monotone and derived
+/// entirely from the two rows, so replay, reordering, and a frozen holder catching
+/// up all converge on the same state and the same manifest revision — and an
+/// Active row can never overwrite a local Withdrawn tombstone.
+async fn apply_persistent_id_to_storage(
+    storage: &StorageHandle,
+    incoming: &PersistentIdMapping,
+    placement: PlacementRef,
+) -> Result<bool> {
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let merged = match persistent_id_merge_txn(storage, incoming, txn_id).await {
+            Ok(Some(merged)) => merged,
+            Ok(None) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(false);
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let target = persistent_id_target(merged.target);
+        let change = persistent_id_change(&merged, placement);
+        let mut writes = vec![(
+            PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
+            ByteView::from(persistent_id_key(merged.target)),
+            Value::from(
+                merged
+                    .to_bytes()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            ),
+        )];
+        writes.push(
+            document_sync_revision_write_entry(&target, &change)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+        if let Some(entry) = shard_manifest_write_entry(&target, &change)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        {
+            writes.push(entry);
+        }
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), writes)
+            .await
+        {
+            Ok(()) => return Ok(true),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "persistent id mapping conflicted twice".to_string(),
+    ))
+}
+
+/// `Ok(None)` when the local row already absorbs the incoming one.
+async fn persistent_id_merge_txn(
+    storage: &StorageHandle,
+    incoming: &PersistentIdMapping,
+    txn_id: TxnId,
+) -> Result<Option<PersistentIdMapping>> {
+    let local = storage_read_from_transaction(
+        storage,
+        PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
+        ByteView::from(persistent_id_key(incoming.target)),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(local) = local else {
+        return Ok(Some(incoming.clone()));
+    };
+    let mut local = PersistentIdMapping::from_bytes(&local)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if !local.merge(incoming) {
+        return Ok(None);
+    }
+    Ok(Some(local))
 }
 
 async fn delete_registry_record(
