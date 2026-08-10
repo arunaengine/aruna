@@ -188,20 +188,26 @@ impl HarvestSource {
     }
 }
 
-/// Whether a harvested source record currently maps to a live document or a
-/// withdrawn one. The mapping row is retained either way so the id is never
-/// reused for a different source record.
+/// How far the current identity of a harvested source record has progressed.
+/// The mapping row is retained in every state so an id is never reused for a
+/// different source record. Variants are independent, so a policy state such as
+/// a permanent absence marker composes as a sibling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HarvestRecordState {
+    /// Identity allocated and durably recorded, create not yet confirmed. A
+    /// retry reuses this id rather than minting a second one.
+    PendingCreate,
     Live,
     Tombstoned,
 }
 
-/// Binds one upstream source record to the metadata document minted for it.
+/// Binds one upstream source record to the metadata document currently minted
+/// for it.
 ///
-/// The mapping `(namespace, source_record_id) -> meta_resource_id` is fixed at
-/// mint and NEVER remapped: the same source record resolves to the same id
-/// across re-harvests, deletions and revivals.
+/// `(group_id, namespace, source_record_id) -> meta_resource_id` is fixed for
+/// the lifetime of one identity. A tombstoned document can never be recreated
+/// under its old id, so a revival allocates a new identity and pushes the old
+/// one onto `predecessors`; ids are retired, never reused.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HarvestProvenance {
     pub group_id: GroupId,
@@ -212,6 +218,8 @@ pub struct HarvestProvenance {
     /// Upstream datestamp last applied; an older datestamp is a stale no-op.
     pub source_datestamp_ms: u64,
     pub state: HarvestRecordState,
+    /// Tombstoned identities this record resolved to before, oldest first.
+    pub predecessors: Vec<Ulid>,
 }
 
 impl HarvestProvenance {
@@ -256,14 +264,18 @@ pub struct IncomingRecord {
 /// What a harvest must do for one source record given its stored provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProvenanceDecision {
-    /// No prior mapping and the record is live: mint a new MetaResourceId.
+    /// No prior mapping and the record is live: allocate a new identity.
     Mint,
+    /// An allocated identity whose create was never confirmed: finish it under
+    /// the same id instead of allocating a second one.
+    ResumeCreate { meta_resource_id: Ulid },
     /// Live mapping, newer datestamp: write a new version under the same id.
     Update { meta_resource_id: Ulid },
-    /// Live mapping, upstream deletion: tombstone and withdraw the document.
+    /// Live or pending mapping, upstream deletion: withdraw the document.
     Tombstone { meta_resource_id: Ulid },
-    /// Tombstoned mapping, record reappeared: revive under the same id.
-    Revive { meta_resource_id: Ulid },
+    /// Tombstoned mapping, record reappeared: allocate a successor identity and
+    /// retain the withdrawn one as lineage. The old id stays withdrawn.
+    Revive { predecessor: Ulid },
     /// Nothing to do: not newer than what was applied, or a deletion of an
     /// unknown or already-tombstoned record.
     Skip,
@@ -272,6 +284,9 @@ pub enum ProvenanceDecision {
 /// Idempotent, wall-clock-free decision for one harvested record. A deletion at
 /// or below the applied datestamp is skipped, so replays and out-of-order old
 /// deletions never withdraw a newer document.
+///
+/// An unresolved `PendingCreate` outranks the staleness test: a replay of the
+/// exact record that crashed mid-create must converge on the persisted id.
 pub fn provenance_decision(
     existing: Option<&HarvestProvenance>,
     incoming: &IncomingRecord,
@@ -284,32 +299,24 @@ pub fn provenance_decision(
         };
     };
 
-    if incoming.datestamp_ms <= prov.source_datestamp_ms {
-        return ProvenanceDecision::Skip;
-    }
-
     let id = prov.meta_resource_id;
+    let stale = incoming.datestamp_ms <= prov.source_datestamp_ms;
     match prov.state {
-        HarvestRecordState::Live => {
-            if incoming.deleted {
-                ProvenanceDecision::Tombstone {
-                    meta_resource_id: id,
-                }
-            } else {
-                ProvenanceDecision::Update {
-                    meta_resource_id: id,
-                }
-            }
-        }
-        HarvestRecordState::Tombstoned => {
-            if incoming.deleted {
-                ProvenanceDecision::Skip
-            } else {
-                ProvenanceDecision::Revive {
-                    meta_resource_id: id,
-                }
-            }
-        }
+        HarvestRecordState::PendingCreate if incoming.deleted => ProvenanceDecision::Tombstone {
+            meta_resource_id: id,
+        },
+        HarvestRecordState::PendingCreate => ProvenanceDecision::ResumeCreate {
+            meta_resource_id: id,
+        },
+        HarvestRecordState::Live if stale => ProvenanceDecision::Skip,
+        HarvestRecordState::Live if incoming.deleted => ProvenanceDecision::Tombstone {
+            meta_resource_id: id,
+        },
+        HarvestRecordState::Live => ProvenanceDecision::Update {
+            meta_resource_id: id,
+        },
+        HarvestRecordState::Tombstoned if stale || incoming.deleted => ProvenanceDecision::Skip,
+        HarvestRecordState::Tombstoned => ProvenanceDecision::Revive { predecessor: id },
     }
 }
 
@@ -342,6 +349,7 @@ mod tests {
             version: 1,
             source_datestamp_ms: datestamp_ms,
             state: HarvestRecordState::Live,
+            predecessors: Vec::new(),
         }
     }
 
@@ -531,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn reappeared_record_revives_same_id() {
+    fn reappeared_record_revives_as_successor() {
         let mut prov = live(9, 5);
         prov.state = HarvestRecordState::Tombstoned;
         assert_eq!(
@@ -543,6 +551,43 @@ mod tests {
                 }
             ),
             ProvenanceDecision::Revive {
+                predecessor: prov.meta_resource_id
+            }
+        );
+    }
+
+    #[test]
+    fn pending_create_resumes_before_staleness() {
+        let mut prov = live(9, 5);
+        prov.state = HarvestRecordState::PendingCreate;
+        // Same datestamp as the crashed attempt: the identity is still unresolved.
+        assert_eq!(
+            provenance_decision(
+                Some(&prov),
+                &IncomingRecord {
+                    datestamp_ms: 5,
+                    deleted: false
+                }
+            ),
+            ProvenanceDecision::ResumeCreate {
+                meta_resource_id: prov.meta_resource_id
+            }
+        );
+    }
+
+    #[test]
+    fn pending_create_deletion_tombstones_id() {
+        let mut prov = live(9, 5);
+        prov.state = HarvestRecordState::PendingCreate;
+        assert_eq!(
+            provenance_decision(
+                Some(&prov),
+                &IncomingRecord {
+                    datestamp_ms: 5,
+                    deleted: true
+                }
+            ),
+            ProvenanceDecision::Tombstone {
                 meta_resource_id: prov.meta_resource_id
             }
         );

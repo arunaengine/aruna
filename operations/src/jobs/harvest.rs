@@ -3,6 +3,7 @@ use std::time::SystemTime;
 use aruna_blob::blob::BlobHandle;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::structured_id::StructuredId;
 use aruna_core::structs::{
     Actor, AuthContext, HarvestCursor, HarvestJobSpec, HarvestProvenance, HarvestRecordState,
     HarvestSource, IncomingRecord, JobError, JobResultPayload, ProvenanceDecision, RealmId,
@@ -12,7 +13,8 @@ use aruna_core::types::GroupId;
 use ulid::Ulid;
 
 use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentPayload, mint_job_document,
 };
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::harvest::oai::mapping::oai_dc_to_jsonld;
@@ -33,6 +35,10 @@ use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 const MAX_HARVEST_PAGES: u32 = 100_000;
+/// Budget for a harvested document's normalized metadata path.
+const HARVEST_PATH_BYTES: usize = 512;
+/// `b3-` plus 64 hex characters: the shortest segment any identifier can take.
+const DIGEST_SEGMENT_BYTES: usize = 67;
 
 #[derive(Default)]
 struct HarvestCounts {
@@ -42,6 +48,7 @@ struct HarvestCounts {
     skipped: u64,
 }
 
+#[derive(Debug)]
 enum HarvestFailure {
     Cancelled,
     Interrupted,
@@ -179,58 +186,49 @@ async fn apply_record(
         deleted: record.header.deleted,
     };
 
+    let mut row = HarvestProvenance {
+        group_id: source.group_id,
+        namespace: source.namespace.clone(),
+        source_record_id: identifier.to_string(),
+        meta_resource_id: Ulid::nil(),
+        version: next_version(existing.as_ref()),
+        source_datestamp_ms: datestamp_ms,
+        state: HarvestRecordState::PendingCreate,
+        predecessors: existing
+            .as_ref()
+            .map(|provenance| provenance.predecessors.clone())
+            .unwrap_or_default(),
+    };
+
     match provenance_decision(existing.as_ref(), &incoming) {
         ProvenanceDecision::Skip => counts.skipped += 1,
         ProvenanceDecision::Mint => {
-            let document_id = Ulid::generate();
-            create_document(ctx, source, actor, realm_id, document_id, record).await?;
-            write_provenance(ctx, source, identifier, document_id, 1, datestamp_ms, false).await?;
+            mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
             counts.minted += 1;
         }
-        ProvenanceDecision::Revive { meta_resource_id } => {
+        ProvenanceDecision::Revive { predecessor } => {
+            row.predecessors.push(predecessor);
+            mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
+            counts.minted += 1;
+        }
+        ProvenanceDecision::ResumeCreate { meta_resource_id } => {
+            row.meta_resource_id = meta_resource_id;
+            row.source_datestamp_ms = datestamp_ms.max(
+                existing
+                    .as_ref()
+                    .map(|provenance| provenance.source_datestamp_ms)
+                    .unwrap_or(0),
+            );
             create_document(ctx, source, actor, realm_id, meta_resource_id, record).await?;
-            let version = next_version(existing.as_ref());
-            write_provenance(
-                ctx,
-                source,
-                identifier,
-                meta_resource_id,
-                version,
-                datestamp_ms,
-                false,
-            )
-            .await?;
+            row.state = HarvestRecordState::Live;
+            write_provenance(ctx, &row).await?;
             counts.minted += 1;
         }
         ProvenanceDecision::Update { meta_resource_id } => {
-            let stored = load_metadata_record_by_document(&ctx.driver, meta_resource_id)
-                .await
-                .map_err(|error| retryable(format!("harvest record read: {error:?}")))?
-                .ok_or_else(|| retryable("harvested document record vanished"))?;
-            update_metadata_document_routed(
-                &ctx.driver,
-                actor.clone(),
-                Some(&stored),
-                meta_resource_id,
-                None,
-                UpdateMetadataDocumentMutation::ReplaceRoCrate {
-                    jsonld: oai_dc_to_jsonld(record),
-                },
-                Some(internal_token(source.created_by, realm_id)),
-            )
-            .await
-            .map_err(apply_failure)?;
-            let version = next_version(existing.as_ref());
-            write_provenance(
-                ctx,
-                source,
-                identifier,
-                meta_resource_id,
-                version,
-                datestamp_ms,
-                false,
-            )
-            .await?;
+            update_document(ctx, source, actor, realm_id, meta_resource_id, record).await?;
+            row.meta_resource_id = meta_resource_id;
+            row.state = HarvestRecordState::Live;
+            write_provenance(ctx, &row).await?;
             counts.updated += 1;
         }
         ProvenanceDecision::Tombstone { meta_resource_id } => {
@@ -248,21 +246,38 @@ async fn apply_record(
                 .await
                 .map_err(apply_failure)?;
             }
-            let version = next_version(existing.as_ref());
-            write_provenance(
-                ctx,
-                source,
-                identifier,
-                meta_resource_id,
-                version,
-                datestamp_ms,
-                true,
-            )
-            .await?;
+            row.meta_resource_id = meta_resource_id;
+            row.state = HarvestRecordState::Tombstoned;
+            write_provenance(ctx, &row).await?;
             counts.tombstoned += 1;
         }
     }
     Ok(())
+}
+
+/// Allocate a structured document id, record it as `PendingCreate` before the
+/// create runs, then confirm it. A crash anywhere in between leaves a retry the
+/// same id, so a replay converges on one document instead of orphaning one per
+/// attempt.
+async fn mint_and_create(
+    ctx: &JobContext,
+    source: &HarvestSource,
+    actor: &Actor,
+    realm_id: RealmId,
+    record: &OaiRecord,
+    row: &mut HarvestProvenance,
+) -> Result<(), HarvestFailure> {
+    let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
+    let document_id = mint_job_document(&ctx.driver, actor, source.group_id, &document_path)
+        .await
+        .map_err(|error| retryable(format!("harvest mint document id: {error}")))?
+        .as_ulid();
+    row.meta_resource_id = document_id;
+    row.state = HarvestRecordState::PendingCreate;
+    write_provenance(ctx, row).await?;
+    create_document(ctx, source, actor, realm_id, document_id, record).await?;
+    row.state = HarvestRecordState::Live;
+    write_provenance(ctx, row).await
 }
 
 async fn create_document(
@@ -273,16 +288,14 @@ async fn create_document(
     document_id: Ulid,
     record: &OaiRecord,
 ) -> Result<(), HarvestFailure> {
-    create_metadata_document_routed(
+    let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
+    let created = create_metadata_document_routed(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
             CreateMetadataDocumentConfig {
                 actor: actor.clone(),
                 group_id: source.group_id,
                 document_id,
-                document_path: harvest_document_path(
-                    &source.target_prefix,
-                    &record.header.identifier,
-                ),
+                document_path: document_path.clone(),
                 public: false,
                 payload: CreateMetadataDocumentPayload::RoCrate {
                     jsonld: oai_dc_to_jsonld(record),
@@ -290,6 +303,40 @@ async fn create_document(
             },
         ),
         ctx.driver.clone(),
+        Some(internal_token(source.created_by, realm_id)),
+    )
+    .await;
+    match created {
+        Ok(_) => Ok(()),
+        // A create the pending identity already committed under a different
+        // payload: the id is resolved, and the newer content lands as an update.
+        Err(MetadataWriteError::Create(CreateMetadataDocumentError::DocumentAlreadyExists)) => {
+            update_document(ctx, source, actor, realm_id, document_id, record).await
+        }
+        Err(error) => Err(apply_failure(error)),
+    }
+}
+
+async fn update_document(
+    ctx: &JobContext,
+    source: &HarvestSource,
+    actor: &Actor,
+    realm_id: RealmId,
+    document_id: Ulid,
+    record: &OaiRecord,
+) -> Result<(), HarvestFailure> {
+    let stored = load_metadata_record_by_document(&ctx.driver, document_id)
+        .await
+        .map_err(|error| retryable(format!("harvest record read: {error:?}")))?;
+    update_metadata_document_routed(
+        &ctx.driver,
+        actor.clone(),
+        stored.as_ref(),
+        document_id,
+        None,
+        UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            jsonld: oai_dc_to_jsonld(record),
+        },
         Some(internal_token(source.created_by, realm_id)),
     )
     .await
@@ -315,43 +362,37 @@ fn next_version(existing: Option<&HarvestProvenance>) -> u64 {
 
 /// Land a source record under its target prefix at a stable, path-safe segment
 /// derived from the OAI identifier.
-fn harvest_document_path(prefix: &str, identifier: &str) -> String {
-    let segment: String = identifier
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("{}/{segment}", prefix.trim_matches('/'))
+///
+/// Every identifier is encoded into one of two disjoint domains so no two raw
+/// identifiers can ever share a segment: `b64-` carries the exact identifier as
+/// URL-safe unpadded base64 whenever it fits the path budget, `b3-` carries the
+/// full 256-bit BLAKE3 digest of anything longer. Provenance keeps the raw
+/// identifier, so the encoding never has to be reversed.
+fn harvest_document_path(prefix: &str, identifier: &str) -> Result<String, HarvestFailure> {
+    let prefix = prefix.trim_matches('/');
+    let budget = HARVEST_PATH_BYTES.saturating_sub(prefix.len() + 1);
+    if budget < DIGEST_SEGMENT_BYTES {
+        return Err(permanent(format!(
+            "harvest target prefix leaves no room for an encoded identifier: {prefix}"
+        )));
+    }
+    let encoded = format!(
+        "b64-{}",
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, identifier)
+    );
+    let segment = if encoded.len() <= budget {
+        encoded
+    } else {
+        format!("b3-{}", blake3::hash(identifier.as_bytes()).to_hex())
+    };
+    Ok(format!("{prefix}/{segment}"))
 }
 
 async fn write_provenance(
     ctx: &JobContext,
-    source: &HarvestSource,
-    identifier: &str,
-    meta_resource_id: Ulid,
-    version: u64,
-    datestamp_ms: u64,
-    tombstoned: bool,
+    provenance: &HarvestProvenance,
 ) -> Result<(), HarvestFailure> {
-    let provenance = HarvestProvenance {
-        group_id: source.group_id,
-        namespace: source.namespace.clone(),
-        source_record_id: identifier.to_string(),
-        meta_resource_id,
-        version,
-        source_datestamp_ms: datestamp_ms,
-        state: if tombstoned {
-            HarvestRecordState::Tombstoned
-        } else {
-            HarvestRecordState::Live
-        },
-    };
-    let effect = write_provenance_effect(&provenance, None)
+    let effect = write_provenance_effect(provenance, None)
         .map_err(|error| permanent(format!("provenance encode: {error}")))?;
     expect_write(ctx.driver.storage_handle.send_effect(effect).await)
 }
@@ -475,12 +516,59 @@ fn apply_failure(error: MetadataWriteError) -> HarvestFailure {
 mod tests {
     use super::*;
 
+    fn path(identifier: &str) -> String {
+        harvest_document_path("/imported/zenodo/", identifier).unwrap()
+    }
+
     #[test]
-    fn document_path_sanitizes_identifier() {
-        assert_eq!(
-            harvest_document_path("/imported/zenodo/", "oai:example.org:123/v2"),
-            "imported/zenodo/oai-example.org-123-v2"
-        );
+    fn document_path_encodes_identifier() {
+        let encoded = path("oai:example.org:123/v2");
+        assert!(encoded.starts_with("imported/zenodo/b64-"));
+        assert!(!encoded["imported/zenodo/".len()..].contains('/'));
+    }
+
+    #[test]
+    fn separator_variants_never_collide() {
+        // ':' and '/' both collapsed to '-' under the old sanitizer.
+        let paths = [
+            path("oai:a:b"),
+            path("oai/a/b"),
+            path("oai-a-b"),
+            path("oai:a/b"),
+        ];
+        for (index, left) in paths.iter().enumerate() {
+            for right in &paths[index + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn clean_digest_shaped_identifier_stays_distinct() {
+        // A raw identifier that looks like digest output lands in the b64 domain.
+        let digest = blake3::hash(b"oai:example.org:1").to_hex().to_string();
+        assert_ne!(path(&format!("b3-{digest}")), path("oai:example.org:1"));
+        assert!(path(&format!("b3-{digest}")).contains("/b64-"));
+    }
+
+    #[test]
+    fn long_identifier_falls_back_to_digest() {
+        let long = "oai:example.org:".to_string() + &"x".repeat(600);
+        let encoded = path(&long);
+        assert!(encoded.starts_with("imported/zenodo/b3-"));
+        assert_eq!(encoded, path(&long));
+        assert!(encoded.len() <= HARVEST_PATH_BYTES);
+    }
+
+    #[test]
+    fn unicode_identifier_round_trips_distinctly() {
+        assert_ne!(path("oai:例:1"), path("oai:例:2"));
+        assert!(path("oai:例:1").contains("/b64-"));
+    }
+
+    #[test]
+    fn oversized_prefix_is_rejected() {
+        assert!(harvest_document_path(&"p".repeat(HARVEST_PATH_BYTES), "x").is_err());
     }
 
     #[test]
@@ -494,6 +582,7 @@ mod tests {
             version: 4,
             source_datestamp_ms: 0,
             state: HarvestRecordState::Live,
+            predecessors: Vec::new(),
         };
         assert_eq!(next_version(Some(&provenance)), 5);
     }
