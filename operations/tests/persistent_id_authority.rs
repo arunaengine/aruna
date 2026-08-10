@@ -90,13 +90,14 @@ async fn withdraw_precedes_mint() -> TestResult<()> {
     // The submitted job is accepted here; the worker's mint runs after the
     // withdrawal below, exactly as the race orders it.
     let submitted = submit_mint_pid(
-        realm.node(0).context.as_ref(),
+        &realm.node(0).context,
         MintPersistentIdSpec {
             document_id,
             minted_by: realm.user_id,
         },
         realm.node(0).node_id(),
         JOB_RETENTION_MS,
+        Some(realm.bearer_token()),
     )
     .await?;
     assert!(submitted.created);
@@ -243,23 +244,25 @@ async fn mint_dedups_users() -> TestResult<()> {
     let other = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
 
     let first = submit_mint_pid(
-        ingress.context.as_ref(),
+        &ingress.context,
         MintPersistentIdSpec {
             document_id,
             minted_by: realm.user_id,
         },
         ingress.node_id(),
         JOB_RETENTION_MS,
+        Some(realm.bearer_token()),
     )
     .await?;
     let second = submit_mint_pid(
-        ingress.context.as_ref(),
+        &ingress.context,
         MintPersistentIdSpec {
             document_id,
             minted_by: other,
         },
         ingress.node_id(),
         JOB_RETENTION_MS,
+        Some(realm.bearer_token()),
     )
     .await?;
 

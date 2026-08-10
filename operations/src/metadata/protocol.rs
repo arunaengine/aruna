@@ -236,6 +236,12 @@ pub enum PersistentIdRequest {
     Withdraw {
         withdrawn_at_ms: u64,
     },
+    /// Queue the mint job on the authority, so one document has one dedup row and
+    /// one execution however many ingress nodes accept the request.
+    SubmitMint {
+        minted_by: UserId,
+        retention_ms: u64,
+    },
     /// Unauthenticated landing resolution: the authority applies the same
     /// per-record anonymous readability check a single-record OAI read applies.
     Resolve,
@@ -249,6 +255,12 @@ pub enum PersistentIdOutcome {
         changed: bool,
     },
     Resolution(PersistentIdResolution),
+    /// The authority's mint job: its id is owned by the authority, and `created`
+    /// is false for a caller that joined the job another submitter opened.
+    Submission {
+        job_id: aruna_core::structs::JobId,
+        created: bool,
+    },
 }
 
 /// What a landing request resolves to. `Gone` outranks `Missing`: a withdrawn PID

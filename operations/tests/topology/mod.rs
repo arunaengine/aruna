@@ -33,7 +33,7 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, DocumentClass, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
+    Actor, AuthContext, DocumentClass, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
     PlacementBinding, PlacementRef, PlacementScope, RealmAuthorizationDocument,
     RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims, band_start,
 };
@@ -190,6 +190,15 @@ impl Topology {
             node_id: node.node_id(),
             user_id: self.user_id,
             realm_id: self.realm_id,
+        }
+    }
+
+    /// The unrestricted principal [`Topology::bearer_token`] authenticates as.
+    pub fn auth_context(&self) -> AuthContext {
+        AuthContext {
+            user_id: self.user_id,
+            realm_id: self.realm_id,
+            path_restrictions: None,
         }
     }
 

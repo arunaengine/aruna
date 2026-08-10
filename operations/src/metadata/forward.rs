@@ -13,8 +13,8 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
 use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, PersistentIdMapping, PlacementRef,
-    RealmConfigDocument, RealmId, RealmNodeKind,
+    Actor, AuthContext, JobId, MetadataRegistryRecord, MintPersistentIdSpec, Permission,
+    PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -1208,8 +1208,68 @@ pub async fn mint_pid_routed(
     .await?;
     match outcome {
         PersistentIdOutcome::Mapping { mapping, changed } => Ok((*mapping, changed)),
-        PersistentIdOutcome::Resolution(_) => Err(MetadataApiError::ServiceUnavailable),
+        _ => Err(MetadataApiError::ServiceUnavailable),
     }
+}
+
+/// Queue the PID mint job on the document's authority. The job store is
+/// node-local, so a document-scoped dedup row only deduplicates when one node
+/// owns it; alternating ingress nodes would otherwise open a job each.
+pub async fn submit_pid_job_routed(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    minted_by: UserId,
+    owner_node_id: NodeId,
+    retention_ms: u64,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<(JobId, bool), MetadataApiError> {
+    let realm_id = minted_by.realm_id;
+    if context.net_handle.is_none() {
+        return submit_pid_job_local(context, document_id, minted_by, owner_node_id, retention_ms)
+            .await;
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return submit_pid_job_local(context, document_id, minted_by, authority, retention_ms)
+            .await;
+    }
+    let outcome = forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::SubmitMint {
+            minted_by,
+            retention_ms,
+        },
+        auth_token,
+    )
+    .await?;
+    match outcome {
+        PersistentIdOutcome::Submission { job_id, created } => Ok((job_id, created)),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+async fn submit_pid_job_local(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    minted_by: UserId,
+    owner_node_id: NodeId,
+    retention_ms: u64,
+) -> Result<(JobId, bool), MetadataApiError> {
+    crate::jobs::service::submit_mint_pid_local(
+        context.as_ref(),
+        MintPersistentIdSpec {
+            document_id,
+            minted_by,
+        },
+        owner_node_id,
+        retention_ms,
+    )
+    .await
+    .map(|result| (result.job_id, result.created))
+    .map_err(|error| MetadataApiError::Internal(error.to_string()))
 }
 
 /// Explicit withdrawal through the document's authority.
@@ -1254,7 +1314,7 @@ pub async fn withdraw_pid_routed(
     .await?;
     match outcome {
         PersistentIdOutcome::Mapping { mapping, .. } => Ok(*mapping),
-        PersistentIdOutcome::Resolution(_) => Err(MetadataApiError::ServiceUnavailable),
+        _ => Err(MetadataApiError::ServiceUnavailable),
     }
 }
 
@@ -1410,6 +1470,16 @@ pub(crate) async fn apply_forwarded_pid(
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
     };
+    // The minting subject is the token's own subject: a routing hop may not
+    // attribute a mint to a user it merely relays for.
+    let minting_subject = match &request {
+        PersistentIdRequest::Mint { minted_by, .. }
+        | PersistentIdRequest::SubmitMint { minted_by, .. } => Some(*minted_by),
+        _ => None,
+    };
+    if minting_subject.is_some_and(|minted_by| minted_by != auth.user_id) {
+        return forward_auth_error(ForwardAuthError::Forbidden);
+    }
     let record = match existing_record(context, document_id).await {
         Ok(Some(record)) => Some(record),
         Ok(None) => None,
@@ -1458,6 +1528,28 @@ pub(crate) async fn apply_forwarded_pid(
                 mapping: Box::new(mapping),
                 changed,
             })
+        }
+        PersistentIdRequest::SubmitMint {
+            minted_by,
+            retention_ms,
+        } => {
+            return match submit_pid_job_local(
+                context,
+                document_id,
+                minted_by,
+                net_handle.node_id(),
+                retention_ms,
+            )
+            .await
+            {
+                Ok((job_id, created)) => MetadataTransportMessage::ForwardedPersistentId {
+                    result: Ok(PersistentIdOutcome::Submission { job_id, created }),
+                },
+                Err(error) => {
+                    warn!(%document_id, ?error, "Forwarded persistent id job submission failed");
+                    MetadataTransportMessage::ForwardedWriteUnavailable
+                }
+            };
         }
         PersistentIdRequest::Resolve => unreachable!("resolve returned above"),
     };

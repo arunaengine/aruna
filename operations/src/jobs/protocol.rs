@@ -21,8 +21,8 @@ use tracing::warn;
 use super::runtime::JobsRuntime;
 use super::service::{
     ArtifactLookup, CancelJobOutcome, JobReportLookup, OwnedArtifact, cancel_owned_job,
-    read_artifact_range, read_job_run_crate_status, read_owned_artifact, read_owned_job,
-    read_owned_report, resolve_job_owner,
+    local_status, read_artifact_range, read_owned_artifact, read_owned_job, read_owned_report,
+    resolve_job_owner,
 };
 use super::staging::read_staging_checkpoint;
 use crate::driver::DriverContext;
@@ -228,7 +228,7 @@ async fn prepare_response(
             if let Some(rejected) = owner_gate(context, job_id, local_node).await {
                 return rejected;
             }
-            prepare_status(context, auth.user_id, job_id).await
+            prepare_status(context, &auth, job_id).await
         }
         JobRequest::Report {
             job_id,
@@ -328,22 +328,17 @@ fn auth_realm_matches(auth: &AuthContext, realm_id: RealmId) -> bool {
 
 async fn prepare_status(
     context: &DriverContext,
-    user_id: UserId,
+    auth: &AuthContext,
     job_id: JobId,
 ) -> PreparedResponse {
-    let record = match read_owned_job(context, user_id, job_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return PreparedResponse::new(JobResponse::NotFound),
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-    };
-    let run_crate = match read_job_run_crate_status(context, job_id).await {
-        Ok(status) => status.map(|status| status.to_public_json().to_string()),
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-    };
-    PreparedResponse::new(JobResponse::Status {
-        job: JobStatusView::from(&record),
-        run_crate,
-    })
+    match local_status(context, auth, job_id).await {
+        Ok(status) => PreparedResponse::new(JobResponse::Status {
+            job: status.job,
+            run_crate: status.run_crate.map(|value| value.to_string()),
+        }),
+        Err(JobRouteError::NotFound) => PreparedResponse::new(JobResponse::NotFound),
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+    }
 }
 
 async fn prepare_report(

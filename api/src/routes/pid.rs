@@ -29,6 +29,7 @@ use aruna_core::structs::{
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::jobs::service::submit_mint_pid;
+use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{resolve_pid_routed, withdraw_pid_routed};
@@ -76,6 +77,17 @@ fn landing_response(
     }
 }
 
+/// The submission runs on the document's PID authority, so its failures are that
+/// node's answer about the document, not an internal fault of this one.
+fn mint_submit_error(error: SubmitJobError) -> ServerError {
+    match error {
+        SubmitJobError::DocumentMissing => ServerError::NotFound,
+        SubmitJobError::AuthorityDenied => ServerError::Forbidden,
+        SubmitJobError::PlacementUnavailable(_) => ServerError::ServiceUnavailable,
+        error => ServerError::InternalError(error.to_string()),
+    }
+}
+
 fn redirect(location: &str) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::FOUND;
@@ -98,6 +110,7 @@ fn gone(pid: &str) -> Response {
 async fn mint_pid(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<serde_json::Value>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
@@ -123,9 +136,10 @@ async fn mint_pid(
         },
         state.get_node_id(),
         DEFAULT_JOB_RETENTION_MS,
+        forwarded_auth_token(bearer_token)?,
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(mint_submit_error)?;
 
     Ok((
         StatusCode::ACCEPTED,

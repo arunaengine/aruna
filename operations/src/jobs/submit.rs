@@ -73,6 +73,12 @@ pub enum SubmitJobError {
     ClockHealth(#[from] ClockHealthError),
     #[error("job placement unavailable: {0}")]
     PlacementUnavailable(String),
+    /// The routed authority no longer has the document the job is scoped to.
+    #[error("persistent id target document is absent")]
+    DocumentMissing,
+    /// The routed authority refused the caller's permission on the document.
+    #[error("persistent id submission is not authorized")]
+    AuthorityDenied,
     #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
     JobPlanConflict { existing_job_id: JobId },
     #[error("invalid workspace: {0}")]

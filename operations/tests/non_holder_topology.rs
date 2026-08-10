@@ -136,7 +136,7 @@ async fn owner_read_routes() -> TestResult<()> {
     let bystander = realm.node(1);
     let routed = read_job_routed(
         bystander.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         submitted.job_id,
         Some(realm.bearer_token()),
     )
@@ -508,7 +508,7 @@ async fn owner_down_unavailable() -> TestResult<()> {
 
     let status = read_job_routed(
         probe.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         submitted.job_id,
         Some(realm.bearer_token()),
     )
@@ -571,7 +571,7 @@ async fn owner_answers_absence() -> TestResult<()> {
 
     let routed = read_job_routed(
         bystander.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         missing,
         Some(realm.bearer_token()),
     )
@@ -585,7 +585,7 @@ async fn owner_answers_absence() -> TestResult<()> {
     let unresolved = mint_job_id(unbound, BucketId::new(0)?)?;
     let routed = read_job_routed(
         bystander.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         unresolved,
         Some(realm.bearer_token()),
     )
