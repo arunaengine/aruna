@@ -1,5 +1,6 @@
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
+use aruna_core::structs::BindingError;
 
 use crate::create_metadata_document::CreateMetadataDocumentError;
 use crate::delete_metadata_document::DeleteMetadataDocumentError;
@@ -51,8 +52,8 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
             CreateMetadataDocumentError::ClockHealth(_)
             | CreateMetadataDocumentError::TopicAnnouncement(_)
             | CreateMetadataDocumentError::OriginHoldsNoBucket
-            | CreateMetadataDocumentError::PlacementBindingUnavailable(_)
-            | CreateMetadataDocumentError::PlacementBinding(_) => true,
+            | CreateMetadataDocumentError::PlacementBindingUnavailable(_) => true,
+            CreateMetadataDocumentError::PlacementBinding(error) => binding_is_transient(error),
             _ => false,
         },
         MetadataWriteError::Update(error) => match error {
@@ -67,6 +68,18 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
             DeleteMetadataDocumentError::SyncDelete(_) => true,
             _ => false,
         },
+    }
+}
+
+/// A binding set that is merely incomplete here still converges, so an unknown
+/// handle or strategy waits for replication. Divergent tuples and a bucket
+/// outside the strategy's range are settled facts of the immutable binding set:
+/// no retry can resolve them, so burning a backoff schedule on them only hides
+/// the fault.
+fn binding_is_transient(error: &BindingError) -> bool {
+    match error {
+        BindingError::Unknown(_) | BindingError::UnknownStrategy(_) => true,
+        BindingError::Conflicted(_) | BindingError::BucketOutOfRange(_) => false,
     }
 }
 
@@ -93,6 +106,10 @@ fn metadata_error_transient(error: &MetadataError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handle() -> aruna_core::structured_id::PlacementHandle {
+        aruna_core::structured_id::PlacementHandle::new(1).expect("handle")
+    }
 
     fn violation() -> Vec<MetadataValidationViolation> {
         vec![MetadataValidationViolation {
@@ -172,6 +189,18 @@ mod tests {
                 expected: "e",
                 got: "g".to_string(),
             }),
+            // Settled facts of the immutable binding set; a retry replays them.
+            create(CreateMetadataDocumentError::PlacementBinding(
+                BindingError::Conflicted(handle()),
+            )),
+            create(CreateMetadataDocumentError::PlacementBinding(
+                BindingError::BucketOutOfRange(
+                    aruna_core::structured_id::BucketId::new(9)
+                        .expect("bucket")
+                        .in_strategy_range(4)
+                        .expect_err("out of range"),
+                ),
+            )),
         ];
         for error in permanent {
             let label = error.to_string();
@@ -207,6 +236,13 @@ mod tests {
             create(CreateMetadataDocumentError::OriginHoldsNoBucket),
             create(CreateMetadataDocumentError::PlacementBindingUnavailable(
                 "no binding".to_string(),
+            )),
+            // An incomplete local binding set still converges by replication.
+            create(CreateMetadataDocumentError::PlacementBinding(
+                BindingError::Unknown(handle()),
+            )),
+            create(CreateMetadataDocumentError::PlacementBinding(
+                BindingError::UnknownStrategy(ulid::Ulid::nil()),
             )),
             create(CreateMetadataDocumentError::MetadataError(
                 MetadataError::ChannelClosed,
