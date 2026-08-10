@@ -1077,6 +1077,102 @@ mod tests {
         assert!(body.contains(&format!("<earliestDatestamp>{earliest}</earliestDatestamp>")));
     }
 
+    async fn call(fixture: &Fixture, request: axum::http::Request<Body>) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let response = router()
+            .with_state(Arc::clone(&fixture.state))
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn peer_request(builder: axum::http::request::Builder, body: Body) -> axum::http::Request<Body> {
+        let mut request = builder.body(body).unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:9000".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        request
+    }
+
+    #[tokio::test]
+    async fn get_and_post_agree() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        let (get_status, get_body) = call(
+            &fixture,
+            peer_request(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/oai?verb=ListMetadataFormats"),
+                Body::empty(),
+            ),
+        )
+        .await;
+        let (post_status, post_body) = call(
+            &fixture,
+            peer_request(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/oai")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+                Body::from("verb=ListMetadataFormats"),
+            ),
+        )
+        .await;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(post_status, StatusCode::OK);
+        assert!(get_body.contains("<ListMetadataFormats>"));
+        // Only the responseDate differs between the two transports.
+        let strip = |body: &str| {
+            let start = body.find("<responseDate>").unwrap();
+            let end = body.find("</responseDate>").unwrap();
+            format!("{}{}", &body[..start], &body[end..])
+        };
+        assert_eq!(strip(&get_body), strip(&post_body));
+    }
+
+    #[tokio::test]
+    async fn post_rejects_other_media() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        let (status, body) = call(
+            &fixture,
+            peer_request(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/oai")
+                    .header(header::CONTENT_TYPE, "application/json"),
+                Body::from("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("code=\"badArgument\""));
+    }
+
+    // A repeated argument must surface as a protocol error inside the envelope,
+    // not as a bare transport 400.
+    #[tokio::test]
+    async fn repeated_argument_stays_in_envelope() {
+        let fixture = fixture(RoCrateLimits::default()).await;
+        let (status, body) = call(
+            &fixture,
+            peer_request(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/oai?verb=ListRecords&metadataPrefix=oai_dc&metadataPrefix=oai_dc"),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("code=\"badArgument\""));
+        assert!(body.contains("xsi:schemaLocation="));
+    }
+
     // The advertised endpoint comes from the configured public URL, never from a
     // Host header an untrusted caller controls.
     #[tokio::test]
