@@ -336,6 +336,30 @@ pub async fn post_objects(
     drs_json_response(StatusCode::OK, DrsBulkObjectsResponse { objects })
 }
 
+/// Maps a source read failure onto its DRS status: an observation the source no
+/// longer serves is a 404, transient drift a 503, and an exhausted binding a 409
+/// because only an explicit rebind heals it.
+fn download_error(error: GetObjectError) -> Response {
+    match error {
+        GetObjectError::NoSuchKey
+        | GetObjectError::NoSuchVersion
+        | GetObjectError::DeleteMarker => drs_error(StatusCode::NOT_FOUND, "DRS object not found"),
+        GetObjectError::HistoricalReferenceUnavailable => drs_error(
+            StatusCode::NOT_FOUND,
+            "the recorded reference observation is no longer served by the source",
+        ),
+        GetObjectError::ReferenceSourceChanged => drs_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the reference source is changing; retry this download",
+        ),
+        GetObjectError::ReferenceAdvanceExhausted => drs_error(
+            StatusCode::CONFLICT,
+            "the reference binding reached its automatic advance limit; rebind it with an explicit write",
+        ),
+        error => DrsError::internal(error.to_string()).into_response(),
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/ga4gh/drs/v1/download",
@@ -345,7 +369,9 @@ pub async fn post_objects(
     responses(
         (status = 200, description = "Object bytes"),
         (status = 400, body = DrsErrorPayload),
-        (status = 404, body = DrsErrorPayload)
+        (status = 404, body = DrsErrorPayload),
+        (status = 409, description = "Reference binding reached its automatic advance limit", body = DrsErrorPayload),
+        (status = 503, description = "Reference source is changing; retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -402,22 +428,8 @@ pub async fn download_object(
     .await
     {
         Ok(Some(Ok(result))) => result,
-        Ok(Some(Err(
-            GetObjectError::NoSuchKey
-            | GetObjectError::NoSuchVersion
-            | GetObjectError::DeleteMarker,
-        )))
-        | Err(
-            GetObjectError::NoSuchKey
-            | GetObjectError::NoSuchVersion
-            | GetObjectError::DeleteMarker,
-        )
-        | Ok(None) => {
-            return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
-        }
-        Ok(Some(Err(error))) | Err(error) => {
-            return DrsError::internal(error.to_string()).into_response();
-        }
+        Ok(None) => return drs_error(StatusCode::NOT_FOUND, "DRS object not found"),
+        Ok(Some(Err(error))) | Err(error) => return download_error(error),
     };
 
     let location = result.location.unwrap_or_else(|| resolved.location.clone());
@@ -826,8 +838,9 @@ impl IntoResponse for DrsError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestedObjectId, ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response,
-        drs_denied_error, encode_component, get_object, parse_requested_object_id, resolve_object,
+        GetObjectError, RequestedObjectId, ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX,
+        build_object_response, download_error, drs_denied_error, encode_component, get_object,
+        parse_requested_object_id, resolve_object,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -1330,6 +1343,53 @@ mod tests {
                 encode_component(&requested_id)
             )
         );
+    }
+
+    // A lost historical observation is not a server fault, drift is transient,
+    // and an exhausted binding needs a rebind: three distinct statuses.
+    #[test]
+    fn maps_reference_errors() {
+        for (error, status) in [
+            (
+                GetObjectError::HistoricalReferenceUnavailable,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                GetObjectError::ReferenceSourceChanged,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                GetObjectError::ReferenceAdvanceExhausted,
+                StatusCode::CONFLICT,
+            ),
+            (GetObjectError::NoSuchKey, StatusCode::NOT_FOUND),
+            (
+                GetObjectError::GetObjectFailed,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            assert_eq!(download_error(error).status(), status);
+        }
+    }
+
+    // Operators reading the spec must see the reference statuses the route can
+    // actually return.
+    #[test]
+    fn download_declares_statuses() {
+        let openapi = ApiDoc::openapi();
+        let responses = &openapi
+            .paths
+            .paths
+            .get("/ga4gh/drs/v1/download")
+            .expect("download path")
+            .get
+            .as_ref()
+            .expect("download operation")
+            .responses
+            .responses;
+        for status in ["404", "409", "503"] {
+            assert!(responses.contains_key(status), "missing {status}");
+        }
     }
 
     #[test]
