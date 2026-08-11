@@ -1530,7 +1530,8 @@ mod tests {
             .extension(auth(user))
             .body(Body::from("{ not json"))
             .unwrap();
-        let response = router().with_state(state).oneshot(request).await.unwrap();
+        let (app, _) = router().split_for_parts();
+        let response = app.with_state(state).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 

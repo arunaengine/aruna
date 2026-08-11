@@ -1321,7 +1321,8 @@ mod tests {
 
     async fn call(fixture: &Fixture, request: axum::http::Request<Body>) -> (StatusCode, String) {
         use tower::ServiceExt;
-        let response = router()
+        let (app, _) = router().split_for_parts();
+        let response = app
             .with_state(Arc::clone(&fixture.state))
             .oneshot(request)
             .await
