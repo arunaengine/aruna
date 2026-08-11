@@ -278,8 +278,11 @@ mod process {
             self.root().join("node.log")
         }
 
-        fn write_env_file(&self, http: u16, p2p: u16, ops: u16, s3: u16) {
+        fn write_env_file(&self, http: u16, p2p: u16, ops: u16, s3: u16, barrier: Option<&Path>) {
             let storage = self.storage_path();
+            let barrier = barrier
+                .map(|path| format!("ARUNA_TEST_CORE_PUBLICATION_BARRIER={}\n", path.display()))
+                .unwrap_or_default();
             let body = format!(
                 "STORAGE_PATH={storage}\n\
                  BLOB_ROOT={storage}/blobstore\n\
@@ -293,6 +296,7 @@ mod process {
                  REALM_DESCRIPTION=\"observability harness realm\"\n\
                  ARUNA_COMPUTE_EXECUTOR=none\n\
                  ARUNA_SHUTDOWN_GRACE_SECS=16\n\
+                 {barrier}\
                  RUST_LOG=info\n",
                 storage = storage.display(),
                 http = http,
@@ -304,6 +308,16 @@ mod process {
         }
 
         pub fn launch(&self) -> NodeProcess {
+            self.launch_mode(None)
+        }
+
+        pub fn launch_core(&self) -> NodeProcess {
+            let barrier = self.root().join("core-publication.barrier");
+            let _ = std::fs::remove_file(&barrier);
+            self.launch_mode(Some(barrier))
+        }
+
+        fn launch_mode(&self, barrier: Option<PathBuf>) -> NodeProcess {
             let ports = Ports::new();
             let (http_port, p2p_port, ops_port, s3_port) = ports.values();
             let log = std::fs::OpenOptions::new()
@@ -317,7 +331,7 @@ mod process {
             let log_start = std::fs::metadata(self.log_path())
                 .map(|meta| meta.len() as usize)
                 .unwrap_or(0);
-            self.write_env_file(http_port, p2p_port, ops_port, s3_port);
+            self.write_env_file(http_port, p2p_port, ops_port, s3_port, barrier.as_deref());
             let mut command = Command::new(env!("CARGO_BIN_EXE_aruna"));
             command
                 .current_dir(self.root())
@@ -332,6 +346,7 @@ mod process {
                 rest_url: format!("http://127.0.0.1:{http_port}"),
                 log_path: self.log_path(),
                 log_start,
+                barrier,
             }
         }
 
@@ -404,6 +419,7 @@ mod process {
         pub rest_url: String,
         log_path: PathBuf,
         log_start: usize,
+        barrier: Option<PathBuf>,
     }
 
     impl NodeProcess {
@@ -499,6 +515,53 @@ mod process {
             panic!("never logged {needle}\n{}", self.logs());
         }
 
+        /// Waits for the tracked core publication barrier to reach `expected`.
+        pub async fn wait_core(&mut self, expected: &str) {
+            let path = self
+                .barrier
+                .as_ref()
+                .expect("core barrier path is present")
+                .clone();
+            let deadline = Instant::now() + HANG_GUARD;
+            while Instant::now() < deadline {
+                if std::fs::read_to_string(&path)
+                    .map(|value| value.trim() == expected)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                if !self.is_running() {
+                    panic!(
+                        "process exited before core barrier reached {expected}\n{}",
+                        self.logs()
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("core barrier never reached {expected}\n{}", self.logs());
+        }
+
+        /// Waits for a complete drain invocation before sampling the store.
+        pub async fn wait_drain_quiet(&mut self) {
+            let deadline = Instant::now() + HANG_GUARD;
+            while Instant::now() < deadline {
+                if !self.is_running() {
+                    panic!("process exited before a quiescent drain\n{}", self.logs());
+                }
+                let mut summary_seen = false;
+                for line in self.own_logs().lines() {
+                    summary_seen |= line.contains("pipeline.drain.summary")
+                        && line.contains("rotation_complete=true")
+                        && line.contains("has_unvisited=false");
+                    if summary_seen && line.contains("pipeline.drain.rotation") {
+                        return;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("never reached a quiescent drain\n{}", self.logs());
+        }
+
         pub fn signal(&self, name: &str) {
             let status = Command::new("kill")
                 .arg(format!("-{name}"))
@@ -511,6 +574,14 @@ mod process {
         /// Sends SIGTERM and waits for exit inside the hang guard.
         pub async fn terminate(mut self) -> std::process::ExitStatus {
             self.signal("TERM");
+            self.wait_exit().await
+        }
+
+        /// Freezes a quiescent process before delivering SIGTERM.
+        pub async fn stop_terminate(mut self) -> std::process::ExitStatus {
+            self.signal("STOP");
+            self.signal("TERM");
+            self.signal("CONT");
             self.wait_exit().await
         }
 
@@ -776,21 +847,58 @@ async fn restart_preserves_outbox() -> TestResult<()> {
     let mut second = env.launch();
     second.wait_status("/healthz", StatusCode::OK).await;
     second.wait_log("startup.recovery.degraded").await;
-    second.wait_log("pipeline.drain.summary").await;
-    second.terminate().await;
+    second.wait_drain_quiet().await;
+    second.stop_terminate().await;
     let before = env.outbox_rows().await;
 
     let mut third = env.launch();
     third.wait_status("/healthz", StatusCode::OK).await;
     third.wait_log("startup.recovery.degraded").await;
-    third.wait_log("pipeline.drain.summary").await;
-    third.terminate().await;
+    third.wait_drain_quiet().await;
+    third.stop_terminate().await;
     let after = env.outbox_rows().await;
 
     assert_eq!(
         after, before,
         "an unchanged restart must add no document sync outbox work"
     );
+    Ok(())
+}
+
+/// SIGTERM must join the tracked core publisher before storage sealing.
+#[tokio::test]
+async fn sigterm_joins_core() -> TestResult<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = process::NodeEnv::new();
+    let mut first = env.launch();
+    first.wait_status("/readyz", StatusCode::OK).await;
+    first.terminate().await;
+
+    let mut node = env.launch_core();
+    node.wait_status("/readyz", StatusCode::OK).await;
+    node.wait_core("active").await;
+    node.signal("TERM");
+    node.wait_core("joined").await;
+
+    let status = node.wait_exit().await;
+    assert_eq!(status.code(), Some(0), "core shutdown must exit cleanly");
+    assert_eq!(status.signal(), None, "core shutdown must not be signaled");
+
+    let logs = node.own_logs();
+    let joined = logs
+        .find("event=\"test.core_publication.joined\"")
+        .expect("core publication join must be observable");
+    let background = logs
+        .find("phase=\"background\"")
+        .expect("background shutdown phase missing");
+    let complete = logs
+        .find("Shutdown complete")
+        .expect("shutdown completion missing");
+    assert!(joined < background && background < complete, "{logs}");
+    assert!(!logs.contains("storage.write.after_seal"), "{logs}");
+    assert!(!logs.contains("storage.write.after_fence"), "{logs}");
+    assert!(logs.contains("rejected_writes=0"), "{logs}");
     Ok(())
 }
 

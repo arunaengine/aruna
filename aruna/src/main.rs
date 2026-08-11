@@ -42,9 +42,67 @@ use aruna_operations::startup::{
 };
 use aruna_operations::task_incoming::{TaskQueues, initialize_task_holder};
 use aruna_tasks::TaskHandle;
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
+
+#[cfg(debug_assertions)]
+struct CoreBarrier {
+    path: PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for CoreBarrier {
+    fn drop(&mut self) {
+        info!(
+            event = "test.core_publication.joined",
+            "Core publication joined"
+        );
+        if let Err(error) = std::fs::write(&self.path, b"joined") {
+            warn!(error = %error, "Failed to record core publication join");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn core_barrier() {
+    let Ok(path) = std::env::var("ARUNA_TEST_CORE_PUBLICATION_BARRIER") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Err(error) = std::fs::write(&path, b"active") {
+        warn!(error = %error, "Failed to arm core publication test barrier");
+        return;
+    }
+    let _barrier = CoreBarrier { path };
+    std::future::pending::<()>().await;
+}
+
+async fn publish_core(
+    core_ctx: Arc<DriverContext>,
+    node_id: iroh::PublicKey,
+    realm_id: aruna_core::structs::RealmId,
+    allow_genesis: bool,
+    documents: Vec<DocumentSyncTarget>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        core_barrier().await;
+    }
+    publish_core_documents(
+        core_ctx.as_ref(),
+        node_id,
+        realm_id,
+        allow_genesis,
+        documents,
+    )
+    .await
+}
 
 fn main() {
     // Both ring and aws-lc-rs are in the graph; rustls needs one picked before any TLS init.
@@ -555,15 +613,16 @@ async fn start_background(background: Background) {
         documents: core_documents,
         allow_genesis: allow_core_genesis,
     } = core_announcement;
+    let core_publish = publish_core(
+        core_ctx,
+        node_id,
+        realm_id,
+        allow_core_genesis,
+        core_documents,
+    );
     shutdown.spawn(async move {
         tokio::select! {
-            result = publish_core_documents(
-                core_ctx.as_ref(),
-                node_id,
-                realm_id,
-                allow_core_genesis,
-                core_documents,
-            ) => {
+            result = core_publish => {
                 if let Err(error) = result {
                     warn!(error = ?error, "Failed to queue core document replication");
                 }
