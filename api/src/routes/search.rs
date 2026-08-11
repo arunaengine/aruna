@@ -212,15 +212,34 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
     get,
     path = "/search/buckets",
     tag = "search",
+    summary = "Search buckets across the realm",
+    description = "Requires a bearer token issued by this realm; a token from another realm is refused with 403. The query is trimmed and must keep at least 2 characters, otherwise the request is rejected with 400. The search fans out over the realm's serving nodes, at most 32 nodes per request and under one shared deadline of about 12 seconds, and every node applies its own authorization and deny policies to its own buckets, so a bucket the caller may not read never appears. Answers are merged and cut to the page size; there is no continuation token, so a broader result set is reached by narrowing the query rather than by paging. A node that fails, is omitted by the node cap or times out does not fail the request: the answer is partial and says so through nodes_queried, nodes_failed and failed_nodes, which names the nodes that did not answer and carries the entry partition-discovery when node discovery itself failed. A partial answer means matching buckets may be missing rather than absent, and the caller may repeat the request.",
     params(
-        ("q" = String, Query, description = "Case-insensitive bucket-name substring"),
-        ("limit" = Option<usize>, Query, description = "Result limit (default 10, clamped to 1..=50)")
+        ("q" = String, Query, description = "Case-insensitive bucket-name substring; trimmed, minimum 2 characters, no wildcards"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of merged hits (default 10, clamped to 1..=50)")
     ),
     responses(
-        (status = 200, description = "Authorized federated bucket matches", body = BucketsSection),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Authorized federated bucket matches, possibly partial when nodes_failed is non-zero",
+            body = BucketsSection,
+            example = json!({
+                "hits": [{
+                    "arn": "arn:aruna:cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/lab-raw",
+                    "bucket": "lab-raw",
+                    "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "group_name": "Lab A",
+                    "created_at": "2026-04-09T14:23:11.123+00:00"
+                }],
+                "nodes_queried": 3,
+                "nodes_failed": 1,
+                "failed_nodes": ["2a3b4c5d6e7f89900a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f6789"]
+            })
+        ),
+        (status = 400, description = "Query shorter than 2 characters or otherwise malformed", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -259,20 +278,67 @@ pub async fn bucket_search(
     get,
     path = "/search",
     tag = "search",
+    summary = "Search documents, buckets, groups and users in one request",
+    description = "Requires a bearer token issued by this realm; a token from another realm is refused with 403. The four sections are searched concurrently and each one is authorized on its own terms: documents and buckets fan out over the realm's serving nodes, at most 32 nodes under one shared deadline of about 12 seconds, and each node filters its own results; groups are matched locally and then filtered per hit against READ on the group's data, so a caller who may not read a group never learns it exists; the user directory is an admin-scoped read, and a caller without it simply gets no users section instead of an error. A section that was not requested is omitted from the response. Answers can be partial: for documents and buckets, nodes_queried and nodes_failed count the fan-out and a non-zero nodes_failed (a node that failed, timed out or was dropped by the node cap) means hits may be missing rather than absent; documents also set truncated when paging stopped at the server-side depth cap, and groups set truncated when the per-hit visibility scan hit its round cap with matches still pending. A partial answer is still 200 and the caller may repeat the request. Paging is per section and only for a single-type request: pass the section's next_cursor back as cursor. A missing next_cursor means that section is exhausted; a cursor sent with more than one type, or with types=buckets, which has no continuation token, is rejected with 400.",
     params(
-        ("q" = String, Query, description = "Search query; trimmed, minimum 2 characters"),
-        ("types" = Option<String>, Query, description = "Comma-separated subset of documents,buckets,groups,users. Defaults to all four; an unknown type returns 400"),
-        ("limit" = Option<usize>, Query, description = "Per-section page size (default 10, clamped to 1..=100)"),
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token. Only accepted when exactly one type is requested"),
-        ("group_id" = Option<String>, Query, description = "Documents-only: restrict metadata hits to a single group id"),
-        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo profile IRI"),
-        ("mode" = Option<MetadataQueryMode>, Query, description = "Documents-only: search mode local or distributed")
+        ("q" = String, Query, description = "Search query; trimmed, minimum 2 characters, matched as a substring for buckets, groups and users and as a full-text query for documents"),
+        ("types" = Option<String>, Query, description = "Comma-separated subset of documents,buckets,groups,users. Defaults to all four; empty entries are ignored and an unknown type returns 400"),
+        ("limit" = Option<usize>, Query, description = "Per-section page size (default 10, clamped to 1..=100, and additionally capped at 50 for the buckets section)"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same section's next_cursor. Only accepted when exactly one type is requested; for documents it is a signed token bound to the exact query and filters, for groups the last returned group id as a ULID and for users the last returned user id in its ulid@realm form, and a malformed or unsupported cursor returns 400"),
+        ("group_id" = Option<String>, Query, description = "Documents-only: restrict metadata hits to a single group id, given as a ULID; a malformed id returns 400"),
+        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo profile IRI, such as https://w3id.org/ro/crate/1.1"),
+        ("mode" = Option<MetadataQueryMode>, Query, description = "Documents-only: local restricts the document search to this node, distributed fans out over the realm; defaults to distributed")
     ),
     responses(
-        (status = 200, description = "Sectioned search results", body = SearchResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Sectioned search results; a section is omitted when it was not requested and the users section is also omitted when the caller may not read the user directory, and a section is authoritative only when its failure counters are zero",
+            body = SearchResponse,
+            example = json!({
+                "documents": {
+                    "hits": [{
+                        "document_id": "01JMETADATA0123456789ABCDE",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "document_path": "datasets/rna-seq",
+                        "graph_iri": "https://node.example.test/api/v1/metadata/01JMETADATA0123456789ABCDE",
+                        "subject_iri": "https://node.example.test/api/v1/metadata/01JMETADATA0123456789ABCDE#root",
+                        "score": 4.5,
+                        "title": "RNA-seq reference run",
+                        "snippet": "reference run of the RNA-seq pipeline"
+                    }],
+                    "next_cursor": "eyJ3IjoiMDFKTUVUQURBVEEwMTIzNDU2Nzg5QUJDREUifQ",
+                    "nodes_queried": 3,
+                    "nodes_failed": 0,
+                    "truncated": false
+                },
+                "buckets": {
+                    "hits": [{
+                        "arn": "arn:aruna:cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/lab-raw",
+                        "bucket": "lab-raw",
+                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "group_name": "Lab A",
+                        "created_at": "2026-04-09T14:23:11.123+00:00"
+                    }],
+                    "nodes_queried": 3,
+                    "nodes_failed": 0,
+                    "failed_nodes": []
+                },
+                "groups": {
+                    "hits": [{"group_id": "01JABCDEF0123456789ABCDEFG", "display_name": "Lab A"}],
+                    "truncated": false
+                },
+                "users": {
+                    "hits": [{
+                        "user_id": "01JUSER0123456789ABCDEFGHI@cmVhbG0tZXhhbXBsZS0wMTIzNDU2Nzg5YWJjZGVmZ2g",
+                        "name": "example-user"
+                    }]
+                }
+            })
+        ),
+        (status = 400, description = "Query shorter than 2 characters, unknown type, malformed group id, or a cursor that is multi-type, unsupported or does not match the original query", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
