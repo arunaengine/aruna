@@ -6,6 +6,16 @@ pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
 pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const METADATA_IRI_REFERENCE_INDEX_KEYSPACE: &str = "metadata_iri_reference_index";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
+/// Time-ordered index of registry records by `updated_at_ms`, for OAI-PMH
+/// datestamp enumeration (#320). Written atomically with each registry record.
+pub const METADATA_UPDATED_INDEX_KEYSPACE: &str = "metadata_updated_index";
+/// Generation-scoped, timestamp-ordered index of the records an anonymous caller
+/// is currently authorized to read, so OAI-PMH enumeration never scans the
+/// registry. Maintained out of band; readers re-check authorization per record.
+pub const METADATA_VISIBILITY_INDEX_KEYSPACE: &str = "metadata_visibility_index";
+/// The single state row naming the servable visibility-index generation. Absent
+/// or not-ready means anonymous enumeration fails closed.
+pub const METADATA_VISIBILITY_STATE_KEYSPACE: &str = "metadata_visibility_state";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const METADATA_EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
 pub const METADATA_CREATE_ACCEPTANCE_KEYSPACE: &str = "metadata_create_acceptance";
@@ -29,6 +39,11 @@ pub const DOCUMENT_SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
 pub const TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
 pub const DOCUMENT_SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const DOCUMENT_SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
+/// Durable store for permanently-invalid replicated sync events (#338).
+pub const SYNC_QUARANTINE_KEYSPACE: &str = "sync_quarantine";
+/// Single-row record/byte accounting for the quarantine store, written in the
+/// same batch as every quarantine row write and prune delete.
+pub const SYNC_QUARANTINE_USAGE_KEYSPACE: &str = "sync_quarantine_usage";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
 pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
@@ -84,6 +99,14 @@ pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_in
 
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
+
+// Repository interop: metadata harvest framework (#442).
+pub const REPOSITORY_CONNECTOR_INDEX_KEYSPACE: &str = "repository_connector_index";
+pub const REPOSITORY_CONNECTOR_SECRET_KEYSPACE: &str = "repository_connector_secret";
+pub const HARVEST_SOURCE_KEYSPACE: &str = "harvest_source";
+pub const HARVEST_PROVENANCE_KEYSPACE: &str = "harvest_provenance";
+/// w3id persistent-identifier mappings, keyed by document id (#442, spec 3.5).
+pub const PERSISTENT_ID_MAPPING_KEYSPACE: &str = "persistent_id_mapping";
 
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";

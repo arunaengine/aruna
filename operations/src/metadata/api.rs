@@ -2591,7 +2591,7 @@ async fn ensure_record_readable(
     }
 }
 
-async fn can_read_record(
+pub(crate) async fn can_read_record(
     context: &DriverContext,
     realm_id: RealmId,
     auth: Option<&AuthContext>,
@@ -2931,6 +2931,9 @@ fn expression_contains_service(expression: &spargebra::algebra::Expression) -> b
     }
 }
 
+/// DEFERRED (#259): this local guard bounds distributed union queries to a safe
+/// subset. The spec-correct single-evaluation captured-generation union awaits
+/// one-holder-per-bucket selection from feat/routing-placement; not built here.
 fn distributed_query_is_union_safe(query: &str) -> bool {
     let Ok(parsed) = spargebra::SparqlParser::new().parse_query(query) else {
         return false;

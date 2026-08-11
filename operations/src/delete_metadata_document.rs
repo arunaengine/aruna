@@ -10,7 +10,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    graph_revision_change, metadata_document_lifecycle_revision_change,
+    graph_revision_change, metadata_document_lifecycle_revision_change, updated_index_delete,
 };
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
@@ -38,6 +38,9 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, write_audit_effect,
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
+use crate::persistent_id::{
+    MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, withdrawal_transition,
+};
 use crate::placement::{registry_placement, resolve_shard_holders};
 
 #[derive(Debug, PartialEq)]
@@ -54,6 +57,7 @@ pub struct DeleteMetadataDocumentOperation {
     registry_placement_ref: PlacementRef,
     holder_peers: Vec<NodeId>,
     registry_peers: Vec<NodeId>,
+    mapping_route: Option<MappingRoute>,
     txn_id: Option<Ulid>,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
@@ -72,10 +76,13 @@ enum DeleteMetadataDocumentState {
     DeleteRegistry,
     DeleteDocumentIndex,
     DeleteHolders,
+    DeleteUpdatedIndex,
     WriteAudit,
     WriteDocumentLifecycleOutbox,
     WriteGraphLifecycleOutbox,
     WriteDeleteOutbox,
+    ReadPidMapping,
+    WritePidWithdrawal,
     CommitTransaction,
     ScheduleGraphPruneQueue,
     PruneGraph,
@@ -122,6 +129,7 @@ impl DeleteMetadataDocumentOperation {
             registry_placement_ref: PlacementRef::NIL,
             holder_peers: Vec::new(),
             registry_peers: Vec::new(),
+            mapping_route: None,
             txn_id: None,
             state: DeleteMetadataDocumentState::Init,
             output: None,
@@ -320,6 +328,17 @@ impl DeleteMetadataDocumentOperation {
     }
 }
 
+/// The timestamp-index key is only reconstructible from the record's own
+/// `updated_at_ms`, so it is deleted inside the same transaction as the row.
+fn delete_index_effect(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -> Effect {
+    let (key_space, key) = updated_index_delete(record);
+    Effect::Storage(StorageEffect::Delete {
+        key_space,
+        key,
+        txn_id,
+    })
+}
+
 const DELETE_CONFLICT_RETRIES: usize = 3;
 
 fn delete_retry_backoff(attempt: usize, document_id: Ulid) -> Duration {
@@ -406,6 +425,15 @@ impl Operation for DeleteMetadataDocumentOperation {
                         self.registry_placement_ref = registry_placement(&config, record);
                         self.registry_peers =
                             resolve_shard_holders(&config, &self.registry_placement_ref);
+                        // The PID mapping rides the placement derived from the
+                        // structured id, not the deletable registry row, so its
+                        // tombstone keeps routing after this delete commits.
+                        self.mapping_route = mapping_route_for(
+                            &config,
+                            record.realm_id,
+                            self.document_id,
+                            self.actor.node_id,
+                        );
                     }
                     self.state = DeleteMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -558,6 +586,20 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
+                    self.state = DeleteMetadataDocumentState::DeleteUpdatedIndex;
+                    smallvec![delete_index_effect(record, Some(txn_id))]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("holders delete result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::DeleteUpdatedIndex => match event {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
                     self.state = DeleteMetadataDocumentState::WriteAudit;
                     match write_audit_effect(
                         &self.audit_record(record),
@@ -571,7 +613,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("holders delete result", format!("{other:?}")),
+                other => self.unexpected_event("updated index delete result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::WriteAudit => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
@@ -641,8 +683,8 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = DeleteMetadataDocumentState::CommitTransaction;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    self.state = DeleteMetadataDocumentState::ReadPidMapping;
+                    smallvec![read_mapping_effect(self.document_id, Some(txn_id))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
@@ -651,6 +693,69 @@ impl Operation for DeleteMetadataDocumentOperation {
                 }
                 other => self
                     .unexpected_event("document delete outbox write result", format!("{other:?}")),
+            },
+            // The PID tombstone commits with the registry row it retires: a
+            // best-effort write afterwards can be lost to a crash and leave a
+            // deleted document's PID Active forever.
+            DeleteMetadataDocumentState::ReadPidMapping => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                };
+                let existing = match parse_mapping_read(event) {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        return self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                            "persistent id mapping read failed: {error}"
+                        )));
+                    }
+                };
+                // A document that never minted a pid leaves no row: the
+                // registry-row fence in this transaction already blocks any
+                // later mint, and a tombstone would turn the landing 404 into
+                // an existence-leaking 410.
+                let transition = match existing.as_ref() {
+                    None => Ok(None),
+                    Some(mapping) => withdrawal_transition(
+                        Some(mapping),
+                        &self.mapping_route,
+                        self.document_id,
+                        unix_timestamp_millis(),
+                    ),
+                };
+                match transition {
+                    Ok(Some((_, writes))) => {
+                        self.state = DeleteMetadataDocumentState::WritePidWithdrawal;
+                        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                            writes,
+                            txn_id: Some(txn_id),
+                        })]
+                    }
+                    Ok(None) => {
+                        self.state = DeleteMetadataDocumentState::CommitTransaction;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    Err(error) => self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                        "persistent id withdrawal encode failed: {error}"
+                    ))),
+                }
+            }
+            DeleteMetadataDocumentState::WritePidWithdrawal => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = DeleteMetadataDocumentState::CommitTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                        "persistent id withdrawal write failed: {error}"
+                    )))
+                }
+                other => self.unexpected_event(
+                    "persistent id withdrawal write result",
+                    format!("{other:?}"),
+                ),
             },
             DeleteMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -772,10 +877,13 @@ mod tests {
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-        METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
     };
     use aruna_core::storage_entries::document_sync_revision_key;
-    use aruna_core::structs::{PlacementStrategy, RealmId, RealmNodeKind};
+    use aruna_core::structs::{
+        PersistentIdMapping, PersistentIdStatus, PlacementStrategy, RealmId, RealmNodeKind,
+        persistent_id_key,
+    };
 
     fn actor() -> aruna_core::structs::Actor {
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -855,6 +963,48 @@ mod tests {
         assert_eq!(event.event_id, outbox.outbox_id);
         assert_eq!(event.tombstone, tombstone);
         assert_eq!(event.deleted_after_event_id, record.last_event_id);
+    }
+
+    #[test]
+    fn delete_drops_index() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation = DeleteMetadataDocumentOperation::new(
+            actor.clone(),
+            record.group_id,
+            record.document_id,
+        );
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(txn_id);
+        operation.state = DeleteMetadataDocumentState::DeleteHolders;
+
+        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: ByteView::from(Vec::new()),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Delete {
+                key_space,
+                key,
+                txn_id: effect_txn,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected an updated-index delete, got {effects:?}");
+        };
+        assert_eq!(
+            key_space,
+            aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE
+        );
+        assert_eq!(
+            key.as_ref(),
+            aruna_core::storage_entries::updated_index_key(
+                record.updated_at_ms,
+                record.document_id
+            )
+            .as_ref()
+        );
+        assert_eq!(*effect_txn, Some(txn_id));
     }
 
     // Every record of a document rides the bucket its create stamped, so all
@@ -1148,6 +1298,101 @@ mod tests {
             operation.finalize(),
             Err(DeleteMetadataDocumentError::DocumentNotFound)
         );
+    }
+
+    // The PID tombstone is part of the delete, not a follow-up: a crash after the
+    // commit must not be able to leave a deleted document's mapping Active.
+    #[test]
+    // A delete without a minted pid writes no tombstone: the registry-row
+    // fence blocks later mints and the landing URL must stay a plain 404.
+    fn delete_skips_unminted() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation =
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(txn_id);
+        operation.state = DeleteMetadataDocumentState::WriteDeleteOutbox;
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: ByteView::from(record.document_id.to_bytes().to_vec()),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: Some(read_txn_id),
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a persistent id mapping read, got {effects:?}");
+        };
+        assert_eq!(key_space, PERSISTENT_ID_MAPPING_KEYSPACE);
+        assert_eq!(*read_txn_id, txn_id);
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(persistent_id_key(record.document_id)),
+            value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
+                if *commit_txn == txn_id
+        ));
+    }
+
+    #[test]
+    // A delete of a minted document withdraws the mapping in the same
+    // transaction that removes the registry row.
+    fn delete_withdraws_minted() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let minted = PersistentIdMapping::conceptual(
+            record.document_id,
+            actor.user_id,
+            aruna_core::structs::PersistentIdRevision {
+                event_id: Ulid::generate(),
+                actor: actor.node_id,
+                occurred_at_ms: 1,
+            },
+        );
+        let mut operation =
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(txn_id);
+        operation.state = DeleteMetadataDocumentState::ReadPidMapping;
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(persistent_id_key(record.document_id)),
+            value: Some(ByteView::from(minted.to_bytes().expect("mapping encodes"))),
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a persistent id withdrawal batch, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+        let mapping = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == PERSISTENT_ID_MAPPING_KEYSPACE)
+            .map(|(_, _, value)| PersistentIdMapping::from_bytes(value).expect("mapping decodes"))
+            .expect("the batch carries the mapping row");
+        assert_eq!(mapping.target, record.document_id);
+        assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
+                if *commit_txn == txn_id
+        ));
     }
 
     #[test]

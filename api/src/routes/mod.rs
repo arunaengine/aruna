@@ -16,13 +16,16 @@ pub mod info;
 pub mod jobs;
 pub mod metadata;
 pub mod notifications;
+pub mod oai;
 pub mod onboarding;
+pub mod pid;
 pub mod policies;
 pub mod rocrate_import;
 pub mod search;
 pub mod staging;
 pub mod storage_routing;
 pub mod sync;
+pub mod sync_quarantine;
 pub mod tes;
 pub mod tokens;
 pub mod users;
@@ -38,11 +41,14 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(group_backends::router())
         .merge(storage_routing::router())
         .merge(sync::router())
+        .merge(sync_quarantine::router())
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())
         .merge(jobs::router())
         .merge(metadata::router())
+        .merge(oai::router())
+        .merge(pid::router())
         .merge(rocrate_import::router())
         .merge(notifications::router())
         .merge(policies::router())

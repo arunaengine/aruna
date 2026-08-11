@@ -3,6 +3,7 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, Do
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
@@ -20,13 +21,15 @@ pub use aruna_core::storage_entries::{
     metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
     metadata_materialization_job_write_entry, metadata_materialization_status_key,
     metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
-    shard_manifest_write_entry,
+    shard_manifest_write_entry, updated_index_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
+
+use crate::driver::DriverContext;
 
 pub const LIST_METADATA_PAGE_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage
@@ -212,6 +215,11 @@ pub fn delete_holders_effect(
     })
 }
 
+// DEFERRED (#280 audit trail): these durable audit records back the generic audit
+// read endpoint (auth-security branch); the authoritative causal-event contract
+// (retained events, actor/cursor pagination) is the deferred remainder.
+// DEFERRED (#364 lineage, #293 historical replay): both are read/dashboard
+// projections over these audit and event-log records; not built (enhancements).
 pub fn write_audit_effect(
     record: &MetadataAuditRecord,
     audit_id: Ulid,
@@ -287,6 +295,7 @@ pub fn create_records_and_outbox_write_entries(
             metadata_registry_key(record.group_id, record.document_id),
             postcard::to_allocvec(&record.holder_node_ids)?.into(),
         ),
+        updated_index_entry(record),
         (
             METADATA_AUDIT_KEYSPACE.to_string(),
             metadata_audit_key(record.group_id, record.document_id, audit_id),
@@ -493,6 +502,37 @@ pub fn parse_registry_iter(
 
 pub fn empty_effects() -> Effects {
     smallvec![]
+}
+
+/// Untransacted batch delete of index keys in one keyspace, returning how many
+/// were dropped.
+pub async fn delete_index_keys(
+    context: &DriverContext,
+    keyspace: &str,
+    keys: Vec<Key>,
+) -> Result<usize, StorageReadError> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let count = keys.len();
+    let deletes = keys
+        .into_iter()
+        .map(|key| (keyspace.to_string(), key))
+        .collect();
+    let event = context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        }))
+        .await;
+    match event {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(count),
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(
+            aruna_core::errors::StorageError::WriteError,
+        )),
+    }
 }
 
 #[derive(Debug)]

@@ -179,7 +179,7 @@ pub fn blob_version_references_connector(version: &BlobVersion, connector_id: Ul
     )
 }
 
-fn parse_storage_read<T>(
+pub(crate) fn parse_storage_read<T>(
     event: Event,
     parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
 ) -> Result<Option<T>, StorageReadError> {

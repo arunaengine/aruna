@@ -73,6 +73,12 @@ pub enum SubmitJobError {
     ClockHealth(#[from] ClockHealthError),
     #[error("job placement unavailable: {0}")]
     PlacementUnavailable(String),
+    /// The routed authority no longer has the document the job is scoped to.
+    #[error("persistent id target document is absent")]
+    DocumentMissing,
+    /// The routed authority refused the caller's permission on the document.
+    #[error("persistent id submission is not authorized")]
+    AuthorityDenied,
     #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
     JobPlanConflict { existing_job_id: JobId },
     #[error("invalid workspace: {0}")]
@@ -201,8 +207,9 @@ impl SubmitJobOperation {
             return self.check_active(txn_id);
         };
         self.state = SubmitState::ReadDedup { txn_id };
-        // Must match the key `job_insert_entries` writes, owner prefix included, or the
-        // reservation read never finds the row it is meant to be reserving against.
+        // Must go through the same index-key builder `job_insert_entries` uses, which
+        // decides per key whether the owner prefixes it, or the reservation read never
+        // finds the row it is meant to be reserving against.
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
             key: job_dedup_index_key(self.record.created_by, &dedup_key),

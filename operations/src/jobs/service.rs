@@ -3,10 +3,11 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ArtifactRef, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE,
-    ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord, JobResultPayload, JobState,
-    RealmId, RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, WorkspaceMode,
-    shard_for_subject, user_dedup_key,
+    ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
+    FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
+    JobResultPayload, JobState, MintPersistentIdSpec, Permission, RealmId, RunCrateStatus,
+    StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key, shard_for_subject,
+    user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -16,6 +17,7 @@ use bytes::Bytes;
 use serde_json::Value as JsonValue;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::warn;
 
 use super::JOB_REPORT_MAX_ROWS;
@@ -32,8 +34,11 @@ use super::submit::{
 };
 use super::workflow::finalize_followups;
 use crate::driver::{DriverContext, drive};
+use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::repository::StorageReadError;
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::PolicyRequestExtras;
 
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
@@ -203,6 +208,76 @@ pub async fn submit_staging_job(
             now_ms: unix_timestamp_millis(),
             retention_ms,
             workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+        },
+        job_id,
+    )
+    .await
+}
+
+/// Register a w3id PID for a document as a fenced job on the document's PID
+/// authority. The dedup key names the document and is indexed without the
+/// submitting user, so a concurrent re-mint by another authorized user joins the
+/// same job; routing it to the one authority is what makes that hold across
+/// ingress nodes. The job record still carries the real requester.
+pub async fn submit_mint_pid(
+    context: &Arc<DriverContext>,
+    spec: MintPersistentIdSpec,
+    local_node_id: NodeId,
+    retention_ms: u64,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let (job_id, created) = crate::metadata::forward::submit_pid_routed(
+        context,
+        spec.document_id,
+        spec.minted_by,
+        local_node_id,
+        retention_ms,
+        auth_token,
+    )
+    .await
+    .map_err(pid_submit_error)?;
+    Ok(SubmitJobResult { job_id, created })
+}
+
+fn pid_submit_error(error: crate::metadata::api::MetadataApiError) -> SubmitJobError {
+    use crate::metadata::api::MetadataApiError;
+    match error {
+        MetadataApiError::NotFound => SubmitJobError::DocumentMissing,
+        MetadataApiError::Unauthorized | MetadataApiError::Forbidden => {
+            SubmitJobError::AuthorityDenied
+        }
+        error => SubmitJobError::PlacementUnavailable(error.to_string()),
+    }
+}
+
+/// The authority's own submission: mints the job id against this node's
+/// job-control binding, so the dedup row and the execution share one owner.
+pub(crate) async fn submit_mint_local(
+    context: &DriverContext,
+    spec: MintPersistentIdSpec,
+    owner_node_id: NodeId,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.minted_by;
+    let dedup_key = Some(pid_dedup_key(spec.document_id));
+    let job_id = mint_local_job(
+        context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::MintPersistentId(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
         },
         job_id,
@@ -457,12 +532,12 @@ pub struct RoutedJobStatus {
     pub run_crate: Option<JsonValue>,
 }
 
-async fn local_status(
+pub(crate) async fn local_status(
     context: &DriverContext,
-    user_id: UserId,
+    auth: &AuthContext,
     job_id: JobId,
 ) -> Result<RoutedJobStatus, JobRouteError> {
-    let record = read_owned_job(context, user_id, job_id)
+    let record = readable_job(context, auth, job_id)
         .await
         .map_err(JobRouteError::Internal)?
         .ok_or(JobRouteError::NotFound)?;
@@ -476,19 +551,73 @@ async fn local_status(
     })
 }
 
+/// The caller's own job, or the PID mint job it joined. A joined job is served as
+/// the caller's own — the record is rewritten onto the caller — so the handle the
+/// mint route returned is inspectable without disclosing the first submitter.
+async fn readable_job(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+) -> Result<Option<JobRecord>, String> {
+    if let Some(record) = read_owned_job(context, auth.user_id, job_id).await? {
+        return Ok(Some(record));
+    }
+    joined_pid_job(context, auth, job_id).await
+}
+
+/// A `MintPersistentId` job the caller did not submit is readable while the
+/// caller currently holds WRITE on the document it mints for, which is exactly
+/// the permission the mint route required to join it.
+async fn joined_pid_job(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+) -> Result<Option<JobRecord>, String> {
+    let Some(mut record) = read_job_record(&context.storage_handle, job_id, None).await? else {
+        return Ok(None);
+    };
+    let JobPayload::MintPersistentId(spec) = &record.payload else {
+        return Ok(None);
+    };
+    let Some(document) = load_metadata_record_by_document(context, spec.document_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+    else {
+        return Ok(None);
+    };
+    match authorize(
+        context,
+        auth.realm_id,
+        auth,
+        &document.permission_path,
+        &Permission::WRITE,
+        PolicyRequestExtras::rest(),
+    )
+    .await
+    {
+        Ok(()) => {
+            record.created_by = auth.user_id;
+            Ok(Some(record))
+        }
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => Ok(None),
+        Err(AuthorizeError::CheckFailed(error)) => Err(error),
+    }
+}
+
 pub async fn read_job_routed(
     context: &DriverContext,
-    user_id: UserId,
+    auth: &AuthContext,
     job_id: JobId,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<RoutedJobStatus, JobRouteError> {
+    let user_id = auth.user_id;
     let Some(net) = context.net_handle.as_ref() else {
-        return local_status(context, user_id, job_id).await;
+        return local_status(context, auth, job_id).await;
     };
     let request = auth_token.map(|auth_token| JobRequest::Status { auth_token, job_id });
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
     match drive(operation, context).await? {
-        JobRouteOutcome::Local => local_status(context, user_id, job_id).await,
+        JobRouteOutcome::Local => local_status(context, auth, job_id).await,
         JobRouteOutcome::Remote(response) => match response {
             JobResponse::Status { job, run_crate } if routed_job_matches(&job, user_id, job_id) => {
                 let run_crate = run_crate

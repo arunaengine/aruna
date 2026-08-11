@@ -30,6 +30,7 @@ impl ApiDoc {
         openapi.merge(crate::routes::group_backends::GroupBackendsApiDoc::openapi());
         openapi.merge(crate::routes::storage_routing::StorageRoutingApiDoc::openapi());
         openapi.merge(crate::routes::sync::SyncApiDoc::openapi());
+        openapi.merge(crate::routes::sync_quarantine::SyncQuarantineApiDoc::openapi());
         openapi.merge(crate::routes::metadata::MetadataApiDoc::openapi());
         openapi.merge(crate::routes::rocrate_import::RoCrateImportApiDoc::openapi());
         openapi.merge(crate::routes::credentials::CredentialsApiDoc::openapi());

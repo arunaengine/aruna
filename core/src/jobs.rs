@@ -23,6 +23,8 @@ pub enum JobKind {
     Staging,
     ImportRoCrate,
     ExportRoCrate,
+    Harvest,
+    MintPersistentId,
 }
 
 impl JobKind {
@@ -35,6 +37,8 @@ impl JobKind {
             Self::Staging => "staging",
             Self::ImportRoCrate => "import_rocrate",
             Self::ExportRoCrate => "export_rocrate",
+            Self::Harvest => "harvest",
+            Self::MintPersistentId => "mint_persistent_id",
         }
     }
 
@@ -57,6 +61,8 @@ impl From<&JobPayload> for JobKind {
             JobPayload::Staging(_) => Self::Staging,
             JobPayload::ImportRoCrate(_) => Self::ImportRoCrate,
             JobPayload::ExportRoCrate(_) => Self::ExportRoCrate,
+            JobPayload::Harvest(_) => Self::Harvest,
+            JobPayload::MintPersistentId(_) => Self::MintPersistentId,
         }
     }
 }

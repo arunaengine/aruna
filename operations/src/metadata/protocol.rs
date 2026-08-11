@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
-use aruna_core::structs::{MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
-use aruna_core::types::GroupId;
+use aruna_core::structs::{
+    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, SyncRelationship,
+};
+use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -211,6 +213,64 @@ pub enum MetadataTransportMessage {
     ForwardedTokenRevoked,
     ForwardedTokenRevocationCapacity,
     ForwardedMetadataHistoryCapacity,
+    /// A PID mapping transition or landing resolution routed to a document
+    /// holder, which is the mapping's authority. Appended last so the postcard
+    /// variant indices the frame classifier depends on stay stable.
+    ForwardPersistentId {
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        request: PersistentIdRequest,
+    },
+    ForwardedPersistentId {
+        result: Result<PersistentIdOutcome, MetadataReadError>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistentIdRequest {
+    Mint {
+        minted_by: UserId,
+        minted_at_ms: u64,
+    },
+    Withdraw {
+        withdrawn_at_ms: u64,
+    },
+    /// Queue the mint job on the authority, so one document has one dedup row and
+    /// one execution however many ingress nodes accept the request.
+    SubmitMint {
+        minted_by: UserId,
+        retention_ms: u64,
+    },
+    /// Unauthenticated landing resolution: the authority applies the same
+    /// per-record anonymous readability check a single-record OAI read applies.
+    Resolve,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistentIdOutcome {
+    Mapping {
+        mapping: Box<PersistentIdMapping>,
+        /// Whether this call performed the transition rather than observing one.
+        changed: bool,
+    },
+    Resolution(PersistentIdResolution),
+    /// The authority's mint job: its id is owned by the authority, and `created`
+    /// is false for a caller that joined the job another submitter opened.
+    Submission {
+        job_id: aruna_core::structs::JobId,
+        created: bool,
+    },
+}
+
+/// What a landing request resolves to. `Gone` outranks `Missing`: a withdrawn PID
+/// is a permanent tombstone even for a document that is not anonymously visible,
+/// which discloses only that a once-public PID is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistentIdResolution {
+    Redirect,
+    Gone { pid: String },
+    Missing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

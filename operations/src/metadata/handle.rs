@@ -1603,6 +1603,9 @@ impl MetadataHandle {
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 super::forward::apply_token_revoke(context, peer, forward).await
             }
+            forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
+                super::forward::apply_forwarded_pid(context, peer, forward).await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
@@ -1623,6 +1626,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedTokenRevoked
             | MetadataTransportMessage::ForwardedTokenRevocationCapacity
             | MetadataTransportMessage::ForwardedMetadataHistoryCapacity
+            | MetadataTransportMessage::ForwardedPersistentId { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4344,6 +4348,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedMetadataHistoryCapacity => {
             "forwarded_metadata_history_capacity"
         }
+        MetadataTransportMessage::ForwardPersistentId { .. } => "forward_persistent_id",
+        MetadataTransportMessage::ForwardedPersistentId { .. } => "forwarded_persistent_id",
     }
 }
 

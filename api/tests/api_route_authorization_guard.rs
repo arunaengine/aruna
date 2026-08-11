@@ -173,9 +173,26 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "self-scoped: counts only the caller's visible notifications",
     ),
     (
+        "oai.rs",
+        "handle_oai",
+        "public OAI-PMH provider by protocol; enumerates only the anonymous \
+         visibility index and re-checks anonymous metadata.read per record",
+    ),
+    (
+        "oai.rs",
+        "handle_oai_post",
+        "public OAI-PMH provider by protocol; same gate as the GET transport",
+    ),
+    (
         "onboarding.rs",
         "bootstrap_onboarding",
         "public enrollment gated by the onboarding secret and node proof",
+    ),
+    (
+        "pid.rs",
+        "resolve_pid",
+        "public w3id landing: the authority re-checks anonymous metadata.read per \
+         record and answers 302, 404, or a 410 tombstone",
     ),
     (
         "rocrate_import.rs",

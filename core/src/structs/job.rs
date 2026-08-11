@@ -10,7 +10,10 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
-use crate::structs::{AuthContext, BackendLocation, HiddenBlobKey, StagingStrategy};
+use crate::structs::{
+    AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentIdSpec,
+    StagingStrategy,
+};
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
@@ -586,6 +589,12 @@ pub enum JobPayload {
     Staging(StagingJobSpec),
     ImportRoCrate(ImportRoCrateSpec),
     ExportRoCrate(ExportRoCrateSpec),
+    /// One run of a repository harvest source. Idempotent by harvest provenance
+    /// keyed on `(namespace, source record id)`; safe to requeue.
+    Harvest(HarvestJobSpec),
+    /// Idempotent w3id persistent-identifier registration for a document.
+    /// Idempotency key is the document id; a re-mint returns the same PID.
+    MintPersistentId(MintPersistentIdSpec),
 }
 
 impl JobPayload {
@@ -599,6 +608,8 @@ impl JobPayload {
             JobPayload::ExportRoCrate(_) => "export_rocrate",
             JobPayload::WriteRunCrate { .. } => "write_run_crate",
             JobPayload::TerminalCleanup { .. } => "terminal_cleanup",
+            JobPayload::Harvest(_) => "harvest",
+            JobPayload::MintPersistentId(_) => "mint_persistent_id",
         }
     }
 
@@ -610,7 +621,10 @@ impl JobPayload {
             JobPayload::Staging(_)
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_) => "items",
-            JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. } => "steps",
+            JobPayload::Harvest(_) => "records",
+            JobPayload::MintPersistentId(_)
+            | JobPayload::WriteRunCrate { .. }
+            | JobPayload::TerminalCleanup { .. } => "steps",
         }
     }
 
@@ -622,6 +636,8 @@ impl JobPayload {
             | JobPayload::Staging(_)
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_)
+            | JobPayload::Harvest(_)
+            | JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
@@ -642,6 +658,13 @@ impl JobPayload {
         )
     }
 
+    /// Whether the dedup row is reclaimed when the job is pruned rather than when
+    /// it reaches a terminal state. Replaying the request while the job is still
+    /// retained must resolve to the same job identity and the same result.
+    pub fn dedup_until_prune(&self) -> bool {
+        self.is_rocrate() || matches!(self, JobPayload::MintPersistentId(_))
+    }
+
     pub fn rocrate_limits(&self) -> Option<&RoCrateLimits> {
         match self {
             JobPayload::ImportRoCrate(spec) => Some(&spec.limits),
@@ -659,6 +682,13 @@ impl JobPayload {
                 let mut spec = spec.clone();
                 spec.document_id = Ulid::nil();
                 postcard::to_allocvec(&JobPayload::ImportRoCrate(spec))
+            }
+            // Idempotency is the document id alone: a re-mint by a different user
+            // must match, not conflict, so the minter is excluded from the digest.
+            JobPayload::MintPersistentId(spec) => {
+                let mut spec = spec.clone();
+                spec.minted_by = UserId::default();
+                postcard::to_allocvec(&JobPayload::MintPersistentId(spec))
             }
             _ => postcard::to_allocvec(self),
         }
@@ -766,6 +796,16 @@ pub enum JobResultPayload {
     },
     ImportRoCrate(ImportRoCrateResult),
     ExportRoCrate(ExportRoCrateResult),
+    Harvest {
+        minted: u64,
+        updated: u64,
+        tombstoned: u64,
+        skipped: u64,
+    },
+    PersistentId {
+        pid: String,
+        newly_minted: bool,
+    },
 }
 
 impl JobResultPayload {
@@ -778,6 +818,8 @@ impl JobResultPayload {
             JobResultPayload::Staging { .. } => "staging",
             JobResultPayload::ImportRoCrate(_) => "import_rocrate",
             JobResultPayload::ExportRoCrate(_) => "export_rocrate",
+            JobResultPayload::Harvest { .. } => "harvest",
+            JobResultPayload::PersistentId { .. } => "persistent_id",
         }
     }
 
@@ -843,6 +885,21 @@ impl JobResultPayload {
                     "unsupported": result.omitted.unsupported,
                 },
                 "report_digest": hex::encode(result.report_digest),
+            }),
+            JobResultPayload::Harvest {
+                minted,
+                updated,
+                tombstoned,
+                skipped,
+            } => serde_json::json!({
+                "minted": minted,
+                "updated": updated,
+                "tombstoned": tombstoned,
+                "skipped": skipped,
+            }),
+            JobResultPayload::PersistentId { pid, newly_minted } => serde_json::json!({
+                "pid": pid,
+                "newly_minted": newly_minted,
             }),
         }
     }
@@ -1226,6 +1283,22 @@ pub fn workspace_credential_id(job_id: JobId) -> String {
     format!("ws{job_id}")
 }
 
+/// Marker of a dedup key whose scope is the subject it names rather than the
+/// submitting user. `job_dedup_index_key` leaves these unprefixed, so two users
+/// asking for the same thing join one job identity. `user_dedup_key` always
+/// namespaces under `user/`, so a caller can never reach this subspace.
+pub const GLOBAL_DEDUP_PREFIX: &[u8] = b"global/";
+
+/// Dedup key of a PID mint: the document alone, so a concurrent mint by another
+/// user joins the same job rather than creating a second one.
+pub fn pid_dedup_key(document_id: Ulid) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(GLOBAL_DEDUP_PREFIX.len() + 4 + 16);
+    bytes.extend_from_slice(GLOBAL_DEDUP_PREFIX);
+    bytes.extend_from_slice(b"pid/");
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes
+}
+
 /// Dedup key of a user-supplied idempotency key: namespaced under `user/` and
 /// scoped to the submitting user (fixed-width id), so a caller can neither
 /// suppress an internal obligation nor squat another user's key.
@@ -1368,6 +1441,20 @@ mod tests {
 
     fn user(realm: u8, byte: u8) -> UserId {
         UserId::new(Ulid::from_bytes([byte; 16]), RealmId([realm; 32]))
+    }
+
+    #[test]
+    fn digest_ignores_minter() {
+        let document_id = Ulid::from_bytes([1; 16]);
+        let first = JobPayload::MintPersistentId(MintPersistentIdSpec {
+            document_id,
+            minted_by: user(1, 2),
+        });
+        let second = JobPayload::MintPersistentId(MintPersistentIdSpec {
+            document_id,
+            minted_by: user(3, 4),
+        });
+        assert_eq!(first.plan_digest(), second.plan_digest());
     }
 
     fn probe_record(job_id: JobId, created_at_ms: u64) -> JobRecord {

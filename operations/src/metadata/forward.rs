@@ -7,13 +7,16 @@ use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
+use aruna_core::keyspaces::{
+    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+};
 use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
 use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
-    RealmId, RealmNodeKind,
+    Actor, AuthContext, JobId, MetadataRegistryRecord, MintPersistentIdSpec, Permission,
+    PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
 };
+use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
 use futures_util::StreamExt;
@@ -42,6 +45,7 @@ use crate::metadata::handle::{
 };
 use crate::metadata::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
+    PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
 };
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{
@@ -765,15 +769,22 @@ pub async fn delete_metadata_document_routed(
             "metadata document has no active frozen holder with history capacity".to_string(),
         ));
     }
+    let authority = pid_authority_node(&config, actor.realm_id, document_id).ok_or_else(|| {
+        MetadataWriteError::Undeliverable("persistent id authority is unavailable".to_string())
+    })?;
     let local_holds = holders.contains(&local_node_id);
-    if local_holds && let Some(record) = record {
-        return delete_metadata_document(
+    if local_node_id == authority
+        && local_holds
+        && let Some(record) = record
+    {
+        delete_metadata_document(
             DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
             context.as_ref(),
             document_id,
         )
         .await
-        .map_err(Into::into);
+        .map_err(MetadataWriteError::from)?;
+        return Ok(());
     }
     let response = forward_to_holders(
         context,
@@ -783,7 +794,7 @@ pub async fn delete_metadata_document_routed(
             config_digest,
             document_id,
         },
-        local_holds.then_some(local_node_id),
+        (local_holds && record.is_none()).then_some(local_node_id),
         false,
     )
     .await?;
@@ -1096,6 +1107,9 @@ pub(crate) async fn apply_forwarded_write(
                         return MetadataTransportMessage::ForwardedWriteUnavailable;
                     }
                 };
+            if pid_authority_node(&config, realm_id, document_id) != Some(net_handle.node_id()) {
+                return MetadataTransportMessage::ForwardedWriteUnavailable;
+            }
             if let Err(error) =
                 authorize_write(context, auth.clone(), record.permission_path.clone()).await
             {
@@ -1119,6 +1133,487 @@ pub(crate) async fn apply_forwarded_write(
             "unexpected forwarded metadata message: {}",
             super::handle::transport_message_kind(&other)
         )),
+    }
+}
+
+/// The one node that owns a document's PID state: the rank-0 current holder of
+/// the placement derived from the structured id, never from the registry row,
+/// which a delete removes while the mapping must survive to serve a permanent
+/// 410. Every node derives the same node from the same replicated config, so
+/// transitions and landing answers have a single source and cannot disagree.
+pub(crate) fn pid_authority_node(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> Option<NodeId> {
+    let placement = resolve_metadata_id(config, realm_id, None, document_id).ok()?;
+    resolve_shard_holders(config, &placement).first().copied()
+}
+
+async fn pid_authority(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> Result<(RealmConfigDocument, NodeId), MetadataApiError> {
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let authority = pid_authority_node(&config, realm_id, document_id)
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    Ok((config, authority))
+}
+
+fn is_local_node(context: &Arc<DriverContext>, node_id: NodeId) -> bool {
+    context
+        .net_handle
+        .as_ref()
+        .is_some_and(|net| net.node_id() == node_id)
+}
+
+/// Mint through the document's authority. Every other node forwards; none mints
+/// into its own store, so one document has exactly one mapping row lineage.
+pub async fn mint_pid_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+    minted_by: UserId,
+    minted_at_ms: u64,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<(PersistentIdMapping, bool), MetadataApiError> {
+    if context.net_handle.is_none() {
+        return crate::persistent_id::mint_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            minted_by,
+            minted_at_ms,
+        )
+        .await
+        .map_err(pid_error);
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return crate::persistent_id::mint_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            minted_by,
+            minted_at_ms,
+        )
+        .await
+        .map_err(pid_error);
+    }
+    let outcome = forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::Mint {
+            minted_by,
+            minted_at_ms,
+        },
+        auth_token,
+    )
+    .await?;
+    match outcome {
+        PersistentIdOutcome::Mapping { mapping, changed } => Ok((*mapping, changed)),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+/// Queue the PID mint job on the document's authority. The job store is
+/// node-local, so a document-scoped dedup row only deduplicates when one node
+/// owns it; alternating ingress nodes would otherwise open a job each.
+pub async fn submit_pid_routed(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    minted_by: UserId,
+    local_node_id: NodeId,
+    retention_ms: u64,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<(JobId, bool), MetadataApiError> {
+    let realm_id = minted_by.realm_id;
+    if context.net_handle.is_none() {
+        return submit_pid_local(context, document_id, minted_by, local_node_id, retention_ms)
+            .await;
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return submit_pid_local(context, document_id, minted_by, authority, retention_ms).await;
+    }
+    let outcome = forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::SubmitMint {
+            minted_by,
+            retention_ms,
+        },
+        auth_token,
+    )
+    .await?;
+    match outcome {
+        PersistentIdOutcome::Submission { job_id, created } => Ok((job_id, created)),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+async fn submit_pid_local(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    minted_by: UserId,
+    owner_node_id: NodeId,
+    retention_ms: u64,
+) -> Result<(JobId, bool), MetadataApiError> {
+    crate::jobs::service::submit_mint_local(
+        context.as_ref(),
+        MintPersistentIdSpec {
+            document_id,
+            minted_by,
+        },
+        owner_node_id,
+        retention_ms,
+    )
+    .await
+    .map(|result| (result.job_id, result.created))
+    .map_err(|error| MetadataApiError::Internal(error.to_string()))
+}
+
+/// Explicit withdrawal through the document's authority.
+pub async fn withdraw_pid_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+    withdrawn_at_ms: u64,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<PersistentIdMapping, MetadataApiError> {
+    if context.net_handle.is_none() {
+        return crate::persistent_id::withdraw_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            withdrawn_at_ms,
+        )
+        .await
+        .map(|(mapping, _)| mapping)
+        .map_err(pid_error);
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return crate::persistent_id::withdraw_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            withdrawn_at_ms,
+        )
+        .await
+        .map(|(mapping, _)| mapping)
+        .map_err(pid_error);
+    }
+    let outcome = forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::Withdraw { withdrawn_at_ms },
+        auth_token,
+    )
+    .await?;
+    match outcome {
+        PersistentIdOutcome::Mapping { mapping, .. } => Ok(*mapping),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+/// Resolve a landing request on the document's authority. Only that node answers:
+/// a replica's mapping row carries no version an outsider can compare, so folding
+/// several answers can promote a stale redirect over an up-to-date denial or a
+/// premature mapping over a live document. Every other node returns the
+/// authority's answer or service unavailable, never a local one.
+pub async fn resolve_pid_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> Result<PersistentIdResolution, MetadataApiError> {
+    if context.net_handle.is_none() {
+        return local_pid_resolution(context, realm_id, document_id).await;
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return local_pid_resolution(context, realm_id, document_id).await;
+    }
+    let outcome = forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::Resolve,
+        None,
+    )
+    .await?;
+    match outcome {
+        PersistentIdOutcome::Resolution(resolution) => Ok(resolution),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+/// The authority's own answer: a withdrawn mapping is a permanent 410 whatever
+/// the document's visibility, an active one redirects only while the document is
+/// anonymously readable, and everything else is indistinguishable from unminted.
+async fn local_pid_resolution(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> Result<PersistentIdResolution, MetadataApiError> {
+    let mapping = crate::persistent_id::read_mapping(context.as_ref(), document_id)
+        .await
+        .map_err(pid_error)?;
+    let Some(mapping) = mapping else {
+        return Ok(PersistentIdResolution::Missing);
+    };
+    if !mapping.is_active() {
+        return Ok(PersistentIdResolution::Gone { pid: mapping.pid });
+    }
+    let record = load_metadata_record_by_document(context.as_ref(), document_id)
+        .await
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    // An active mapping without a registry row is a permanent 410 only once this
+    // node has evidence the document was created here and is gone. An unprojected
+    // create looks identical, and answering Gone for it would kill a live PID.
+    let Some(record) = record else {
+        return if document_deleted_here(context, document_id).await? {
+            Ok(PersistentIdResolution::Gone { pid: mapping.pid })
+        } else {
+            Err(MetadataApiError::ServiceUnavailable)
+        };
+    };
+    if crate::metadata::api::can_read_record(context.as_ref(), realm_id, None, &record).await? {
+        Ok(PersistentIdResolution::Redirect)
+    } else {
+        Ok(PersistentIdResolution::Missing)
+    }
+}
+
+async fn forward_pid(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+    authority: NodeId,
+    document_id: Ulid,
+    request: PersistentIdRequest,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<PersistentIdOutcome, MetadataApiError> {
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let response = forward_to_holders(
+        context,
+        &[authority],
+        MetadataTransportMessage::ForwardPersistentId {
+            auth_token,
+            config_digest,
+            document_id,
+            request,
+        },
+        None,
+        false,
+    )
+    .await
+    .map_err(write_error)?;
+    match response {
+        MetadataTransportMessage::ForwardedPersistentId {
+            result: Ok(outcome),
+        } => Ok(outcome),
+        MetadataTransportMessage::ForwardedPersistentId { result: Err(error) } => {
+            Err(match error {
+                MetadataReadError::Unauthorized => MetadataApiError::Unauthorized,
+                MetadataReadError::Forbidden => MetadataApiError::Forbidden,
+                MetadataReadError::NotFound => MetadataApiError::NotFound,
+                MetadataReadError::Unavailable => MetadataApiError::ServiceUnavailable,
+            })
+        }
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+/// Applies a PID transition or landing resolution on the authority.
+pub(crate) async fn apply_forwarded_pid(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::ForwardPersistentId {
+        auth_token,
+        config_digest,
+        document_id,
+        request,
+    } = message
+    else {
+        return reject("unexpected forwarded persistent id message");
+    };
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let realm_id = *net_handle.realm_id();
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    if config.digest().ok() != Some(config_digest) {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    }
+    if pid_authority_node(&config, realm_id, document_id) != Some(net_handle.node_id()) {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    }
+    if let PersistentIdRequest::Resolve = request {
+        let result = local_pid_resolution(context, realm_id, document_id)
+            .await
+            .map(PersistentIdOutcome::Resolution)
+            .map_err(read_error);
+        return MetadataTransportMessage::ForwardedPersistentId { result };
+    }
+
+    // Transitions carry the caller's authority: forwarding is a routing hop, so
+    // the holder re-runs the WRITE check the origin's handler ran.
+    let auth = match authorize_forwarded_pid(context, peer, realm_id, auth_token).await {
+        Ok(auth) => auth,
+        Err(error) => return forward_auth_error(error),
+    };
+    // The minting subject is the token's own subject: a routing hop may not
+    // attribute a mint to a user it merely relays for.
+    let minting_subject = match &request {
+        PersistentIdRequest::Mint { minted_by, .. }
+        | PersistentIdRequest::SubmitMint { minted_by, .. } => Some(*minted_by),
+        _ => None,
+    };
+    if minting_subject.is_some_and(|minted_by| minted_by != auth.user_id) {
+        return forward_auth_error(ForwardAuthError::Forbidden);
+    }
+    let record = match existing_record(context, document_id).await {
+        Ok(Some(record)) => Some(record),
+        Ok(None) => None,
+        Err(error) => return reject(error),
+    };
+    match (&request, record.as_ref()) {
+        (_, Some(record)) => {
+            if let Err(error) =
+                authorize_write(context, auth.clone(), record.permission_path.clone()).await
+            {
+                return forward_auth_error(error);
+            }
+        }
+        // Without a registry row there is no permission path to check, so no
+        // transition is authorized: bare realm membership must never tombstone an
+        // arbitrary document id, and a withdrawal that outlived its own document
+        // was already written by the delete that removed it.
+        (_, None) => return MetadataTransportMessage::ForwardedWriteNotFound,
+    }
+
+    let outcome = match request {
+        PersistentIdRequest::Mint {
+            minted_by,
+            minted_at_ms,
+        } => crate::persistent_id::mint_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            minted_by,
+            minted_at_ms,
+        )
+        .await
+        .map(|(mapping, changed)| PersistentIdOutcome::Mapping {
+            mapping: Box::new(mapping),
+            changed,
+        }),
+        PersistentIdRequest::Withdraw { withdrawn_at_ms } => {
+            crate::persistent_id::withdraw_persistent_id(
+                context.as_ref(),
+                realm_id,
+                document_id,
+                withdrawn_at_ms,
+            )
+            .await
+            .map(|(mapping, changed)| PersistentIdOutcome::Mapping {
+                mapping: Box::new(mapping),
+                changed,
+            })
+        }
+        PersistentIdRequest::SubmitMint {
+            minted_by,
+            retention_ms,
+        } => {
+            return match submit_pid_local(
+                context,
+                document_id,
+                minted_by,
+                net_handle.node_id(),
+                retention_ms,
+            )
+            .await
+            {
+                Ok((job_id, created)) => MetadataTransportMessage::ForwardedPersistentId {
+                    result: Ok(PersistentIdOutcome::Submission { job_id, created }),
+                },
+                Err(error) => {
+                    warn!(%document_id, ?error, "Forwarded persistent id job submission failed");
+                    MetadataTransportMessage::ForwardedWriteUnavailable
+                }
+            };
+        }
+        PersistentIdRequest::Resolve => unreachable!("resolve returned above"),
+    };
+    match outcome {
+        Ok(outcome) => MetadataTransportMessage::ForwardedPersistentId {
+            result: Ok(outcome),
+        },
+        Err(crate::persistent_id::PersistentIdError::DocumentMissing) => {
+            MetadataTransportMessage::ForwardedWriteNotFound
+        }
+        Err(error) => {
+            warn!(%document_id, ?error, "Forwarded persistent id transition failed");
+            MetadataTransportMessage::ForwardedWriteUnavailable
+        }
+    }
+}
+
+async fn authorize_forwarded_pid(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    realm_id: RealmId,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<AuthContext, ForwardAuthError> {
+    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+        return Err(ForwardAuthError::Unavailable(
+            "forwarded persistent id transition needs a metadata handle".to_string(),
+        ));
+    };
+    let auth = metadata_handle
+        .authorize_write_peer(peer, auth_token)
+        .await
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => ForwardAuthError::Unauthorized,
+            MetadataWritePeerError::Unavailable(error) => {
+                ForwardAuthError::Unavailable(error.to_string())
+            }
+        })?;
+    if auth.realm_id != realm_id {
+        return Err(ForwardAuthError::Forbidden);
+    }
+    Ok(auth)
+}
+
+fn pid_error(error: crate::persistent_id::PersistentIdError) -> MetadataApiError {
+    match error {
+        crate::persistent_id::PersistentIdError::DocumentMissing => MetadataApiError::NotFound,
+        error => MetadataApiError::Internal(error.to_string()),
+    }
+}
+
+fn write_error(error: MetadataWriteError) -> MetadataApiError {
+    match error {
+        MetadataWriteError::Unauthorized => MetadataApiError::Unauthorized,
+        MetadataWriteError::Forbidden => MetadataApiError::Forbidden,
+        MetadataWriteError::NotFound => MetadataApiError::NotFound,
+        _ => MetadataApiError::ServiceUnavailable,
     }
 }
 
@@ -1354,6 +1849,45 @@ async fn accepted_create(
     }
 }
 
+/// Whether this node has evidence that the document was created here and is now
+/// gone, rather than a create whose registry projection has not landed yet. The
+/// create acceptance survives the delete; a queued projection means the row is
+/// still on its way and no terminal answer may be derived from its absence.
+async fn document_deleted_here(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<bool, MetadataApiError> {
+    if projection_queued(context, document_id).await? {
+        return Ok(false);
+    }
+    accepted_create(context, document_id)
+        .await
+        .map(|accepted| accepted.is_some())
+        .map_err(|_| MetadataApiError::ServiceUnavailable)
+}
+
+/// Whether a committed metadata event for this document is still waiting to be
+/// projected into this node's registry.
+pub(crate) async fn projection_queued(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<bool, MetadataApiError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: Some(byteview::ByteView::from(document_id.to_bytes().to_vec())),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
 /// The document's registry record, whatever this node's holdership of it.
 async fn existing_record(
     context: &Arc<DriverContext>,
@@ -1384,10 +1918,26 @@ async fn held_record(
             placement.strategy_id, placement.shard
         )));
     }
-    let record = existing_record(context, document_id)
+    let record = match existing_record(context, document_id)
         .await
         .map_err(HeldRecordError::Unavailable)?
-        .ok_or(HeldRecordError::NotFound)?;
+    {
+        Some(record) => record,
+        // An empty registry read is not absence while this node still owes the
+        // projection of a committed create: reporting not-found would let a caller
+        // that polls every holder conclude the document never existed.
+        None => {
+            return Err(match projection_queued(context, document_id).await {
+                Ok(true) => HeldRecordError::Unavailable(format!(
+                    "metadata document `{document_id}` has a queued registry projection"
+                )),
+                Ok(false) => HeldRecordError::NotFound,
+                Err(_) => HeldRecordError::Unavailable(
+                    "pending metadata projection scan is unavailable".to_string(),
+                ),
+            });
+        }
+    };
     if !routed_record_matches(config, config.realm_id, document_id, &placement, &record) {
         return Err(HeldRecordError::Unavailable(
             "metadata registry record does not match its structured placement".to_string(),
@@ -1497,6 +2047,7 @@ async fn forward_to_holders(
         &message,
         MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
+            | MetadataTransportMessage::ForwardPersistentId { .. }
     );
 
     let mut failures: Vec<String> = Vec::new();

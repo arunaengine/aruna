@@ -47,8 +47,8 @@ use aruna_operations::metadata::api::{
     query_metadata_document,
 };
 use aruna_operations::metadata::forward::{
-    create_metadata_document_routed, delete_metadata_document_routed, export_rocrate_routed,
-    origin_holds_document, update_metadata_document_routed,
+    MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
+    export_rocrate_routed, origin_holds_document, update_metadata_document_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::sync_placement::sort_node_ids;
@@ -136,7 +136,7 @@ async fn owner_read_routes() -> TestResult<()> {
     let bystander = realm.node(1);
     let routed = read_job_routed(
         bystander.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         submitted.job_id,
         Some(realm.bearer_token()),
     )
@@ -508,7 +508,7 @@ async fn owner_down_unavailable() -> TestResult<()> {
 
     let status = read_job_routed(
         probe.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         submitted.job_id,
         Some(realm.bearer_token()),
     )
@@ -571,7 +571,7 @@ async fn owner_answers_absence() -> TestResult<()> {
 
     let routed = read_job_routed(
         bystander.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         missing,
         Some(realm.bearer_token()),
     )
@@ -585,7 +585,7 @@ async fn owner_answers_absence() -> TestResult<()> {
     let unresolved = mint_job_id(unbound, BucketId::new(0)?)?;
     let routed = read_job_routed(
         bystander.context.as_ref(),
-        realm.user_id,
+        &realm.auth_context(),
         unresolved,
         Some(realm.bearer_token()),
     )
@@ -799,17 +799,11 @@ async fn bystander_writes_forward() -> TestResult<()> {
         .await?
     );
 
-    update_metadata_document_routed(
-        &bystander.context,
-        realm.actor(bystander),
-        None,
+    update_routed(
+        bystander,
+        &realm,
         document_id,
-        None,
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
-            jsonld: r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#
-                .to_string(),
-        },
-        Some(realm.bearer_token()),
+        r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#,
     )
     .await?;
 
@@ -837,11 +831,15 @@ async fn bystander_writes_forward() -> TestResult<()> {
     );
 
     let stale = realm.find(holders[0]);
+    let stale_record = load_metadata_record_by_document(stale.context.as_ref(), document_id)
+        .await
+        .map_err(|error| format!("registry read failed: {error:?}"))?
+        .ok_or("the holder must carry the registry row")?;
     let deleted = stale
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::BatchDelete {
-            deletes: metadata_registry_delete_entries(group_id, document_id),
+            deletes: metadata_registry_delete_entries(&stale_record),
             txn_id: None,
         })
         .await;
@@ -851,17 +849,11 @@ async fn bystander_writes_forward() -> TestResult<()> {
     ));
     assert!(!registry_row_present(stale, document_id).await);
 
-    update_metadata_document_routed(
-        &stale.context,
-        realm.actor(stale),
-        None,
+    update_routed(
+        stale,
+        &realm,
         document_id,
-        None,
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
-            jsonld: r#"{"@id":"./stale-holder.txt","@type":"File","name":"stale-holder.txt"}"#
-                .to_string(),
-        },
-        Some(realm.bearer_token()),
+        r#"{"@id":"./stale-holder.txt","@type":"File","name":"stale-holder.txt"}"#,
     )
     .await?;
     let healthy = realm.find(holders[1]);
@@ -875,14 +867,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
     })
     .await?;
 
-    delete_metadata_document_routed(
-        &bystander.context,
-        realm.actor(bystander),
-        None,
-        document_id,
-        Some(realm.bearer_token()),
-    )
-    .await?;
+    delete_routed(bystander, &realm, document_id).await?;
 
     for holder in &holders {
         let node = realm.find(*holder);
@@ -1110,6 +1095,77 @@ async fn export_routed(
     Ok(export
         .into_inner()
         .ok_or("the routed export produced no result")?)
+}
+
+/// A routed update, re-run while every holder reports its placement view
+/// unavailable: forwarded writes fail closed while config replication or a
+/// pending registry projection lags, which a starved machine stretches past
+/// one attempt.
+async fn update_routed(
+    node: &TestNode,
+    realm: &Topology,
+    document_id: Ulid,
+    jsonld: &str,
+) -> TestResult<()> {
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed update reached a holder",
+        || async {
+            match update_metadata_document_routed(
+                &node.context,
+                realm.actor(node),
+                None,
+                document_id,
+                None,
+                UpdateMetadataDocumentMutation::UpsertDataEntity {
+                    jsonld: jsonld.to_string(),
+                },
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataWriteError::Undeliverable(reason))
+                    if reason.contains("placement view is unavailable") =>
+                {
+                    Ok(1)
+                }
+                other => {
+                    other?;
+                    Ok(0)
+                }
+            }
+        },
+    )
+    .await
+}
+
+/// The delete twin of [`update_routed`]; deletes additionally require the pid
+/// authority's converged view, so the window is wider.
+async fn delete_routed(node: &TestNode, realm: &Topology, document_id: Ulid) -> TestResult<()> {
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed delete reached a holder",
+        || async {
+            match delete_metadata_document_routed(
+                &node.context,
+                realm.actor(node),
+                None,
+                document_id,
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataWriteError::Undeliverable(reason))
+                    if reason.contains("placement view is unavailable") =>
+                {
+                    Ok(1)
+                }
+                other => {
+                    other?;
+                    Ok(0)
+                }
+            }
+        },
+    )
+    .await
 }
 
 fn document_config(

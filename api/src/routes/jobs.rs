@@ -703,14 +703,9 @@ pub async fn get_job(
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
-    let routed = read_job_routed(
-        &state.get_ctx(),
-        auth.user_id,
-        job_id,
-        forwarded_job_auth(bearer)?,
-    )
-    .await
-    .map_err(map_job_route)?;
+    let routed = read_job_routed(&state.get_ctx(), &auth, job_id, forwarded_job_auth(bearer)?)
+        .await
+        .map_err(map_job_route)?;
     let mut response = job_view_response(&routed.job);
     response.run_crate = routed.run_crate;
     Ok((StatusCode::OK, Json(response)))

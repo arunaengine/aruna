@@ -9,14 +9,14 @@ use aruna_core::keyspaces::{
     STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
-    AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
-    JobProgress, JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
-    UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id,
-    encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key, job_entry_prefix,
-    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
-    job_prune_index_key, job_record_key, job_run_crate_key, parse_entry_key, parse_job_dedup_value,
-    parse_job_owner_index_key, rocrate_plan_key, run_crate_dedup_key, validate_transition,
-    workspace_credential_id,
+    AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobExecutionClass,
+    JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, JobTransitionError,
+    RunCrateStatus, UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
+    crate_job_id, encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key,
+    job_entry_prefix, job_lease_index_key, job_owner_cursor, job_owner_index_key,
+    job_owner_index_prefix, job_prune_index_key, job_record_key, job_run_crate_key,
+    parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key,
+    run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -91,7 +91,14 @@ fn job_schedule_key(record: &JobRecord) -> Key {
     }
 }
 
+/// Dedup index path. A user-scoped key is prefixed with the submitting user so a
+/// caller cannot squat another's idempotency key; a `global/` key names its own
+/// subject and stays unprefixed, so concurrent submissions by different users
+/// resolve to one job identity.
 pub(super) fn job_dedup_index_key(created_by: UserId, dedup_key: &[u8]) -> Key {
+    if dedup_key.starts_with(GLOBAL_DEDUP_PREFIX) {
+        return ByteView::from(dedup_key.to_vec());
+    }
     let mut key = created_by.to_storage_key();
     key.extend_from_slice(dedup_key);
     ByteView::from(key)
@@ -176,12 +183,14 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             JOB_ACTIVE_USER_KEYSPACE.to_string(),
             job_active_key(record.created_by, record.job_id),
         ));
-        if let Some(dedup_key) = &record.dedup_key {
-            deletes.push((
-                JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-                job_dedup_index_key(record.created_by, dedup_key),
-            ));
-        }
+    }
+    if record.payload.dedup_until_prune()
+        && let Some(dedup_key) = &record.dedup_key
+    {
+        deletes.push((
+            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            job_dedup_index_key(record.created_by, dedup_key),
+        ));
     }
     // Epochs are handed out from 1; every used epoch left a control row.
     for epoch in 1..record.next_attempt_epoch {
@@ -659,7 +668,7 @@ async fn cleanup_dedup_entry(
     let Some(dedup_key) = &old.dedup_key else {
         return Ok(());
     };
-    if old.payload.is_rocrate() || old.state.is_terminal() || !new.state.is_terminal() {
+    if old.payload.dedup_until_prune() || old.state.is_terminal() || !new.state.is_terminal() {
         return Ok(());
     }
     let key = job_dedup_index_key(old.created_by, dedup_key);
@@ -2133,8 +2142,9 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
         ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId,
-        ReasonCode, RoCrateLimits, parse_job_schedule_index_key,
+        ImportRoCrateSpec, ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload,
+        MintPersistentIdSpec, RealmId, ReasonCode, RoCrateLimits, parse_job_schedule_index_key,
+        pid_dedup_key,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
@@ -2353,6 +2363,57 @@ mod tests {
             JOB_DEDUP_INDEX_KEYSPACE.to_string(),
             job_dedup_index_key(record.created_by, b"import"),
         )));
+    }
+
+    fn pid_record(job_id: JobId, minted_by: UserId) -> JobRecord {
+        let document_id = Ulid::from_bytes([0x99u8; 16]);
+        JobRecord::new(
+            job_id,
+            JobPayload::MintPersistentId(MintPersistentIdSpec {
+                document_id,
+                minted_by,
+            }),
+            minted_by,
+            node_id(7),
+            1_000,
+            1_000,
+            Some(pid_dedup_key(document_id)),
+        )
+    }
+
+    #[test]
+    fn dedup_index_global() {
+        let realm = RealmId([1u8; 32]);
+        let first = UserId::new(Ulid::from_bytes([2u8; 16]), realm);
+        let second = UserId::new(Ulid::from_bytes([3u8; 16]), realm);
+        let document_id = Ulid::from_bytes([0x99u8; 16]);
+
+        assert_eq!(
+            job_dedup_index_key(first, &pid_dedup_key(document_id)),
+            job_dedup_index_key(second, &pid_dedup_key(document_id)),
+        );
+        assert_ne!(
+            job_dedup_index_key(first, b"user/local"),
+            job_dedup_index_key(second, b"user/local"),
+        );
+    }
+
+    #[test]
+    fn prune_reclaims_pid() {
+        let minted_by = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let record = pid_record(JobId::from_bytes([0x58; 16]), minted_by);
+        let dedup_key = record
+            .dedup_key
+            .clone()
+            .expect("pid jobs carry a dedup key");
+
+        let deletes = job_prune_delete_entries(&record);
+
+        assert!(deletes.contains(&(
+            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            job_dedup_index_key(record.created_by, &dedup_key),
+        )));
+        assert!(record.payload.dedup_until_prune());
     }
 
     #[test]

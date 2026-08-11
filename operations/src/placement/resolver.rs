@@ -207,7 +207,8 @@ pub fn document_class(target: &DocumentSyncTarget) -> DocumentClass {
         DocumentSyncTarget::MetadataRegistry { .. } => DocumentClass::MetadataRegistry,
         DocumentSyncTarget::MetadataCreateEvent { .. }
         | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
-        | DocumentSyncTarget::MetadataGraphLifecycle { .. } => DocumentClass::Metadata,
+        | DocumentSyncTarget::MetadataGraphLifecycle { .. }
+        | DocumentSyncTarget::PersistentIdMapping { .. } => DocumentClass::Metadata,
         DocumentSyncTarget::RealmAuthorization { .. }
         | DocumentSyncTarget::RealmConfig { .. }
         | DocumentSyncTarget::NodeUsage { .. }
@@ -227,7 +228,8 @@ pub fn subject_bytes(target: &DocumentSyncTarget) -> Vec<u8> {
         DocumentSyncTarget::User { user_id } => user_id.to_bytes(),
         DocumentSyncTarget::MetadataRegistry { document_id, .. }
         | DocumentSyncTarget::MetadataCreateEvent { document_id, .. }
-        | DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
+        | DocumentSyncTarget::MetadataDocumentLifecycle { document_id }
+        | DocumentSyncTarget::PersistentIdMapping { document_id } => {
             document_id.to_bytes().to_vec()
         }
         DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => graph_iri.as_bytes().to_vec(),

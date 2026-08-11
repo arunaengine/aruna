@@ -341,6 +341,15 @@ impl BlobHandle {
         self.handler.registry.routing()
     }
 
+    /// SSRF-screened plain-HTTP GET builder for non-opendal fetches, such as an
+    /// OAI-PMH verb request against an attacker-influenceable repository URL.
+    pub fn egress_request(
+        &self,
+        url: reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, aruna_core::egress::EgressError> {
+        self.handler.egress.request(url)
+    }
+
     /// Holds every tenant backend an effect names for as long as the guard
     /// lives. The driver keeps it for the whole operation, so the metadata
     /// transaction behind the bytes and its rollback are both covered.
