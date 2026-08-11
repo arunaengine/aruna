@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
-use aruna_core::storage_entries::{metadata_updated_index_key, parse_metadata_updated_index_key};
+use aruna_core::storage_entries::{updated_index_key, parse_updated_key};
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 use tracing::warn;
@@ -53,7 +53,7 @@ pub async fn enumerate_updated(
     let mut stale_keys = Vec::new();
     let mut start = match after {
         Some(cursor) => IterStart::After(cursor),
-        None => IterStart::At(metadata_updated_index_key(from_ms, Ulid::nil())),
+        None => IterStart::At(updated_index_key(from_ms, Ulid::nil())),
     };
 
     loop {
@@ -67,7 +67,7 @@ pub async fn enumerate_updated(
         }
 
         for (key, _) in entries {
-            let (updated_at_ms, document_id) = parse_metadata_updated_index_key(key.as_ref())
+            let (updated_at_ms, document_id) = parse_updated_key(key.as_ref())
                 .map_err(StorageReadError::Conversion)?;
             if updated_at_ms > until_ms {
                 return Ok(UpdatedRecordsPage {
@@ -128,7 +128,7 @@ async fn sweep_bounded(
 ) -> Result<SweepPass, StorageReadError> {
     let mut start = match after {
         Some(cursor) => IterStart::After(cursor),
-        None => IterStart::At(metadata_updated_index_key(0, Ulid::nil())),
+        None => IterStart::At(updated_index_key(0, Ulid::nil())),
     };
     let mut stale = Vec::new();
     let mut deleted = 0usize;
@@ -146,7 +146,7 @@ async fn sweep_bounded(
         }
 
         for (key, _) in entries {
-            let (updated_at_ms, document_id) = parse_metadata_updated_index_key(key.as_ref())
+            let (updated_at_ms, document_id) = parse_updated_key(key.as_ref())
                 .map_err(StorageReadError::Conversion)?;
             scanned += 1;
             resume = Some(key.clone());
@@ -323,8 +323,9 @@ mod tests {
         ));
     }
 
+    // enumerates in datestamp order within the window
     #[tokio::test]
-    async fn enumerates_in_datestamp_order_within_window() {
+    async fn enumerates_in_order() {
         let (context, _dir) = context();
         let early = record(Ulid::from_bytes([10; 16]), 100);
         let mid = record(Ulid::from_bytes([11; 16]), 200);
@@ -341,8 +342,9 @@ mod tests {
         assert!(page.stale_keys.is_empty());
     }
 
+    // a stale key is skipped after a reindex
     #[tokio::test]
-    async fn stale_key_is_skipped_after_reindex() {
+    async fn stale_key_skipped() {
         // Writing the record twice leaves the first datestamp's index key stale.
         let (context, _dir) = context();
         let mut record = record(Ulid::from_bytes([20; 16]), 100);
@@ -359,7 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_removes_index_key() {
+    async fn delete_removes_key() {
         let (context, _dir) = context();
         let record = record(Ulid::from_bytes([30; 16]), 700);
         store(&context, &record).await;
@@ -384,7 +386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_deletes_only_stale() {
+    async fn sweep_deletes_stale() {
         let (context, _dir) = context();
         let mut moved = record(Ulid::from_bytes([40; 16]), 100);
         store(&context, &moved).await;
@@ -407,7 +409,7 @@ mod tests {
 
     // A pass stops at its scan bound and hands back the cursor for the next one.
     #[tokio::test]
-    async fn sweep_resumes_across_passes() {
+    async fn sweep_resumes_passes() {
         let (context, _dir) = context();
         for seed in 0..6u8 {
             let mut record = record(Ulid::from_bytes([50 + seed; 16]), 100 + seed as u64);
@@ -430,8 +432,9 @@ mod tests {
         assert!(cursor.is_none());
     }
 
+    // pagination resumes after the cursor
     #[tokio::test]
-    async fn pagination_resumes_after_cursor() {
+    async fn pagination_after_cursor() {
         let (context, _dir) = context();
         for seed in 0..5u8 {
             store(

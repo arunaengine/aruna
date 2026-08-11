@@ -95,14 +95,14 @@ pub fn metadata_registry_key(group_id: GroupId, document_id: Ulid) -> Key {
 /// is spec ch.17, out of scope) and registry rows are realm-complete on every
 /// node (bridge B1), so a local scan is realm-complete. Add a realm prefix here
 /// if that ever changes.
-pub fn metadata_updated_index_key(updated_at_ms: u64, document_id: Ulid) -> Key {
+pub fn updated_index_key(updated_at_ms: u64, document_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(24);
     bytes.extend_from_slice(&updated_at_ms.to_be_bytes());
     bytes.extend_from_slice(&document_id.to_bytes());
     ByteView::from(bytes)
 }
 
-pub fn parse_metadata_updated_index_key(key: &[u8]) -> Result<(u64, Ulid), ConversionError> {
+pub fn parse_updated_key(key: &[u8]) -> Result<(u64, Ulid), ConversionError> {
     if key.len() != 24 {
         return Err(ConversionError::InvalidLength(format!(
             "expected 24-byte metadata updated index key, got {}",
@@ -117,10 +117,10 @@ pub fn parse_metadata_updated_index_key(key: &[u8]) -> Result<(u64, Ulid), Conve
 /// The timestamp-index entry for a registry record. Written in the same batch as
 /// the record so the new key is atomic; the prior key (at the old timestamp) is
 /// left for lazy cleanup, which only ever over-lists and never under-lists.
-pub fn metadata_updated_index_entry(record: &MetadataRegistryRecord) -> (KeySpace, Key, Value) {
+pub fn updated_index_entry(record: &MetadataRegistryRecord) -> (KeySpace, Key, Value) {
     (
         METADATA_UPDATED_INDEX_KEYSPACE.to_string(),
-        metadata_updated_index_key(record.updated_at_ms, record.document_id),
+        updated_index_key(record.updated_at_ms, record.document_id),
         ByteView::from(Vec::new()),
     )
 }
@@ -800,17 +800,17 @@ pub fn metadata_registry_write_entries(
             metadata_registry_key(record.group_id, record.document_id),
             postcard::to_allocvec(&record.holder_node_ids)?.into(),
         ),
-        metadata_updated_index_entry(record),
+        updated_index_entry(record),
     ])
 }
 
 /// The timestamp-index key of a record being removed. Only the record itself
 /// carries the `updated_at_ms` half of the key, so the row must be read before
 /// the delete batch is built or the key leaks with no later write to supersede it.
-pub fn metadata_updated_index_delete_entry(record: &MetadataRegistryRecord) -> (KeySpace, Key) {
+pub fn updated_index_delete(record: &MetadataRegistryRecord) -> (KeySpace, Key) {
     (
         METADATA_UPDATED_INDEX_KEYSPACE.to_string(),
-        metadata_updated_index_key(record.updated_at_ms, record.document_id),
+        updated_index_key(record.updated_at_ms, record.document_id),
     )
 }
 
@@ -830,7 +830,7 @@ pub fn metadata_registry_delete_entries(record: &MetadataRegistryRecord) -> Vec<
             METADATA_HOLDERS_KEYSPACE.to_string(),
             metadata_registry_key(group_id, document_id),
         ),
-        metadata_updated_index_delete_entry(record),
+        updated_index_delete(record),
     ]
 }
 

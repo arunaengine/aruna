@@ -1444,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn mint_digest_ignores_the_minter() {
+    fn digest_ignores_minter() {
         let document_id = Ulid::from_bytes([1; 16]);
         let first = JobPayload::MintPersistentId(MintPersistentIdSpec {
             document_id,

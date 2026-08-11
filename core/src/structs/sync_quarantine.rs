@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_record_keeps_bytes() {
+    fn record_keeps_bytes() {
         let record = SyncQuarantineRecord::new(
             identity(3),
             SyncQuarantineEvidence::raw(vec![9, 9, 9]),
@@ -488,8 +488,9 @@ mod tests {
         assert!(decoded.decoded_event().is_none());
     }
 
+    // the key is the transport identity
     #[test]
-    fn key_is_transport_identity() {
+    fn key_is_identity() {
         let key = identity(5).storage_key();
         assert_eq!(key.len(), 72);
         assert!(key.starts_with(&[7u8; 32]));

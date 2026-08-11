@@ -389,8 +389,9 @@ mod tests {
         }
     }
 
+    // the connector secret split stays redacted
     #[test]
-    fn connector_secret_split_stays_redacted() {
+    fn secret_stays_redacted() {
         let connector = RepositoryConnector::new(
             Ulid::from_bytes([1u8; 16]),
             Ulid::from_bytes([2u8; 16]),
@@ -424,8 +425,9 @@ mod tests {
         );
     }
 
+    // an empty secret config is None
     #[test]
-    fn empty_secret_config_is_none() {
+    fn empty_secret_none() {
         assert!(
             RepositoryConnectorSecret::new(
                 Ulid::from_bytes([4u8; 16]),
@@ -437,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn source_roundtrip_preserves_cursor() {
+    fn roundtrip_preserves_cursor() {
         let mut source = HarvestSource::new(
             Ulid::from_bytes([5u8; 16]),
             Ulid::from_bytes([6u8; 16]),
@@ -461,8 +463,9 @@ mod tests {
         assert_eq!(restored, source);
     }
 
+    // the provenance key disambiguates the namespace boundary
     #[test]
-    fn provenance_key_disambiguates_namespace_boundary() {
+    fn key_disambiguates_boundary() {
         // "a" + "bc" and "ab" + "c" must not collide on the same key bytes.
         assert_ne!(
             harvest_provenance_key(group(1), "a", "bc"),
@@ -473,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn provenance_key_separates_groups() {
+    fn key_separates_groups() {
         assert_ne!(
             harvest_provenance_key(group(1), "zenodo", "rec-1"),
             harvest_provenance_key(group(2), "zenodo", "rec-1")
@@ -484,8 +487,9 @@ mod tests {
         );
     }
 
+    // an unknown record mints; a deletion of an unknown one skips
     #[test]
-    fn unknown_record_mints_and_deletion_of_unknown_skips() {
+    fn unknown_record_mints() {
         assert_eq!(
             provenance_decision(
                 None,
@@ -508,8 +512,9 @@ mod tests {
         );
     }
 
+    // a newer record updates the same id and never remaps
     #[test]
-    fn newer_record_updates_same_id_never_remaps() {
+    fn newer_record_updates() {
         let prov = live(9, 5);
         assert_eq!(
             provenance_decision(
@@ -525,8 +530,9 @@ mod tests {
         );
     }
 
+    // a stale or equal datestamp is an idempotent skip
     #[test]
-    fn stale_or_equal_datestamp_is_idempotent_skip() {
+    fn stale_datestamp_skips() {
         let prov = live(9, 5);
         for datestamp_ms in [4, 5] {
             assert_eq!(
@@ -542,8 +548,9 @@ mod tests {
         }
     }
 
+    // a newer deletion tombstones, then a reharvest skips
     #[test]
-    fn newer_deletion_tombstones_then_reharvest_skips() {
+    fn deletion_then_reharvest() {
         let live_prov = live(9, 5);
         let decision = provenance_decision(
             Some(&live_prov),
@@ -574,8 +581,9 @@ mod tests {
         );
     }
 
+    // a reappeared record revives as a successor
     #[test]
-    fn reappeared_record_revives_as_successor() {
+    fn reappearance_revives_successor() {
         let mut prov = live(9, 5);
         prov.state = HarvestRecordState::Tombstoned;
         assert_eq!(
@@ -592,8 +600,9 @@ mod tests {
         );
     }
 
+    // a pending create resumes before the staleness check
     #[test]
-    fn pending_create_resumes_before_staleness() {
+    fn pending_create_resumes() {
         let mut prov = live(9, 5);
         prov.state = HarvestRecordState::PendingCreate;
         // Same datestamp as the crashed attempt: the identity is still unresolved.
@@ -611,8 +620,9 @@ mod tests {
         );
     }
 
+    // a deletion during a pending create tombstones the id
     #[test]
-    fn pending_create_deletion_tombstones_id() {
+    fn pending_deletion_tombstones() {
         let mut prov = live(9, 5);
         prov.state = HarvestRecordState::PendingCreate;
         assert_eq!(

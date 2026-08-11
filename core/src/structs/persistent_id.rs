@@ -215,8 +215,9 @@ mod tests {
         }
     }
 
+    // the conceptual PID is the graph IRI
     #[test]
-    fn conceptual_pid_is_the_graph_iri() {
+    fn pid_is_iri() {
         let id = Ulid::from_bytes([1; 16]);
         let mapping = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
         assert_eq!(mapping.pid, MetadataRegistryRecord::graph_iri_for(id));
@@ -225,8 +226,9 @@ mod tests {
         assert_eq!(persistent_id_key(id), id.to_bytes().to_vec());
     }
 
+    // withdraw is permanent and keeps the first timestamp
     #[test]
-    fn withdraw_is_permanent_and_keeps_first_timestamp() {
+    fn withdraw_is_permanent() {
         let id = Ulid::from_bytes([1; 16]);
         let mut mapping = PersistentIdMapping::conceptual(id, user(), revision(1, 5));
         assert!(mapping.withdraw(revision(2, 10)));

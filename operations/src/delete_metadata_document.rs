@@ -11,7 +11,7 @@ use aruna_core::metadata::{
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     graph_revision_change, metadata_document_lifecycle_revision_change,
-    metadata_updated_index_delete_entry,
+    updated_index_delete,
 };
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
@@ -331,8 +331,8 @@ impl DeleteMetadataDocumentOperation {
 
 /// The timestamp-index key is only reconstructible from the record's own
 /// `updated_at_ms`, so it is deleted inside the same transaction as the row.
-fn delete_updated_index_effect(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -> Effect {
-    let (key_space, key) = metadata_updated_index_delete_entry(record);
+fn delete_index_effect(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -> Effect {
+    let (key_space, key) = updated_index_delete(record);
     Effect::Storage(StorageEffect::Delete {
         key_space,
         key,
@@ -588,7 +588,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::DeleteUpdatedIndex;
-                    smallvec![delete_updated_index_effect(record, Some(txn_id))]
+                    smallvec![delete_index_effect(record, Some(txn_id))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("holders delete result", format!("{other:?}")),
@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_drops_updated_index() {
+    fn delete_drops_index() {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::generate();
@@ -991,7 +991,7 @@ mod tests {
         );
         assert_eq!(
             key.as_ref(),
-            aruna_core::storage_entries::metadata_updated_index_key(
+            aruna_core::storage_entries::updated_index_key(
                 record.updated_at_ms,
                 record.document_id
             )
