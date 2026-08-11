@@ -3269,11 +3269,20 @@ mod tests {
         assert!(undeliverable.is_empty());
     }
 
+    fn admin_placement(shard: u32) -> aruna_core::structs::PlacementRef {
+        aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_bytes([50; 16]),
+            epoch: 0,
+            shard,
+        }
+    }
+
     fn admin_outbox(
         realm_id: RealmId,
         origin: aruna_core::NodeId,
         origin_seq: u64,
         target: DocumentSyncTarget,
+        placement: aruna_core::structs::PlacementRef,
     ) -> DocumentSyncOutboxRecord {
         use aruna_core::admin_documents::{
             AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
@@ -3300,17 +3309,19 @@ mod tests {
                     },
                 }),
             },
-            aruna_core::structs::PlacementRef {
-                strategy_id: Ulid::from_bytes([50; 16]),
-                epoch: 0,
-                shard: 1,
-            },
+            placement,
             false,
         )
     }
 
     fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentSyncOutboxRecord {
-        admin_outbox(RealmId([3; 32]), origin, origin_seq, target())
+        admin_outbox(
+            RealmId([3; 32]),
+            origin,
+            origin_seq,
+            target(),
+            admin_placement(1),
+        )
     }
 
     fn shard_change(seed: u8) -> DocumentSyncChange {
@@ -3430,9 +3441,12 @@ mod tests {
         let healthy_target = DocumentSyncTarget::Group {
             group_id: Ulid::from_parts(10, 2),
         };
-        let placement = shard_change(49).placement;
-        let blocked_topic = blocked_target.sync_topic_id(realm_id, &placement);
-        let healthy_topic = healthy_target.sync_topic_id(realm_id, &placement);
+        // A shard topic keys on (strategy, shard) alone, so the two records need
+        // different placements to ride a blocked and a healthy topic.
+        let blocked_change = shard_change(49);
+        let healthy_change = shard_change(51);
+        let blocked_topic = blocked_target.sync_topic_id(realm_id, &blocked_change.placement);
+        let healthy_topic = healthy_target.sync_topic_id(realm_id, &healthy_change.placement);
         net.ensure_document_sync_topics(&[healthy_topic], Vec::new())
             .expect("healthy topic genesis");
         let blocked = crate::document_sync_outbox::new_outbox_record_with_id(
@@ -3442,7 +3456,7 @@ mod tests {
             Vec::new(),
             DocumentSyncOutboxEvent::Upsert {
                 bytes: b"blocked".to_vec(),
-                change: shard_change(49),
+                change: blocked_change,
             },
             aruna_core::structs::PlacementRef::NIL,
             true,
@@ -3454,7 +3468,7 @@ mod tests {
             Vec::new(),
             DocumentSyncOutboxEvent::Upsert {
                 bytes: b"healthy".to_vec(),
-                change: shard_change(49),
+                change: healthy_change,
             },
             aruna_core::structs::PlacementRef::NIL,
             true,
@@ -3524,17 +3538,16 @@ mod tests {
         let healthy_target = DocumentSyncTarget::Group {
             group_id: Ulid::from_parts(11, 2),
         };
-        let placement = aruna_core::structs::PlacementRef {
-            strategy_id: Ulid::from_bytes([50; 16]),
-            epoch: 0,
-            shard: 1,
-        };
-        let blocked_topic = blocked_target.sync_topic_id(realm_id, &placement);
-        let healthy_topic = healthy_target.sync_topic_id(realm_id, &placement);
+        // A shard topic keys on (strategy, shard) alone, so the two records need
+        // different placements to ride a blocked and a healthy topic.
+        let blocked_placement = admin_placement(1);
+        let healthy_placement = admin_placement(2);
+        let blocked_topic = blocked_target.sync_topic_id(realm_id, &blocked_placement);
+        let healthy_topic = healthy_target.sync_topic_id(realm_id, &healthy_placement);
         net.ensure_document_sync_topics(&[healthy_topic], Vec::new())
             .expect("healthy topic genesis");
-        let blocked = admin_outbox(realm_id, origin, 1, blocked_target);
-        let healthy = admin_outbox(realm_id, origin, 2, healthy_target);
+        let blocked = admin_outbox(realm_id, origin, 1, blocked_target, blocked_placement);
+        let healthy = admin_outbox(realm_id, origin, 2, healthy_target, healthy_placement);
         let blocked_key = outbox_key(&blocked).to_vec();
         let healthy_key = outbox_key(&healthy).to_vec();
         write_outbox_record(&storage, &blocked).await;
