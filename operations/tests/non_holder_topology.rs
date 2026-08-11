@@ -799,36 +799,11 @@ async fn bystander_writes_forward() -> TestResult<()> {
         .await?
     );
 
-    // The first routed write can race the holders' replicated placement view
-    // on a starved machine; retry while every holder reports it unavailable.
-    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
-        "no routed update reached a holder",
-        || async {
-            match update_metadata_document_routed(
-                &bystander.context,
-                realm.actor(bystander),
-                None,
-                document_id,
-                None,
-                UpdateMetadataDocumentMutation::UpsertDataEntity {
-                    jsonld: r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#
-                        .to_string(),
-                },
-                Some(realm.bearer_token()),
-            )
-            .await
-            {
-                Err(MetadataWriteError::Undeliverable(reason))
-                    if reason.contains("placement view is unavailable") =>
-                {
-                    Ok(1)
-                }
-                other => {
-                    other?;
-                    Ok(0)
-                }
-            }
-        },
+    update_routed(
+        bystander,
+        &realm,
+        document_id,
+        r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#,
     )
     .await?;
 
@@ -874,17 +849,11 @@ async fn bystander_writes_forward() -> TestResult<()> {
     ));
     assert!(!registry_row_present(stale, document_id).await);
 
-    update_metadata_document_routed(
-        &stale.context,
-        realm.actor(stale),
-        None,
+    update_routed(
+        stale,
+        &realm,
         document_id,
-        None,
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
-            jsonld: r#"{"@id":"./stale-holder.txt","@type":"File","name":"stale-holder.txt"}"#
-                .to_string(),
-        },
-        Some(realm.bearer_token()),
+        r#"{"@id":"./stale-holder.txt","@type":"File","name":"stale-holder.txt"}"#,
     )
     .await?;
     let healthy = realm.find(holders[1]);
@@ -898,14 +867,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
     })
     .await?;
 
-    delete_metadata_document_routed(
-        &bystander.context,
-        realm.actor(bystander),
-        None,
-        document_id,
-        Some(realm.bearer_token()),
-    )
-    .await?;
+    delete_routed(bystander, &realm, document_id).await?;
 
     for holder in &holders {
         let node = realm.find(*holder);
@@ -1133,6 +1095,77 @@ async fn export_routed(
     Ok(export
         .into_inner()
         .ok_or("the routed export produced no result")?)
+}
+
+/// A routed update, re-run while every holder reports its placement view
+/// unavailable: forwarded writes fail closed while config replication or a
+/// pending registry projection lags, which a starved machine stretches past
+/// one attempt.
+async fn update_routed(
+    node: &TestNode,
+    realm: &Topology,
+    document_id: Ulid,
+    jsonld: &str,
+) -> TestResult<()> {
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed update reached a holder",
+        || async {
+            match update_metadata_document_routed(
+                &node.context,
+                realm.actor(node),
+                None,
+                document_id,
+                None,
+                UpdateMetadataDocumentMutation::UpsertDataEntity {
+                    jsonld: jsonld.to_string(),
+                },
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataWriteError::Undeliverable(reason))
+                    if reason.contains("placement view is unavailable") =>
+                {
+                    Ok(1)
+                }
+                other => {
+                    other?;
+                    Ok(0)
+                }
+            }
+        },
+    )
+    .await
+}
+
+/// The delete twin of [`update_routed`]; deletes additionally require the pid
+/// authority's converged view, so the window is wider.
+async fn delete_routed(node: &TestNode, realm: &Topology, document_id: Ulid) -> TestResult<()> {
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed delete reached a holder",
+        || async {
+            match delete_metadata_document_routed(
+                &node.context,
+                realm.actor(node),
+                None,
+                document_id,
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataWriteError::Undeliverable(reason))
+                    if reason.contains("placement view is unavailable") =>
+                {
+                    Ok(1)
+                }
+                other => {
+                    other?;
+                    Ok(0)
+                }
+            }
+        },
+    )
+    .await
 }
 
 fn document_config(
