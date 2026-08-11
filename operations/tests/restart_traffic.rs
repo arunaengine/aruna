@@ -50,6 +50,27 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
+struct IncidentFixture {
+    nodes: Vec<TestNode>,
+    secrets: [iroh::SecretKey; 3],
+    config: RealmConfigDocument,
+    target: aruna_core::document::DocumentSyncTarget,
+    placement: aruna_core::structs::PlacementRef,
+}
+
+struct OutageFixture {
+    live: TestNode,
+    dir_one: TempDir,
+    dir_two: TempDir,
+    secrets: [iroh::SecretKey; 3],
+    config: RealmConfigDocument,
+    target: aruna_core::document::DocumentSyncTarget,
+    placement: aruna_core::structs::PlacementRef,
+    group_id: GroupId,
+    document_id: Ulid,
+    seeded: Vec<Vec<u8>>,
+}
+
 // A restart re-announces one topic per held shard plus the fixed shared topics —
 // never one per stored document — and a fresh write still converges to the
 // restarted node afterwards.
@@ -577,28 +598,164 @@ fn offline_bounds_recovery() -> Result<(), BoxError> {
 }
 
 async fn offline_recovery_body() -> Result<(), BoxError> {
-    use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-        DocumentSyncTarget,
-    };
-    use aruna_core::structs::{PlacementRef, PlacementStrategy};
     use aruna_operations::startup::{
-        RecoveryConfig, RecoveryState, RecoveryStatus, SHARD_RESTORE_UNIT_BUDGET,
-        ShardRestoreCursor, restore_shard_pass, run_recovery,
+        RecoveryConfig, RecoveryOutcome, RecoveryStatus, run_recovery,
     };
     use aruna_operations::task_incoming::OutboxDrainer;
     use tokio_util::sync::CancellationToken;
 
     let realm_id = RealmId([91u8; 32]);
-    let node = spawn_node(realm_id).await?;
-    let local = node.net.node_id();
-    // Never spawned and never dialled: config-only peers are the fixture.
-    let offline = [
-        iroh::SecretKey::from_bytes(&[0xB1; 32]).public(),
-        iroh::SecretKey::from_bytes(&[0xB2; 32]).public(),
-    ];
+    let outage = prepare_outage(realm_id).await?;
+    let local = outage.live.net.node_id();
 
-    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    let status = RecoveryStatus::new();
+    let cancelled = CancellationToken::new();
+    let driver = tokio::spawn(run_recovery(
+        outage.live.context.clone(),
+        RecoveryConfig {
+            realm_id,
+            node_id: local,
+            publish_full_usage: false,
+        },
+        status.clone(),
+        cancelled.clone(),
+    ));
+    wait_degraded(&status).await?;
+    let degraded = status.snapshot();
+    assert!(degraded.topics_remaining > 0);
+    assert!(degraded.last_progress_timestamp > 0);
+
+    let drainer = OutboxDrainer::new(drain_context(&outage.live));
+    assert_drain_bound(&outage, &drainer).await?;
+    finish_outage(outage, &drainer, &status, cancelled, driver).await
+}
+
+async fn prepare_outage(realm_id: RealmId) -> Result<OutageFixture, BoxError> {
+    use aruna_core::document::DocumentSyncTarget;
+
+    let IncidentFixture {
+        nodes,
+        secrets,
+        config,
+        target,
+        placement,
+    } = incident_fixture(realm_id).await?;
+    let (group_id, document_id) = match &target {
+        DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        } => (*group_id, *document_id),
+        _ => return Err("incident target must be a metadata registry".into()),
+    };
+    let local = nodes[0].net.node_id();
+    let holders: Vec<_> = nodes.iter().map(|node| node.net.node_id()).collect();
+    let (live, dir_one, dir_two) = stop_peers(nodes).await?;
+    let seeded = seed_outbox(&live, realm_id, local, &target, placement, &holders).await?;
+    assert_eq!(seeded.len(), INCIDENT_RECORDS);
+
+    Ok(OutageFixture {
+        live,
+        dir_one,
+        dir_two,
+        secrets,
+        config,
+        target,
+        placement,
+        group_id,
+        document_id,
+        seeded,
+    })
+}
+
+async fn assert_drain_bound(
+    outage: &OutageFixture,
+    drainer: &aruna_operations::task_incoming::OutboxDrainer,
+) -> Result<(), BoxError> {
+    drainer.run_once().await;
+    let (examined, cursor_parked) = drainer.rotation_progress();
+    assert_eq!(examined, INCIDENT_LIMIT);
+    assert!(cursor_parked, "the first invocation must park its cursor");
+    assert_eq!(
+        outbox_keys(&outage.live).await?,
+        outage.seeded,
+        "a blocked rotation must not delete or reorder accepted work"
+    );
+    Ok(())
+}
+
+async fn finish_outage(
+    outage: OutageFixture,
+    drainer: &aruna_operations::task_incoming::OutboxDrainer,
+    status: &aruna_operations::startup::RecoveryStatus,
+    cancelled: tokio_util::sync::CancellationToken,
+    driver: tokio::task::JoinHandle<()>,
+) -> Result<(), BoxError> {
+    use aruna_operations::startup::{RecoveryOutcome, RecoveryState};
+
+    let realm_id = outage.config.realm_id;
+    let nodes = restore_peers(
+        realm_id,
+        &outage.secrets,
+        outage.dir_one,
+        outage.dir_two,
+        outage.live,
+        &outage.config,
+    )
+    .await?;
+    let topic = outage.target.sync_topic_id(realm_id, &outage.placement);
+    assert!(
+        nodes[1]
+            .net
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false),
+        "restored peer must retain the genesis"
+    );
+
+    let expected_event = Ulid::from_parts(3, INCIDENT_RECORDS as u128);
+    wait_outbox(drainer, &nodes).await?;
+    wait_registry(&nodes, outage.group_id, outage.document_id, expected_event).await?;
+    wait_recovery(status).await?;
+    assert_eq!(status.snapshot().topics_remaining, 0);
+    assert_eq!(status.snapshot().state, RecoveryState::Converged);
+    assert!(status.pass_total(RecoveryOutcome::Success) > 0);
+    cancelled.cancel();
+    tokio::time::timeout(NO_PROGRESS_TIMEOUT, driver)
+        .await
+        .map_err(|_| "recovery driver did not stop on cancellation")??;
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+async fn incident_fixture(realm_id: RealmId) -> Result<IncidentFixture, BoxError> {
+    use aruna_core::MetaResourceId;
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::structs::{
+        DocumentClass, METADATA_HANDLE, PlacementBinding, PlacementRef, PlacementScope,
+        PlacementStrategy,
+    };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
+
+    let secrets = [
+        iroh::SecretKey::from_bytes(&[0xA1; 32]),
+        iroh::SecretKey::from_bytes(&[0xB1; 32]),
+        iroh::SecretKey::from_bytes(&[0xB2; 32]),
+    ];
+    let mut nodes = Vec::with_capacity(3);
+    for secret in &secrets {
+        let dir = tempfile::tempdir()?;
+        let mut node =
+            spawn_node_with(realm_id, Some(secret.clone()), dir.path().to_path_buf()).await?;
+        node._temp_dir = Some(dir);
+        nodes.push(node);
+    }
+    wire_peers(&nodes).await;
+    assert_eq!(
+        nodes.len(),
+        3,
+        "incident fixture must have three live nodes"
+    );
+
     let strategy = PlacementStrategy {
         strategy_id: Ulid::from_bytes([6u8; 16]),
         name: "incident".to_string(),
@@ -607,89 +764,116 @@ async fn offline_recovery_body() -> Result<(), BoxError> {
         affinity: Vec::new(),
         shard_count: INCIDENT_SHARDS,
     };
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.default_strategy_id = Some(strategy.strategy_id);
     config.strategies = vec![strategy.clone()];
-    config.ensure_node(local, RealmNodeKind::Management);
-    for peer in offline {
-        config.ensure_node(peer, RealmNodeKind::Management);
+    config.placement_bindings = vec![PlacementBinding {
+        handle: PlacementHandle::new(METADATA_HANDLE)?,
+        scope: PlacementScope::Realm(realm_id),
+        document_class: DocumentClass::Metadata,
+        strategy_id: strategy.strategy_id,
+        allocator_range_id: None,
+        allocated_by: None,
+        allocated_at_ms: None,
+    }];
+    for node in &nodes {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
-    let actor = Actor {
-        node_id: local,
-        user_id: UserId::nil(realm_id),
-        realm_id,
-    };
-    match node
-        .context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: (*realm_id.as_bytes()).into(),
-            value: config.to_bytes(&actor)?.into(),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-    }
+    write_config(&nodes, &realm_id, &config).await?;
 
-    // A bounded pass never exceeds its work-unit limit, so a later group cannot
-    // be starved by an unavailable one.
-    let mut cursor = ShardRestoreCursor::default();
-    let pass = restore_shard_pass(
-        &node.context,
-        local,
-        realm_id,
-        &mut cursor,
-        &CancellationToken::new(),
-    )
-    .await;
-    assert!(pass.summary.held_shards > 0, "the node must hold shards");
-    assert!(
-        pass.units_processed <= SHARD_RESTORE_UNIT_BUDGET,
-        "one pass processed {} units, over its {SHARD_RESTORE_UNIT_BUDGET} budget",
-        pass.units_processed
-    );
-    if !pass.wrapped {
-        assert_ne!(cursor, ShardRestoreCursor::default(), "cursor must advance");
-    }
-
-    // All records target one shard topic whose genesis this node cannot mint
-    // while its co-holders are unavailable.
-    let change = DocumentSyncChange {
-        base: None,
-        current: DocumentSyncRevision {
-            generation: 1,
-            event_id: Ulid::from_parts(3, 1),
-            actor: local,
-            updated_at_ms: 1,
-        },
-        kind: DocumentSyncChangeKind::Upsert,
-        placement: PlacementRef {
-            strategy_id: strategy.strategy_id,
-            epoch: 0,
-            shard: 5,
-        },
+    let local = nodes[0].net.node_id();
+    let peer_two = nodes[2].net.node_id();
+    let placement = PlacementRef {
+        strategy_id: strategy.strategy_id,
+        epoch: 0,
+        shard: 5,
     };
+    let document_id: Ulid = MetaResourceId::from_parts(
+        2,
+        PlacementHandle::new(METADATA_HANDLE)?,
+        BucketId::new(5)?,
+        2,
+    )?
+    .into();
     let target = DocumentSyncTarget::MetadataRegistry {
         group_id: Ulid::from_parts(1, 1),
-        document_id: Ulid::from_parts(2, 2),
+        document_id,
     };
+    let topic = target.sync_topic_id(realm_id, &placement);
+    let topics: Vec<_> = (0..INCIDENT_SHARDS)
+        .map(|shard| {
+            aruna_core::document::shard_topic_id(
+                realm_id,
+                &PlacementRef {
+                    strategy_id: strategy.strategy_id,
+                    epoch: 0,
+                    shard,
+                },
+            )
+        })
+        .collect();
+    nodes[1]
+        .net
+        .ensure_document_sync_topics(&topics, vec![local, peer_two])?;
+    assert!(
+        nodes[1]
+            .net
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false),
+        "one peer must hold the recovery fixture genesis"
+    );
+    assert!(
+        !nodes[0]
+            .net
+            .document_sync_topic_exists(topic)
+            .unwrap_or(true),
+        "the live node must start without the shard genesis"
+    );
+
+    Ok(IncidentFixture {
+        nodes,
+        secrets,
+        config,
+        target,
+        placement,
+    })
+}
+
+async fn stop_peers(mut nodes: Vec<TestNode>) -> Result<(TestNode, TempDir, TempDir), BoxError> {
+    let live = nodes.remove(0);
+    let mut offline_one = nodes.remove(0);
+    let mut offline_two = nodes.remove(0);
+    let dir_one = offline_one
+        ._temp_dir
+        .take()
+        .ok_or("offline peer directory missing")?;
+    let dir_two = offline_two
+        ._temp_dir
+        .take()
+        .ok_or("offline peer directory missing")?;
+    offline_one.net.clear_inbound_handler();
+    offline_one.task_handle.clear_inbound_handler().await;
+    offline_one.net.shutdown().await;
+    offline_two.net.clear_inbound_handler();
+    offline_two.task_handle.clear_inbound_handler().await;
+    offline_two.net.shutdown().await;
+    drop(offline_one);
+    drop(offline_two);
+    Ok((live, dir_one, dir_two))
+}
+
+async fn seed_outbox(
+    node: &TestNode,
+    realm_id: RealmId,
+    local: aruna_core::NodeId,
+    target: &aruna_core::document::DocumentSyncTarget,
+    placement: aruna_core::structs::PlacementRef,
+    holders: &[aruna_core::NodeId],
+) -> Result<Vec<Vec<u8>>, BoxError> {
     for chunk_start in (0..INCIDENT_RECORDS).step_by(1_024) {
         let mut writes = Vec::with_capacity(1_024);
         for index in chunk_start..(chunk_start + 1_024).min(INCIDENT_RECORDS) {
-            let record = aruna_operations::document_sync_outbox::new_outbox_record_with_id(
-                Ulid::from_parts(1, index as u128),
-                local,
-                target.clone(),
-                Vec::new(),
-                DocumentSyncOutboxEvent::Upsert {
-                    bytes: Vec::new(),
-                    change,
-                },
-                PlacementRef::NIL,
-                false,
-            );
+            let record = incident_record(realm_id, local, target, placement, holders, index)?;
             writes.push(aruna_operations::document_sync_outbox::outbox_write_entry(
                 &record,
             )?);
