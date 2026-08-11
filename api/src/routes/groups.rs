@@ -333,13 +333,50 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
     post,
     path = "/groups",
     tag = "groups",
-    request_body = CreateGroupRequest,
+    summary = "Create a group in this realm",
+    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Group creation is self-service: any unrestricted realm member may create groups up to the realm's per-user group quota, and a caller holding WRITE on the realm group-admin path is exempt from that cap. The caller becomes the owner and the only member of the new group's admin role, next to the default user and viewer roles. The write commits on this node and replicates to the rest of the realm afterwards, so another node may not list the group immediately.",
+    request_body(
+        content = CreateGroupRequest,
+        description = "Display name for the new group. It is stored as given and need not be unique.",
+        example = json!({"name": "Proteomics Lab"})
+    ),
     responses(
-        (status = 201, description = "Group created", body = CreateGroupResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 409, description = "Group creation conflict", body = ErrorResponse)
+        (
+            status = 201,
+            description = "Group created on this node, with its initial roles. Assigned users are listed because the caller is a member.",
+            body = CreateGroupResponse,
+            example = json!({
+                "display_name": "Proteomics Lab",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "roles": [
+                    {
+                        "role_id": "01JROLEADMIN0123456789ABCD",
+                        "name": "admin",
+                        "permissions": {
+                            "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/**": "Write"
+                        },
+                        "assigned_users": [
+                            "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                        ],
+                        "public": false
+                    },
+                    {
+                        "role_id": "01JROLEUSER00123456789ABCD",
+                        "name": "user",
+                        "permissions": {
+                            "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/**": "Write"
+                        },
+                        "assigned_users": [],
+                        "public": false
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "Request body is not a valid create-group document", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or is confined to a path subset", body = ErrorResponse),
+        (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter may be retried unchanged", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -432,14 +469,39 @@ pub async fn create_group(
     get,
     path = "/groups",
     tag = "groups",
+    summary = "List the groups of this realm",
+    description = "Requires a bearer token issued for this realm: an anonymous caller is rejected and a token from another realm is forbidden. Reads the group directory as replicated to this node, so a group created elsewhere can be missing until it arrives here. Every realm member sees each group's id, realm and display name. `include=roles` additionally returns each group's roles and their permission paths, but the users assigned to a role are only included for groups the caller is a member of; for every other group the `assigned_users` field is omitted and a role that applies to everyone is visible only through its `public` flag.",
     params(
-        ("limit" = Option<u32>, Query, description = "Maximum number of groups to return"),
-        ("offset" = Option<u32>, Query, description = "Number of groups to skip"),
-        ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports roles")
+        ("limit" = Option<u32>, Query, description = "Maximum number of groups to return; defaults to 100 and is clamped to the range 1-1000"),
+        ("offset" = Option<u32>, Query, description = "Number of groups to skip from the start of the directory; defaults to 0"),
+        ("include" = Option<String>, Query, description = "Comma-separated extras. Currently supports roles; blank entries are ignored and any other value is rejected as a bad request")
     ),
     responses(
-        (status = 200, description = "List groups", body = ListGroupsResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Groups visible to the caller, with member-only fields hidden for groups the caller does not belong to",
+            body = ListGroupsResponse,
+            example = json!({
+                "groups": [
+                    {
+                        "display_name": "Proteomics Lab",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "roles": [
+                            {
+                                "role_id": "01JROLEUSER00123456789ABCD",
+                                "name": "user",
+                                "permissions": {
+                                    "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/**": "Write"
+                                },
+                                "public": false
+                            }
+                        ]
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -523,12 +585,36 @@ async fn build_api_groups(
     get,
     path = "/groups/{id}",
     tag = "groups",
-    params(("id" = String, Path, description = "Group id")),
+    summary = "Read one group's directory entry",
+    description = "Requires a bearer token issued for this realm; no group membership is needed, because every realm member may look up any group in the realm. Reads the copy replicated to this node. Members receive the full role list including the users assigned to each role; a non-member receives the same roles and permission paths with the `assigned_users` field omitted, and learns only from the `public` flag that a role applies to everyone. A group whose record or authorization document is not present on this node reads as not found.",
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 200, description = "Group info", body = GroupInfoResponse),
-        (status = 400, description = "Invalid group id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Group not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The group and its roles, with member lists included only for a caller who is a member",
+            body = GroupInfoResponse,
+            example = json!({
+                "display_name": "Proteomics Lab",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "roles": [
+                    {
+                        "role_id": "01JROLEADMIN0123456789ABCD",
+                        "name": "admin",
+                        "permissions": {
+                            "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/**": "Write"
+                        },
+                        "assigned_users": [
+                            "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                        ],
+                        "public": false
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -596,13 +682,41 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
     get,
     path = "/groups/{id}/usage",
     tag = "groups",
-    params(("id" = String, Path, description = "Group id")),
+    summary = "Read a group's storage usage",
+    description = "Requires a bearer token issued for this realm and membership in the group: membership is the only check, so a realm administrator who is not a member is forbidden. The flat counters report what this node stores for the group, while `realm` reports the realm-wide totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes. `quota` restates the realm quota configuration for this group together with a warning flag evaluated against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be read, and the document count reported by the realm-wide usage endpoint is never included here.",
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 200, description = "Group storage usage", body = crate::routes::info::UsageResponse),
-        (status = 400, description = "Invalid group id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Group not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Local counters for this node, realm-wide totals, and the group's quota status when it is available",
+            body = crate::routes::info::UsageResponse,
+            example = json!({
+                "buckets": 3,
+                "objects": 1284,
+                "stored_blobs": 1190,
+                "stored_bytes": 87412338176,
+                "logical_bytes": 91002113024,
+                "referenced_bytes": 91002113024,
+                "realm": {
+                    "buckets": 5,
+                    "objects": 2048,
+                    "stored_blobs": 1902,
+                    "stored_bytes": 140733193388,
+                    "logical_bytes": 152882105100,
+                    "referenced_bytes": 152882105100
+                },
+                "quota": {
+                    "quota_bytes": 214748364800,
+                    "ceiling_bytes": 236223201280,
+                    "warn_threshold_percent": 80,
+                    "warning": false
+                }
+            })
+        ),
+        (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller is not a member of the group", body = ErrorResponse),
+        (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -650,11 +764,35 @@ pub async fn get_group_usage(
     get,
     path = "/groups/{id}/members",
     tag = "groups",
-    params(("id" = String, Path, description = "Group id")),
+    summary = "List the members of a group",
+    description = "Requires a bearer token issued for this realm and membership in the group; the member list is never exposed to outsiders, so a non-member is forbidden. Returns every member in one response, sorted by user id, each with the roles that assign them, sorted by role name. A role that applies to everyone contributes no member here, since the principal standing for everyone is not a user. Display names are resolved from the realm's user directory as a best effort: a member without a resolvable record is returned with a null name instead of failing the listing.",
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 200, description = "Group members", body = GroupMembersResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Every member of the group with their roles; names may be null when the user directory cannot resolve them",
+            body = GroupMembersResponse,
+            example = json!({
+                "members": [
+                    {
+                        "user_id": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "name": "Ada Lovelace",
+                        "roles": [
+                            {"role_id": "01JROLEADMIN0123456789ABCD", "name": "admin"}
+                        ]
+                    },
+                    {
+                        "user_id": "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "name": null,
+                        "roles": [
+                            {"role_id": "01JROLEUSER00123456789ABCD", "name": "user"}
+                        ]
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller is not a member of the group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -734,14 +872,42 @@ async fn resolve_member_names(
     post,
     path = "/groups/{id}/members",
     tag = "groups",
-    request_body = AddGroupMemberRequest,
-    params(("id" = String, Path, description = "Group id")),
+    summary = "Add a user to a group",
+    description = "Requires an unrestricted bearer token issued for this realm and WRITE on the group's administrative path for the user being added, so authority can be delegated per member. When `role_ids` is omitted or empty the user is assigned the group's role named user, and the request is rejected when that role is missing or ambiguous. Adding a user who already holds the roles is accepted and changes nothing. The response is the group's complete role list after the change, including the users assigned to each role. The change commits on this node and replicates to the rest of the realm afterwards.",
+    request_body(
+        content = AddGroupMemberRequest,
+        description = "User to add, and optionally the exact roles to assign instead of the default user role.",
+        example = json!({
+            "user_id": "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            "role_ids": ["01JROLEUSER00123456789ABCD"]
+        })
+    ),
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 201, description = "Member added", body = GroupRolesResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Group or role not found", body = ErrorResponse)
+        (
+            status = 201,
+            description = "The group's roles after the assignment",
+            body = GroupRolesResponse,
+            example = json!({
+                "roles": [
+                    {
+                        "role_id": "01JROLEUSER00123456789ABCD",
+                        "name": "user",
+                        "permissions": {
+                            "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/**": "Write"
+                        },
+                        "assigned_users": [
+                            "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                        ],
+                        "public": false
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "Malformed ids, a user id standing for everyone, or no default user role to fall back on", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
+        (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -814,17 +980,19 @@ pub async fn add_group_member(
     delete,
     path = "/groups/{id}/members/{user_id}",
     tag = "groups",
+    summary = "Remove a member from a group or revoke one of their roles",
+    description = "Requires an unrestricted bearer token issued for this realm. Removing yourself needs no group permission; removing anyone else requires WRITE on the group's administrative path for that user. Without `role_id` the user loses every role in the group, with it only that one assignment is revoked and the rest are kept. A group must keep at least one administrator, so the request is refused when it would strip the last one. The change commits on this node and replicates to the rest of the realm afterwards.",
     params(
-        ("id" = String, Path, description = "Group id"),
-        ("user_id" = String, Path, description = "User id to remove"),
-        ("role_id" = Option<String>, Query, description = "Revoke only this role")
+        ("id" = String, Path, description = "Group id as a 26-character ULID"),
+        ("user_id" = String, Path, description = "Member to remove, in the realm-qualified user id form `<user ULID>@<realm id>`"),
+        ("role_id" = Option<String>, Query, description = "Revoke only this role, given as a 26-character ULID; when omitted every role of the user in this group is revoked")
     ),
     responses(
-        (status = 204, description = "Member removed"),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 409, description = "Last admin cannot be removed", body = ErrorResponse)
+        (status = 204, description = "The membership or role assignment is gone; no response body is returned"),
+        (status = 400, description = "Malformed group, user or role id, or a user id standing for everyone", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token is confined to a path subset, or the caller lacks write access to this member of the group", body = ErrorResponse),
+        (status = 409, description = "The removal would leave the group without an administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -878,11 +1046,13 @@ pub async fn remove_group_member(
     post,
     path = "/groups/{id}/leave",
     tag = "groups",
-    params(("id" = String, Path, description = "Group id")),
+    summary = "Leave a group",
+    description = "Self-scoped: the caller drops every role they hold in the group, and no group permission is required because the token's own subject is the only user affected. Requires an unrestricted bearer token issued for this realm; a token confined to a path subset is refused. A group must keep at least one administrator, so the last one cannot leave and must hand the role over first. Leaving a group the caller does not belong to changes nothing. The change commits on this node and replicates to the rest of the realm afterwards.",
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 204, description = "Left the group"),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 409, description = "Last admin cannot leave", body = ErrorResponse)
+        (status = 204, description = "The caller no longer holds any role in the group; no response body is returned"),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 409, description = "The caller is the group's last administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -913,14 +1083,44 @@ pub async fn leave_group(
     post,
     path = "/groups/{id}/roles",
     tag = "groups",
-    request_body = CreateGroupRoleRequest,
-    params(("id" = String, Path, description = "Group id")),
+    summary = "Create a role in a group",
+    description = "Requires an unrestricted bearer token issued for this realm and WRITE on the group's administrative path. The name is trimmed, must not be empty and must not be admin or user, which are reserved for the built-in roles. Every permission path must lie inside the group's own path, so a group administrator cannot mint authority over anything else, and each is granted as read, write or deny (accepted case-insensitively, reported capitalised). A public role applies to every principal including anonymous callers and may therefore only carry read grants. The role commits on this node and replicates to the rest of the realm afterwards.",
+    request_body(
+        content = CreateGroupRoleRequest,
+        description = "Role name, the permission paths it grants inside the group, and the users it is assigned to.",
+        example = json!({
+            "name": "readers",
+            "permissions": {
+                "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/**": "read"
+            },
+            "assigned_users": [
+                "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+            ],
+            "public": false
+        })
+    ),
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 201, description = "Role created", body = RoleResponse),
-        (status = 400, description = "Invalid request or foreign permission path", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Group not found", body = ErrorResponse)
+        (
+            status = 201,
+            description = "The created role as stored, with its generated id",
+            body = RoleResponse,
+            example = json!({
+                "role_id": "01JROLEREADERS123456789ABC",
+                "name": "readers",
+                "permissions": {
+                    "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/**": "Read"
+                },
+                "assigned_users": [
+                    "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                ],
+                "public": false
+            })
+        ),
+        (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than read", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
+        (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1011,17 +1211,19 @@ pub async fn create_group_role(
     delete,
     path = "/groups/{id}/roles/{role_id}",
     tag = "groups",
+    summary = "Delete a role from a group",
+    description = "Requires an unrestricted bearer token issued for this realm and WRITE on the group's administrative path. Deleting a role revokes it from every user holding it, which can leave a user with no role in the group at all. The built-in admin role is permanent and cannot be deleted, so a group never loses its administrative path. The change commits on this node and replicates to the rest of the realm afterwards.",
     params(
-        ("id" = String, Path, description = "Group id"),
-        ("role_id" = String, Path, description = "Role id to delete")
+        ("id" = String, Path, description = "Group id as a 26-character ULID"),
+        ("role_id" = String, Path, description = "Role to delete, as a 26-character ULID")
     ),
     responses(
-        (status = 204, description = "Role deleted"),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Role not found", body = ErrorResponse),
-        (status = 409, description = "Admin role cannot be deleted", body = ErrorResponse)
+        (status = 204, description = "The role and all of its assignments are gone; no response body is returned"),
+        (status = 400, description = "Malformed group or role id", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token is confined to a path subset, or the caller does not administer the group", body = ErrorResponse),
+        (status = 404, description = "No such role in this group, or the group is not present on this node", body = ErrorResponse),
+        (status = 409, description = "The built-in admin role cannot be deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1107,18 +1309,37 @@ pub struct DataPathsQuery {
     get,
     path = "/groups/{id}/data-paths",
     tag = "groups",
+    summary = "Browse the data permission paths of a group",
+    description = "Requires a bearer token issued for this realm and membership in the group, and every page is additionally authorized as a data read: browsing the bucket level needs READ on the group's data root, browsing inside a bucket needs READ on that bucket or on the prefix being listed, so a token confined to a narrower path sees only what it may read. The entries are the permission paths that role grants are written against, folders ending at the delimiter and objects as leaves, and they are scoped to this node, so a prefix belonging to another node is rejected. Bucket names are globally unique: naming a bucket owned by another group returns an empty page instead of an error. Paging is forward-only through an opaque token that must be echoed back unchanged; a response without one is the last page.",
     params(
-        ("id" = String, Path, description = "Group id"),
+        ("id" = String, Path, description = "Group id as a 26-character ULID"),
         ("prefix" = Option<String>, Query, description = "Data permission path to browse under; empty or the group data path lists buckets; a bucket path lists that bucket's contents; any other bare segment filters bucket names by that prefix"),
-        ("delimiter" = Option<String>, Query, description = "Folder delimiter, typically '/'"),
-        ("continuation_token" = Option<String>, Query, description = "Opaque token from a previous page"),
-        ("limit" = Option<u32>, Query, description = "Maximum entries per page (1-1000)")
+        ("delimiter" = Option<String>, Query, description = "Folder delimiter that collapses keys sharing a prefix into one folder entry, typically '/'; when omitted every matching object is listed individually"),
+        ("continuation_token" = Option<String>, Query, description = "Opaque base64 token copied from the previous page; omit it to start at the beginning, and pass back the exact value received"),
+        ("limit" = Option<u32>, Query, description = "Maximum entries per page; defaults to 1000 and is clamped to the range 1-1000")
     ),
     responses(
-        (status = 200, description = "Browsable data permission paths. v1 lists the local node only.", body = DataPathsResponse),
-        (status = 400, description = "Invalid group id or prefix", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "One page of browsable data permission paths on this node, with a continuation token when more entries remain",
+            body = DataPathsResponse,
+            example = json!({
+                "entries": [
+                    {
+                        "permission_path": "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/proteomics/runs/",
+                        "kind": "folder"
+                    },
+                    {
+                        "permission_path": "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/proteomics/README.md",
+                        "kind": "object"
+                    }
+                ],
+                "continuation_token": "cHJvdGVvbWljcy9SRUFETUUubWQ="
+            })
+        ),
+        (status = 400, description = "Malformed group id, a prefix outside this node's group data path, or an unreadable continuation token", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, the caller is not a member of the group, or the caller may not read the browsed path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

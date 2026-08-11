@@ -842,9 +842,92 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
     get,
     path = "/info/realm",
     tag = "info",
+    summary = "Read the realm's public settings and its node topology",
+    description = "Answers every caller, but answers a realm member with more. Without a usable token of this realm, and that includes a token of another realm or one this node cannot validate, the response is the public part: realm id, description, metadata replication policy, the OIDC providers a client needs to obtain a token, and the public interface urls. A bearer token of this realm additionally reveals the realm's discovery configuration, its quota policy, the node list and the interface listen addresses. Gated values are absent or empty, never restructured, so one parser handles both. The node list is the realm's configured membership read from this node's replicated realm configuration; `placement` is the node's entry in the placement map and `info` is the last node information document that reached this node, so it may lag or be absent. Liveness is a separate, deliberately conservative signal: presence is resolved through a bounded realm lookup with a four second budget, and if that lookup is stale, times out or fails, only this node counts as present. `present` true and `connection_status` `connected` therefore mean the peer was confirmed live by a fresh lookup just now; `configured` means no fresh confirmation, which is not evidence that the peer is down. Stale presence is candidate data and is never reported as a connection.",
     responses(
-        (status = 200, description = "Realm information; nodes, discovery and quota only for realm-authenticated callers", body = RealmInfoResponse),
-        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse)
+        (
+            status = 200,
+            description = "Realm information at the caller's level of access; discovery, quota, nodes and interface bind addresses only for a caller holding a token of this realm",
+            body = RealmInfoResponse,
+            examples(
+                ("Anonymous" = (
+                    summary = "What a client needs to reach the realm and obtain a token",
+                    value = json!({
+                        "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "description": "Example realm",
+                        "metadata_replication": {"default_replication_factor": 3},
+                        "oidc_providers": [
+                            {
+                                "id": "example",
+                                "issuer": "https://idp.example.test/realms/aruna",
+                                "audience": "aruna",
+                                "discovery_url": "https://idp.example.test/realms/aruna/.well-known/openid-configuration"
+                            }
+                        ],
+                        "nodes": [],
+                        "interfaces": {
+                            "rest": {"status": "available", "bind": null, "url": "https://node.example.test/api/v1"},
+                            "s3": {"status": "available", "bind": null, "url": "https://s3.example.test"}
+                        }
+                    })
+                )),
+                ("Realm token" = (
+                    summary = "A realm member also sees discovery, quota and the node topology",
+                    value = json!({
+                        "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "description": "Example realm",
+                        "metadata_replication": {"default_replication_factor": 3},
+                        "oidc_providers": [],
+                        "discovery": {"Dynamic": {"methods": [{"DhtSigned": {"ttl_secs": 3600, "refresh_after_secs": 1800}}]}},
+                        "nodes": [
+                            {
+                                "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                                "kind": "server",
+                                "configured": true,
+                                "present": true,
+                                "connection_status": "connected",
+                                "placement": {"location": "dc-a", "weight": 100, "full": false, "draining": false},
+                                "info": {
+                                    "executors": [{"kind": "docker", "file_staging": true, "direct_s3": false}],
+                                    "labels": {"zone": "dc-a"},
+                                    "urls": {"api": "https://node.example.test/api/v1"},
+                                    "utilization": {
+                                        "storage_bytes_used": 1073741824,
+                                        "documents_held": 128,
+                                        "load_permille": 120,
+                                        "heartbeat_at_ms": 1775744591123
+                                    },
+                                    "updated_at_ms": 1775744591123
+                                }
+                            },
+                            {
+                                "node_id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+                                "kind": "local",
+                                "configured": true,
+                                "present": false,
+                                "connection_status": "configured",
+                                "placement": null,
+                                "info": null
+                            }
+                        ],
+                        "quota": {
+                            "default_group_quota_bytes": 10737418240,
+                            "grace_factor_percent": 110,
+                            "warn_threshold_percent": 80,
+                            "group_overrides": [],
+                            "max_groups_per_user": 10,
+                            "user_group_cap_overrides": [],
+                            "max_devices_per_user": null
+                        },
+                        "interfaces": {
+                            "rest": {"status": "available", "bind": "0.0.0.0:3000", "url": "https://node.example.test/api/v1"},
+                            "s3": {"status": "available", "bind": "0.0.0.0:1337", "url": "https://s3.example.test"}
+                        }
+                    })
+                ))
+            )
+        ),
+        (status = 404, description = "This node holds no configuration document for its realm, so there is nothing to report yet", body = crate::error::ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -1016,9 +1099,39 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     get,
     path = "/info/realm/placement",
     tag = "info",
+    summary = "Read the realm's placement strategies, bindings and overrides",
+    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403 whatever the caller holds. Returns the placement policy as stored in this node's copy of the realm configuration: the defined strategies with their replica count, distinctness requirement, affinity rules and shard count; the default strategy; the bindings that map a scope, the realm, a group, a document class or a metadata path prefix, to a strategy; and the per-subject overrides that pin or exclude individual nodes. This is policy, not a placement result: it says how replicas are chosen, not where any particular document currently sits.",
     responses(
-        (status = 200, description = "Realm placement configuration", body = RealmPlacementConfigResponse),
-        (status = 401, description = "Authentication required", body = crate::error::ErrorResponse),
+        (
+            status = 200,
+            description = "The realm's placement policy as this management node has it",
+            body = RealmPlacementConfigResponse,
+            example = json!({
+                "strategies": [
+                    {
+                        "strategy_id": "01JABCDEF0123456789ABCDEFG",
+                        "name": "three-replicas-across-sites",
+                        "replica_count": 3,
+                        "distinct_locations": true,
+                        "affinity": [{"key": "zone", "value": "dc-a", "effect": {"kind": "multiply", "permille": 1500}}],
+                        "shard_count": 16
+                    }
+                ],
+                "default_strategy_id": "01JABCDEF0123456789ABCDEFG",
+                "bindings": [
+                    {"scope": {"kind": "class", "document_class": "metadata"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
+                ],
+                "overrides": [
+                    {
+                        "subject": "0102030405060708",
+                        "pinned": ["1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"],
+                        "excluded": [],
+                        "strategy_id": null
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
         (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
         (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
@@ -1051,14 +1164,74 @@ pub async fn get_realm_placement(
     patch,
     path = "/info/realm/placement",
     tag = "info",
-    request_body = RealmPlacementMutationRequest,
+    summary = "Apply one change to the realm's placement policy",
+    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403. The body carries exactly one change, selected by its `mutation` field: define or replace a strategy, remove one, set the default, set or remove a binding for a scope, set or remove a per-subject override, or provision a metadata binding for a strategy. Provisioning is idempotent, an existing binding for the same scope and strategy is returned unchanged instead of allocating a second one. The whole placement policy after the change is returned, so a client never has to re-read to learn the new state. The change is written to the replicated realm configuration, which means it is durable here when the response is sent and reaches the other realm nodes asynchronously; it does not move any data by itself, existing replicas are relocated by later placement work. Removing a strategy that a binding or override still points at is refused with 409 rather than leaving a dangling reference, and a concurrent update of the same configuration is also 409, where retrying the request is the expected response.",
+    request_body(
+        content = RealmPlacementMutationRequest,
+        description = "Exactly one placement change, discriminated by `mutation`. Ids are ULIDs, node ids are hex-encoded, an override `subject` is a hex-encoded key prefix",
+        examples(
+            ("Define a strategy" = (
+                summary = "Create or replace a strategy that spreads three replicas over distinct locations",
+                value = json!({
+                    "mutation": "upsert_strategy",
+                    "strategy": {
+                        "strategy_id": "01JABCDEF0123456789ABCDEFG",
+                        "name": "three-replicas-across-sites",
+                        "replica_count": 3,
+                        "distinct_locations": true,
+                        "affinity": [{"key": "zone", "value": "dc-a", "effect": {"kind": "filter"}}],
+                        "shard_count": 16
+                    }
+                })
+            )),
+            ("Bind a scope" = (
+                summary = "Route every metadata document of one group through that strategy",
+                value = json!({
+                    "mutation": "set_binding",
+                    "binding": {
+                        "scope": {"kind": "group", "group_id": "01JMETADATA0123456789ABCDE"},
+                        "strategy_id": "01JABCDEF0123456789ABCDEFG"
+                    }
+                })
+            )),
+            ("Provision a metadata binding" = (
+                summary = "Idempotently allocate the realm-wide metadata binding for a strategy",
+                value = json!({
+                    "mutation": "provision_metadata_binding",
+                    "strategy_id": "01JABCDEF0123456789ABCDEFG",
+                    "group_id": null
+                })
+            ))
+        )
+    ),
     responses(
-        (status = 200, description = "Updated realm placement configuration", body = RealmPlacementConfigResponse),
-        (status = 400, description = "Invalid placement mutation", body = crate::error::ErrorResponse),
-        (status = 401, description = "Authentication required", body = crate::error::ErrorResponse),
+        (
+            status = 200,
+            description = "The complete placement policy after the change was applied",
+            body = RealmPlacementConfigResponse,
+            example = json!({
+                "strategies": [
+                    {
+                        "strategy_id": "01JABCDEF0123456789ABCDEFG",
+                        "name": "three-replicas-across-sites",
+                        "replica_count": 3,
+                        "distinct_locations": true,
+                        "affinity": [{"key": "zone", "value": "dc-a", "effect": {"kind": "filter"}}],
+                        "shard_count": 16
+                    }
+                ],
+                "default_strategy_id": "01JABCDEF0123456789ABCDEFG",
+                "bindings": [
+                    {"scope": {"kind": "realm"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
+                ],
+                "overrides": []
+            })
+        ),
+        (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
+        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
-        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
-        (status = 409, description = "Referenced strategy or concurrent transaction conflict", body = crate::error::ErrorResponse),
+        (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
+        (status = 409, description = "The strategy is still referenced by a binding or override, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
         (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1152,13 +1325,48 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
     put,
     path = "/info/realm/quota",
     tag = "info",
-    request_body = RealmQuotaConfig,
+    summary = "Replace the realm-wide quota policy",
+    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; an anonymous caller is rejected and every other node answers 403. This replaces the stored policy wholesale rather than patching it: overrides absent from the body are dropped, so send the complete intended policy. `default_group_quota_bytes` is the pre-grace allowance per group and null means unlimited; `grace_factor_percent` must be at least 100 and scales that allowance into the hard ceiling a write is refused at; `warn_threshold_percent` must be between 1 and 100 and only decides when a group is reported as warning. Per-group overrides replace both values for one group, and per-user overrides cap how many groups a user may hold. `max_devices_per_user` must be null, since device ownership is not enforced yet and any other value is refused. Quota is evaluated against a group's realm-wide logical bytes, which are aggregated from counters that replicate between nodes, so enforcement follows a policy change as those counters and the realm configuration propagate. The stored policy after the change is echoed back.",
+    request_body(
+        content = RealmQuotaConfig,
+        description = "The complete quota policy to store; it replaces the current one, including all override lists",
+        example = json!({
+            "default_group_quota_bytes": 10737418240,
+            "grace_factor_percent": 110,
+            "warn_threshold_percent": 80,
+            "group_overrides": [
+                {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400, "grace_factor_percent": 120}
+            ],
+            "max_groups_per_user": 10,
+            "user_group_cap_overrides": [
+                {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
+            ],
+            "max_devices_per_user": null
+        })
+    ),
     responses(
-        (status = 200, description = "Updated realm quota configuration", body = RealmQuotaConfig),
-        (status = 400, description = "Invalid quota configuration", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
-        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
-        (status = 409, description = "Concurrent quota update conflict", body = crate::error::ErrorResponse)
+        (
+            status = 200,
+            description = "The quota policy now stored in the realm configuration",
+            body = RealmQuotaConfig,
+            example = json!({
+                "default_group_quota_bytes": 10737418240,
+                "grace_factor_percent": 110,
+                "warn_threshold_percent": 80,
+                "group_overrides": [
+                    {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400, "grace_factor_percent": 120}
+                ],
+                "max_groups_per_user": 10,
+                "user_group_cap_overrides": [
+                    {"user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "max_groups": 25}
+                ],
+                "max_devices_per_user": null
+            })
+        ),
+        (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a value for max_devices_per_user", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
+        (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1315,9 +1523,32 @@ pub async fn load_realm_usage(
     get,
     path = "/info/usage",
     tag = "info",
+    summary = "Report this node's and the realm's storage usage",
+    description = "Requires a bearer token of this realm; an anonymous caller gets 401 and a token of another realm 403. No further permission is checked, because the figures are realm-wide totals and not per-caller views. The flat fields are this node's own counters, while `realm` is the total summed from every realm node's replicated usage snapshot, so it is eventually consistent: a node whose snapshot has not arrived or has not refreshed yet is simply not part of the sum, which can make the total lag reality after a burst of writes. `metadata_documents` counts the realm's live metadata documents, excluding lifecycle-deleted ones, and is deliberately unfiltered by what the caller may read; it is omitted, never zeroed, when this node has no metadata subsystem or the count cannot be produced, so an absent field means unknown. `quota` is not reported here, it belongs to the per-group usage view.",
     responses(
-        (status = 200, description = "Local and realm-wide storage usage", body = UsageResponse),
-        (status = 401, description = "Authentication required", body = crate::error::ErrorResponse),
+        (
+            status = 200,
+            description = "This node's counters plus the realm-wide totals",
+            body = UsageResponse,
+            example = json!({
+                "buckets": 4,
+                "objects": 128,
+                "stored_blobs": 130,
+                "stored_bytes": 1073741824,
+                "logical_bytes": 1099511627776,
+                "referenced_bytes": 2147483648,
+                "realm": {
+                    "buckets": 12,
+                    "objects": 512,
+                    "stored_blobs": 530,
+                    "stored_bytes": 4294967296,
+                    "logical_bytes": 4398046511104,
+                    "referenced_bytes": 8589934592
+                },
+                "metadata_documents": 4096
+            })
+        ),
+        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a member of this realm", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1487,11 +1718,76 @@ async fn backend_statuses(
     get,
     path = "/info",
     tag = "info",
+    summary = "Report this node's health, version and service status",
+    description = "The health check of a single node, answered locally and never routed to a peer, so it always returns 200 for a node that is serving requests at all. Every caller is answered, but the amount of detail depends on the token. Anonymous callers, and callers whose token belongs to another realm or cannot be validated here, see only what is needed to health check the node and learn where to authenticate: node status, realm id, api version and the public interface urls. A bearer token of this realm adds the node's own identity and capability kind, its listen addresses, its peer connections and the network service summary. A token with WRITE on the realm's configuration admin path additionally reveals the blob and database services, every registered storage backend with its quota and used bytes, the portal deployment state, operational warnings and the last error of each peer connection. Gated values are absent or empty rather than restructured, so the same parser works at every level. Backend `used_bytes` comes from maintained counters and is absent when they cannot be read, which is not the same as zero.",
     responses(
         (
             status = 200,
             description = "Node health and version; node identity, addresses and topology for realm-authenticated callers, backend detail for realm admins",
-            body = InfoResponse
+            body = InfoResponse,
+            examples(
+                ("Anonymous" = (
+                    summary = "Public health check: status, realm and public urls only",
+                    value = json!({
+                        "node": {"status": "available", "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"},
+                        "api_version": "3.0.0-alpha.41",
+                        "my_addresses": [],
+                        "connections": [],
+                        "services": {
+                            "interfaces": {
+                                "rest": {"status": "available", "bind": null, "url": "https://node.example.test/api/v1"},
+                                "s3": {"status": "unavailable", "bind": null, "url": null}
+                            }
+                        },
+                        "warnings": []
+                    })
+                )),
+                ("Realm token" = (
+                    summary = "A realm member also sees node identity, addresses and peer topology",
+                    value = json!({
+                        "node": {
+                            "status": "available",
+                            "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                            "peer_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                            "capabilities": "server"
+                        },
+                        "api_version": "3.0.0-alpha.41",
+                        "my_addresses": ["192.0.2.10:4433", "https://relay.example.test/"],
+                        "connections": [
+                            {
+                                "peer_id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+                                "status": "connected",
+                                "active_addresses": [
+                                    {
+                                        "status": "active",
+                                        "address": "192.0.2.11:4433",
+                                        "rtt_ms": 12,
+                                        "protocol_connections": [
+                                            {"connection_id": 7, "protocol": "document_sync", "side": "client", "status": "open"}
+                                        ]
+                                    }
+                                ],
+                                "last_error": null,
+                                "next_retry_secs": null
+                            }
+                        ],
+                        "services": {
+                            "network": {
+                                "status": "available",
+                                "discovery": ["dns"],
+                                "relay": "default",
+                                "relay_urls": ["https://relay.example.test/"],
+                                "routing_table_size": 24
+                            },
+                            "interfaces": {
+                                "rest": {"status": "available", "bind": "0.0.0.0:3000", "url": "https://node.example.test/api/v1"},
+                                "s3": {"status": "available", "bind": "0.0.0.0:1337", "url": "https://s3.example.test"}
+                            }
+                        },
+                        "warnings": []
+                    })
+                ))
+            )
         )
     ),
     security((), ("bearer_auth" = []))

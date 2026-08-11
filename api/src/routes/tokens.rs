@@ -41,13 +41,19 @@ pub struct RevokeTokenRequest {
     post,
     path = "/users/tokens/revoke",
     tag = "tokens",
-    request_body = RevokeTokenRequest,
+    summary = "Revoke a bearer token of this realm",
+    description = "Requires a bearer token of this realm. The token in the body must itself be a well-formed, signed bearer token of this realm whose remaining lifetime still fits the retained revocation window; anything else is 400, including a token of another realm. A caller may always retire its own token, but a path-restricted (delegated) token may only revoke the very token it presented; revoking any other user's token requires WRITE on that user's realm admin path. On a user-kind node the revocation is forwarded to a ranked management or server peer under the caller's own token, and 503 is returned when no eligible peer accepts it. Otherwise the revocation is recorded in the replicated realm configuration: it takes effect on this node before the response and reaches the other realm nodes asynchronously with that configuration, so a 204 is not proof that every node already refuses the token. Revoking the same token again is accepted and returns 204 again.",
+    request_body(
+        content = RevokeTokenRequest,
+        description = "The bearer token to revoke, as issued, not its hash",
+        example = json!({"token": "<aruna-access-token-to-revoke>"})
+    ),
     responses(
-        (status = 204, description = "Token revoked"),
-        (status = 400, description = "Not a valid bearer token of this realm", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 503, description = "No eligible revocation peer available or token revocation capacity exhausted", body = ErrorResponse)
+        (status = 204, description = "Revocation recorded, or already recorded by an earlier call; no response body"),
+        (status = 400, description = "The body is not a well-formed bearer token of this realm, or its lifetime exceeds what the revocation set retains", body = ErrorResponse),
+        (status = 401, description = "Missing or unusable bearer token on the request itself", body = ErrorResponse),
+        (status = 403, description = "Caller token belongs to another realm, or lacks WRITE on the token owner's realm admin path", body = ErrorResponse),
+        (status = 503, description = "No eligible realm peer accepted the forwarded revocation, or the revocation set is at capacity; retryable, the response carries a Retry-After header", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

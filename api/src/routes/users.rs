@@ -509,13 +509,39 @@ async fn register_admin(
     post,
     path = "/users/register",
     tag = "users",
-    description = "Requires an OIDC bearer token from a configured issuer, not an Aruna access token.",
-    request_body = RegisterUserRequest,
+    summary = "Register the calling OIDC identity as a realm user",
+    description = "Requires an OIDC bearer token from a configured issuer, not an Aruna access token. It serves two callers: a user registering themselves, and an operator bootstrapping the first realm administrator. Any holder of a valid OIDC token registers themselves by leaving the onboarding secret out; that path is get or create, so a subject that already has a user gets the existing user back unchanged, still with 201. Sending an onboarding secret takes the administrator path: the secret must have been issued for this realm with the initial administrator purpose, it is consumed single use, and the registered user then claims the initial realm administrator role. A secret issued for any other purpose is refused with 403, and one that is unknown, expired, already claimed or issued for another realm is refused with 401. The registered identity is always the subject of the presented token, never a user id chosen by the caller, and the display name comes from the token. The user document is written on the node that serves the request and replicates to the other realm nodes asynchronously, so it may not be visible elsewhere immediately. No access token is returned here: exchange the same OIDC token at GET /users/token.",
+    request_body(
+        content = RegisterUserRequest,
+        description = "Optional onboarding secret. Omit it, or send null, for ordinary self service registration; send the secret handed out by the node operator only to claim the initial realm administrator.",
+        examples(
+            (
+                "SelfService" = (
+                    summary = "Register the OIDC subject with no special role",
+                    value = json!({"onboarding_secret": null})
+                )
+            ),
+            (
+                "InitialAdministrator" = (
+                    summary = "Consume an onboarding secret and claim the realm administrator role",
+                    value = json!({"onboarding_secret": "<onboarding-secret-issued-by-the-node-operator>"})
+                )
+            )
+        )
+    ),
     responses(
-        (status = 201, description = "User registered", body = RegisterUserResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 201,
+            description = "The user of this OIDC subject, either newly created or already present from an earlier registration",
+            body = RegisterUserResponse,
+            example = json!({
+                "id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                "name": "Alice Example"
+            })
+        ),
+        (status = 400, description = "The request body is not valid JSON for this operation", body = ErrorResponse),
+        (status = 401, description = "No OIDC bearer token was presented, it failed validation against the configured issuers, or the onboarding secret is unknown, expired, already claimed or issued for another realm", body = ErrorResponse),
+        (status = 403, description = "The onboarding secret was issued for another purpose than the initial realm administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -570,11 +596,18 @@ async fn register_user(
     get,
     path = "/users/token",
     tag = "users",
+    summary = "Issue an access token for the calling identity",
+    description = "Self-scoped: the token is always minted for the caller's own identity and can never be requested on behalf of somebody else. Two kinds of bearer token are accepted. An Aruna access token without path restrictions refreshes itself, while a path-restricted (delegated) token is refused with 403, as is a token whose subject is an alias rather than the canonical user of that OIDC subject. An OIDC token from a configured issuer is accepted once its subject has been registered at POST /users/register. The issued token is a realm bearer credential valid for 24 hours, it is returned only in this response and is not retrievable afterwards, so a lost token has to be reissued here.",
     responses(
-        (status = 200, description = "Token issued", body = GetTokenResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "A freshly issued access token for the caller, valid for 24 hours and shown only here",
+            body = GetTokenResponse,
+            example = json!({"token": "<aruna-access-token>"})
+        ),
+        (status = 400, description = "Not produced by this operation; a request that cannot be authenticated is answered with 401 or 403 instead", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented, the OIDC token failed validation, or this node knows no user for the presented identity", body = ErrorResponse),
+        (status = 403, description = "The presented access token carries path restrictions, or its subject is an alias of the canonical user of that OIDC subject", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -617,11 +650,61 @@ async fn get_token(
     get,
     path = "/users/info",
     tag = "users",
+    summary = "Get the calling user's profile, roles and preferences",
+    description = "Self-scoped: it always describes the caller and takes no user id. Requires a realm bearer token that carries no path restrictions; a delegated token, or a token issued by another realm, is refused with 403. The response combines the caller's user document, the realm roles whose assignment list contains the caller, one entry for every group known to this node whose roles list the caller, and the UI preferences derived from the caller's ui.theme, ui.preferred_profile_path and ui.favourite_metadata_ids attributes, where the favourites attribute is a comma separated list. Group membership is collected from the groups this node holds, so a group that has not replicated here yet is missing. 404 means this node holds no user document for the caller, which can happen while a registration made on another node is still replicating.",
     responses(
-        (status = 200, description = "Current user information", body = GetUserInfoResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "User not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The caller's user document, realm roles, group memberships and UI preferences",
+            body = GetUserInfoResponse,
+            example = json!({
+                "user": {
+                    "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                    "name": "Alice Example",
+                    "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
+                    "attributes": {
+                        "email": "user@example.test",
+                        "orcid": "0000-0002-1825-0097",
+                        "ui.theme": "dark",
+                        "ui.preferred_profile_path": "datasets/proteomics",
+                        "ui.favourite_metadata_ids": "01JMETADATA0123456789ABCDE"
+                    }
+                },
+                "realm": {
+                    "realm_id": "YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                    "roles": [
+                        {
+                            "role_id": "01JR0123456789ABCDEFGHJKMN",
+                            "name": "realm-admin",
+                            "permissions": {"/YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA/admin/**": "Write"},
+                            "assigned_users": ["01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"]
+                        }
+                    ]
+                },
+                "groups": [
+                    {
+                        "group_id": "01JGRP00123456789ABCDEFGHJ",
+                        "display_name": "Proteomics",
+                        "roles": [
+                            {
+                                "role_id": "01JR0123456789ABCDEFGHJKMP",
+                                "name": "group-writer",
+                                "permissions": {"/YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA/g/01JGRP00123456789ABCDEFGHJ/**": "Write"},
+                                "assigned_users": ["01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"]
+                            }
+                        ]
+                    }
+                ],
+                "preferences": {
+                    "preferred_profile_path": "datasets/proteomics",
+                    "favourite_metadata_ids": ["01JMETADATA0123456789ABCDE"],
+                    "theme": "dark"
+                }
+            })
+        ),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "This node holds no user document for the calling identity", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -640,13 +723,62 @@ async fn get_user_info(
     patch,
     path = "/users/info",
     tag = "users",
-    request_body = PatchUserInfoRequest,
+    summary = "Update the calling user's profile",
+    description = "Self-scoped: it always writes the caller's own user document and takes no user id. Requires a realm bearer token that carries no path restrictions; a delegated token, or a token issued by another realm, is refused with 403. Fields left out change nothing. The name is trimmed and must be 1 to 256 characters. An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes, a value is at most 4096 bytes and carries no control characters, and a user holds at most 128 attributes. Removals are applied before sets, so a key named in both ends up set to the new value. UI preferences are ordinary attributes: ui.theme, ui.preferred_profile_path and ui.favourite_metadata_ids as a comma separated list. The write is durable on the node that answers and replicates to the other realm nodes asynchronously. The response is the caller's refreshed profile in the same shape as GET /users/info.",
+    request_body(
+        content = PatchUserInfoRequest,
+        description = "Optional new display name, attributes to set and attribute keys to remove. Send only what changes.",
+        example = json!({
+            "name": "Alice Example",
+            "set_attributes": {"ui.theme": "dark", "orcid": "0000-0002-1825-0097"},
+            "remove_attributes": ["ui.preferred_profile_path"]
+        })
+    ),
     responses(
-        (status = 200, description = "Current user updated", body = GetUserInfoResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "User not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The caller's profile after the update, with realm roles, group memberships and the recomputed preferences",
+            body = GetUserInfoResponse,
+            example = json!({
+                "user": {
+                    "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                    "name": "Alice Example",
+                    "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
+                    "attributes": {
+                        "email": "user@example.test",
+                        "orcid": "0000-0002-1825-0097",
+                        "ui.theme": "dark"
+                    }
+                },
+                "realm": {
+                    "realm_id": "YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                    "roles": []
+                },
+                "groups": [
+                    {
+                        "group_id": "01JGRP00123456789ABCDEFGHJ",
+                        "display_name": "Proteomics",
+                        "roles": [
+                            {
+                                "role_id": "01JR0123456789ABCDEFGHJKMP",
+                                "name": "group-writer",
+                                "permissions": {"/YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA/g/01JGRP00123456789ABCDEFGHJ/**": "Write"},
+                                "assigned_users": ["01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"]
+                            }
+                        ]
+                    }
+                ],
+                "preferences": {
+                    "preferred_profile_path": null,
+                    "favourite_metadata_ids": [],
+                    "theme": "dark"
+                }
+            })
+        ),
+        (status = 400, description = "The name is empty or longer than 256 characters, or an attribute key or value is rejected, or the user would hold more than 128 attributes", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm or carries path restrictions", body = ErrorResponse),
+        (status = 404, description = "This node holds no user document for the calling identity", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -704,15 +836,32 @@ async fn patch_user_info(
     get,
     path = "/users",
     tag = "users",
+    summary = "List the users of this realm",
+    description = "Requires a realm bearer token and read access on the realm's user administration path, so an ordinary member is refused with 403; the realm request policies are evaluated as well and may deny a read that the role grant alone would allow. Only users of this realm are listed, in user id order, from the replica held by the node that serves the request, so a user registered on another node appears once replication has caught up. Every entry is the full user document including its attributes. Pagination is cursor based: limit defaults to 100 and is clamped into 1 to 1000, next_start_after repeats the last returned user id, and its absence means the end of the listing was reached.",
     params(
-        ("limit" = Option<usize>, Query, description = "Maximum users to return"),
-        ("start_after" = Option<String>, Query, description = "Exclusive user id cursor")
+        ("limit" = Option<usize>, Query, description = "Page size; defaults to 100 and is clamped into 1 to 1000"),
+        ("start_after" = Option<String>, Query, description = "Exclusive cursor: the user id returned as next_start_after by the previous page; omit it to start at the first user")
     ),
     responses(
-        (status = 200, description = "Users listed", body = ListUsersResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "One page of this realm's users held by this node, with the cursor for the next page",
+            body = ListUsersResponse,
+            example = json!({
+                "users": [
+                    {
+                        "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                        "name": "Alice Example",
+                        "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
+                        "attributes": {"email": "user@example.test", "orcid": "0000-0002-1825-0097"}
+                    }
+                ],
+                "next_start_after": "01JB2C3D4E5F6G7H8J9KABCDEF@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"
+            })
+        ),
+        (status = 400, description = "The start_after cursor is not a user id", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm, or the caller has no read access on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -771,16 +920,31 @@ async fn list_users(
     get,
     path = "/users/search",
     tag = "users",
+    summary = "Search this realm's users by name or email",
+    description = "Requires a realm bearer token and read access on the realm's user administration path, the same grant as the full listing, so an ordinary member is refused with 403. The query is trimmed and matched case insensitively as a substring of the display name and of the email attribute, over the users of this realm held by the node that serves the request; a user registered elsewhere is found once replication has caught up. A result carries only the user id and the display name, never attributes. Pagination is cursor based: limit defaults to 20 and is clamped into 1 to 20, next_start_after repeats the last returned user id, and its absence means the scan reached the end of the realm's users rather than that no further match exists on a later page.",
     params(
-        ("q" = String, Query, description = "Substring to match against user name or email; minimum 2 characters"),
-        ("limit" = Option<usize>, Query, description = "Maximum results, capped at 20"),
-        ("start_after" = Option<String>, Query, description = "Pagination cursor")
+        ("q" = String, Query, description = "Substring matched case insensitively against the user name and the email attribute; at least 2 characters after trimming"),
+        ("limit" = Option<usize>, Query, description = "Page size; defaults to 20 and is clamped into 1 to 20"),
+        ("start_after" = Option<String>, Query, description = "Exclusive cursor: the user id returned as next_start_after by the previous page; omit it to start at the first user")
     ),
     responses(
-        (status = 200, description = "Matching users", body = SearchUsersResponse),
-        (status = 400, description = "Query too short", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "One page of matching users, reduced to user id and display name, with the cursor for the next page",
+            body = SearchUsersResponse,
+            example = json!({
+                "users": [
+                    {
+                        "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                        "name": "Alice Example"
+                    }
+                ],
+                "next_start_after": null
+            })
+        ),
+        (status = 400, description = "The query is shorter than 2 characters after trimming, or the start_after cursor is not a user id", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm, or the caller has no read access on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -845,12 +1009,34 @@ async fn search_users(
     post,
     path = "/users/resolve",
     tag = "users",
-    request_body = ResolveUsersRequest,
+    summary = "Resolve user ids to directory entries",
+    description = "Requires a realm bearer token and read access on the realm's user administration path, so an ordinary member is refused with 403. Batch lookup of at most 100 user ids per request against the replica held by the node that serves the request. Duplicate ids collapse and ids unknown to this node are dropped silently, so the result may be shorter than the request and carries no positional mapping; match the entries by user id. Only the directory safe attributes orcid, affiliation and department are exposed, while email and every other attribute are withheld here. The response body is a JSON array, not an object.",
+    request_body(
+        content = ResolveUsersRequest,
+        description = "Up to 100 user ids, each in the form ulid@realm-id. Duplicates are collapsed and unknown ids are omitted from the result.",
+        example = json!({
+            "user_ids": [
+                "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                "01JB2C3D4E5F6G7H8J9KABCDEF@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"
+            ]
+        })
+    ),
     responses(
-        (status = 200, description = "Resolved users", body = [ResolveUserResult]),
-        (status = 400, description = "Too many or invalid user ids", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Directory entries for the ids this node could resolve, with only the safe attributes",
+            body = [ResolveUserResult],
+            example = json!([
+                {
+                    "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                    "name": "Alice Example",
+                    "attributes": {"orcid": "0000-0002-1825-0097", "affiliation": "Example University"}
+                }
+            ])
+        ),
+        (status = 400, description = "More than 100 user ids were sent, or an entry is not a user id", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm, or the caller has no read access on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -907,13 +1093,25 @@ async fn resolve_users(
     get,
     path = "/users/{id}",
     tag = "users",
-    params(("id" = String, Path, description = "User id")),
+    summary = "Get a user of this realm by id",
+    description = "Requires a realm bearer token and read access on the administration path of that specific user, so a caller without the grant is refused with 403 whether or not the user exists and existence stays hidden; the realm request policies are evaluated as well and may deny a read the role grant would allow. The reply is served from the replica held by the node that receives the request, so a user registered on another node appears once replication has caught up, and 404 is only reachable for a caller that may read that user. The response is the full user document including its attributes. A token issued by another trusted realm is answered with 501, because forwarding a read to the owning realm is not implemented.",
+    params(("id" = String, Path, description = "User id in the form ulid@realm-id, as returned by the listing and search operations")),
     responses(
-        (status = 200, description = "User fetched", body = GetUserResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "User not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The user document held by this node",
+            body = GetUserResponse,
+            example = json!({
+                "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                "name": "Alice Example",
+                "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
+                "attributes": {"email": "user@example.test", "orcid": "0000-0002-1825-0097"}
+            })
+        ),
+        (status = 400, description = "Declared for malformed input; in practice an id that is not a user id is refused by the authorization check with 403 instead", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The caller has no read access on that user's administration path; the same answer is given whether or not the user exists", body = ErrorResponse),
+        (status = 404, description = "This node holds no user with that id, and the caller is allowed to know that", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -958,14 +1156,34 @@ async fn get_user(
     patch,
     path = "/users/{id}",
     tag = "users",
-    params(("id" = String, Path, description = "User id")),
-    request_body = UpdateUserRequest,
+    summary = "Update a user of this realm by id",
+    description = "Requires a realm bearer token; a token issued by another realm is refused with 403. Updating the caller's own user needs no further grant but refuses a path-restricted (delegated) token with 403. Updating anybody else requires write access on that user's administration path and additionally passes the realm request policies, which may deny the write even when the role grant allows it. Validation matches the self service profile update: the name is trimmed and must be 1 to 256 characters, an attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes, a value is at most 4096 bytes without control characters, and a user holds at most 128 attributes. Removals are applied before sets, so a key named in both ends up set, and fields left out change nothing. The write is durable on the node that answers and replicates to the other realm nodes asynchronously. The response is the updated user document.",
+    params(("id" = String, Path, description = "User id in the form ulid@realm-id of the user to update; the caller's own id for a self service update")),
+    request_body(
+        content = UpdateUserRequest,
+        description = "Optional new display name, attributes to set and attribute keys to remove. Send only what changes.",
+        example = json!({
+            "name": "Alice Example",
+            "set_attributes": {"affiliation": "Example University"},
+            "remove_attributes": ["department"]
+        })
+    ),
     responses(
-        (status = 200, description = "User updated", body = GetUserResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "User not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The user document after the update",
+            body = GetUserResponse,
+            example = json!({
+                "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                "name": "Alice Example",
+                "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
+                "attributes": {"email": "user@example.test", "affiliation": "Example University"}
+            })
+        ),
+        (status = 400, description = "The id is not a user id, the name is empty or longer than 256 characters, or an attribute key or value is rejected", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
+        (status = 403, description = "The token was issued by another realm, a delegated token attempted a self update, or the caller has no write access on that user's administration path", body = ErrorResponse),
+        (status = 404, description = "This node holds no user with that id", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
