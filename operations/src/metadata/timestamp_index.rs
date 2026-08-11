@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::get_metadata_document::load_metadata_record_by_document;
-use crate::metadata::repository::StorageReadError;
+use crate::metadata::repository::{StorageReadError, delete_index_keys};
 
 /// Storage rows scanned per index batch while assembling one enumeration page.
 const INDEX_SCAN_BATCH: usize = 256;
@@ -155,7 +155,12 @@ async fn sweep_bounded(
                 _ => stale.push(key),
             }
             if stale.len() >= SWEEP_DELETE_BATCH {
-                deleted += delete_index_keys(context, std::mem::take(&mut stale)).await?;
+                deleted += delete_index_keys(
+                    context,
+                    METADATA_UPDATED_INDEX_KEYSPACE,
+                    std::mem::take(&mut stale),
+                )
+                .await?;
             }
             if scanned >= scan_limit {
                 break 'scan;
@@ -171,37 +176,11 @@ async fn sweep_bounded(
         }
     }
 
-    deleted += delete_index_keys(context, stale).await?;
+    deleted += delete_index_keys(context, METADATA_UPDATED_INDEX_KEYSPACE, stale).await?;
     Ok(SweepPass {
         deleted,
         next_after: resume,
     })
-}
-
-async fn delete_index_keys(
-    context: &DriverContext,
-    keys: Vec<Key>,
-) -> Result<usize, StorageReadError> {
-    if keys.is_empty() {
-        return Ok(0);
-    }
-    let count = keys.len();
-    let deletes = keys
-        .into_iter()
-        .map(|key| (METADATA_UPDATED_INDEX_KEYSPACE.to_string(), key))
-        .collect();
-    let event = context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        }))
-        .await;
-    match event {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(count),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::WriteError)),
-    }
 }
 
 /// Runs the sweep on the shutdown supervisor, resuming from the previous pass so

@@ -26,7 +26,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::repository::StorageReadError;
+use crate::metadata::repository::{StorageReadError, delete_index_keys};
 use crate::metadata::timestamp_index::enumerate_updated;
 use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 
@@ -612,7 +612,7 @@ async fn prune_pass(
     if token.is_cancelled() {
         return Ok(PassOutcome::Cancelled);
     }
-    delete_index_keys(context, stale).await?;
+    delete_index_keys(context, METADATA_VISIBILITY_INDEX_KEYSPACE, stale).await?;
     match next {
         Some(next) => state.prune_after = Some(next.as_ref().to_vec()),
         None => {
@@ -666,32 +666,6 @@ async fn write_index_keys(
         .await;
     match event {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::WriteError)),
-    }
-}
-
-async fn delete_index_keys(
-    context: &DriverContext,
-    keys: Vec<Key>,
-) -> Result<usize, StorageReadError> {
-    if keys.is_empty() {
-        return Ok(0);
-    }
-    let count = keys.len();
-    let deletes = keys
-        .into_iter()
-        .map(|key| (METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(), key))
-        .collect();
-    let event = context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        }))
-        .await;
-    match event {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(count),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(StorageError::WriteError)),
     }

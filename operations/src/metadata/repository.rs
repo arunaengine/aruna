@@ -1,6 +1,7 @@
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::handle::Handle;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -27,6 +28,8 @@ use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
+
+use crate::driver::DriverContext;
 
 pub const LIST_METADATA_PAGE_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage
@@ -499,6 +502,37 @@ pub fn parse_registry_iter(
 
 pub fn empty_effects() -> Effects {
     smallvec![]
+}
+
+/// Untransacted batch delete of index keys in one keyspace, returning how many
+/// were dropped.
+pub async fn delete_index_keys(
+    context: &DriverContext,
+    keyspace: &str,
+    keys: Vec<Key>,
+) -> Result<usize, StorageReadError> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let count = keys.len();
+    let deletes = keys
+        .into_iter()
+        .map(|key| (keyspace.to_string(), key))
+        .collect();
+    let event = context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        }))
+        .await;
+    match event {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(count),
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(
+            aruna_core::errors::StorageError::WriteError,
+        )),
+    }
 }
 
 #[derive(Debug)]
