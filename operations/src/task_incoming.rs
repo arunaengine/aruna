@@ -1307,20 +1307,28 @@ impl OperationsTaskHandler {
         (publish_elapsed, outcome)
     }
 
-        // A later record of the same topic or admin origin must not overtake one
-        // that has not landed.
-        defer_state
+    async fn finish_drain_invocation(
+        &self,
+        retry_key: TaskKey,
+        net_handle: &aruna_net::NetHandle,
+        realm_id: RealmId,
+        mut rotation: OutboxRotation,
+        mut invocation: DrainInvocation,
+        drain_started: Instant,
+    ) {
+        invocation
+            .defer
             .deferred_topics
-            .extend(totals.blocked_topics.iter().copied());
-        defer_state
+            .extend(invocation.outcome.blocked_topics.iter().copied());
+        invocation
+            .defer
             .blocked_origins
-            .extend(totals.blocked_origins.iter().copied());
-
-        if let Some((oldest_ms, target, topic, placement)) = oldest_stuck {
+            .extend(invocation.outcome.blocked_origins.iter().copied());
+        if let Some((oldest_ms, target, topic, placement)) = &invocation.oldest_stuck {
             error!(
                 event = "pipeline.drain.stuck",
-                count = stuck_total,
-                oldest_age_ms = unix_timestamp_millis().saturating_sub(oldest_ms),
+                count = invocation.stuck,
+                oldest_age_ms = unix_timestamp_millis().saturating_sub(*oldest_ms),
                 representative_target = ?target,
                 representative_topic = %topic,
                 representative_strategy = %placement.strategy_id,
@@ -1328,112 +1336,77 @@ impl OperationsTaskHandler {
                 "Document sync outbox records are stuck: this node holds their buckets but their shard topic geneses have never arrived"
             );
         }
-
-        // A locally-originated realm-config change (strategy upsert, node
-        // placement, quota) must re-run the placement reconciler on this origin
-        // so its rank-0 shard topic geneses are created without a restart; the
-        // inbound reconcile path does the same for remote changes.
-        if realm_config_drained {
+        if invocation.config_drained {
             self.schedule_sync_placements(realm_id, net_handle.node_id())
                 .await;
         }
 
-        // Nothing derived from the realm config is carried forward.
-        rotation.cursor = if reached_end {
+        let unvisited = invocation.has_unvisited();
+        rotation.cursor = if invocation.reached_end {
             None
         } else {
-            start_after.clone()
+            invocation.cursor.clone()
         };
-        rotation.blocked_topics = defer_state.deferred_topics.clone();
-        rotation.blocked_origins = defer_state.blocked_origins.clone();
-        rotation.undeliverable_topics = defer_state.undeliverable_topics.clone();
-        rotation.totals.examined += record_count;
-        rotation.totals.deleted += totals.deleted;
-        rotation.totals.deferred += deferred_total;
-        rotation.totals.undeliverable += undeliverable_total;
-        rotation.totals.retried += usize::from(totals.retry_needed);
+        rotation.blocked_topics = invocation.defer.deferred_topics;
+        rotation.blocked_origins = invocation.defer.blocked_origins;
+        rotation.undeliverable_topics = invocation.defer.undeliverable_topics;
+        rotation.totals.examined += invocation.records;
+        rotation.totals.deleted += invocation.outcome.deleted;
+        rotation.totals.deferred += invocation.deferred;
+        rotation.totals.undeliverable += invocation.undeliverable;
+        rotation.totals.retry_invocations +=
+            usize::from(invocation.outcome.retry_needed || invocation.read_failed);
         rotation.totals.invocations = rotation.totals.invocations.saturating_add(1);
 
-        let oldest_age_ms = oldest_record_ms
+        let oldest_age_ms = invocation
+            .oldest_record_ms
             .map(|record_ms| unix_timestamp_millis().saturating_sub(record_ms))
             .unwrap_or(0);
-        // Unvisited work is what a bound cut short, not what this pass deferred.
-        let unvisited = !reached_end && !read_failed;
-        if record_count > 0 {
+        if invocation.records > 0 {
             info!(
                 event = "pipeline.drain.summary",
-                records = record_count,
-                examined = record_count,
-                deleted = totals.deleted,
-                deferred = deferred_total,
-                undeliverable = undeliverable_total,
-                retried = usize::from(totals.retry_needed),
-                remaining = usize::from(unvisited),
+                records = invocation.records,
+                examined = invocation.records,
+                deleted = invocation.outcome.deleted,
+                deferred = invocation.deferred,
+                undeliverable = invocation.undeliverable,
+                retry_scheduled = invocation.outcome.retry_needed || invocation.read_failed,
+                has_unvisited = unvisited,
                 continuation = rotation.continuations,
-                rotation_complete = reached_end,
-                groups = group_count,
-                subbatches = subbatch_count,
-                pages,
-                scan_ms = duration_ms(scan_elapsed),
-                publish_ms = duration_ms(publish_elapsed),
-                sync_ms = duration_ms(totals.sync_elapsed),
-                project_ms = duration_ms(totals.project_elapsed),
-                delete_ms = duration_ms(totals.delete_elapsed),
+                rotation_complete = invocation.reached_end,
+                groups = invocation.groups,
+                subbatches = invocation.subbatches,
+                pages = invocation.pages,
+                scan_ms = duration_ms(invocation.scan_elapsed),
+                publish_ms = duration_ms(invocation.publish_elapsed),
+                sync_ms = duration_ms(invocation.outcome.sync_elapsed),
+                project_ms = duration_ms(invocation.outcome.project_elapsed),
+                delete_ms = duration_ms(invocation.outcome.delete_elapsed),
                 total_ms = duration_ms(drain_started.elapsed()),
                 oldest_age_ms,
-                retry = totals.retry_needed,
+                retry = invocation.outcome.retry_needed || invocation.read_failed,
                 "Document sync outbox drain summary"
             );
         }
 
-        if totals.retry_needed || read_failed {
-            // A persisted failure deadline outranks a rotation continuation.
+        if invocation.outcome.retry_needed || invocation.read_failed {
             rotation.continuations = 0;
             self.store_rotation(rotation);
             self.reschedule_with_backoff(retry_key).await;
-            return;
-        }
-        if unvisited {
-            if rotation.continuations < OUTBOX_CONTINUATION_STREAK {
+        } else if unvisited {
+            if rotation.continuations < self.outbox_limits.continuation_streak {
                 rotation.continuations = rotation.continuations.saturating_add(1);
                 self.store_rotation(rotation);
                 self.reschedule_timer(retry_key, OUTBOX_CONTINUATION_AFTER)
                     .await;
             } else {
-                // Keep the cursor and blocks so the rotation resumes where it was.
                 rotation.continuations = 0;
                 self.store_rotation(rotation);
                 self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
                     .await;
             }
-            return;
-        }
-
-        // Records inserted behind the cursor wait for the next rotation.
-        let closed = rotation.close();
-        self.store_rotation(rotation);
-        if closed.examined > 0 {
-            info!(
-                event = "pipeline.drain.rotation",
-                examined = closed.examined,
-                deleted = closed.deleted,
-                deferred = closed.deferred,
-                undeliverable = closed.undeliverable,
-                retried = closed.retried,
-                invocations = closed.invocations,
-                "Document sync outbox rotation complete"
-            );
-        }
-
-        if deferred_total > 0 {
-            // Deferred records wait only for a genesis to arrive from the
-            // shard's rank-0 holder; retry quickly rather than on the failure
-            // backoff.
-            self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
-                .await;
         } else {
-            // The rotation made progress or found no eligible work.
-            self.reset_backoff(&retry_key);
+            self.close_rotation(retry_key, rotation).await;
         }
     }
 
@@ -2426,7 +2399,6 @@ pub async fn initialize_task_holder(
 pub struct TaskQueues {
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
-    jobs_runtime: Arc<JobsRuntime>,
     handler: Arc<OperationsTaskHandler>,
     refresh_holders: bool,
 }
@@ -2459,7 +2431,6 @@ async fn install_task_handler(
     TaskQueues {
         context,
         task_handle,
-        jobs_runtime,
         handler,
         refresh_holders,
     }
@@ -2472,18 +2443,9 @@ impl TaskQueues {
         let Self {
             context,
             task_handle,
-            jobs_runtime,
             handler,
             refresh_holders,
         } = self;
-        let jobs_started = jobs_runtime.is_started();
-        if jobs_started
-            && let Err(error) = jobs_runtime
-                .recover_stale_jobs(&context.storage_handle)
-                .await
-        {
-            warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to recover stale jobs at startup");
-        }
         spawn_queue_rearm(&context, &task_handle, shutdown);
         restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
@@ -2500,9 +2462,6 @@ impl TaskQueues {
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
-        if jobs_started {
-            restore_job_queue_timer(&context.storage_handle, &task_handle).await;
-        }
         restore_job_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
         if context.blob_handle.is_some() {
@@ -2520,13 +2479,14 @@ impl TaskQueues {
     }
 }
 
-/// Runs one document sync outbox drain pass synchronously against `context`.
-/// A placement mutation that drains the local node uses this to flush the
-/// records it accepted before its holdership loss right away, narrowing the
-/// window before the asynchronous drain timer fires; the flush is best-effort,
-/// so a failure simply leaves the records for the retryable drain.
+/// Kicks the installed document-sync drain owner without replacing an existing
+/// persisted retry deadline.
 pub async fn drive_document_sync_outbox_drain(context: Arc<DriverContext>) {
-    OutboxDrainer::new(context).run_once().await;
+    let Some(task_handle) = context.task_handle.as_ref() else {
+        warn!("Cannot kick document sync outbox drain without task handle");
+        return;
+    };
+    restore_document_sync_outbox_timers(&context.storage_handle, task_handle).await;
 }
 
 /// A document sync drain that keeps its rotation across invocations like the
