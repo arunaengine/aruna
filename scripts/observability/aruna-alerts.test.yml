@@ -4,7 +4,7 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
-  # Recovery stalls: not converged and no progress timestamp movement.
+  # A driver that never finishes its first unit fires after one ten-minute window.
   - interval: 1m
     input_series:
       - series: 'aruna_recovery_state{instance="node-a:3002",state="converged"}'
@@ -14,10 +14,10 @@ tests:
       - series: 'aruna_recovery_last_progress_timestamp_seconds{instance="node-a:3002"}'
         values: "0+0x40"
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 10m
         alertname: ArunaRecoveryStalled
         exp_alerts: []
-      - eval_time: 25m
+      - eval_time: 11m
         alertname: ArunaRecoveryStalled
         exp_alerts:
           - exp_labels:
@@ -27,7 +27,7 @@ tests:
               summary: Aruna remote recovery has made no progress for 10 minutes
               description: >-
                 The node is serving but its remote recovery is not converged and has
-                not completed a work unit for ten minutes. Check peer reachability
+                made no measurable progress for ten minutes. Check peer reachability
                 and the startup.recovery.degraded events; do not restart the node
                 merely because peers are unavailable.
               runbook: docs/operational-recovery.md

@@ -52,7 +52,7 @@ Record, in this order:
 2. container restart count;
 3. outbox depth **lower bound** and whether it is capped;
 4. oldest outbox record age;
-5. last recovery progress timestamp.
+5. recovery start/last measurable progress timestamp.
 
 ## 3. Reading `/readyz`
 
@@ -73,14 +73,21 @@ Record, in this order:
 }
 ```
 
+`topics_remaining` is the current recovery rotation's count of distinct
+unresolved topics plus topics in restore units that have not been visited yet.
+It is not an outbox-depth value. A non-topic recovery phase can keep the node
+`degraded` with a zero count; inspect `last_error_class` as well. The count
+reaches zero only after a complete rotation has no unresolved topic or failed
+phase.
+
 `recovery.state` is one of:
 
 | State | Meaning | Action |
 | --- | --- | --- |
 | `pending` | Remote recovery has not started. | Normal for the first seconds after the serving gate. |
 | `running` | A bounded recovery pass is active. | Wait. |
-| `degraded` | A pass completed with retryable unavailable-peer work. | Restore peers. Do **not** restart this node. |
-| `converged` | No known remote-recovery remainder. | Nothing to do. |
+| `degraded` | The latest bounded invocation left retryable work or an error. The driver continues an incomplete rotation immediately, or backs off after it has visited the rotation. | Restore peers. Do **not** restart this node. |
+| `converged` | A complete current rotation found no unresolved topic or failed recovery phase. | Nothing to do. |
 
 `last_error_class` is a closed set: `peer_unavailable`, `storage`, `panicked`.
 `panicked` means the recovery driver itself died; convergence then depends only
@@ -94,9 +101,9 @@ structured log events in section 5 for detail.
 | Series | Use |
 | --- | --- |
 | `aruna_recovery_state{state=...}` | One-hot; the current lifecycle of remote recovery. |
-| `aruna_recovery_topics_remaining` | Held topics the latest pass could not finish. |
-| `aruna_recovery_last_progress_timestamp_seconds` | Staleness input for `ArunaRecoveryStalled`. |
-| `aruna_recovery_pass_total{outcome=...}` | `success` / `partial` / `failed` pass counts. |
+| `aruna_recovery_topics_remaining` | Distinct unresolved topics plus topics in unvisited restore units in the current rotation; zero is meaningful only after a clean complete rotation. |
+| `aruna_recovery_last_progress_timestamp_seconds` | Unix seconds when recovery started or last made measurable progress: a completed work unit, reduced unresolved work, or completed recovery phase. Staleness input for `ArunaRecoveryStalled`. |
+| `aruna_recovery_pass_total{outcome=...}` | Completed bounded invocation counts labeled `success`, `partial`, or `failed`. |
 | `aruna_queue_depth{queue=...}` | Durable queue depth. |
 | `aruna_queue_depth_capped{queue=...}` | **1 means "at least the scan ceiling", not exactly it.** |
 | `aruna_queue_oldest_age_seconds{queue=...}` | Convergence SLO input. |
@@ -115,11 +122,11 @@ kubectl logs <pod> --since=15m --previous | grep -E 'startup\.recovery|pipeline\
 | Event | Meaning |
 | --- | --- |
 | `startup.recovery.begin` | The tracked recovery driver started, after the serving gate. |
-| `startup.recovery.progress` | One bounded work unit finished. Carries phase and counts. |
-| `startup.recovery.degraded` | A pass left retryable work; carries `topics_remaining` and `error_class`. |
+| `startup.recovery.progress` | A shard-restore work unit finished; placement reconciliation also emits a phase progress event. Carries phase and counts where applicable. |
+| `startup.recovery.degraded` | A completed rotation left retryable work or a failed recovery phase; carries unresolved `topics_remaining` and `error_class`. |
 | `startup.recovery.complete` | Converged. |
-| `pipeline.drain.summary` | One bounded outbox invocation: examined, deleted, deferred, undeliverable, retried, remaining, continuation, rotation_complete. |
-| `pipeline.drain.rotation` | One rotation reached the keyspace end; totals across its invocations. |
+| `pipeline.drain.summary` | One bounded outbox invocation: `examined`, `deleted`, `deferred`, and `undeliverable` are record counts; `retry_scheduled`, `has_unvisited`, and `rotation_complete` are booleans; `continuation` and timing/page fields describe the bound. |
+| `pipeline.drain.rotation` | One rotation reached its observed high-water boundary; totals across its invocations. `retry_invocations` counts invocations that scheduled retry, not records. |
 | `pipeline.drain.stuck` | Records whose buckets this node holds but whose shard genesis never arrived. |
 | `pipeline.drain.undeliverable` | Records this node can never publish. Never deleted; needs a placement fix. |
 
@@ -161,6 +168,7 @@ exactly the incident this design removes.
 | --- | --- | --- |
 | `0` | Clean, ordered shutdown inside its grace budget. | None. |
 | `75` | The graceful-shutdown watchdog forced exit: the drain exceeded `ARUNA_SHUTDOWN_GRACE_SECS` (default 20 s) plus its margin. | Investigate what did not stop. Check for an in-flight drain or recovery pass at SIGTERM. |
+| `143` | A second SIGTERM stopped an active graceful drain immediately. | This is intentional only for an emergency stop; inspect the shutdown logs and let the next start replay durable work. |
 | `137` | Kubernetes SIGKILL after `terminationGracePeriodSeconds`. | The pod grace is too short for the application budget, or the process ignored SIGTERM. Ensure pod grace (30 s) exceeds the application budget (20 s) plus the 5 s watchdog margin. |
 
 Check it with:
@@ -169,7 +177,9 @@ Check it with:
 kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'
 ```
 
-A repeated 75 or any 137 is a shutdown defect, not a peer problem.
+A repeated 75 or any 137 is a shutdown defect, not a peer problem. Exit 143 is
+expected only after an operator or supervisor sends a second SIGTERM during the
+active drain.
 
 ## 9. Alerts
 
@@ -179,13 +189,23 @@ this repository's Aruna scrape actually ingests. It is loaded from
 `scripts/observability/aruna-alerts.test.yml`:
 
 ```sh
-promtool check rules  scripts/observability/aruna-alerts.yml
-promtool test rules   scripts/observability/aruna-alerts.test.yml
+PROMETHEUS_IMAGE='prom/prometheus:v3.5.3@sha256:ddc2493835a1509976d5e4e0c94199c4f843ce1f42dd6bcfc8231ba734a93ff7'
+promtool() {
+  docker run --rm --network none \
+    --volume "$PWD/scripts/observability:/rules:ro" \
+    --entrypoint /bin/promtool \
+    "$PROMETHEUS_IMAGE" "$@"
+}
+promtool check rules /rules/aruna-alerts.yml
+promtool test rules /rules/aruna-alerts.test.yml
 ```
+
+This uses the Prometheus image pinned by the repository's Compose and CI
+configuration; it does not require a host-installed `promtool`.
 
 | Alert | Fires when | First action |
 | --- | --- | --- |
-| `ArunaRecoveryStalled` | not converged and no progress for 10 min | Section 6, then restore peers. |
+| `ArunaRecoveryStalled` | not converged and no measurable progress for more than 10 min | Section 6, then restore peers. |
 | `ArunaOutboxCapped` | `queue_depth_capped == 1` for 5 min | Treat depth as a lower bound; check drain summaries. |
 | `ArunaOutboxOld` | oldest age > 15 min for 10 min | Convergence SLO breach; check peers and drain summaries. |
 | `ArunaQueueProbeDown` | `queue_probe_up == 0` for 5 min | Backlog alerts are blind; check the storage worker. |
@@ -198,7 +218,7 @@ ingest them, they stay manual checks here:
 | --- | --- |
 | `ArunaNoReadyNodes` (zero ready pods for 2 min) | `kubectl get pod -l app=aruna -o wide` |
 | `ArunaRestartLoop` (≥2 restarts in 10 min) | `kubectl get pod -l app=aruna -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].restartCount}{"\n"}{end}'` |
-| `ArunaForcedShutdown` (exit 75 or the watchdog log line) | section 8, plus `kubectl logs <pod> --previous \| grep -i watchdog` |
+| `ArunaForcedShutdown` (exit 75/143 or the watchdog log line) | section 8, plus `kubectl logs <pod> --previous \| grep -i watchdog` |
 
 There is deliberately no app-local forced-exit counter: a forced exit can
 terminate before the process persists or exports one, so exit code 75 and the

@@ -439,7 +439,7 @@ impl Collector for RecoveryCollector {
         let remaining = ConstGauge::new(snapshot.topics_remaining as i64);
         let metric_encoder = encoder.encode_descriptor(
             "recovery_topics_remaining",
-            "Held topics the latest recovery pass could not finish",
+            "Unresolved and unvisited topics in the current recovery rotation",
             None,
             remaining.metric_type(),
         )?;
@@ -448,7 +448,7 @@ impl Collector for RecoveryCollector {
         let progress = ConstGauge::new(snapshot.last_progress_timestamp as i64);
         let metric_encoder = encoder.encode_descriptor(
             "recovery_last_progress_timestamp_seconds",
-            "Unix timestamp of the last completed recovery work unit",
+            "Unix timestamp when recovery started or last made measurable progress",
             None,
             progress.metric_type(),
         )?;

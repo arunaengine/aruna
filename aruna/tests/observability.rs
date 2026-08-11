@@ -338,18 +338,20 @@ mod process {
             }
         }
 
-        /// Document-sync outbox rows of the stopped node, described by target and
-        /// event so a delta names the work a restart added. Heartbeat rows are
-        /// excluded: their timer, not the restart, decides when they appear.
-        pub async fn outbox_rows(&self) -> Vec<String> {
+        /// Exact document-sync outbox rows of the stopped node.
+        pub async fn outbox_rows(
+            &self,
+        ) -> Vec<(Vec<u8>, aruna_core::document::DocumentSyncOutboxRecord)> {
             let storage = self.open_storage().await;
             let rows = read_outbox(&storage).await;
             drop(storage);
-            rows.into_iter().filter(|row| !heartbeat_row(row)).collect()
+            rows
         }
     }
 
-    pub async fn read_outbox(storage: &StorageHandle) -> Vec<String> {
+    pub async fn read_outbox(
+        storage: &StorageHandle,
+    ) -> Vec<(Vec<u8>, aruna_core::document::DocumentSyncOutboxRecord)> {
         let mut start: Option<aruna_core::types::Key> = None;
         let mut rows = Vec::new();
         loop {
@@ -369,33 +371,16 @@ mod process {
             else {
                 panic!("unexpected outbox iter event: {event:?}");
             };
-            rows.extend(values.into_iter().map(|(_, value)| describe_outbox(&value)));
+            rows.extend(values.into_iter().map(|(key, value)| {
+                let record = postcard::from_bytes(&value).expect("outbox record decodes");
+                (key.to_vec(), record)
+            }));
             match next_start_after {
                 Some(next) => start = Some(next),
                 None => break,
             }
         }
         rows
-    }
-
-    fn describe_outbox(value: &[u8]) -> String {
-        use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
-
-        let Ok(record) = postcard::from_bytes::<DocumentSyncOutboxRecord>(value) else {
-            return "undecodable outbox record".to_string();
-        };
-        let kind = match &record.event {
-            DocumentSyncOutboxEvent::Upsert { .. } => "upsert",
-            DocumentSyncOutboxEvent::Delete { .. } => "delete",
-            DocumentSyncOutboxEvent::AdminOperation { .. } => "admin",
-        };
-        format!("{kind} {:?}", record.target)
-    }
-
-    /// Node info is the periodic liveness heartbeat: its revisions follow the
-    /// heartbeat timer, so they are never restart-attributable work.
-    pub fn heartbeat_row(row: &str) -> bool {
-        row.contains("NodeInfo")
     }
 
     pub struct NodeProcess {
@@ -420,7 +405,7 @@ mod process {
         }
 
         /// Only what this launch logged.
-        fn own_logs(&self) -> String {
+        pub fn own_logs(&self) -> String {
             let logs = self.logs();
             logs.get(self.log_start..).unwrap_or_default().to_string()
         }
@@ -428,6 +413,28 @@ mod process {
         /// Waits until the ops listener answers `path` with `expect`.
         pub async fn wait_status(&mut self, path: &str, expect: StatusCode) -> String {
             self.wait_body(path, expect, "").await
+        }
+
+        /// Waits for readiness to report draining while liveness remains up.
+        pub async fn wait_draining(&mut self) -> String {
+            let body = self
+                .wait_body(
+                    "/readyz",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "node is draining",
+                )
+                .await;
+            let health = probe_client()
+                .get(format!("{}/healthz", self.ops_url))
+                .send()
+                .await
+                .expect("liveness probe during shutdown");
+            assert_eq!(
+                health.status(),
+                StatusCode::OK,
+                "ops listener must remain up"
+            );
+            body
         }
 
         /// Same, but also waiting for `needle` in the body. Recovery cycles
@@ -489,6 +496,11 @@ mod process {
         /// Sends SIGTERM and waits for exit inside the hang guard.
         pub async fn terminate(mut self) -> std::process::ExitStatus {
             self.signal("TERM");
+            self.wait_exit().await
+        }
+
+        /// Waits for this launch to exit inside the deadlock guard.
+        pub async fn wait_exit(&mut self) -> std::process::ExitStatus {
             let deadline = Instant::now() + HANG_GUARD;
             loop {
                 match self.child.try_wait().expect("wait for exit") {
@@ -521,8 +533,7 @@ mod process {
     use reqwest::StatusCode;
 }
 
-/// Adds synthetic, never-dialled peers plus a strategy the node has no genesis
-/// for, so the stopped node's state names absent peers and owes them work.
+/// Adds synthetic, never-dialled peers and bounds their placement workload.
 async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<()> {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -551,21 +562,21 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
         let peer = iroh::SecretKey::from_bytes(&[0xA0 + seed; 32]).public();
         config.ensure_node(peer, RealmNodeKind::Server);
     }
-    // Every held shard now has absent co-holders, so keep the shard counts small:
-    // the restore attempt per topic and peer is what the harness pays for.
+    // Keep outage recovery bounded to the fewest synthetic topics.
     for strategy in &mut config.strategies {
-        strategy.shard_count = 2;
+        strategy.shard_count = if count == 1 { 1 } else { 2 };
     }
-    // Shards of a strategy added after the first boot have no local genesis, so
-    // restoring them needs a co-holder that never answers.
-    config.strategies.push(PlacementStrategy {
-        strategy_id: ulid::Ulid::from_bytes([0x5A; 16]),
-        name: "offline-harness".to_string(),
-        replica_count: None,
-        distinct_locations: false,
-        affinity: Vec::new(),
-        shard_count: 2,
-    });
+    // Extra strategy coverage remains in the two-peer outage fixtures.
+    if count > 1 {
+        config.strategies.push(PlacementStrategy {
+            strategy_id: ulid::Ulid::from_bytes([0x5A; 16]),
+            name: "offline-harness".to_string(),
+            replica_count: None,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 2,
+        });
+    }
     let value = postcard::to_allocvec(&config).expect("encode realm config");
     let event = storage
         .send_storage_effect(StorageEffect::Write {
@@ -584,10 +595,161 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
     Ok(())
 }
 
+async fn load_state(
+    storage: &aruna_storage::StorageHandle,
+) -> TestResult<aruna::config::PersistedNodeState> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: b"node_state".to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => Ok(postcard::from_bytes::<aruna::config::PersistedNodeState>(
+            &value,
+        )?),
+        other => return Err(format!("unexpected node state event: {other:?}").into()),
+    }
+}
+
+async fn load_realm(
+    storage: &aruna_storage::StorageHandle,
+) -> TestResult<aruna_core::structs::RealmConfigDocument> {
+    use aruna_core::effects::{IterStart, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::structs::RealmConfigDocument;
+
+    match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            prefix: None,
+            start: None::<IterStart>,
+            limit: 8,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values
+            .into_iter()
+            .find_map(|(_, value)| RealmConfigDocument::from_bytes(&value).ok())
+            .ok_or("realm config missing")?),
+        other => return Err(format!("unexpected realm config event: {other:?}").into()),
+    }
+}
+
+async fn clear_space(storage: &aruna_storage::StorageHandle, key_space: &str) -> TestResult<()> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+
+    let values = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 4096,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        other => return Err(format!("unexpected {key_space} event: {other:?}").into()),
+    };
+    if values.is_empty() {
+        return Ok(());
+    }
+    let deletes = values
+        .into_iter()
+        .map(|(key, _)| (key_space.to_string(), key))
+        .collect();
+    let event = storage
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        })
+        .await;
+    assert!(
+        matches!(
+            event,
+            Event::Storage(StorageEvent::BatchDeleteResult { .. })
+        ),
+        "unexpected {key_space} delete event: {event:?}"
+    );
+    Ok(())
+}
+
+/// Leaves one valid document-sync row for the first post-start drain.
+async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+        DocumentSyncTarget,
+    };
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::structs::PlacementRef;
+    use aruna_operations::document_sync_outbox::{new_outbox_record, outbox_write_entry};
+
+    let storage = env.open_storage().await;
+    clear_space(&storage, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await?;
+    clear_space(&storage, TASK_TIMER_KEYSPACE).await?;
+    let state = load_state(&storage).await?;
+    let config = load_realm(&storage).await?;
+    let node_id = iroh::SecretKey::from_bytes(&state.net_secret_key).public();
+    let placement = PlacementRef::NIL;
+    let record = new_outbox_record(
+        node_id,
+        DocumentSyncTarget::NodeInfo {
+            realm_id: config.realm_id,
+            node_id,
+        },
+        Vec::new(),
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: Vec::new(),
+            change: DocumentSyncChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: 1,
+                    event_id: ulid::Ulid::from_parts(7, 1),
+                    actor: node_id,
+                    updated_at_ms: 1,
+                },
+                kind: DocumentSyncChangeKind::Upsert,
+                placement,
+            },
+        },
+        placement,
+        true,
+    );
+    let (key_space, key, value) = outbox_write_entry(&record)?;
+    let event = storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space,
+            key: key.clone(),
+            value,
+            txn_id: None,
+        })
+        .await;
+    assert!(
+        matches!(event, Event::Storage(StorageEvent::WriteResult { .. })),
+        "unexpected outbox write event: {event:?}"
+    );
+    storage.sync_all().await?;
+    drop(storage);
+    Ok(key.to_vec())
+}
+
 /// The delta between two restarts against unchanged state is what startup itself
 /// adds to the document-sync outbox; it must be exactly zero.
 #[tokio::test]
-async fn restart_adds_no_outbox() -> TestResult<()> {
+async fn restart_preserves_outbox() -> TestResult<()> {
     let env = process::NodeEnv::new();
 
     let mut first = env.launch();
@@ -599,12 +761,14 @@ async fn restart_adds_no_outbox() -> TestResult<()> {
     let mut second = env.launch();
     second.wait_status("/healthz", StatusCode::OK).await;
     second.wait_log("startup.recovery.degraded").await;
+    second.wait_log("pipeline.drain.rotation").await;
     second.terminate().await;
     let before = env.outbox_rows().await;
 
     let mut third = env.launch();
     third.wait_status("/healthz", StatusCode::OK).await;
     third.wait_log("startup.recovery.degraded").await;
+    third.wait_log("pipeline.drain.rotation").await;
     third.terminate().await;
     let after = env.outbox_rows().await;
 
@@ -642,6 +806,14 @@ async fn gate_survives_outage() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(info.status(), StatusCode::OK);
+    let realm = client
+        .get(format!("{}/api/v1/info/realm", node.rest_url))
+        .send()
+        .await?;
+    assert_eq!(realm.status(), StatusCode::OK);
+    let realm: serde_json::Value = realm.json().await?;
+    assert_eq!(realm["description"], "observability harness realm");
+    assert!(realm["realm_id"].as_str().is_some(), "missing realm id");
 
     node.wait_log("startup.recovery.degraded").await;
     assert!(node.is_running(), "a peer outage must not end the process");
@@ -702,14 +874,32 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
     first.wait_status("/readyz", StatusCode::OK).await;
     first.terminate().await;
 
-    inject_offline_peers(&env, 2).await?;
+    inject_offline_peers(&env, 1).await?;
+    let outbox_key = inject_outbox(&env).await?;
+    assert!(
+        env.outbox_rows()
+            .await
+            .iter()
+            .any(|(key, _)| key == &outbox_key),
+        "the shutdown case must start with durable outbox work"
+    );
 
     let mut node = env.launch();
     node.wait_status("/readyz", StatusCode::OK).await;
-    // Recovery is blocked on unreachable peers and the drain timer is armed.
+    // Recovery is blocked on unreachable peers and the outbox drain is active.
     node.wait_log("startup.recovery.degraded").await;
+    node.wait_log("pipeline.publish.summary").await;
 
-    let status = node.terminate().await;
+    node.signal("TERM");
+    let body = node.wait_draining().await;
+    let ready: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(ready["ready"], serde_json::json!(false));
+    assert_eq!(
+        ready["checks"]["startup"],
+        serde_json::json!("failed: node is draining")
+    );
+
+    let status = node.wait_exit().await;
     assert_eq!(
         status.code(),
         Some(0),
@@ -720,5 +910,63 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
         None,
         "the process must not be killed by a signal"
     );
+    let logs = node.own_logs();
+    assert!(
+        logs.contains("pipeline.drain.summary"),
+        "outbox drain missing\n{logs}"
+    );
+    let draining = logs
+        .find("Shutdown: readiness gate closed, draining")
+        .expect("shutdown must close readiness first");
+    let tasks = logs
+        .find("Shutdown: task scheduler drained")
+        .unwrap_or_else(|| panic!("task children did not finish\n{logs}"));
+    let background = logs
+        .find("phase=\"background\"")
+        .unwrap_or_else(|| panic!("background phase missing\n{logs}"));
+    let complete = logs
+        .find("Shutdown complete")
+        .expect("shutdown must finish after storage sync");
+    assert!(
+        draining < tasks && tasks < background && background < complete,
+        "{logs}"
+    );
+    assert!(
+        !logs.contains("Background children failed to drain before shutdown continued"),
+        "{logs}"
+    );
+    assert!(!logs.contains("storage.write.after_seal"), "{logs}");
+    assert!(!logs.contains("storage.write.after_fence"), "{logs}");
+    assert!(logs.contains("rejected_writes=0"), "{logs}");
+    Ok(())
+}
+
+/// A second SIGTERM must force the process out of an active drain.
+#[tokio::test]
+async fn second_signal_exits() -> TestResult<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = process::NodeEnv::new();
+    let mut first = env.launch();
+    first.wait_status("/readyz", StatusCode::OK).await;
+    first.terminate().await;
+
+    inject_offline_peers(&env, 1).await?;
+    inject_outbox(&env).await?;
+
+    let mut node = env.launch();
+    node.wait_status("/readyz", StatusCode::OK).await;
+    node.wait_log("startup.recovery.degraded").await;
+    node.signal("TERM");
+    node.wait_draining().await;
+    node.signal("TERM");
+
+    let status = node.wait_exit().await;
+    assert_eq!(
+        status.signal(),
+        None,
+        "forced exit should use the documented code"
+    );
+    assert_eq!(status.code(), Some(143), "second SIGTERM must force exit");
     Ok(())
 }

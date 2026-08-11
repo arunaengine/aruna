@@ -2,21 +2,19 @@ groups:
   - name: aruna-recovery
     rules:
       # Remote recovery is not converged and has published no progress for ten
-      # minutes. Peer loss alone is expected and does not fire this: the driver
-      # keeps publishing progress while it makes any.
+      # minutes. The timestamp starts with the driver and moves only on work.
       - alert: ArunaRecoveryStalled
         expr: |
           max by (instance) (aruna_recovery_state{state="converged"}) == 0
           and
           (time() - max by (instance) (aruna_recovery_last_progress_timestamp_seconds)) > 600
-        for: 10m
         labels:
           severity: warning
         annotations:
           summary: Aruna remote recovery has made no progress for 10 minutes
           description: >-
             The node is serving but its remote recovery is not converged and has
-            not completed a work unit for ten minutes. Check peer reachability
+            made no measurable progress for ten minutes. Check peer reachability
             and the startup.recovery.degraded events; do not restart the node
             merely because peers are unavailable.
           runbook: docs/operational-recovery.md
