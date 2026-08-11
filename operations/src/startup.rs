@@ -806,15 +806,26 @@ pub async fn restore_shard_pass(
     cursor: &mut ShardRestoreCursor,
     cancelled: &CancellationToken,
 ) -> ShardRestorePass {
-    let Some(net_handle) = context.net_handle.clone() else {
-        *cursor = ShardRestoreCursor::default();
-        return ShardRestorePass {
-            wrapped: true,
-            ..ShardRestorePass::default()
-        };
+    let config = match load_realm_config(context, realm_id).await {
+        RealmConfigLoad::Found(config) => config,
+        RealmConfigLoad::Absent => {
+            // No config yet (fresh/onboarding node): nothing sharded to restore.
+            *cursor = ShardRestoreCursor::default();
+            return ShardRestorePass {
+                wrapped: true,
+                ..ShardRestorePass::default()
+            };
+        }
+        RealmConfigLoad::StorageFailure => {
+            *cursor = ShardRestoreCursor::default();
+            return ShardRestorePass {
+                error: Some(RecoveryError::Storage),
+                wrapped: true,
+                ..ShardRestorePass::default()
+            };
+        }
     };
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        // No config yet (fresh/onboarding node): nothing sharded to restore.
+    let Some(net_handle) = context.net_handle.clone() else {
         *cursor = ShardRestoreCursor::default();
         return ShardRestorePass {
             wrapped: true,
@@ -825,13 +836,16 @@ pub async fn restore_shard_pass(
     let mut summary = plan.summary;
     let units = plan.into_units();
     let units_total = units.len();
+    let plan_changed = bind_restore_plan(cursor, &units);
     if units_total == 0 {
-        *cursor = ShardRestoreCursor::default();
+        cursor.next_unit = 0;
         return ShardRestorePass {
             summary,
             units_processed: 0,
             units_total: 0,
+            plan_changed,
             wrapped: true,
+            ..ShardRestorePass::default()
         };
     }
 
@@ -839,32 +853,38 @@ pub async fn restore_shard_pass(
     // durably verified; join verification below happens after this restore.
     let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
 
-    let (start, mut end, mut wrapped) = restore_range(*cursor, units_total);
-    let mut withheld = 0usize;
-    for (offset, unit) in units[start..end].iter().enumerate() {
-        // Cancellation lands between work units, so an interrupted pass leaves
-        // the cursor on the first unprocessed unit.
-        if cancelled.is_cancelled() {
-            end = start + offset;
-            wrapped = false;
-            break;
-        }
-        withheld += process_restore_unit(context, &net_handle, node_id, unit, &verified).await;
-    }
-    summary.withheld_topics = withheld;
-    cursor.next_unit = if wrapped { 0 } else { end };
+    let (start, end, wrapped) = restore_range(*cursor, units_total);
+    let batch = restore_batch(
+        context,
+        &net_handle,
+        node_id,
+        &units,
+        start,
+        end,
+        wrapped,
+        &verified,
+        cancelled,
+    )
+    .await;
+    summary.withheld_topics = batch.unresolved_topics.len();
+    cursor.next_unit = if batch.wrapped { 0 } else { batch.end };
+    let unvisited_topics = units[batch.end..]
+        .iter()
+        .map(|unit| unit.topics.len())
+        .sum();
+    let unresolved_topics = batch.unresolved_topics;
 
     // A withheld genesis (co-holder down or refusing) has no placement record to
     // drive a re-run, so arm the retry timer here — the reconciler re-probes when
     // the co-holder returns instead of deferring writes at 1s until restart.
-    if withheld > 0
+    if !unresolved_topics.is_empty()
         && let Some(task_handle) = context.task_handle.as_ref()
     {
         let effect = crate::sync_placement::schedule_placement_retry_effect(realm_id, node_id);
         let _ = task_handle.send_effect(effect).await;
     }
 
-    if wrapped {
+    if batch.wrapped {
         // New-holder verification: reconcile each held shard against a co-holder
         // and persist a marker so a restart resumes only unverified shards.
         crate::shard::verify::verify_held_shards(context, node_id, realm_id).await;
@@ -872,9 +892,76 @@ pub async fn restore_shard_pass(
 
     ShardRestorePass {
         summary,
-        units_processed: end - start,
+        units_processed: batch.end - start,
+        topics_completed: batch.topics_completed,
         units_total,
-        wrapped,
+        unvisited_topics,
+        unresolved_topics,
+        error: batch.error,
+        plan_changed,
+        wrapped: batch.wrapped,
+    }
+}
+
+#[derive(Default)]
+struct RestoreBatch {
+    end: usize,
+    wrapped: bool,
+    topics_completed: usize,
+    unresolved_topics: BTreeSet<::irokle::TopicId>,
+    error: Option<RecoveryError>,
+}
+
+async fn restore_batch(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    node_id: NodeId,
+    units: &[RestoreUnit],
+    start: usize,
+    end: usize,
+    wrapped: bool,
+    verified: &BTreeSet<::irokle::TopicId>,
+    cancelled: &CancellationToken,
+) -> RestoreBatch {
+    let mut batch_end = end;
+    let mut batch_wrapped = wrapped;
+    let mut topics_completed = 0usize;
+    let mut unresolved_topics = BTreeSet::new();
+    let mut error = None;
+    for (offset, unit) in units[start..end].iter().enumerate() {
+        // Cancellation lands between work units, so an interrupted pass leaves
+        // the cursor on the first unprocessed unit.
+        if cancelled.is_cancelled() {
+            batch_end = start + offset;
+            batch_wrapped = false;
+            break;
+        }
+        let outcome = process_restore_unit(context, net_handle, node_id, unit, verified).await;
+        let completed = unit
+            .topics
+            .len()
+            .saturating_sub(outcome.unresolved_topics.len());
+        topics_completed = topics_completed.saturating_add(completed);
+        if completed > 0 {
+            info!(
+                event = "startup.recovery.progress",
+                phase = "shard_restore",
+                topics = completed,
+                withheld_topics = outcome.unresolved_topics.len(),
+                unit = start + offset + 1,
+                units_total = units.len(),
+                "Completed recovery topics"
+            );
+        }
+        unresolved_topics.extend(outcome.unresolved_topics);
+        error = RecoveryError::merge(error, outcome.error);
+    }
+    RestoreBatch {
+        end: batch_end,
+        wrapped: batch_wrapped,
+        topics_completed,
+        unresolved_topics,
+        error,
     }
 }
 
@@ -965,7 +1052,7 @@ pub async fn prepare_shard_policy(
     let Some(net_handle) = context.net_handle.clone() else {
         return RestoreShardSummary::default();
     };
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let RealmConfigLoad::Found(config) = load_realm_config(context, realm_id).await else {
         return RestoreShardSummary::default();
     };
     let plan = plan_shard_groups(&config, node_id, realm_id);
@@ -1034,6 +1121,41 @@ enum RestoreKind {
     Join,
 }
 
+fn bind_restore_plan(cursor: &mut ShardRestoreCursor, units: &[RestoreUnit]) -> bool {
+    let plan_hash = restore_plan_hash(units);
+    let changed = cursor.plan_hash != Some(plan_hash);
+    if changed {
+        cursor.next_unit = 0;
+        cursor.plan_hash = Some(plan_hash);
+    }
+    changed
+}
+
+fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for unit in units {
+        let kind = match unit.kind {
+            RestoreKind::Shared => 0,
+            RestoreKind::Rank0 => 1,
+            RestoreKind::Join => 2,
+        };
+        hasher.update(&[kind]);
+        hasher.update(&(unit.peers.len() as u64).to_be_bytes());
+        for peer in &unit.peers {
+            hasher.update(peer.as_bytes());
+        }
+        hasher.update(&(unit.retained.len() as u64).to_be_bytes());
+        for peer in &unit.retained {
+            hasher.update(peer.as_bytes());
+        }
+        hasher.update(&(unit.topics.len() as u64).to_be_bytes());
+        for topic in &unit.topics {
+            hasher.update(topic.as_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
 impl ShardPlan {
     /// Flattens the plan into a deterministic list of bounded work units.
     fn into_units(self) -> Vec<RestoreUnit> {
@@ -1064,128 +1186,184 @@ impl ShardPlan {
     }
 }
 
-/// Returns how many topics of `unit` were left withheld, so the caller can arm
-/// a retry instead of deferring writes until the next restart.
+#[derive(Default)]
+struct RestoreUnitOutcome {
+    unresolved_topics: BTreeSet<::irokle::TopicId>,
+    error: Option<RecoveryError>,
+}
+
+impl RestoreUnitOutcome {
+    fn fail_topics(&mut self, topics: impl IntoIterator<Item = ::irokle::TopicId>) {
+        let before = self.unresolved_topics.len();
+        self.unresolved_topics.extend(topics);
+        if self.unresolved_topics.len() > before {
+            self.error = RecoveryError::merge(self.error, Some(RecoveryError::PeerUnavailable));
+        }
+    }
+}
+
 async fn process_restore_unit(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     node_id: NodeId,
     unit: &RestoreUnit,
     verified: &BTreeSet<::irokle::TopicId>,
-) -> usize {
+) -> RestoreUnitOutcome {
     match unit.kind {
-        RestoreKind::Shared => {
-            let missing: Vec<::irokle::TopicId> = unit
-                .topics
-                .iter()
-                .copied()
-                .filter(|topic| {
-                    !net_handle
-                        .document_sync_topic_exists(*topic)
-                        .unwrap_or(false)
-                })
-                .collect();
-            if !missing.is_empty() {
-                let event = net_handle
-                    .sync_document_topics(missing, unit.peers.clone())
-                    .await;
-                apply_restored_reconcile(context, node_id, event).await;
-            }
-            if let Err(error) =
-                net_handle.ensure_document_sync_topics(&unit.topics, unit.peers.clone())
-            {
-                warn!(error = %error, "Failed to ensure shared realm topics on restart");
-            }
-            let event = net_handle
-                .sync_document_topics(unit.topics.clone(), unit.peers.clone())
-                .await;
-            apply_restored_reconcile(context, node_id, event).await;
-            0
-        }
-        RestoreKind::Rank0 => {
-            // An unreachable co-holder might still hold the genesis, so creation
-            // is withheld rather than forking a second one.
-            let group_withheld = crate::process_placements::ensure_rank0_shard_group(
-                context,
-                net_handle,
-                node_id,
-                unit.peers.clone(),
-                unit.topics.clone(),
-                &unit.retained,
-                verified,
-            )
+        RestoreKind::Shared => restore_shared(context, net_handle, node_id, unit).await,
+        RestoreKind::Rank0 => restore_rank0(context, net_handle, node_id, unit, verified).await,
+        RestoreKind::Join => restore_join(context, net_handle, node_id, unit, verified).await,
+    }
+}
+
+async fn restore_shared(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    node_id: NodeId,
+    unit: &RestoreUnit,
+) -> RestoreUnitOutcome {
+    let mut outcome = RestoreUnitOutcome::default();
+    let missing: Vec<::irokle::TopicId> = unit
+        .topics
+        .iter()
+        .copied()
+        .filter(|topic| {
+            !net_handle
+                .document_sync_topic_exists(*topic)
+                .unwrap_or(false)
+        })
+        .collect();
+    if !missing.is_empty() {
+        let event = net_handle
+            .sync_document_topics(missing.clone(), unit.peers.clone())
             .await;
-            // Only topics whose genesis is now local; withheld ones retry later.
-            let present: Vec<::irokle::TopicId> = unit
-                .topics
-                .iter()
-                .copied()
-                .filter(|topic| {
-                    net_handle
-                        .document_sync_topic_exists(*topic)
-                        .unwrap_or(false)
-                })
-                .collect();
-            let withheld = if group_withheld {
-                unit.topics.len().saturating_sub(present.len()).max(1)
-            } else {
-                0
-            };
-            if !present.is_empty() {
-                let event = net_handle
-                    .sync_document_topics(present, unit.peers.clone())
-                    .await;
-                apply_restored_reconcile(context, node_id, event).await;
-            }
-            withheld
-        }
-        RestoreKind::Join => {
-            let mut current_holders = unit.peers.clone();
-            current_holders.push(node_id);
-            current_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            // Install publisher policy before pulling history. Missing topics are
-            // expected and get an exact membership pass after a successful join.
-            let _ = net_handle
-                .reconcile_shard_membership(
-                    &unit.topics,
-                    current_holders.clone(),
-                    &unit.retained,
-                    verified,
-                )
-                .await;
-            let event = net_handle
-                .sync_document_topics(unit.topics.clone(), unit.peers.clone())
-                .await;
-            apply_restored_reconcile(context, node_id, event).await;
-            let present: Vec<::irokle::TopicId> = unit
-                .topics
-                .iter()
-                .copied()
-                .filter(|topic| {
-                    net_handle
-                        .document_sync_topic_exists(*topic)
-                        .unwrap_or(false)
-                })
-                .collect();
-            let mut withheld = unit.topics.len().saturating_sub(present.len());
-            if !present.is_empty()
-                && let Err(error) = net_handle
-                    .reconcile_shard_membership(&present, current_holders, &unit.retained, verified)
-                    .await
-            {
-                warn!(error = %error, "Failed to reconcile joined shard membership on restart");
-                withheld += present.len();
-            }
-            withheld
+        if !apply_restored_reconcile(context, node_id, event).await {
+            outcome.fail_topics(missing);
         }
     }
+    if let Err(error) = net_handle.ensure_document_sync_topics(&unit.topics, unit.peers.clone()) {
+        warn!(error = %error, "Failed to ensure shared realm topics on restart");
+        outcome.fail_topics(unit.topics.iter().copied());
+    }
+    let event = net_handle
+        .sync_document_topics(unit.topics.clone(), unit.peers.clone())
+        .await;
+    if !apply_restored_reconcile(context, node_id, event).await {
+        outcome.fail_topics(unit.topics.iter().copied());
+    }
+    outcome
+}
+
+async fn restore_rank0(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    node_id: NodeId,
+    unit: &RestoreUnit,
+    verified: &BTreeSet<::irokle::TopicId>,
+) -> RestoreUnitOutcome {
+    let mut outcome = RestoreUnitOutcome::default();
+    // An unreachable co-holder might hold the genesis; never fork a second one.
+    let group_withheld = crate::process_placements::ensure_rank0_shard_group(
+        context,
+        net_handle,
+        node_id,
+        unit.peers.clone(),
+        unit.topics.clone(),
+        &unit.retained,
+        verified,
+    )
+    .await;
+    let present: Vec<::irokle::TopicId> = unit
+        .topics
+        .iter()
+        .copied()
+        .filter(|topic| {
+            net_handle
+                .document_sync_topic_exists(*topic)
+                .unwrap_or(false)
+        })
+        .collect();
+    if group_withheld {
+        outcome.error = RecoveryError::merge(outcome.error, Some(RecoveryError::PeerUnavailable));
+    }
+    outcome.fail_topics(
+        unit.topics
+            .iter()
+            .copied()
+            .filter(|topic| !present.contains(topic)),
+    );
+    if !present.is_empty() {
+        let event = net_handle
+            .sync_document_topics(present.clone(), unit.peers.clone())
+            .await;
+        if !apply_restored_reconcile(context, node_id, event).await {
+            outcome.fail_topics(present);
+        }
+    }
+    outcome
+}
+
+async fn restore_join(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    node_id: NodeId,
+    unit: &RestoreUnit,
+    verified: &BTreeSet<::irokle::TopicId>,
+) -> RestoreUnitOutcome {
+    let mut outcome = RestoreUnitOutcome::default();
+    let mut current_holders = unit.peers.clone();
+    current_holders.push(node_id);
+    current_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    if let Err(error) = net_handle
+        .reconcile_shard_membership(
+            &unit.topics,
+            current_holders.clone(),
+            &unit.retained,
+            verified,
+        )
+        .await
+    {
+        warn!(error = %error, "Failed to prepare joined shard membership on restart");
+        outcome.fail_topics(unit.topics.iter().copied());
+    }
+    let event = net_handle
+        .sync_document_topics(unit.topics.clone(), unit.peers.clone())
+        .await;
+    if !apply_restored_reconcile(context, node_id, event).await {
+        outcome.fail_topics(unit.topics.iter().copied());
+    }
+    let present: Vec<::irokle::TopicId> = unit
+        .topics
+        .iter()
+        .copied()
+        .filter(|topic| {
+            net_handle
+                .document_sync_topic_exists(*topic)
+                .unwrap_or(false)
+        })
+        .collect();
+    outcome.fail_topics(
+        unit.topics
+            .iter()
+            .copied()
+            .filter(|topic| !present.contains(topic)),
+    );
+    if !present.is_empty()
+        && let Err(error) = net_handle
+            .reconcile_shard_membership(&present, current_holders, &unit.retained, verified)
+            .await
+    {
+        warn!(error = %error, "Failed to reconcile joined shard membership on restart");
+        outcome.fail_topics(present);
+    }
+    outcome
 }
 
 pub(crate) async fn apply_restored_reconcile(
     context: &Arc<DriverContext>,
     node_id: NodeId,
     event: DocumentSyncNetEvent,
-) {
+) -> bool {
     let result = match event {
         DocumentSyncNetEvent::DocumentsReconciled {
             applied,
@@ -1194,7 +1372,7 @@ pub(crate) async fn apply_restored_reconcile(
             metadata_graph_tombstones,
         } => {
             if applied == 0 {
-                return;
+                return true;
             }
             DocumentSyncReconcileResult {
                 targets,
@@ -1204,11 +1382,11 @@ pub(crate) async fn apply_restored_reconcile(
         }
         DocumentSyncNetEvent::Error { error, .. } => {
             warn!(error = %error, "Failed to sync held shard topics on restart");
-            return;
+            return false;
         }
         other => {
             warn!(event = ?other, "Unexpected restart shard sync result");
-            return;
+            return false;
         }
     };
 
@@ -1223,6 +1401,7 @@ pub(crate) async fn apply_restored_reconcile(
     )
     .await;
     process_metadata_graph_tombstones(context, tombstones).await;
+    true
 }
 
 async fn project_restored_metadata_create_events(
@@ -1258,10 +1437,7 @@ async fn project_restored_metadata_create_events(
     }
 }
 
-async fn load_realm_config(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-) -> Option<RealmConfigDocument> {
+async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigLoad {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
     match context
         .storage_handle
@@ -1272,10 +1448,24 @@ async fn load_realm_config(
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            value.and_then(|bytes| RealmConfigDocument::from_bytes(&bytes).ok())
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => match RealmConfigDocument::from_bytes(&bytes) {
+            Ok(config) => RealmConfigLoad::Found(config),
+            Err(error) => {
+                warn!(%realm_id, error = %error, "Failed to decode realm config for recovery");
+                RealmConfigLoad::StorageFailure
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => RealmConfigLoad::Absent,
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(%realm_id, error = %error, "Failed to read realm config for recovery");
+            RealmConfigLoad::StorageFailure
         }
-        _ => None,
+        other => {
+            warn!(%realm_id, event = ?other, "Unexpected realm config read result for recovery");
+            RealmConfigLoad::StorageFailure
+        }
     }
 }
 
