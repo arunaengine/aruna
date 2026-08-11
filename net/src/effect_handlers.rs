@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -273,14 +274,36 @@ fn spawn_refresh(
     }
 
     let dht = ctx.dht.clone();
-    let presence = ctx.presence.clone();
-    let shutdown = ctx.shutdown.clone();
-    ctx.tasks.spawn(async move {
-        let refreshed = tokio::select! {
-            _ = shutdown.cancelled() => None,
-            result = dht.get(&key, realm_filter, options) => Some(result),
-        };
-        match refreshed {
+    spawn_refresh_task(
+        &ctx.presence,
+        &ctx.tasks,
+        &ctx.shutdown,
+        realm_id,
+        move |shutdown| async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => None,
+                result = dht.get(&key, realm_filter, options) => {
+                    Some(result.map_err(|error| error.to_string()))
+                }
+            }
+        },
+    );
+}
+
+fn spawn_refresh_task<F, Fut>(
+    presence: &RealmPresenceCache,
+    tasks: &TaskTracker,
+    shutdown: &CancellationToken,
+    realm_id: RealmId,
+    refresh: F,
+) where
+    F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = Option<Result<Vec<DhtEntry>, String>>> + Send + 'static,
+{
+    let presence = presence.clone();
+    let shutdown = shutdown.clone();
+    tasks.spawn(async move {
+        match refresh(shutdown).await {
             Some(Ok(values)) => presence.store(realm_id, values, Instant::now()),
             Some(Err(error)) => {
                 debug!(error = %error, "realm presence refresh failed; keeping the previous snapshot")
@@ -343,6 +366,7 @@ mod tests {
     use super::*;
     use aruna_core::audit::MAX_AUDIT_PEERS;
     use aruna_core::id::NodeId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -393,6 +417,140 @@ mod tests {
             cache.serve(realm_id, stale),
             PresenceServe::Stale { refresh: true, .. }
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_success() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(5, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, move |_| async move {
+            Some(Ok(vec![make_entry(6, realm_id)]))
+        });
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Fresh(values) if values[0].node_id == make_node(6)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_empty() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(6, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, |_| async {
+            Some(Ok(Vec::new()))
+        });
+        tasks.close();
+        tasks.wait().await;
+
+        assert_eq!(cache.serve(realm_id, Instant::now()), PresenceServe::Cold);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(7, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, |_| async {
+            Some(Err("offline".to_string()))
+        });
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, values } if values[0].node_id == make_node(7)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_cancel() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(8, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, |shutdown| async move {
+            shutdown.cancelled().await;
+            None
+        });
+        shutdown.cancel();
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_single_flight() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(9, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let stale = Instant::now();
+        let first = cache.serve(realm_id, stale);
+        assert!(matches!(&first, PresenceServe::Stale { refresh: true, .. }));
+        let second = cache.serve(realm_id, stale);
+        assert!(matches!(
+            &second,
+            PresenceServe::Stale { refresh: false, .. }
+        ));
+
+        let calls_for_task = calls.clone();
+        if matches!(&first, PresenceServe::Stale { refresh: true, .. }) {
+            spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, move |_| async move {
+                calls_for_task.fetch_add(1, Ordering::SeqCst);
+                Some(Ok(vec![make_entry(10, realm_id)]))
+            });
+        }
+        tasks.close();
+        tasks.wait().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
