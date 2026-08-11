@@ -500,18 +500,79 @@ async fn bind_servers(
             config.s3_public_url.as_deref().unwrap_or(&config.s3_host),
         )
         .await;
-    let (_s3_addr, server_handle) = s3_server
+    let (_s3_addr, s3_handle) = s3_server
         .run_with_listener(s3_listener, shutdown.token())
         .unwrap();
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
     let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
 
-    // Both listeners are bound and the local safety gate is satisfied. Everything
-    // below is background work whose failure never withholds admission.
+    Ok(ServerBindings {
+        rest_handle,
+        s3_handle,
+        realm_id: config.realm_id,
+        node_id: config.node_id,
+        is_initial_boot,
+    })
+}
+
+struct Background {
+    realm_id: aruna_core::structs::RealmId,
+    node_id: iroh::PublicKey,
+    is_initial_boot: bool,
+    driver_ctx: Arc<DriverContext>,
+    shutdown: Shutdown,
+    readiness: Readiness,
+    recovery: RecoveryStatus,
+    jobs_runtime: Arc<JobsRuntime>,
+    task_handle: TaskHandle,
+    task_queues: TaskQueues,
+    usage_counters_rebuilt: bool,
+    core_announcement: CoreAnnouncement,
+}
+
+async fn start_background(background: Background) {
+    let Background {
+        realm_id,
+        node_id,
+        is_initial_boot,
+        driver_ctx,
+        shutdown,
+        readiness,
+        recovery,
+        jobs_runtime,
+        task_handle,
+        task_queues,
+        usage_counters_rebuilt,
+        core_announcement,
+    } = background;
+    // Both listeners are bound and the local safety gate is satisfied.
     readiness.set_ready();
 
-    // Durable background queues, on their own storage lanes and behind the gate.
+    let core_ctx = driver_ctx.clone();
+    let core_cancelled = shutdown.token();
+    let CoreAnnouncement {
+        documents: core_documents,
+        allow_genesis: allow_core_genesis,
+    } = core_announcement;
+    shutdown.spawn(async move {
+        tokio::select! {
+            result = publish_core_documents(
+                core_ctx.as_ref(),
+                node_id,
+                realm_id,
+                allow_core_genesis,
+                core_documents,
+            ) => {
+                if let Err(error) = result {
+                    warn!(error = ?error, "Failed to queue core document replication");
+                }
+            }
+            _ = core_cancelled.cancelled() => {}
+        }
+    });
+
+    // Durable background queues run after admission opens.
     if let Err(error) = jobs_runtime
         .recover_stale_jobs(&driver_ctx.storage_handle)
         .await
@@ -523,27 +584,74 @@ async fn bind_servers(
     restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
     spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
-    // Bounded, cancellable, tracked peer convergence. An unreachable peer here is
-    // retryable background state, never a process-start failure.
-    {
-        let recovery_ctx = driver_ctx.clone();
-        let recovery_status = recovery.clone();
-        let recovery_config = RecoveryConfig {
-            realm_id: config.realm_id,
-            node_id: config.node_id,
-            // An unchanged restart republishes nothing: accepted outbox work and
-            // document sync history already carry convergence.
-            publish_full_usage: usage_counters_rebuilt || is_initial_boot,
-        };
-        let cancelled = shutdown.token();
-        shutdown.spawn(async move {
-            run_recovery(recovery_ctx, recovery_config, recovery_status, cancelled).await;
-        });
-    }
+    let recovery_ctx = driver_ctx.clone();
+    let recovery_config = RecoveryConfig {
+        realm_id,
+        node_id,
+        // An unchanged restart republishes nothing: accepted outbox work and
+        // document sync history already carry convergence.
+        publish_full_usage: usage_counters_rebuilt || is_initial_boot,
+    };
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
+        run_recovery(recovery_ctx, recovery_config, recovery, cancelled).await;
+    });
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let Runtime {
+        config,
+        driver_ctx,
+        net_handle,
+        s3_mounts_available,
+        shutdown,
+        metrics,
+        readiness,
+        recovery,
+        jobs_runtime,
+        task_handle,
+        task_queues,
+        usage_counters_rebuilt,
+        ops_handle,
+    } = setup_runtime().await?;
+
+    let core_announcement = prepare_startup(&config, &driver_ctx, &net_handle).await?;
+
+    let ServerBindings {
+        rest_handle,
+        s3_handle,
+        realm_id,
+        node_id,
+        is_initial_boot,
+    } = bind_servers(
+        config,
+        driver_ctx.clone(),
+        jobs_runtime.clone(),
+        metrics.clone(),
+        s3_mounts_available,
+        &shutdown,
+    )
+    .await?;
+
+    start_background(Background {
+        realm_id,
+        node_id,
+        is_initial_boot,
+        driver_ctx: driver_ctx.clone(),
+        shutdown: shutdown.clone(),
+        readiness: readiness.clone(),
+        recovery: recovery.clone(),
+        jobs_runtime: jobs_runtime.clone(),
+        task_handle: task_handle.clone(),
+        task_queues,
+        usage_counters_rebuilt,
+        core_announcement,
+    })
+    .await;
 
     let mut signal = tokio::spawn(wait_for_signal());
     let mut rest_handle = Some(rest_handle);
-    let mut s3_handle = Some(server_handle);
+    let mut s3_handle = Some(s3_handle);
 
     // A server that returns before shutdown was requested has failed: the node
     // is no longer serving, so it must not exit as success.
