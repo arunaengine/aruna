@@ -137,7 +137,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let readiness = Readiness::new();
     let recovery = RecoveryStatus::new();
     let ops_handle = {
-        let ops_state = OpsState::new(driver_ctx.clone(), metrics.clone(), readiness.clone()).await;
+        let ops_state = OpsState::with_recovery(
+            driver_ctx.clone(),
+            metrics.clone(),
+            readiness.clone(),
+            recovery.clone(),
+        )
+        .await;
         let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
         let bound = ops_listener.local_addr()?;
         let handle = tokio::spawn(async move {
