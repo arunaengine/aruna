@@ -1473,6 +1473,9 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
 mod tests {
     use super::*;
     use aruna_core::structs::{PlacementStrategy, RealmNode, RealmNodeKind};
+    use aruna_net::{NetConfig, NetHandle};
+    use aruna_storage::storage::FjallStorage;
+    use tempfile::tempdir;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -1541,13 +1544,318 @@ mod tests {
     }
 
     #[test]
+    fn cursor_rebinds_plan() {
+        let topic = |seed| ::irokle::TopicId::from_bytes([seed; 32]);
+        let unit = |seed| RestoreUnit {
+            kind: RestoreKind::Shared,
+            peers: vec![node(seed)],
+            retained: BTreeSet::new(),
+            topics: vec![topic(seed)],
+        };
+        let mut cursor = ShardRestoreCursor::default();
+        let original = vec![unit(1), unit(2), unit(3)];
+
+        assert!(bind_restore_plan(&mut cursor, &original));
+        cursor.next_unit = 2;
+        assert!(!bind_restore_plan(&mut cursor, &original));
+        assert_eq!(cursor.next_unit, 2);
+
+        let mut reordered = original.clone();
+        reordered.swap(0, 2);
+        assert!(bind_restore_plan(&mut cursor, &reordered));
+        assert_eq!(cursor.next_unit, 0);
+
+        cursor.next_unit = 2;
+        assert!(bind_restore_plan(&mut cursor, &original[..2]));
+        assert_eq!(cursor.next_unit, 0);
+
+        cursor.next_unit = 1;
+        let mut added = original;
+        added.push(unit(4));
+        assert!(bind_restore_plan(&mut cursor, &added));
+        assert_eq!(cursor.next_unit, 0);
+    }
+
+    #[test]
+    fn cursor_rebinds_config() {
+        let local = node(1);
+        let mut config = sharded_config(&[local, node(2), node(3)], 16);
+        let original = plan_shard_groups(&config, local, RealmId([7; 32])).into_units();
+        let mut cursor = ShardRestoreCursor::default();
+        assert!(bind_restore_plan(&mut cursor, &original));
+        cursor.next_unit = 1;
+
+        config.strategies[0].shard_count = 32;
+        let changed = plan_shard_groups(&config, local, RealmId([7; 32])).into_units();
+        assert!(bind_restore_plan(&mut cursor, &changed));
+        assert_eq!(cursor.next_unit, 0);
+    }
+
+    #[test]
+    fn rotation_visits_suffix() {
+        let topic = ::irokle::TopicId::from_bytes([1; 32]);
+        let mut rotation = RecoveryRotation::default();
+        let mut previous = None;
+        let mut first = true;
+        let blocked = apply_recovery_pass(
+            &mut rotation,
+            &mut previous,
+            &mut first,
+            &RecoveryPass {
+                unresolved_topics: BTreeSet::from([topic]),
+                error: Some(RecoveryError::PeerUnavailable),
+                more_local_work: true,
+                units_processed: SHARD_RESTORE_UNIT_BUDGET,
+                topics_completed: SHARD_RESTORE_UNIT_BUDGET - 1,
+                unvisited_topics: 3,
+                ..RecoveryPass::default()
+            },
+        );
+        assert_eq!(
+            blocked,
+            RecoveryDecision::ContinueLocal {
+                progress: true,
+                topics_remaining: 4,
+                error: Some(RecoveryError::PeerUnavailable),
+            }
+        );
+
+        let suffix = apply_recovery_pass(
+            &mut rotation,
+            &mut previous,
+            &mut first,
+            &RecoveryPass {
+                units_processed: 3,
+                topics_completed: 3,
+                ..RecoveryPass::default()
+            },
+        );
+        assert!(matches!(
+            suffix,
+            RecoveryDecision::Retry {
+                failure: RecoveryFailure {
+                    error: Some(RecoveryError::PeerUnavailable),
+                    ..
+                },
+                progress: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn heal_needs_rotation() {
+        let topic = ::irokle::TopicId::from_bytes([2; 32]);
+        let mut rotation = RecoveryRotation::default();
+        let mut previous = None;
+        let mut first = true;
+        let blocked = apply_recovery_pass(
+            &mut rotation,
+            &mut previous,
+            &mut first,
+            &RecoveryPass {
+                unresolved_topics: BTreeSet::from([topic]),
+                error: Some(RecoveryError::PeerUnavailable),
+                units_processed: 1,
+                ..RecoveryPass::default()
+            },
+        );
+        assert!(matches!(blocked, RecoveryDecision::Retry { .. }));
+        let healed = apply_recovery_pass(
+            &mut rotation,
+            &mut previous,
+            &mut first,
+            &RecoveryPass {
+                units_processed: 1,
+                ..RecoveryPass::default()
+            },
+        );
+        assert_eq!(healed, RecoveryDecision::Converged);
+    }
+
+    #[test]
+    fn failed_work_stalls() {
+        let topic = ::irokle::TopicId::from_bytes([3; 32]);
+        let mut rotation = RecoveryRotation::default();
+        let mut previous = None;
+        let mut first = true;
+        let decision = apply_recovery_pass(
+            &mut rotation,
+            &mut previous,
+            &mut first,
+            &RecoveryPass {
+                unresolved_topics: BTreeSet::from([topic]),
+                error: Some(RecoveryError::PeerUnavailable),
+                units_processed: 1,
+                ..RecoveryPass::default()
+            },
+        );
+
+        assert!(matches!(
+            decision,
+            RecoveryDecision::Retry {
+                progress: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn phase_failure_visible() {
+        let mut pass = RecoveryPass::default();
+        pass.merge_phase(PhaseOutcome {
+            progress: false,
+            error: Some(RecoveryError::PeerUnavailable),
+        });
+        pass.merge_phase(PhaseOutcome {
+            progress: false,
+            error: Some(RecoveryError::Storage),
+        });
+        let mut rotation = RecoveryRotation::default();
+        let mut previous = None;
+        let mut first = false;
+        let decision = apply_recovery_pass(&mut rotation, &mut previous, &mut first, &pass);
+        assert!(matches!(
+            decision,
+            RecoveryDecision::Retry {
+                failure: RecoveryFailure {
+                    error: Some(RecoveryError::Storage),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn remaining_topics_exact() {
+        let first = ::irokle::TopicId::from_bytes([3; 32]);
+        let second = ::irokle::TopicId::from_bytes([4; 32]);
+        let mut rotation = RecoveryRotation::default();
+        rotation.merge(&RecoveryPass {
+            unresolved_topics: BTreeSet::from([first, second]),
+            ..RecoveryPass::default()
+        });
+        rotation.merge(&RecoveryPass {
+            unresolved_topics: BTreeSet::from([first]),
+            ..RecoveryPass::default()
+        });
+        assert_eq!(rotation.remaining_topics(5), 7);
+    }
+
+    #[tokio::test]
+    async fn restore_stops_cancelled() {
+        let dir = tempdir().expect("tempdir must open");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage must open");
+        let net = NetHandle::new(NetConfig::default(), storage.clone())
+            .await
+            .expect("net must open");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let units = vec![RestoreUnit {
+            kind: RestoreKind::Shared,
+            peers: vec![node(2)],
+            retained: BTreeSet::new(),
+            topics: vec![::irokle::TopicId::from_bytes([5; 32])],
+        }];
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let batch = restore_batch(
+            &context,
+            &net,
+            node(1),
+            &units,
+            0,
+            1,
+            false,
+            &BTreeSet::new(),
+            &cancelled,
+        )
+        .await;
+        assert_eq!(batch.end, 0);
+        assert!(!batch.wrapped);
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bad_config_degrades() {
+        let dir = tempdir().expect("tempdir must open");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage must open");
+        let realm_id = RealmId([8; 32]);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: vec![0xff].into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let pass = restore_shard_pass(
+            &context,
+            node(1),
+            realm_id,
+            &mut ShardRestoreCursor::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(pass.error, Some(RecoveryError::Storage));
+        assert!(pass.wrapped);
+    }
+
+    #[test]
+    fn rotation_keeps_failure() {
+        let first = ::irokle::TopicId::from_bytes([1; 32]);
+        let mut rotation = RecoveryRotation::default();
+        rotation.merge(&RecoveryPass {
+            unresolved_topics: BTreeSet::from([first]),
+            error: Some(RecoveryError::PeerUnavailable),
+            more_local_work: true,
+            ..RecoveryPass::default()
+        });
+        rotation.merge(&RecoveryPass::default());
+
+        assert_eq!(rotation.unresolved_topics, BTreeSet::from([first]));
+        assert_eq!(rotation.error, Some(RecoveryError::PeerUnavailable));
+    }
+
+    #[test]
     fn recovery_tracks_passes() {
         let status = RecoveryStatus::new();
         assert_eq!(status.snapshot().state, RecoveryState::Pending);
         assert_eq!(status.snapshot().last_progress_timestamp, 0);
 
         status.begin_pass();
-        assert_eq!(status.snapshot().state, RecoveryState::Running);
+        let started = status.snapshot();
+        assert_eq!(started.state, RecoveryState::Running);
+        assert!(started.last_progress_timestamp > 0);
+
+        status.set_remaining(5);
+        let unchanged = status.snapshot();
+        assert_eq!(unchanged.topics_remaining, 5);
+        assert_eq!(
+            unchanged.last_progress_timestamp,
+            started.last_progress_timestamp
+        );
 
         status.note_progress(4);
         let snapshot = status.snapshot();
@@ -1568,6 +1876,30 @@ mod tests {
         assert_eq!(snapshot.state, RecoveryState::Converged);
         assert_eq!(snapshot.last_error, None);
         assert_eq!(status.pass_total(RecoveryOutcome::Success), 1);
+    }
+
+    #[test]
+    fn failed_pass_stalls() {
+        let status = RecoveryStatus::new();
+        status.begin_pass();
+        status.note_progress(1);
+        let progress = status
+            .inner
+            .last_progress_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        status.begin_pass();
+        status.set_remaining(1);
+        status.finish_pass(
+            RecoveryOutcome::Partial,
+            Some(RecoveryError::PeerUnavailable),
+        );
+        assert_eq!(
+            status
+                .inner
+                .last_progress_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            progress
+        );
     }
 
     // Backoff climbs from the base to the cap and never past it, so a peer that
