@@ -421,9 +421,7 @@ pub async fn ensure_initial_local_onboarding_secret(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        node_is_ready, prepare_core_documents, unique_user_topic, watch_target_needed,
-    };
+    use super::{node_is_ready, prepare_core_documents, unique_user_topic, watch_target_needed};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

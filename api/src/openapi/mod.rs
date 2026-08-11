@@ -393,9 +393,7 @@ mod tests {
         let (Some(items), Some(array)) = (schema.get("items"), value.as_array()) else {
             return true;
         };
-        array
-            .iter()
-            .all(|value| schema_matches(doc, items, value))
+        array.iter().all(|value| schema_matches(doc, items, value))
     }
 
     fn type_matches(value_type: &str, value: &Value) -> bool {
@@ -652,9 +650,7 @@ mod tests {
                 crate::routes::onboarding::TransportAddressDoc::Relay(
                     "https://relay.example.test/".to_string(),
                 ),
-                crate::routes::onboarding::TransportAddressDoc::Ip(
-                    "192.0.2.10:4433".to_string(),
-                ),
+                crate::routes::onboarding::TransportAddressDoc::Ip("192.0.2.10:4433".to_string()),
             ],
         };
         let endpoint = serde_json::to_value(endpoint).unwrap();

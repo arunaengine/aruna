@@ -2223,8 +2223,7 @@ async fn run_peer_connectivity_attempt(
         .await
         {
             Ok(Some(endpoint_addr)) => {
-                install_signed_endpoint(address_lookup, dht, connection_pool, endpoint_addr)
-                    .await;
+                install_signed_endpoint(address_lookup, dht, connection_pool, endpoint_addr).await;
                 result = dht.bootstrap_nodes(&[peer]).await;
             }
             Ok(None) => {}
