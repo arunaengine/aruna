@@ -8,9 +8,7 @@
 //! reach these on the document's single authority only; routing lives in
 //! [`crate::metadata::forward`].
 
-use std::sync::Arc;
-
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::DocumentSyncOutboxEvent;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -482,20 +480,6 @@ async fn schedule_drain(ctx: &DriverContext) {
             .send_effect(schedule_outbox_drain_effect())
             .await;
     }
-}
-
-/// Local read used by the routed landing path once the authority answered.
-pub async fn mapping_for_document(
-    ctx: &Arc<DriverContext>,
-    document_id: Ulid,
-) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
-    read_mapping(ctx.as_ref(), document_id).await
-}
-
-/// The sync target a mapping publishes under, exposed for tests and callers that
-/// assert replication coverage.
-pub fn mapping_target(document_id: Ulid) -> DocumentSyncTarget {
-    persistent_id_target(document_id)
 }
 
 #[cfg(test)]
