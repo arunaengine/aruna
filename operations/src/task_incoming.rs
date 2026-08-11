@@ -117,6 +117,7 @@ const OUTBOX_INVOCATION_RECORDS: usize = OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_
 /// Consecutive continuations before a rotation yields through the timer, so an
 /// append-heavy or wholly blocked queue cannot keep the task continuously hot.
 const OUTBOX_CONTINUATION_STREAK: u32 = 8;
+const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
 const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
@@ -2914,8 +2915,7 @@ mod tests {
             OUTBOX_INVOCATION_RECORDS,
             OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_BATCH_SIZE
         );
-        assert!(OUTBOX_INVOCATION_PAGES > 0);
-        assert!(OUTBOX_CONTINUATION_STREAK > 0);
+        assert_ne!(OUTBOX_INVOCATION_RECORDS, 0);
     }
 
     #[test]
