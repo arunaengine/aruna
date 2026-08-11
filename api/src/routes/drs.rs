@@ -154,6 +154,7 @@ pub struct DownloadQuery {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[schema(example = json!({"status_code": 404, "msg": "DRS object not found"}))]
 pub struct DrsErrorPayload {
     status_code: u16,
     msg: String,
@@ -191,7 +192,21 @@ enum ResolveOutcome {
     get,
     path = "/ga4gh/drs/v1/service-info",
     tag = "drs",
-    responses((status = 200, body = DrsServiceInfoResponse))
+    summary = "Describe this node's GA4GH DRS service",
+    description = "Deliberately public: the GA4GH service-info document is served without authentication and a bearer token changes nothing. Answered from this node alone, with no lookup and no network call, so it is always current for the node that received the request. `id` and `name` are derived from the realm this node serves, `type` reports the GA4GH `org.ga4gh`/`drs` service type with this node's software version, and `organization.url` is the externally visible base URL of the node, taken from the forwarded scheme and host when the request came through a trusted proxy and from the `Host` header otherwise.",
+    responses((
+        status = 200,
+        description = "GA4GH service-info document for this node",
+        body = DrsServiceInfoResponse,
+        example = json!({
+            "id": "org.aruna.9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
+            "name": "Aruna Realm 9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
+            "type": {"group": "org.ga4gh", "artifact": "drs", "version": "3.0.0-alpha.41"},
+            "organization": {"name": "Aruna", "url": "https://node.example.test"},
+            "environment": "dev",
+            "documentation_url": "https://docs.aruna-engine.org"
+        })
+    ))
 )]
 pub async fn get_service_info(
     State(state): State<Arc<ServerState>>,
@@ -223,11 +238,18 @@ pub async fn get_service_info(
     options,
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
-    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
+    summary = "Report the authentication schemes accepted for a DRS object",
+    description = "Deliberately public and never resolves the object: the identifier is echoed back unparsed, so this operation can neither confirm nor deny that an object exists and answers the same for every caller. `supported_types` is always `[BearerAuth]`; GA4GH passports are not accepted, so `passport_auth_issuers` is always empty. `bearer_auth_issuers` lists the OIDC issuers this node currently trusts, and is empty when no OIDC validator is configured or it cannot be reached. A browser CORS preflight on this path is answered by the CORS layer, when one is configured, and never reaches this operation.",
+    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator, in the same three forms the object lookup accepts; it is echoed back verbatim and is not validated here")),
     responses(
-        (status = 200, body = DrsAuthorizationsResponse),
-        (status = 400, body = DrsErrorPayload),
-        (status = 404, body = DrsErrorPayload)
+        (status = 200, description = "Authentication schemes and bearer issuers this node accepts for DRS content", body = DrsAuthorizationsResponse, example = json!({
+            "drs_object_id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "supported_types": ["BearerAuth"],
+            "passport_auth_issuers": [],
+            "bearer_auth_issuers": ["https://login.example.test/realms/aruna"]
+        })),
+        (status = 400, description = "Reserved by the DRS specification for a malformed identifier; this operation does not parse the identifier and so does not return it", body = DrsErrorPayload),
+        (status = 404, description = "Reserved by the DRS specification for an unknown object; this operation does not resolve the identifier and so does not return it", body = DrsErrorPayload)
     ),
 )]
 pub async fn get_authorizations(
@@ -256,13 +278,38 @@ pub async fn get_authorizations(
     get,
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
-    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role.",
-    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
+    summary = "Resolve a DRS object by identifier",
+    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. A request without a bearer token, or with one this node cannot validate, is treated as anonymous rather than rejected, and READ is then evaluated for the Everyone principal. Only content held by this node in this realm resolves; an identifier naming another realm or node answers 404 without any lookup, so this is a node-local operation with no fan-out. A caller that presented a token but lacks READ gets 403, while an anonymous caller in the same position gets the same 404 as for a missing object, so existence is never revealed to an unauthenticated caller. A content-hash identifier is resolved against every object on this node carrying that content and the first one the caller may read is returned, so the same digest can resolve differently for different callers. The response carries the requested identifier in `id`, the canonical W3ID in `aliases` when the request used a different form, the stored checksums including the blake3 content digest, and a single `https` access method whose `access_url.url` is a direct download URL on this node; no redirect is issued and no signed or time-limited URL is minted, so the caller must send its own bearer token to that URL. `contents` is always null because bundles are not served.",
+    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator: `https://w3id.org/aruna/data/{blake3-hex}`, `https://w3id.org/aruna/data/{versioned-s3-arn}`, `arn:aruna:{realm_id}:{node_id}:ch/{blake3-hex}` with 64 lowercase hex characters, or `arn:aruna:{realm_id}:{node_id}:s3/{bucket}/{key}@{version-ulid}` whose key is percent-encoded except for the separating slashes. Identifiers contain slashes, so the whole remainder of the path is taken as the identifier")),
     responses(
-        (status = 200, body = DrsObjectResponse),
-        (status = 400, body = DrsErrorPayload),
-        (status = 403, body = DrsErrorPayload),
-        (status = 404, body = DrsErrorPayload)
+        (status = 200, description = "The resolved DRS object, as visible to this caller", body = DrsObjectResponse, example = json!({
+            "id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "self_uri": "https://node.example.test/api/v1/ga4gh/drs/v1/objects/https%3A%2F%2Fw3id.org%2Faruna%2Fdata%2F000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "name": "content-000102030405",
+            "description": null,
+            "size": 10485760,
+            "checksums": [
+                {"type": "blake3", "checksum": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"},
+                {"type": "sha256", "checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+            ],
+            "mime_type": "application/octet-stream",
+            "aliases": [],
+            "access_methods": [
+                {
+                    "access_id": "https",
+                    "type": "https",
+                    "region": null,
+                    "access_url": {
+                        "url": "https://node.example.test/api/v1/ga4gh/drs/v1/download?object_id=https%3A%2F%2Fw3id.org%2Faruna%2Fdata%2F000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                        "headers": {}
+                    }
+                }
+            ],
+            "contents": null
+        })),
+        (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
+        (status = 403, description = "The caller presented a token but may not read the object, or the token belongs to another realm", body = DrsErrorPayload),
+        (status = 404, description = "No such object on this node, or an anonymous caller may not read it", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -294,11 +341,53 @@ pub async fn get_object(
     post,
     path = "/ga4gh/drs/v1/objects",
     tag = "drs",
-    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role.",
-    request_body = DrsBulkObjectsRequestBody,
+    summary = "Resolve several DRS objects in one request",
+    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. Each identifier is resolved and authorized exactly as the single-object lookup does, one after another and node-locally, so a batch is a convenience and not a transaction. The request itself succeeds with 200 whenever the body parses: per-identifier failures are reported inside the matching entry as `{status_code, msg}` instead of failing the batch, an unreadable object appears as 403 for a token-bearing caller and as 404 for an anonymous one, and an object that could not be serialized appears as 500. Entries are returned in the order the identifiers were given, one entry per identifier, including duplicates. The number of identifiers is bounded only by the server's maximum request body size.",
+    request_body(
+        content = DrsBulkObjectsRequestBody,
+        description = "The DRS identifiers to resolve, in any of the forms the single-object lookup accepts",
+        example = json!({
+            "object_ids": [
+                "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "arn:aruna:9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/reads/run-42/sample.fastq.gz@01JABCDEF0123456789ABCDEFG"
+            ]
+        })
+    ),
     responses(
-        (status = 200, body = DrsBulkObjectsResponse),
-        (status = 400, body = DrsErrorPayload)
+        (status = 200, description = "One entry per requested identifier, in request order, each holding either the resolved object or a per-identifier error", body = DrsBulkObjectsResponse, example = json!({
+            "objects": [
+                {
+                    "object_id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                    "result": {
+                        "id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                        "self_uri": "https://node.example.test/api/v1/ga4gh/drs/v1/objects/https%3A%2F%2Fw3id.org%2Faruna%2Fdata%2F000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                        "name": "content-000102030405",
+                        "description": null,
+                        "size": 10485760,
+                        "checksums": [{"type": "blake3", "checksum": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}],
+                        "mime_type": "application/octet-stream",
+                        "aliases": [],
+                        "access_methods": [
+                            {
+                                "access_id": "https",
+                                "type": "https",
+                                "region": null,
+                                "access_url": {
+                                    "url": "https://node.example.test/api/v1/ga4gh/drs/v1/download?object_id=https%3A%2F%2Fw3id.org%2Faruna%2Fdata%2F000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                                    "headers": {}
+                                }
+                            }
+                        ],
+                        "contents": null
+                    }
+                },
+                {
+                    "object_id": "arn:aruna:9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/reads/run-42/sample.fastq.gz@01JABCDEF0123456789ABCDEFG",
+                    "result": {"status_code": 404, "msg": "DRS object not found"}
+                }
+            ]
+        })),
+        (status = 400, description = "The request body is not valid JSON for a list of identifiers; this rejection comes from the body extractor and is returned as plain text rather than the declared payload", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -365,14 +454,15 @@ fn download_error(error: GetObjectError) -> Response {
     get,
     path = "/ga4gh/drs/v1/download",
     tag = "drs",
-    description = "Authentication is optional and changes the result: an anonymous caller only downloads objects readable by the public role.",
-    params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
+    summary = "Download the bytes of a DRS object",
+    description = "Authentication is optional and changes the result: an anonymous caller only downloads objects readable by the public role. This is the URL advertised as the object's `https` access method; it streams the bytes itself and never redirects, so a client follows no `Location` and needs no signed URL, only its own bearer token. The identifier is resolved and authorized exactly as the object lookup does, node-locally, and every denial an anonymous caller could observe is reported as 404 so that existence stays hidden; an authenticated caller without READ gets 403. On success the response is 200 with the raw bytes and a `Content-Length` taken from the stored object; no content type is asserted and range requests are not supported. Each transfer takes one node-wide download slot and one per-caller slot, keyed by user for an authenticated caller and by client address for an anonymous one; when a slot cannot be taken the download is refused rather than queued and the caller may retry later. A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut mid-body: the 200 has already been sent, so a client must treat a body shorter than `Content-Length` as a failed download and retry.",
+    params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator, in the same three forms the object lookup accepts, given as a single query parameter and URL-encoded because these identifiers contain `:` and `/`")),
     responses(
-        (status = 200, description = "Object bytes"),
-        (status = 400, body = DrsErrorPayload),
-        (status = 404, body = DrsErrorPayload),
-        (status = 409, description = "Reference binding reached its automatic advance limit", body = DrsErrorPayload),
-        (status = 503, description = "Reference source is changing; retry", body = DrsErrorPayload)
+        (status = 200, description = "Object bytes, streamed inline with a `Content-Length` header and no content type"),
+        (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
+        (status = 404, description = "No such object on this node, an anonymous caller may not read it, or the recorded reference observation is no longer served by its source", body = DrsErrorPayload),
+        (status = 409, description = "Reference binding reached its automatic advance limit; retrying does not help until the reference is rebound by an explicit write", body = DrsErrorPayload),
+        (status = 503, description = "Reference source is changing; retry. The same status is returned when the node's download capacity is exhausted, which is also retryable", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]

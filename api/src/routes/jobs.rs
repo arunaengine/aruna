@@ -499,15 +499,38 @@ fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> 
     get,
     path = "/jobs/",
     tag = "jobs",
+    summary = "List the caller's jobs on this node",
+    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused even for its own jobs. The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs this node owns, ordered newest first. Jobs owned by other nodes are never merged in, so a caller that submitted against another node pages that node's listing instead (submission answers with the owning node's base URL). Jobs the system creates for its own bookkeeping are never listed. `limit` defaults to 50 and is capped at 200, `cursor` continues a previous page, and a page without `next_cursor` is the last one.",
     params(
-        ("limit" = Option<usize>, Query, description = "Max jobs to return (default 50, max 200)"),
-        ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous page"),
-        ("state" = Option<String>, Query, description = "Optional state filter")
+        ("limit" = Option<usize>, Query, description = "Maximum jobs in one page. Default 50, clamped to at most 200; 0 is treated as unset"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous page's `next_cursor`: 24 bytes, base64url without padding. Anything else is rejected with 400. Absent starts at the newest job"),
+        ("state" = Option<String>, Query, description = "Restrict the page to one job state: `queued`, `claimed`, `preparing`, `ready`, `running`, `cancelling`, `indeterminate`, `succeeded`, `failed` or `cancelled`. Any other value is rejected with 400. Absent returns every state")
     ),
     responses(
-        (status = 200, description = "Node-local jobs page; jobs owned by other nodes are omitted", body = JobListResponse),
-        (status = 400, description = "Invalid cursor or state", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Page of the caller's jobs on this node, newest first; jobs owned by other nodes are omitted and `next_cursor` is absent on the last page",
+            body = JobListResponse,
+            example = json!({
+                "jobs": [
+                    {
+                        "job_id": "01JJRSTVWXYZ0123456789ABCD",
+                        "kind": "execution",
+                        "state": "running",
+                        "attempts": 1,
+                        "cancel_requested": false,
+                        "created_at": "2026-04-09T14:23:11.123+00:00",
+                        "updated_at": "2026-04-09T14:24:02.481+00:00",
+                        "progress": {"current": 2, "total": 5, "unit": "phases"},
+                        "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
+                        "workspace_mode": "kept"
+                    }
+                ],
+                "next_cursor": "RqTuvSDYgez8DstU9tg0ZST62xQ3JtJW"
+            })
+        ),
+        (status = 400, description = "Cursor is not a valid continuation token, or `state` is not a known job state", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -549,15 +572,58 @@ pub async fn list_jobs(
     post,
     path = "/jobs/",
     tag = "jobs",
-    request_body = SubmitExecutionRequest,
+    summary = "Submit a container execution job",
+    description = "Requires a realm bearer token with WRITE on the target group's data; a path-restricted (delegated) token is refused. Submission is asynchronous: a 2xx means the job is durably accepted and queued for the node that owns it, never that it started, finished or produced outputs. The job is anchored to that owning node for its whole life, and the response carries the node's base URL plus the status URL to poll. `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200 with the job that already exists and `created` false, while the same key with a different plan is a 409 conflict. Set `workspace.mode` to `existing` to run in a bucket that already exists, which additionally requires WRITE on that bucket and that it belongs to the same group; omitting `workspace` keeps a per-job workspace bucket. Rejected with 400: an empty image, `cpu_cores` of 0, a `ram_bytes` of 0 or above 2^63-1, more than 512 inputs or outputs, more than 32 output prefixes, an empty `dest_key`, a container path that is not absolute and traversal-free, or two inputs or outputs sharing a `dest_key` or container path. A 503 is retryable: the caller may submit again.",
+    request_body(
+        content = SubmitExecutionRequest,
+        description = "Container image, command and the inputs and outputs to stage around it",
+        example = json!({
+            "group_id": "01JABCDEF0123456789ABCDEFG",
+            "image": "registry.example.test/tools/fastqc:0.12.1",
+            "command": ["fastqc", "--outdir", "/outputs", "/inputs/reads.fastq"],
+            "env": {"FASTQC_THREADS": "2"},
+            "cpu_cores": 2,
+            "ram_bytes": 4294967296,
+            "max_walltime_ms": 3600000,
+            "inputs": [
+                {"bucket": "project-data", "key": "raw/reads.fastq", "dest_key": "reads.fastq"}
+            ],
+            "outputs": [
+                {"container_path": "/outputs/reads_fastqc.html", "dest_key": "reports/reads_fastqc.html"}
+            ],
+            "output_prefixes": ["reports/"],
+            "idempotency_key": "fastqc-reads-2026-04-09",
+            "workspace": {"mode": "kept"}
+        })
+    ),
     responses(
-        (status = 201, description = "Execution job created", body = SubmitJobResponse),
-        (status = 200, description = "Idempotent match of an existing job", body = SubmitJobResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 409, description = "Idempotency key bound to a different plan", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
-        (status = 503, description = "Job placement unavailable", body = ErrorResponse)
+        (
+            status = 201,
+            description = "Job durably accepted and queued on the owning node; poll `status_url` for progress",
+            body = SubmitJobResponse,
+            example = json!({
+                "job_id": "01JJRSTVWXYZ0123456789ABCD",
+                "created": true,
+                "owner_node_url": "https://node.example.test/api/v1",
+                "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
+            })
+        ),
+        (
+            status = 200,
+            description = "The idempotency key already names a job with this exact plan; nothing new was queued",
+            body = SubmitJobResponse,
+            example = json!({
+                "job_id": "01JJRSTVWXYZ0123456789ABCD",
+                "created": false,
+                "owner_node_url": "https://node.example.test/api/v1",
+                "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
+            })
+        ),
+        (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, or a workspace request that names no usable bucket", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is already bound to a job with a different plan", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, or the caller lacks WRITE on the group or on the named existing workspace bucket", body = ErrorResponse),
+        (status = 503, description = "No node could be selected to own the job, or the id clock is unhealthy; retryable, the caller may submit again with the same idempotency key", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -673,14 +739,49 @@ pub async fn submit_job(
     get,
     path = "/jobs/{job_id}",
     tag = "jobs",
-    params(("job_id" = String, Path, description = "Job identifier")),
+    summary = "Read one job's status",
+    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Reads are self-scoped: only the job's own submitter may read it, and a job belonging to somebody else answers 404 rather than 403, so the surface never confirms that an id exists. The one exception is a persistent-id minting job the caller joined, which stays readable while the caller holds WRITE on the document it mints for. The read is answered by the node that owns the job, derived from the id itself: when that is another node the request is forwarded under the caller's own bearer token, so a malformed token is 400 and an owner that cannot be reached is a retryable 503. `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or `cancelled`. `run_crate` appears only for jobs that owe a run crate and reports that side obligation, not the job itself.",
+    params(("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404")),
     responses(
-        (status = 200, description = "Job status", body = JobStatusResponse),
-        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
-        (status = 404, description = "Job not found", body = ErrorResponse),
-        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Current status of the caller's job, including its terminal result once it has one",
+            body = JobStatusResponse,
+            example = json!({
+                "job_id": "01JJRSTVWXYZ0123456789ABCD",
+                "kind": "execution",
+                "state": "succeeded",
+                "attempts": 1,
+                "cancel_requested": false,
+                "created_at": "2026-04-09T14:23:11.123+00:00",
+                "updated_at": "2026-04-09T14:31:47.902+00:00",
+                "finished_at": "2026-04-09T14:31:47.902+00:00",
+                "progress": {"current": 5, "total": 5, "unit": "phases"},
+                "result": {
+                    "exit_code": 0,
+                    "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
+                    "stdout": "",
+                    "stderr": "",
+                    "outputs": [
+                        {
+                            "bucket": "ws-01jjrstvwxyz0123456789abcd",
+                            "key": "reports/reads_fastqc.html",
+                            "container_path": "/outputs/reads_fastqc.html",
+                            "size": 20480,
+                            "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8"
+                        }
+                    ]
+                },
+                "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
+                "workspace_mode": "kept",
+                "run_crate": {"status": "written", "resource": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#run/01JJRSTVWXYZ0123456789ABCD"}
+            })
+        ),
+        (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
+        (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -746,19 +847,56 @@ fn decode_report_row(
     get,
     path = "/jobs/{job_id}/report",
     tag = "jobs",
+    summary = "Page a finished RO-Crate job's report",
+    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403. Only RO-Crate import and export jobs keep a per-entry report; every other kind answers 404. The report exists only once the job is terminal, so while it is still running the answer is 404 carrying a pending marker with the job's current state, and the caller should poll. It is then frozen and immutable, and it disappears again once the job's retention window passes, which is a plain 404. Paging is stable against that frozen snapshot: `report_digest` names it, a cursor carries both the job and that digest, and a cursor from another job or another report is 409 rather than a silently different page. The read is answered by the node that owns the job, forwarded under the caller's own bearer token when this node is not the owner, so an unreachable owner is a retryable 503.",
     params(
-        ("job_id" = String, Path, description = "Job identifier"),
-        ("limit" = Option<usize>, Query, description = "Max report rows (default 200, max 1000)"),
-        ("cursor" = Option<String>, Query, description = "Opaque report cursor")
+        ("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404"),
+        ("limit" = Option<usize>, Query, description = "Maximum report rows in one page. Default 200, clamped to at most 1000; 0 is treated as unset"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous page's `next_cursor`, bound to this job and to the frozen report it was issued against. Malformed values are 400 and mismatched ones 409. Absent starts at the first row")
     ),
     responses(
-        (status = 200, description = "Immutable terminal report page", body = JobReportResponse),
-        (status = 400, description = "Invalid cursor or bearer forwarding carrier", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
-        (status = 404, description = "Job not found or report pending", body = ReportUnavailableResponse),
-        (status = 409, description = "Cursor does not match this frozen report", body = ErrorResponse),
-        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Page of the frozen report; rows are entry-keyed outcomes and `report_digest` identifies the snapshot this page belongs to. No `next_cursor` means the last page",
+            body = JobReportResponse,
+            example = json!({
+                "rows": [
+                    {
+                        "entry_key": "data/reads.fastq",
+                        "code": "imported",
+                        "message": null,
+                        "detail": {
+                            "archive_path": "data/reads.fastq",
+                            "target_key": "crate/data/reads.fastq",
+                            "version_id": "01JMETADATA0123456789ABCDE",
+                            "blake3": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8",
+                            "size": 1048576,
+                            "arn": null,
+                            "w3id": null,
+                            "validation": null
+                        }
+                    }
+                ],
+                "next_cursor": "vPr_5UvGEO5Zc2Jc1Vn7NPw9toS74HXJPkSW5Mouj9k",
+                "report_digest": "5c15818ae224f9a918b32cc1ae79a2b9ff3d251b1d88412df04eb67250e2d3d1"
+            })
+        ),
+        (status = 400, description = "The cursor is not a decodable continuation token, or the bearer token cannot be forwarded to the owning node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
+        (
+            status = 404,
+            description = "Either the report is not available yet, answered as a pending marker naming the job's current state, or there is no readable report at all: unknown job, a job submitted by somebody else, a kind that keeps no report, or a report whose retention has passed, answered as the standard error body",
+            body = ReportUnavailableResponse,
+            examples(
+                ("Report pending" = (
+                    summary = "The job has not reached a terminal state, so no report is frozen yet",
+                    value = json!({"code": "report_pending", "state": "running"})
+                ))
+            )
+        ),
+        (status = 409, description = "The cursor was issued for a different job or a different frozen report, so it cannot continue this one", body = ErrorResponse),
+        (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1074,20 +1212,22 @@ async fn artifact_response(
     get,
     path = "/jobs/{job_id}/artifacts/rocrate",
     tag = "jobs",
+    summary = "Download a finished export job's RO-Crate",
+    description = "Downloads the packaged RO-Crate produced by an export job as a binary `application/zip` body, not JSON. Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403, and a job kind that produces no crate answers 404 as well. A successful answer always carries `Content-Type: application/zip`, `Content-Length`, `Accept-Ranges: bytes`, an `ETag` that is the artifact's quoted hex BLAKE3 digest, and a `Content-Disposition: attachment` naming the crate file with both an ASCII fallback and a UTF-8 form; a partial answer adds `Content-Range`. While the export job has not finished the crate is not ready and the answer is 404 with the code `artifact_pending` and the job's current state in its details, so the caller should poll the status instead of retrying blindly; once the artifact's retention window passes it is 410 and never comes back. `Range` accepts one byte range only. Downloads are admission-limited, so a saturated node refuses rather than queueing.",
     params(
-        ("job_id" = String, Path, description = "Job identifier"),
-        ("Range" = Option<String>, Header, description = "Single byte range")
+        ("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404"),
+        ("Range" = Option<String>, Header, description = "One byte range over the crate: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`. Multiple ranges and unparseable or out-of-bounds values are refused with 416. Absent returns the whole crate")
     ),
     responses(
-        (status = 200, description = "Complete RO-Crate ZIP"),
-        (status = 206, description = "Requested artifact byte range"),
-        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
-        (status = 404, description = "Artifact not found or pending", body = ErrorResponse),
-        (status = 410, description = "Artifact expired", body = ErrorResponse),
-        (status = 416, description = "Range not satisfiable", body = ErrorResponse),
-        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
+        (status = 200, description = "The complete RO-Crate as an `application/zip` byte stream, with `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`"),
+        (status = 206, description = "The requested byte range of the crate as `application/zip`, with `Content-Range` and a `Content-Length` covering the range only"),
+        (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "No downloadable crate: unknown job, a job submitted by somebody else, a kind that produces none, or the export has not finished yet, which is coded `artifact_pending` and carries the job's current state", body = ErrorResponse),
+        (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
+        (status = 416, description = "The requested range is not a single satisfiable byte range; the answer repeats `Accept-Ranges` and reports the crate size in `Content-Range`", body = ErrorResponse),
+        (status = 503, description = "The node owning this job could not be reached, or this node's download capacity is exhausted; retryable, the caller may repeat the download", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1105,20 +1245,22 @@ pub async fn get_job_artifact(
     head,
     path = "/jobs/{job_id}/artifacts/rocrate",
     tag = "jobs",
+    summary = "Probe a finished export job's RO-Crate headers",
+    description = "Answers exactly what the download would answer, with the headers but no body, so a client can learn a crate's size, digest and filename before fetching it. Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: a job submitted by somebody else answers 404 instead of 403. The headers describe an `application/zip` crate: `Content-Type`, `Content-Length` for the whole crate or for the requested range, `Accept-Ranges: bytes`, an `ETag` that is the artifact's quoted hex BLAKE3 digest, an attachment `Content-Disposition`, and `Content-Range` when a range was asked for. Readiness behaves as it does for the download: a crate whose export has not finished is 404 coded `artifact_pending` with the job's current state, and one past its retention window is 410. Probing does not consume download capacity.",
     params(
-        ("job_id" = String, Path, description = "Job identifier"),
-        ("Range" = Option<String>, Header, description = "Single byte range")
+        ("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404"),
+        ("Range" = Option<String>, Header, description = "One byte range over the crate: `bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`. Multiple ranges and unparseable or out-of-bounds values are refused with 416. Absent describes the whole crate")
     ),
     responses(
-        (status = 200, description = "RO-Crate artifact headers"),
-        (status = 206, description = "Requested artifact range headers"),
-        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
-        (status = 404, description = "Artifact not found or pending", body = ErrorResponse),
-        (status = 410, description = "Artifact expired", body = ErrorResponse),
-        (status = 416, description = "Range not satisfiable", body = ErrorResponse),
-        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
+        (status = 200, description = "Headers for the complete `application/zip` crate: `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`. No body is sent"),
+        (status = 206, description = "Headers for the requested byte range, including `Content-Range` and a `Content-Length` covering the range only. No body is sent"),
+        (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "No crate to describe: unknown job, a job submitted by somebody else, a kind that produces none, or the export has not finished yet, which is coded `artifact_pending` and carries the job's current state", body = ErrorResponse),
+        (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
+        (status = 416, description = "The requested range is not a single satisfiable byte range; the answer repeats `Accept-Ranges` and reports the crate size in `Content-Range`", body = ErrorResponse),
+        (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the probe", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1136,15 +1278,50 @@ pub async fn head_job_artifact(
     post,
     path = "/jobs/{job_id}/cancel",
     tag = "jobs",
-    params(("job_id" = String, Path, description = "Job identifier")),
+    summary = "Request cancellation of the caller's job",
+    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Self-scoped like the status read: only the submitter may cancel, and a job belonging to somebody else answers 404 rather than 403. Cancellation is asynchronous: 202 means the request was durably recorded on the job, not that work has stopped. A job that never started is settled immediately, while one already running is asked to stop and reaches `cancelled` some time later, and may still finish on its own first, so the caller polls the status to learn the outcome. The call is idempotent: repeating it on a job that is still live keeps answering 202 with `cancel_requested` true, and a job that has already reached a terminal state answers 200 with that state unchanged. Cancellation is anchored to the node that owns the job: when that node cannot be reached the answer is a retryable 503 and nothing was recorded anywhere else.",
+    params(("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404")),
     responses(
-        (status = 202, description = "Cancellation requested", body = JobStatusResponse),
-        (status = 200, description = "Job already terminal", body = JobStatusResponse),
-        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
-        (status = 404, description = "Job not found", body = ErrorResponse),
-        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
+        (
+            status = 202,
+            description = "Cancellation was recorded on the job; it is not stopped yet, poll the status for the outcome",
+            body = JobStatusResponse,
+            example = json!({
+                "job_id": "01JJRSTVWXYZ0123456789ABCD",
+                "kind": "execution",
+                "state": "running",
+                "attempts": 1,
+                "cancel_requested": true,
+                "created_at": "2026-04-09T14:23:11.123+00:00",
+                "updated_at": "2026-04-09T14:29:55.004+00:00",
+                "progress": {"current": 3, "total": 5, "unit": "phases"},
+                "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
+                "workspace_mode": "kept"
+            })
+        ),
+        (
+            status = 200,
+            description = "The job had already finished, so nothing was cancelled and its terminal state is returned unchanged",
+            body = JobStatusResponse,
+            example = json!({
+                "job_id": "01JJRSTVWXYZ0123456789ABCD",
+                "kind": "execution",
+                "state": "succeeded",
+                "attempts": 1,
+                "cancel_requested": false,
+                "created_at": "2026-04-09T14:23:11.123+00:00",
+                "updated_at": "2026-04-09T14:31:47.902+00:00",
+                "finished_at": "2026-04-09T14:31:47.902+00:00",
+                "progress": {"current": 5, "total": 5, "unit": "phases"},
+                "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
+                "workspace_mode": "kept"
+            })
+        ),
+        (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
+        (status = 503, description = "The node owning this job could not be reached, so no cancellation was recorded; retryable, the caller may repeat the request", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

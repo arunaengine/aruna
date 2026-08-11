@@ -476,17 +476,53 @@ async fn canonicalize_watch_path(
     get,
     path = "/notifications",
     tag = "notifications",
+    summary = "List the caller's notification inbox",
+    description = "Requires a realm bearer token. The inbox is self-scoped: it always belongs to the calling user and there is no way to read another user's inbox, so no further permission is checked. A token carrying path restrictions is rejected with 403 because a user-scoped surface cannot honour a delegated token's confinement. The request is served by the node that holds the caller's inbox, either locally or proxied to that holder over the realm network, so results are as consistent as that single holder. Notifications are returned newest first by creation time. Resource-watch notifications are re-authorized while the page is assembled and dropped when the caller may no longer read the resource; suppressed rows do not consume the page. A response without `next_cursor` is the last page.",
     params(
-        ("limit" = Option<usize>, Query, description = "Max notifications to return (default 50, max 200)"),
-        ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous page")
+        ("limit" = Option<usize>, Query, description = "Max notifications to return, default 50, capped at 200; a limit of 0 is raised to 1"),
+        ("cursor" = Option<String>, Query, description = "Opaque pagination cursor: pass the `next_cursor` of the previous page, an unpadded base64url encoding of 24 bytes; omit it to start at the newest notification")
     ),
     responses(
-        (status = 200, description = "Notifications page", body = NotificationListResponse),
-        (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
-        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Page of the caller's notifications, newest first",
+            body = NotificationListResponse,
+            example = json!({
+                "notifications": [
+                    {
+                        "id": "01JABCDEF0123456789ABCDEFG",
+                        "category": "group.membership",
+                        "kind": "added_to_group",
+                        "class": "direct",
+                        "created_at_ms": 1775744591123,
+                        "read": false,
+                        "group_id": "01JGRP000123456789ABCDEFGH",
+                        "actor_user_id": "01JACTR00123456789ABCDEFGH"
+                    },
+                    {
+                        "id": "01JMETADATA0123456789ABCDE",
+                        "category": "resource.watch",
+                        "kind": "data_uploaded",
+                        "class": "transient",
+                        "created_at_ms": 1775744501001,
+                        "read": true,
+                        "group_id": "01JGRP000123456789ABCDEFGH",
+                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "bucket": "reads",
+                        "key": "run-42/sample.fastq.gz",
+                        "size_bytes": 10485760,
+                        "path": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/sample.fastq.gz",
+                        "actor_user_id": "01JACTR00123456789ABCDEFGH"
+                    }
+                ],
+                "next_cursor": "___-Yo1f2uwBAgMEBQYHCAkKCwwNDg8Q"
+            })
+        ),
+        (status = 400, description = "Cursor is not unpadded base64url of exactly 24 bytes", body = ErrorResponse),
+        (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 502, description = "The inbox holder was reached but did not answer; the caller may retry", body = ErrorResponse),
+        (status = 503, description = "No inbox holder is currently available, or this node has no realm network handle to reach it; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -526,12 +562,19 @@ pub async fn list_notifications(
     get,
     path = "/notifications/unread",
     tag = "notifications",
+    summary = "Count the caller's unread notifications",
+    description = "Requires a realm bearer token; the count is self-scoped to the calling user and a path-restricted token is rejected with 403. The count is produced by the node holding the caller's inbox, locally or proxied to that holder. It is a badge value, not an exact total: counting stops at 100 and stops after scanning 2000 inbox rows, and `capped` is true in either case, meaning `at least count unread`. Resource-watch notifications the caller may no longer read are excluded.",
     responses(
-        (status = 200, description = "Unread notification count", body = UnreadCountApiResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
-        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Unread badge value for the caller",
+            body = UnreadCountApiResponse,
+            example = json!({"count": 7, "capped": false})
+        ),
+        (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 502, description = "The inbox holder was reached but did not answer; the caller may retry", body = ErrorResponse),
+        (status = 503, description = "No inbox holder is currently available, or this node has no realm network handle to reach it; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -860,11 +903,13 @@ fn state_event(state: NotificationStreamStateResponse) -> Event {
     get,
     path = "/notifications/stream",
     tag = "notifications",
+    summary = "Stream the caller's notification state",
+    description = "Requires a realm bearer token; the stream is self-scoped to the calling user and a path-restricted token is rejected with 403. The response is a `text/event-stream` that stays open until the client disconnects or the node shuts down; it is not a JSON document and carries no notification payloads, only a small state frame the client uses as a trigger to refetch the inbox. When this node holds the caller's inbox the stream reacts to local delivery wakes within about 200ms of coalescing; otherwise it polls the holder every 5s and emits only on change. A local stream re-resolves the holder after 60s of silence and degrades to polling if the inbox moved to another node, so a client never has to reconnect for that. Transient fetch failures are skipped rather than ending the stream.",
     responses(
-        (status = 200, description = r#"Server-sent state stream. Every application frame is `event: state` with JSON `{"epoch": <string>, "revision": <u64>, "unread": {"count": <u32>, "capped": <bool>}}`. The current state is sent on connect, after a dashboard revision or unread-state change, and about every 20s without advancing the revision. The epoch changes when the retained counter is reset. The stream ends on client disconnect."#, body = NotificationStreamStateResponse, content_type = "text/event-stream"),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+        (status = 200, description = r#"Server-sent state stream, media type `text/event-stream`. Every application frame is `event: state` followed by one `data:` line holding JSON `{"epoch": <string>, "revision": <u64>, "unread": {"count": <u32>, "capped": <bool>}}` and a blank line; frames carry no `id:` field, so `Last-Event-ID` is not honoured. The current state is sent on connect, after a dashboard revision or unread-state change, and about every 20s without advancing the revision; that periodic frame doubles as the keep-alive, and an SSE comment line is sent instead whenever 20s pass with no frame, so proxies do not cut an idle stream. The epoch changes when the retained counter is reset, which tells a client its cached revision is meaningless. A client resumes by simply reconnecting: the first frame of the new stream is the full current state, and any state missed while disconnected is recovered by refetching the inbox, never replayed on the stream. The stream ends on client disconnect or node shutdown."#, body = NotificationStreamStateResponse, content_type = "text/event-stream"),
+        (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 503, description = "No inbox holder is available, this node has no realm network handle, or the dashboard change feed is not running; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -916,14 +961,25 @@ pub async fn stream_notifications(
     post,
     path = "/notifications/read",
     tag = "notifications",
-    request_body = MarkReadApiRequest,
+    summary = "Mark the caller's notifications as read",
+    description = "Requires a realm bearer token; only the calling user's own inbox is affected and a path-restricted token is rejected with 403. The update is applied on the node holding the caller's inbox, locally or proxied to that holder. Both selectors may be combined: `ids` marks those notifications, `up_to_ms` marks every notification created at or before that epoch-millisecond timestamp. Unknown ids are ignored and already-read notifications are left untouched, so the returned count is the number of notifications this call actually flipped to read and repeating a call is safe. A body with no ids and no `up_to_ms` marks nothing and returns 0.",
+    request_body(
+        content = MarkReadApiRequest,
+        description = "Notifications to mark read, by id, by age, or both; at most 512 ids, duplicates are collapsed",
+        example = json!({"ids": ["01JABCDEF0123456789ABCDEFG"], "up_to_ms": 1775744591123})
+    ),
     responses(
-        (status = 200, description = "Notifications marked read", body = MarkReadApiResponse),
-        (status = 400, description = "Invalid notification id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
-        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Number of notifications flipped from unread to read by this call",
+            body = MarkReadApiResponse,
+            example = json!({"marked": 3})
+        ),
+        (status = 400, description = "An id is not a ULID, or more than 512 ids were supplied", body = ErrorResponse),
+        (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 502, description = "The inbox holder was reached but did not answer; the caller may retry", body = ErrorResponse),
+        (status = 503, description = "No inbox holder is currently available, or this node has no realm network handle to reach it; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -959,12 +1015,28 @@ pub async fn mark_read(
     get,
     path = "/notifications/watches",
     tag = "notifications",
+    summary = "List the caller's notification watches",
+    description = "Requires a realm bearer token; watches are per-user, so this returns only the calling user's own subscriptions and a path-restricted token is rejected with 403. The list is read from the node holding the caller's inbox, locally or proxied to that holder. It is complete and unpaginated because a user may hold at most 50 watches. Entries are returned as stored, in watch-id order, with the canonical path prefix that was recorded at creation; authorization is re-evaluated when an event is delivered, so a listed watch may stop producing notifications after a permission change without disappearing here.",
     responses(
-        (status = 200, description = "Watch subscriptions", body = WatchListResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
-        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Every watch subscription owned by the caller",
+            body = WatchListResponse,
+            example = json!({
+                "watches": [
+                    {
+                        "id": "01JWATCH0123456789ABCDEFGH",
+                        "path_prefix": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/",
+                        "events": ["data_uploaded"],
+                        "created_at_ms": 1775744591123
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 502, description = "The inbox holder was reached but did not answer; the caller may retry", body = ErrorResponse),
+        (status = 503, description = "No inbox holder is currently available, or this node has no realm network handle to reach it; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -986,16 +1058,34 @@ pub async fn list_watches(
     post,
     path = "/notifications/watches",
     tag = "notifications",
-    description = "Create an authorized watch subscription using a canonical resource prefix. Data events use `s3/{group_id}/{node_id}/{bucket}/{key-prefix}` and require READ on that exact node's blob bucket permission path. For a bucket on this node, the supplied group is canonicalized to the bucket-owning group and the response exposes that canonical prefix. Metadata events use `meta/{group_id}/{normalized_document_path-prefix}` and require READ on the group's metadata permission path. The slash after the bucket or metadata group is required, no leading slash is allowed, and metadata/data event kinds cannot be combined because their canonical namespaces differ.",
-    request_body = CreateWatchRequest,
+    summary = "Create a notification watch for the caller",
+    description = "Create an authorized watch subscription using a canonical resource prefix. Data events use `s3/{group_id}/{node_id}/{bucket}/{key-prefix}` and require READ on that exact node's blob bucket permission path. For a bucket on this node, the supplied group is canonicalized to the bucket-owning group and the response exposes that canonical prefix. Metadata events use `meta/{group_id}/{normalized_document_path-prefix}` and require READ on the group's metadata permission path. The slash after the bucket or metadata group is required, no leading slash is allowed, and metadata/data event kinds cannot be combined because their canonical namespaces differ. Requires a realm bearer token and creates the watch for the calling user only; a path-restricted token is rejected with 403. READ is evaluated against the caller's current grants at creation time, and a caller that cannot read the prefix always gets 403, never a 404 that would separate an unreadable resource from a missing one. The prefix must be non-empty and at most 1024 bytes and at least one event name must be given; a user may hold at most 50 watches, beyond which creation answers 409. The subscription is stored on the node holding the caller's inbox, locally or proxied to that holder; 201 means it is durably recorded there, while replication to the other holders and publication of the watch interest are scheduled afterwards, so the first matching events may occur before delivery starts. Every delivery is re-authorized, so revoking the caller's READ silently stops notifications without deleting the watch.",
+    request_body(
+        content = CreateWatchRequest,
+        description = "Canonical resource prefix plus the event names to subscribe to; valid names are `metadata_created`, `data_uploaded`, `sync_completed` and `sync_failed`",
+        example = json!({
+            "path_prefix": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/",
+            "events": ["data_uploaded"]
+        })
+    ),
     responses(
-        (status = 201, description = "Watch subscription created", body = WatchResponse),
-        (status = 400, description = "Invalid or non-canonical path prefix, or invalid event name", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 409, description = "Per-user watch cap reached", body = ErrorResponse),
-        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
-        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+        (
+            status = 201,
+            description = "Watch subscription created, echoing the canonical prefix that was stored",
+            body = WatchResponse,
+            example = json!({
+                "id": "01JWATCH0123456789ABCDEFGH",
+                "path_prefix": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/",
+                "events": ["data_uploaded"],
+                "created_at_ms": 1775744591123
+            })
+        ),
+        (status = 400, description = "Invalid or non-canonical path prefix, prefix longer than 1024 bytes, empty event list, or invalid event name", body = ErrorResponse),
+        (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, carries path restrictions, or the caller may not read the watched prefix", body = ErrorResponse),
+        (status = 409, description = "The caller already holds the maximum of 50 watches", body = ErrorResponse),
+        (status = 502, description = "The inbox holder was reached but did not answer; the caller may retry", body = ErrorResponse),
+        (status = 503, description = "No inbox holder is currently available, or this node has no realm network handle to reach it; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1052,14 +1142,16 @@ pub async fn create_watch(
     delete,
     path = "/notifications/watches/{id}",
     tag = "notifications",
-    params(("id" = String, Path, description = "Watch subscription id")),
+    summary = "Delete one of the caller's notification watches",
+    description = "Requires a realm bearer token; watches are per-user and the id is resolved inside the caller's own set, so another user's watch can never be deleted and no further permission is checked. A path-restricted token is rejected with 403. The delete is applied on the node holding the caller's inbox, locally or proxied to that holder, and is idempotent: an id the caller does not own, including one already deleted, also answers 204. The 204 means the subscription is durably removed on that holder; removing the watch interest from the other holders is replicated afterwards, so a small number of already-matched events may still arrive.",
+    params(("id" = String, Path, description = "ULID of a watch subscription owned by the caller, as returned when the watch was created or listed")),
     responses(
-        (status = 204, description = "Watch subscription deleted"),
-        (status = 400, description = "Invalid watch id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
-        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+        (status = 204, description = "Watch subscription deleted, or it did not exist; no response body"),
+        (status = 400, description = "The id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
+        (status = 502, description = "The inbox holder was reached but did not answer; the caller may retry", body = ErrorResponse),
+        (status = 503, description = "No inbox holder is currently available, or this node has no realm network handle to reach it; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
