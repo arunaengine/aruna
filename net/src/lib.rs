@@ -1000,6 +1000,11 @@ impl NetHandle {
         self.inner.connection_pool.counts()
     }
 
+    #[doc(hidden)]
+    pub fn pool_counts_for(&self, node_id: NodeId, alpn: Alpn) -> PoolCounts {
+        self.inner.connection_pool.counts_for(node_id, alpn)
+    }
+
     pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
         if endpoint_addr.id == self.inner.node_id {
             return;

@@ -14,6 +14,7 @@ use iroh::endpoint::{
     WeakConnectionHandle,
 };
 use iroh::{Endpoint, TransportAddr};
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 use tokio::sync::{Notify, oneshot};
@@ -50,14 +51,15 @@ impl Default for ConnectionPoolOptions {
     }
 }
 
-/// Attempt counters behind the structured connection diagnostics. Fixed outcome
-/// classes only; peer identity is never a counter dimension.
-#[derive(Debug, Default)]
+/// Attempt counters behind aggregate and bounded per-key diagnostics.
+#[derive(Debug)]
 struct PoolCounters {
     dials: AtomicU64,
     cooldown_hits: AtomicU64,
     cooldown_records: AtomicU64,
     cooldown_expiries: AtomicU64,
+    by_key: Mutex<HashMap<ConnectionKey, KeyCounters>>,
+    capacity: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,6 +68,80 @@ pub struct PoolCounts {
     pub cooldown_hits: u64,
     pub cooldown_records: u64,
     pub cooldown_expiries: u64,
+}
+
+#[derive(Debug, Default)]
+struct KeyCounters {
+    dials: u64,
+    cooldown_hits: u64,
+    cooldown_records: u64,
+    cooldown_expiries: u64,
+}
+
+impl PoolCounters {
+    fn new(capacity: usize) -> Self {
+        Self {
+            dials: AtomicU64::new(0),
+            cooldown_hits: AtomicU64::new(0),
+            cooldown_records: AtomicU64::new(0),
+            cooldown_expiries: AtomicU64::new(0),
+            by_key: Mutex::new(HashMap::new()),
+            capacity,
+        }
+    }
+
+    fn update_key(&self, key: ConnectionKey, update: impl FnOnce(&mut KeyCounters)) {
+        if self.capacity == 0 {
+            return;
+        }
+        let mut by_key = self.by_key.lock();
+        if !by_key.contains_key(&key) && by_key.len() >= self.capacity {
+            let Some(oldest) = by_key.keys().next().copied() else {
+                return;
+            };
+            by_key.remove(&oldest);
+        }
+        update(by_key.entry(key).or_default());
+    }
+
+    fn record_dial(&self, key: ConnectionKey) {
+        self.dials.fetch_add(1, Ordering::Relaxed);
+        self.update_key(key, |counts| counts.dials += 1);
+    }
+
+    fn record_hit(&self, key: ConnectionKey) {
+        self.cooldown_hits.fetch_add(1, Ordering::Relaxed);
+        self.update_key(key, |counts| counts.cooldown_hits += 1);
+    }
+
+    fn record_failure(&self, key: ConnectionKey) {
+        self.cooldown_records.fetch_add(1, Ordering::Relaxed);
+        self.update_key(key, |counts| counts.cooldown_records += 1);
+    }
+
+    fn record_expiry(&self, key: ConnectionKey) {
+        self.cooldown_expiries.fetch_add(1, Ordering::Relaxed);
+        self.update_key(key, |counts| counts.cooldown_expiries += 1);
+    }
+
+    fn counts_for(&self, key: ConnectionKey) -> PoolCounts {
+        let by_key = self.by_key.lock();
+        let Some(counts) = by_key.get(&key) else {
+            return PoolCounts::default();
+        };
+        PoolCounts {
+            dials: counts.dials,
+            cooldown_hits: counts.cooldown_hits,
+            cooldown_records: counts.cooldown_records,
+            cooldown_expiries: counts.cooldown_expiries,
+        }
+    }
+}
+
+impl Default for PoolCounters {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -133,6 +209,8 @@ enum ActorMessage {
     ClearFailures {
         node_id: NodeId,
     },
+    #[cfg(test)]
+    Barrier(oneshot::Sender<()>),
     Shutdown,
 }
 
@@ -184,9 +262,7 @@ impl FailureCache {
                 expires: now + self.cooldown,
             },
         );
-        self.counters
-            .cooldown_records
-            .fetch_add(1, Ordering::Relaxed);
+        self.counters.record_failure(key);
     }
 
     /// Returns the cached error while the key is still cooling. An expired entry
@@ -194,13 +270,11 @@ impl FailureCache {
     fn hit(&mut self, key: &ConnectionKey, now: Instant) -> Option<PoolConnectError> {
         let entry = self.entries.get(key)?;
         if entry.expires > now {
-            self.counters.cooldown_hits.fetch_add(1, Ordering::Relaxed);
+            self.counters.record_hit(*key);
             return Some(entry.error.clone());
         }
         self.entries.remove(key);
-        self.counters
-            .cooldown_expiries
-            .fetch_add(1, Ordering::Relaxed);
+        self.counters.record_expiry(*key);
         None
     }
 
@@ -250,7 +324,7 @@ impl PoolContext {
         key: ConnectionKey,
         mut rx: Receiver<RequestLease>,
     ) {
-        self.owner.counters.dials.fetch_add(1, Ordering::Relaxed);
+        self.owner.counters.record_dial(key);
         let connect = async {
             self.endpoint
                 .connect(key.node_id, key.alpn.as_bytes())
@@ -404,6 +478,10 @@ impl Actor {
                 }
                 ActorMessage::ConnectionReady { key } => self.failures.clear(&key),
                 ActorMessage::ClearFailures { node_id } => self.failures.clear_node(node_id),
+                #[cfg(test)]
+                ActorMessage::Barrier(done) => {
+                    let _ = done.send(());
+                }
                 ActorMessage::Shutdown => break,
             }
         }
@@ -497,7 +575,7 @@ impl std::fmt::Debug for ConnectionPool {
 impl ConnectionPool {
     pub fn new(endpoint: Endpoint, options: ConnectionPoolOptions) -> Self {
         let request_timeout = options.connect_timeout;
-        let counters = Arc::new(PoolCounters::default());
+        let counters = Arc::new(PoolCounters::new(options.max_connections));
         let (actor, tx) = Actor::new(endpoint, options, counters.clone());
         tokio::spawn(actor.run());
         Self {
@@ -514,6 +592,10 @@ impl ConnectionPool {
             cooldown_records: self.counters.cooldown_records.load(Ordering::Relaxed),
             cooldown_expiries: self.counters.cooldown_expiries.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn counts_for(&self, node_id: NodeId, alpn: Alpn) -> PoolCounts {
+        self.counters.counts_for(ConnectionKey { node_id, alpn })
     }
 
     /// Drops every cooldown for a peer whose endpoint address was just
@@ -623,6 +705,68 @@ mod tests {
             .bind()
             .await
             .expect("endpoint binds")
+    }
+
+    async fn pending_endpoint(peer: NodeId) -> (Endpoint, tokio::net::UdpSocket) {
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("blackhole socket");
+        lookup.add_endpoint_info(iroh::EndpointAddr::from_parts(
+            peer,
+            [TransportAddr::Ip(
+                blackhole.local_addr().expect("blackhole address"),
+            )],
+        ));
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .address_lookup(lookup)
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("valid bind addr"),
+            )
+            .expect("valid bind addr")
+            .bind()
+            .await
+            .expect("endpoint binds");
+        (endpoint, blackhole)
+    }
+
+    async fn actor_barrier(pool: &ConnectionPool) {
+        let (done, ready) = oneshot::channel();
+        pool.tx
+            .send(ActorMessage::Barrier(done))
+            .await
+            .expect("pool actor");
+        ready.await.expect("pool barrier");
+    }
+
+    async fn wait_dial(pool: &ConnectionPool, before: u64) {
+        for _ in 0..1024 {
+            if pool.counts().dials > before {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("connection actor did not start");
+    }
+
+    fn fill_mailbox(pool: &ConnectionPool, key: ConnectionKey) {
+        let mut full = false;
+        for _ in 0..512 {
+            let (reply, _response) = oneshot::channel();
+            let request = RequestLease { key, tx: reply };
+            match pool.tx.try_send(ActorMessage::RequestLease(request)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    full = true;
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => panic!("pool actor stopped"),
+            }
+        }
+        assert!(full, "pool actor mailbox did not saturate");
     }
 
     #[tokio::test]
@@ -770,6 +914,70 @@ mod tests {
             assert!(result.expect("request task"));
         }
         assert_eq!(pool.counts().dials, 2);
+    }
+
+    #[tokio::test]
+    async fn clear_after_pressure() {
+        let blocked = node(20);
+        let target = node(21);
+        let (endpoint, _blackhole) = pending_endpoint(blocked).await;
+        tokio::time::pause();
+        let options = ConnectionPoolOptions {
+            connect_timeout: Duration::from_secs(30),
+            failure_cooldown: Duration::from_secs(30),
+            ..ConnectionPoolOptions::default()
+        };
+        let connect_timeout = options.connect_timeout;
+        let pool = ConnectionPool::new(endpoint.clone(), options);
+        pool.record_failure(
+            ConnectionKey {
+                node_id: target,
+                alpn: Alpn::Bao,
+            },
+            PoolConnectError::Connection("offline".to_string()),
+        )
+        .await
+        .expect("record failure");
+        actor_barrier(&pool).await;
+
+        let before = pool.counts();
+        let blocked_pool = pool.clone();
+        let blocked_task =
+            tokio::spawn(async move { blocked_pool.get_or_connect(blocked, Alpn::Bao).await });
+        wait_dial(&pool, before.dials).await;
+        fill_mailbox(
+            &pool,
+            ConnectionKey {
+                node_id: blocked,
+                alpn: Alpn::Bao,
+            },
+        );
+
+        let mut clear = Box::pin(pool.clear_failures(target));
+        tokio::select! {
+            result = &mut clear => panic!("clear completed before pressure released: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(connect_timeout + Duration::from_secs(1)).await;
+        clear.await.expect("clear failures");
+        actor_barrier(&pool).await;
+        assert!(blocked_task.await.expect("blocked request").is_err());
+
+        let before_group = pool.counts_for(target, Alpn::Bao);
+        let mut requests = JoinSet::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            requests.spawn(async move { pool.get_or_connect(target, Alpn::Bao).await });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert!(result.expect("request task").is_err());
+        }
+        actor_barrier(&pool).await;
+        let after_group = pool.counts_for(target, Alpn::Bao);
+        assert_eq!(after_group.dials - before_group.dials, 1);
+
+        pool.shutdown().await.expect("pool shutdown");
+        endpoint.close().await;
     }
 
     #[tokio::test]

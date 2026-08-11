@@ -2,6 +2,7 @@
 
 mod shared;
 
+use aruna_core::alpn::Alpn;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::handle::Handle;
@@ -54,6 +55,10 @@ async fn metadata_query(base_url: &str, token: &str) -> TestResult<Value> {
         .into());
     }
     Ok(response.json().await?)
+}
+
+fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net::PoolCounts {
+    seed.net.pool_counts_for(peer, Alpn::Metadata)
 }
 
 async fn rejoin_peer(
@@ -155,7 +160,7 @@ async fn check_outage(
     joiner: &shared::JoinerNode,
     token: &str,
 ) -> TestResult<()> {
-    let before = seed.net.pool_counts();
+    let before = metadata_counts(seed, joiner.config.node_id);
     joiner.net.shutdown().await;
     let partial = metadata_query(&seed.base_url, token).await?;
     assert_eq!(partial["complete"], false);
@@ -168,14 +173,14 @@ async fn check_outage(
                 .iter()
                 .any(|node| node == &json!(joiner.config.node_id.to_string())))
     );
-    let after = seed.net.pool_counts();
-    assert!(after.dials > before.dials);
+    let after = metadata_counts(seed, joiner.config.node_id);
+    assert_eq!(after.dials - before.dials, 1);
 
     let retry = metadata_query(&seed.base_url, token).await?;
     assert_eq!(retry["complete"], false);
     assert_eq!(retry["nodes_queried"], 2);
     assert_eq!(retry["nodes_failed"], 1);
-    let retried = seed.net.pool_counts();
+    let retried = metadata_counts(seed, joiner.config.node_id);
     // A request may cross the five-second cooldown; then one re-probe is valid.
     let retry_dials = retried.dials - after.dials;
     assert!(retry_dials <= 1);
@@ -191,6 +196,7 @@ async fn check_recovery(
     token: &str,
 ) -> TestResult<()> {
     let peer = rejoin_peer(joiner, seed).await?;
+    let before = metadata_counts(seed, joiner.config.node_id);
     let result = async {
         announce_peer(&peer.net, seed.realm_id).await?;
         wait_until(
@@ -218,6 +224,8 @@ async fn check_recovery(
     }
     .await;
     peer.net.shutdown().await;
+    let after = metadata_counts(seed, joiner.config.node_id);
+    assert_eq!(after.dials - before.dials, 1);
     result
 }
 
