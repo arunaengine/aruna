@@ -292,21 +292,42 @@ async fn apply_record(
                         Some(&stored),
                         record,
                     )
-                    .await?;
+                    .await
+                    .map_err(apply_failure)?;
                     row.meta_resource_id = meta_resource_id;
                     row.state = HarvestRecordState::Live;
                     write_provenance(ctx, &row).await?;
                     counts.updated += 1;
                 }
-                // Deleted out of band while the provenance stayed live: an
-                // update can never land on a document that is gone, so the
-                // identity is retired and a successor allocated, exactly as a
-                // revival does.
+                // Local absence may only be registry lag. Ask the routed holders
+                // to update first; retire the identity only when all report it
+                // gone.
                 None => {
                     confirm_absent(ctx, meta_resource_id).await?;
-                    row.predecessors.push(meta_resource_id);
-                    mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
-                    counts.minted += 1;
+                    match update_document(
+                        ctx,
+                        source,
+                        actor,
+                        realm_id,
+                        meta_resource_id,
+                        None,
+                        record,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            row.meta_resource_id = meta_resource_id;
+                            row.state = HarvestRecordState::Live;
+                            write_provenance(ctx, &row).await?;
+                            counts.updated += 1;
+                        }
+                        Err(MetadataWriteError::NotFound) => {
+                            row.predecessors.push(meta_resource_id);
+                            mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
+                            counts.minted += 1;
+                        }
+                        Err(error) => return Err(apply_failure(error)),
+                    }
                 }
             }
         }
@@ -467,6 +488,7 @@ async fn create_document(
                 record,
             )
             .await
+            .map_err(apply_failure)
         }
         Err(error) => Err(apply_failure(error)),
     }
@@ -480,7 +502,7 @@ async fn update_document(
     document_id: Ulid,
     stored: Option<&MetadataRegistryRecord>,
     record: &OaiRecord,
-) -> Result<(), HarvestFailure> {
+) -> Result<(), MetadataWriteError> {
     update_metadata_document_routed(
         &ctx.driver,
         actor.clone(),
@@ -492,8 +514,7 @@ async fn update_document(
         },
         Some(internal_token(source.created_by, realm_id)),
     )
-    .await
-    .map_err(apply_failure)?;
+    .await?;
     Ok(())
 }
 
