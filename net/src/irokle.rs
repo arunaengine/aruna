@@ -5020,7 +5020,7 @@ async fn store_pid_mapping(
 ) -> Result<MetadataPlacementOutcome<bool>> {
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
-        match derive_metadata_placement_txn(
+        match derive_placement_txn(
             storage,
             realm_id,
             None,
@@ -6608,7 +6608,7 @@ async fn metadata_placement_fence_in_transaction(
     txn_id: TxnId,
 ) -> Result<MetadataPlacementOutcome<MetadataPlacementFence>> {
     Ok(
-        match derive_metadata_placement_txn(
+        match derive_placement_txn(
             storage,
             record.realm_id,
             Some(record.group_id),
@@ -6634,7 +6634,7 @@ async fn metadata_placement_fence_in_transaction(
 /// the publisher stamped. The transactional config read is the whole fence: a
 /// concurrent config mutation conflicts the commit. `group_id` is compared only
 /// when the caller knows it; a PID mapping target carries no group.
-async fn derive_metadata_placement_txn(
+async fn derive_placement_txn(
     storage: &StorageHandle,
     realm_id: RealmId,
     group_id: Option<Ulid>,
@@ -17792,7 +17792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantine_retains_rejected_families() {
+    async fn quarantine_retains_families() {
         use aruna_core::structs::{WatchEventKind, WatchEventMask};
 
         let (_storage_dir, storage) = test_storage();
@@ -18016,7 +18016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantine_keeps_shard_placement() {
+    async fn quarantine_keeps_placement() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
         let realm_id = RealmId::from_bytes([72u8; 32]);
@@ -18099,7 +18099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantine_metadata_placement_rejects() {
+    async fn quarantine_rejects_placement() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
         let realm_id = RealmId::from_bytes([42; 32]);
@@ -18689,7 +18689,7 @@ mod tests {
     /// not stamp a document that decodes to another, even when both shards share
     /// this holder.
     #[tokio::test]
-    async fn pid_mapping_placement_fence() {
+    async fn pid_placement_fence() {
         use aruna_core::keyspaces::{PERSISTENT_ID_MAPPING_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
         use aruna_core::storage_entries::shard_manifest_key;
         use aruna_core::structs::PersistentIdRevision;
@@ -18893,7 +18893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantine_capacity_holds_cursor() {
+    async fn capacity_holds_cursor() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
         let realm_id = RealmId::from_bytes([73u8; 32]);
