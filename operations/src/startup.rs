@@ -562,6 +562,7 @@ pub async fn restore_shard_pass(
     node_id: NodeId,
     realm_id: RealmId,
     cursor: &mut ShardRestoreCursor,
+    cancelled: &CancellationToken,
 ) -> ShardRestorePass {
     let Some(net_handle) = context.net_handle.clone() else {
         *cursor = ShardRestoreCursor::default();
@@ -596,9 +597,16 @@ pub async fn restore_shard_pass(
     // durably verified; join verification below happens after this restore.
     let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
 
-    let (start, end, wrapped) = restore_range(*cursor, units_total);
+    let (start, mut end, mut wrapped) = restore_range(*cursor, units_total);
     let mut withheld = 0usize;
-    for unit in &units[start..end] {
+    for (offset, unit) in units[start..end].iter().enumerate() {
+        // Cancellation lands between work units, so an interrupted pass leaves
+        // the cursor on the first unprocessed unit.
+        if cancelled.is_cancelled() {
+            end = start + offset;
+            wrapped = false;
+            break;
+        }
         withheld += process_restore_unit(context, &net_handle, node_id, unit, &verified).await;
     }
     summary.withheld_topics = withheld;
