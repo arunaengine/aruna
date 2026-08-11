@@ -211,6 +211,11 @@ enum ActorMessage {
     },
     #[cfg(test)]
     Barrier(oneshot::Sender<()>),
+    #[cfg(test)]
+    Hold {
+        ready: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
     Shutdown,
 }
 
@@ -482,6 +487,11 @@ impl Actor {
                 ActorMessage::Barrier(done) => {
                     let _ = done.send(());
                 }
+                #[cfg(test)]
+                ActorMessage::Hold { ready, release } => {
+                    let _ = ready.send(());
+                    let _ = release.await;
+                }
                 ActorMessage::Shutdown => break,
             }
         }
@@ -742,6 +752,20 @@ mod tests {
         ready.await.expect("pool barrier");
     }
 
+    async fn hold_actor(pool: &ConnectionPool) -> oneshot::Sender<()> {
+        let (ready, held) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        pool.tx
+            .send(ActorMessage::Hold {
+                ready,
+                release: wait,
+            })
+            .await
+            .expect("pool actor");
+        held.await.expect("pool hold");
+        release
+    }
+
     async fn wait_dial(pool: &ConnectionPool, before: u64) {
         for _ in 0..1024 {
             if pool.counts().dials > before {
@@ -945,6 +969,7 @@ mod tests {
         let blocked_task =
             tokio::spawn(async move { blocked_pool.get_or_connect(blocked, Alpn::Bao).await });
         wait_dial(&pool, before.dials).await;
+        let release = hold_actor(&pool).await;
         fill_mailbox(
             &pool,
             ConnectionKey {
@@ -953,13 +978,22 @@ mod tests {
             },
         );
 
-        let mut clear = Box::pin(pool.clear_failures(target));
-        tokio::select! {
-            result = &mut clear => panic!("clear completed before pressure released: {result:?}"),
-            _ = tokio::task::yield_now() => {}
-        }
+        let clear_pool = pool.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let clear = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            clear_pool.clear_failures(target).await
+        });
+        started_rx.await.expect("clear task started");
+        assert_eq!(pool.tx.capacity(), 0);
+        assert!(!clear.is_finished());
+        release.send(()).expect("release pool actor");
         tokio::time::advance(connect_timeout + Duration::from_secs(1)).await;
-        clear.await.expect("clear failures");
+        tokio::time::timeout(Duration::from_secs(5), clear)
+            .await
+            .expect("clear request made progress")
+            .expect("clear task")
+            .expect("clear failures");
         actor_barrier(&pool).await;
         assert!(blocked_task.await.expect("blocked request").is_err());
 
