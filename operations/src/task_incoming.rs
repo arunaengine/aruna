@@ -2795,6 +2795,27 @@ mod tests {
         }
     }
 
+    /// Tokio inhibits paused-clock auto-advance while a blocking task is alive.
+    /// Storage and net answer from their own threads, so without this the clock
+    /// races ahead of every round trip. `tokio::time::advance` still applies.
+    struct ClockGuard {
+        _stop: std::sync::mpsc::Sender<()>,
+    }
+
+    fn freeze_clock() -> ClockGuard {
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            let _ = wait.recv();
+        });
+        ClockGuard { _stop: stop }
+    }
+
+    // Net shutdown drains under a timeout that a still clock never expires.
+    async fn shutdown_net(net: &NetHandle) {
+        tokio::time::resume();
+        net.shutdown().await;
+    }
+
     struct InstalledHarness {
         _dir: tempfile::TempDir,
         storage: aruna_storage::StorageHandle,
@@ -2805,16 +2826,10 @@ mod tests {
         completed: mpsc::Receiver<()>,
     }
 
+    // The frozen clock only moves on an explicit advance, so waiting here cannot
+    // outrun the drain; a poll bound would instead depend on machine speed.
     async fn recv_progress(receiver: &mut mpsc::Receiver<()>) -> bool {
-        // Bound polling so a paused clock cannot leave a lost timer waiting forever.
-        for _ in 0..1024 {
-            match receiver.try_recv() {
-                Ok(()) => return true,
-                Err(mpsc::error::TryRecvError::Empty) => tokio::task::yield_now().await,
-                Err(mpsc::error::TryRecvError::Disconnected) => return false,
-            }
-        }
-        false
+        receiver.recv().await.is_some()
     }
 
     async fn installed_setup() -> InstalledHarness {
@@ -3393,6 +3408,7 @@ mod tests {
 
     #[tokio::test]
     async fn topic_page_blocks() {
+        let _clock = freeze_clock();
         let realm_id = RealmId::from_bytes([49u8; 32]);
         let dir = tempdir().expect("temp dir");
         let storage =
@@ -3480,11 +3496,12 @@ mod tests {
                 .expect("read retried record"),
             None
         );
-        net.shutdown().await;
+        shutdown_net(&net).await;
     }
 
     #[tokio::test]
     async fn admin_page_blocks() {
+        let _clock = freeze_clock();
         let realm_id = RealmId::from_bytes([50u8; 32]);
         let dir = tempdir().expect("temp dir");
         let storage =
@@ -3555,7 +3572,7 @@ mod tests {
                 .expect("read admin suffix"),
             None
         );
-        net.shutdown().await;
+        shutdown_net(&net).await;
     }
 
     // Closing a rotation returns its accumulated totals and clears every
@@ -3612,6 +3629,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn close_routes_defer() {
+        let _clock = freeze_clock();
         let (_dir, handler, task_handle) = outbox_handler();
         let key = TaskKey::DrainDocumentSyncOutbox;
         handler
@@ -3647,6 +3665,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn close_keeps_retry() {
+        let _clock = freeze_clock();
         let (_dir, handler, task_handle) = outbox_handler();
         let key = TaskKey::DrainDocumentSyncOutbox;
         handler
@@ -3678,6 +3697,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn close_resets_progress() {
+        let _clock = freeze_clock();
         let (_dir, handler, task_handle) = outbox_handler();
         let key = TaskKey::DrainDocumentSyncOutbox;
         handler
@@ -3715,6 +3735,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_suffix_closes() {
+        let _clock = freeze_clock();
         let (_dir, handler, task_handle) = outbox_handler();
         let key = TaskKey::DrainDocumentSyncOutbox;
         // The first page retried; a clean suffix made progress before the
@@ -3752,6 +3773,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn midpoint_retry_keeps() {
+        let _clock = freeze_clock();
         let (_dir, handler, task_handle) = outbox_handler();
         let key = TaskKey::DrainDocumentSyncOutbox;
         let topic = irokle::TopicId::hash(b"midpoint-retry-topic");
@@ -3784,6 +3806,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn empty_resets_backoff() {
+        let _clock = freeze_clock();
         let (_dir, handler, _task_handle) = outbox_handler();
         let key = TaskKey::DrainDocumentSyncOutbox;
         handler
@@ -3809,6 +3832,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_keeps_backoff() {
+        let _clock = freeze_clock();
         let realm_id = RealmId::from_bytes([48u8; 32]);
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -3865,7 +3889,7 @@ mod tests {
                 .get(&key),
             Some(&3)
         );
-        net.shutdown().await;
+        shutdown_net(&net).await;
     }
 
     // The invocation bound is a work-unit limit, never a latency assertion.
@@ -3931,6 +3955,7 @@ mod tests {
     // pages the whole outbox per run, so a later-page record still publishes.
     #[tokio::test(start_paused = true)]
     async fn deferred_head_paginates() {
+        let _clock = freeze_clock();
         let realm_id = RealmId::from_bytes([44u8; 32]);
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -4050,7 +4075,7 @@ mod tests {
             "an early defer followed by a clean suffix keeps the aggregate retry"
         );
 
-        net.shutdown().await;
+        shutdown_net(&net).await;
     }
 
     struct BoundaryHarness {
@@ -4223,12 +4248,13 @@ mod tests {
                 remaining.records.is_empty(),
                 "records across all streams must retry after the rotation closes"
             );
-            self.net.shutdown().await;
+            shutdown_net(&self.net).await;
         }
     }
 
     #[tokio::test]
     async fn boundary_appends_wait() {
+        let _clock = freeze_clock();
         let mut harness = BoundaryHarness::new().await;
         harness.seed_records().await;
 
@@ -4263,6 +4289,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotation_streak() {
+        let _clock = freeze_clock();
         let realm_id = RealmId::from_bytes([51u8; 32]);
         let dir = tempdir().expect("temp dir");
         let storage =
@@ -4342,7 +4369,7 @@ mod tests {
                 .records
                 .is_empty()
         );
-        net.shutdown().await;
+        shutdown_net(&net).await;
     }
 
     struct ConfigHarness {
@@ -4764,6 +4791,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn restore_document_sync_outbox_timers_keeps_existing_backoff_timer() {
+        let _clock = freeze_clock();
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -4809,6 +4837,7 @@ mod tests {
 
     #[tokio::test]
     async fn installed_fence() {
+        let _clock = freeze_clock();
         let InstalledHarness {
             _dir,
             task_handle,
@@ -4847,11 +4876,12 @@ mod tests {
         );
         assert!(completed.try_recv().is_err());
 
-        net.shutdown().await;
+        shutdown_net(&net).await;
     }
 
     #[tokio::test]
     async fn installed_continues() {
+        let _clock = freeze_clock();
         let InstalledHarness {
             _dir,
             storage,
@@ -4863,7 +4893,9 @@ mod tests {
 
         drive_document_sync_outbox_drain(context).await;
         assert!(recv_progress(&mut completed).await);
-        tokio::time::advance(OUTBOX_CONTINUATION_AFTER).await;
+        // Tokio rounds a timer deadline up to the next millisecond, so the clock
+        // has to pass the interval rather than land exactly on it.
+        tokio::time::advance(OUTBOX_CONTINUATION_AFTER + Duration::from_millis(1)).await;
         assert!(recv_progress(&mut completed).await);
         assert!(completed.try_recv().is_err());
         assert!(
@@ -4874,7 +4906,7 @@ mod tests {
                 .is_empty()
         );
 
-        net.shutdown().await;
+        shutdown_net(&net).await;
     }
 
     #[tokio::test]
