@@ -210,6 +210,9 @@ pub enum DhtEvent {
     GetResult {
         key: DhtKeyId,
         values: Vec<DhtEntry>,
+        /// Answered from a bounded-stale snapshot instead of a completed lookup.
+        /// Stale values are candidates, never proof that a peer is reachable.
+        stale: bool,
     },
     Error {
         error: DhtError,

@@ -1947,15 +1947,17 @@ pub(crate) async fn discover_realm_nodes(
             failed: true,
         };
     };
-    // Race discovery against REALM_DISCOVERY_TIMEOUT so fanout queries degrade
-    // to reachable/local partitions instead of stalling behind offline peers.
+    // Race discovery so fanout queries degrade to reachable/local partitions
+    // instead of stalling behind offline peers.
     let discovery = tokio::time::timeout(
         REALM_DISCOVERY_TIMEOUT,
         drive(GetRealmNodesOperation::new(realm_id), context),
     )
     .await;
     let nodes = match discovery {
-        Ok(Ok(nodes)) => match authorized_realm_nodes(&config, nodes) {
+        // Bounded-stale candidates are allowed here; an unreachable one is
+        // reported through the existing partial-result fields.
+        Ok(Ok(presence)) => match authorized_realm_nodes(&config, presence.into_nodes()) {
             Ok(nodes) => (nodes, false),
             Err(error) => {
                 warn!(error = %error, "realm config contains invalid node ids; using local-only metadata results");
@@ -4482,6 +4484,21 @@ mod tests {
             check_policy_limit(over),
             Err(MetadataApiError::ServiceUnavailable)
         ));
+    }
+
+    #[test]
+    fn config_filters_cached() {
+        // A cached candidate that realm config no longer lists must disappear
+        // from fan-out immediately, without waiting for the snapshot to expire.
+        let kept = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        let removed = iroh::SecretKey::from_bytes(&[12u8; 32]).public();
+        let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 2);
+        config.ensure_node(kept, RealmNodeKind::Server);
+
+        let authorized = authorized_realm_nodes(&config, HashSet::from([kept, removed]))
+            .expect("node ids parse");
+
+        assert_eq!(authorized, HashSet::from([kept]));
     }
 
     #[test]

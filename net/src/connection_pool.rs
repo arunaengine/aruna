@@ -34,9 +34,8 @@ pub struct ConnectionPoolOptions {
     pub connect_timeout: Duration,
     pub max_connections: usize,
     /// How long an eligible connect failure suppresses new dials for its
-    /// `(NodeId, Alpn)` key. This is a latency optimization only: it never
-    /// proves a peer is offline and never feeds health, membership, placement,
-    /// publisher policy, or write authority.
+    /// `(NodeId, Alpn)` key. A latency optimization only: it never proves a peer
+    /// is offline and never grants health, membership, or write authority.
     pub failure_cooldown: Duration,
 }
 

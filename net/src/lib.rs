@@ -53,7 +53,7 @@ use tracing::{Instrument, Span, debug, warn};
 use ulid::Ulid;
 
 pub use ::irokle::net::IrohRuntimeConfig;
-pub use connection_pool::Monitor;
+pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
 pub use document_sync::{DocumentSyncService, ShardGenesisProbe};
 pub use error::{NetError, Result};
@@ -620,24 +620,27 @@ impl NetHandle {
 
         let (effect_tx, mut effect_rx) = mpsc::channel::<EffectHandle>(256);
 
+        // Inbound handlers and presence refreshes write to storage, so shutdown
+        // has to be able to join them instead of leaving them detached behind
+        // the final sync.
+        let inbound_tasks = TaskTracker::new();
+        let effect_context = Arc::new(effect_handlers::NetEffectContext {
+            dht: dht.clone(),
+            document_sync: document_sync.clone(),
+            presence: effect_handlers::RealmPresenceCache::default(),
+            tasks: inbound_tasks.clone(),
+            shutdown: shutdown.clone(),
+        });
         let shutdown_for_effects = shutdown.clone();
-        let dht_for_effects = dht.clone();
-        let document_sync_for_effects = document_sync.clone();
         let effect_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown_for_effects.cancelled() => break,
                     maybe_effect = effect_rx.recv() => {
                         let Some((effect, response_tx, span)) = maybe_effect else { break };
-                        let dht = dht_for_effects.clone();
-                        let document_sync = document_sync_for_effects.clone();
+                        let context = effect_context.clone();
                         tokio::spawn(async move {
-                            let event = effect_handlers::handle_net_effect(
-                                &dht,
-                                &document_sync,
-                                effect,
-                            )
-                            .await;
+                            let event = effect_handlers::handle_net_effect(&context, effect).await;
                             let _ = response_tx.send(event);
                         }.instrument(span));
                     }
@@ -664,9 +667,6 @@ impl NetHandle {
         let dht_for_streams = dht.clone();
         let inbound_handler_for_streams = inbound_handler.clone();
         let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
-        // Inbound handlers write to storage, so shutdown has to be able to join
-        // them instead of leaving them detached behind the final sync.
-        let inbound_tasks = TaskTracker::new();
         let inbound_tasks_for_streams = inbound_tasks.clone();
         let stream_task = tokio::spawn(async move {
             while let Some((alpn, stream, peer_id)) = stream_rx.recv().await {
@@ -992,6 +992,12 @@ impl NetHandle {
         Ok(applied)
     }
 
+    /// Connection-attempt counters behind the structured connection
+    /// diagnostics; fixed outcome classes with no peer dimension.
+    pub fn pool_counts(&self) -> PoolCounts {
+        self.inner.connection_pool.counts()
+    }
+
     pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
         if endpoint_addr.id == self.inner.node_id {
             return;
@@ -1001,6 +1007,9 @@ impl NetHandle {
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
+        // A newly installed address invalidates the failures recorded against
+        // the previous one.
+        self.inner.connection_pool.clear_failures(endpoint_addr.id);
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {

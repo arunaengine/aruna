@@ -293,6 +293,9 @@ pub enum DhtCompletion {
 pub struct DhtGetOptions {
     pub deadline: Duration,
     pub completion: DhtCompletion,
+    /// Realm whose bounded-stale presence snapshot may answer this read. Every
+    /// other read always reaches the DHT.
+    pub presence: Option<RealmId>,
 }
 
 impl DhtGetOptions {
@@ -300,6 +303,7 @@ impl DhtGetOptions {
         Self {
             deadline,
             completion: DhtCompletion::Exhaustive,
+            presence: None,
         }
     }
 
@@ -310,6 +314,14 @@ impl DhtGetOptions {
                 realm_id,
                 publisher,
             },
+            presence: None,
+        }
+    }
+
+    pub fn presence(deadline: Duration, realm_id: RealmId) -> Self {
+        Self {
+            presence: Some(realm_id),
+            ..Self::exhaustive(deadline)
         }
     }
 }

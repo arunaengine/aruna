@@ -396,6 +396,65 @@ async fn test_open_stream_rejects_internal_alpn() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+#[tokio::test]
+async fn offline_peer_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    // Repeated requests to a peer that went away must not repay a dial each
+    // time, and the peer must become reachable again once its address returns.
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let temp_c = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_c = FjallStorage::open(temp_c.path().to_str().ok_or("invalid temp path")?)?;
+
+    let secret_b = iroh::SecretKey::from_bytes(&[71u8; 32]);
+    let node_b = secret_b.public();
+    let cfg = |secret_key: Option<iroh::SecretKey>| NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(None), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(Some(secret_b.clone())), storage_b).await?;
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+
+    handle_a
+        .open_stream(node_b, Alpn::Bao)
+        .await
+        .expect("reachable peer accepts a stream");
+
+    handle_b.shutdown().await;
+    let before = handle_a.pool_counts();
+    for _ in 0..5 {
+        assert!(handle_a.open_stream(node_b, Alpn::Bao).await.is_err());
+    }
+    let after = handle_a.pool_counts();
+
+    assert!(
+        after.dials - before.dials < 5,
+        "expected the cooldown to suppress dials, saw {}",
+        after.dials - before.dials
+    );
+    assert!(after.cooldown_hits > before.cooldown_hits);
+
+    let handle_c = NetHandle::new(cfg(Some(secret_b)), storage_c).await?;
+    handle_c.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    handle_a.add_peer_addr(handle_c.endpoint_addr()).await;
+    handle_a
+        .open_stream(node_b, Alpn::Bao)
+        .await
+        .expect("returned peer is reachable again");
+
+    handle_a.shutdown().await;
+    handle_c.shutdown().await;
+    Ok(())
+}
+
 #[test]
 fn test_dht_key_id_hashing() {
     let key1 = DhtKeyId::from_data(b"test-key");

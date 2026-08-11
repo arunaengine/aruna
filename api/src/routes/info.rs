@@ -15,7 +15,9 @@ use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
 use aruna_operations::allocate_handle::{HandleAllocationError, provision_metadata_binding};
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
+use aruna_operations::get_realm_nodes::{
+    GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
+};
 use aruna_operations::metadata::stats::count_realm_documents;
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
@@ -1394,9 +1396,23 @@ fn map_realm_nodes(
         .collect()
 }
 
+/// Stale presence is candidate data, so it may not report a peer as connected;
+/// only the local node stays present until a fresh lookup confirms the rest.
+fn presence_nodes(
+    presence: RealmPresence,
+    local: aruna_core::NodeId,
+) -> HashSet<aruna_core::NodeId> {
+    if presence.is_stale() {
+        return HashSet::from([local]);
+    }
+    let mut nodes = presence.into_nodes();
+    nodes.insert(local);
+    nodes
+}
+
 async fn load_realm_presence_best_effort(state: &ServerState) -> HashSet<aruna_core::NodeId> {
-    // Race discovery against REALM_DISCOVERY_TIMEOUT: a realm with offline
-    // nodes must degrade to local-only presence, not stall the dashboard.
+    // A realm with offline nodes must degrade to local-only presence rather
+    // than stall the dashboard.
     let discovery = tokio::time::timeout(
         REALM_DISCOVERY_TIMEOUT,
         drive(
@@ -1406,10 +1422,7 @@ async fn load_realm_presence_best_effort(state: &ServerState) -> HashSet<aruna_c
     )
     .await;
     match discovery {
-        Ok(Ok(mut nodes)) => {
-            nodes.insert(state.get_node_id());
-            nodes
-        }
+        Ok(Ok(presence)) => presence_nodes(presence, state.get_node_id()),
         Ok(Err(error)) => {
             warn!(error = %error, "realm node discovery failed for realm info response");
             HashSet::from([state.get_node_id()])
@@ -1717,7 +1730,7 @@ mod tests {
         RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
         RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
         get_info, get_realm_info, get_realm_placement, get_usage, map_mutate_realm_placement_error,
-        map_set_realm_quota_error, mutate_realm_placement, set_realm_quota,
+        map_set_realm_quota_error, mutate_realm_placement, presence_nodes, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -1735,6 +1748,7 @@ mod tests {
     };
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::get_realm_nodes::RealmPresence;
     use aruna_operations::mutate_realm_placement::MutateRealmPlacementError;
     use aruna_operations::set_realm_quota::SetRealmQuotaError;
     use aruna_storage::storage;
@@ -1743,6 +1757,7 @@ mod tests {
     use axum::extract::{FromRequest, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use tower::ServiceExt;
@@ -3067,5 +3082,19 @@ mod tests {
             error,
             ServerError::BadRequestReason(reason) if reason.contains("max_devices_per_user")
         ));
+    }
+
+    #[test]
+    fn stale_stays_configured() {
+        // A bounded-stale snapshot may not report a remote peer as connected.
+        let local = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
+        let remote = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let nodes = HashSet::from([remote]);
+
+        let fresh = presence_nodes(RealmPresence::new(nodes.clone(), false), local);
+        assert!(fresh.contains(&remote) && fresh.contains(&local));
+
+        let stale = presence_nodes(RealmPresence::new(nodes, true), local);
+        assert_eq!(stale, HashSet::from([local]));
     }
 }

@@ -282,7 +282,7 @@ impl Operation for GetBlobHoldersOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             GetState::Read => match event {
-                Event::Net(NetEvent::Dht(DhtEvent::GetResult { key, values }))
+                Event::Net(NetEvent::Dht(DhtEvent::GetResult { key, values, .. }))
                     if key == self.key =>
                 {
                     self.finish(values)
@@ -446,6 +446,7 @@ mod tests {
         operation.start();
         operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_bytes([4; 32]),
+            stale: false,
             values: vec![
                 entry(node(3), realm_id),
                 entry(node(1), realm_id),
@@ -465,6 +466,7 @@ mod tests {
         operation.start();
         operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_bytes([4; 32]),
+            stale: false,
             values: vec![
                 entry(self_node, realm_id),
                 entry(other, realm_id),
