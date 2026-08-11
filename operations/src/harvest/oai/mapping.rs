@@ -361,16 +361,10 @@ mod tests {
         record
             .dc
             .push(("date".to_string(), "circa 1900".to_string()));
-        assert_eq!(
-            root(&dc_to_jsonld(&record))["datePublished"],
-            "2026-01-02"
-        );
+        assert_eq!(root(&dc_to_jsonld(&record))["datePublished"], "2026-01-02");
 
         record.header.datestamp = "whenever".to_string();
-        assert_eq!(
-            root(&dc_to_jsonld(&record))["datePublished"],
-            UNKNOWN_DATE
-        );
+        assert_eq!(root(&dc_to_jsonld(&record))["datePublished"], UNKNOWN_DATE);
     }
 
     // a Dublin Core date wins over the record datestamp
@@ -380,10 +374,7 @@ mod tests {
         record
             .dc
             .push(("date".to_string(), "2020-05-06".to_string()));
-        assert_eq!(
-            root(&dc_to_jsonld(&record))["datePublished"],
-            "2020-05-06"
-        );
+        assert_eq!(root(&dc_to_jsonld(&record))["datePublished"], "2020-05-06");
     }
 
     #[test]

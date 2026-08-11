@@ -10,8 +10,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    graph_revision_change, metadata_document_lifecycle_revision_change,
-    updated_index_delete,
+    graph_revision_change, metadata_document_lifecycle_revision_change, updated_index_delete,
 };
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,

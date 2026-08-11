@@ -1230,8 +1230,7 @@ pub async fn submit_pid_routed(
     }
     let (config, authority) = pid_authority(context, realm_id, document_id).await?;
     if is_local_node(context, authority) {
-        return submit_pid_local(context, document_id, minted_by, authority, retention_ms)
-            .await;
+        return submit_pid_local(context, document_id, minted_by, authority, retention_ms).await;
     }
     let outcome = forward_pid(
         context,

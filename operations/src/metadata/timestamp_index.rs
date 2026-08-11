@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
-use aruna_core::storage_entries::{updated_index_key, parse_updated_key};
+use aruna_core::storage_entries::{parse_updated_key, updated_index_key};
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 use tracing::warn;
@@ -67,8 +67,8 @@ pub async fn enumerate_updated(
         }
 
         for (key, _) in entries {
-            let (updated_at_ms, document_id) = parse_updated_key(key.as_ref())
-                .map_err(StorageReadError::Conversion)?;
+            let (updated_at_ms, document_id) =
+                parse_updated_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
             if updated_at_ms > until_ms {
                 return Ok(UpdatedRecordsPage {
                     records,
@@ -146,8 +146,8 @@ async fn sweep_bounded(
         }
 
         for (key, _) in entries {
-            let (updated_at_ms, document_id) = parse_updated_key(key.as_ref())
-                .map_err(StorageReadError::Conversion)?;
+            let (updated_at_ms, document_id) =
+                parse_updated_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
             scanned += 1;
             resume = Some(key.clone());
             match load_metadata_record_by_document(context, document_id).await? {

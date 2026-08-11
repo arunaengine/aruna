@@ -5020,15 +5020,8 @@ async fn store_pid_mapping(
 ) -> Result<MetadataPlacementOutcome<bool>> {
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
-        match derive_placement_txn(
-            storage,
-            realm_id,
-            None,
-            incoming.target,
-            placement,
-            txn_id,
-        )
-        .await
+        match derive_placement_txn(storage, realm_id, None, incoming.target, placement, txn_id)
+            .await
         {
             Ok(MetadataPlacementOutcome::Accepted(_)) => {}
             Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
