@@ -331,7 +331,7 @@ async fn recovery_loop(
     let mut reconcile_placements = true;
     let mut announce_presence = true;
     let mut rotation = RecoveryRotation::default();
-    let mut previous_failure: Option<RecoveryFailure> = None;
+    let mut recovery_baseline = None;
     let mut first_rotation = true;
     let mut invocations = 0u64;
     loop {
@@ -356,7 +356,7 @@ async fn recovery_loop(
 
         let decision = apply_recovery_pass(
             &mut rotation,
-            &mut previous_failure,
+            &mut recovery_baseline,
             &mut first_rotation,
             &pass,
         );
@@ -462,10 +462,27 @@ struct RecoveryFailure {
     error: Option<RecoveryError>,
 }
 
-impl RecoveryFailure {
-    fn improves(&self, previous: &Self) -> bool {
-        self.unresolved_topics.len() < previous.unresolved_topics.len()
-            || previous.error.is_some() && self.error.is_none()
+#[derive(Clone, Copy, Debug)]
+struct RecoveryBaseline {
+    fewest_topics: usize,
+    error_cleared: bool,
+}
+
+impl RecoveryBaseline {
+    fn new(failure: &RecoveryFailure) -> Self {
+        Self {
+            fewest_topics: failure.unresolved_topics.len(),
+            error_cleared: failure.error.is_none(),
+        }
+    }
+
+    fn note_failure(&mut self, failure: &RecoveryFailure) -> bool {
+        let topics = failure.unresolved_topics.len();
+        let improved =
+            topics < self.fewest_topics || !self.error_cleared && failure.error.is_none();
+        self.fewest_topics = self.fewest_topics.min(topics);
+        self.error_cleared |= failure.error.is_none();
+        improved
     }
 }
 
@@ -505,13 +522,13 @@ enum RecoveryDecision {
 
 fn apply_recovery_pass(
     rotation: &mut RecoveryRotation,
-    previous_failure: &mut Option<RecoveryFailure>,
+    recovery_baseline: &mut Option<RecoveryBaseline>,
     first_rotation: &mut bool,
     pass: &RecoveryPass,
 ) -> RecoveryDecision {
     if pass.plan_changed {
         *rotation = RecoveryRotation::default();
-        *previous_failure = None;
+        *recovery_baseline = None;
         *first_rotation = true;
     }
     rotation.merge(pass);
@@ -533,11 +550,14 @@ fn apply_recovery_pass(
         return RecoveryDecision::Converged;
     }
 
-    let improved = previous_failure
-        .as_ref()
-        .is_some_and(|previous| failure.improves(previous));
+    let improved = match recovery_baseline {
+        Some(baseline) => baseline.note_failure(&failure),
+        None => {
+            *recovery_baseline = Some(RecoveryBaseline::new(&failure));
+            false
+        }
+    };
     let progress = pass_progress || improved;
-    *previous_failure = Some(failure.clone());
     *rotation = RecoveryRotation::default();
     *first_rotation = false;
     RecoveryDecision::Retry { failure, progress }
@@ -1481,6 +1501,8 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
+    const RECOVERY_TEST_GUARD: Duration = Duration::from_secs(5 * 60);
+
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
@@ -1712,6 +1734,7 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
+        crate::incoming::initialize_net_incoming(context.clone());
         RecoveryNode {
             _dir: dir,
             net,
@@ -1760,6 +1783,14 @@ mod tests {
         (config, placements)
     }
 
+    fn flat_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        for node_id in nodes {
+            config.ensure_node(*node_id, RealmNodeKind::Server);
+        }
+        config
+    }
+
     async fn save_config(node: &RecoveryNode, config: &RealmConfigDocument) {
         let realm_id = config.realm_id;
         let target = DocumentSyncTarget::RealmConfig { realm_id };
@@ -1793,10 +1824,34 @@ mod tests {
         second.net.add_peer_addr(first.net.endpoint_addr()).await;
     }
 
-    fn seed_topic(node: &RecoveryNode, topic: ::irokle::TopicId) {
+    fn seed_topic(node: &RecoveryNode, topic: ::irokle::TopicId, peers: &[NodeId]) {
         node.net
-            .ensure_document_sync_topics(&[topic], vec![node.net.node_id()])
+            .ensure_document_sync_topics(&[topic], peers.to_vec())
             .expect("blocked peer topic creates");
+    }
+
+    fn spawn_driver(
+        node: &RecoveryNode,
+        realm_id: RealmId,
+        publish_full_usage: bool,
+    ) -> (
+        RecoveryStatus,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let status = RecoveryStatus::new();
+        let cancelled = CancellationToken::new();
+        let driver = tokio::spawn(run_recovery(
+            node.context.clone(),
+            RecoveryConfig {
+                realm_id,
+                node_id: node.net.node_id(),
+                publish_full_usage,
+            },
+            status.clone(),
+            cancelled.clone(),
+        ));
+        (status, cancelled, driver)
     }
 
     async fn wait_state(status: &RecoveryStatus, expected: RecoveryState) {
@@ -1805,13 +1860,62 @@ mod tests {
                 if status.snapshot().state == expected {
                     return;
                 }
-                tokio::time::advance(Duration::from_millis(100)).await;
                 tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(100)).await;
             }
         };
-        tokio::time::timeout(RECOVERY_RETRY_MAX, wait)
+        tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
             .await
             .unwrap_or_else(|_| panic!("recovery did not reach {expected:?}"));
+    }
+
+    async fn wait_partial(status: &RecoveryStatus, target: u64) {
+        let wait = async {
+            loop {
+                if status.pass_total(RecoveryOutcome::Partial) >= target {
+                    return;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
+            .await
+            .unwrap_or_else(|_| panic!("recovery did not reach partial pass {target}"));
+    }
+
+    async fn wait_stall(status: &RecoveryStatus) -> (u64, u64, u64) {
+        let wait = async {
+            let mut observed = 0;
+            let mut previous = None;
+            loop {
+                let partial = status.pass_total(RecoveryOutcome::Partial);
+                if partial <= observed || status.snapshot().state != RecoveryState::Degraded {
+                    tokio::task::yield_now().await;
+                    tokio::time::advance(Duration::from_millis(100)).await;
+                    continue;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::advance(RECOVERY_RETRY_BASE / 2).await;
+                if status.snapshot().state == RecoveryState::Degraded
+                    && status.pass_total(RecoveryOutcome::Partial) == partial
+                {
+                    observed = partial;
+                    let progress = status
+                        .inner
+                        .last_progress_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let remaining = status.snapshot().topics_remaining;
+                    if previous == Some((progress, remaining)) {
+                        return (partial, progress, remaining);
+                    }
+                    previous = Some((progress, remaining));
+                }
+            }
+        };
+        tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
+            .await
+            .expect("recovery did not reach a stable retry")
     }
 
     async fn finish_driver(cancelled: CancellationToken, driver: tokio::task::JoinHandle<()>) {
@@ -1842,7 +1946,8 @@ mod tests {
 
         let blocked_topic = shard_topic_id(realm_id, &placements[0]);
         let healthy_topic = shard_topic_id(realm_id, &placements[1]);
-        seed_topic(&blocked, blocked_topic);
+        seed_topic(&blocked, blocked_topic, &[blocked.net.node_id()]);
+        seed_topic(&healthy, healthy_topic, &[local.net.node_id()]);
         let pass = restore_shard_pass(
             &local.context,
             local.net.node_id(),
@@ -1868,7 +1973,7 @@ mod tests {
         stop_node(healthy).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn heal_rotation() {
         let realm_id = RealmId([11; 32]);
         let local = make_node(realm_id, 4).await;
@@ -1878,20 +1983,10 @@ mod tests {
         save_config(&local, &config).await;
         save_config(&blocked, &config).await;
         let topic = shard_topic_id(realm_id, &placements[0]);
-        seed_topic(&blocked, topic);
+        seed_topic(&blocked, topic, &[blocked.net.node_id()]);
 
-        let status = RecoveryStatus::new();
-        let cancelled = CancellationToken::new();
-        let driver = tokio::spawn(run_recovery(
-            local.context.clone(),
-            RecoveryConfig {
-                realm_id,
-                node_id: local.net.node_id(),
-                publish_full_usage: false,
-            },
-            status.clone(),
-            cancelled.clone(),
-        ));
+        tokio::time::pause();
+        let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
         wait_state(&status, RecoveryState::Degraded).await;
         assert!(status.snapshot().topics_remaining > 0);
         assert!(
@@ -1908,15 +2003,7 @@ mod tests {
             blocked.net.node_id(),
         )
         .await;
-        for _ in 0..8 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-            if status.snapshot().state == RecoveryState::Converged {
-                break;
-            }
-        }
+        wait_state(&status, RecoveryState::Converged).await;
         assert_eq!(status.snapshot().state, RecoveryState::Converged);
         assert_eq!(status.snapshot().topics_remaining, 0);
         assert_eq!(status.snapshot().last_error, None);
@@ -1933,31 +2020,73 @@ mod tests {
         stop_node(blocked).await;
     }
 
-    #[test]
-    fn phase_failure_visible() {
-        let mut pass = RecoveryPass::default();
-        pass.merge_phase(PhaseOutcome {
-            progress: false,
-            error: Some(RecoveryError::PeerUnavailable),
-        });
-        pass.merge_phase(PhaseOutcome {
-            progress: false,
-            error: Some(RecoveryError::Storage),
-        });
-        let mut rotation = RecoveryRotation::default();
-        let mut previous = None;
-        let mut first = false;
-        let decision = apply_recovery_pass(&mut rotation, &mut previous, &mut first, &pass);
+    #[tokio::test]
+    async fn shared_retry() {
+        let realm_id = RealmId([13; 32]);
+        let local = make_node(realm_id, 8).await;
+        let blocked = make_node(realm_id, 9).await;
+        let config = flat_config(realm_id, &[local.net.node_id(), blocked.net.node_id()]);
+        save_config(&local, &config).await;
+        save_config(&blocked, &config).await;
+
+        tokio::time::pause();
+        let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
+        wait_state(&status, RecoveryState::Degraded).await;
+        assert_eq!(
+            status.snapshot().last_error,
+            Some(RecoveryError::PeerUnavailable)
+        );
+        assert!(status.snapshot().topics_remaining > 0);
+        let partial = status.pass_total(RecoveryOutcome::Partial);
+
+        wait_partial(&status, partial.saturating_add(1)).await;
+        assert_eq!(status.snapshot().state, RecoveryState::Degraded);
+        assert_eq!(
+            status.snapshot().last_error,
+            Some(RecoveryError::PeerUnavailable)
+        );
+
+        finish_driver(cancelled, driver).await;
+        stop_node(local).await;
+        stop_node(blocked).await;
+    }
+
+    #[tokio::test]
+    async fn usage_retry() {
+        let realm_id = RealmId([14; 32]);
+        let local = make_node(realm_id, 10).await;
+        let config = flat_config(realm_id, &[local.net.node_id()]);
+        save_config(&local, &config).await;
+        let group_id = ulid::Ulid::from_bytes([15; 16]);
+        let event = local
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
+                key: aruna_core::structs::usage_group_key(group_id).into(),
+                value: vec![0xff].into(),
+                txn_id: None,
+            })
+            .await;
         assert!(matches!(
-            decision,
-            RecoveryDecision::Retry {
-                failure: RecoveryFailure {
-                    error: Some(RecoveryError::Storage),
-                    ..
-                },
-                ..
-            }
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
         ));
+
+        tokio::time::pause();
+        let (status, cancelled, driver) = spawn_driver(&local, realm_id, true);
+        wait_state(&status, RecoveryState::Degraded).await;
+        assert_eq!(status.snapshot().last_error, Some(RecoveryError::Storage));
+        assert_eq!(status.snapshot().topics_remaining, 0);
+        let partial = status.pass_total(RecoveryOutcome::Partial);
+
+        wait_partial(&status, partial.saturating_add(1)).await;
+        assert_eq!(status.snapshot().state, RecoveryState::Degraded);
+        assert_eq!(status.snapshot().last_error, Some(RecoveryError::Storage));
+        assert_eq!(status.snapshot().topics_remaining, 0);
+
+        finish_driver(cancelled, driver).await;
+        stop_node(local).await;
     }
 
     #[test]
@@ -1974,6 +2103,29 @@ mod tests {
             ..RecoveryPass::default()
         });
         assert_eq!(rotation.remaining_topics(5), 7);
+    }
+
+    #[test]
+    fn baseline_is_monotonic() {
+        let first = ::irokle::TopicId::from_bytes([5; 32]);
+        let second = ::irokle::TopicId::from_bytes([6; 32]);
+        let failure = |topics| RecoveryFailure {
+            unresolved_topics: topics,
+            error: Some(RecoveryError::PeerUnavailable),
+        };
+        let mut baseline = RecoveryBaseline::new(&failure(BTreeSet::from([first])));
+
+        assert!(!baseline.note_failure(&failure(BTreeSet::from([first]))));
+        assert!(!baseline.note_failure(&failure(BTreeSet::from([first, second]))));
+        assert!(baseline.note_failure(&failure(BTreeSet::new())));
+        assert!(!baseline.note_failure(&failure(BTreeSet::from([first]))));
+
+        let cleared = RecoveryFailure {
+            unresolved_topics: BTreeSet::from([first]),
+            error: None,
+        };
+        assert!(baseline.note_failure(&cleared));
+        assert!(!baseline.note_failure(&cleared));
     }
 
     #[tokio::test]
@@ -2112,7 +2264,7 @@ mod tests {
         assert_eq!(status.pass_total(RecoveryOutcome::Success), 1);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stall_recovery() {
         let realm_id = RealmId([12; 32]);
         let local = make_node(realm_id, 6).await;
@@ -2122,43 +2274,21 @@ mod tests {
         save_config(&local, &config).await;
         save_config(&blocked, &config).await;
         let topic = shard_topic_id(realm_id, &placements[0]);
-        seed_topic(&blocked, topic);
+        seed_topic(&blocked, topic, &[blocked.net.node_id()]);
 
-        let status = RecoveryStatus::new();
-        let cancelled = CancellationToken::new();
-        let driver = tokio::spawn(run_recovery(
-            local.context.clone(),
-            RecoveryConfig {
-                realm_id,
-                node_id: local.net.node_id(),
-                publish_full_usage: false,
-            },
-            status.clone(),
-            cancelled.clone(),
-        ));
-        wait_state(&status, RecoveryState::Degraded).await;
-        let progress = status
-            .inner
-            .last_progress_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = status.snapshot().topics_remaining;
-        let partial = status.pass_total(RecoveryOutcome::Partial);
+        tokio::time::pause();
+        let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
+        let (partial, progress, remaining) = wait_stall(&status).await;
 
-        for _ in 0..3 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                status
-                    .inner
-                    .last_progress_ms
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                progress
-            );
-            assert_eq!(status.snapshot().topics_remaining, remaining);
-        }
-        assert!(status.pass_total(RecoveryOutcome::Partial) > partial);
+        wait_partial(&status, partial.saturating_add(3)).await;
+        assert_eq!(
+            status
+                .inner
+                .last_progress_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            progress
+        );
+        assert_eq!(status.snapshot().topics_remaining, remaining);
 
         finish_driver(cancelled, driver).await;
         stop_node(local).await;
