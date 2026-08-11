@@ -28,7 +28,7 @@ use aruna_operations::metadata::api::{
 };
 use aruna_operations::metadata::forward::export_rocrate_routed;
 use aruna_operations::metadata::visibility_index::{
-    VisibilityError, earliest_visible, visible_page,
+    VisibilityError, earliest_visible, effective_datestamp, visible_page,
 };
 
 use crate::forwarded::external_base_url;
@@ -463,21 +463,18 @@ fn resolve_window(
         ));
     }
     let from_ms = from.map(|(ms, _)| ms).unwrap_or(0);
-    // An omitted upper bound freezes at the current second instead of staying
-    // open, so records written during pagination cannot join the sequence the
-    // token is already walking.
-    let until_ms = until.map(|(ms, _)| ms).unwrap_or_else(current_second_end);
+    // An omitted upper bound freezes at the current instant instead of staying
+    // open, so records written later in the same second cannot join the sequence
+    // the token is already walking.
+    let until_ms = until.map(|(ms, _)| ms).unwrap_or_else(current_time_ms);
     if from_ms > until_ms {
         return Err(protocol("badArgument", "from must not be after until"));
     }
     Ok((from_ms, until_ms, None))
 }
 
-/// The last millisecond of the second in progress, at seconds granularity like
-/// every other bound this repository advertises.
-fn current_second_end() -> u64 {
-    let millis = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-    millis - millis % 1000 + 999
+fn current_time_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
 }
 
 /// Parses an OAI datestamp and returns its bound in milliseconds plus whether it
@@ -541,12 +538,15 @@ async fn get_record(
         // A record from another realm is not this repository's to serve, and a
         // public flag alone never crosses that boundary.
         .filter(|record| record.realm_id == realm_id && record.document_id == document_id);
-    let Some(record) = record else {
+    let Some(mut record) = record else {
         return Err(protocol("idDoesNotExist", "Unknown identifier"));
     };
     if !anon_can_read(ctx.as_ref(), &record).await? {
         return Err(protocol("idDoesNotExist", "Unknown identifier"));
     }
+    record.updated_at_ms = effective_datestamp(ctx.as_ref(), &record)
+        .await
+        .map_err(visibility_fault)?;
     Ok(format!(
         "<GetRecord>{}</GetRecord>",
         render_record(state, ctx, realm_id, &record).await?
@@ -1104,7 +1104,7 @@ mod tests {
         assert_eq!(first.matches("<header>").count(), PAGE_SIZE);
         let token = token_from(&first).expect("a token continues the list");
 
-        let later = current_second_end() + 5_000;
+        let later = decode_token(&token).unwrap().until_ms + 1;
         let mut created = registry_record(&fixture, 500, true);
         created.updated_at_ms = later;
         store_record(&fixture, &created).await;
@@ -1666,14 +1666,13 @@ mod tests {
             metadata_prefix: Some(METADATA_PREFIX.to_string()),
             ..OaiParams::default()
         };
-        let before = current_second_end();
+        let before = current_time_ms();
         let (from_ms, until_ms, cursor) = resolve_window(&params).unwrap();
-        let after = current_second_end();
+        let after = current_time_ms();
         assert_eq!(from_ms, 0);
         assert!(cursor.is_none());
         assert_ne!(until_ms, u64::MAX);
         assert!(until_ms >= before && until_ms <= after);
-        assert_eq!(until_ms % 1000, 999);
     }
 
     // A continuation carries the frozen bound through unchanged.

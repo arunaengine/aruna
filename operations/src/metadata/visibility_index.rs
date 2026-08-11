@@ -19,6 +19,7 @@ use aruna_core::keyspaces::{
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{MetadataRegistryRecord, Permission};
 use aruna_core::types::{Key, Value};
+use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -57,6 +58,9 @@ struct VisibilityState {
     /// Fingerprint of the visible set the published generation was built from.
     /// A pass whose fingerprint matches it publishes nothing.
     digest: [u8; 32],
+    /// Largest effective OAI datestamp lifted above a registry timestamp because
+    /// the record was newly exposed by a visibility change.
+    max_uplift_ms: u64,
     /// The registry walk in flight, if any.
     pass: Option<PassState>,
     /// Superseded generations may still hold rows; resume deleting after this key.
@@ -74,6 +78,11 @@ struct PassState {
     digest: [u8; 32],
     /// The generation being written; `None` while the walk only compares.
     building: Option<u64>,
+    /// Time the visible-set change was detected. Initial construction preserves
+    /// registry timestamps; later additions use this as their OAI creation time.
+    changed_at_ms: Option<u64>,
+    /// Largest uplift copied or created while building this generation.
+    max_uplift_ms: u64,
 }
 
 /// What one bounded maintenance pass accomplished.
@@ -158,6 +167,40 @@ fn parse_index_key(key: &[u8]) -> Result<(u64, u64, Ulid), ConversionError> {
     let updated_at_ms = u64::from_be_bytes(key[8..16].try_into()?);
     let document_id = Ulid::from_bytes(key[16..32].try_into()?);
     Ok((generation, updated_at_ms, document_id))
+}
+
+fn index_datestamp(value: &[u8]) -> Result<u64, ConversionError> {
+    if value.len() != 8 {
+        return Err(ConversionError::InvalidLength(format!(
+            "expected 8-byte visibility datestamp, got {}",
+            value.len()
+        )));
+    }
+    Ok(u64::from_be_bytes(value.try_into()?))
+}
+
+async fn read_index_datestamp(
+    context: &DriverContext,
+    generation: u64,
+    updated_at_ms: u64,
+    document_id: Ulid,
+) -> Result<Option<u64>, StorageReadError> {
+    let event = context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+            key: index_key(generation, updated_at_ms, document_id),
+            txn_id: None,
+        }))
+        .await;
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| index_datestamp(value.as_ref()))
+            .transpose()
+            .map_err(StorageReadError::Conversion),
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+    }
 }
 
 fn state_key() -> Key {
@@ -327,12 +370,17 @@ pub async fn visible_page(
         return Err(VisibilityError::Unavailable);
     }
     let generation = state.generation;
+    let scan_from_ms = if from_ms <= state.max_uplift_ms {
+        0
+    } else {
+        from_ms
+    };
     let mut start = match after
         .as_ref()
         .and_then(|key| rebase_cursor(key, generation))
     {
         Some(cursor) => IterStart::After(cursor),
-        None => IterStart::At(index_key(generation, from_ms, Ulid::nil())),
+        None => IterStart::At(index_key(generation, scan_from_ms, Ulid::nil())),
     };
 
     let mut entries: Vec<(Key, MetadataRegistryRecord)> = Vec::new();
@@ -352,16 +400,22 @@ pub async fn visible_page(
             more = false;
             break;
         }
-        for (key, _) in batch {
+        for (key, value) in batch {
             let (key_generation, updated_at_ms, document_id) =
                 parse_index_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
             if key_generation != generation || updated_at_ms > until_ms {
                 more = false;
                 break 'scan;
             }
+            let effective_ms =
+                index_datestamp(value.as_ref()).map_err(StorageReadError::Conversion)?;
+            if effective_ms < updated_at_ms {
+                return Err(VisibilityError::Unavailable);
+            }
             scanned += 1;
             cursor = Some(key.clone());
-            if updated_at_ms >= from_ms
+            if effective_ms >= from_ms
+                && effective_ms <= until_ms
                 && let Some(record) =
                     crate::get_metadata_document::load_metadata_record_by_document(
                         context,
@@ -370,6 +424,8 @@ pub async fn visible_page(
                     .await?
                 && record.updated_at_ms == updated_at_ms
             {
+                let mut record = record;
+                record.updated_at_ms = effective_ms;
                 pending.push((key, record));
             }
             // Re-check as soon as the candidates in hand could fill the page, so
@@ -408,6 +464,31 @@ pub async fn visible_page(
         more,
         budget_hit,
     })
+}
+
+/// Effective OAI datestamp for a currently published record. A missing row means
+/// the visibility generation has not yet caught up, so GetRecord must fail closed
+/// rather than expose an old datestamp that an incremental harvest cannot find.
+pub async fn effective_datestamp(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<u64, VisibilityError> {
+    let state = read_state(context)
+        .await?
+        .filter(|state| state.ready)
+        .ok_or(VisibilityError::Unavailable)?;
+    let effective = read_index_datestamp(
+        context,
+        state.generation,
+        record.updated_at_ms,
+        record.document_id,
+    )
+    .await?
+    .ok_or(VisibilityError::Unavailable)?;
+    if effective < record.updated_at_ms {
+        return Err(VisibilityError::Unavailable);
+    }
+    Ok(effective)
 }
 
 /// Applies the anonymous policy re-check to the candidates in hand and moves the
@@ -495,6 +576,8 @@ async fn pass_bounded(
         digest: [0u8; 32],
         // Nothing is published yet, so there is nothing to compare against.
         building: (!state.ready).then_some(state.generation + 1),
+        changed_at_ms: None,
+        max_uplift_ms: 0,
     });
 
     for _ in 0..bounds.batches {
@@ -513,16 +596,35 @@ async fn pass_bounded(
             fold_visible(&mut pass.digest, record.updated_at_ms, record.document_id);
         }
         if let Some(generation) = pass.building {
-            let writes: Vec<(String, Key, Value)> = visible
-                .iter()
-                .map(|record| {
-                    (
-                        METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
-                        index_key(generation, record.updated_at_ms, record.document_id),
-                        ByteView::from(Vec::new()),
+            let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(visible.len());
+            for record in visible {
+                if token.is_cancelled() {
+                    return Ok(PassOutcome::Cancelled);
+                }
+                let effective_ms = if let Some(changed_at_ms) = pass.changed_at_ms {
+                    read_index_datestamp(
+                        context,
+                        state.generation,
+                        record.updated_at_ms,
+                        record.document_id,
                     )
-                })
-                .collect();
+                    .await?
+                    .unwrap_or_else(|| record.updated_at_ms.max(changed_at_ms))
+                } else {
+                    record.updated_at_ms
+                };
+                if effective_ms < record.updated_at_ms {
+                    return Err(VisibilityError::Unavailable);
+                }
+                if effective_ms > record.updated_at_ms {
+                    pass.max_uplift_ms = pass.max_uplift_ms.max(effective_ms);
+                }
+                writes.push((
+                    METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+                    index_key(generation, record.updated_at_ms, record.document_id),
+                    ByteView::from(effective_ms.to_be_bytes().to_vec()),
+                ));
+            }
             if !writes.is_empty() {
                 if token.is_cancelled() {
                     return Ok(PassOutcome::Cancelled);
@@ -560,6 +662,7 @@ async fn finish_pass(
             state.generation = generation;
             state.ready = true;
             state.digest = pass.digest;
+            state.max_uplift_ms = pass.max_uplift_ms;
             state.pass = None;
             state.pruning = true;
             state.prune_after = None;
@@ -578,6 +681,8 @@ async fn finish_pass(
                 cursor: None,
                 digest: [0u8; 32],
                 building: Some(state.generation + 1),
+                changed_at_ms: Some(unix_timestamp_millis()),
+                max_uplift_ms: 0,
             });
             write_state(context, &state).await?;
             Ok(PassOutcome::Continue)
@@ -1271,6 +1376,37 @@ mod tests {
         assert!(index_keys(&context).await.is_empty());
     }
 
+    #[tokio::test]
+    async fn newly_allowed_record_gets_new_oai_datestamp() {
+        let (context, _dir) = context();
+        let group_id = Ulid::from_bytes([99; 16]);
+        seed_realm(&context, Vec::new()).await;
+        seed_group(
+            &context,
+            group_id,
+            vec![deny_policy("operation == 'metadata.read'")],
+        )
+        .await;
+        let record = record(group_id, Ulid::from_bytes([100; 16]), 100, true);
+        seed_record(&context, &record).await;
+        rebuild_index(&context).await.unwrap();
+
+        let exposed_after = unix_timestamp_millis();
+        seed_group(&context, group_id, Vec::new()).await;
+        rebuild_index(&context).await.unwrap();
+
+        let page = visible_page(&context, exposed_after, u64::MAX, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let effective = page.entries[0].1.updated_at_ms;
+        assert!(effective >= exposed_after);
+        assert_eq!(
+            effective_datestamp(&context, &record).await.unwrap(),
+            effective
+        );
+    }
+
     #[test]
     fn index_key_roundtrips() {
         let document_id = Ulid::from_bytes([3; 16]);
@@ -1280,6 +1416,8 @@ mod tests {
             (7, 1_234, document_id)
         );
         assert!(parse_index_key(&[0u8; 24]).is_err());
+        assert_eq!(index_datestamp(&1_234u64.to_be_bytes()).unwrap(), 1_234);
+        assert!(index_datestamp(&[0u8; 7]).is_err());
     }
 
     #[test]
