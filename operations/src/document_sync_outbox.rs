@@ -26,6 +26,16 @@ use ulid::Ulid;
 pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
     4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
 const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
+const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
+const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
+
+fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
+    [
+        ADMIN_OUTBOX_PREFIX,
+        DELETE_OUTBOX_PREFIX,
+        UPSERT_OUTBOX_PREFIX,
+    ]
+}
 
 // Keys order by kind then outbox id (a ULID), with admin operations additionally
 // ordered by origin sequence, so drains are FIFO instead of following the random
@@ -231,6 +241,29 @@ pub async fn read_outbox_records(
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
     }
+}
+
+pub async fn read_outbox_tails(storage: &StorageHandle) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+    let mut tails = Vec::with_capacity(3);
+    for prefix in outbox_stream_prefixes() {
+        match storage
+            .send_storage_effect(StorageEffect::Last {
+                key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: Some(prefix.to_vec().into()),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                if let Some((key, _)) = values.into_iter().next() {
+                    tails.push((prefix.to_vec(), key.to_vec()));
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected outbox tail result: {other:?}")),
+        }
+    }
+    Ok(tails)
 }
 
 pub async fn delete_outbox_records(

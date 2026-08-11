@@ -95,7 +95,8 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
         StorageEffect::Read { key_space, .. }
         | StorageEffect::Write { key_space, .. }
         | StorageEffect::Delete { key_space, .. }
-        | StorageEffect::Iter { key_space, .. } => Some(key_space),
+        | StorageEffect::Iter { key_space, .. }
+        | StorageEffect::Last { key_space, .. } => Some(key_space),
         StorageEffect::BatchRead { reads, .. } => {
             reads.first().map(|(key_space, _)| key_space.as_str())
         }
@@ -908,6 +909,7 @@ fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         StorageEffect::Read { .. }
         | StorageEffect::BatchRead { .. }
         | StorageEffect::Iter { .. }
+        | StorageEffect::Last { .. }
         | StorageEffect::AbortTransaction { .. }
         | StorageEffect::SyncAll => false,
     }
@@ -943,6 +945,10 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
             txn_id: Some(txn_id),
             ..
         }
+        | StorageEffect::Last {
+            txn_id: Some(txn_id),
+            ..
+        }
         | StorageEffect::CommitTransaction { txn_id }
         | StorageEffect::AbortTransaction { txn_id } => Some(*txn_id),
         StorageEffect::StartTransaction { .. }
@@ -953,7 +959,8 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::BatchWrite { txn_id: None, .. }
         | StorageEffect::Delete { txn_id: None, .. }
         | StorageEffect::BatchDelete { txn_id: None, .. }
-        | StorageEffect::Iter { txn_id: None, .. } => None,
+        | StorageEffect::Iter { txn_id: None, .. }
+        | StorageEffect::Last { txn_id: None, .. } => None,
     }
 }
 
@@ -1446,6 +1453,11 @@ impl FjallStorage {
                 limit,
                 txn_id,
             } => self.iterate(key_space, prefix, start, limit, txn_id),
+            StorageEffect::Last {
+                key_space,
+                prefix,
+                txn_id,
+            } => self.last(key_space, prefix, txn_id),
         }
     }
 
@@ -2325,6 +2337,28 @@ impl FjallStorage {
             Err(error) => StorageEvent::Error { error },
         }
     }
+
+    fn last(
+        &mut self,
+        key_space: String,
+        prefix: Option<ByteView>,
+        txn_id: Option<Ulid>,
+    ) -> StorageEvent {
+        let keyspace = match self.store.resolve_keyspace(&key_space) {
+            Ok(keyspace) => keyspace,
+            Err(error) => return StorageEvent::Error { error },
+        };
+        if let Some(txn_id) = txn_id {
+            return match self.txns.get(&txn_id) {
+                Some(Txn::Read(txn)) => read_last_with(txn, &keyspace, prefix.as_ref()),
+                Some(Txn::Write(txn)) => read_last_with(txn.as_ref(), &keyspace, prefix.as_ref()),
+                None => StorageEvent::Error {
+                    error: StorageError::TransactionNotFound,
+                },
+            };
+        }
+        store_last(&self.store, keyspace, prefix)
+    }
 }
 
 fn store_read(store: &Store, keyspace: OptimisticTxKeyspace, key: ByteView) -> StorageEvent {
@@ -2368,6 +2402,47 @@ fn store_batch_read(store: &Store, reads: Vec<(String, ByteView)>) -> StorageEve
     batch_read_with(store, &snapshot, reads)
 }
 
+fn read_last_with<R: Readable>(
+    reader: &R,
+    keyspace: &OptimisticTxKeyspace,
+    prefix: Option<&ByteView>,
+) -> StorageEvent {
+    let guard = match prefix {
+        Some(prefix) => {
+            let prefix = prefix.as_ref().to_vec();
+            let mut range = match prefix_upper_bound(&prefix) {
+                Some(end) => reader.range(keyspace, (Included(prefix), Excluded(end))),
+                None => reader.range(keyspace, (Included(prefix), Unbounded::<Vec<u8>>)),
+            };
+            range.next_back()
+        }
+        None => reader.last_key_value(keyspace),
+    };
+    let Some(guard) = guard else {
+        return StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        };
+    };
+    match guard.into_inner() {
+        Ok((key, value)) => StorageEvent::IterResult {
+            values: vec![(ByteView::from(key.as_ref()), ByteView::from(value.as_ref()))],
+            next_start_after: None,
+        },
+        Err(_) => StorageEvent::Error {
+            error: StorageError::ReadError,
+        },
+    }
+}
+
+fn store_last(
+    store: &Store,
+    keyspace: OptimisticTxKeyspace,
+    prefix: Option<ByteView>,
+) -> StorageEvent {
+    read_last_with(&store.db.read_tx(), &keyspace, prefix.as_ref())
+}
+
 fn store_iterate(
     store: &Store,
     keyspace: OptimisticTxKeyspace,
@@ -2401,6 +2476,7 @@ fn is_poolable_read(effect: &StorageEffect) -> bool {
         StorageEffect::Read { txn_id: None, .. }
             | StorageEffect::BatchRead { txn_id: None, .. }
             | StorageEffect::Iter { txn_id: None, .. }
+            | StorageEffect::Last { txn_id: None, .. }
     )
 }
 
@@ -2491,6 +2567,11 @@ impl PendingWriteIndex {
                 limit,
                 txn_id: None,
             } => *limit != 0 && self.contains_iter_key(key_space, prefix.as_ref(), start.as_ref()),
+            StorageEffect::Last {
+                key_space,
+                prefix,
+                txn_id: None,
+            } => self.contains_iter_key(key_space, prefix.as_ref(), None),
             _ => false,
         }
     }
@@ -2708,6 +2789,14 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                 Ok(keyspace) => store_read(&store, keyspace, key),
                 Err(error) => StorageEvent::Error { error },
             },
+            StorageEffect::Last {
+                key_space,
+                prefix,
+                txn_id: None,
+            } => match store.resolve_keyspace(&key_space) {
+                Ok(keyspace) => store_last(&store, keyspace, prefix),
+                Err(error) => StorageEvent::Error { error },
+            },
             StorageEffect::BatchRead {
                 reads,
                 txn_id: None,
@@ -2908,6 +2997,19 @@ fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
                 span.record("txn_id", field::display(txn_id));
             }
         }
+        StorageEffect::Last {
+            key_space,
+            prefix,
+            txn_id,
+        } => {
+            span.record("key_space", field::display(key_space));
+            if let Some(prefix) = prefix {
+                span.record("key_len", prefix.as_ref().len() as u64);
+            }
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
         StorageEffect::SyncAll => {}
     }
 }
@@ -2925,6 +3027,7 @@ fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::AbortTransaction { .. } => "abort_transaction",
         StorageEffect::SyncAll => "sync_all",
         StorageEffect::Iter { .. } => "iter",
+        StorageEffect::Last { .. } => "last",
     }
 }
 
@@ -5003,6 +5106,53 @@ mod tests {
         assert_eq!(
             keys,
             vec![b"p/a".to_vec(), b"p/b".to_vec(), b"p/c".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn last_returns_tail() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        for key in [b"a".as_slice(), b"c", b"b", b"b/1", b"b/2"] {
+            assert_write_result(
+                handle
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: "last_key".to_string(),
+                        key: key.to_vec().into(),
+                        value: key.to_vec().into(),
+                        txn_id: None,
+                    })
+                    .await,
+                key,
+            );
+        }
+
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = handle
+            .send_storage_effect(StorageEffect::Last {
+                key_space: "last_key".to_string(),
+                prefix: None,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("expected last result");
+        };
+        assert_eq!(values, vec![(b"c".to_vec().into(), b"c".to_vec().into())]);
+
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = handle
+            .send_storage_effect(StorageEffect::Last {
+                key_space: "last_key".to_string(),
+                prefix: Some(b"b/".to_vec().into()),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("expected prefixed last result");
+        };
+        assert_eq!(
+            values,
+            vec![(b"b/2".to_vec().into(), b"b/2".to_vec().into())]
         );
     }
 

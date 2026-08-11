@@ -213,6 +213,12 @@ pub enum StorageEffect {
         limit: usize,
         txn_id: Option<TxnId>,
     },
+    /// Read the lexicographically last entry in a keyspace, optionally by prefix.
+    Last {
+        key_space: KeySpace,
+        prefix: Option<Key>,
+        txn_id: Option<TxnId>,
+    },
 }
 
 /// Dispatch lane for a storage effect. Foreground is always served before Bulk,

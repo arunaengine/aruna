@@ -37,7 +37,7 @@ use crate::blob::reclaim::{
 use crate::blob_holders::RefreshBlobHoldersOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
-    OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records,
+    OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
     restore_document_sync_outbox_timers,
 };
 use crate::driver::{DriverContext, drive};
@@ -126,6 +126,23 @@ const DEAD_LETTER_SWEEP_TICKS: usize = 12;
 /// stops treating the wait as normal and says so at error level.
 const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
 
+#[derive(Clone, Copy)]
+struct OutboxLimits {
+    pages: usize,
+    records: usize,
+    continuation_streak: u32,
+}
+
+impl Default for OutboxLimits {
+    fn default() -> Self {
+        Self {
+            pages: OUTBOX_INVOCATION_PAGES,
+            records: OUTBOX_INVOCATION_RECORDS,
+            continuation_streak: OUTBOX_CONTINUATION_STREAK,
+        }
+    }
+}
+
 /// One drained outbox record with its resolved publish topic.
 type DrainRecord = (
     Vec<u8>,
@@ -146,6 +163,8 @@ struct OperationsTaskHandler {
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
+    drain_guard: tokio::sync::Mutex<()>,
+    outbox_limits: OutboxLimits,
 }
 
 /// Outcome counts accumulated across the invocations of one rotation.
@@ -155,7 +174,7 @@ struct RotationTotals {
     deleted: usize,
     deferred: usize,
     undeliverable: usize,
-    retried: usize,
+    retry_invocations: usize,
     invocations: u32,
 }
 
@@ -164,6 +183,10 @@ struct RotationTotals {
 /// carry across them; holdership and publisher authority never do.
 #[derive(Default)]
 struct OutboxRotation {
+    /// Last key observed when this rotation opened.
+    boundary: Option<Vec<u8>>,
+    /// Last key observed in each independently ordered event-kind stream.
+    stream_boundaries: Vec<(Vec<u8>, Vec<u8>)>,
     /// Where the next invocation resumes; `None` is the head.
     cursor: Option<Vec<u8>>,
     /// Topics whose FIFO is blocked for the rest of this rotation.
@@ -178,6 +201,27 @@ struct OutboxRotation {
 }
 
 impl OutboxRotation {
+    fn admits(&self, key: &[u8]) -> bool {
+        if !self.stream_boundaries.is_empty() {
+            return self
+                .stream_boundaries
+                .iter()
+                .find(|(prefix, _)| key.starts_with(prefix))
+                .is_some_and(|(_, boundary)| key <= boundary.as_slice());
+        }
+        self.boundary
+            .as_deref()
+            .is_none_or(|boundary| key <= boundary)
+    }
+
+    fn at_end(&self, cursor: Option<&[u8]>) -> bool {
+        cursor.is_some_and(|cursor| {
+            self.boundary
+                .as_deref()
+                .is_some_and(|boundary| cursor >= boundary)
+        })
+    }
+
     fn close(&mut self) -> RotationTotals {
         let totals = self.totals;
         *self = Self::default();
@@ -334,6 +378,76 @@ struct DrainDeferState {
     undeliverable_topics: HashSet<irokle::TopicId>,
 }
 
+type StuckRecord = (
+    u64,
+    DocumentSyncTarget,
+    irokle::TopicId,
+    aruna_core::structs::PlacementRef,
+);
+
+struct DrainInvocation {
+    outcome: DrainSyncOutcome,
+    defer: DrainDeferState,
+    cursor: Option<Vec<u8>>,
+    reached_end: bool,
+    scan_elapsed: Duration,
+    publish_elapsed: Duration,
+    records: usize,
+    deferred: usize,
+    stuck: usize,
+    oldest_stuck: Option<StuckRecord>,
+    undeliverable: usize,
+    groups: usize,
+    subbatches: usize,
+    pages: usize,
+    oldest_record_ms: Option<u64>,
+    read_failed: bool,
+    config_drained: bool,
+}
+
+impl DrainInvocation {
+    fn new(rotation: &OutboxRotation) -> Self {
+        Self {
+            outcome: DrainSyncOutcome::default(),
+            defer: DrainDeferState {
+                deferred_topics: rotation.blocked_topics.clone(),
+                blocked_origins: rotation.blocked_origins.clone(),
+                undeliverable_topics: rotation.undeliverable_topics.clone(),
+                ..DrainDeferState::default()
+            },
+            cursor: rotation.cursor.clone(),
+            reached_end: false,
+            scan_elapsed: Duration::ZERO,
+            publish_elapsed: Duration::ZERO,
+            records: 0,
+            deferred: 0,
+            stuck: 0,
+            oldest_stuck: None,
+            undeliverable: 0,
+            groups: 0,
+            subbatches: 0,
+            pages: 0,
+            oldest_record_ms: None,
+            read_failed: false,
+            config_drained: false,
+        }
+    }
+
+    fn has_unvisited(&self) -> bool {
+        !self.reached_end && !self.read_failed
+    }
+}
+
+enum DrainPage {
+    Records {
+        records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+        has_more: bool,
+        boundary_reached: bool,
+    },
+    Skip,
+    Stop,
+}
+
 /// The admin origin stream a record belongs to. Origin sequence is ordered
 /// within one origin node.
 fn admin_origin(record: &DocumentSyncOutboxRecord) -> Option<aruna_core::NodeId> {
@@ -473,11 +587,29 @@ impl OperationsTaskHandler {
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
+            drain_guard: tokio::sync::Mutex::new(()),
+            outbox_limits: OutboxLimits::default(),
         }
     }
 
     fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
         self.rocrate_limits = limits;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_outbox_limits(
+        mut self,
+        pages: usize,
+        records: usize,
+        continuation_streak: u32,
+    ) -> Self {
+        assert!(pages > 0 && records > 0 && continuation_streak > 0);
+        self.outbox_limits = OutboxLimits {
+            pages,
+            records,
+            continuation_streak,
+        };
         self
     }
 
@@ -690,10 +822,67 @@ impl OperationsTaskHandler {
             .expect("outbox rotation mutex poisoned") = rotation;
     }
 
+    async fn open_rotation(
+        &self,
+        retry_key: &TaskKey,
+        mut rotation: OutboxRotation,
+    ) -> Option<OutboxRotation> {
+        if rotation.boundary.is_none() {
+            match read_outbox_tails(&self.context.storage_handle).await {
+                Ok(boundaries) if boundaries.is_empty() => {
+                    self.reset_backoff(retry_key);
+                    return None;
+                }
+                Ok(boundaries) => {
+                    rotation.boundary = boundaries.iter().map(|(_, key)| key).max().cloned();
+                    rotation.stream_boundaries = boundaries;
+                }
+                Err(error) => {
+                    warn!(task_id = ?retry_key, %error, "Failed to open document sync outbox rotation");
+                    self.store_rotation(rotation);
+                    self.reschedule_with_backoff(retry_key.clone()).await;
+                    return None;
+                }
+            }
+        }
+        debug_assert!(rotation.boundary.is_some());
+        Some(rotation)
+    }
+
+    async fn close_rotation(&self, retry_key: TaskKey, mut rotation: OutboxRotation) {
+        let closed = rotation.close();
+        self.store_rotation(rotation);
+        if closed.examined > 0 {
+            info!(
+                event = "pipeline.drain.rotation",
+                examined = closed.examined,
+                deleted = closed.deleted,
+                deferred = closed.deferred,
+                undeliverable = closed.undeliverable,
+                retry_invocations = closed.retry_invocations,
+                invocations = closed.invocations,
+                "Document sync outbox rotation complete"
+            );
+        }
+
+        if closed.retry_invocations > 0 {
+            if closed.deleted > 0 {
+                self.reset_backoff(&retry_key);
+            }
+            self.reschedule_with_backoff(retry_key).await;
+        } else if closed.deferred > 0 {
+            self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
+                .await;
+        } else {
+            self.reset_backoff(&retry_key);
+        }
+    }
+
     /// Runs one bounded invocation of the open rotation, then continues, yields
     /// through the timer, or closes it. No record is ever deleted, truncated, or
     /// overwritten to satisfy a bound.
     async fn drain_document_sync_outbox(&self) {
+        let _drain = self.drain_guard.lock().await;
         let retry_key = TaskKey::DrainDocumentSyncOutbox;
         let drain_started = Instant::now();
 
