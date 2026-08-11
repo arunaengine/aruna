@@ -891,79 +891,191 @@ async fn seed_outbox(
             other => return Err(format!("unexpected outbox batch write: {other:?}").into()),
         }
     }
-    let seeded = outbox_keys(&node).await?;
-    assert_eq!(seeded.len(), INCIDENT_RECORDS);
+    outbox_keys(node).await
+}
 
-    // A bounded invocation parks the rotation mid-keyspace and deletes nothing
-    // while the topic is blocked.
-    let drainer = OutboxDrainer::new(node.context.clone());
-    drainer.run_once().await;
-    let (examined, cursor_parked) = drainer.rotation_progress();
-    assert!(
-        examined <= INCIDENT_RECORDS,
-        "one invocation examined {examined} records"
-    );
-    assert!(
-        examined < INCIDENT_RECORDS || !cursor_parked,
-        "an invocation that examined everything must have closed its rotation"
-    );
-    assert_eq!(
-        outbox_keys(&node).await?,
-        seeded,
-        "a blocked rotation must not delete or reorder accepted work"
-    );
+fn incident_record(
+    realm_id: RealmId,
+    local: aruna_core::NodeId,
+    target: &aruna_core::document::DocumentSyncTarget,
+    placement: aruna_core::structs::PlacementRef,
+    holders: &[aruna_core::NodeId],
+    index: usize,
+) -> Result<aruna_core::document::DocumentSyncOutboxRecord, BoxError> {
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+        DocumentSyncTarget,
+    };
+    use aruna_core::structs::MetadataRegistryRecord;
 
-    // Continuations stay bounded and the cursor survives every yield.
-    for _ in 0..3 {
-        drainer.run_once().await;
-    }
-    assert_eq!(
-        outbox_keys(&node).await?,
-        seeded,
-        "continuations must not delete or reorder accepted work"
-    );
+    let (group_id, document_id) = match target {
+        DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        } => (*group_id, *document_id),
+        _ => return Err("incident target must be a metadata registry".into()),
+    };
 
-    // A fresh drainer is the cursor reset a process restart performs.
-    let restarted = OutboxDrainer::new(node.context.clone());
-    restarted.run_once().await;
-    assert_eq!(
-        outbox_keys(&node).await?,
-        seeded,
-        "the restart cursor reset must not change the outbox"
-    );
-
-    // The driver reports degraded, not a start failure, and stops on cancel.
-    let status = RecoveryStatus::new();
-    let cancelled = CancellationToken::new();
-    let driver = tokio::spawn(run_recovery(
-        node.context.clone(),
-        RecoveryConfig {
-            realm_id,
-            node_id: local,
-            publish_full_usage: false,
+    let event_id = Ulid::from_parts(3, (index + 1) as u128);
+    let base = (index > 0).then(|| DocumentSyncRevision {
+        generation: index as u64,
+        event_id: Ulid::from_parts(3, index as u128),
+        actor: local,
+        updated_at_ms: index as u64,
+    });
+    let change = DocumentSyncChange {
+        base,
+        current: DocumentSyncRevision {
+            generation: (index + 1) as u64,
+            event_id,
+            actor: local,
+            updated_at_ms: (index + 1) as u64,
         },
-        status.clone(),
-        cancelled.clone(),
-    ));
-    let deadline = Instant::now() + HANG_CAP;
-    while status.snapshot().state != RecoveryState::Degraded {
-        if Instant::now() >= deadline {
-            cancelled.cancel();
-            let _ = driver.await;
-            return Err("recovery never reported degraded with peers unavailable".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    let snapshot = status.snapshot();
-    assert!(snapshot.topics_remaining > 0);
-    assert!(snapshot.last_progress_timestamp > 0);
-    cancelled.cancel();
-    tokio::time::timeout(NO_PROGRESS_TIMEOUT, driver)
-        .await
-        .map_err(|_| "recovery driver did not stop on cancellation")??;
+        kind: DocumentSyncChangeKind::Upsert,
+        placement,
+    };
+    let registry = MetadataRegistryRecord {
+        realm_id,
+        group_id,
+        document_id,
+        document_path: "datasets/incident".to_string(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+        public: true,
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &realm_id,
+            group_id,
+            "datasets/incident",
+            document_id,
+        ),
+        placement,
+        holder_node_ids: holders.to_vec(),
+        created_at_ms: 1,
+        updated_at_ms: (index + 1) as u64,
+        establishing_event_id: Ulid::from_parts(3, 1),
+        last_event_id: event_id,
+    };
+    Ok(
+        aruna_operations::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, index as u128),
+            local,
+            target.clone(),
+            holders.to_vec(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: postcard::to_allocvec(&registry)?,
+                change,
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        ),
+    )
+}
 
-    node.net.shutdown().await;
-    Ok(())
+async fn wait_degraded(status: &aruna_operations::startup::RecoveryStatus) -> Result<(), BoxError> {
+    use aruna_operations::startup::{RecoveryOutcome, RecoveryState};
+
+    wait_for_convergence("recovery did not report degraded", || async {
+        let snapshot = status.snapshot();
+        Ok::<usize, BoxError>(usize::from(
+            snapshot.state != RecoveryState::Degraded
+                || status.pass_total(RecoveryOutcome::Partial) == 0,
+        ))
+    })
+    .await
+}
+
+fn drain_context(node: &TestNode) -> Arc<DriverContext> {
+    Arc::new(DriverContext {
+        storage_handle: node.context.storage_handle.clone(),
+        net_handle: node.context.net_handle.clone(),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    })
+}
+
+async fn restore_peers(
+    realm_id: RealmId,
+    secrets: &[iroh::SecretKey; 3],
+    dir_one: TempDir,
+    dir_two: TempDir,
+    live: TestNode,
+    config: &RealmConfigDocument,
+) -> Result<Vec<TestNode>, BoxError> {
+    let path_one = dir_one.path().to_path_buf();
+    let mut peer_one = spawn_node_with(realm_id, Some(secrets[1].clone()), path_one).await?;
+    peer_one._temp_dir = Some(dir_one);
+    let path_two = dir_two.path().to_path_buf();
+    let mut peer_two = spawn_node_with(realm_id, Some(secrets[2].clone()), path_two).await?;
+    peer_two._temp_dir = Some(dir_two);
+    let nodes = vec![live, peer_one, peer_two];
+    wire_peers(&nodes).await;
+    write_config(&nodes, &realm_id, config).await?;
+    Ok(nodes)
+}
+
+async fn wait_outbox(
+    drainer: &aruna_operations::task_incoming::OutboxDrainer,
+    nodes: &[TestNode],
+) -> Result<(), BoxError> {
+    wait_for_convergence("outbox did not drain", || async {
+        drainer.run_once().await;
+        Ok::<usize, BoxError>(outbox_keys(&nodes[0]).await?.len())
+    })
+    .await
+}
+
+async fn wait_registry(
+    nodes: &[TestNode],
+    group_id: GroupId,
+    document_id: Ulid,
+    expected_event: Ulid,
+) -> Result<(), BoxError> {
+    wait_for_convergence("registry did not converge", || async {
+        let mut pending = 0;
+        for node in nodes {
+            match read_registry(node, group_id, document_id).await? {
+                Some(record) if record.last_event_id == expected_event => {}
+                _ => pending += 1,
+            }
+        }
+        Ok::<usize, BoxError>(pending)
+    })
+    .await
+}
+
+async fn wait_recovery(status: &aruna_operations::startup::RecoveryStatus) -> Result<(), BoxError> {
+    use aruna_operations::startup::RecoveryState;
+
+    wait_for_convergence("recovery did not converge", || async {
+        Ok::<usize, BoxError>(usize::from(
+            status.snapshot().state != RecoveryState::Converged,
+        ))
+    })
+    .await
+}
+
+async fn read_registry(
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+) -> Result<Option<aruna_core::structs::MetadataRegistryRecord>, BoxError> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: aruna_core::keyspaces::METADATA_INDEX_KEYSPACE.to_string(),
+            key: aruna_core::storage_entries::metadata_registry_key(group_id, document_id),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| postcard::from_bytes(&bytes))
+            .transpose()
+            .map_err(Into::into),
+        other => Err(format!("unexpected registry read event: {other:?}").into()),
+    }
 }
 
 async fn outbox_keys(node: &TestNode) -> Result<Vec<Vec<u8>>, BoxError> {
