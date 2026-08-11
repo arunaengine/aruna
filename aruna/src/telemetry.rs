@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::sync::OnceLock;
 
 use opentelemetry::KeyValue;
@@ -51,7 +52,10 @@ pub fn init_tracing() {
             .with_file(true)
             .with_line_number(true)
             .boxed(),
+        // Colour only a terminal: escape codes in a log file or container stream
+        // break field matching for log ingestion.
         LogFormat::Text => tracing_subscriber::fmt::layer()
+            .with_ansi(std::io::stdout().is_terminal())
             .with_target(true)
             .with_file(true)
             .with_line_number(true)
