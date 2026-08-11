@@ -435,8 +435,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             node_id: config.node_id,
             // An unchanged restart republishes nothing: accepted outbox work and
             // document sync history already carry convergence.
-            // An unchanged restart republishes nothing: accepted outbox work and
-            // document sync history already carry convergence.
             publish_full_usage: usage_counters_rebuilt || is_initial_boot,
         };
         let cancelled = shutdown.token();

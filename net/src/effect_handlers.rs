@@ -83,7 +83,13 @@ impl RealmPresenceCache {
         }
     }
 
+    /// An empty answer holds no candidate to serve, so caching it would only
+    /// hide a peer that announces during the freshness window.
     fn store(&self, realm_id: RealmId, values: Vec<DhtEntry>, now: Instant) {
+        if values.is_empty() {
+            self.snapshots.lock().remove(&realm_id);
+            return;
+        }
         self.snapshots.lock().insert(
             realm_id,
             PresenceSnapshot {
@@ -407,6 +413,21 @@ mod tests {
             cache.serve(RealmId::from_bytes([9u8; 32]), start),
             PresenceServe::Cold
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skips_empty() {
+        // Caching "nobody announced yet" would delay discovery of a peer that
+        // announces inside the freshness window.
+        let cache = RealmPresenceCache::default();
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, Vec::new(), start);
+        assert_eq!(cache.serve(realm_id, start), PresenceServe::Cold);
+
+        cache.store(realm_id, vec![make_entry(4, realm_id)], start);
+        cache.store(realm_id, Vec::new(), start);
+        assert_eq!(cache.serve(realm_id, start), PresenceServe::Cold);
     }
 
     #[test]
