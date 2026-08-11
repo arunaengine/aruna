@@ -599,7 +599,7 @@ fn offline_bounds_recovery() -> Result<(), BoxError> {
 
 async fn offline_recovery_body() -> Result<(), BoxError> {
     use aruna_operations::startup::{
-        RecoveryConfig, RecoveryOutcome, RecoveryStatus, run_recovery,
+        RecoveryConfig, RecoveryStatus, run_recovery,
     };
     use aruna_operations::task_incoming::OutboxDrainer;
     use tokio_util::sync::CancellationToken;
