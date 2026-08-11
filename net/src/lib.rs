@@ -630,6 +630,8 @@ impl NetHandle {
             presence: effect_handlers::RealmPresenceCache::default(),
             tasks: inbound_tasks.clone(),
             shutdown: shutdown.clone(),
+            #[cfg(test)]
+            refresh_probe: None,
         });
         let shutdown_for_effects = shutdown.clone();
         let effect_task = tokio::spawn(async move {
