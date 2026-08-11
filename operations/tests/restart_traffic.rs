@@ -548,3 +548,244 @@ async fn shutdown_nodes(nodes: Vec<TestNode>) {
         node.net.shutdown().await;
     }
 }
+
+/// Held shard topics the incident node restored.
+const INCIDENT_SHARDS: u32 = 128;
+/// Outbox records seeded at the metric scan ceiling observed in the incident.
+const INCIDENT_RECORDS: usize = 8_192;
+
+// A node holding 128 shard topics whose co-holders are all unavailable, with the
+// outbox at its scan ceiling: recovery stays bounded and degraded, and neither
+// the drain nor a restart's cursor reset loses or reorders a record.
+#[test]
+fn offline_bounds_recovery() -> Result<(), BoxError> {
+    let runtime = make_runtime()?;
+    let result = runtime.block_on(offline_recovery_body());
+    runtime.shutdown_timeout(Duration::from_secs(10));
+    result
+}
+
+async fn offline_recovery_body() -> Result<(), BoxError> {
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+        DocumentSyncTarget,
+    };
+    use aruna_core::structs::{PlacementRef, PlacementStrategy};
+    use aruna_operations::startup::{
+        RecoveryConfig, RecoveryState, RecoveryStatus, SHARD_RESTORE_UNIT_BUDGET,
+        ShardRestoreCursor, restore_shard_pass, run_recovery,
+    };
+    use aruna_operations::task_incoming::OutboxDrainer;
+    use tokio_util::sync::CancellationToken;
+
+    let realm_id = RealmId([91u8; 32]);
+    let node = spawn_node(realm_id).await?;
+    let local = node.net.node_id();
+    // Never spawned and never dialled: config-only peers are the fixture.
+    let offline = [
+        iroh::SecretKey::from_bytes(&[0xB1; 32]).public(),
+        iroh::SecretKey::from_bytes(&[0xB2; 32]).public(),
+    ];
+
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    let strategy = PlacementStrategy {
+        strategy_id: Ulid::from_bytes([6u8; 16]),
+        name: "incident".to_string(),
+        replica_count: None,
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: INCIDENT_SHARDS,
+    };
+    config.default_strategy_id = Some(strategy.strategy_id);
+    config.strategies = vec![strategy.clone()];
+    config.ensure_node(local, RealmNodeKind::Management);
+    for peer in offline {
+        config.ensure_node(peer, RealmNodeKind::Management);
+    }
+    let actor = Actor {
+        node_id: local,
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*realm_id.as_bytes()).into(),
+            value: config.to_bytes(&actor)?.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return Err(format!("unexpected realm config write event: {other:?}").into()),
+    }
+
+    // A bounded pass never exceeds its work-unit limit, so a later group cannot
+    // be starved by an unavailable one.
+    let mut cursor = ShardRestoreCursor::default();
+    let pass = restore_shard_pass(
+        &node.context,
+        local,
+        realm_id,
+        &mut cursor,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(pass.summary.held_shards > 0, "the node must hold shards");
+    assert!(
+        pass.units_processed <= SHARD_RESTORE_UNIT_BUDGET,
+        "one pass processed {} units, over its {SHARD_RESTORE_UNIT_BUDGET} budget",
+        pass.units_processed
+    );
+    if !pass.wrapped {
+        assert_ne!(cursor, ShardRestoreCursor::default(), "cursor must advance");
+    }
+
+    // All records target one shard topic whose genesis this node cannot mint
+    // while its co-holders are unavailable.
+    let change = DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(3, 1),
+            actor: local,
+            updated_at_ms: 1,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement: PlacementRef {
+            strategy_id: strategy.strategy_id,
+            epoch: 0,
+            shard: 5,
+        },
+    };
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id: Ulid::from_parts(1, 1),
+        document_id: Ulid::from_parts(2, 2),
+    };
+    for chunk_start in (0..INCIDENT_RECORDS).step_by(1_024) {
+        let mut writes = Vec::with_capacity(1_024);
+        for index in chunk_start..(chunk_start + 1_024).min(INCIDENT_RECORDS) {
+            let record = aruna_operations::document_sync_outbox::new_outbox_record_with_id(
+                Ulid::from_parts(1, index as u128),
+                local,
+                target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: Vec::new(),
+                    change,
+                },
+                PlacementRef::NIL,
+                false,
+            );
+            writes.push(aruna_operations::document_sync_outbox::outbox_write_entry(
+                &record,
+            )?);
+        }
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => return Err(format!("unexpected outbox batch write: {other:?}").into()),
+        }
+    }
+    let seeded = outbox_keys(&node).await?;
+    assert_eq!(seeded.len(), INCIDENT_RECORDS);
+
+    // A bounded invocation parks the rotation mid-keyspace and deletes nothing
+    // while the topic is blocked.
+    let drainer = OutboxDrainer::new(node.context.clone());
+    drainer.run_once().await;
+    let (examined, cursor_parked) = drainer.rotation_progress();
+    assert!(
+        examined <= INCIDENT_RECORDS,
+        "one invocation examined {examined} records"
+    );
+    assert!(
+        examined < INCIDENT_RECORDS || !cursor_parked,
+        "an invocation that examined everything must have closed its rotation"
+    );
+    assert_eq!(
+        outbox_keys(&node).await?,
+        seeded,
+        "a blocked rotation must not delete or reorder accepted work"
+    );
+
+    // Continuations stay bounded and the cursor survives every yield.
+    for _ in 0..3 {
+        drainer.run_once().await;
+    }
+    assert_eq!(
+        outbox_keys(&node).await?,
+        seeded,
+        "continuations must not delete or reorder accepted work"
+    );
+
+    // A fresh drainer is the cursor reset a process restart performs.
+    let restarted = OutboxDrainer::new(node.context.clone());
+    restarted.run_once().await;
+    assert_eq!(
+        outbox_keys(&node).await?,
+        seeded,
+        "the restart cursor reset must not change the outbox"
+    );
+
+    // The driver reports degraded, not a start failure, and stops on cancel.
+    let status = RecoveryStatus::new();
+    let cancelled = CancellationToken::new();
+    let driver = tokio::spawn(run_recovery(
+        node.context.clone(),
+        RecoveryConfig {
+            realm_id,
+            node_id: local,
+            publish_full_usage: false,
+        },
+        status.clone(),
+        cancelled.clone(),
+    ));
+    let deadline = Instant::now() + HANG_CAP;
+    while status.snapshot().state != RecoveryState::Degraded {
+        if Instant::now() >= deadline {
+            cancelled.cancel();
+            let _ = driver.await;
+            return Err("recovery never reported degraded with peers unavailable".into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let snapshot = status.snapshot();
+    assert!(snapshot.topics_remaining > 0);
+    assert!(snapshot.last_progress_timestamp > 0);
+    cancelled.cancel();
+    tokio::time::timeout(NO_PROGRESS_TIMEOUT, driver)
+        .await
+        .map_err(|_| "recovery driver did not stop on cancellation")??;
+
+    node.net.shutdown().await;
+    Ok(())
+}
+
+async fn outbox_keys(node: &TestNode) -> Result<Vec<Vec<u8>>, BoxError> {
+    let mut keys = Vec::new();
+    let mut start: Option<Vec<u8>> = None;
+    loop {
+        let batch = aruna_operations::document_sync_outbox::read_outbox_records(
+            &node.context.storage_handle,
+            &[],
+            start.take(),
+            1_024,
+        )
+        .await?;
+        keys.extend(batch.records.iter().map(|(key, _)| key.clone()));
+        if !batch.has_more {
+            return Ok(keys);
+        }
+        start = batch.next_start_after;
+    }
+}
