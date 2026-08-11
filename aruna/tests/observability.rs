@@ -279,7 +279,7 @@ mod process {
                  S3_ADDRESS=127.0.0.1:{s3}\n\
                  API_PUBLIC_URL=http://127.0.0.1:{http}\n\
                  S3_PUBLIC_URL=http://127.0.0.1:{s3}\n\
-                 REALM_DESCRIPTION=observability harness realm\n\
+                 REALM_DESCRIPTION=\"observability harness realm\"\n\
                  ARUNA_COMPUTE_EXECUTOR=none\n\
                  ARUNA_SHUTDOWN_GRACE_SECS=16\n\
                  RUST_LOG=info\n",
@@ -299,6 +299,11 @@ mod process {
                 .open(self.log_path())
                 .expect("open node log");
             let errlog = log.try_clone().expect("clone node log");
+            // Every launch appends to one log, so a launch only ever reads past
+            // what its predecessors already wrote.
+            let log_start = std::fs::metadata(self.log_path())
+                .map(|meta| meta.len() as usize)
+                .unwrap_or(0);
             let child = Command::new(env!("CARGO_BIN_EXE_aruna"))
                 .current_dir(self.root())
                 .stdin(Stdio::null())
@@ -311,6 +316,7 @@ mod process {
                 ops_url: self.ops_url(),
                 rest_url: self.rest_url(),
                 log_path: self.log_path(),
+                log_start,
             }
         }
 
@@ -332,18 +338,20 @@ mod process {
             }
         }
 
-        /// Counts document-sync outbox records in the stopped node's store.
-        pub async fn outbox_len(&self) -> usize {
+        /// Document-sync outbox rows of the stopped node, described by target and
+        /// event so a delta names the work a restart added. Heartbeat rows are
+        /// excluded: their timer, not the restart, decides when they appear.
+        pub async fn outbox_rows(&self) -> Vec<String> {
             let storage = self.open_storage().await;
-            let counted = count_outbox(&storage).await;
+            let rows = read_outbox(&storage).await;
             drop(storage);
-            counted
+            rows.into_iter().filter(|row| !heartbeat_row(row)).collect()
         }
     }
 
-    pub async fn count_outbox(storage: &StorageHandle) -> usize {
+    pub async fn read_outbox(storage: &StorageHandle) -> Vec<String> {
         let mut start: Option<aruna_core::types::Key> = None;
-        let mut total = 0usize;
+        let mut rows = Vec::new();
         loop {
             let event = storage
                 .send_storage_effect(StorageEffect::Iter {
@@ -361,13 +369,33 @@ mod process {
             else {
                 panic!("unexpected outbox iter event: {event:?}");
             };
-            total += values.len();
+            rows.extend(values.into_iter().map(|(_, value)| describe_outbox(&value)));
             match next_start_after {
                 Some(next) => start = Some(next),
                 None => break,
             }
         }
-        total
+        rows
+    }
+
+    fn describe_outbox(value: &[u8]) -> String {
+        use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
+
+        let Ok(record) = postcard::from_bytes::<DocumentSyncOutboxRecord>(value) else {
+            return "undecodable outbox record".to_string();
+        };
+        let kind = match &record.event {
+            DocumentSyncOutboxEvent::Upsert { .. } => "upsert",
+            DocumentSyncOutboxEvent::Delete { .. } => "delete",
+            DocumentSyncOutboxEvent::AdminOperation { .. } => "admin",
+        };
+        format!("{kind} {:?}", record.target)
+    }
+
+    /// Node info is the periodic liveness heartbeat: its revisions follow the
+    /// heartbeat timer, so they are never restart-attributable work.
+    pub fn heartbeat_row(row: &str) -> bool {
+        row.contains("NodeInfo")
     }
 
     pub struct NodeProcess {
@@ -375,6 +403,7 @@ mod process {
         pub ops_url: String,
         pub rest_url: String,
         log_path: PathBuf,
+        log_start: usize,
     }
 
     impl NodeProcess {
@@ -390,8 +419,20 @@ mod process {
             std::fs::read_to_string(&self.log_path).unwrap_or_default()
         }
 
+        /// Only what this launch logged.
+        fn own_logs(&self) -> String {
+            let logs = self.logs();
+            logs.get(self.log_start..).unwrap_or_default().to_string()
+        }
+
         /// Waits until the ops listener answers `path` with `expect`.
         pub async fn wait_status(&mut self, path: &str, expect: StatusCode) -> String {
+            self.wait_body(path, expect, "").await
+        }
+
+        /// Same, but also waiting for `needle` in the body. Recovery cycles
+        /// between degraded and running, so its report has to be awaited.
+        pub async fn wait_body(&mut self, path: &str, expect: StatusCode, needle: &str) -> String {
             let client = probe_client();
             let deadline = Instant::now() + HANG_GUARD;
             let mut last = String::from("no response yet");
@@ -406,7 +447,7 @@ mod process {
                     Ok(response) => {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
-                        if status == expect {
+                        if status == expect && body.contains(needle) {
                             return body;
                         }
                         last = format!("status {status}: {body}");
@@ -416,16 +457,16 @@ mod process {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             panic!(
-                "{path} never returned {expect} (last {last})\n{}",
+                "{path} never returned {expect} with {needle:?} (last {last})\n{}",
                 self.logs()
             );
         }
 
-        /// Waits until `needle` appears in the process log.
+        /// Waits until `needle` appears in this launch's own log output.
         pub async fn wait_log(&mut self, needle: &str) {
             let deadline = Instant::now() + HANG_GUARD;
             while Instant::now() < deadline {
-                if self.logs().contains(needle) {
+                if self.own_logs().contains(needle) {
                     return;
                 }
                 if !self.is_running() {
@@ -480,13 +521,13 @@ mod process {
     use reqwest::StatusCode;
 }
 
-/// Adds synthetic, never-dialled peers to the stopped node's realm config, so
-/// the node holds shards whose co-holders are absent.
+/// Adds synthetic, never-dialled peers plus a strategy the node has no genesis
+/// for, so the stopped node's state names absent peers and owes them work.
 async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<()> {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::{PlacementStrategy, RealmConfigDocument, RealmNodeKind};
 
     let storage = env.open_storage().await;
     let event = storage
@@ -510,6 +551,21 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
         let peer = iroh::SecretKey::from_bytes(&[0xA0 + seed; 32]).public();
         config.ensure_node(peer, RealmNodeKind::Server);
     }
+    // Every held shard now has absent co-holders, so keep the shard counts small:
+    // the restore attempt per topic and peer is what the harness pays for.
+    for strategy in &mut config.strategies {
+        strategy.shard_count = 2;
+    }
+    // Shards of a strategy added after the first boot have no local genesis, so
+    // restoring them needs a co-holder that never answers.
+    config.strategies.push(PlacementStrategy {
+        strategy_id: ulid::Ulid::from_bytes([0x5A; 16]),
+        name: "offline-harness".to_string(),
+        replica_count: None,
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: 2,
+    });
     let value = postcard::to_allocvec(&config).expect("encode realm config");
     let event = storage
         .send_storage_effect(StorageEffect::Write {
@@ -544,13 +600,13 @@ async fn restart_adds_no_outbox() -> TestResult<()> {
     second.wait_status("/healthz", StatusCode::OK).await;
     second.wait_log("startup.recovery.degraded").await;
     second.terminate().await;
-    let before = env.outbox_len().await;
+    let before = env.outbox_rows().await;
 
     let mut third = env.launch();
     third.wait_status("/healthz", StatusCode::OK).await;
     third.wait_log("startup.recovery.degraded").await;
     third.terminate().await;
-    let after = env.outbox_len().await;
+    let after = env.outbox_rows().await;
 
     assert_eq!(
         after, before,
@@ -591,7 +647,9 @@ async fn gate_survives_outage() -> TestResult<()> {
     assert!(node.is_running(), "a peer outage must not end the process");
     assert_eq!(node.wait_status("/healthz", StatusCode::OK).await, "ok");
 
-    let body = node.wait_status("/readyz", StatusCode::OK).await;
+    let body = node
+        .wait_body("/readyz", StatusCode::OK, "\"state\":\"degraded\"")
+        .await;
     let ready: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(
         ready["recovery"]["state"],
@@ -617,12 +675,13 @@ async fn gate_survives_outage() -> TestResult<()> {
         ]
     );
 
-    let scrape = client
-        .get(format!("{}/metrics", node.ops_url))
-        .send()
-        .await?
-        .text()
-        .await?;
+    let scrape = node
+        .wait_body(
+            "/metrics",
+            StatusCode::OK,
+            "aruna_recovery_state{state=\"degraded\"} 1",
+        )
+        .await;
     assert!(
         scrape.contains("aruna_recovery_state{state=\"degraded\"} 1"),
         "{scrape}"
