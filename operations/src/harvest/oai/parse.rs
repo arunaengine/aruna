@@ -345,8 +345,9 @@ mod tests {
   </ListRecords>
 </OAI-PMH>"#;
 
+    // parses records, sets, deletions and the resumption token
     #[test]
-    fn parses_records_sets_deletions_and_token() {
+    fn parses_list_response() {
         let page = parse_list_page(LIST).unwrap();
         assert_eq!(page.records.len(), 2);
         assert_eq!(page.resumption_token.as_deref(), Some("TOKEN-2"));
@@ -366,8 +367,9 @@ mod tests {
         assert!(second.dc.is_empty());
     }
 
+    // an empty resumption-token element ends the list
     #[test]
-    fn empty_element_resumption_token_ends_list() {
+    fn empty_token_ends() {
         let xml = LIST.replace(
             "<resumptionToken cursor=\"0\">TOKEN-2</resumptionToken>",
             "<resumptionToken/>",
@@ -376,8 +378,9 @@ mod tests {
         assert!(page.resumption_token.is_none());
     }
 
+    // noRecordsMatch is an empty result, not an error
     #[test]
-    fn no_records_match_is_empty_not_error() {
+    fn empty_not_error() {
         let xml = r#"<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
           <error code="noRecordsMatch">no records</error></OAI-PMH>"#;
         let page = parse_list_page(xml).unwrap();
@@ -386,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_error_is_reported() {
+    fn protocol_error_reported() {
         let xml = r#"<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
           <error code="badArgument">bad</error></OAI-PMH>"#;
         assert_eq!(
@@ -450,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn cdata_values_are_preserved() {
+    fn cdata_values_preserved() {
         let xml = LIST.replace(
             "<dc:title>First &amp; only</dc:title>",
             "<dc:title><![CDATA[Raw <b>&amp; markup</b>]]></dc:title>",
@@ -462,8 +465,9 @@ mod tests {
         );
     }
 
+    // mixed text and CDATA concatenate
     #[test]
-    fn mixed_text_and_cdata_concatenates() {
+    fn mixed_cdata_concatenates() {
         let xml = LIST.replace(
             "<dc:title>First &amp; only</dc:title>",
             "<dc:title>a &amp; <![CDATA[b & c]]> d\u{e9}</dc:title>",
@@ -476,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn identify_granularity_is_read() {
+    fn identify_reads_granularity() {
         let identify = |value: &str| {
             format!(
                 r#"<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><Identify>
@@ -497,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn datestamp_parses_both_forms() {
+    fn datestamp_both_forms() {
         assert_eq!(parse_datestamp_ms("1970-01-01"), Some(0));
         assert_eq!(parse_datestamp_ms("1970-01-01T00:00:01Z"), Some(1000));
         assert!(parse_datestamp_ms("not-a-date").is_none());

@@ -754,7 +754,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
 /// A crash between the identity write and the create leaves a `PendingCreate`
 /// row; the replay must adopt that id rather than mint a second one.
 #[tokio::test]
-async fn pending_identity_is_adopted() -> Result<(), BoxError> {
+async fn pending_identity_adopted() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let (provider, server) = serve_oai().await?;
     let source = seed_source(&fixture, &provider.endpoint).await?;
@@ -806,7 +806,7 @@ async fn pending_identity_is_adopted() -> Result<(), BoxError> {
 /// Two groups harvesting the same namespace and identifier must not share a
 /// provenance row, and must mint independent documents.
 #[tokio::test]
-async fn groups_keep_separate_provenance() -> Result<(), BoxError> {
+async fn groups_separate_provenance() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let (provider, server) = serve_oai().await?;
     provider.script("identify", identify_page());
@@ -883,7 +883,7 @@ async fn groups_keep_separate_provenance() -> Result<(), BoxError> {
 /// while the routed authority is unreachable, must not retire the identity: the
 /// document is confirmed gone first, and replay converges without an orphan.
 #[tokio::test]
-async fn deletion_waits_for_confirmation() -> Result<(), BoxError> {
+async fn deletion_awaits_confirmation() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let (provider, server) = serve_oai().await?;
     let source = seed_source(&fixture, &provider.endpoint).await?;
@@ -1160,7 +1160,7 @@ async fn unmaterialized_graph_retries() -> Result<(), BoxError> {
 /// A provider handing back a token it already issued is a cycle: the run ends
 /// retryable with the token cleared instead of paging forever.
 #[tokio::test]
-async fn repeated_token_ends_the_run() -> Result<(), BoxError> {
+async fn repeated_token_ends() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let (provider, server) = serve_oai().await?;
     let source = seed_source(&fixture, &provider.endpoint).await?;
@@ -1207,7 +1207,7 @@ async fn repeated_token_ends_the_run() -> Result<(), BoxError> {
 /// A `badResumptionToken` restarts the window once inside the run; a provider
 /// that keeps rejecting cannot restart-loop.
 #[tokio::test]
-async fn expired_token_restarts_once() -> Result<(), BoxError> {
+async fn expired_token_restarts() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let (provider, server) = serve_oai().await?;
     let source = seed_source(&fixture, &provider.endpoint).await?;
@@ -1247,7 +1247,7 @@ async fn expired_token_restarts_once() -> Result<(), BoxError> {
 /// Malformed upstream XML is transient junk on a fresh request and must retry;
 /// an OAI protocol rejection of that same request is a configuration fault.
 #[tokio::test]
-async fn parse_failures_are_classified() -> Result<(), BoxError> {
+async fn parse_failures_classified() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let (provider, server) = serve_oai().await?;
     let source = seed_source(&fixture, &provider.endpoint).await?;
@@ -1272,7 +1272,7 @@ async fn parse_failures_are_classified() -> Result<(), BoxError> {
 
 /// A response larger than the decoded-byte cap is rejected instead of buffered.
 #[tokio::test]
-async fn oversized_body_is_rejected() -> Result<(), BoxError> {
+async fn oversized_body_rejected() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let (provider, server) = serve_oai().await?;
     let source = seed_source(&fixture, &provider.endpoint).await?;
@@ -1295,7 +1295,7 @@ async fn oversized_body_is_rejected() -> Result<(), BoxError> {
 /// A provider that never answers must not hold the worker past a cancel: the
 /// job's own signals win over the client's inactivity timeouts.
 #[tokio::test]
-async fn slow_provider_stays_cancellable() -> Result<(), BoxError> {
+async fn slow_provider_cancellable() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let address = listener.local_addr()?;

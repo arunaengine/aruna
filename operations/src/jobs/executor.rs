@@ -115,7 +115,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::ImportRoCrate(spec) => crate::jobs::import::run_rocrate_import(ctx, spec).await,
         JobPayload::Harvest(spec) => crate::jobs::harvest::run_harvest_job(ctx, spec).await,
         JobPayload::MintPersistentId(spec) => {
-            crate::jobs::persistent_id::run_mint_persistent_id(ctx, spec).await
+            crate::jobs::persistent_id::run_mint_pid(ctx, spec).await
         }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(

@@ -194,8 +194,9 @@ async fn withdraw_pid(
 mod tests {
     use super::*;
 
+    // the RO-Crate Location header targets the read route
     #[test]
-    fn rocrate_location_targets_the_read_route() {
+    fn location_targets_read() {
         let id = Ulid::from_bytes([1; 16]);
         assert_eq!(
             rocrate_location(id),
@@ -236,7 +237,7 @@ mod tests {
     // The mint job is queued on the document's authority, so that node's answer
     // about the document is the client's answer, not a fault of this one.
     #[test]
-    fn mint_maps_submit_errors() {
+    fn mint_maps_errors() {
         assert!(matches!(
             mint_submit_error(SubmitJobError::DocumentMissing),
             ServerError::NotFound

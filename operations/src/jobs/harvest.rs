@@ -22,7 +22,7 @@ use crate::create_metadata_document::{
     CreateMetadataDocumentPayload, mint_job_document,
 };
 use crate::get_metadata_document::load_metadata_record_by_document;
-use crate::harvest::oai::mapping::oai_dc_to_jsonld;
+use crate::harvest::oai::mapping::dc_to_jsonld;
 use crate::harvest::oai::parse::{
     OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
 };
@@ -443,7 +443,7 @@ async fn create_document(
                 document_path: document_path.clone(),
                 public: false,
                 payload: CreateMetadataDocumentPayload::RoCrate {
-                    jsonld: oai_dc_to_jsonld(record),
+                    jsonld: dc_to_jsonld(record),
                 },
             },
         ),
@@ -488,7 +488,7 @@ async fn update_document(
         document_id,
         None,
         UpdateMetadataDocumentMutation::ReplaceRoCrate {
-            jsonld: oai_dc_to_jsonld(record),
+            jsonld: dc_to_jsonld(record),
         },
         Some(internal_token(source.created_by, realm_id)),
     )
@@ -752,14 +752,14 @@ mod tests {
     }
 
     #[test]
-    fn document_path_encodes_identifier() {
+    fn path_encodes_identifier() {
         let encoded = path("oai:example.org:123/v2");
         assert!(encoded.starts_with("imported/zenodo/b64-"));
         assert!(!encoded["imported/zenodo/".len()..].contains('/'));
     }
 
     #[test]
-    fn separator_variants_never_collide() {
+    fn separators_never_collide() {
         // ':' and '/' both collapsed to '-' under the old sanitizer.
         let paths = [
             path("oai:a:b"),
@@ -774,16 +774,18 @@ mod tests {
         }
     }
 
+    // a clean digest-shaped identifier stays distinct
     #[test]
-    fn clean_digest_shaped_identifier_stays_distinct() {
+    fn digest_shape_distinct() {
         // A raw identifier that looks like digest output lands in the b64 domain.
         let digest = blake3::hash(b"oai:example.org:1").to_hex().to_string();
         assert_ne!(path(&format!("b3-{digest}")), path("oai:example.org:1"));
         assert!(path(&format!("b3-{digest}")).contains("/b64-"));
     }
 
+    // a long identifier falls back to a digest
     #[test]
-    fn long_identifier_falls_back_to_digest() {
+    fn long_identifier_digests() {
         let long = "oai:example.org:".to_string() + &"x".repeat(600);
         let encoded = path(&long);
         assert!(encoded.starts_with("imported/zenodo/b3-"));
@@ -791,21 +793,22 @@ mod tests {
         assert!(encoded.len() <= HARVEST_PATH_BYTES);
     }
 
+    // a unicode identifier round-trips distinctly
     #[test]
-    fn unicode_identifier_round_trips_distinctly() {
+    fn unicode_stays_distinct() {
         assert_ne!(path("oai:例:1"), path("oai:例:2"));
         assert!(path("oai:例:1").contains("/b64-"));
     }
 
     #[test]
-    fn oversized_prefix_is_rejected() {
+    fn oversized_prefix_rejected() {
         assert!(harvest_document_path(&"p".repeat(HARVEST_PATH_BYTES), "x").is_err());
     }
 
     /// Every prefix source creation accepts must yield a bounded path, and
     /// padding must never move a record to a different one.
     #[test]
-    fn accepted_prefixes_always_yield_a_path() {
+    fn accepted_prefixes_yield() {
         let longest = "p".repeat(HARVEST_PATH_BYTES - DIGEST_SEGMENT_BYTES - 1);
         for prefix in ["imported/zenodo", " /imported/zenodo/ ", longest.as_str()] {
             assert!(normalize_target_prefix(prefix).is_some());
@@ -818,8 +821,9 @@ mod tests {
         );
     }
 
+    // the next version increments, or starts at one
     #[test]
-    fn next_version_increments_or_starts_at_one() {
+    fn next_version_increments() {
         assert_eq!(next_version(None), 1);
         let provenance = HarvestProvenance {
             group_id: Ulid::nil(),

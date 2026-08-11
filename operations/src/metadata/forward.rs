@@ -1215,7 +1215,7 @@ pub async fn mint_pid_routed(
 /// Queue the PID mint job on the document's authority. The job store is
 /// node-local, so a document-scoped dedup row only deduplicates when one node
 /// owns it; alternating ingress nodes would otherwise open a job each.
-pub async fn submit_pid_job_routed(
+pub async fn submit_pid_routed(
     context: &Arc<DriverContext>,
     document_id: Ulid,
     minted_by: UserId,
@@ -1225,12 +1225,12 @@ pub async fn submit_pid_job_routed(
 ) -> Result<(JobId, bool), MetadataApiError> {
     let realm_id = minted_by.realm_id;
     if context.net_handle.is_none() {
-        return submit_pid_job_local(context, document_id, minted_by, local_node_id, retention_ms)
+        return submit_pid_local(context, document_id, minted_by, local_node_id, retention_ms)
             .await;
     }
     let (config, authority) = pid_authority(context, realm_id, document_id).await?;
     if is_local_node(context, authority) {
-        return submit_pid_job_local(context, document_id, minted_by, authority, retention_ms)
+        return submit_pid_local(context, document_id, minted_by, authority, retention_ms)
             .await;
     }
     let outcome = forward_pid(
@@ -1251,14 +1251,14 @@ pub async fn submit_pid_job_routed(
     }
 }
 
-async fn submit_pid_job_local(
+async fn submit_pid_local(
     context: &Arc<DriverContext>,
     document_id: Ulid,
     minted_by: UserId,
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<(JobId, bool), MetadataApiError> {
-    crate::jobs::service::submit_mint_pid_local(
+    crate::jobs::service::submit_mint_local(
         context.as_ref(),
         MintPersistentIdSpec {
             document_id,
@@ -1533,7 +1533,7 @@ pub(crate) async fn apply_forwarded_pid(
             minted_by,
             retention_ms,
         } => {
-            return match submit_pid_job_local(
+            return match submit_pid_local(
                 context,
                 document_id,
                 minted_by,

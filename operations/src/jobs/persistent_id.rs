@@ -12,7 +12,7 @@ use crate::jobs::executor::{JobContext, JobRunOutcome};
 /// reports the authoritative mapping with `newly_minted: false` instead of
 /// overwriting it. Runs from wherever the job was claimed and routes; it never
 /// mints into the claiming node's own store.
-pub async fn run_mint_persistent_id(
+pub async fn run_mint_pid(
     ctx: &JobContext,
     spec: &MintPersistentIdSpec,
 ) -> JobRunOutcome {

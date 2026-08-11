@@ -132,8 +132,9 @@ mod tests {
         MetadataWriteError::Delete(error)
     }
 
+    // a validation failure is reported, not retried
     #[test]
-    fn validation_is_reported_not_retried() {
+    fn validation_never_retries() {
         for error in [
             create(CreateMetadataDocumentError::MetadataError(
                 MetadataError::Validation(violation()),
@@ -153,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn every_write_variant_is_classified() {
+    fn write_variants_classified() {
         let permanent: Vec<MetadataWriteError> = vec![
             MetadataWriteError::Unauthorized,
             MetadataWriteError::Forbidden,
@@ -300,7 +301,7 @@ mod tests {
     /// A lagging graph must never retire a source record: the read API answers
     /// the same condition with service unavailable.
     #[test]
-    fn graph_not_found_is_unavailable() {
+    fn missing_graph_unavailable() {
         assert!(matches!(
             classify_metadata(update(UpdateMetadataDocumentError::MetadataError(
                 MetadataError::GraphNotFound
@@ -316,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_errors_stay_permanent() {
+    fn conversions_stay_permanent() {
         let error = create(CreateMetadataDocumentError::ConversionError(
             postcard::Error::SerdeSerCustom.into(),
         ));

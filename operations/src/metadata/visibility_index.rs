@@ -898,7 +898,7 @@ mod tests {
     // More than one budget of leading candidates denied after publication must
     // not end the scan: the page continues and the later group still enumerates.
     #[tokio::test]
-    async fn scan_passes_denied_prefix() {
+    async fn scan_passes_denied() {
         let (context, _dir) = context();
         let denied = Ulid::from_bytes([91; 16]);
         let allowed = Ulid::from_bytes([92; 16]);
@@ -937,7 +937,7 @@ mod tests {
     // A page cut at `limit` inside one re-check batch must resume at its last
     // kept entry, so the surplus is served next instead of being skipped.
     #[tokio::test]
-    async fn limit_cut_keeps_surplus() {
+    async fn limit_keeps_surplus() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([93; 16]);
         seed_realm(&context, Vec::new()).await;
@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_allowed_is_indexed() {
+    async fn public_allowed_indexed() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([11; 16]);
         seed_realm(&context, Vec::new()).await;
@@ -980,7 +980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_public_stays_hidden() {
+    async fn denied_stays_hidden() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([21; 16]);
         seed_realm(&context, vec![deny_policy("operation == 'metadata.read'")]).await;
@@ -996,7 +996,7 @@ mod tests {
     // A policy that starts denying after the pass must not be served from the
     // stale index; the reader re-checks every candidate.
     #[tokio::test]
-    async fn recheck_drops_newly_denied() {
+    async fn recheck_drops_denied() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([31; 16]);
         seed_realm(&context, Vec::new()).await;
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbuilt_index_fails_closed() {
+    async fn unbuilt_fails_closed() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([41; 16]);
         seed_realm(&context, Vec::new()).await;
@@ -1047,7 +1047,7 @@ mod tests {
 
     // Losing the realm policy state must not downgrade to serving the index.
     #[tokio::test]
-    async fn policy_loss_fails_closed() {
+    async fn loss_fails_closed() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([51; 16]);
         seed_realm(&context, Vec::new()).await;
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn earliest_comes_from_index() {
+    async fn earliest_from_index() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([61; 16]);
         seed_realm(&context, Vec::new()).await;
@@ -1171,7 +1171,7 @@ mod tests {
     // One pass yields at its bound instead of walking the whole registry, so
     // cancellation is observed within a fixed amount of work.
     #[tokio::test]
-    async fn pass_yields_at_bound() {
+    async fn pass_yields_bound() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([94; 16]);
         seed_realm_group(&context, group_id, 20).await;
@@ -1194,7 +1194,7 @@ mod tests {
 
     // A cancelled token stops the build before any further storage mutation.
     #[tokio::test]
-    async fn build_stops_on_cancel() {
+    async fn build_honors_cancel() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([95; 16]);
         seed_realm_group(&context, group_id, 20).await;
@@ -1220,7 +1220,7 @@ mod tests {
 
     // The same holds once the cycle has moved on to deleting superseded rows.
     #[tokio::test]
-    async fn prune_stops_on_cancel() {
+    async fn prune_honors_cancel() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([96; 16]);
         seed_realm_group(&context, group_id, 20).await;
@@ -1255,7 +1255,7 @@ mod tests {
     // A pass over an unchanged registry must publish nothing, so steady state
     // costs no index writes at all.
     #[tokio::test]
-    async fn steady_pass_rewrites_nothing() {
+    async fn steady_rewrites_nothing() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([97; 16]);
         seed_realm_group(&context, group_id, 20).await;
@@ -1298,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn index_key_round_trips() {
+    fn index_key_roundtrips() {
         let document_id = Ulid::from_bytes([3; 16]);
         let key = index_key(7, 1_234, document_id);
         assert_eq!(
@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_rebases_onto_generation() {
+    fn cursor_rebases_generation() {
         let document_id = Ulid::from_bytes([4; 16]);
         let old = index_key(1, 900, document_id);
         let rebased = rebase_cursor(&old, 5).unwrap();
@@ -1319,7 +1319,7 @@ mod tests {
     // Ordering must be generation-major then datestamp so a published generation
     // is one contiguous range.
     #[test]
-    fn keys_order_by_generation() {
+    fn keys_order_generation() {
         let document_id = Ulid::from_bytes([5; 16]);
         assert!(
             index_key(1, u64::MAX, document_id).as_ref() < index_key(2, 0, document_id).as_ref()

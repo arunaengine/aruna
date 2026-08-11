@@ -109,8 +109,9 @@ mod tests {
         }
     }
 
+    // a fresh request carries prefix, set and from
     #[test]
-    fn fresh_request_carries_prefix_set_and_from() {
+    fn fresh_request_selectors() {
         let url = list_records_url(
             "https://ex.org/oai",
             &selector(),
@@ -126,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn resumption_token_is_exclusive() {
+    fn token_is_exclusive() {
         let url =
             list_records_url("https://ex.org/oai", &selector(), Some("x"), Some("TOK")).unwrap();
         let query = url.query().unwrap();
@@ -138,7 +139,7 @@ mod tests {
 
     /// Blank and padded prefixes are "unset", not a literal argument value.
     #[test]
-    fn blank_and_padded_prefixes_canonicalize() {
+    fn padded_prefixes_canonicalize() {
         for raw in [None, Some(""), Some("   "), Some("\t\n"), Some(" oai_dc ")] {
             assert_eq!(
                 normalize_metadata_prefix(raw).as_deref(),
@@ -151,8 +152,9 @@ mod tests {
         );
     }
 
+    // unusable selector values never reach the URL
     #[test]
-    fn unusable_selector_values_never_reach_the_url() {
+    fn unusable_selectors_dropped() {
         let url = list_records_url(
             "https://ex.org/oai",
             &HarvestSelector {
@@ -169,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn default_prefix_when_unset() {
+    fn default_prefix_unset() {
         let url = list_records_url(
             "https://ex.org/oai",
             &HarvestSelector::default(),
@@ -180,8 +182,9 @@ mod tests {
         assert!(url.query().unwrap().contains("metadataPrefix=oai_dc"));
     }
 
+    // the window formats at the advertised granularity
     #[test]
-    fn window_formats_at_advertised_granularity() {
+    fn window_formats_granularity() {
         assert_eq!(
             format_window(1000, HarvestGranularity::Second).as_deref(),
             Some("1970-01-01T00:00:01Z")
@@ -193,8 +196,9 @@ mod tests {
         assert_eq!(format_from(1000).as_deref(), Some("1970-01-01T00:00:01Z"));
     }
 
+    // an epoch cursor sends no from
     #[test]
-    fn epoch_cursor_sends_no_from() {
+    fn epoch_omits_from() {
         for granularity in [HarvestGranularity::Day, HarvestGranularity::Second] {
             assert!(format_window(0, granularity).is_none());
         }
@@ -202,8 +206,9 @@ mod tests {
         assert!(!url.query().unwrap().contains("from="));
     }
 
+    // the Identify URL carries only the verb
     #[test]
-    fn identify_url_carries_only_the_verb() {
+    fn identify_url_bare() {
         let url = identify_url("https://ex.org/oai?stale=1").unwrap();
         assert_eq!(url.query(), Some("verb=Identify"));
     }

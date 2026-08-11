@@ -184,16 +184,18 @@ pub enum StorageReadError {
 mod tests {
     use super::*;
 
+    // the connector key is group-scoped
     #[test]
-    fn connector_key_is_group_scoped() {
+    fn connector_key_scoped() {
         let group = Ulid::from_bytes([1u8; 16]);
         let key = connector_key(group, Ulid::from_bytes([2u8; 16]));
         assert!(key.as_ref().starts_with(connector_prefix(group).as_ref()));
         assert_eq!(key.as_ref().len(), 32);
     }
 
+    // the provenance key scans within one group
     #[test]
-    fn provenance_key_scans_within_group() {
+    fn provenance_scans_group() {
         let group = Ulid::from_bytes([3u8; 16]);
         let key = provenance_key(group, "ns", "rec-1");
         assert!(

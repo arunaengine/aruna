@@ -11,7 +11,7 @@ use ulid::Ulid;
 
 use crate::harvest::oai::request::{normalize_metadata_prefix, normalize_set};
 use crate::harvest::repository::{StorageReadError, read_connector_effect, write_source_effect};
-use crate::harvest::target_path::{normalize_target_prefix, target_prefix_is_blank};
+use crate::harvest::target_path::{normalize_target_prefix, prefix_is_blank};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateSourceInput {
@@ -99,7 +99,7 @@ impl CreateSourceOperation {
             return self.emit_error(CreateSourceError::EmptyNamespace);
         }
         let Some(target_prefix) = normalize_target_prefix(&self.input.target_prefix) else {
-            return self.emit_error(if target_prefix_is_blank(&self.input.target_prefix) {
+            return self.emit_error(if prefix_is_blank(&self.input.target_prefix) {
                 CreateSourceError::EmptyTargetPrefix
             } else {
                 CreateSourceError::TargetPrefixTooLong(self.input.target_prefix.clone())
@@ -251,8 +251,9 @@ mod tests {
         }
     }
 
+    // an empty namespace errors before any read
     #[test]
-    fn empty_namespace_errors_before_read() {
+    fn empty_namespace_errors() {
         let mut op = CreateSourceOperation::new(CreateSourceInput {
             namespace: " ".to_string(),
             ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
@@ -265,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_metadata_prefix_is_rejected() {
+    fn foreign_prefix_rejected() {
         for prefix in ["datacite", "marc21", "oai_datacite"] {
             let mut op = CreateSourceOperation::new(CreateSourceInput {
                 selector: HarvestSelector {
@@ -285,7 +286,7 @@ mod tests {
     /// Omitted, empty, whitespace, padded and exact prefixes are one source
     /// configuration, stored in exactly one form.
     #[test]
-    fn omitted_and_explicit_oai_dc_agree() {
+    fn omitted_prefix_agrees() {
         for prefix in [
             None,
             Some("oai_dc".to_string()),
@@ -307,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn target_prefix_is_stored_canonical() {
+    fn prefix_stored_canonical() {
         let mut op = CreateSourceOperation::new(CreateSourceInput {
             target_prefix: "  /imported/zenodo/  ".to_string(),
             ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
@@ -319,7 +320,7 @@ mod tests {
     /// A prefix one byte past the path budget makes every record fail later, so
     /// it is refused at creation; the longest usable prefix is still accepted.
     #[test]
-    fn target_prefix_budget_is_enforced() {
+    fn prefix_budget_enforced() {
         let longest = HARVEST_PATH_BYTES - DIGEST_SEGMENT_BYTES - 1;
         let mut accepted = CreateSourceOperation::new(CreateSourceInput {
             target_prefix: "p".repeat(longest),
@@ -340,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_target_prefix_is_rejected() {
+    fn blank_prefix_rejected() {
         for prefix in ["", " ", "/", "  //  "] {
             let mut op = CreateSourceOperation::new(CreateSourceInput {
                 target_prefix: prefix.to_string(),
@@ -354,8 +355,9 @@ mod tests {
         }
     }
 
+    // a missing connector errors as not found
     #[test]
-    fn missing_connector_errors_not_found() {
+    fn missing_connector_errors() {
         let mut op =
             CreateSourceOperation::new(input(ulid::Ulid::generate(), ulid::Ulid::generate()));
         assert_eq!(op.start().len(), 1);
@@ -369,8 +371,9 @@ mod tests {
         );
     }
 
+    // the source persists once the connector exists
     #[tokio::test]
-    async fn persists_source_after_connector_exists() {
+    async fn persists_after_connector() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {

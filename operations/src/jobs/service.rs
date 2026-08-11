@@ -227,7 +227,7 @@ pub async fn submit_mint_pid(
     retention_ms: u64,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let (job_id, created) = crate::metadata::forward::submit_pid_job_routed(
+    let (job_id, created) = crate::metadata::forward::submit_pid_routed(
         context,
         spec.document_id,
         spec.minted_by,
@@ -253,7 +253,7 @@ fn pid_submit_error(error: crate::metadata::api::MetadataApiError) -> SubmitJobE
 
 /// The authority's own submission: mints the job id against this node's
 /// job-control binding, so the dedup row and the execution share one owner.
-pub(crate) async fn submit_mint_pid_local(
+pub(crate) async fn submit_mint_local(
     context: &DriverContext,
     spec: MintPersistentIdSpec,
     owner_node_id: NodeId,

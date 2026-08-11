@@ -139,8 +139,9 @@ fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
     .expect("node info serializes")
 }
 
+// capacity blocks, then releases
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn capacity_blocks_then_releases() {
+async fn capacity_blocks_releases() {
     let storage_dir = tempfile::tempdir().expect("storage dir");
     let storage = aruna_storage::FjallStorage::open(storage_dir.path().to_str().expect("path"))
         .expect("storage opens");

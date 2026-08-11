@@ -24,7 +24,7 @@ pub fn normalize_target_prefix(prefix: &str) -> Option<String> {
 
 /// Whether a prefix is blank rather than merely too long, so a caller can name
 /// the reason it was refused.
-pub fn target_prefix_is_blank(prefix: &str) -> bool {
+pub fn prefix_is_blank(prefix: &str) -> bool {
     prefix.trim().trim_matches('/').trim().is_empty()
 }
 
@@ -32,8 +32,9 @@ pub fn target_prefix_is_blank(prefix: &str) -> bool {
 mod tests {
     use super::*;
 
+    // padding and slashes are not part of the prefix
     #[test]
-    fn padding_and_slashes_are_not_part_of_the_prefix() {
+    fn padding_is_trimmed() {
         for raw in [
             "imported/zenodo",
             " imported/zenodo ",
@@ -48,29 +49,29 @@ mod tests {
     }
 
     #[test]
-    fn blank_prefixes_are_refused() {
+    fn blank_prefixes_refused() {
         for raw in ["", " ", "\t\n", "/", "///", "  //  "] {
             assert!(normalize_target_prefix(raw).is_none());
-            assert!(target_prefix_is_blank(raw));
+            assert!(prefix_is_blank(raw));
         }
     }
 
     /// One byte on either side of the budget: the longest accepted prefix still
     /// leaves an exact digest segment, and one more byte leaves too little.
     #[test]
-    fn budget_boundary_is_exact() {
+    fn budget_boundary_exact() {
         let longest = HARVEST_PATH_BYTES - DIGEST_SEGMENT_BYTES - 1;
         assert_eq!(
             normalize_target_prefix(&"p".repeat(longest)).map(|prefix| prefix.len()),
             Some(longest)
         );
         assert!(normalize_target_prefix(&"p".repeat(longest + 1)).is_none());
-        assert!(!target_prefix_is_blank(&"p".repeat(longest + 1)));
+        assert!(!prefix_is_blank(&"p".repeat(longest + 1)));
     }
 
     /// The budget applies to the canonical prefix, not the padded input.
     #[test]
-    fn padding_does_not_count_against_the_budget() {
+    fn padding_is_free() {
         let longest = HARVEST_PATH_BYTES - DIGEST_SEGMENT_BYTES - 1;
         let padded = format!("  /{}/  ", "p".repeat(longest));
         assert_eq!(

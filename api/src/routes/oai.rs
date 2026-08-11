@@ -21,7 +21,7 @@ use ulid::Ulid;
 use aruna_core::structs::{MetadataRegistryRecord, RealmId};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
-use aruna_operations::harvest::oai::mapping::jsonld_to_oai_dc;
+use aruna_operations::harvest::oai::mapping::jsonld_to_dc;
 use aruna_operations::harvest::oai::request::format_from;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
@@ -580,7 +580,7 @@ async fn render_record(
 ) -> Result<String, OaiFault> {
     let jsonld = read_jsonld(state, ctx, realm_id, record.document_id).await?;
     let mut elements = String::new();
-    for (element, value) in jsonld_to_oai_dc(&jsonld, &record.graph_iri) {
+    for (element, value) in jsonld_to_dc(&jsonld, &record.graph_iri) {
         elements.push_str(&format!(
             "<dc:{element}>{}</dc:{element}>",
             escape_xml(&value)
@@ -984,8 +984,9 @@ mod tests {
         .await
     }
 
+    // a full page emits no resumption token
     #[tokio::test]
-    async fn full_page_emits_no_token() {
+    async fn full_page_ends() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, PAGE_SIZE as u64, true).await;
         let body = list_page(&fixture, None).await.unwrap();
@@ -994,8 +995,9 @@ mod tests {
         assert!(!body.contains("<resumptionToken"));
     }
 
+    // a short page emits no resumption token
     #[tokio::test]
-    async fn short_page_emits_no_token() {
+    async fn short_page_ends() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, PAGE_SIZE as u64 - 1, true).await;
         let body = list_page(&fixture, None).await.unwrap();
@@ -1006,7 +1008,7 @@ mod tests {
     // 101 visible records: the lookahead exists, so a token is issued, and the
     // token-driven final page carries the empty terminal element.
     #[tokio::test]
-    async fn overflow_page_carries_token() {
+    async fn overflow_carries_token() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, PAGE_SIZE as u64 + 1, true).await;
         let first = list_page(&fixture, None).await.unwrap();
@@ -1021,7 +1023,7 @@ mod tests {
     // Leading candidates denied after publication must continue the enumeration
     // through a token; reporting noRecordsMatch would drop the later group.
     #[tokio::test]
-    async fn denied_prefix_continues_list() {
+    async fn denied_prefix_continues() {
         let fixture = fixture(RoCrateLimits::default()).await;
         let denied = Ulid::from_bytes([31; 16]);
         seed_group(&fixture, denied, Vec::new()).await;
@@ -1047,7 +1049,7 @@ mod tests {
     // The oldest visible datestamp must survive a denied prefix longer than one
     // candidate budget.
     #[tokio::test]
-    async fn earliest_skips_denied_prefix() {
+    async fn earliest_skips_denied() {
         let fixture = fixture(RoCrateLimits::default()).await;
         let denied = Ulid::from_bytes([32; 16]);
         seed_group(&fixture, denied, Vec::new()).await;
@@ -1095,7 +1097,7 @@ mod tests {
     // A sequence started before later writes must terminate on the window frozen
     // at its first page, even across a generation flip.
     #[tokio::test]
-    async fn frozen_window_ends_sequence() {
+    async fn frozen_window_ends() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, PAGE_SIZE as u64 + 1, true).await;
         let first = list_page(&fixture, None).await.unwrap();
@@ -1139,7 +1141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_records_never_list() {
+    async fn private_never_lists() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, 5, false).await;
         assert!(matches!(
@@ -1152,7 +1154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbuilt_index_is_unavailable() {
+    async fn unbuilt_index_unavailable() {
         let fixture = fixture(RoCrateLimits::default()).await;
         assert!(matches!(
             list_page(&fixture, None).await,
@@ -1163,7 +1165,7 @@ mod tests {
     // The page stops before the record that would breach the aggregate budget and
     // hands the caller a token at the last emitted cursor.
     #[tokio::test]
-    async fn budget_stops_before_overflow() {
+    async fn budget_stops_early() {
         let limits = RoCrateLimits {
             metadata_bytes: 100,
             ..RoCrateLimits::default()
@@ -1178,7 +1180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_record_is_unavailable() {
+    async fn oversized_record_unavailable() {
         let limits = RoCrateLimits {
             metadata_bytes: 1,
             ..RoCrateLimits::default()
@@ -1194,7 +1196,7 @@ mod tests {
     // A record whose graph cannot be exported must fail the request, never fall
     // back to a synthesized title-only crosswalk.
     #[tokio::test]
-    async fn export_failure_never_falls_back() {
+    async fn export_failure_faults() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, 1, true).await;
         let record = registry_record(&fixture, 0, true);
@@ -1203,7 +1205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_record_guards_realm() {
+    async fn record_guards_realm() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, 1, true).await;
         let record = registry_record(&fixture, 0, true);
@@ -1224,7 +1226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_record_hides_private() {
+    async fn record_hides_private() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, 1, false).await;
         let record = registry_record(&fixture, 0, false);
@@ -1243,8 +1245,9 @@ mod tests {
         ));
     }
 
+    // Identify reports the earliest visible datestamp
     #[tokio::test]
-    async fn identify_uses_visible_earliest() {
+    async fn identify_uses_earliest() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, 3, true).await;
         let body = identify(&fixture.ctx, "https://example.test/api/v1/oai")
@@ -1297,8 +1300,9 @@ mod tests {
         assert!(request < payload_at);
     }
 
+    // every verb answers inside a well-shaped envelope
     #[tokio::test]
-    async fn every_verb_envelope_is_shaped() {
+    async fn verb_envelopes_shaped() {
         let fixture = fixture(RoCrateLimits::default()).await;
         seed_records(&fixture, 2, true).await;
         let record = registry_record(&fixture, 0, true);
@@ -1348,7 +1352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_and_post_agree() {
+    async fn get_post_agree() {
         let fixture = fixture(RoCrateLimits::default()).await;
         let (get_status, get_body) = call(
             &fixture,
@@ -1383,8 +1387,9 @@ mod tests {
         assert_eq!(strip(&get_body), strip(&post_body));
     }
 
+    // POST rejects media types other than form-urlencoded
     #[tokio::test]
-    async fn post_rejects_other_media() {
+    async fn post_rejects_media() {
         let fixture = fixture(RoCrateLimits::default()).await;
         let (status, body) = call(
             &fixture,
@@ -1404,7 +1409,7 @@ mod tests {
     // A repeated argument must surface as a protocol error inside the envelope,
     // not as a bare transport 400.
     #[tokio::test]
-    async fn repeated_argument_stays_in_envelope() {
+    async fn repeat_stays_enveloped() {
         let fixture = fixture(RoCrateLimits::default()).await;
         let (status, body) = call(
             &fixture,
@@ -1424,7 +1429,7 @@ mod tests {
     // The advertised endpoint comes from the configured public URL, never from a
     // Host header an untrusted caller controls.
     #[tokio::test]
-    async fn base_url_uses_configured() {
+    async fn base_url_configured() {
         let fixture = fixture(RoCrateLimits::default()).await;
         fixture
             .state
@@ -1444,7 +1449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base_url_ignores_host() {
+    async fn url_ignores_host() {
         let fixture = fixture(RoCrateLimits::default()).await;
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("evil.test"));
@@ -1467,8 +1472,9 @@ mod tests {
         }
     }
 
+    // the OAI identifier round-trips through the graph IRI
     #[test]
-    fn identifier_round_trips_graph_iri() {
+    fn identifier_round_trips() {
         let id = Ulid::from_bytes([7; 16]);
         let iri = format!("{GRAPH_IRI_PREFIX}{id}");
         assert_eq!(parse_identifier(&iri), Some(id));
@@ -1487,22 +1493,23 @@ mod tests {
     }
 
     #[test]
-    fn escapes_xml_special_characters() {
+    fn escapes_xml_specials() {
         assert_eq!(
             escape_xml("a & b < c > \"d\" 'e'"),
             "a &amp; b &lt; c &gt; &quot;d&quot; &apos;e&apos;"
         );
     }
 
+    // strips the characters XML forbids
     #[test]
-    fn strips_illegal_xml_characters() {
+    fn strips_illegal_xml() {
         let value = "a\u{0}b\u{8}c\u{1F}d\u{B}e\tf\nh";
         assert_eq!(escape_xml(value), "abcde\tf\nh");
         assert_eq!(escape_xml("\u{FFFE}\u{FFFF}ok"), "ok");
     }
 
     #[test]
-    fn duplicate_argument_is_bad() {
+    fn duplicate_argument_faults() {
         let error = validate_pairs(&params(&[
             ("verb", "GetRecord"),
             ("identifier", "a"),
@@ -1514,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_argument_is_bad() {
+    fn unknown_argument_faults() {
         let error = validate_pairs(&params(&[("verb", "Identify"), ("nonsense", "1")]))
             .err()
             .unwrap();
@@ -1522,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn illegal_verb_is_bad() {
+    fn illegal_verb_faults() {
         assert_eq!(
             fault_code(validate_pairs(&params(&[("verb", "Nope")])).err().unwrap()),
             "badVerb"
@@ -1534,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn verb_matrix_rejects_extras() {
+    fn verb_matrix_rejects() {
         // Identify takes no selective arguments; GetRecord takes no window.
         assert_eq!(
             fault_code(
@@ -1563,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_is_bad() {
+    fn missing_required_faults() {
         assert_eq!(
             fault_code(
                 validate_pairs(&params(&[("verb", "ListRecords")]))
@@ -1585,8 +1592,9 @@ mod tests {
         );
     }
 
+    // a resumption token alone needs no metadataPrefix
     #[test]
-    fn token_only_needs_no_prefix() {
+    fn token_skips_prefix() {
         let parsed = validate_pairs(&params(&[
             ("verb", "ListRecords"),
             ("resumptionToken", "abc"),
@@ -1596,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn form_pairs_keep_duplicates() {
+    fn form_keeps_duplicates() {
         let pairs = parse_pairs(b"verb=ListRecords&from=a&from=b");
         assert_eq!(pairs.len(), 3);
         assert_eq!(
@@ -1606,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn until_covers_whole_second() {
+    fn until_covers_second() {
         let params = OaiParams {
             verb: Some("ListRecords".to_string()),
             metadata_prefix: Some(METADATA_PREFIX.to_string()),
@@ -1624,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn until_covers_whole_day() {
+    fn until_covers_day() {
         let params = OaiParams {
             verb: Some("ListRecords".to_string()),
             metadata_prefix: Some(METADATA_PREFIX.to_string()),
@@ -1637,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_granularity_is_bad() {
+    fn mixed_granularity_faults() {
         let params = OaiParams {
             verb: Some("ListRecords".to_string()),
             metadata_prefix: Some(METADATA_PREFIX.to_string()),
@@ -1652,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_until_freezes_now() {
+    fn omitted_until_freezes() {
         let params = OaiParams {
             verb: Some("ListRecords".to_string()),
             metadata_prefix: Some(METADATA_PREFIX.to_string()),
@@ -1670,7 +1678,7 @@ mod tests {
 
     // A continuation carries the frozen bound through unchanged.
     #[test]
-    fn token_preserves_frozen_until() {
+    fn token_preserves_until() {
         let params = OaiParams {
             verb: Some("ListRecords".to_string()),
             resumption_token: Some(encode_token(1_700_000_000_999, vec![1, 2, 3])),
@@ -1682,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn token_excludes_selective_args() {
+    fn token_excludes_args() {
         let params = OaiParams {
             verb: Some("ListRecords".to_string()),
             metadata_prefix: Some(METADATA_PREFIX.to_string()),
@@ -1713,8 +1721,9 @@ mod tests {
         assert!(OAI_DC_OPEN.contains("oai_dc.xsd"));
     }
 
+    // the form content type is checked
     #[test]
-    fn form_content_type_is_checked() {
+    fn form_type_checked() {
         let mut headers = HeaderMap::new();
         assert!(!is_form_encoded(&headers));
         headers.insert(

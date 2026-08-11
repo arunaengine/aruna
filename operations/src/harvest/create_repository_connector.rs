@@ -213,8 +213,9 @@ mod tests {
         }
     }
 
+    // an empty name errors before any write
     #[test]
-    fn empty_name_errors_before_any_write() {
+    fn empty_name_errors() {
         let mut op = CreateConnectorOperation::new(CreateConnectorInput {
             name: "  ".to_string(),
             ..input()
@@ -263,8 +264,9 @@ mod tests {
         }
     }
 
+    // a wrong event in the write state errors
     #[test]
-    fn wrong_event_in_write_state_errors() {
+    fn wrong_event_errors() {
         let mut op = CreateConnectorOperation::new(input());
         let effects = op.start();
         assert_eq!(effects.len(), 1);

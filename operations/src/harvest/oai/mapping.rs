@@ -21,7 +21,7 @@ const UNKNOWN_DATE: &str = "1970-01-01";
 /// The `ro-crate-metadata.json` descriptor, `conformsTo`, `description` and a
 /// single `datePublished` are all mandatory for the checked create/replace seam,
 /// so each is synthesized when the record does not supply one.
-pub fn oai_dc_to_jsonld(record: &OaiRecord) -> String {
+pub fn dc_to_jsonld(record: &OaiRecord) -> String {
     let mut entity = Map::new();
     entity.insert("@id".to_string(), Value::String("./".to_string()));
     entity.insert("@type".to_string(), Value::String("Dataset".to_string()));
@@ -148,12 +148,12 @@ const SCHEMA_CROSSWALK: [(&str, &str); 14] = [
 /// Map a stored RO-Crate JSON-LD document to `oai_dc` element pairs, in canonical
 /// Dublin Core order.
 ///
-/// DEFAULT crosswalk (not locked, swappable), mirroring `oai_dc_to_jsonld`: a
+/// DEFAULT crosswalk (not locked, swappable), mirroring `dc_to_jsonld`: a
 /// harvested document carrying explicit DCMI-IRI properties round-trips
 /// losslessly; a native schema.org document is down-projected with the standard
 /// crosswalk. `oai_dc` is the lowest-common-denominator format, so a lossy
 /// down-mapping is expected. Always yields at least a `title`.
-pub fn jsonld_to_oai_dc(jsonld: &str, fallback_title: &str) -> Vec<(String, String)> {
+pub fn jsonld_to_dc(jsonld: &str, fallback_title: &str) -> Vec<(String, String)> {
     let mut collected: Vec<(&'static str, Vec<String>)> = DC_ELEMENT_ORDER
         .iter()
         .map(|element| (*element, Vec::new()))
@@ -317,9 +317,10 @@ mod tests {
             .clone()
     }
 
+    // elements map to DCMI IRIs and repeats become arrays
     #[test]
-    fn maps_elements_to_dcmi_iris_and_arrays_repeats() {
-        let entity = root(&oai_dc_to_jsonld(&record()));
+    fn elements_become_iris() {
+        let entity = root(&dc_to_jsonld(&record()));
 
         assert_eq!(entity["@type"], "Dataset");
         assert_eq!(entity["name"], "A dataset");
@@ -331,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_points_at_root() {
-        let jsonld = oai_dc_to_jsonld(&record());
+    fn descriptor_points_root() {
+        let jsonld = dc_to_jsonld(&record());
         let entity = descriptor(&jsonld);
         assert_eq!(entity["@type"], "CreativeWork");
         assert_eq!(entity["about"]["@id"], "./");
@@ -340,10 +341,10 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_root_properties_are_present() {
+    fn mandatory_properties_present() {
         let mut record = record();
         record.dc.clear();
-        let entity = root(&oai_dc_to_jsonld(&record));
+        let entity = root(&dc_to_jsonld(&record));
         assert_eq!(entity["name"], "oai:example.org:1");
         assert!(
             entity["description"]
@@ -355,39 +356,40 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_dates_fall_back() {
+    fn unparseable_dates_fallback() {
         let mut record = record();
         record
             .dc
             .push(("date".to_string(), "circa 1900".to_string()));
         assert_eq!(
-            root(&oai_dc_to_jsonld(&record))["datePublished"],
+            root(&dc_to_jsonld(&record))["datePublished"],
             "2026-01-02"
         );
 
         record.header.datestamp = "whenever".to_string();
         assert_eq!(
-            root(&oai_dc_to_jsonld(&record))["datePublished"],
+            root(&dc_to_jsonld(&record))["datePublished"],
             UNKNOWN_DATE
         );
     }
 
+    // a Dublin Core date wins over the record datestamp
     #[test]
-    fn dublin_core_date_wins_over_datestamp() {
+    fn dc_date_wins() {
         let mut record = record();
         record
             .dc
             .push(("date".to_string(), "2020-05-06".to_string()));
         assert_eq!(
-            root(&oai_dc_to_jsonld(&record))["datePublished"],
+            root(&dc_to_jsonld(&record))["datePublished"],
             "2020-05-06"
         );
     }
 
     #[test]
-    fn harvested_dcmi_document_round_trips() {
-        let jsonld = oai_dc_to_jsonld(&record());
-        let pairs = jsonld_to_oai_dc(&jsonld, "urn:fallback");
+    fn harvested_document_roundtrips() {
+        let jsonld = dc_to_jsonld(&record());
+        let pairs = jsonld_to_dc(&jsonld, "urn:fallback");
         assert!(pairs.contains(&("title".to_string(), "A dataset".to_string())));
         assert_eq!(
             pairs
@@ -398,8 +400,9 @@ mod tests {
         );
     }
 
+    // a native schema.org document projects down to Dublin Core
     #[test]
-    fn native_schema_document_projects_to_dublin_core() {
+    fn native_projects_down() {
         let jsonld = serde_json::json!({
             "@context": "https://w3id.org/ro/crate/1.2/context",
             "@graph": [{
@@ -414,7 +417,7 @@ mod tests {
         })
         .to_string();
 
-        let pairs = jsonld_to_oai_dc(&jsonld, "urn:fallback");
+        let pairs = jsonld_to_dc(&jsonld, "urn:fallback");
         assert!(pairs.contains(&("title".to_string(), "Native crate".to_string())));
         assert!(pairs.contains(&("creator".to_string(), "Alice".to_string())));
         assert!(pairs.contains(&("creator".to_string(), "Bob".to_string())));
@@ -427,9 +430,10 @@ mod tests {
         assert!(pairs.contains(&("type".to_string(), "Dataset".to_string())));
     }
 
+    // malformed JSON-LD still yields a title
     #[test]
-    fn malformed_jsonld_still_yields_title() {
-        let pairs = jsonld_to_oai_dc("not json", "urn:fallback");
+    fn malformed_yields_title() {
+        let pairs = jsonld_to_dc("not json", "urn:fallback");
         assert_eq!(
             pairs,
             vec![("title".to_string(), "urn:fallback".to_string())]
@@ -437,12 +441,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_order_is_stable() {
+    fn canonical_order_stable() {
         let jsonld = serde_json::json!({
             "@graph": [{ "@id": "./", "@type": "Dataset", "license": "CC0", "name": "N" }]
         })
         .to_string();
-        let pairs = jsonld_to_oai_dc(&jsonld, "urn:fallback");
+        let pairs = jsonld_to_dc(&jsonld, "urn:fallback");
         let elements: Vec<&str> = pairs.iter().map(|(element, _)| element.as_str()).collect();
         // title precedes type precedes rights in canonical DC order.
         assert_eq!(elements, vec!["title", "type", "rights"]);
