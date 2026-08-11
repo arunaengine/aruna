@@ -23,7 +23,7 @@ use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
 };
 use aruna_core::effects::StorageEffect;
-use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::effects::{DhtGetOptions, Effect, NetEffect};
 use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
@@ -316,8 +316,11 @@ const PEER_MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 const PEER_SUCCESS_REFRESH_DELAY: Duration = Duration::from_secs(300);
 const PEER_MANAGER_IDLE_DELAY: Duration = Duration::from_secs(300);
 // Overall open_stream budget: first open attempt, DHT-signed endpoint
-// re-resolution (an otherwise unbounded DHT lookup), and the retry combined.
+// re-resolution, and the retry combined.
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+// The DHT sub-budget of OPEN_STREAM_TIMEOUT, enforced inside the driver so the
+// lookup is released rather than left running when the caller stops waiting.
+const DHT_SIGNED_LOOKUP_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug)]
 struct PeerConnectivityManagerState {
@@ -1617,7 +1620,16 @@ async fn lookup_dht_signed_endpoint(
     }
 
     let key = realm_endpoint_key(&realm_id, &peer);
-    let entries = dht.get(&key, Some(realm_id)).await?;
+    // The announcement is only usable when `peer` published it in this realm, so
+    // the driver may stop at the first valid record from that publisher. The
+    // sub-budget keeps the whole resolve inside OPEN_STREAM_TIMEOUT.
+    let entries = dht
+        .get(
+            &key,
+            Some(realm_id),
+            DhtGetOptions::first_usable(DHT_SIGNED_LOOKUP_TIMEOUT, realm_id, peer),
+        )
+        .await?;
     let now = unix_timestamp_secs();
 
     Ok(select_dht_signed_endpoint(

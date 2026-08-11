@@ -89,14 +89,19 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
                 }
             }
         }
-        DhtEffect::Get { key, realm_filter } => {
+        DhtEffect::Get {
+            key,
+            realm_filter,
+            options,
+        } => {
             trace!(
                 event = "dht.get.started",
                 key = %hex_prefix(key.as_bytes()),
                 realm_id = ?realm_filter,
+                deadline_ms = options.deadline.as_millis(),
                 "Starting DHT get"
             );
-            match dht.get(&key, realm_filter).await {
+            match dht.get(&key, realm_filter, options).await {
                 Ok(values) => NetEvent::Dht(DhtEvent::GetResult { key, values }),
                 Err(error) => {
                     warn!(key = %hex_prefix(key.as_bytes()), error = %error, "DHT get failed");

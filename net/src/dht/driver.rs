@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
+use aruna_core::effects::DhtGetOptions;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -18,7 +19,7 @@ use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
 use iroh::Endpoint;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, debug_span, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -74,6 +75,7 @@ pub enum DriverCmd {
     Get {
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        options: DhtGetOptions,
         trace_context: Option<DistributedTraceContext>,
         reply: oneshot::Sender<CallerOutcome>,
     },
@@ -108,11 +110,15 @@ impl std::fmt::Debug for DriverCmd {
                 .field("ttl", ttl)
                 .finish(),
             Self::Get {
-                key, realm_filter, ..
+                key,
+                realm_filter,
+                options,
+                ..
             } => f
                 .debug_struct("DriverCmd::Get")
                 .field("key", key)
                 .field("realm_filter", realm_filter)
+                .field("options", options)
                 .finish(),
             Self::Bootstrap { nodes, .. } => f
                 .debug_struct("DriverCmd::Bootstrap")
@@ -153,10 +159,55 @@ enum DriverLane {
 enum DriverEvent {
     Shutdown,
     Tick,
+    Deadline,
     Command(DriverCmd),
     Inbound(InboundDhtStream),
     Io(DhtIo),
     Closed,
+}
+
+/// Wall-clock deadlines of the operations a caller is waiting on. The driver
+/// owns them so an expired lookup is released here instead of running on after
+/// its caller stopped waiting.
+#[derive(Debug, Default)]
+struct OpDeadlines {
+    by_op: HashMap<OpId, TokioInstant>,
+    order: BTreeSet<(TokioInstant, OpId)>,
+}
+
+impl OpDeadlines {
+    fn insert(&mut self, op_id: OpId, at: TokioInstant) {
+        self.remove(op_id);
+        self.by_op.insert(op_id, at);
+        self.order.insert((at, op_id));
+    }
+
+    fn remove(&mut self, op_id: OpId) {
+        if let Some(at) = self.by_op.remove(&op_id) {
+            self.order.remove(&(at, op_id));
+        }
+    }
+
+    fn next(&self) -> Option<TokioInstant> {
+        self.order.first().map(|(at, _)| *at)
+    }
+
+    fn expired(&mut self, now: TokioInstant) -> Vec<OpId> {
+        let mut expired = Vec::new();
+        while let Some((at, op_id)) = self.order.first().copied() {
+            if at > now {
+                break;
+            }
+            self.order.remove(&(at, op_id));
+            self.by_op.remove(&op_id);
+            expired.push(op_id);
+        }
+        expired
+    }
+
+    fn len(&self) -> usize {
+        self.by_op.len()
+    }
 }
 
 // Committed blocks amortize revision I/O; unused values become harmless crash gaps.
@@ -182,6 +233,7 @@ pub struct DhtDriver {
     shutdown: CancellationToken,
     now_tick: u64,
     pending_callers: HashMap<OpId, oneshot::Sender<CallerOutcome>>,
+    deadlines: OpDeadlines,
     op_spans: HashMap<OpId, Span>,
     next_op_id: OpId,
     inbound_contexts: HashMap<InboundId, Option<SendStream>>,
@@ -196,24 +248,36 @@ impl std::fmt::Debug for DhtDriver {
         f.debug_struct("DhtDriver")
             .field("now_tick", &self.now_tick)
             .field("pending_callers", &self.pending_callers.len())
+            .field("deadlines", &self.deadlines.len())
             .field("inbound_contexts", &self.inbound_contexts.len())
             .finish()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn next_driver_event(
     lane: DriverLane,
     shutdown: &CancellationToken,
     ticker: &mut tokio::time::Interval,
+    deadline: Option<TokioInstant>,
     cmd_rx: &mut DriverCmdReceiver,
     inbound_rx: &mut InboundReceiver,
     io_rx: &mut IoReceiver,
 ) -> (DriverEvent, DriverLane) {
+    let expiry = async move {
+        match deadline {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(expiry);
+
     match lane {
         DriverLane::Command => {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => (DriverEvent::Shutdown, lane),
+                _ = &mut expiry => (DriverEvent::Deadline, lane),
                 _ = ticker.tick() => (DriverEvent::Tick, lane),
                 result = cmd_rx.recv() => (
                     result.map_or(DriverEvent::Closed, DriverEvent::Command),
@@ -233,6 +297,7 @@ async fn next_driver_event(
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => (DriverEvent::Shutdown, lane),
+                _ = &mut expiry => (DriverEvent::Deadline, lane),
                 _ = ticker.tick() => (DriverEvent::Tick, lane),
                 result = inbound_rx.recv() => (
                     result.map_or(DriverEvent::Closed, DriverEvent::Inbound),
@@ -252,6 +317,7 @@ async fn next_driver_event(
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => (DriverEvent::Shutdown, lane),
+                _ = &mut expiry => (DriverEvent::Deadline, lane),
                 _ = ticker.tick() => (DriverEvent::Tick, lane),
                 result = io_rx.recv() => (
                     result.map_or(DriverEvent::Closed, DriverEvent::Io),
@@ -327,6 +393,7 @@ impl DhtDriver {
             shutdown,
             now_tick: 0,
             pending_callers: HashMap::new(),
+            deadlines: OpDeadlines::default(),
             op_spans: HashMap::new(),
             next_op_id: 1,
             inbound_contexts: HashMap::new(),
@@ -349,6 +416,7 @@ impl DhtDriver {
                 next_lane,
                 &self.shutdown,
                 &mut ticker,
+                self.deadlines.next(),
                 &mut self.cmd_rx,
                 &mut self.inbound_rx,
                 &mut self.io_rx,
@@ -359,6 +427,8 @@ impl DhtDriver {
             if matches!(&event, DriverEvent::Shutdown | DriverEvent::Closed) {
                 break DhtIoError::Shutdown;
             }
+            self.release_expired();
+            self.release_abandoned();
             let now_secs = match self.clock.now_secs() {
                 Ok(now_secs) => {
                     self.clock_diverged = false;
@@ -398,6 +468,7 @@ impl DhtDriver {
                         now_secs,
                     });
                 }
+                DriverEvent::Deadline => {}
             }
         };
 
@@ -506,6 +577,7 @@ impl DhtDriver {
             DriverCmd::Get {
                 key,
                 realm_filter,
+                options,
                 trace_context,
                 reply,
             } => {
@@ -519,17 +591,21 @@ impl DhtDriver {
                     operation = "get",
                     key = %key,
                     realm_id = ?realm_filter,
+                    deadline_ms = duration_ms(options.deadline),
                 );
                 if let Some(trace_context) = trace_context.as_ref() {
                     let _ = span.set_parent(extract_trace_context(trace_context));
                 }
                 self.op_spans.insert(op_id, span);
+                self.deadlines
+                    .insert(op_id, TokioInstant::now() + options.deadline);
                 self.process_input_for_op(
                     op_id,
                     DhtInput::Cmd(DhtCmd::Get {
                         op_id,
                         key,
                         realm_filter,
+                        completion: options.completion,
                         trace_context,
                     }),
                 );
@@ -635,6 +711,7 @@ impl DhtDriver {
         fields(op_id = output_op_id(&output), output = dht_output_kind(&output))
     )]
     fn handle_output(&mut self, output: DhtOutput) {
+        self.deadlines.remove(output_op_id(&output));
         match output {
             DhtOutput::Completed { op_id, result } => {
                 if let Some(span) = self.op_spans.get(&op_id) {
@@ -662,7 +739,50 @@ impl DhtDriver {
         for (_, sender) in waiting {
             let _ = sender.send(Err(error.clone()));
         }
+        self.deadlines = OpDeadlines::default();
         self.op_spans.clear();
+    }
+
+    /// Releases every operation whose wall-clock budget elapsed. Completed cache
+    /// write-backs are already durable; only the live lookup is dropped.
+    fn release_expired(&mut self) {
+        for op_id in self.deadlines.expired(TokioInstant::now()) {
+            debug!(op_id, outcome = "deadline", "releasing DHT operation");
+            self.cancel_op(op_id, DhtIoError::Timeout);
+        }
+    }
+
+    /// Releases operations whose caller stopped waiting, so a dropped request
+    /// cannot leave a lookup consuming connection attempts.
+    fn release_abandoned(&mut self) {
+        let abandoned: Vec<OpId> = self
+            .pending_callers
+            .iter()
+            .filter(|(_, reply)| reply.is_closed())
+            .map(|(op_id, _)| *op_id)
+            .collect();
+        for op_id in abandoned {
+            debug!(op_id, outcome = "caller_gone", "releasing DHT operation");
+            self.deadlines.remove(op_id);
+            self.pending_callers.remove(&op_id);
+            self.process_input(DhtInput::Cmd(DhtCmd::Cancel {
+                op_id,
+                error: DhtIoError::Timeout,
+            }));
+        }
+    }
+
+    #[tracing::instrument(name = "dht.driver.cancel_op", level = "debug", skip(self))]
+    fn cancel_op(&mut self, op_id: OpId, error: DhtIoError) {
+        self.deadlines.remove(op_id);
+        self.process_input(DhtInput::Cmd(DhtCmd::Cancel {
+            op_id,
+            error: error.clone(),
+        }));
+        if let Some(reply) = self.pending_callers.remove(&op_id) {
+            let _ = reply.send(Err(error));
+            self.op_spans.remove(&op_id);
+        }
     }
 
     #[tracing::instrument(name = "dht.driver.cleanup_spans", level = "trace", skip(self))]
@@ -2365,6 +2485,7 @@ fn dht_cmd_kind(cmd: &DhtCmd) -> &'static str {
     match cmd {
         DhtCmd::Put { .. } => "put",
         DhtCmd::Get { .. } => "get",
+        DhtCmd::Cancel { .. } => "cancel",
         DhtCmd::Bootstrap { .. } => "bootstrap",
         DhtCmd::RoutingTableSize { .. } => "routing_table_size",
         DhtCmd::AddPeer { .. } => "add_peer",
@@ -3161,6 +3282,7 @@ mod tests {
             DriverLane::Command,
             &shutdown,
             &mut ticker,
+            None,
             &mut cmd_rx,
             &mut inbound_rx,
             &mut io_rx,
@@ -3172,12 +3294,30 @@ mod tests {
             next_lane,
             &shutdown,
             &mut ticker,
+            None,
             &mut cmd_rx,
             &mut inbound_rx,
             &mut io_rx,
         )
         .await;
         assert!(matches!(second, DriverEvent::Io(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadlines_expire_order() {
+        let mut deadlines = OpDeadlines::default();
+        let start = TokioInstant::now();
+        deadlines.insert(7, start + Duration::from_secs(4));
+        deadlines.insert(8, start + Duration::from_secs(1));
+
+        assert_eq!(deadlines.next(), Some(start + Duration::from_secs(1)));
+        assert!(deadlines.expired(start).is_empty());
+        assert_eq!(deadlines.expired(start + Duration::from_secs(1)), vec![8]);
+
+        // A completed operation stops holding the driver's next wakeup.
+        deadlines.remove(7);
+        assert_eq!(deadlines.next(), None);
+        assert_eq!(deadlines.len(), 0);
     }
 
     #[test]

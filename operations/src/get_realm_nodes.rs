@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{DhtEffect, Effect, NetEffect};
+use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::keys::realm_presence_key;
@@ -81,6 +81,9 @@ impl Operation for GetRealmNodesOperation {
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: realm_presence_key(&self.realm_id),
             realm_filter: Some(self.realm_id),
+            // Multi-publisher presence must stay exhaustive; the driver enforces
+            // the same budget the caller races this operation against.
+            options: DhtGetOptions::exhaustive(REALM_DISCOVERY_TIMEOUT),
         }))]
     }
 

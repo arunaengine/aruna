@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::effects::{DhtEffect, Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, DhtError, StorageError};
 use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::id::DhtKeyId;
@@ -273,6 +273,9 @@ impl Operation for GetBlobHoldersOperation {
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: self.key,
             realm_filter: Some(self.realm_id),
+            // Holder discovery must see every publisher, so it stays exhaustive
+            // under the default read budget.
+            options: DhtGetOptions::default(),
         }))]
     }
 

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{DhtEffect, Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
@@ -166,6 +166,7 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
             .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
                 key,
                 realm_filter: None,
+                options: DhtGetOptions::default(),
             })))
             .await;
 
