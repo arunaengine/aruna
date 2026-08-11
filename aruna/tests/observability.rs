@@ -210,7 +210,7 @@ mod process {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
     use aruna_storage::{FjallStorage, StorageHandle};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, UdpSocket};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
@@ -222,29 +222,48 @@ mod process {
 
     pub struct NodeEnv {
         dir: tempfile::TempDir,
-        http_port: u16,
-        p2p_port: u16,
-        ops_port: u16,
-        s3_port: u16,
     }
 
-    fn free_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.local_addr().expect("ephemeral addr").port()
+    struct Ports {
+        http: TcpListener,
+        p2p: UdpSocket,
+        ops: TcpListener,
+        s3: TcpListener,
+    }
+
+    fn bind_port() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
+    }
+
+    fn bind_udp() -> UdpSocket {
+        UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral port")
+    }
+
+    impl Ports {
+        fn new() -> Self {
+            Self {
+                http: bind_port(),
+                p2p: bind_udp(),
+                ops: bind_port(),
+                s3: bind_port(),
+            }
+        }
+
+        fn values(&self) -> (u16, u16, u16, u16) {
+            (
+                self.http.local_addr().expect("http addr").port(),
+                self.p2p.local_addr().expect("p2p addr").port(),
+                self.ops.local_addr().expect("ops addr").port(),
+                self.s3.local_addr().expect("s3 addr").port(),
+            )
+        }
     }
 
     impl NodeEnv {
         pub fn new() -> Self {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let env = Self {
-                http_port: free_port(),
-                p2p_port: free_port(),
-                ops_port: free_port(),
-                s3_port: free_port(),
-                dir,
-            };
-            env.write_env_file();
-            env
+            Self {
+                dir: tempfile::tempdir().expect("temp dir"),
+            }
         }
 
         pub fn root(&self) -> &Path {
@@ -255,19 +274,11 @@ mod process {
             self.root().join("storage")
         }
 
-        pub fn ops_url(&self) -> String {
-            format!("http://127.0.0.1:{}", self.ops_port)
-        }
-
-        pub fn rest_url(&self) -> String {
-            format!("http://127.0.0.1:{}", self.http_port)
-        }
-
         pub fn log_path(&self) -> PathBuf {
             self.root().join("node.log")
         }
 
-        fn write_env_file(&self) {
+        fn write_env_file(&self, http: u16, p2p: u16, ops: u16, s3: u16) {
             let storage = self.storage_path();
             let body = format!(
                 "STORAGE_PATH={storage}\n\
@@ -284,15 +295,17 @@ mod process {
                  ARUNA_SHUTDOWN_GRACE_SECS=16\n\
                  RUST_LOG=info\n",
                 storage = storage.display(),
-                http = self.http_port,
-                p2p = self.p2p_port,
-                ops = self.ops_port,
-                s3 = self.s3_port,
+                http = http,
+                p2p = p2p,
+                ops = ops,
+                s3 = s3,
             );
             std::fs::write(self.root().join(".env"), body).expect("write .env");
         }
 
         pub fn launch(&self) -> NodeProcess {
+            let ports = Ports::new();
+            let (http_port, p2p_port, ops_port, s3_port) = ports.values();
             let log = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -304,17 +317,19 @@ mod process {
             let log_start = std::fs::metadata(self.log_path())
                 .map(|meta| meta.len() as usize)
                 .unwrap_or(0);
-            let child = Command::new(env!("CARGO_BIN_EXE_aruna"))
+            self.write_env_file(http_port, p2p_port, ops_port, s3_port);
+            let mut command = Command::new(env!("CARGO_BIN_EXE_aruna"));
+            command
                 .current_dir(self.root())
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log))
-                .stderr(Stdio::from(errlog))
-                .spawn()
-                .expect("spawn aruna process");
+                .stderr(Stdio::from(errlog));
+            drop(ports);
+            let child = command.spawn().expect("spawn aruna process");
             NodeProcess {
                 child,
-                ops_url: self.ops_url(),
-                rest_url: self.rest_url(),
+                ops_url: format!("http://127.0.0.1:{ops_port}"),
+                rest_url: format!("http://127.0.0.1:{http_port}"),
                 log_path: self.log_path(),
                 log_start,
             }
@@ -761,14 +776,14 @@ async fn restart_preserves_outbox() -> TestResult<()> {
     let mut second = env.launch();
     second.wait_status("/healthz", StatusCode::OK).await;
     second.wait_log("startup.recovery.degraded").await;
-    second.wait_log("pipeline.drain.rotation").await;
+    second.wait_log("pipeline.drain.summary").await;
     second.terminate().await;
     let before = env.outbox_rows().await;
 
     let mut third = env.launch();
     third.wait_status("/healthz", StatusCode::OK).await;
     third.wait_log("startup.recovery.degraded").await;
-    third.wait_log("pipeline.drain.rotation").await;
+    third.wait_log("pipeline.drain.summary").await;
     third.terminate().await;
     let after = env.outbox_rows().await;
 
