@@ -635,6 +635,95 @@ mod tests {
         );
     }
 
+    fn endpoint_addr() -> iroh::EndpointAddr {
+        let id = iroh::PublicKey::from_bytes(&[
+            0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8,
+            0x09, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6,
+            0xe7, 0xf8, 0x09, 0x1a,
+        ])
+        .unwrap();
+        iroh::EndpointAddr::from_parts(
+            id,
+            [
+                iroh::TransportAddr::Relay("https://relay.example.test/".parse().unwrap()),
+                iroh::TransportAddr::Ip("192.0.2.10:4433".parse().unwrap()),
+            ],
+        )
+    }
+
+    async fn response_value(response: axum::response::Response) -> Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn accepts_example(doc: &Value, path: &str, method: &str, status: &str, runtime: &Value) {
+        let media = &doc["paths"][path][method]["responses"][status]["content"]["application/json"];
+        assert_eq!(media["example"], *runtime);
+        assert!(schema_matches(doc, &media["schema"], runtime));
+    }
+
+    fn normalize_addrs(mut value: Value) -> Value {
+        // Iroh stores addresses in a set; their JSON array order is not contractual.
+        if let Some(addrs) = value["temporary_bootstrap_endpoint"]["addrs"].as_array_mut() {
+            addrs.sort_by_key(|item| item.to_string());
+        }
+        value
+    }
+
+    fn align_policy_ids(mut value: Value, example: &Value) -> Value {
+        // Policy ids are generated at runtime; the documentation uses stable examples.
+        let Some(actual) = value["trace"].as_array_mut() else {
+            return value;
+        };
+        let Some(expected) = example["trace"].as_array() else {
+            return value;
+        };
+        for (actual, expected) in actual.iter_mut().zip(expected) {
+            if let Some(policy_id) = expected.get("policy_id") {
+                actual["policy_id"] = policy_id.clone();
+            }
+        }
+        value
+    }
+
+    fn policy_response() -> crate::routes::policies::DryRunResponse {
+        use crate::routes::policies::{DryRunResponse, ScopedTraceEntry};
+        use aruna_core::request_policy::{PolicyKind, PolicyResult, PolicyTraceEntry};
+
+        DryRunResponse {
+            denied: true,
+            matched_scope: Some("group(01JABCDEF0123456789ABCDEFG)".to_string()),
+            policy_name: Some("read-only-group".to_string()),
+            reason: Some("policy matched".to_string()),
+            trace: vec![
+                ScopedTraceEntry {
+                    scope: "realm".to_string(),
+                    entry: PolicyTraceEntry {
+                        policy_id: ulid::Ulid::from_bytes([7; 16]),
+                        name: "no-admin-writes".to_string(),
+                        kind: PolicyKind::Deny,
+                        applicable: true,
+                        result: PolicyResult::Passed,
+                        detail: None,
+                    },
+                },
+                ScopedTraceEntry {
+                    scope: "group(01JABCDEF0123456789ABCDEFG)".to_string(),
+                    entry: PolicyTraceEntry {
+                        policy_id: ulid::Ulid::from_bytes([8; 16]),
+                        name: "read-only-group".to_string(),
+                        kind: PolicyKind::Deny,
+                        applicable: true,
+                        result: PolicyResult::Denied,
+                        detail: Some("policy matched".to_string()),
+                    },
+                },
+            ],
+        }
+    }
+
     #[test]
     fn accepts_typed_examples() {
         let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
@@ -685,6 +774,61 @@ mod tests {
             &doc["components"]["schemas"]["ScopedTraceEntry"],
             &trace
         ));
+    }
+
+    #[tokio::test]
+    async fn accepts_runtime_examples() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let cancel = response_value(crate::routes::tes::cancel_response()).await;
+        accepts_example(
+            &doc,
+            "/ga4gh/tes/v1/tasks/{id}:cancel",
+            "post",
+            "200",
+            &cancel,
+        );
+
+        let drs = response_value(crate::routes::drs::authorizations_response()).await;
+        accepts_example(
+            &doc,
+            "/ga4gh/drs/v1/objects/{object_id}",
+            "options",
+            "200",
+            &drs,
+        );
+
+        let onboarding =
+            serde_json::to_value(aruna_core::onboarding::BootstrapOnboardingResponse {
+                realm_id: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".to_string(),
+                mode: aruna_core::onboarding::OnboardingMode::Server,
+                temporary_bootstrap_endpoint: endpoint_addr(),
+                wrapped_realm_private_key: None,
+                wrapped_realm_private_key_nonce: None,
+                wrapping_public_key: None,
+                delegation_signature: Some("<realm-delegation-signature>".to_string()),
+                onboarding_sync_ticket: "<one-time-onboarding-sync-ticket>".to_string(),
+            })
+            .unwrap();
+        let onboarding_media = &doc["paths"]["/onboarding/bootstrap"]["post"]["responses"]["200"]["content"]
+            ["application/json"];
+        assert_eq!(
+            normalize_addrs(&onboarding_media["example"]),
+            normalize_addrs(&onboarding)
+        );
+        assert!(schema_matches(
+            &doc,
+            &onboarding_media["schema"],
+            &onboarding
+        ));
+
+        let policy = serde_json::to_value(policy_response()).unwrap();
+        let policy_media = &doc["paths"]["/policies/dry-run"]["post"]["responses"]["200"]["content"]
+            ["application/json"];
+        assert_eq!(
+            align_policy_ids(policy.clone(), &policy_media["example"]),
+            policy_media["example"]
+        );
+        assert!(schema_matches(&doc, &policy_media["schema"], &policy));
     }
 
     #[test]

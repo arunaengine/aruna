@@ -254,6 +254,9 @@ pub struct TesCreateTaskResponse {
     pub id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct TesCancelResponse {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TesListTasksResponse {
     pub tasks: Vec<TesTask>,
@@ -841,7 +844,7 @@ pub async fn cancel_task(
             TesError::not_found("TES task not found").into_response()
         }
         Ok(RoutedCancelOutcome::AlreadyTerminal(_) | RoutedCancelOutcome::Requested(_)) => {
-            tes_json_response(StatusCode::OK, serde_json::json!({}))
+            tes_json_response(StatusCode::OK, TesCancelResponse {})
         }
         Err(error) => TesError::from_job_route(error).into_response(),
     }
@@ -1544,6 +1547,11 @@ fn tes_json_response<T: Serialize>(status: StatusCode, value: T) -> Response {
         http::HeaderValue::from_static("application/json; charset=utf-8"),
     );
     response
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_response() -> Response {
+    tes_json_response(StatusCode::OK, TesCancelResponse {})
 }
 
 #[derive(Debug)]

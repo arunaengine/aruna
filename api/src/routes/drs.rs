@@ -96,6 +96,20 @@ pub struct DrsAuthorizationsResponse {
     bearer_auth_issuers: Vec<String>,
 }
 
+#[cfg(test)]
+pub(crate) fn authorizations_response() -> Response {
+    drs_json_response(
+        StatusCode::OK,
+        DrsAuthorizationsResponse {
+            drs_object_id: "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+                .to_string(),
+            supported_types: vec!["BearerAuth".to_string()],
+            passport_auth_issuers: vec![],
+            bearer_auth_issuers: vec!["https://login.example.test/realms/aruna".to_string()],
+        },
+    )
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DrsObjectResponse {
     id: String,
