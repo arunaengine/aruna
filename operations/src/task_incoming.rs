@@ -1093,178 +1093,219 @@ impl OperationsTaskHandler {
         records
     }
 
-            let (to_publish, deferred, undeliverable) = partition_drain_records(
-                records,
-                &mut defer_state,
-                |topic| {
-                    net_handle
-                        .document_sync_topic_exists(topic)
-                        .unwrap_or(false)
-                },
-                |record| classify_deferred_record(realm_config.as_ref(), net_handle, record),
+    async fn process_drain_page(
+        &self,
+        retry_key: &TaskKey,
+        net_handle: &aruna_net::NetHandle,
+        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        realm_id: RealmId,
+        records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+        invocation: &mut DrainInvocation,
+    ) {
+        invocation.pages += 1;
+        invocation.records += records.len();
+        if let Some(page_oldest) = records
+            .iter()
+            .map(|(_, record)| record.outbox_id.timestamp_ms())
+            .min()
+        {
+            invocation.oldest_record_ms = Some(
+                invocation
+                    .oldest_record_ms
+                    .map_or(page_oldest, |current| current.min(page_oldest)),
             );
-            deferred_total += deferred.len();
-            let now_ms = unix_timestamp_millis();
-            for (_, record, topic) in &deferred {
-                let record_ms = record.outbox_id.timestamp_ms();
-                if now_ms.saturating_sub(record_ms) < OUTBOX_STUCK_AFTER.as_millis() as u64 {
-                    continue;
-                }
-                stuck_total += 1;
-                if oldest_stuck
-                    .as_ref()
-                    .is_none_or(|(oldest_ms, ..)| record_ms < *oldest_ms)
-                {
-                    oldest_stuck =
-                        Some((record_ms, record.target.clone(), *topic, record.placement));
-                }
+        }
+        let records = self
+            .prepare_drain_records(retry_key, net_handle, config, realm_id, records, invocation)
+            .await;
+        let (to_publish, deferred, undeliverable) = partition_drain_records(
+            records,
+            &mut invocation.defer,
+            |topic| {
+                net_handle
+                    .document_sync_topic_exists(topic)
+                    .unwrap_or(false)
+            },
+            |record| classify_deferred_record(config, net_handle, record),
+        );
+        invocation.deferred += deferred.len();
+        let now_ms = unix_timestamp_millis();
+        for (_, record, topic) in &deferred {
+            let record_ms = record.outbox_id.timestamp_ms();
+            if now_ms.saturating_sub(record_ms) < OUTBOX_STUCK_AFTER.as_millis() as u64 {
+                continue;
             }
-            undeliverable_total += undeliverable.len();
-            self.report_undeliverable_records(&undeliverable);
-
-            let mut publish_groups: BTreeMap<
-                Vec<aruna_core::NodeId>,
-                (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
-            > = BTreeMap::new();
-            for (record_key, record, topic) in to_publish {
-                let origin = admin_origin(&record);
-                let document = document_publish_from_outbox(
-                    record.outbox_id,
-                    record.target.clone(),
-                    record.event,
-                    record.placement,
-                    record.allow_genesis,
-                );
-
-                let mut peer_key = record.peers.clone();
-                crate::sync_placement::sort_node_ids(&mut peer_key);
-                let (peers, subbatches) = publish_groups
-                    .entry(peer_key)
-                    .or_insert_with(|| (record.peers.clone(), Vec::new()));
-                if subbatches
-                    .last()
-                    .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
-                {
-                    subbatches.push(DrainSubBatch {
-                        peers: peers.clone(),
-                        documents: Vec::new(),
-                        topics: Vec::new(),
-                        origins: Vec::new(),
-                        targets: Vec::new(),
-                        record_keys: Vec::new(),
-                    });
-                }
-                let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
-                subbatch.documents.push(document);
-                subbatch.topics.push(topic);
-                subbatch.origins.push(origin);
-                subbatch.targets.push(record.target);
-                subbatch.record_keys.push(record_key);
-            }
-
-            group_count += publish_groups.len();
-            let subbatches: Vec<DrainSubBatch> = publish_groups
-                .into_values()
-                .flat_map(|(_, subbatches)| subbatches)
-                .collect();
-            subbatch_count += subbatches.len();
-
-            // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;
-            // sub-batches enter the sync stage strictly in submission order.
-            let mut awaiting_sync: Option<DrainSubBatch> = None;
-            for mut subbatch in subbatches {
-                let documents = std::mem::take(&mut subbatch.documents);
-                let peers = subbatch.peers.clone();
-                let (batch_topics, batch_origins) = subbatch.ordering_domains();
-                let publish = async {
-                    let publish_started = Instant::now();
-                    let event = net_handle
-                        .send_effect(Effect::Net(NetEffect::DocumentSync(
-                            DocumentSyncEffect::PublishDocuments { documents, peers },
-                        )))
-                        .await;
-                    (event, publish_started.elapsed())
-                };
-                let ((publish_event, publish_time), sync_outcome) = tokio::join!(
-                    publish,
-                    self.sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
-                );
-                publish_elapsed += publish_time;
-                totals.merge(sync_outcome);
-                match publish_event {
-                    Event::Net(NetEvent::DocumentSync(
-                        DocumentSyncNetEvent::DocumentsPublished { .. },
-                    )) => {
-                        awaiting_sync = Some(subbatch);
-                    }
-                    Event::Net(NetEvent::DocumentSync(
-                        DocumentSyncNetEvent::DocumentsPartiallyPublished {
-                            published_indices,
-                            retry_indices,
-                            error,
-                        },
-                    )) => {
-                        warn!(
-                            task_id = ?retry_key,
-                            published = published_indices.len(),
-                            retry = retry_indices.len(),
-                            error = %error,
-                            "Partially created local document sync batch"
-                        );
-                        totals.retry_needed = true;
-                        if let Some(retried) = subbatch.sync_subset(&retry_indices) {
-                            let (topics, origins) = retried.ordering_domains();
-                            totals.blocked_topics.extend(topics);
-                            totals.blocked_origins.extend(origins);
-                        } else {
-                            totals.blocked_topics.extend(batch_topics.iter().copied());
-                            totals.blocked_origins.extend(batch_origins.iter().copied());
-                        }
-                        match subbatch.sync_subset(&published_indices) {
-                            Some(published_subbatch)
-                                if !published_subbatch.record_keys.is_empty() =>
-                            {
-                                awaiting_sync = Some(published_subbatch);
-                            }
-                            Some(_) => {}
-                            None => {
-                                warn!(task_id = ?retry_key, "Invalid partial document publish indices");
-                            }
-                        }
-                    }
-                    Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                        error,
-                        ..
-                    })) => {
-                        warn!(task_id = ?retry_key, error = %error, "Failed to create local document sync batch");
-                        totals.retry_needed = true;
-                        totals.blocked_topics.extend(batch_topics.iter().copied());
-                        totals.blocked_origins.extend(batch_origins.iter().copied());
-                    }
-                    Event::Net(NetEvent::Error(error)) => {
-                        warn!(task_id = ?retry_key, error = ?error, "Failed to create local document sync batch");
-                        totals.retry_needed = true;
-                        totals.blocked_topics.extend(batch_topics.iter().copied());
-                        totals.blocked_origins.extend(batch_origins.iter().copied());
-                    }
-                    other => {
-                        warn!(task_id = ?retry_key, event = ?other, "Unexpected local document sync batch result");
-                        totals.retry_needed = true;
-                        totals.blocked_topics.extend(batch_topics.iter().copied());
-                        totals.blocked_origins.extend(batch_origins.iter().copied());
-                    }
-                }
-            }
-            let sync_outcome = self
-                .sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
-                .await;
-            totals.merge(sync_outcome);
-
-            if !has_more {
-                reached_end = true;
-                break;
+            invocation.stuck += 1;
+            if invocation
+                .oldest_stuck
+                .as_ref()
+                .is_none_or(|(oldest_ms, ..)| record_ms < *oldest_ms)
+            {
+                invocation.oldest_stuck =
+                    Some((record_ms, record.target.clone(), *topic, record.placement));
             }
         }
+        invocation.undeliverable += undeliverable.len();
+        self.report_undeliverable_records(&undeliverable);
+
+        let (groups, subbatches) = Self::build_drain_batches(to_publish);
+        invocation.groups += groups;
+        invocation.subbatches += subbatches.len();
+        let (publish_elapsed, outcome) = self
+            .publish_drain_batches(retry_key, net_handle, subbatches)
+            .await;
+        invocation.publish_elapsed += publish_elapsed;
+        invocation.outcome.merge(outcome);
+    }
+
+    fn build_drain_batches(records: Vec<DrainRecord>) -> (usize, Vec<DrainSubBatch>) {
+        let mut publish_groups: BTreeMap<
+            Vec<aruna_core::NodeId>,
+            (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
+        > = BTreeMap::new();
+        for (record_key, record, topic) in records {
+            let origin = admin_origin(&record);
+            let document = document_publish_from_outbox(
+                record.outbox_id,
+                record.target.clone(),
+                record.event,
+                record.placement,
+                record.allow_genesis,
+            );
+            let mut peer_key = record.peers.clone();
+            crate::sync_placement::sort_node_ids(&mut peer_key);
+            let (peers, subbatches) = publish_groups
+                .entry(peer_key)
+                .or_insert_with(|| (record.peers.clone(), Vec::new()));
+            if subbatches
+                .last()
+                .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
+            {
+                subbatches.push(DrainSubBatch {
+                    peers: peers.clone(),
+                    documents: Vec::new(),
+                    topics: Vec::new(),
+                    origins: Vec::new(),
+                    targets: Vec::new(),
+                    record_keys: Vec::new(),
+                });
+            }
+            let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
+            subbatch.documents.push(document);
+            subbatch.topics.push(topic);
+            subbatch.origins.push(origin);
+            subbatch.targets.push(record.target);
+            subbatch.record_keys.push(record_key);
+        }
+        let groups = publish_groups.len();
+        let subbatches = publish_groups
+            .into_values()
+            .flat_map(|(_, subbatches)| subbatches)
+            .collect();
+        (groups, subbatches)
+    }
+
+    async fn publish_drain_batches(
+        &self,
+        retry_key: &TaskKey,
+        net_handle: &aruna_net::NetHandle,
+        subbatches: Vec<DrainSubBatch>,
+    ) -> (Duration, DrainSyncOutcome) {
+        let mut publish_elapsed = Duration::ZERO;
+        let mut outcome = DrainSyncOutcome::default();
+        let mut awaiting_sync: Option<DrainSubBatch> = None;
+        for mut subbatch in subbatches {
+            let documents = std::mem::take(&mut subbatch.documents);
+            let peers = subbatch.peers.clone();
+            let (batch_topics, batch_origins) = subbatch.ordering_domains();
+            let publish = async {
+                let publish_started = Instant::now();
+                let event = net_handle
+                    .send_effect(Effect::Net(NetEffect::DocumentSync(
+                        DocumentSyncEffect::PublishDocuments { documents, peers },
+                    )))
+                    .await;
+                (event, publish_started.elapsed())
+            };
+            let ((publish_event, publish_time), sync_outcome) = tokio::join!(
+                publish,
+                self.sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
+            );
+            publish_elapsed += publish_time;
+            outcome.merge(sync_outcome);
+            match publish_event {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+                    ..
+                })) => awaiting_sync = Some(subbatch),
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                        published_indices,
+                        retry_indices,
+                        error,
+                    },
+                )) => {
+                    warn!(
+                        task_id = ?retry_key,
+                        published = published_indices.len(),
+                        retry = retry_indices.len(),
+                        error = %error,
+                        "Partially created local document sync batch"
+                    );
+                    outcome.retry_needed = true;
+                    if let Some(retried) = subbatch.sync_subset(&retry_indices) {
+                        let (topics, origins) = retried.ordering_domains();
+                        outcome.blocked_topics.extend(topics);
+                        outcome.blocked_origins.extend(origins);
+                    } else {
+                        outcome.blocked_topics.extend(batch_topics.iter().copied());
+                        outcome
+                            .blocked_origins
+                            .extend(batch_origins.iter().copied());
+                    }
+                    match subbatch.sync_subset(&published_indices) {
+                        Some(published) if !published.record_keys.is_empty() => {
+                            awaiting_sync = Some(published);
+                        }
+                        Some(_) => {}
+                        None => {
+                            warn!(task_id = ?retry_key, "Invalid partial document publish indices");
+                        }
+                    }
+                }
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                    error, ..
+                })) => {
+                    warn!(task_id = ?retry_key, error = %error, "Failed to create local document sync batch");
+                    outcome.retry_needed = true;
+                    outcome.blocked_topics.extend(batch_topics.iter().copied());
+                    outcome
+                        .blocked_origins
+                        .extend(batch_origins.iter().copied());
+                }
+                Event::Net(NetEvent::Error(error)) => {
+                    warn!(task_id = ?retry_key, error = ?error, "Failed to create local document sync batch");
+                    outcome.retry_needed = true;
+                    outcome.blocked_topics.extend(batch_topics.iter().copied());
+                    outcome
+                        .blocked_origins
+                        .extend(batch_origins.iter().copied());
+                }
+                other => {
+                    warn!(task_id = ?retry_key, event = ?other, "Unexpected local document sync batch result");
+                    outcome.retry_needed = true;
+                    outcome.blocked_topics.extend(batch_topics.iter().copied());
+                    outcome
+                        .blocked_origins
+                        .extend(batch_origins.iter().copied());
+                }
+            }
+        }
+        let sync_outcome = self
+            .sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
+            .await;
+        outcome.merge(sync_outcome);
+        (publish_elapsed, outcome)
+    }
 
         // A later record of the same topic or admin origin must not overtake one
         // that has not landed.
