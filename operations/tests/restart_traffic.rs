@@ -154,6 +154,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
         summary.total_topics()
     );
     assert!(summary.held_shards > 0, "node 2 must hold shards");
+    assert_eq!(summary.shared_topics, SHARED_RESTORE_TOPIC_COUNT);
     assert!(
         summary.total_topics() <= summary.held_shards + SHARED_RESTORE_TOPIC_COUNT,
         "restore announced {} topics, more than held_shards {} + shared {}",
@@ -485,6 +486,23 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
 
+    write_config(nodes, realm_id, &config).await?;
+    for node in nodes {
+        aruna_operations::process_placements::process_shard_placements(
+            &node.context,
+            *realm_id,
+            node.net.node_id(),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn write_config(
+    nodes: &[TestNode],
+    realm_id: &RealmId,
+    config: &RealmConfigDocument,
+) -> Result<(), BoxError> {
     for node in nodes {
         let actor = Actor {
             node_id: node.net.node_id(),
@@ -507,14 +525,6 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
-    }
-    for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
     }
     Ok(())
 }
@@ -551,12 +561,13 @@ async fn shutdown_nodes(nodes: Vec<TestNode>) {
 
 /// Held shard topics the incident node restored.
 const INCIDENT_SHARDS: u32 = 128;
-/// Outbox records seeded at the metric scan ceiling observed in the incident.
-const INCIDENT_RECORDS: usize = 8_192;
+/// The production drain examines two full topic pages per invocation.
+const INCIDENT_LIMIT: usize = 2 * aruna_operations::document_sync_outbox::OUTBOX_DRAIN_BATCH_SIZE;
+/// Two full invocation limits prove the first pass cannot consume the queue.
+const INCIDENT_RECORDS: usize = 2 * INCIDENT_LIMIT;
 
-// A node holding 128 shard topics whose co-holders are all unavailable, with the
-// outbox at its scan ceiling: recovery stays bounded and degraded, and neither
-// the drain nor a restart's cursor reset loses or reorders a record.
+// With both co-holders unavailable and two full drain caps queued, recovery
+// stays bounded and degraded; peer restoration then drains every record in order.
 #[test]
 fn offline_bounds_recovery() -> Result<(), BoxError> {
     let runtime = make_runtime()?;
