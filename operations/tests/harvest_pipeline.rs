@@ -1093,10 +1093,8 @@ async fn deleted_document_revives() -> Result<(), BoxError> {
 }
 
 /// A registry row durable before its graph materializes must never retire the
-/// source record. The harvest update path does not read the graph today, so the
-/// update lands straight away; if it ever does surface a missing graph, that
-/// failure has to stay retryable and the next run must still update the same
-/// identity. The classifier table test pins the retryability itself down.
+/// source record: a missing graph is retryable, and the next run updates the same
+/// identity.
 #[tokio::test]
 async fn unmaterialized_graph_retries() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
