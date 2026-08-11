@@ -47,8 +47,8 @@ use aruna_operations::metadata::api::{
     query_metadata_document,
 };
 use aruna_operations::metadata::forward::{
-    create_metadata_document_routed, delete_metadata_document_routed, export_rocrate_routed,
-    origin_holds_document, update_metadata_document_routed,
+    MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
+    export_rocrate_routed, origin_holds_document, update_metadata_document_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::sync_placement::sort_node_ids;
@@ -799,17 +799,36 @@ async fn bystander_writes_forward() -> TestResult<()> {
         .await?
     );
 
-    update_metadata_document_routed(
-        &bystander.context,
-        realm.actor(bystander),
-        None,
-        document_id,
-        None,
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
-            jsonld: r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#
-                .to_string(),
+    // The first routed write can race the holders' replicated placement view
+    // on a starved machine; retry while every holder reports it unavailable.
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed update reached a holder",
+        || async {
+            match update_metadata_document_routed(
+                &bystander.context,
+                realm.actor(bystander),
+                None,
+                document_id,
+                None,
+                UpdateMetadataDocumentMutation::UpsertDataEntity {
+                    jsonld: r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#
+                        .to_string(),
+                },
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataWriteError::Undeliverable(reason))
+                    if reason.contains("placement view is unavailable") =>
+                {
+                    Ok(1)
+                }
+                other => {
+                    other?;
+                    Ok(0)
+                }
+            }
         },
-        Some(realm.bearer_token()),
     )
     .await?;
 
