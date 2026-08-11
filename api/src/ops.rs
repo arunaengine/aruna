@@ -182,15 +182,25 @@ async fn healthz(State(state): State<Arc<OpsState>>) -> Response {
 }
 
 async fn readyz(State(state): State<Arc<OpsState>>) -> Response {
+    let draining = state.readiness.is_draining();
     let startup = if !state.readiness.is_started() {
         CheckOutcome::failed("node has not finished startup")
-    } else if state.readiness.is_draining() {
+    } else if draining {
         CheckOutcome::failed("node is draining")
     } else {
         CheckOutcome::ok()
     };
-    let storage = check_storage(&state.ctx).await;
-    let sync = check_sync(&state.ctx).await;
+    let (storage, sync) = if draining {
+        (
+            CheckOutcome::failed("not checked while node is draining"),
+            CheckOutcome::failed("not checked while node is draining"),
+        )
+    } else {
+        (
+            check_storage(&state.ctx).await,
+            check_sync(&state.ctx).await,
+        )
+    };
     // Degraded remote recovery is reported, never a readiness failure: a locally
     // safe node must not leave Service capacity because a peer is down.
     let ready = startup.ok && storage.ok && sync.ok;
@@ -843,6 +853,10 @@ mod tests {
         let (status, body) = request(&router, "/readyz").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("node is draining"), "{body}");
+        assert_eq!(
+            body.matches("not checked while node is draining").count(),
+            2
+        );
     }
 
     #[test]
