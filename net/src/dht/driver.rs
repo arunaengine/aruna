@@ -3123,6 +3123,48 @@ mod tests {
         (directory, storage)
     }
 
+    async fn make_driver(seed: u8) -> (DhtDriver, ConnectionPool, TempDir) {
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![Alpn::Dht.as_bytes().to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("valid bind address"),
+            )
+            .expect("bind address configures")
+            .bind()
+            .await
+            .expect("endpoint binds");
+        let pool = ConnectionPool::new(endpoint.clone(), Default::default());
+        let (directory, storage) = open_storage();
+        let state = DhtStateMachine::new(
+            endpoint.id(),
+            endpoint.secret_key().clone(),
+            now_unix_secs(),
+        );
+        let (_cmd_tx, cmd_rx) = mpsc::bounded_blocking_async(CMD_CHANNEL_CAPACITY);
+        let (_inbound_tx, inbound_rx) = mpsc::bounded_blocking_async(1);
+        let driver = DhtDriver::with_clock(
+            state,
+            DhtClock::new(),
+            endpoint,
+            storage,
+            pool.clone(),
+            cmd_rx,
+            inbound_rx,
+            CancellationToken::new(),
+        );
+        (driver, pool, directory)
+    }
+
+    async fn close_driver(driver: DhtDriver, pool: ConnectionPool) {
+        driver.shutdown.cancel();
+        driver.revision_task.abort();
+        let _ = pool.shutdown().await;
+    }
+
     fn spawn_revision_worker(
         storage: &StorageHandle,
     ) -> (
@@ -3323,6 +3365,90 @@ mod tests {
         deadlines.remove(7);
         assert_eq!(deadlines.next(), None);
         assert_eq!(deadlines.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_deadline_cleans() {
+        let (mut driver, pool, _directory) = make_driver(201).await;
+        let peer = make_node(202);
+        driver.handle_driver_cmd(DriverCmd::AddPeer { node_id: peer });
+        let (reply, result) = oneshot::channel();
+        driver.handle_driver_cmd(DriverCmd::Get {
+            key: DhtKeyId::from_data(b"driver-deadline"),
+            realm_filter: None,
+            options: DhtGetOptions::exhaustive(Duration::from_secs(1)),
+            trace_context: None,
+            reply,
+        });
+        driver.process_input(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 1,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        assert_eq!(driver.pending_callers.len(), 1);
+        assert_eq!(driver.deadlines.len(), 1);
+        assert!(driver.state.contains_op(1));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        driver.release_expired();
+
+        assert_eq!(driver.pending_callers.len(), 0);
+        assert_eq!(driver.deadlines.len(), 0);
+        assert!(!driver.state.contains_op(1));
+        assert!(matches!(result.await, Ok(Err(DhtIoError::Timeout))));
+
+        driver.process_input(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 1,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Nodes { nodes: Vec::new() },
+        }));
+        assert_eq!(driver.pending_callers.len(), 0);
+        assert_eq!(driver.deadlines.len(), 0);
+        assert!(!driver.state.contains_op(1));
+        close_driver(driver, pool).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_drop_cleans() {
+        let (mut driver, pool, _directory) = make_driver(203).await;
+        let peer = make_node(204);
+        driver.handle_driver_cmd(DriverCmd::AddPeer { node_id: peer });
+        let (reply, result) = oneshot::channel();
+        drop(result);
+        driver.handle_driver_cmd(DriverCmd::Get {
+            key: DhtKeyId::from_data(b"driver-drop"),
+            realm_filter: None,
+            options: DhtGetOptions::exhaustive(Duration::from_secs(10)),
+            trace_context: None,
+            reply,
+        });
+        driver.process_input(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 1,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        assert_eq!(driver.pending_callers.len(), 1);
+        assert_eq!(driver.deadlines.len(), 1);
+        assert!(driver.state.contains_op(1));
+
+        driver.release_abandoned();
+
+        assert_eq!(driver.pending_callers.len(), 0);
+        assert_eq!(driver.deadlines.len(), 0);
+        assert!(!driver.state.contains_op(1));
+        driver.process_input(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 1,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Nodes { nodes: Vec::new() },
+        }));
+        assert_eq!(driver.pending_callers.len(), 0);
+        assert_eq!(driver.deadlines.len(), 0);
+        assert!(!driver.state.contains_op(1));
+        close_driver(driver, pool).await;
     }
 
     #[test]

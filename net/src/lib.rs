@@ -1009,7 +1009,14 @@ impl NetHandle {
             .set_endpoint_info(endpoint_addr.clone());
         // A newly installed address invalidates the failures recorded against
         // the previous one.
-        self.inner.connection_pool.clear_failures(endpoint_addr.id);
+        if let Err(error) = self
+            .inner
+            .connection_pool
+            .clear_failures(endpoint_addr.id)
+            .await
+        {
+            debug!(node_id = %endpoint_addr.id, %error, "Connection pool stopped during address installation");
+        }
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -1330,12 +1337,13 @@ impl NetHandle {
                     .await
                     {
                         Ok(Some(endpoint_addr)) => {
-                            install_dht_signed_endpoint(
+                            install_signed_endpoint(
                                 &self.inner.address_lookup,
                                 &self.inner.dht,
                                 &self.inner.connection_pool,
                                 endpoint_addr,
-                            );
+                            )
+                            .await;
                             debug!(
                                 node_id = %node_id,
                                 "Retrying stream after DHT-signed endpoint resolution"
@@ -1787,7 +1795,7 @@ fn validate_realm_endpoint_announcement(
         .map_err(|err| err.to_string())
 }
 
-fn install_dht_signed_endpoint(
+async fn install_signed_endpoint(
     address_lookup: &MemoryLookup,
     dht: &DhtHandle,
     connection_pool: &ConnectionPool,
@@ -1797,7 +1805,9 @@ fn install_dht_signed_endpoint(
     address_lookup.set_endpoint_info(endpoint_addr);
     // The newly validated address invalidates the failures recorded against the
     // previous one, so the next request dials instead of failing fast.
-    connection_pool.clear_failures(node_id);
+    if let Err(error) = connection_pool.clear_failures(node_id).await {
+        debug!(node_id = %node_id, %error, "Connection pool stopped during signed address installation");
+    }
     if let Err(err) = dht.add_peer(node_id) {
         debug!(
             node_id = %node_id,
@@ -2213,7 +2223,8 @@ async fn run_peer_connectivity_attempt(
         .await
         {
             Ok(Some(endpoint_addr)) => {
-                install_dht_signed_endpoint(address_lookup, dht, connection_pool, endpoint_addr);
+                install_signed_endpoint(address_lookup, dht, connection_pool, endpoint_addr)
+                    .await;
                 result = dht.bootstrap_nodes(&[peer]).await;
             }
             Ok(None) => {}

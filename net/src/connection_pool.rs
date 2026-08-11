@@ -518,14 +518,14 @@ impl ConnectionPool {
 
     /// Drops every cooldown for a peer whose endpoint address was just
     /// validated and installed, so the next request dials the new address.
-    pub fn clear_failures(&self, node_id: NodeId) {
-        if self
-            .tx
-            .try_send(ActorMessage::ClearFailures { node_id })
-            .is_err()
-        {
-            debug!(peer = %node_id, outcome = "cooldown_clear_dropped", "connection pool is busy or stopped");
-        }
+    pub async fn clear_failures(
+        &self,
+        node_id: NodeId,
+    ) -> std::result::Result<(), ConnectionPoolError> {
+        self.tx
+            .send(ActorMessage::ClearFailures { node_id })
+            .await
+            .map_err(|_| ConnectionPoolError::Shutdown)
     }
 
     pub async fn get_or_connect(
@@ -760,10 +760,44 @@ mod tests {
         assert_eq!(counts.cooldown_hits, 1);
 
         // A validated endpoint address replaces the cooldown with one re-probe.
-        pool.clear_failures(peer);
-        let third = pool.get_or_connect(peer, Alpn::Bao).await;
-        assert!(third.is_err());
+        pool.clear_failures(peer).await.unwrap();
+        let mut requests = JoinSet::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            requests.spawn(async move { pool.get_or_connect(peer, Alpn::Bao).await.is_err() });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert!(result.expect("request task"));
+        }
         assert_eq!(pool.counts().dials, 2);
+    }
+
+    #[tokio::test]
+    async fn clear_waits_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let first = node(1);
+        let second = node(2);
+        tx.send(ActorMessage::ClearFailures { node_id: first })
+            .await
+            .unwrap();
+        let pool = ConnectionPool {
+            tx,
+            request_timeout: Duration::from_secs(1),
+            counters: Arc::new(PoolCounters::default()),
+        };
+
+        let pending = tokio::spawn(async move { pool.clear_failures(second).await });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        assert!(matches!(
+            rx.recv().await,
+            Some(ActorMessage::ClearFailures { node_id }) if node_id == first
+        ));
+        pending.await.unwrap().unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(ActorMessage::ClearFailures { node_id }) if node_id == second
+        ));
     }
 
     #[tokio::test]

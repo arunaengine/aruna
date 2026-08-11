@@ -2678,8 +2678,8 @@ mod tests {
 
     #[test]
     fn first_usable_filters() {
-        // Wrong publisher, wrong realm and expired records may not complete an
-        // expected-publisher lookup.
+        // Wrong publisher, wrong realm, expired, and forged records may not
+        // complete an expected-publisher lookup.
         let local_secret = make_secret(156);
         let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
         let key = DhtKeyId::from_data(b"first-usable-filters");
@@ -2707,6 +2707,21 @@ mod tests {
                     make_value(159, key, realm_id, b"other-publisher", 2_000),
                     make_value(158, key, other_realm, b"other-realm", 2_000),
                     make_value(158, key, realm_id, b"expired", 900),
+                    {
+                        let mut invalid =
+                            make_value(158, key, realm_id, b"invalid-signature", 2_000);
+                        let attacker = make_secret(160);
+                        let signed = signed_record_bytes(
+                            &key,
+                            &invalid.publisher,
+                            &invalid.realm_id,
+                            &invalid.value,
+                            invalid.expires_at,
+                            invalid.revision,
+                        );
+                        invalid.signature = attacker.sign(&signed);
+                        invalid
+                    },
                 ],
                 closer_nodes: Vec::new(),
             },
