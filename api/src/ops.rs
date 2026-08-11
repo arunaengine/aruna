@@ -16,6 +16,7 @@ use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::queue_lag::{QueueLagReporter, QueueLagSnapshot};
+use aruna_operations::startup::{RecoveryOutcome, RecoveryState, RecoveryStatus};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -25,7 +26,7 @@ use axum::routing::get;
 use byteview::ByteView;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric};
-use prometheus_client::metrics::counter::ConstCounter;
+use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Unit;
@@ -104,6 +105,7 @@ pub struct OpsState {
     ctx: Arc<DriverContext>,
     metrics: Arc<NodeMetrics>,
     readiness: Readiness,
+    recovery: RecoveryStatus,
 }
 
 impl OpsState {
@@ -113,8 +115,20 @@ impl OpsState {
         metrics: Arc<NodeMetrics>,
         readiness: Readiness,
     ) -> Arc<Self> {
+        Self::with_recovery(ctx, metrics, readiness, RecoveryStatus::new()).await
+    }
+
+    /// Same, but reporting the recovery status the caller also hands to the
+    /// recovery driver.
+    pub async fn with_recovery(
+        ctx: Arc<DriverContext>,
+        metrics: Arc<NodeMetrics>,
+        readiness: Readiness,
+        recovery: RecoveryStatus,
+    ) -> Arc<Self> {
         register_storage_source(&metrics, ctx.clone()).await;
         register_queue_metrics(&metrics, ctx.clone()).await;
+        register_recovery_metrics(&metrics, recovery.clone()).await;
         if let Some(net_handle) = &ctx.net_handle {
             net_handle
                 .notification_watch_metrics()
@@ -125,6 +139,7 @@ impl OpsState {
             ctx,
             metrics,
             readiness,
+            recovery,
         })
     }
 }
@@ -176,14 +191,23 @@ async fn readyz(State(state): State<Arc<OpsState>>) -> Response {
     };
     let storage = check_storage(&state.ctx).await;
     let sync = check_sync(&state.ctx).await;
+    // Degraded remote recovery is reported, never a readiness failure: a locally
+    // safe node must not leave Service capacity because a peer is down.
     let ready = startup.ok && storage.ok && sync.ok;
 
+    let recovery = state.recovery.snapshot();
     let body = ReadinessBody {
         ready,
         checks: ReadinessChecks {
             startup: startup.status,
             storage: storage.status,
             sync: sync.status,
+        },
+        recovery: RecoveryBody {
+            state: recovery.state.label(),
+            topics_remaining: recovery.topics_remaining,
+            last_progress_timestamp: recovery.last_progress_timestamp,
+            last_error_class: recovery.last_error.map(|error| error.label()),
         },
     };
     let code = if ready {
@@ -211,6 +235,7 @@ async fn metrics_handler(State(state): State<Arc<OpsState>>) -> Response {
 struct ReadinessBody {
     ready: bool,
     checks: ReadinessChecks,
+    recovery: RecoveryBody,
 }
 
 #[derive(Serialize)]
@@ -218,6 +243,16 @@ struct ReadinessChecks {
     startup: String,
     storage: String,
     sync: String,
+}
+
+/// Stable operational fields only: never ids, credentials, payloads, or
+/// unbounded error strings.
+#[derive(Serialize)]
+struct RecoveryBody {
+    state: &'static str,
+    topics_remaining: u64,
+    last_progress_timestamp: u64,
+    last_error_class: Option<&'static str>,
 }
 
 struct CheckOutcome {
@@ -364,6 +399,88 @@ struct QueueLabels {
     queue: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RecoveryStateLabels {
+    state: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RecoveryOutcomeLabels {
+    outcome: &'static str,
+}
+
+/// Scrape-time view of the recovery status. Reads a lock-free snapshot, so it
+/// never sends an effect or awaits a peer, and its label sets are closed.
+#[derive(Debug)]
+struct RecoveryCollector {
+    recovery: RecoveryStatus,
+}
+
+impl Collector for RecoveryCollector {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let snapshot = self.recovery.snapshot();
+
+        let states = Family::<RecoveryStateLabels, Gauge>::default();
+        for state in RecoveryState::ALL {
+            states
+                .get_or_create(&RecoveryStateLabels {
+                    state: state.label(),
+                })
+                .set(i64::from(state == snapshot.state));
+        }
+        let metric_encoder = encoder.encode_descriptor(
+            "recovery_state",
+            "1 for the node's current remote recovery state",
+            None,
+            states.metric_type(),
+        )?;
+        states.encode(metric_encoder)?;
+
+        let remaining = ConstGauge::new(snapshot.topics_remaining as i64);
+        let metric_encoder = encoder.encode_descriptor(
+            "recovery_topics_remaining",
+            "Held topics the latest recovery pass could not finish",
+            None,
+            remaining.metric_type(),
+        )?;
+        remaining.encode(metric_encoder)?;
+
+        let progress = ConstGauge::new(snapshot.last_progress_timestamp as i64);
+        let metric_encoder = encoder.encode_descriptor(
+            "recovery_last_progress_timestamp_seconds",
+            "Unix timestamp of the last completed recovery work unit",
+            None,
+            progress.metric_type(),
+        )?;
+        progress.encode(metric_encoder)?;
+
+        // A fresh family starts at zero.
+        let passes = Family::<RecoveryOutcomeLabels, Counter>::default();
+        for outcome in RecoveryOutcome::ALL {
+            passes
+                .get_or_create(&RecoveryOutcomeLabels {
+                    outcome: outcome.label(),
+                })
+                .inc_by(self.recovery.pass_total(outcome));
+        }
+        let metric_encoder = encoder.encode_descriptor(
+            "recovery_pass",
+            "Completed remote recovery passes by outcome",
+            None,
+            passes.metric_type(),
+        )?;
+        passes.encode(metric_encoder)?;
+
+        Ok(())
+    }
+}
+
+async fn register_recovery_metrics(metrics: &NodeMetrics, recovery: RecoveryStatus) {
+    metrics
+        .register_collector(RecoveryCollector { recovery })
+        .await;
+}
+
 /// Background-updated depth and oldest-record age gauges for durable work
 /// queues, reusing the same probes as the periodic `queue.lag` monitor.
 struct QueueMetrics {
@@ -496,6 +613,7 @@ async fn register_queue_metrics(metrics: &NodeMetrics, ctx: Arc<DriverContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_operations::startup::RecoveryError;
     use aruna_storage::{FjallStorage, StorageHandle};
     use axum::body::{Body, to_bytes};
     use http::Request;
@@ -595,6 +713,83 @@ mod tests {
         let (status, body) = request(&ops_router(ops), "/readyz").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("\"storage\":\"failed"), "{body}");
+    }
+
+    // Degraded recovery is reported in the body, never as a 503.
+    #[tokio::test]
+    async fn readyz_reports_recovery() {
+        let (_temp, ctx) = fjall_ctx();
+        let readiness = Readiness::new();
+        readiness.set_ready();
+        let recovery = RecoveryStatus::new();
+        let ops = OpsState::with_recovery(
+            ctx,
+            Arc::new(NodeMetrics::new()),
+            readiness,
+            recovery.clone(),
+        )
+        .await;
+        let router = ops_router(ops);
+
+        let (_status, body) = request(&router, "/readyz").await;
+        assert!(body.contains("\"state\":\"pending\""), "{body}");
+        assert!(body.contains("\"last_error_class\":null"), "{body}");
+
+        recovery.note_progress(3);
+        recovery.finish_pass(
+            RecoveryOutcome::Partial,
+            Some(RecoveryError::PeerUnavailable),
+        );
+        let (_status, body) = request(&router, "/readyz").await;
+        assert!(body.contains("\"state\":\"degraded\""), "{body}");
+        assert!(body.contains("\"topics_remaining\":3"), "{body}");
+        assert!(
+            body.contains("\"last_error_class\":\"peer_unavailable\""),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_recovery() {
+        let (_temp, ctx) = fjall_ctx();
+        let recovery = RecoveryStatus::new();
+        recovery.note_progress(2);
+        recovery.finish_pass(
+            RecoveryOutcome::Partial,
+            Some(RecoveryError::PeerUnavailable),
+        );
+        let ops = OpsState::with_recovery(
+            ctx,
+            Arc::new(NodeMetrics::new()),
+            Readiness::new(),
+            recovery,
+        )
+        .await;
+        let (status, body) = request(&ops_router(ops), "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // One-hot over a finite state label, and nothing else in the label set.
+        assert!(
+            body.contains("aruna_recovery_state{state=\"degraded\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("aruna_recovery_state{state=\"converged\"} 0"),
+            "{body}"
+        );
+        assert!(body.contains("aruna_recovery_topics_remaining 2"), "{body}");
+        assert!(
+            body.contains("aruna_recovery_last_progress_timestamp_seconds "),
+            "{body}"
+        );
+        assert!(
+            body.contains("aruna_recovery_pass_total{outcome=\"partial\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("aruna_recovery_pass_total{outcome=\"failed\"} 0"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

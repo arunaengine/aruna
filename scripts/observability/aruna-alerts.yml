@@ -1,0 +1,61 @@
+groups:
+  - name: aruna-recovery
+    rules:
+      # Remote recovery is not converged and has published no progress for ten
+      # minutes. Peer loss alone is expected and does not fire this: the driver
+      # keeps publishing progress while it makes any.
+      - alert: ArunaRecoveryStalled
+        expr: |
+          max by (instance) (aruna_recovery_state{state="converged"}) == 0
+          and
+          (time() - max by (instance) (aruna_recovery_last_progress_timestamp_seconds)) > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Aruna remote recovery has made no progress for 10 minutes
+          description: >-
+            The node is serving but its remote recovery is not converged and has
+            not completed a work unit for ten minutes. Check peer reachability
+            and the startup.recovery.degraded events; do not restart the node
+            merely because peers are unavailable.
+          runbook: docs/operational-recovery.md
+
+  - name: aruna-queues
+    rules:
+      # depth_capped means "at least the scan ceiling", never exactly it.
+      - alert: ArunaOutboxCapped
+        expr: max by (instance, queue) (aruna_queue_depth_capped) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Aruna durable queue is at or beyond its depth scan ceiling
+          description: >-
+            The depth probe stopped at its page cap, so the reported depth is a
+            lower bound. Treat this as urgent backlog. Never delete the outbox.
+          runbook: docs/operational-recovery.md
+
+      - alert: ArunaOutboxOld
+        expr: max by (instance, queue) (aruna_queue_oldest_age_seconds) > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Aruna durable queue has records older than 15 minutes
+          description: >-
+            Convergence SLO breach. Records are accepted but not draining;
+            check peer reachability and the pipeline.drain.summary events.
+          runbook: docs/operational-recovery.md
+
+      - alert: ArunaQueueProbeDown
+        expr: min by (instance, queue) (aruna_queue_probe_up) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Aruna durable queue depth probe is failing
+          description: >-
+            Queue depth and age are no longer observable, so backlog alerts are
+            blind. Check the storage worker and the ops listener.
+          runbook: docs/operational-recovery.md

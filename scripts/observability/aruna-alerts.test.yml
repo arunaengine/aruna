@@ -1,0 +1,121 @@
+rule_files:
+  - aruna-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Recovery stalls: not converged and no progress timestamp movement.
+  - interval: 1m
+    input_series:
+      - series: 'aruna_recovery_state{instance="node-a:3002",state="converged"}'
+        values: "0+0x40"
+      - series: 'aruna_recovery_state{instance="node-a:3002",state="degraded"}'
+        values: "1+0x40"
+      - series: 'aruna_recovery_last_progress_timestamp_seconds{instance="node-a:3002"}'
+        values: "0+0x40"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ArunaRecoveryStalled
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ArunaRecoveryStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-a:3002
+            exp_annotations:
+              summary: Aruna remote recovery has made no progress for 10 minutes
+              description: >-
+                The node is serving but its remote recovery is not converged and has
+                not completed a work unit for ten minutes. Check peer reachability
+                and the startup.recovery.degraded events; do not restart the node
+                merely because peers are unavailable.
+              runbook: docs/operational-recovery.md
+
+  # Converged recovery never fires, however old the progress timestamp is.
+  - interval: 1m
+    input_series:
+      - series: 'aruna_recovery_state{instance="node-b:3002",state="converged"}'
+        values: "1+0x40"
+      - series: 'aruna_recovery_last_progress_timestamp_seconds{instance="node-b:3002"}'
+        values: "0+0x40"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ArunaRecoveryStalled
+        exp_alerts: []
+
+  # Capped depth fires while capped and recovers when the probe reports a real
+  # depth again.
+  - interval: 1m
+    input_series:
+      - series: 'aruna_queue_depth_capped{instance="node-a:3002",queue="document_sync_outbox"}'
+        values: "1+0x10 0+0x10"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ArunaOutboxCapped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-a:3002
+              queue: document_sync_outbox
+            exp_annotations:
+              summary: Aruna durable queue is at or beyond its depth scan ceiling
+              description: >-
+                The depth probe stopped at its page cap, so the reported depth is a
+                lower bound. Treat this as urgent backlog. Never delete the outbox.
+              runbook: docs/operational-recovery.md
+      - eval_time: 20m
+        alertname: ArunaOutboxCapped
+        exp_alerts: []
+
+  # Oldest age crosses fifteen minutes, then drains.
+  - interval: 1m
+    input_series:
+      - series: 'aruna_queue_oldest_age_seconds{instance="node-a:3002",queue="document_sync_outbox"}'
+        values: "1000+0x15 0+0x15"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ArunaOutboxOld
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: ArunaOutboxOld
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-a:3002
+              queue: document_sync_outbox
+            exp_annotations:
+              summary: Aruna durable queue has records older than 15 minutes
+              description: >-
+                Convergence SLO breach. Records are accepted but not draining;
+                check peer reachability and the pipeline.drain.summary events.
+              runbook: docs/operational-recovery.md
+      - eval_time: 28m
+        alertname: ArunaOutboxOld
+        exp_alerts: []
+
+  # Probe down fires after five minutes and recovers once it succeeds again.
+  - interval: 1m
+    input_series:
+      - series: 'aruna_queue_probe_up{instance="node-a:3002",queue="document_sync_outbox"}'
+        values: "0+0x10 1+0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArunaQueueProbeDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: ArunaQueueProbeDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-a:3002
+              queue: document_sync_outbox
+            exp_annotations:
+              summary: Aruna durable queue depth probe is failing
+              description: >-
+                Queue depth and age are no longer observable, so backlog alerts are
+                blind. Check the storage worker and the ops listener.
+              runbook: docs/operational-recovery.md
+      - eval_time: 20m
+        alertname: ArunaQueueProbeDown
+        exp_alerts: []
