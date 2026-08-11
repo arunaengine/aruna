@@ -995,121 +995,103 @@ impl OperationsTaskHandler {
         }
     }
 
-            let mut records: Vec<DrainRecord> = batch
-                .records
-                .into_iter()
-                .map(|(record_key, mut record)| {
-                    realm_config_drained |=
-                        matches!(record.target, DocumentSyncTarget::RealmConfig { .. });
-                    record.placement = resolve_publish_placement(
-                        realm_config.as_ref(),
-                        &record.target,
-                        record.placement,
-                    );
-                    let topic = record.target.sync_topic_id(realm_id, &record.placement);
-                    (record_key, record, topic)
-                })
-                .collect();
+    async fn prepare_drain_records(
+        &self,
+        retry_key: &TaskKey,
+        net_handle: &aruna_net::NetHandle,
+        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        realm_id: RealmId,
+        records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+        invocation: &mut DrainInvocation,
+    ) -> Vec<DrainRecord> {
+        let mut records: Vec<DrainRecord> = records
+            .into_iter()
+            .map(|(record_key, mut record)| {
+                invocation.config_drained |=
+                    matches!(record.target, DocumentSyncTarget::RealmConfig { .. });
+                record.placement =
+                    resolve_publish_placement(config, &record.target, record.placement);
+                let topic = record.target.sync_topic_id(realm_id, &record.placement);
+                (record_key, record, topic)
+            })
+            .collect();
 
-            // Shard topics are join-only for this node unless it is the shard's
-            // rank-0 holder: a record whose topic has no local genesis yet cannot
-            // publish. Try one bootstrap pass against the union of the record's
-            // emit-time stamped peers and the shard's live holders, then defer
-            // whatever is still missing to a short retry — the genesis arrives
-            // via gossip or the next pass. The union matters after a rebalance:
-            // the genesis-with-history may survive only on a stamped ex-holder,
-            // and pulling from the live holders alone would leave it
-            // unreachable — this node would mint a fresh genesis, fork the
-            // topic, and irokle's genesis tie-break would evict acknowledged
-            // writes. A topic already deferred earlier this run is skipped: its
-            // records stay deferred regardless, and re-probing would only waste
-            // RPCs.
-            //
-            // Only buckets this node holds or formerly held while draining are
-            // pulled. Joining is not holder-gated, so a non-holder could adopt the
-            // genesis here — and would then look publishable while its publishes
-            // went nowhere. Its records belong in the forwarding path instead.
-            let mut missing_topics: BTreeMap<
-                Vec<aruna_core::NodeId>,
-                (Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>),
-            > = BTreeMap::new();
-            for (_, record, topic) in &records {
-                if !record.target.uses_shard_topic()
-                    || defer_state.deferred_topics.contains(topic)
-                    || !realm_config.as_ref().is_none_or(|config| {
-                        crate::placement::holds_placement(
-                            config,
-                            &record.placement,
-                            net_handle.node_id(),
-                        ) || crate::placement::is_draining_former_holder(
-                            config,
-                            &record.placement,
-                            net_handle.node_id(),
-                        )
-                    })
-                    || net_handle
-                        .document_sync_topic_exists(*topic)
-                        .unwrap_or(false)
-                {
-                    continue;
-                }
-                let mut bootstrap_peers = record.peers.clone();
-                if let Some(config) = realm_config.as_ref() {
-                    for holder in crate::placement::resolve_shard_holders(config, &record.placement)
-                    {
-                        if !bootstrap_peers.contains(&holder) {
-                            bootstrap_peers.push(holder);
-                        }
-                    }
-                }
-                bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
-                if bootstrap_peers.is_empty() {
-                    continue;
-                }
-                let mut peer_key = bootstrap_peers.clone();
-                crate::sync_placement::sort_node_ids(&mut peer_key);
-                missing_topics
-                    .entry(peer_key)
-                    .or_insert_with(|| (bootstrap_peers, BTreeSet::new()))
-                    .1
-                    .insert(*topic);
-            }
-            for (_, (peers, topics)) in missing_topics {
-                let event = net_handle
-                    .sync_document_topics(topics.into_iter().collect(), peers)
-                    .await;
-                let outcome = self
-                    .finish_sync_drain_subbatch(
-                        &retry_key,
-                        Vec::new(),
-                        Vec::new(),
-                        Event::Net(NetEvent::DocumentSync(event)),
-                        Default::default(),
+        // Pull a missing shard genesis from stamped ex-holders and live holders.
+        // Only current or draining former holders may adopt it for publication.
+        let mut missing_topics: BTreeMap<
+            Vec<aruna_core::NodeId>,
+            (Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>),
+        > = BTreeMap::new();
+        for (_, record, topic) in &records {
+            if !record.target.uses_shard_topic()
+                || invocation.defer.deferred_topics.contains(topic)
+                || !config.is_none_or(|config| {
+                    crate::placement::holds_placement(
+                        config,
+                        &record.placement,
+                        net_handle.node_id(),
+                    ) || crate::placement::is_draining_former_holder(
+                        config,
+                        &record.placement,
+                        net_handle.node_id(),
                     )
-                    .await;
-                totals.merge(outcome);
+                })
+                || net_handle
+                    .document_sync_topic_exists(*topic)
+                    .unwrap_or(false)
+            {
+                continue;
             }
-
-            // Emit-time peer stamps go stale across a rebalance: a drained
-            // holder refuses the push as a non-member and the whole record
-            // would ride the retry ladder while the replacement holder never
-            // gets pushed to. Re-resolve the shard's live holders for the
-            // publish path only — after the bootstrap pull above, which must
-            // keep the stamped ex-holders as genesis sources. Empty stamps keep
-            // their realm-default-set semantics, and a config gap or an unknown
-            // strategy keeps the stamp.
-            if let Some(config) = realm_config.as_ref() {
-                for (_, record, _) in &mut records {
-                    if record.peers.is_empty() || !record.target.uses_shard_topic() {
-                        continue;
-                    }
-                    let holders =
-                        crate::placement::resolve_shard_holders(config, &record.placement);
-                    if !holders.is_empty() {
-                        record.peers = holders;
+            let mut bootstrap_peers = record.peers.clone();
+            if let Some(config) = config {
+                for holder in crate::placement::resolve_shard_holders(config, &record.placement) {
+                    if !bootstrap_peers.contains(&holder) {
+                        bootstrap_peers.push(holder);
                     }
                 }
             }
+            bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
+            if bootstrap_peers.is_empty() {
+                continue;
+            }
+            let mut peer_key = bootstrap_peers.clone();
+            crate::sync_placement::sort_node_ids(&mut peer_key);
+            missing_topics
+                .entry(peer_key)
+                .or_insert_with(|| (bootstrap_peers, BTreeSet::new()))
+                .1
+                .insert(*topic);
+        }
+        for (_, (peers, topics)) in missing_topics {
+            let event = net_handle
+                .sync_document_topics(topics.into_iter().collect(), peers)
+                .await;
+            let outcome = self
+                .finish_sync_drain_subbatch(
+                    retry_key,
+                    Vec::new(),
+                    Vec::new(),
+                    Event::Net(NetEvent::DocumentSync(event)),
+                    Default::default(),
+                )
+                .await;
+            invocation.outcome.merge(outcome);
+        }
+
+        // Publish to live holders, but keep stamped peers above as genesis sources.
+        if let Some(config) = config {
+            for (_, record, _) in &mut records {
+                if record.peers.is_empty() || !record.target.uses_shard_topic() {
+                    continue;
+                }
+                let holders = crate::placement::resolve_shard_holders(config, &record.placement);
+                if !holders.is_empty() {
+                    record.peers = holders;
+                }
+            }
+        }
+        records
+    }
 
             let (to_publish, deferred, undeliverable) = partition_drain_records(
                 records,
