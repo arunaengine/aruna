@@ -205,6 +205,10 @@ impl OpDeadlines {
         expired
     }
 
+    fn contains(&self, op_id: OpId) -> bool {
+        self.by_op.contains_key(&op_id)
+    }
+
     fn len(&self) -> usize {
         self.by_op.len()
     }
@@ -752,13 +756,14 @@ impl DhtDriver {
         }
     }
 
-    /// Releases operations whose caller stopped waiting, so a dropped request
-    /// cannot leave a lookup consuming connection attempts.
+    /// Releases reads whose caller stopped waiting, so a dropped request cannot
+    /// leave a lookup consuming connection attempts. Only deadline-carrying
+    /// reads qualify; an accepted put still finishes storing.
     fn release_abandoned(&mut self) {
         let abandoned: Vec<OpId> = self
             .pending_callers
             .iter()
-            .filter(|(_, reply)| reply.is_closed())
+            .filter(|(op_id, reply)| reply.is_closed() && self.deadlines.contains(**op_id))
             .map(|(op_id, _)| *op_id)
             .collect();
         for op_id in abandoned {
