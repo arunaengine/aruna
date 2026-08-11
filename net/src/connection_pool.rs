@@ -3,7 +3,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
@@ -24,12 +24,20 @@ use tracing::{Instrument, debug, info_span, trace, warn};
 
 const MONITOR_CHANNEL_CAPACITY: usize = 4096;
 const PARKED_IDLE_TIMER_SECS: u64 = 365 * 24 * 60 * 60;
+// Matches the initial peer retry interval, so a cooled peer is re-probed on the
+// same cadence the connectivity manager already uses.
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct ConnectionPoolOptions {
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
     pub max_connections: usize,
+    /// How long an eligible connect failure suppresses new dials for its
+    /// `(NodeId, Alpn)` key. This is a latency optimization only: it never
+    /// proves a peer is offline and never feeds health, membership, placement,
+    /// publisher policy, or write authority.
+    pub failure_cooldown: Duration,
 }
 
 impl Default for ConnectionPoolOptions {
@@ -38,8 +46,27 @@ impl Default for ConnectionPoolOptions {
             idle_timeout: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),
             max_connections: 128,
+            failure_cooldown: FAILURE_COOLDOWN,
         }
     }
+}
+
+/// Attempt counters behind the structured connection diagnostics. Fixed outcome
+/// classes only; peer identity is never a counter dimension.
+#[derive(Debug, Default)]
+struct PoolCounters {
+    dials: AtomicU64,
+    cooldown_hits: AtomicU64,
+    cooldown_records: AtomicU64,
+    cooldown_expiries: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolCounts {
+    pub dials: u64,
+    pub cooldown_hits: u64,
+    pub cooldown_records: u64,
+    pub cooldown_expiries: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,9 +118,120 @@ impl Deref for ConnectionLease {
 
 enum ActorMessage {
     RequestLease(RequestLease),
-    ConnectionIdle { key: ConnectionKey },
-    ConnectionClosed { key: ConnectionKey },
+    ConnectionIdle {
+        key: ConnectionKey,
+    },
+    ConnectionClosed {
+        key: ConnectionKey,
+    },
+    ConnectionFailed {
+        key: ConnectionKey,
+        error: PoolConnectError,
+    },
+    ConnectionReady {
+        key: ConnectionKey,
+    },
+    ClearFailures {
+        node_id: NodeId,
+    },
     Shutdown,
+}
+
+/// Only a transport-connect failure or a connect timeout is evidence about
+/// reachability. Shutdown, local capacity, and caller-side failures say nothing
+/// about the peer and must never start a cooldown.
+fn cooldown_eligible(error: &PoolConnectError) -> bool {
+    matches!(
+        error,
+        PoolConnectError::Connection(_) | PoolConnectError::Timeout
+    )
+}
+
+#[derive(Debug, Clone)]
+struct FailureEntry {
+    error: PoolConnectError,
+    recorded: Instant,
+    expires: Instant,
+}
+
+#[derive(Debug)]
+struct FailureCache {
+    entries: HashMap<ConnectionKey, FailureEntry>,
+    cooldown: Duration,
+    capacity: usize,
+    counters: Arc<PoolCounters>,
+}
+
+impl FailureCache {
+    fn new(cooldown: Duration, capacity: usize, counters: Arc<PoolCounters>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            cooldown,
+            capacity,
+            counters,
+        }
+    }
+
+    fn record(&mut self, key: ConnectionKey, error: PoolConnectError, now: Instant) {
+        if self.cooldown.is_zero() || self.capacity == 0 || !cooldown_eligible(&error) {
+            return;
+        }
+        self.evict(now);
+        self.entries.insert(
+            key,
+            FailureEntry {
+                error,
+                recorded: now,
+                expires: now + self.cooldown,
+            },
+        );
+        self.counters
+            .cooldown_records
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the cached error while the key is still cooling. An expired entry
+    /// is dropped here, so exactly one caller re-probes after expiry.
+    fn hit(&mut self, key: &ConnectionKey, now: Instant) -> Option<PoolConnectError> {
+        let entry = self.entries.get(key)?;
+        if entry.expires > now {
+            self.counters.cooldown_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(entry.error.clone());
+        }
+        self.entries.remove(key);
+        self.counters
+            .cooldown_expiries
+            .fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn clear(&mut self, key: &ConnectionKey) {
+        self.entries.remove(key);
+    }
+
+    fn clear_node(&mut self, node_id: NodeId) {
+        self.entries.retain(|key, _| key.node_id != node_id);
+    }
+
+    /// Keeps the retained failures inside the pool's connection bound, dropping
+    /// expired entries before the oldest live one.
+    fn evict(&mut self, now: Instant) {
+        if self.entries.len() < self.capacity {
+            return;
+        }
+        self.entries.retain(|_, entry| entry.expires > now);
+        while self.entries.len() >= self.capacity {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.recorded)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
 }
 
 struct RequestLease {
@@ -113,6 +251,7 @@ impl PoolContext {
         key: ConnectionKey,
         mut rx: Receiver<RequestLease>,
     ) {
+        self.owner.counters.dials.fetch_add(1, Ordering::Relaxed);
         let connect = async {
             self.endpoint
                 .connect(key.node_id, key.alpn.as_bytes())
@@ -124,14 +263,20 @@ impl PoolContext {
             Err(_) => Err(PoolConnectError::Timeout),
         };
 
-        if let Err(error) = &state {
-            debug!(
-                peer = %key.node_id,
-                alpn = %key.alpn,
-                error = %error,
-                "pooled connection attempt failed"
-            );
-            let _ = self.owner.close_key(key).await;
+        match &state {
+            Err(error) => {
+                debug!(
+                    peer = %key.node_id,
+                    alpn = %key.alpn,
+                    error = %error,
+                    outcome = if cooldown_eligible(error) { "dial_failed_cooled" } else { "dial_failed" },
+                    "pooled connection attempt failed"
+                );
+                let _ = self.owner.record_failure(key, error.clone()).await;
+            }
+            Ok(_) => {
+                let _ = self.owner.connection_ready(key).await;
+            }
         }
 
         let counter = ConnectionCounter::new();
@@ -210,19 +355,30 @@ struct Actor {
     rx: Receiver<ActorMessage>,
     connections: HashMap<ConnectionKey, Sender<RequestLease>>,
     idle: VecDeque<ConnectionKey>,
+    failures: FailureCache,
     context: Arc<PoolContext>,
 }
 
 impl Actor {
-    fn new(endpoint: Endpoint, options: ConnectionPoolOptions) -> (Self, Sender<ActorMessage>) {
+    fn new(
+        endpoint: Endpoint,
+        options: ConnectionPoolOptions,
+        counters: Arc<PoolCounters>,
+    ) -> (Self, Sender<ActorMessage>) {
         let (tx, rx) = mpsc::channel(256);
         let request_timeout = options.connect_timeout;
+        let failures = FailureCache::new(
+            options.failure_cooldown,
+            options.max_connections,
+            counters.clone(),
+        );
         let context = Arc::new(PoolContext {
             endpoint,
             options,
             owner: ConnectionPool {
                 tx: tx.clone(),
                 request_timeout,
+                counters,
             },
         });
         (
@@ -230,6 +386,7 @@ impl Actor {
                 rx,
                 connections: HashMap::new(),
                 idle: VecDeque::new(),
+                failures,
                 context,
             },
             tx,
@@ -242,11 +399,18 @@ impl Actor {
                 ActorMessage::RequestLease(request) => self.handle_request(request).await,
                 ActorMessage::ConnectionIdle { key } => self.add_idle(key),
                 ActorMessage::ConnectionClosed { key } => self.remove_connection(key),
+                ActorMessage::ConnectionFailed { key, error } => {
+                    self.failures.record(key, error, Instant::now());
+                    self.remove_connection(key);
+                }
+                ActorMessage::ConnectionReady { key } => self.failures.clear(&key),
+                ActorMessage::ClearFailures { node_id } => self.failures.clear_node(node_id),
                 ActorMessage::Shutdown => break,
             }
         }
         self.connections.clear();
         self.idle.clear();
+        self.failures.entries.clear();
     }
 
     async fn handle_request(&mut self, mut request: RequestLease) {
@@ -261,6 +425,17 @@ impl Actor {
                     self.remove_connection(key);
                 }
             }
+        }
+
+        if let Some(error) = self.failures.hit(&key, Instant::now()) {
+            debug!(
+                peer = %key.node_id,
+                alpn = %key.alpn,
+                outcome = "cooldown_hit",
+                "suppressing dial to a recently unreachable peer"
+            );
+            let _ = request.tx.send(Err(error));
+            return;
         }
 
         if self.connections.len() >= self.context.options.max_connections {
@@ -311,6 +486,7 @@ impl Actor {
 pub struct ConnectionPool {
     tx: Sender<ActorMessage>,
     request_timeout: Duration,
+    counters: Arc<PoolCounters>,
 }
 
 impl std::fmt::Debug for ConnectionPool {
@@ -322,11 +498,34 @@ impl std::fmt::Debug for ConnectionPool {
 impl ConnectionPool {
     pub fn new(endpoint: Endpoint, options: ConnectionPoolOptions) -> Self {
         let request_timeout = options.connect_timeout;
-        let (actor, tx) = Actor::new(endpoint, options);
+        let counters = Arc::new(PoolCounters::default());
+        let (actor, tx) = Actor::new(endpoint, options, counters.clone());
         tokio::spawn(actor.run());
         Self {
             tx,
             request_timeout,
+            counters,
+        }
+    }
+
+    pub fn counts(&self) -> PoolCounts {
+        PoolCounts {
+            dials: self.counters.dials.load(Ordering::Relaxed),
+            cooldown_hits: self.counters.cooldown_hits.load(Ordering::Relaxed),
+            cooldown_records: self.counters.cooldown_records.load(Ordering::Relaxed),
+            cooldown_expiries: self.counters.cooldown_expiries.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Drops every cooldown for a peer whose endpoint address was just
+    /// validated and installed, so the next request dials the new address.
+    pub fn clear_failures(&self, node_id: NodeId) {
+        if self
+            .tx
+            .try_send(ActorMessage::ClearFailures { node_id })
+            .is_err()
+        {
+            debug!(peer = %node_id, outcome = "cooldown_clear_dropped", "connection pool is busy or stopped");
         }
     }
 
@@ -371,11 +570,61 @@ impl ConnectionPool {
             .await
             .map_err(|_| ConnectionPoolError::Shutdown)
     }
+
+    async fn record_failure(
+        &self,
+        key: ConnectionKey,
+        error: PoolConnectError,
+    ) -> std::result::Result<(), ConnectionPoolError> {
+        self.tx
+            .send(ActorMessage::ConnectionFailed { key, error })
+            .await
+            .map_err(|_| ConnectionPoolError::Shutdown)
+    }
+
+    async fn connection_ready(
+        &self,
+        key: ConnectionKey,
+    ) -> std::result::Result<(), ConnectionPoolError> {
+        self.tx
+            .send(ActorMessage::ConnectionReady { key })
+            .await
+            .map_err(|_| ConnectionPoolError::Shutdown)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn key(seed: u8, alpn: Alpn) -> ConnectionKey {
+        ConnectionKey {
+            node_id: node(seed),
+            alpn,
+        }
+    }
+
+    fn cache(cooldown: Duration, capacity: usize) -> FailureCache {
+        FailureCache::new(cooldown, capacity, Arc::new(PoolCounters::default()))
+    }
+
+    async fn test_endpoint() -> Endpoint {
+        Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("valid bind addr"),
+            )
+            .expect("valid bind addr")
+            .bind()
+            .await
+            .expect("endpoint binds")
+    }
 
     #[tokio::test]
     async fn lease_request_times_out_when_actor_does_not_reply() {
@@ -383,12 +632,162 @@ mod tests {
         let pool = ConnectionPool {
             tx,
             request_timeout: Duration::from_millis(10),
+            counters: Arc::new(PoolCounters::default()),
         };
-        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 
-        let result = pool.get_or_connect(node_id, Alpn::Bao).await;
+        let result = pool.get_or_connect(node(1), Alpn::Bao).await;
 
         assert!(matches!(result, Err(PoolConnectError::Timeout)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caches_transport_only() {
+        // Only reachability evidence may cool a key; a shutdown or a local
+        // capacity refusal says nothing about the peer.
+        let mut cache = cache(Duration::from_secs(5), 8);
+        let now = Instant::now();
+
+        cache.record(key(1, Alpn::Bao), PoolConnectError::Shutdown, now);
+        cache.record(key(2, Alpn::Bao), PoolConnectError::TooManyConnections, now);
+        cache.record(key(3, Alpn::Bao), PoolConnectError::Timeout, now);
+        cache.record(
+            key(4, Alpn::Bao),
+            PoolConnectError::Connection("refused".to_string()),
+            now,
+        );
+
+        assert!(cache.hit(&key(1, Alpn::Bao), now).is_none());
+        assert!(cache.hit(&key(2, Alpn::Bao), now).is_none());
+        assert!(matches!(
+            cache.hit(&key(3, Alpn::Bao), now),
+            Some(PoolConnectError::Timeout)
+        ));
+        assert!(matches!(
+            cache.hit(&key(4, Alpn::Bao), now),
+            Some(PoolConnectError::Connection(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keys_by_alpn() {
+        let mut cache = cache(Duration::from_secs(5), 8);
+        let now = Instant::now();
+
+        cache.record(key(1, Alpn::Bao), PoolConnectError::Timeout, now);
+
+        assert!(cache.hit(&key(1, Alpn::Bao), now).is_some());
+        assert!(cache.hit(&key(1, Alpn::Metadata), now).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expires_once() {
+        let mut cache = cache(Duration::from_secs(5), 8);
+        let start = Instant::now();
+        cache.record(key(1, Alpn::Bao), PoolConnectError::Timeout, start);
+
+        assert!(cache.hit(&key(1, Alpn::Bao), start).is_some());
+        let expired = start + Duration::from_secs(5);
+        assert!(cache.hit(&key(1, Alpn::Bao), expired).is_none());
+        // The expired entry is gone, so the re-probe is not repeated per caller.
+        assert!(cache.hit(&key(1, Alpn::Bao), expired).is_none());
+        assert_eq!(cache.counters.cooldown_expiries.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.counters.cooldown_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn evicts_expired_first() {
+        let mut cache = cache(Duration::from_secs(5), 2);
+        let start = Instant::now();
+        cache.record(key(1, Alpn::Bao), PoolConnectError::Timeout, start);
+        cache.record(key(2, Alpn::Bao), PoolConnectError::Timeout, start);
+
+        let later = start + Duration::from_secs(6);
+        cache.record(key(3, Alpn::Bao), PoolConnectError::Timeout, later);
+
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&key(3, Alpn::Bao)));
+
+        cache.record(
+            key(4, Alpn::Bao),
+            PoolConnectError::Timeout,
+            later + Duration::from_secs(1),
+        );
+        cache.record(
+            key(5, Alpn::Bao),
+            PoolConnectError::Timeout,
+            later + Duration::from_secs(2),
+        );
+
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains_key(&key(3, Alpn::Bao)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clears_by_node() {
+        let mut cache = cache(Duration::from_secs(5), 8);
+        let now = Instant::now();
+        cache.record(key(1, Alpn::Bao), PoolConnectError::Timeout, now);
+        cache.record(key(1, Alpn::Metadata), PoolConnectError::Timeout, now);
+        cache.record(key(2, Alpn::Bao), PoolConnectError::Timeout, now);
+
+        cache.clear_node(node(1));
+
+        assert!(cache.hit(&key(1, Alpn::Bao), now).is_none());
+        assert!(cache.hit(&key(1, Alpn::Metadata), now).is_none());
+        assert!(cache.hit(&key(2, Alpn::Bao), now).is_some());
+    }
+
+    #[tokio::test]
+    async fn dials_once() {
+        // An unreachable peer must cost one dial for the whole cooldown, and the
+        // suppressed calls must return the same retryable error class.
+        let pool = ConnectionPool::new(
+            test_endpoint().await,
+            ConnectionPoolOptions {
+                failure_cooldown: Duration::from_secs(30),
+                ..ConnectionPoolOptions::default()
+            },
+        );
+        let peer = node(9);
+
+        let first = pool.get_or_connect(peer, Alpn::Bao).await;
+        assert!(first.is_err());
+        let second = pool.get_or_connect(peer, Alpn::Bao).await;
+        assert!(second.is_err());
+
+        let counts = pool.counts();
+        assert_eq!(counts.dials, 1);
+        assert_eq!(counts.cooldown_records, 1);
+        assert_eq!(counts.cooldown_hits, 1);
+
+        // A validated endpoint address replaces the cooldown with one re-probe.
+        pool.clear_failures(peer);
+        let third = pool.get_or_connect(peer, Alpn::Bao).await;
+        assert!(third.is_err());
+        assert_eq!(pool.counts().dials, 2);
+    }
+
+    #[tokio::test]
+    async fn coalesces_requests() {
+        let pool = ConnectionPool::new(
+            test_endpoint().await,
+            ConnectionPoolOptions {
+                failure_cooldown: Duration::from_secs(30),
+                ..ConnectionPoolOptions::default()
+            },
+        );
+        let peer = node(10);
+
+        let mut requests = JoinSet::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            requests.spawn(async move { pool.get_or_connect(peer, Alpn::Bao).await.is_err() });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert!(result.expect("request task"));
+        }
+
+        assert_eq!(pool.counts().dials, 1);
     }
 }
 

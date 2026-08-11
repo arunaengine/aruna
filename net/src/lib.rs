@@ -780,6 +780,7 @@ impl NetHandle {
         let peer_connectivity_task = tokio::spawn(run_peer_connectivity_manager(
             dht.clone(),
             address_lookup.clone(),
+            connection_pool.clone(),
             discovery_method.clone(),
             config.realm_id,
             dht_signed_authorized_nodes.clone(),
@@ -1320,6 +1321,7 @@ impl NetHandle {
                             install_dht_signed_endpoint(
                                 &self.inner.address_lookup,
                                 &self.inner.dht,
+                                &self.inner.connection_pool,
                                 endpoint_addr,
                             );
                             debug!(
@@ -1767,10 +1769,14 @@ fn validate_realm_endpoint_announcement(
 fn install_dht_signed_endpoint(
     address_lookup: &MemoryLookup,
     dht: &DhtHandle,
+    connection_pool: &ConnectionPool,
     endpoint_addr: EndpointAddr,
 ) {
     let node_id = endpoint_addr.id;
     address_lookup.set_endpoint_info(endpoint_addr);
+    // The newly validated address invalidates the failures recorded against the
+    // previous one, so the next request dials instead of failing fast.
+    connection_pool.clear_failures(node_id);
     if let Err(err) = dht.add_peer(node_id) {
         debug!(
             node_id = %node_id,
@@ -2069,6 +2075,7 @@ async fn peer_connectivity_status(
 async fn run_peer_connectivity_manager(
     dht: Arc<DhtHandle>,
     address_lookup: MemoryLookup,
+    connection_pool: ConnectionPool,
     discovery_method: DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
@@ -2093,6 +2100,7 @@ async fn run_peer_connectivity_manager(
                     _ = run_peer_connectivity_attempt(
                         &dht,
                         &address_lookup,
+                        &connection_pool,
                         &discovery_method,
                         realm_id,
                         &authorized_nodes,
@@ -2161,6 +2169,7 @@ async fn apply_peer_connectivity_event(
 async fn run_peer_connectivity_attempt(
     dht: &DhtHandle,
     address_lookup: &MemoryLookup,
+    connection_pool: &ConnectionPool,
     discovery_method: &DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: &[NodeId],
@@ -2183,14 +2192,7 @@ async fn run_peer_connectivity_attempt(
         .await
         {
             Ok(Some(endpoint_addr)) => {
-                address_lookup.set_endpoint_info(endpoint_addr.clone());
-                if let Err(err) = dht.add_peer(endpoint_addr.id) {
-                    debug!(
-                        node_id = %endpoint_addr.id,
-                        error = %err,
-                        "Failed to add DHT-signed endpoint peer before retry"
-                    );
-                }
+                install_dht_signed_endpoint(address_lookup, dht, connection_pool, endpoint_addr);
                 result = dht.bootstrap_nodes(&[peer]).await;
             }
             Ok(None) => {}
