@@ -3,8 +3,9 @@
 #![recursion_limit = "256"]
 
 use aruna::bootstrap::{
-    announce_core_documents, ensure_initial_local_onboarding_secret,
-    fetch_core_onboarding_documents, realm_bootstrap_exists, wait_for_onboarding_placement,
+    ensure_initial_local_onboarding_secret, fetch_core_onboarding_documents,
+    prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
+    wait_for_onboarding_placement,
 };
 use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::portal;
@@ -19,6 +20,7 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::OnboardingPhase;
@@ -38,7 +40,7 @@ use aruna_operations::replication::migration::migrate_legacy_sync;
 use aruna_operations::startup::{
     RecoveryConfig, RecoveryStatus, prepare_shard_policy, run_recovery,
 };
-use aruna_operations::task_incoming::initialize_task_holder;
+use aruna_operations::task_incoming::{TaskQueues, initialize_task_holder};
 use aruna_tasks::TaskHandle;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -69,7 +71,23 @@ async fn async_main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+struct Runtime {
+    config: Config,
+    driver_ctx: Arc<DriverContext>,
+    net_handle: NetHandle,
+    s3_mounts_available: bool,
+    shutdown: Shutdown,
+    metrics: Arc<NodeMetrics>,
+    readiness: Readiness,
+    recovery: RecoveryStatus,
+    jobs_runtime: Arc<JobsRuntime>,
+    task_handle: TaskHandle,
+    task_queues: TaskQueues,
+    usage_counters_rebuilt: bool,
+    ops_handle: tokio::task::JoinHandle<()>,
+}
+
+async fn setup_runtime() -> Result<Runtime, Box<dyn std::error::Error>> {
     let (config, storage_handle) = load().await?;
     let net_handle = NetHandle::new(
         NetConfig {
@@ -130,36 +148,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // here so an ordered shutdown can drain them before storage is sealed.
     let shutdown = Shutdown::new();
 
-    // Start the ops listener before realm bootstrap so `/readyz` reports 503
-    // (startup) and `/metrics` is scrapable while the node is still coming up.
-    // Its handle survives the drain and is aborted only after final storage sync.
+    // Start ops before realm bootstrap so readiness reports startup failure.
     let metrics = Arc::new(NodeMetrics::new());
     let readiness = Readiness::new();
     let recovery = RecoveryStatus::new();
-    let ops_handle = {
-        let ops_state = OpsState::with_recovery(
-            driver_ctx.clone(),
-            metrics.clone(),
-            readiness.clone(),
-            recovery.clone(),
-        )
-        .await;
-        let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
-        let bound = ops_listener.local_addr()?;
-        let handle = tokio::spawn(async move {
-            if let Err(error) = serve_ops(ops_listener, ops_state).await {
-                error!(error = %error, "Ops server stopped");
-            }
-        });
-        info!(ops_address = %bound, "Ops server listening");
-        handle
-    };
+    let ops_state = OpsState::with_recovery(
+        driver_ctx.clone(),
+        metrics.clone(),
+        readiness.clone(),
+        recovery.clone(),
+    )
+    .await;
+    let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
+    let bound = ops_listener.local_addr()?;
+    let ops_handle = tokio::spawn(async move {
+        if let Err(error) = serve_ops(ops_listener, ops_state).await {
+            error!(error = %error, "Ops server stopped");
+        }
+    });
+    info!(ops_address = %bound, "Ops server listening");
 
-    // A rebuild is the only local evidence that the counters were not carried
-    // over; peer availability never decides it.
+    // A rebuild is the only local evidence that counters were not carried over.
     let usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
 
-    // Task initialization binds the compute reconciler before startup recovery.
+    // Bind compute reconciliation before startup recovery.
     let jobs_runtime = JobsRuntime::new_paused();
     initialize_net_holder(
         driver_ctx.clone(),
@@ -175,6 +187,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
+    Ok(Runtime {
+        config,
+        driver_ctx,
+        net_handle,
+        s3_mounts_available,
+        shutdown,
+        metrics,
+        readiness,
+        recovery,
+        jobs_runtime,
+        task_handle,
+        task_queues,
+        usage_counters_rebuilt,
+        ops_handle,
+    })
+}
+
+struct CoreAnnouncement {
+    documents: Vec<DocumentSyncTarget>,
+    allow_genesis: bool,
+}
+
+async fn prepare_startup(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
     let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
@@ -183,139 +222,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // A bootstrap boot has no accepted usage history at the peers yet.
-    let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
-
-    match &config.startup_mode {
-        StartupMode::InitializeRealm { realm_description } => {
-            if !realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
-                drive(
-                    CreateRealmOperation::new(CreateRealmConfig {
-                        actor: Actor {
-                            node_id: config.node_id,
-                            user_id: UserId::nil(config.realm_id),
-                            realm_id: config.realm_id,
-                        },
-                        realm_description: realm_description.clone(),
-                        oidc_providers: config.oidc_providers.clone(),
-                        node_location: config.node_location.clone(),
-                        node_weight: config.node_weight,
-                        node_labels: config.node_labels.clone(),
-                    }),
-                    driver_ctx.as_ref(),
-                )
-                .await?;
-            }
-            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
-            // CreateRealm mints the realm-auth/realm-config genesis via its admin
-            // operation outbox records, but not the shared realm topics. Seed
-            // NodeInfo first so its stored document is included in bootstrap.
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, true)
-                .await?;
-
-            if config.is_initial_node() {
-                match ensure_initial_local_onboarding_secret(
-                    driver_ctx.as_ref(),
-                    format!("http://{}", config.http_socket_addr),
-                    &config.node_state.net_secret_key,
-                    config.realm_id,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        info!("Created initial local onboarding secret for first user registration")
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "failed to create initial local onboarding secret: {error}"
-                        )
-                        .into());
-                    }
-                }
-            }
-
-            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
-        }
-        StartupMode::JoinRealm { phase } => {
-            let bootstrap_peer = config
-                .peer_endpoints
-                .first()
-                .map(|endpoint| endpoint.id)
-                .or_else(|| config.peer_nodes.first().copied());
-            if matches!(phase, OnboardingPhase::Bootstrapped) {
-                fetch_core_onboarding_documents(
-                    driver_ctx.as_ref(),
-                    &config.node_state,
-                    &config.realm_id,
-                    bootstrap_peer,
-                )
-                .await?;
-            }
-            wait_for_onboarding_placement(
-                driver_ctx.as_ref(),
-                config.realm_id,
-                config.node_id,
-                bootstrap_peer,
-            )
-            .await?;
-            if matches!(phase, OnboardingPhase::Bootstrapped) {
-                mark_onboarding_phase(
-                    &driver_ctx.storage_handle,
-                    &config.node_state,
-                    OnboardingPhase::CoreDocumentsFetched,
-                )
-                .await?;
-                if let Err(error) = net_handle.reload_realm_peers().await {
-                    warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
-                }
-            }
-            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
-            // A joining node is never the realm-bootstrap node: it announces the
-            // shared topics with allow_genesis=false after onboarding fetched a
-            // representative target for each.
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
-                .await?;
-            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
-        }
-        StartupMode::Provisioned => {
-            if matches!(
-                &config.node_capabilities,
-                NodeCapabilities::Management { .. }
-            ) {
-                drive(
-                    EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
-                        actor: Actor {
-                            node_id: config.node_id,
-                            user_id: UserId::nil(config.realm_id),
-                            realm_id: config.realm_id,
-                        },
-                        target_node_id: config.node_id,
-                        target_node_kind: RealmNodeKind::Management,
-                        default_metadata_replication_factor: config
-                            .default_metadata_replication_factor,
-                        realm_description: config.realm_description.clone(),
-                        create_if_missing: true,
-                        reject_kind_mismatch: false,
-                    }),
-                    driver_ctx.as_ref(),
-                )
-                .await?;
-            }
-
-            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
-            // The realm-bootstrap node retains genesis authority so a missing
-            // shared topic can be repaired after a partial first boot. Onboarded
-            // nodes still wait for that authoritative genesis.
-            announce_core_documents(
-                driver_ctx.as_ref(),
-                config.node_id,
-                &config.realm_id,
-                config.is_initial_node(),
-            )
-            .await?;
-        }
-    }
-
+    let announcement = prepare_mode(config, driver_ctx, net_handle).await?;
     match migrate_legacy_sync(driver_ctx.as_ref(), config.node_id, config.realm_id).await {
         Ok(summary) if summary.failed > 0 => warn!(
             migrated = summary.migrated,
@@ -332,12 +239,198 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => warn!(%error, "Failed to migrate legacy S3 replication configs"),
     }
 
-    // Make already materialized shard topics publishable before binding; missing
-    // geneses and anti-entropy are remote convergence and run behind the gate.
-    prepare_shard_policy(&driver_ctx, config.node_id, config.realm_id).await;
+    // Prepare local topics before binding; remote convergence stays behind the gate.
+    prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    Ok(announcement)
+}
 
-    // REST Server
+async fn prepare_mode(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    match &config.startup_mode {
+        StartupMode::InitializeRealm { realm_description } => {
+            init_realm(config, driver_ctx, realm_description).await
+        }
+        StartupMode::JoinRealm { phase } => join_realm(config, driver_ctx, net_handle, phase).await,
+        StartupMode::Provisioned => provision_realm(config, driver_ctx).await,
+    }
+}
+
+async fn init_realm(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    realm_description: &str,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    if !realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id: config.node_id,
+                    user_id: UserId::nil(config.realm_id),
+                    realm_id: config.realm_id,
+                },
+                realm_description: realm_description.to_string(),
+                oidc_providers: config.oidc_providers.clone(),
+                node_location: config.node_location.clone(),
+                node_weight: config.node_weight,
+                node_labels: config.node_labels.clone(),
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await?;
+    }
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    let documents = prepare_core_documents(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        true,
+        true,
+    )
+    .await?;
+
+    if config.is_initial_node() {
+        match ensure_initial_local_onboarding_secret(
+            driver_ctx.as_ref(),
+            format!("http://{}", config.http_socket_addr),
+            &config.node_state.net_secret_key,
+            config.realm_id,
+        )
+        .await
+        {
+            Ok(_) => info!("Created initial local onboarding secret for first user registration"),
+            Err(error) => {
+                return Err(
+                    format!("failed to create initial local onboarding secret: {error}").into(),
+                );
+            }
+        }
+    }
+
+    mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+    Ok(CoreAnnouncement {
+        documents,
+        allow_genesis: true,
+    })
+}
+
+async fn join_realm(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+    phase: &OnboardingPhase,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    let bootstrap_peer = config
+        .peer_endpoints
+        .first()
+        .map(|endpoint| endpoint.id)
+        .or_else(|| config.peer_nodes.first().copied());
+    if matches!(phase, OnboardingPhase::Bootstrapped) {
+        fetch_core_onboarding_documents(
+            driver_ctx.as_ref(),
+            &config.node_state,
+            &config.realm_id,
+            bootstrap_peer,
+        )
+        .await?;
+    }
+    wait_for_onboarding_placement(
+        driver_ctx.as_ref(),
+        config.realm_id,
+        config.node_id,
+        bootstrap_peer,
+    )
+    .await?;
+    if matches!(phase, OnboardingPhase::Bootstrapped) {
+        mark_onboarding_phase(
+            &driver_ctx.storage_handle,
+            &config.node_state,
+            OnboardingPhase::CoreDocumentsFetched,
+        )
+        .await?;
+        if let Err(error) = net_handle.reload_realm_peers().await {
+            warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
+        }
+    }
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    let documents = prepare_core_documents(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        false,
+        true,
+    )
+    .await?;
+    mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+    Ok(CoreAnnouncement {
+        documents,
+        allow_genesis: false,
+    })
+}
+
+async fn provision_realm(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    if matches!(
+        &config.node_capabilities,
+        NodeCapabilities::Management { .. }
+    ) {
+        drive(
+            EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+                actor: Actor {
+                    node_id: config.node_id,
+                    user_id: UserId::nil(config.realm_id),
+                    realm_id: config.realm_id,
+                },
+                target_node_id: config.node_id,
+                target_node_kind: RealmNodeKind::Management,
+                default_metadata_replication_factor: config.default_metadata_replication_factor,
+                realm_description: config.realm_description.clone(),
+                create_if_missing: true,
+                reject_kind_mismatch: false,
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await?;
+    }
+
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    let allow_genesis = config.is_initial_node();
+    let documents = prepare_core_documents(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        allow_genesis,
+        false,
+    )
+    .await?;
+    Ok(CoreAnnouncement {
+        documents,
+        allow_genesis,
+    })
+}
+
+struct ServerBindings {
+    rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
+    s3_handle: tokio::task::JoinHandle<()>,
+    realm_id: aruna_core::structs::RealmId,
+    node_id: iroh::PublicKey,
+    is_initial_boot: bool,
+}
+
+async fn bind_servers(
+    config: Config,
+    driver_ctx: Arc<DriverContext>,
+    jobs_runtime: Arc<JobsRuntime>,
+    metrics: Arc<NodeMetrics>,
+    s3_mounts_available: bool,
+    shutdown: &Shutdown,
+) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
+    let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
@@ -346,7 +439,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.node_capabilities,
             is_initial_node,
             Some(Arc::new(OidcValidator::new()?)),
-            jobs_runtime.clone(),
+            jobs_runtime,
         )
         .await
         .with_metrics(metrics.clone())
@@ -373,17 +466,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server::new(state.clone(), server_config)
         .with_api_public_url(config.api_public_url.clone());
 
-    // S3 Server
     let s3_server = S3Server::new(
         &config.s3_address,
         &config.s3_host,
-        driver_ctx.clone(),
+        driver_ctx,
         config.realm_id,
         config.node_id,
         aruna_core::credential_seal::CredentialSealKey::derive(&config.node_state.net_secret_key),
         config.rocrate_limits.clone(),
         cors,
-        metrics.clone(),
+        metrics,
     )
     .await
     .unwrap()
