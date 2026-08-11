@@ -792,6 +792,46 @@ mod tests {
         );
     }
 
+    // Invariants 2 and 15: probes decide from local state only, so no
+    // connection-cooldown or presence-snapshot state can reach them. A context
+    // with no net handle at all still answers liveness.
+    #[tokio::test]
+    async fn probes_ignore_peers() {
+        let (_temp, ctx) = fjall_ctx();
+        assert!(ctx.net_handle.is_none());
+        let readiness = Readiness::new();
+        readiness.set_ready();
+        let recovery = RecoveryStatus::new();
+        recovery.finish_pass(
+            RecoveryOutcome::Partial,
+            Some(RecoveryError::PeerUnavailable),
+        );
+        let ops =
+            OpsState::with_recovery(ctx, Arc::new(NodeMetrics::new()), readiness, recovery).await;
+        let router = ops_router(ops);
+
+        let (status, body) = request(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK, "peer loss must not fail liveness");
+        assert_eq!(body, "ok");
+
+        // Readiness may fail its own local checks, but never with a peer,
+        // presence, or cooldown reason. The recovery object legitimately carries
+        // an error class, so only the checks decide.
+        let (_status, body) = request(&router, "/readyz").await;
+        let checks = body
+            .split("\"checks\":")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        for forbidden in ["peer", "presence", "cooldown", "dht"] {
+            assert!(
+                !checks.contains(forbidden),
+                "readiness leaked {forbidden} state: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn readyz_reports_draining() {
         let (_temp, ctx) = fjall_ctx();
