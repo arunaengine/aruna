@@ -1,6 +1,6 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     HARVEST_PROVENANCE_KEYSPACE, HARVEST_SOURCE_KEYSPACE, REPOSITORY_CONNECTOR_INDEX_KEYSPACE,
     REPOSITORY_CONNECTOR_SECRET_KEYSPACE,
@@ -11,8 +11,10 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
-use thiserror::Error;
 use ulid::Ulid;
+
+pub use crate::connectors::repository::StorageReadError;
+use crate::connectors::repository::parse_storage_read;
 
 pub const HARVEST_SCAN_PAGE_SIZE: usize = 128;
 
@@ -138,19 +140,6 @@ pub fn parse_provenance_read(event: Event) -> Result<Option<HarvestProvenance>, 
     parse_storage_read(event, HarvestProvenance::from_bytes)
 }
 
-fn parse_storage_read<T>(
-    event: Event,
-    parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
-) -> Result<Option<T>, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| parse(bytes.as_ref()).map_err(StorageReadError::Conversion))
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
-    }
-}
-
 /// Value builders for the connector write batch. Public so the create operation
 /// keeps the connector and its secret in one atomic batch.
 pub fn connector_writes(
@@ -170,14 +159,6 @@ pub fn connector_writes(
         ));
     }
     Ok(writes)
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum StorageReadError {
-    #[error(transparent)]
-    Storage(StorageError),
-    #[error(transparent)]
-    Conversion(ConversionError),
 }
 
 #[cfg(test)]
