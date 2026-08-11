@@ -2726,6 +2726,35 @@ mod tests {
         iroh::SecretKey::from_bytes(&bytes).public()
     }
 
+    fn outbox_handler() -> (tempfile::TempDir, OperationsTaskHandler, TaskHandle) {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let handler = OperationsTaskHandler::new(
+            Arc::new(DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: Some(task_handle.clone()),
+                compute_handle: None,
+            }),
+            JobsRuntime::new(),
+        );
+        (dir, handler, task_handle)
+    }
+
+    async fn scheduled_after(task_handle: &TaskHandle) -> Duration {
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+            .await
+        else {
+            panic!("expected timer schedule event");
+        };
+        after
+    }
+
     #[tokio::test]
     async fn paused_runtime_waits() {
         // Startup recovery must wait until production has made S3 reachable.
@@ -3100,6 +3129,114 @@ mod tests {
         assert_eq!(rotation.totals.examined, 0);
     }
 
+    #[test]
+    fn rotation_holds_boundary() {
+        let mut rotation = OutboxRotation {
+            boundary: Some(b"b".to_vec()),
+            cursor: Some(b"a".to_vec()),
+            ..OutboxRotation::default()
+        };
+
+        assert!(rotation.admits(b"a"));
+        assert!(rotation.admits(b"b"));
+        assert!(!rotation.admits(b"c"));
+        assert!(!rotation.at_end(Some(b"a")));
+        assert!(rotation.at_end(Some(b"b")));
+
+        rotation.close();
+        assert!(rotation.boundary.is_none());
+        assert!(rotation.admits(b"appended"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_routes_defer() {
+        let (_dir, handler, task_handle) = outbox_handler();
+        let rotation = OutboxRotation {
+            totals: RotationTotals {
+                deferred: 2,
+                deleted: 1,
+                invocations: 2,
+                ..RotationTotals::default()
+            },
+            ..OutboxRotation::default()
+        };
+
+        handler
+            .close_rotation(TaskKey::DrainDocumentSyncOutbox, rotation)
+            .await;
+
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_keeps_retry() {
+        let (_dir, handler, task_handle) = outbox_handler();
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        handler
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .insert(key.clone(), 3);
+        let rotation = OutboxRotation {
+            totals: RotationTotals {
+                retry_invocations: 1,
+                invocations: 2,
+                ..RotationTotals::default()
+            },
+            ..OutboxRotation::default()
+        };
+
+        handler.close_rotation(key.clone(), rotation).await;
+
+        assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
+        assert_eq!(
+            handler
+                .retry_backoff
+                .lock()
+                .expect("retry backoff mutex poisoned")
+                .get(&key),
+            Some(&4)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_resets_progress() {
+        let (_dir, handler, task_handle) = outbox_handler();
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        handler
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .insert(key.clone(), 3);
+        let rotation = OutboxRotation {
+            totals: RotationTotals {
+                deleted: 1,
+                retry_invocations: 1,
+                invocations: 2,
+                ..RotationTotals::default()
+            },
+            ..OutboxRotation::default()
+        };
+
+        handler.close_rotation(key.clone(), rotation).await;
+
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            handler
+                .retry_backoff
+                .lock()
+                .expect("retry backoff mutex poisoned")
+                .get(&key),
+            Some(&1)
+        );
+    }
+
     // The invocation bound is a work-unit limit, never a latency assertion.
     #[test]
     fn outbox_bound_finite() {
@@ -3274,6 +3411,112 @@ mod tests {
             remaining.records.len(),
             OUTBOX_DRAIN_BATCH_SIZE,
             "every deferred record is retained for the next run"
+        );
+
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn drain_boundary_appends() {
+        let realm_id = RealmId::from_bytes([45u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let placed_change = || {
+            let mut value = change();
+            value.placement = aruna_core::structs::PlacementRef {
+                strategy_id: Ulid::from_bytes([45; 16]),
+                epoch: 0,
+                shard: 1,
+            };
+            value
+        };
+
+        let make_record = |id: u128, target: DocumentSyncTarget, event: DocumentSyncOutboxEvent| {
+            crate::document_sync_outbox::new_outbox_record_with_id(
+                Ulid::from_parts(1, id),
+                node(1),
+                target,
+                Vec::new(),
+                event,
+                aruna_core::structs::PlacementRef::NIL,
+                true,
+            )
+        };
+        for id in 1..=3 {
+            write_outbox_record(
+                &storage,
+                &make_record(
+                    id,
+                    target(),
+                    DocumentSyncOutboxEvent::Upsert {
+                        bytes: id.to_be_bytes().to_vec(),
+                        change: placed_change(),
+                    },
+                ),
+            )
+            .await;
+        }
+
+        let handler =
+            OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 2, 1);
+        handler.drain_document_sync_outbox().await;
+        {
+            let rotation = handler.rotation.lock().expect("rotation lock");
+            assert_eq!(
+                (rotation.totals.examined, rotation.cursor.is_some()),
+                (2, true)
+            );
+            assert_eq!(rotation.continuations, 1);
+        }
+
+        let appended_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let appended_topic =
+            appended_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        net.ensure_document_sync_topics(&[appended_topic], Vec::new())
+            .expect("appended topic genesis");
+        let appended = make_record(
+            4,
+            appended_target,
+            DocumentSyncOutboxEvent::Delete { change: change() },
+        );
+        let appended_key = outbox_key(&appended).to_vec();
+        write_outbox_record(&storage, &appended).await;
+
+        handler.drain_document_sync_outbox().await;
+        {
+            let rotation = handler.rotation.lock().expect("rotation lock");
+            assert_eq!(
+                (rotation.totals.examined, rotation.cursor.is_some()),
+                (0, false)
+            );
+        }
+        assert_eq!(
+            read_outbox_record(&storage, &appended_key)
+                .await
+                .expect("read appended record"),
+            Some(appended),
+            "records appended after the boundary wait for the next rotation"
         );
 
         net.shutdown().await;
@@ -3615,6 +3858,65 @@ mod tests {
                 .is_err(),
             "durable rearm must not replace an active backoff timer"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_timer() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("storage opens"))
+            .expect("storage opens");
+        let record = crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"direct fence".to_vec(),
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        write_outbox_record(&storage, &record).await;
+
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = mpsc::channel(1);
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+            .await;
+        match task_handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainDocumentSyncOutbox,
+                after: Duration::from_secs(3600),
+            }))
+            .await
+        {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {}
+            other => panic!("unexpected timer schedule event: {other:?}"),
+        }
+
+        drive_document_sync_outbox_drain(Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        }))
+        .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), seen_rx.recv())
+                .await
+                .is_err(),
+            "the direct fence must not replace the active timer"
+        );
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+            .await
+        else {
+            panic!("expected timer schedule event");
+        };
+        assert!(after > Duration::from_secs(3000));
     }
 
     #[tokio::test]
