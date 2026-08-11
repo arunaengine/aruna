@@ -149,7 +149,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         handle
     };
 
-    ensure_usage_counters(driver_ctx.as_ref()).await?;
+    // A rebuild is the only local evidence that the counters were not carried
+    // over; peer availability never decides it.
+    let usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
 
     // Task initialization binds the compute reconciler before startup recovery.
     let jobs_runtime = JobsRuntime::new_paused();
@@ -167,17 +169,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
-    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        true,
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to publish initial node usage snapshots");
-    }
-
     let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
@@ -185,6 +176,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Replayed metadata event log during startup"
         );
     }
+
+    // A bootstrap boot has no accepted usage history at the peers yet.
+    let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
@@ -441,7 +435,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             node_id: config.node_id,
             // An unchanged restart republishes nothing: accepted outbox work and
             // document sync history already carry convergence.
-            publish_full_usage: true,
+            // An unchanged restart republishes nothing: accepted outbox work and
+            // document sync history already carry convergence.
+            publish_full_usage: usage_counters_rebuilt || is_initial_boot,
         };
         let cancelled = shutdown.token();
         shutdown.spawn(async move {
@@ -809,10 +805,11 @@ fn container_local_endpoint(endpoint: &str) -> bool {
             .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
 }
 
-/// Ensures the maintained usage counter shards exist before background writes start.
+/// Ensures the maintained usage counter shards exist before background writes
+/// start, and reports whether that required a rebuild.
 async fn ensure_usage_counters(
     driver_ctx: &DriverContext,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
@@ -843,6 +840,7 @@ async fn ensure_usage_counters(
             }
             if values.iter().any(|(_, value)| value.is_none()) {
                 drive(RebuildUsageStatsOperation::new(), driver_ctx).await?;
+                return Ok(true);
             }
         }
         Event::Storage(StorageEvent::Error { error }) => {
@@ -852,7 +850,7 @@ async fn ensure_usage_counters(
             return Err(format!("usage counter probe received unexpected event: {other:?}").into());
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -914,7 +912,14 @@ mod tests {
         .expect("storage opens");
         let driver_ctx = test_driver_ctx(storage_handle.clone());
 
-        ensure_usage_counters(&driver_ctx).await.unwrap();
+        assert!(
+            ensure_usage_counters(&driver_ctx).await.unwrap(),
+            "missing shards must report a rebuild"
+        );
+        assert!(
+            !ensure_usage_counters(&driver_ctx).await.unwrap(),
+            "intact shards must report no rebuild"
+        );
 
         for key in usage_global_shard_keys() {
             let event = storage_handle
