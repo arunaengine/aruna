@@ -110,6 +110,14 @@ pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
+/// Pages one drain invocation may examine, so a large or blocked queue cannot
+/// monopolise a task invocation.
+const OUTBOX_INVOCATION_PAGES: usize = 2;
+const OUTBOX_INVOCATION_RECORDS: usize = OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_BATCH_SIZE;
+/// Consecutive continuations before a rotation yields through the timer, so an
+/// append-heavy or wholly blocked queue cannot keep the task continuously hot.
+const OUTBOX_CONTINUATION_STREAK: u32 = 8;
+const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_SWEEP_TICKS: usize = 12;
@@ -134,12 +142,55 @@ struct OperationsTaskHandler {
     // Where a capped reclaim sweep resumes. Loss on restart is fine: the next
     // sweep starts from the head and reaches the tail over the ticks after it.
     reclaim_cursor: std::sync::Mutex<Option<Key>>,
+    // Rotation state of the bounded outbox drain. Loss on restart is fine: the
+    // next rotation opens at the head.
+    rotation: std::sync::Mutex<OutboxRotation>,
+}
+
+/// Outcome counts accumulated across the invocations of one rotation.
+#[derive(Clone, Copy, Debug, Default)]
+struct RotationTotals {
+    examined: usize,
+    deleted: usize,
+    deferred: usize,
+    undeliverable: usize,
+    retried: usize,
+    invocations: u32,
+}
+
+/// One rotation of the bounded document-sync drain: head to observed end across
+/// as many bounded invocations as it needs. Ordering blocks and outcome counts
+/// carry across them; holdership and publisher authority never do.
+#[derive(Default)]
+struct OutboxRotation {
+    /// Where the next invocation resumes; `None` is the head.
+    cursor: Option<Vec<u8>>,
+    /// Topics whose FIFO is blocked for the rest of this rotation.
+    blocked_topics: HashSet<irokle::TopicId>,
+    /// Admin origin streams blocked for the rest of this rotation.
+    blocked_origins: HashSet<aruna_core::NodeId>,
+    /// Topics this node can never publish onto, for the rest of this rotation.
+    undeliverable_topics: HashSet<irokle::TopicId>,
+    totals: RotationTotals,
+    /// Continuations already spent without yielding through the timer.
+    continuations: u32,
+}
+
+impl OutboxRotation {
+    fn close(&mut self) -> RotationTotals {
+        let totals = self.totals;
+        *self = Self::default();
+        totals
+    }
 }
 
 struct DrainSubBatch {
     peers: Vec<aruna_core::NodeId>,
     documents: Vec<DocumentSyncPublish>,
     topics: Vec<irokle::TopicId>,
+    /// Admin origin of each entry, so a blocked publish also blocks the rest of
+    /// that origin's sequence.
+    origins: Vec<Option<aruna_core::NodeId>>,
     targets: Vec<DocumentSyncTarget>,
     record_keys: Vec<Vec<u8>>,
 }
@@ -147,10 +198,12 @@ struct DrainSubBatch {
 impl DrainSubBatch {
     fn sync_subset(&self, indices: &[usize]) -> Option<Self> {
         let mut topics = Vec::with_capacity(indices.len());
+        let mut origins = Vec::with_capacity(indices.len());
         let mut targets = Vec::with_capacity(indices.len());
         let mut record_keys = Vec::with_capacity(indices.len());
         for &index in indices {
             topics.push(*self.topics.get(index)?);
+            origins.push(*self.origins.get(index)?);
             targets.push(self.targets.get(index)?.clone());
             record_keys.push(self.record_keys.get(index)?.clone());
         }
@@ -158,9 +211,19 @@ impl DrainSubBatch {
             peers: self.peers.clone(),
             documents: Vec::new(),
             topics,
+            origins,
             targets,
             record_keys,
         })
+    }
+
+    /// Ordering domains blocked together when a publish or sync leaves records
+    /// behind.
+    fn ordering_domains(&self) -> (Vec<irokle::TopicId>, Vec<aruna_core::NodeId>) {
+        (
+            self.topics.clone(),
+            self.origins.iter().flatten().copied().collect(),
+        )
     }
 }
 
@@ -170,6 +233,10 @@ struct DrainSyncOutcome {
     project_elapsed: Duration,
     delete_elapsed: Duration,
     retry_needed: bool,
+    deleted: usize,
+    /// Ordering domains to block for the rest of the rotation.
+    blocked_topics: Vec<irokle::TopicId>,
+    blocked_origins: Vec<aruna_core::NodeId>,
 }
 
 /// Resolves the shard placement a drained record publishes under. A record
@@ -248,18 +315,31 @@ impl DrainSyncOutcome {
         self.project_elapsed += other.project_elapsed;
         self.delete_elapsed += other.delete_elapsed;
         self.retry_needed |= other.retry_needed;
+        self.deleted += other.deleted;
+        self.blocked_topics.extend(other.blocked_topics);
+        self.blocked_origins.extend(other.blocked_origins);
     }
 }
 
-/// Per-run defer state, carried across the drain's pages so a topic deferred on
-/// one page keeps deferring on later pages (preserving FIFO within a topic) and
-/// each topic's holdership and genesis presence are decided at most once per run.
+/// Per-invocation defer state. The block sets are seeded from the open rotation;
+/// `topic_exists` and `topic_held` deliberately are not, so holdership and
+/// genesis presence are re-read every invocation.
 #[derive(Default)]
 struct DrainDeferState {
     topic_exists: HashMap<irokle::TopicId, bool>,
     topic_held: HashMap<irokle::TopicId, bool>,
     deferred_topics: HashSet<irokle::TopicId>,
+    blocked_origins: HashSet<aruna_core::NodeId>,
     undeliverable_topics: HashSet<irokle::TopicId>,
+}
+
+/// The admin origin stream a record belongs to. Origin sequence is ordered
+/// within one origin node.
+fn admin_origin(record: &DocumentSyncOutboxRecord) -> Option<aruna_core::NodeId> {
+    match &record.event {
+        DocumentSyncOutboxEvent::AdminOperation { event } => Some(event.origin_node_id),
+        _ => None,
+    }
 }
 
 /// Whether a shard-classed record can ever publish from this node.
@@ -302,11 +382,19 @@ fn partition_drain_records(
     let mut deferred = Vec::new();
     let mut undeliverable = Vec::new();
     for (record_key, record, topic) in records {
+        // Origin order is the contract, whatever topic the later records ride.
+        if admin_origin(&record).is_some_and(|origin| defer.blocked_origins.contains(&origin)) {
+            deferred.push((record_key, record, topic));
+            continue;
+        }
         if !record.target.uses_shard_topic() {
             to_publish.push((record_key, record, topic));
             continue;
         }
         if defer.undeliverable_topics.contains(&topic) {
+            if let Some(origin) = admin_origin(&record) {
+                defer.blocked_origins.insert(origin);
+            }
             undeliverable.push((record_key, record, topic));
             continue;
         }
@@ -316,6 +404,9 @@ fn partition_drain_records(
             .or_insert_with(|| classify_defer(&record) == DeferOutcome::Retry);
         if !held {
             defer.undeliverable_topics.insert(topic);
+            if let Some(origin) = admin_origin(&record) {
+                defer.blocked_origins.insert(origin);
+            }
             undeliverable.push((record_key, record, topic));
             continue;
         }
@@ -330,6 +421,9 @@ fn partition_drain_records(
             continue;
         }
         defer.deferred_topics.insert(topic);
+        if let Some(origin) = admin_origin(&record) {
+            defer.blocked_origins.insert(origin);
+        }
         debug!(
             event = "pipeline.drain.deferred",
             target = ?record.target,
@@ -377,6 +471,7 @@ impl OperationsTaskHandler {
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
+            rotation: std::sync::Mutex::new(OutboxRotation::default()),
         }
     }
 
@@ -576,6 +671,27 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// Takes the open rotation, leaving a fresh one for a concurrent
+    /// invocation.
+    fn take_rotation(&self) -> OutboxRotation {
+        std::mem::take(
+            &mut *self
+                .rotation
+                .lock()
+                .expect("outbox rotation mutex poisoned"),
+        )
+    }
+
+    fn store_rotation(&self, rotation: OutboxRotation) {
+        *self
+            .rotation
+            .lock()
+            .expect("outbox rotation mutex poisoned") = rotation;
+    }
+
+    /// Runs one bounded invocation of the open rotation, then continues, yields
+    /// through the timer, or closes it. No record is ever deleted, truncated, or
+    /// overwritten to satisfy a bound.
     async fn drain_document_sync_outbox(&self) {
         let retry_key = TaskKey::DrainDocumentSyncOutbox;
         let drain_started = Instant::now();
@@ -591,12 +707,21 @@ impl OperationsTaskHandler {
         // their emitters; resolve their shard placement here from the realm
         // config so they publish onto the right shard topic. Records that
         // already carry a real ref (metadata upserts/deletes) keep it.
+        // Re-read every invocation: rotation state must never cache holdership
+        // or publisher authority.
         let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
 
+        let mut rotation = self.take_rotation();
         let mut totals = DrainSyncOutcome::default();
-        let mut defer_state = DrainDeferState::default();
+        let mut defer_state = DrainDeferState {
+            deferred_topics: rotation.blocked_topics.clone(),
+            blocked_origins: rotation.blocked_origins.clone(),
+            undeliverable_topics: rotation.undeliverable_topics.clone(),
+            ..DrainDeferState::default()
+        };
         let mut realm_config_drained = false;
-        let mut start_after: Option<Vec<u8>> = None;
+        let mut start_after: Option<Vec<u8>> = rotation.cursor.clone();
+        let mut reached_end = false;
         let mut scan_elapsed = Duration::ZERO;
         let mut publish_elapsed = Duration::ZERO;
         let mut record_count = 0usize;
@@ -615,14 +740,13 @@ impl OperationsTaskHandler {
         let mut oldest_record_ms: Option<u64> = None;
         let mut read_failed = false;
 
-        // Drain the whole outbox in pages every run rather than only the FIFO
-        // head: a page of permanently-deferred records (a missing shard genesis)
-        // at the head must never starve records for other topics sitting behind
-        // it. Deferred records are left in place but paged past; published
-        // records are deleted, so the next run reads from the head again. The
-        // per-topic defer state carries across pages so a topic deferred on one
-        // page keeps deferring on the next (FIFO within a topic).
+        // Bounded pages rather than whole-queue traversal: a deferred head must
+        // not starve later topics, and a large queue must not monopolise one
+        // invocation. Deferred records are paged past, not deleted.
         loop {
+            if record_count >= OUTBOX_INVOCATION_RECORDS || pages >= OUTBOX_INVOCATION_PAGES {
+                break;
+            }
             let scan_started = Instant::now();
             let batch = match read_outbox_records(
                 &self.context.storage_handle,
@@ -646,6 +770,7 @@ impl OperationsTaskHandler {
                 if has_more && start_after.is_some() {
                     continue;
                 }
+                reached_end = true;
                 break;
             }
             pages += 1;
@@ -810,6 +935,7 @@ impl OperationsTaskHandler {
                 (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
             > = BTreeMap::new();
             for (record_key, record, topic) in to_publish {
+                let origin = admin_origin(&record);
                 let document = document_publish_from_outbox(
                     record.outbox_id,
                     record.target.clone(),
@@ -831,6 +957,7 @@ impl OperationsTaskHandler {
                         peers: peers.clone(),
                         documents: Vec::new(),
                         topics: Vec::new(),
+                        origins: Vec::new(),
                         targets: Vec::new(),
                         record_keys: Vec::new(),
                     });
@@ -838,6 +965,7 @@ impl OperationsTaskHandler {
                 let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
                 subbatch.documents.push(document);
                 subbatch.topics.push(topic);
+                subbatch.origins.push(origin);
                 subbatch.targets.push(record.target);
                 subbatch.record_keys.push(record_key);
             }
@@ -855,6 +983,7 @@ impl OperationsTaskHandler {
             for mut subbatch in subbatches {
                 let documents = std::mem::take(&mut subbatch.documents);
                 let peers = subbatch.peers.clone();
+                let (batch_topics, batch_origins) = subbatch.ordering_domains();
                 let publish = async {
                     let publish_started = Instant::now();
                     let event = net_handle
@@ -891,6 +1020,14 @@ impl OperationsTaskHandler {
                             "Partially created local document sync batch"
                         );
                         totals.retry_needed = true;
+                        if let Some(retried) = subbatch.sync_subset(&retry_indices) {
+                            let (topics, origins) = retried.ordering_domains();
+                            totals.blocked_topics.extend(topics);
+                            totals.blocked_origins.extend(origins);
+                        } else {
+                            totals.blocked_topics.extend(batch_topics.iter().copied());
+                            totals.blocked_origins.extend(batch_origins.iter().copied());
+                        }
                         match subbatch.sync_subset(&published_indices) {
                             Some(published_subbatch)
                                 if !published_subbatch.record_keys.is_empty() =>
@@ -909,14 +1046,20 @@ impl OperationsTaskHandler {
                     })) => {
                         warn!(task_id = ?retry_key, error = %error, "Failed to create local document sync batch");
                         totals.retry_needed = true;
+                        totals.blocked_topics.extend(batch_topics.iter().copied());
+                        totals.blocked_origins.extend(batch_origins.iter().copied());
                     }
                     Event::Net(NetEvent::Error(error)) => {
                         warn!(task_id = ?retry_key, error = ?error, "Failed to create local document sync batch");
                         totals.retry_needed = true;
+                        totals.blocked_topics.extend(batch_topics.iter().copied());
+                        totals.blocked_origins.extend(batch_origins.iter().copied());
                     }
                     other => {
                         warn!(task_id = ?retry_key, event = ?other, "Unexpected local document sync batch result");
                         totals.retry_needed = true;
+                        totals.blocked_topics.extend(batch_topics.iter().copied());
+                        totals.blocked_origins.extend(batch_origins.iter().copied());
                     }
                 }
             }
@@ -926,9 +1069,19 @@ impl OperationsTaskHandler {
             totals.merge(sync_outcome);
 
             if !has_more {
+                reached_end = true;
                 break;
             }
         }
+
+        // A later record of the same topic or admin origin must not overtake one
+        // that has not landed.
+        defer_state
+            .deferred_topics
+            .extend(totals.blocked_topics.iter().copied());
+        defer_state
+            .blocked_origins
+            .extend(totals.blocked_origins.iter().copied());
 
         if let Some((oldest_ms, target, topic, placement)) = oldest_stuck {
             error!(
@@ -952,46 +1105,101 @@ impl OperationsTaskHandler {
                 .await;
         }
 
-        if record_count == 0 {
-            if read_failed {
-                self.reschedule_with_backoff(retry_key).await;
-            } else {
-                self.reset_backoff(&retry_key);
-            }
-            return;
-        }
+        // Nothing derived from the realm config is carried forward.
+        rotation.cursor = if reached_end {
+            None
+        } else {
+            start_after.clone()
+        };
+        rotation.blocked_topics = defer_state.deferred_topics.clone();
+        rotation.blocked_origins = defer_state.blocked_origins.clone();
+        rotation.undeliverable_topics = defer_state.undeliverable_topics.clone();
+        rotation.totals.examined += record_count;
+        rotation.totals.deleted += totals.deleted;
+        rotation.totals.deferred += deferred_total;
+        rotation.totals.undeliverable += undeliverable_total;
+        rotation.totals.retried += usize::from(totals.retry_needed);
+        rotation.totals.invocations = rotation.totals.invocations.saturating_add(1);
 
         let oldest_age_ms = oldest_record_ms
             .map(|record_ms| unix_timestamp_millis().saturating_sub(record_ms))
             .unwrap_or(0);
-        info!(
-            event = "pipeline.drain.summary",
-            records = record_count,
-            deferred = deferred_total,
-            undeliverable = undeliverable_total,
-            groups = group_count,
-            subbatches = subbatch_count,
-            pages,
-            scan_ms = duration_ms(scan_elapsed),
-            publish_ms = duration_ms(publish_elapsed),
-            sync_ms = duration_ms(totals.sync_elapsed),
-            project_ms = duration_ms(totals.project_elapsed),
-            delete_ms = duration_ms(totals.delete_elapsed),
-            total_ms = duration_ms(drain_started.elapsed()),
-            oldest_age_ms,
-            retry = totals.retry_needed,
-            "Document sync outbox drain summary"
-        );
+        // Unvisited work is what a bound cut short, not what this pass deferred.
+        let unvisited = !reached_end && !read_failed;
+        if record_count > 0 {
+            info!(
+                event = "pipeline.drain.summary",
+                records = record_count,
+                examined = record_count,
+                deleted = totals.deleted,
+                deferred = deferred_total,
+                undeliverable = undeliverable_total,
+                retried = usize::from(totals.retry_needed),
+                remaining = usize::from(unvisited),
+                continuation = rotation.continuations,
+                rotation_complete = reached_end,
+                groups = group_count,
+                subbatches = subbatch_count,
+                pages,
+                scan_ms = duration_ms(scan_elapsed),
+                publish_ms = duration_ms(publish_elapsed),
+                sync_ms = duration_ms(totals.sync_elapsed),
+                project_ms = duration_ms(totals.project_elapsed),
+                delete_ms = duration_ms(totals.delete_elapsed),
+                total_ms = duration_ms(drain_started.elapsed()),
+                oldest_age_ms,
+                retry = totals.retry_needed,
+                "Document sync outbox drain summary"
+            );
+        }
 
         if totals.retry_needed || read_failed {
+            // A persisted failure deadline outranks a rotation continuation.
+            rotation.continuations = 0;
+            self.store_rotation(rotation);
             self.reschedule_with_backoff(retry_key).await;
-        } else if deferred_total > 0 {
+            return;
+        }
+        if unvisited {
+            if rotation.continuations < OUTBOX_CONTINUATION_STREAK {
+                rotation.continuations = rotation.continuations.saturating_add(1);
+                self.store_rotation(rotation);
+                self.reschedule_timer(retry_key, OUTBOX_CONTINUATION_AFTER)
+                    .await;
+            } else {
+                // Keep the cursor and blocks so the rotation resumes where it was.
+                rotation.continuations = 0;
+                self.store_rotation(rotation);
+                self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
+                    .await;
+            }
+            return;
+        }
+
+        // Records inserted behind the cursor wait for the next rotation.
+        let closed = rotation.close();
+        self.store_rotation(rotation);
+        if closed.examined > 0 {
+            info!(
+                event = "pipeline.drain.rotation",
+                examined = closed.examined,
+                deleted = closed.deleted,
+                deferred = closed.deferred,
+                undeliverable = closed.undeliverable,
+                retried = closed.retried,
+                invocations = closed.invocations,
+                "Document sync outbox rotation complete"
+            );
+        }
+
+        if deferred_total > 0 {
             // Deferred records wait only for a genesis to arrive from the
             // shard's rank-0 holder; retry quickly rather than on the failure
             // backoff.
             self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
                 .await;
         } else {
+            // The rotation made progress or found no eligible work.
             self.reset_backoff(&retry_key);
         }
     }
@@ -1007,6 +1215,7 @@ impl OperationsTaskHandler {
             return outcome;
         };
         let requested_targets = subbatch.targets.clone();
+        let (batch_topics, batch_origins) = subbatch.ordering_domains();
         let sync_started = Instant::now();
         let event = net_handle
             .send_effect(Effect::Net(NetEffect::DocumentSync(
@@ -1017,14 +1226,20 @@ impl OperationsTaskHandler {
             )))
             .await;
         outcome.sync_elapsed = sync_started.elapsed();
-        self.finish_sync_drain_subbatch(
-            retry_key,
-            subbatch.record_keys,
-            requested_targets,
-            event,
-            outcome,
-        )
-        .await
+        let mut outcome = self
+            .finish_sync_drain_subbatch(
+                retry_key,
+                subbatch.record_keys,
+                requested_targets,
+                event,
+                outcome,
+            )
+            .await;
+        if outcome.retry_needed {
+            outcome.blocked_topics.extend(batch_topics);
+            outcome.blocked_origins.extend(batch_origins);
+        }
+        outcome
     }
 
     async fn finish_sync_drain_subbatch(
@@ -1069,9 +1284,13 @@ impl OperationsTaskHandler {
                     return outcome;
                 }
                 let delete_started = Instant::now();
+                let delete_count = record_keys.len();
                 let deleted =
                     delete_outbox_records(&self.context.storage_handle, record_keys).await;
                 outcome.delete_elapsed = delete_started.elapsed();
+                if deleted.is_ok() {
+                    outcome.deleted += delete_count;
+                }
                 if let Err(error) = deleted {
                     warn!(task_id = ?retry_key, error = %error, "Failed to delete document sync outbox records");
                     outcome.retry_needed = true;
@@ -1946,43 +2165,46 @@ pub async fn initialize_task_incoming(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
 ) {
-    initialize_task_handler(
+    install_task_handler(
         context,
         task_handle,
         jobs_runtime,
         RoCrateLimits::default(),
         false,
-        &Shutdown::new(),
     )
+    .await
+    .start(&Shutdown::new())
     .await;
 }
 
+/// Installs the inbound task handler without touching durable queues. Handler
+/// installation stays in the serving gate; the expensive durable-queue
+/// restoration behind it is [`TaskQueues::start`].
 pub async fn initialize_task_holder(
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
-    shutdown: &Shutdown,
-) {
-    initialize_task_handler(
-        context,
-        task_handle,
-        jobs_runtime,
-        rocrate_limits,
-        true,
-        shutdown,
-    )
-    .await;
+) -> TaskQueues {
+    install_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await
 }
 
-async fn initialize_task_handler(
+/// The durable queue work deferred until after the local serving gate.
+pub struct TaskQueues {
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    jobs_runtime: Arc<JobsRuntime>,
+    handler: Arc<OperationsTaskHandler>,
+    refresh_holders: bool,
+}
+
+async fn install_task_handler(
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
     refresh_holders: bool,
-    shutdown: &Shutdown,
-) {
+) -> TaskQueues {
     let handler_context = context.clone();
     if context.compute_handle.is_some() {
         jobs_runtime.set_reconciler(crate::jobs::workflow::reconcile::ComputeReconciler::new(
@@ -1990,16 +2212,8 @@ async fn initialize_task_handler(
             Arc::downgrade(&jobs_runtime),
         ));
     }
-    let jobs_started = jobs_runtime.is_started();
-    if jobs_started
-        && let Err(error) = jobs_runtime
-            .recover_stale_jobs(&context.storage_handle)
-            .await
-    {
-        warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to recover stale jobs at startup");
-    }
     let handler = Arc::new(
-        OperationsTaskHandler::new(handler_context, jobs_runtime)
+        OperationsTaskHandler::new(handler_context, jobs_runtime.clone())
             .with_rocrate_limits(rocrate_limits),
     );
     task_handle.set_inbound_handler(handler.clone()).await;
@@ -2009,36 +2223,67 @@ async fn initialize_task_handler(
         let table = rebuild_watch_interest_table(&context.storage_handle).await;
         net_handle.replace_watch_interest(table);
     }
-    spawn_queue_rearm(&context, &task_handle, shutdown);
-    restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
-    restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
-    restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
-    restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
-    crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle).await;
-    restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
-    restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
-    sweep_dead_letters(&context.storage_handle).await;
-    restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-    restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
-    restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
-    restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
-    restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
-    if jobs_started {
-        restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+    TaskQueues {
+        context,
+        task_handle,
+        jobs_runtime,
+        handler,
+        refresh_holders,
     }
-    restore_job_prune_timer(&context.storage_handle, &task_handle).await;
-    restore_mirror_timer(&context.storage_handle, &task_handle).await;
-    if context.blob_handle.is_some() {
-        restore_hidden_sweep(&context.storage_handle, &task_handle).await;
-        restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
-        handler
-            .reschedule_timer(TaskKey::DrainBlobCleanupQueue, Duration::ZERO)
+}
+
+impl TaskQueues {
+    /// Restores persisted timers with their stored due time and starts the
+    /// recurring re-arm loop, once the node is already serving.
+    pub async fn start(self, shutdown: &Shutdown) {
+        let Self {
+            context,
+            task_handle,
+            jobs_runtime,
+            handler,
+            refresh_holders,
+        } = self;
+        let jobs_started = jobs_runtime.is_started();
+        if jobs_started
+            && let Err(error) = jobs_runtime
+                .recover_stale_jobs(&context.storage_handle)
+                .await
+        {
+            warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to recover stale jobs at startup");
+        }
+        spawn_queue_rearm(&context, &task_handle, shutdown);
+        restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
+        restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
+        crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
             .await;
-    }
-    if refresh_holders {
-        handler
-            .reschedule_timer(TaskKey::RefreshBlobHolders, Duration::ZERO)
+        restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO)
             .await;
+        restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
+        sweep_dead_letters(&context.storage_handle).await;
+        restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
+        restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
+        restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
+        if jobs_started {
+            restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+        }
+        restore_job_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_mirror_timer(&context.storage_handle, &task_handle).await;
+        if context.blob_handle.is_some() {
+            restore_hidden_sweep(&context.storage_handle, &task_handle).await;
+            restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
+            handler
+                .reschedule_timer(TaskKey::DrainBlobCleanupQueue, Duration::ZERO)
+                .await;
+        }
+        if refresh_holders {
+            handler
+                .reschedule_timer(TaskKey::RefreshBlobHolders, Duration::ZERO)
+                .await;
+        }
     }
 }
 
@@ -2048,9 +2293,37 @@ async fn initialize_task_handler(
 /// window before the asynchronous drain timer fires; the flush is best-effort,
 /// so a failure simply leaves the records for the retryable drain.
 pub async fn drive_document_sync_outbox_drain(context: Arc<DriverContext>) {
-    OperationsTaskHandler::new(context, JobsRuntime::new())
-        .drain_document_sync_outbox()
-        .await;
+    OutboxDrainer::new(context).run_once().await;
+}
+
+/// A document sync drain that keeps its rotation across invocations like the
+/// timer-driven handler. A fresh drainer starts at the head, which is the same
+/// reset a process restart performs.
+pub struct OutboxDrainer {
+    handler: Arc<OperationsTaskHandler>,
+}
+
+impl OutboxDrainer {
+    pub fn new(context: Arc<DriverContext>) -> Self {
+        Self {
+            handler: Arc::new(OperationsTaskHandler::new(context, JobsRuntime::new())),
+        }
+    }
+
+    /// Runs one bounded invocation of the open rotation.
+    pub async fn run_once(&self) {
+        self.handler.drain_document_sync_outbox().await;
+    }
+
+    /// Records examined so far, and whether the cursor is parked mid-rotation.
+    pub fn rotation_progress(&self) -> (usize, bool) {
+        let rotation = self
+            .handler
+            .rotation
+            .lock()
+            .expect("outbox rotation mutex poisoned");
+        (rotation.totals.examined, rotation.cursor.is_some())
+    }
 }
 
 #[async_trait]
@@ -2467,6 +2740,7 @@ mod tests {
                 irokle::TopicId::hash(b"second"),
                 irokle::TopicId::hash(b"third"),
             ],
+            origins: vec![None, None, Some(node(3))],
             targets: vec![
                 duplicate_target.clone(),
                 other_target,
@@ -2481,6 +2755,7 @@ mod tests {
 
         assert_eq!(selected.targets, vec![duplicate_target]);
         assert_eq!(selected.topics, vec![irokle::TopicId::hash(b"third")]);
+        assert_eq!(selected.origins, vec![Some(node(3))]);
         assert_eq!(selected.record_keys, vec![b"third".to_vec()]);
         assert!(selected.documents.is_empty());
         assert!(subbatch.sync_subset(&[3]).is_none());
@@ -2535,6 +2810,112 @@ mod tests {
         );
         assert_eq!(deferred.len(), 2);
         assert!(undeliverable.is_empty());
+    }
+
+    fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentSyncOutboxRecord {
+        use aruna_core::admin_documents::{
+            AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+        };
+        let realm_id = RealmId([3; 32]);
+        let user_id = aruna_core::types::UserId::nil(realm_id);
+        crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::AdminOperation {
+                event: Box::new(AdminDocumentEvent {
+                    event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
+                    target: AdminDocumentTarget::User { user_id },
+                    origin_node_id: origin,
+                    origin_seq,
+                    observed: AdminDocumentClock::default(),
+                    actor: aruna_core::structs::Actor {
+                        node_id: node(1),
+                        user_id,
+                        realm_id,
+                    },
+                    op: AdminDocumentOperation::UserNameSet {
+                        name: format!("user-{origin_seq}"),
+                    },
+                }),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        )
+    }
+
+    // A blocked admin operation blocks the rest of its origin sequence for the
+    // whole rotation, whatever topic the later records ride: publishing a later
+    // origin_seq first would drop the earlier one as StaleOriginSequence.
+    #[test]
+    fn admin_origin_blocks() {
+        let origin = node(4);
+        let blocked_topic = irokle::TopicId::hash(b"blocked-admin-topic");
+        let healthy_topic = irokle::TopicId::hash(b"healthy-admin-topic");
+        let records = vec![
+            (b"first".to_vec(), admin_record(origin, 1), blocked_topic),
+            (b"second".to_vec(), admin_record(origin, 2), healthy_topic),
+        ];
+
+        let mut defer = DrainDeferState::default();
+        let (to_publish, deferred, undeliverable) = partition_drain_records(
+            records,
+            &mut defer,
+            |topic| topic != blocked_topic,
+            |_| DeferOutcome::Retry,
+        );
+
+        assert!(
+            to_publish.is_empty(),
+            "a later origin_seq must not overtake"
+        );
+        assert_eq!(deferred.len(), 2);
+        assert!(undeliverable.is_empty());
+        assert!(defer.blocked_origins.contains(&origin));
+    }
+
+    // Closing a rotation returns its accumulated totals and clears every
+    // ordering block, so the next rotation starts clean at the head.
+    #[test]
+    fn rotation_close_clears() {
+        let mut rotation = OutboxRotation {
+            cursor: Some(b"somewhere".to_vec()),
+            continuations: 3,
+            ..OutboxRotation::default()
+        };
+        rotation
+            .blocked_topics
+            .insert(irokle::TopicId::hash(b"blocked"));
+        rotation.blocked_origins.insert(node(4));
+        rotation
+            .undeliverable_topics
+            .insert(irokle::TopicId::hash(b"undeliverable"));
+        rotation.totals.examined = 12;
+        rotation.totals.deleted = 5;
+        rotation.totals.invocations = 2;
+
+        let totals = rotation.close();
+
+        assert_eq!(totals.examined, 12);
+        assert_eq!(totals.deleted, 5);
+        assert_eq!(totals.invocations, 2);
+        assert!(rotation.cursor.is_none());
+        assert!(rotation.blocked_topics.is_empty());
+        assert!(rotation.blocked_origins.is_empty());
+        assert!(rotation.undeliverable_topics.is_empty());
+        assert_eq!(rotation.continuations, 0);
+        assert_eq!(rotation.totals.examined, 0);
+    }
+
+    // The invocation bound is a work-unit limit, never a latency assertion.
+    #[test]
+    fn outbox_bound_finite() {
+        assert_eq!(
+            OUTBOX_INVOCATION_RECORDS,
+            OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_BATCH_SIZE
+        );
+        assert!(OUTBOX_INVOCATION_PAGES > 0);
+        assert!(OUTBOX_CONTINUATION_STREAK > 0);
     }
 
     #[test]

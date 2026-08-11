@@ -1,4 +1,6 @@
 #![allow(clippy::result_large_err)]
+// The tracked recovery child overflows the default query depth in a fresh build.
+#![recursion_limit = "256"]
 
 use aruna::bootstrap::{
     announce_core_documents, ensure_initial_local_onboarding_secret,
@@ -24,9 +26,6 @@ use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::NodeCapabilities;
 use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
@@ -36,7 +35,9 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 use aruna_operations::replication::migration::migrate_legacy_sync;
-use aruna_operations::startup::restore_shard_subscriptions;
+use aruna_operations::startup::{
+    RecoveryConfig, RecoveryStatus, prepare_shard_policy, run_recovery,
+};
 use aruna_operations::task_incoming::initialize_task_holder;
 use aruna_tasks::TaskHandle;
 use std::sync::Arc;
@@ -134,6 +135,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Its handle survives the drain and is aborted only after final storage sync.
     let metrics = Arc::new(NodeMetrics::new());
     let readiness = Readiness::new();
+    let recovery = RecoveryStatus::new();
     let ops_handle = {
         let ops_state = OpsState::new(driver_ctx.clone(), metrics.clone(), readiness.clone()).await;
         let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
@@ -157,18 +159,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         jobs_runtime.clone(),
         &shutdown,
     );
-    initialize_task_holder(
+    let task_queues = initialize_task_holder(
         driver_ctx.clone(),
         task_handle.clone(),
         jobs_runtime.clone(),
         config.rocrate_limits.clone(),
-        &shutdown,
     )
     .await;
 
-    // Republish a full set of node usage snapshots at startup so realm peers see
-    // this node's totals again after a restart, dirty-marker loss, or a counter
-    // rebuild. Best-effort: failures are retried by the debounced publisher.
     if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
         driver_ctx.as_ref(),
         config.node_id,
@@ -187,7 +185,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Replayed metadata event log during startup"
         );
     }
-    spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
@@ -335,47 +332,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => warn!(%error, "Failed to migrate legacy S3 replication configs"),
     }
 
-    // Republish a full set of node usage snapshots after startup-mode core
-    // document announcement has had a chance to queue the shared node-usage topic
-    // genesis. Best-effort: failures are retried by the debounced publisher.
-    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        true,
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to publish initial node usage snapshots");
-    }
-
-    // All startup modes: join the held shard topics (a freshly onboarded node
-    // pulls existing shard data from its co-holders here), then create the
-    // geneses of the shards this node is rank-0 holder of.
-    let restore_summary =
-        restore_shard_subscriptions(&driver_ctx, config.node_id, config.realm_id).await;
-    tracing::info!(
-        held_shards = restore_summary.held_shards,
-        shard_topics = restore_summary.shard_topics,
-        shared_topics = restore_summary.shared_topics,
-        "Restored held shard subscriptions",
-    );
-    aruna_operations::process_placements::process_shard_placements(
-        &driver_ctx,
-        config.realm_id,
-        config.node_id,
-    )
-    .await;
-
-    drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: config.realm_id,
-            node_id: config.node_id,
-            schedule_refresh: true,
-        }),
-        driver_ctx.as_ref(),
-    )
-    .await?;
+    // Make already materialized shard topics publishable before binding; missing
+    // geneses and anti-entropy are remote convergence and run behind the gate.
+    prepare_shard_policy(&driver_ctx, config.node_id, config.realm_id).await;
 
     // REST Server
     let is_initial_node = config.is_initial_node();
@@ -452,6 +411,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (_s3_addr, server_handle) = s3_server
         .run_with_listener(s3_listener, shutdown.token())
         .unwrap();
+
+    let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+    let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
+
+    // Both listeners are bound and the local safety gate is satisfied. Everything
+    // below is background work whose failure never withholds admission.
+    readiness.set_ready();
+
+    // Durable background queues, on their own storage lanes and behind the gate.
     if let Err(error) = jobs_runtime
         .recover_stale_jobs(&driver_ctx.storage_handle)
         .await
@@ -459,14 +427,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %error, "Failed to recover stale jobs at startup");
     }
     jobs_runtime.start();
+    task_queues.start(&shutdown).await;
     restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
+    spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
-    let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
-    let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
-
-    // Both request listeners are bound and bootstrap has completed: the node is
-    // ready to serve, so `/readyz` may now return 200.
-    readiness.set_ready();
+    // Bounded, cancellable, tracked peer convergence. An unreachable peer here is
+    // retryable background state, never a process-start failure.
+    {
+        let recovery_ctx = driver_ctx.clone();
+        let recovery_status = recovery.clone();
+        let recovery_config = RecoveryConfig {
+            realm_id: config.realm_id,
+            node_id: config.node_id,
+            // An unchanged restart republishes nothing: accepted outbox work and
+            // document sync history already carry convergence.
+            publish_full_usage: true,
+        };
+        let cancelled = shutdown.token();
+        shutdown.spawn(async move {
+            run_recovery(recovery_ctx, recovery_config, recovery_status, cancelled).await;
+        });
+    }
 
     let mut signal = tokio::spawn(wait_for_signal());
     let mut rest_handle = Some(rest_handle);
