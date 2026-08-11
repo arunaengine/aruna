@@ -45,6 +45,8 @@ const TAIL_RESERVE: Duration = Duration::from_secs(
 /// Time reserved for net teardown after the forced inbound join, preventing the
 /// outer phase timeout from dropping teardown work.
 const NET_TEARDOWN_MARGIN: Duration = Duration::from_secs(2);
+/// Time reserved for aborting timer handlers after their drain deadline.
+const TASK_ABORT_MARGIN: Duration = Duration::from_secs(2);
 /// Exit code when the watchdog has to kill a shutdown that would not finish.
 const FORCED_EXIT_CODE: i32 = 75;
 
@@ -168,9 +170,10 @@ impl NodeShutdown {
 
         // 4. Timer handlers drain while the network still works.
         let task_budget = writer_budget(budget.remaining());
+        let task_drain = task_drain_budget(task_budget);
         let mut task_report = None;
         phase("tasks", task_budget, async {
-            task_report = Some(self.task_handle.shutdown(task_budget).await);
+            task_report = Some(self.task_handle.shutdown(task_drain).await);
         })
         .await;
         if let Some(report) = task_report {
@@ -340,6 +343,10 @@ fn net_drain_budget(phase_budget: Duration) -> Duration {
     phase_budget.saturating_sub(FORCED_INBOUND_DRAIN + NET_TEARDOWN_MARGIN)
 }
 
+fn task_drain_budget(phase_budget: Duration) -> Duration {
+    phase_budget.saturating_sub(TASK_ABORT_MARGIN)
+}
+
 async fn phase<F>(name: &'static str, budget: Duration, future: F)
 where
     F: Future<Output = ()>,
@@ -479,6 +486,16 @@ mod tests {
             Duration::from_secs(3)
         );
         assert_eq!(net_drain_budget(Duration::from_secs(1)), Duration::ZERO);
+    }
+
+    // The task abort command gets time after its drain expires.
+    #[test]
+    fn task_reserves_abort() {
+        assert_eq!(
+            task_drain_budget(Duration::from_secs(5)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(task_drain_budget(Duration::from_secs(1)), Duration::ZERO);
     }
 
     // At the smallest configured grace every protected phase still gets its
