@@ -769,8 +769,14 @@ pub async fn delete_metadata_document_routed(
             "metadata document has no active frozen holder with history capacity".to_string(),
         ));
     }
+    let authority = pid_authority_node(&config, actor.realm_id, document_id).ok_or_else(|| {
+        MetadataWriteError::Undeliverable("persistent id authority is unavailable".to_string())
+    })?;
     let local_holds = holders.contains(&local_node_id);
-    if local_holds && let Some(record) = record {
+    if local_node_id == authority
+        && local_holds
+        && let Some(record) = record
+    {
         delete_metadata_document(
             DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
             context.as_ref(),
@@ -788,7 +794,7 @@ pub async fn delete_metadata_document_routed(
             config_digest,
             document_id,
         },
-        local_holds.then_some(local_node_id),
+        (local_holds && record.is_none()).then_some(local_node_id),
         false,
     )
     .await?;
@@ -1101,6 +1107,9 @@ pub(crate) async fn apply_forwarded_write(
                         return MetadataTransportMessage::ForwardedWriteUnavailable;
                     }
                 };
+            if pid_authority_node(&config, realm_id, document_id) != Some(net_handle.node_id()) {
+                return MetadataTransportMessage::ForwardedWriteUnavailable;
+            }
             if let Err(error) =
                 authorize_write(context, auth.clone(), record.permission_path.clone()).await
             {

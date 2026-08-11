@@ -192,6 +192,47 @@ async fn delete_withdraws_mapping() -> TestResult<()> {
     Ok(())
 }
 
+/// A delete accepted by another replica must execute on the same rank-0 authority
+/// that answers PID landing requests; otherwise the successful delete can race an
+/// authoritative redirect until its tombstone happens to replicate.
+#[tokio::test]
+async fn replica_delete_routes_to_pid_authority() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let (document_id, placement) =
+        seed_document(&realm, group_id, "datasets/replica-delete", true).await?;
+    let holders = realm.holders(&placement);
+    let authority = realm.find(holders[0]);
+    let replica = realm.find(holders[1]);
+
+    mint_routed(&realm, replica, document_id).await?;
+    wait_until("mint reaches the replica", replica.node_id(), || {
+        mapping_active(replica, document_id)
+    })
+    .await?;
+    let record = registry_record(replica, document_id)
+        .await
+        .expect("the replica carries the registry row");
+    delete_metadata_document_routed(
+        &replica.context,
+        realm.actor(replica),
+        Some(&record),
+        document_id,
+        Some(realm.bearer_token()),
+    )
+    .await?;
+
+    let mapping = read_mapping(authority.context.as_ref(), document_id)
+        .await?
+        .expect("the authority retains the withdrawn mapping");
+    assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+    assert_eq!(mapping.revision.actor, authority.node_id());
+    assert!(registry_record(authority, document_id).await.is_none());
+
+    realm.shutdown().await;
+    Ok(())
+}
+
 /// The landing path is unauthenticated, so it may not become an existence oracle:
 /// a minted PID for a document that is not anonymously readable resolves as absent,
 /// while an anonymously readable one redirects.
