@@ -15,21 +15,21 @@ use aruna_operations::revoke_token::{
 };
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::post;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "tokens", description = "Bearer token revocation")),
-    paths(revoke_token)
+    tags((name = "tokens", description = "Bearer token revocation"))
 )]
 pub struct TokensApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/users/tokens/revoke", post(revoke_token))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(TokensApiDoc::openapi()).routes(routes!(revoke_token))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]

@@ -25,8 +25,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{Stream, StreamExt, stream};
@@ -35,6 +34,8 @@ use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use super::jobs::{job_urls, map_submit_error};
 use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
@@ -48,15 +49,14 @@ const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "rocrate-import", description = "RO-Crate upload and import")),
-    paths(upload_rocrate, submit_import)
+    tags((name = "rocrate-import", description = "RO-Crate upload and import"))
 )]
 pub struct RoCrateImportApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/metadata/rocrate/uploads", post(upload_rocrate))
-        .route("/metadata/rocrate/imports", post(submit_import))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(RoCrateImportApiDoc::openapi())
+        .routes(routes!(upload_rocrate))
+        .routes(routes!(submit_import))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1515,7 +1515,7 @@ mod tests {
 
     #[test]
     fn upload_openapi_types() {
-        let openapi = serde_json::to_value(RoCrateImportApiDoc::openapi()).unwrap();
+        let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
         let content =
             &openapi["paths"]["/metadata/rocrate/uploads"]["post"]["requestBody"]["content"];
         assert!(content.get(ZIP_MEDIA_TYPE).is_some());

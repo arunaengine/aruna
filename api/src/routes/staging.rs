@@ -37,8 +37,7 @@ use aruna_operations::staging::snapshot::{
 };
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -47,28 +46,22 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "staging", description = "Blob staging")),
-    paths(
-        stage_blob,
-        stage_batch,
-        submit_staging,
-        list_staging_jobs,
-        get_staging_job,
-        list_references
-    )
+    tags((name = "staging", description = "Blob staging"))
 )]
 pub struct StagingApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/staging/", post(stage_blob))
-        .route("/staging/batch", post(stage_batch))
-        .route("/staging/jobs", get(list_staging_jobs).post(submit_staging))
-        .route("/staging/jobs/{job_id}", get(get_staging_job))
-        .route("/staging/references", get(list_references))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(StagingApiDoc::openapi())
+        .routes(routes!(stage_blob))
+        .routes(routes!(stage_batch))
+        .routes(routes!(list_staging_jobs, submit_staging))
+        .routes(routes!(get_staging_job))
+        .routes(routes!(list_references))
 }
 
 const DEFAULT_REFERENCE_LIMIT: usize = 500;

@@ -12,24 +12,24 @@ use aruna_operations::metadata::audit::{
 use aruna_operations::metadata::forward::is_user_origin;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "audit", description = "Audit trail reads")),
-    paths(list_audit)
+    tags((name = "audit", description = "Audit trail reads"))
 )]
 pub struct AuditApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/audit", get(list_audit))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(AuditApiDoc::openapi()).routes(routes!(list_audit))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]

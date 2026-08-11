@@ -1,3 +1,4 @@
+use super::routes_at;
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::ServerError;
@@ -17,8 +18,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, options, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -27,6 +27,8 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 use url::form_urlencoded::byte_serialize;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const W3ID_DATA_PREFIX: &str = "https://w3id.org/aruna/data/";
 const ACCESS_ID_HTTPS: &str = "https";
@@ -34,7 +36,6 @@ const ACCESS_ID_HTTPS: &str = "https";
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "drs", description = "GA4GH DRS content access")),
-    paths(get_service_info, get_object, post_objects, download_object, get_authorizations),
     components(
         schemas(
             DrsServiceInfoResponse,
@@ -52,16 +53,16 @@ const ACCESS_ID_HTTPS: &str = "https";
 )]
 pub struct DrsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/ga4gh/drs/v1/service-info", get(get_service_info))
-        .route("/ga4gh/drs/v1/objects", post(post_objects))
-        .route(
-            "/ga4gh/drs/v1/objects/{*object_id}",
-            options(get_authorizations),
-        )
-        .route("/ga4gh/drs/v1/objects/{*object_id}", get(get_object))
-        .route("/ga4gh/drs/v1/download", get(download_object))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    routes_at(
+        OpenApiRouter::with_openapi(DrsApiDoc::openapi())
+            .routes(routes!(get_service_info))
+            .routes(routes!(post_objects))
+            .routes(routes!(download_object)),
+        // Object ids carry `/`, so the runtime template is a catch-all.
+        "/ga4gh/drs/v1/objects/{*object_id}",
+        routes!(get_authorizations, get_object),
+    )
 }
 
 #[derive(Debug, Serialize, ToSchema)]

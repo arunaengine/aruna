@@ -21,30 +21,11 @@ struct BaseApiDoc;
 pub struct ApiDoc;
 
 impl ApiDoc {
+    /// Serves the document built by the same registration that builds the
+    /// runtime router, so a live route is never missing from it.
     pub fn openapi() -> utoipa::openapi::OpenApi {
         let mut openapi = BaseApiDoc::openapi();
-        openapi.merge(crate::routes::audit::AuditApiDoc::openapi());
-        openapi.merge(crate::routes::groups::GroupsApiDoc::openapi());
-        openapi.merge(crate::routes::connectors::ConnectorsApiDoc::openapi());
-        openapi.merge(crate::routes::staging::StagingApiDoc::openapi());
-        openapi.merge(crate::routes::group_backends::GroupBackendsApiDoc::openapi());
-        openapi.merge(crate::routes::storage_routing::StorageRoutingApiDoc::openapi());
-        openapi.merge(crate::routes::sync::SyncApiDoc::openapi());
-        openapi.merge(crate::routes::sync_quarantine::SyncQuarantineApiDoc::openapi());
-        openapi.merge(crate::routes::metadata::MetadataApiDoc::openapi());
-        openapi.merge(crate::routes::rocrate_import::RoCrateImportApiDoc::openapi());
-        openapi.merge(crate::routes::credentials::CredentialsApiDoc::openapi());
-        openapi.merge(crate::routes::blobs::BlobsApiDoc::openapi());
-        openapi.merge(crate::routes::drs::DrsApiDoc::openapi());
-        openapi.merge(crate::routes::info::InfoApiDoc::openapi());
-        openapi.merge(crate::routes::jobs::JobsApiDoc::openapi());
-        openapi.merge(crate::routes::notifications::NotificationsApiDoc::openapi());
-        openapi.merge(crate::routes::onboarding::OnboardingApiDoc::openapi());
-        openapi.merge(crate::routes::policies::PoliciesApiDoc::openapi());
-        openapi.merge(crate::routes::search::SearchApiDoc::openapi());
-        openapi.merge(crate::routes::tes::TesApiDoc::openapi());
-        openapi.merge(crate::routes::tokens::TokensApiDoc::openapi());
-        openapi.merge(crate::routes::users::UsersApiDoc::openapi());
+        openapi.merge(crate::routes::rest_openapi());
         openapi
     }
 }

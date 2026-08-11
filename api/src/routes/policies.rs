@@ -17,43 +17,29 @@ use aruna_operations::set_realm_policies::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "policies", description = "Deny-only CEL request policies")),
-    paths(
-        get_realm_policies,
-        set_realm_policies,
-        get_group_policies,
-        set_group_policies,
-        effective_policies,
-        validate_policy,
-        dry_run_policy
-    )
+    tags((name = "policies", description = "Deny-only CEL request policies"))
 )]
 pub struct PoliciesApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/policies/realm",
-            get(get_realm_policies).put(set_realm_policies),
-        )
-        .route(
-            "/policies/group/{group_id}",
-            get(get_group_policies).put(set_group_policies),
-        )
-        .route("/policies/effective", get(effective_policies))
-        .route("/policies/validate", post(validate_policy))
-        .route("/policies/dry-run", post(dry_run_policy))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(PoliciesApiDoc::openapi())
+        .routes(routes!(get_realm_policies, set_realm_policies))
+        .routes(routes!(get_group_policies, set_group_policies))
+        .routes(routes!(effective_policies))
+        .routes(routes!(validate_policy))
+        .routes(routes!(dry_run_policy))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

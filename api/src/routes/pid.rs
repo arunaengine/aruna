@@ -8,9 +8,11 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use ulid::Ulid;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use aruna_core::structs::{
     AuthContext, DEFAULT_JOB_RETENTION_MS, MetadataRegistryRecord, MintPersistentIdSpec,
@@ -27,21 +29,41 @@ use aruna_operations::metadata::forward::{resolve_pid_routed, withdraw_pid_route
 use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
 };
-use crate::error::{ServerError, ServerResult};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::metadata::{forwarded_auth_token, map_metadata_api_error};
 use crate::server_state::ServerState;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route(
-        "/pid/{document_id}",
-        get(resolve_pid).post(mint_pid).delete(withdraw_pid),
-    )
+#[derive(OpenApi)]
+#[openapi(
+    tags((name = "pid", description = "w3id persistent identifier landing and lifecycle"))
+)]
+pub struct PidApiDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(PidApiDoc::openapi()).routes(routes!(
+        resolve_pid,
+        mint_pid,
+        withdraw_pid
+    ))
 }
 
 fn rocrate_location(document_id: Ulid) -> String {
     format!("/api/v1/metadata/{document_id}/rocrate")
 }
 
+#[utoipa::path(
+    get,
+    path = "/pid/{document_id}",
+    tag = "pid",
+    params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID")),
+    responses(
+        (status = 302, description = "Redirect to the document's RO-Crate read route"),
+        (status = 404, description = "No PID is registered for this document"),
+        (status = 410, description = "Withdrawn PID tombstone", body = Object, content_type = "application/json"),
+        (status = 503, description = "PID authority unreachable, retry later")
+    ),
+    security(())
+)]
 async fn resolve_pid(
     State(state): State<Arc<ServerState>>,
     Path(document_id): Path<String>,
@@ -97,6 +119,21 @@ fn gone(pid: &str) -> Response {
 
 /// Register a w3id PID for a document. Idempotent by document id; requires WRITE
 /// on the document. Runs as a fenced job, so the response is 202 Accepted.
+#[utoipa::path(
+    post,
+    path = "/pid/{document_id}",
+    tag = "pid",
+    params(("document_id" = String, Path, description = "Document ULID to mint a PID for")),
+    responses(
+        (status = 202, description = "Mint job durably accepted on the document's PID authority", body = Object, content_type = "application/json"),
+        (status = 400, description = "Malformed document id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Caller lacks WRITE on the document", body = ErrorResponse),
+        (status = 404, description = "Document not found", body = ErrorResponse),
+        (status = 503, description = "PID authority unreachable, retry later", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn mint_pid(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -145,6 +182,21 @@ async fn mint_pid(
 /// writing the tombstone even when nothing was ever minted so an accepted mint job
 /// cannot land after it. Deletion withdraws automatically; this is the manual
 /// path. Idempotent, and 204 only once the transition is durable on the authority.
+#[utoipa::path(
+    delete,
+    path = "/pid/{document_id}",
+    tag = "pid",
+    params(("document_id" = String, Path, description = "Document ULID whose PID is withdrawn")),
+    responses(
+        (status = 204, description = "Withdrawal is durable on the PID authority"),
+        (status = 400, description = "Malformed document id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Caller lacks WRITE on the document", body = ErrorResponse),
+        (status = 404, description = "Document not found", body = ErrorResponse),
+        (status = 503, description = "PID authority unreachable, retry later", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn withdraw_pid(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,

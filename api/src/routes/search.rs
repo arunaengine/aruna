@@ -17,12 +17,13 @@ use aruna_operations::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 100;
@@ -34,8 +35,7 @@ const SEARCH_TYPE_USERS: &str = "users";
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "search", description = "Unified realm search")),
-    paths(unified_search, bucket_search)
+    tags((name = "search", description = "Unified realm search"))
 )]
 pub struct SearchApiDoc;
 
@@ -44,10 +44,10 @@ pub struct SearchApiDoc;
 // DEFERRED (#266 directories): the /search groups/users and /search/buckets core
 // landed (#427); visibility tiers, public profiles, and the signed bucket
 // directory are the deferred enhancements.
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/search", get(unified_search))
-        .route("/search/buckets", get(bucket_search))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(SearchApiDoc::openapi())
+        .routes(routes!(unified_search))
+        .routes(routes!(bucket_search))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]

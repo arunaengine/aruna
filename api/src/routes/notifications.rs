@@ -28,8 +28,7 @@ use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOpe
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{delete, get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_core::Stream;
@@ -47,6 +46,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 /// Burst-coalescing window on the local wake arm: after a wake, wait briefly and
@@ -65,15 +66,6 @@ const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "notifications", description = "User notification inbox")),
-    paths(
-        list_notifications,
-        unread_count,
-        stream_notifications,
-        mark_read,
-        list_watches,
-        create_watch,
-        delete_watch
-    ),
     components(schemas(
         NotificationStreamStateResponse,
         UnreadCountApiResponse
@@ -81,17 +73,14 @@ const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
 )]
 pub struct NotificationsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/notifications", get(list_notifications))
-        .route("/notifications/unread", get(unread_count))
-        .route("/notifications/stream", get(stream_notifications))
-        .route("/notifications/read", post(mark_read))
-        .route(
-            "/notifications/watches",
-            get(list_watches).post(create_watch),
-        )
-        .route("/notifications/watches/{id}", delete(delete_watch))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(NotificationsApiDoc::openapi())
+        .routes(routes!(list_notifications))
+        .routes(routes!(unread_count))
+        .routes(routes!(stream_notifications))
+        .routes(routes!(mark_read))
+        .routes(routes!(list_watches, create_watch))
+        .routes(routes!(delete_watch))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]

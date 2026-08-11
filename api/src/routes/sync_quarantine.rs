@@ -16,10 +16,11 @@ use aruna_operations::sync_quarantine::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -27,30 +28,15 @@ use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "sync-quarantine", description = "Rejected replicated sync events")),
-    paths(
-        list_quarantine,
-        prune_quarantine,
-        inspect_quarantine,
-        acknowledge_quarantine
-    )
+    tags((name = "sync-quarantine", description = "Rejected replicated sync events"))
 )]
 pub struct SyncQuarantineApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/admin/sync-quarantine",
-            get(list_quarantine).delete(prune_quarantine),
-        )
-        .route(
-            "/admin/sync-quarantine/{record_id}",
-            get(inspect_quarantine),
-        )
-        .route(
-            "/admin/sync-quarantine/{record_id}/acknowledge",
-            post(acknowledge_quarantine),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(SyncQuarantineApiDoc::openapi())
+        .routes(routes!(list_quarantine, prune_quarantine))
+        .routes(routes!(inspect_quarantine))
+        .routes(routes!(acknowledge_quarantine))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]

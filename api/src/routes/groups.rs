@@ -34,8 +34,7 @@ use aruna_operations::s3::list_objects_v2::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
@@ -44,44 +43,26 @@ use std::sync::Arc;
 use tracing::{Instrument, Span, field, info_span, trace};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "groups", description = "Group management operations")),
-    paths(
-        create_group,
-        list_groups,
-        get_group,
-        get_group_usage,
-        list_group_members,
-        add_group_member,
-        remove_group_member,
-        leave_group,
-        create_group_role,
-        delete_group_role,
-        list_data_paths,
-    )
+    tags((name = "groups", description = "Group management operations"))
 )]
 pub struct GroupsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/groups", post(create_group))
-        .route("/groups", get(list_groups))
-        .route("/groups/{id}", get(get_group))
-        .route("/groups/{id}/usage", get(get_group_usage))
-        .route("/groups/{id}/data-paths", get(list_data_paths))
-        .route(
-            "/groups/{id}/members",
-            get(list_group_members).post(add_group_member),
-        )
-        .route(
-            "/groups/{id}/members/{user_id}",
-            delete(remove_group_member),
-        )
-        .route("/groups/{id}/leave", post(leave_group))
-        .route("/groups/{id}/roles", post(create_group_role))
-        .route("/groups/{id}/roles/{role_id}", delete(delete_group_role))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(GroupsApiDoc::openapi())
+        .routes(routes!(create_group, list_groups))
+        .routes(routes!(get_group))
+        .routes(routes!(get_group_usage))
+        .routes(routes!(list_data_paths))
+        .routes(routes!(list_group_members, add_group_member))
+        .routes(routes!(remove_group_member))
+        .routes(routes!(leave_group))
+        .routes(routes!(create_group_role))
+        .routes(routes!(delete_group_role))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

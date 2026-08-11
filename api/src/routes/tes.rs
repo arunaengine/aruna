@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use super::routes_at;
 use aruna_core::compute::{
     has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
@@ -22,13 +23,14 @@ use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOpe
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
 use crate::error::ServerError;
@@ -52,7 +54,6 @@ const MAX_TASK_IO: usize = 512;
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "tes", description = "GA4GH TES v1.1 task execution facade")),
-    paths(service_info, create_task, list_tasks, get_task, cancel_task),
     components(schemas(
         TesServiceInfo,
         TesServiceType,
@@ -74,11 +75,16 @@ const MAX_TASK_IO: usize = 512;
 )]
 pub struct TesApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/ga4gh/tes/v1/service-info", get(service_info))
-        .route("/ga4gh/tes/v1/tasks", get(list_tasks).post(create_task))
-        .route("/ga4gh/tes/v1/tasks/{id}", get(get_task).post(cancel_task))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    routes_at(
+        OpenApiRouter::with_openapi(TesApiDoc::openapi())
+            .routes(routes!(service_info))
+            .routes(routes!(list_tasks, create_task))
+            .routes(routes!(get_task)),
+        // The `:cancel` action suffix is parsed out of `{id}` by the handler.
+        "/ga4gh/tes/v1/tasks/{id}",
+        routes!(cancel_task),
+    )
 }
 
 // ---------------------------------------------------------------------------

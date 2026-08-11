@@ -8,15 +8,16 @@
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use axum::routing::get;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use aruna_core::structs::{MetadataRegistryRecord, RealmId};
 use aruna_operations::driver::DriverContext;
@@ -62,8 +63,14 @@ const OAI_PMH_OPEN: &str = concat!(
     "http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd\">"
 );
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route(OAI_PATH, get(handle_oai).post(handle_oai_post))
+#[derive(OpenApi)]
+#[openapi(
+    tags((name = "oai", description = "OAI-PMH 2.0 metadata harvesting"))
+)]
+pub struct OaiApiDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(OaiApiDoc::openapi()).routes(routes!(handle_oai, handle_oai_post))
 }
 
 /// The six protocol arguments, already validated against the verb's matrix.
@@ -94,6 +101,26 @@ fn protocol(code: &'static str, message: impl Into<String>) -> OaiFault {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/oai",
+    tag = "oai",
+    params(
+        ("verb" = Option<String>, Query, description = "OAI-PMH verb: Identify, ListMetadataFormats, ListSets, ListIdentifiers, ListRecords or GetRecord"),
+        ("metadataPrefix" = Option<String>, Query, description = "Requested metadata format; only oai_dc is disseminated"),
+        ("identifier" = Option<String>, Query, description = "Record identifier, the document graph IRI https://w3id.org/aruna/{document_id}"),
+        ("from" = Option<String>, Query, description = "Inclusive lower datestamp bound, YYYY-MM-DDThh:mm:ssZ"),
+        ("until" = Option<String>, Query, description = "Inclusive upper datestamp bound, YYYY-MM-DDThh:mm:ssZ"),
+        ("set" = Option<String>, Query, description = "Set spec; this repository answers noSetHierarchy"),
+        ("resumptionToken" = Option<String>, Query, description = "Continuation token returned by a previous incomplete list")
+    ),
+    responses(
+        (status = 200, description = "OAI-PMH envelope", body = String, content_type = "text/xml"),
+        (status = 500, description = "Internal error"),
+        (status = 503, description = "Visibility index unavailable")
+    ),
+    security(())
+)]
 async fn handle_oai(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -105,6 +132,22 @@ async fn handle_oai(
     dispatch(state, base_url, pairs).await
 }
 
+#[utoipa::path(
+    post,
+    path = "/oai",
+    tag = "oai",
+    request_body(
+        content = String,
+        content_type = "application/x-www-form-urlencoded",
+        description = "The same OAI-PMH arguments as the GET form, url-encoded"
+    ),
+    responses(
+        (status = 200, description = "OAI-PMH envelope", body = String, content_type = "text/xml"),
+        (status = 500, description = "Internal error"),
+        (status = 503, description = "Visibility index unavailable")
+    ),
+    security(())
+)]
 async fn handle_oai_post(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,

@@ -17,8 +17,7 @@ use aruna_operations::group_backends::query::{
 use aruna_operations::group_backends::replace::ReplaceGroupBackendOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -26,45 +25,28 @@ use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
     tags((
         name = "storage-backends",
         description = "Tenant-registered write backends on a group's own object storage"
-    )),
-    paths(
-        create_group_backend,
-        list_group_backends,
-        get_group_backend,
-        replace_group_backend,
-        delete_group_backend,
-        enable_group_backend,
-        backend_reclaim_status
-    )
+    ))
 )]
 pub struct GroupBackendsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/groups/{group_id}/storage-backends",
-            post(create_group_backend).get(list_group_backends),
-        )
-        .route(
-            "/groups/{group_id}/storage-backends/{backend_id}",
-            get(get_group_backend)
-                .put(replace_group_backend)
-                .delete(delete_group_backend),
-        )
-        .route(
-            "/groups/{group_id}/storage-backends/{backend_id}/enable",
-            post(enable_group_backend),
-        )
-        .route(
-            "/groups/{group_id}/storage-backends/{backend_id}/reclaim-status",
-            get(backend_reclaim_status),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(GroupBackendsApiDoc::openapi())
+        .routes(routes!(create_group_backend, list_group_backends))
+        .routes(routes!(
+            get_group_backend,
+            replace_group_backend,
+            delete_group_backend
+        ))
+        .routes(routes!(enable_group_backend))
+        .routes(routes!(backend_reclaim_status))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]

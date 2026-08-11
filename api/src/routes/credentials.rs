@@ -14,32 +14,26 @@ use aruna_operations::s3::list_user_access::{ListUserAccessInput, ListUserAccess
 use aruna_operations::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use std::{str::FromStr, sync::Arc};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "credentials", description = "User credential management")),
-    paths(list_s3_credentials, create_s3_credentials, revoke_s3_credentials)
+    tags((name = "credentials", description = "User credential management"))
 )]
 pub struct CredentialsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/users/credentials",
-            get(list_s3_credentials).post(create_s3_credentials),
-        )
-        .route(
-            "/users/credentials/{access_key_id}",
-            delete(revoke_s3_credentials),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(CredentialsApiDoc::openapi())
+        .routes(routes!(list_s3_credentials, create_s3_credentials))
+        .routes(routes!(revoke_s3_credentials))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

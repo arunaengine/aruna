@@ -31,8 +31,7 @@ use aruna_operations::sync_relationship::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
@@ -42,22 +41,20 @@ use std::time::SystemTime;
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "sync", description = "S3 bucket synchronization")),
-    paths(create_sync, list_sync, get_sync, update_sync, run_sync, delete_sync)
+    tags((name = "sync", description = "S3 bucket synchronization"))
 )]
 pub struct SyncApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/data/sync-relationships", post(create_sync).get(list_sync))
-        .route(
-            "/data/sync-relationships/{id}",
-            get(get_sync).patch(update_sync).delete(delete_sync),
-        )
-        .route("/data/sync-relationships/{id}/run", post(run_sync))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(SyncApiDoc::openapi())
+        .routes(routes!(create_sync, list_sync))
+        .routes(routes!(get_sync, update_sync, delete_sync))
+        .routes(routes!(run_sync))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]

@@ -49,8 +49,7 @@ use aruna_operations::update_metadata_document::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,6 +59,8 @@ use std::time::Instant;
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use super::jobs::{job_urls, map_submit_error};
 
@@ -77,62 +78,27 @@ use std::time::Duration;
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "metadata", description = "Metadata RO-Crate and SPARQL operations")),
-    components(schemas(MetadataRoCrateView)),
-    paths(
-        create_metadata_document,
-        list_all_metadata_documents,
-        list_metadata_documents,
-        get_metadata_path,
-        get_metadata_document,
-        delete_metadata_document,
-        search_metadata,
-        metadata_references,
-        export_metadata_rocrate,
-        submit_rocrate_export,
-        replace_metadata_rocrate,
-        add_metadata_data_entity,
-        add_metadata_contextual_entity,
-        query_metadata_document,
-        query_all_metadata
-    )
+    components(schemas(MetadataRoCrateView))
 )]
 pub struct MetadataApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/metadata",
-            get(list_all_metadata_documents).post(create_metadata_document),
-        )
-        .route("/metadata/search", get(search_metadata))
-        .route("/metadata/references", get(metadata_references))
-        .route("/metadata/sparql/query", post(query_all_metadata))
-        .route("/groups/{group_id}/metadata", get(list_metadata_documents))
-        .route("/groups/{group_id}/metadata/path", get(get_metadata_path))
-        .route(
-            "/metadata/{document_id}",
-            get(get_metadata_document).delete(delete_metadata_document),
-        )
-        .route(
-            "/metadata/{document_id}/rocrate",
-            get(export_metadata_rocrate).put(replace_metadata_rocrate),
-        )
-        .route(
-            "/metadata/{document_id}/rocrate/exports",
-            post(submit_rocrate_export),
-        )
-        .route(
-            "/metadata/{document_id}/rocrate/data-entities",
-            post(add_metadata_data_entity),
-        )
-        .route(
-            "/metadata/{document_id}/rocrate/contextual-entities",
-            post(add_metadata_contextual_entity),
-        )
-        .route(
-            "/metadata/{document_id}/sparql/query",
-            post(query_metadata_document),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(MetadataApiDoc::openapi())
+        .routes(routes!(
+            list_all_metadata_documents,
+            create_metadata_document
+        ))
+        .routes(routes!(search_metadata))
+        .routes(routes!(metadata_references))
+        .routes(routes!(query_all_metadata))
+        .routes(routes!(list_metadata_documents))
+        .routes(routes!(get_metadata_path))
+        .routes(routes!(get_metadata_document, delete_metadata_document))
+        .routes(routes!(export_metadata_rocrate, replace_metadata_rocrate))
+        .routes(routes!(submit_rocrate_export))
+        .routes(routes!(add_metadata_data_entity))
+        .routes(routes!(add_metadata_contextual_entity))
+        .routes(routes!(query_metadata_document))
 }
 
 /// Public metadata registry summary.
@@ -3396,7 +3362,7 @@ mod tests {
 
     #[test]
     fn metadata_openapi_includes_examples_and_public_field_names() {
-        let openapi = serde_json::to_value(MetadataApiDoc::openapi()).unwrap();
+        let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
 
         assert_eq!(
             openapi["components"]["schemas"]["MetadataRoCrateView"]["type"],

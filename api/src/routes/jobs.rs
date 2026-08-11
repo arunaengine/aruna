@@ -24,14 +24,15 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
@@ -51,29 +52,17 @@ const MAX_INPUTS: usize = 512;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "jobs", description = "Durable background jobs")),
-    paths(
-        list_jobs,
-        get_job,
-        cancel_job,
-        submit_job,
-        get_job_report,
-        get_job_artifact,
-        head_job_artifact
-    )
+    tags((name = "jobs", description = "Durable background jobs"))
 )]
 pub struct JobsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/jobs/", get(list_jobs).post(submit_job))
-        .route("/jobs/{job_id}", get(get_job))
-        .route("/jobs/{job_id}/cancel", post(cancel_job))
-        .route("/jobs/{job_id}/report", get(get_job_report))
-        .route(
-            "/jobs/{job_id}/artifacts/rocrate",
-            get(get_job_artifact).head(head_job_artifact),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(JobsApiDoc::openapi())
+        .routes(routes!(list_jobs, submit_job))
+        .routes(routes!(get_job))
+        .routes(routes!(cancel_job))
+        .routes(routes!(get_job_report))
+        .routes(routes!(get_job_artifact, head_job_artifact))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1619,7 +1608,7 @@ mod tests {
 
     #[test]
     fn report_openapi_union() {
-        let openapi = serde_json::to_value(JobsApiDoc::openapi()).unwrap();
+        let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
         let schema = &openapi["paths"]["/jobs/{job_id}/report"]["get"]["responses"]["404"]["content"]
             ["application/json"]["schema"];
         assert_eq!(

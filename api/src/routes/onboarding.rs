@@ -28,8 +28,7 @@ use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
 use aruna_operations::reserve_onboarding_secret::ReserveOnboardingSecretError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine;
 use crypto_box::{
     PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
@@ -41,30 +40,22 @@ use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const DEFAULT_ONBOARDING_SECRET_TTL_SECS: u64 = 3600;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "onboarding", description = "Node onboarding and bootstrap operations")),
-    paths(
-        create_onboarding_secret,
-        list_onboarding_secrets,
-        revoke_onboarding_secret,
-        bootstrap_onboarding
-    )
+    tags((name = "onboarding", description = "Node onboarding and bootstrap operations"))
 )]
 pub struct OnboardingApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/onboarding/bootstrap", post(bootstrap_onboarding))
-        .route("/admin/onboarding/secrets", post(create_onboarding_secret))
-        .route("/admin/onboarding/secrets", get(list_onboarding_secrets))
-        .route(
-            "/admin/onboarding/secrets/{id}",
-            delete(revoke_onboarding_secret),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(OnboardingApiDoc::openapi())
+        .routes(routes!(bootstrap_onboarding))
+        .routes(routes!(create_onboarding_secret, list_onboarding_secrets))
+        .routes(routes!(revoke_onboarding_secret))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]

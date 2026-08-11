@@ -38,13 +38,14 @@ use aruna_operations::staging::list_source::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::time::timeout;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const CONNECTOR_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_ENTRY_LIMIT: usize = 200;
@@ -52,44 +53,21 @@ const MAX_ENTRY_LIMIT: usize = 1000;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "connectors", description = "External source connector registration")),
-    paths(
-        create_source_connector,
-        list_source_connectors,
-        get_source_connector,
-        replace_source_connector,
-        delete_source_connector,
-        check_source_connector,
-        check_stored_connector,
-        list_connector_entries
-    )
+    tags((name = "connectors", description = "External source connector registration"))
 )]
 pub struct ConnectorsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/groups/{group_id}/connectors/check",
-            post(check_source_connector),
-        )
-        .route(
-            "/groups/{group_id}/connectors",
-            post(create_source_connector).get(list_source_connectors),
-        )
-        .route(
-            "/groups/{group_id}/connectors/{connector_id}",
-            get(get_source_connector)
-                .put(replace_source_connector)
-                .delete(delete_source_connector),
-        )
-        .route(
-            "/groups/{group_id}/connectors/{connector_id}/check",
-            post(check_stored_connector),
-        )
-        .route(
-            "/groups/{group_id}/connectors/{connector_id}/entries",
-            get(list_connector_entries),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(ConnectorsApiDoc::openapi())
+        .routes(routes!(check_source_connector))
+        .routes(routes!(create_source_connector, list_source_connectors))
+        .routes(routes!(
+            get_source_connector,
+            replace_source_connector,
+            delete_source_connector
+        ))
+        .routes(routes!(check_stored_connector))
+        .routes(routes!(list_connector_entries))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]

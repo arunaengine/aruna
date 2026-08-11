@@ -15,37 +15,26 @@ use aruna_operations::s3::bucket_routing::{
 };
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "storage-routing", description = "Write routing rules for buckets and groups")),
-    paths(
-        get_bucket_routing,
-        put_bucket_routing,
-        get_group_routing,
-        put_group_routing
-    )
+    tags((name = "storage-routing", description = "Write routing rules for buckets and groups"))
 )]
 pub struct StorageRoutingApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/buckets/{bucket}/storage-routing",
-            get(get_bucket_routing).put(put_bucket_routing),
-        )
-        .route(
-            "/groups/{group_id}/storage-routing",
-            get(get_group_routing).put(put_group_routing),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(StorageRoutingApiDoc::openapi())
+        .routes(routes!(get_bucket_routing, put_bucket_routing))
+        .routes(routes!(get_group_routing, put_group_routing))
 }
 
 /// A rule target names either a group storage backend or a storage class, and

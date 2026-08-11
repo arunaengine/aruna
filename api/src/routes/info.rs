@@ -31,8 +31,7 @@ use aruna_operations::usage_stats::{LoadUsageCountersOperation, RealmUsageScope}
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
-use axum::routing::{get, put};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -40,31 +39,22 @@ use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "info", description = "Node information endpoints")),
-    paths(
-        get_info,
-        get_realm_info,
-        get_realm_placement,
-        mutate_realm_placement,
-        set_realm_quota,
-        get_usage
-    )
+    tags((name = "info", description = "Node information endpoints"))
 )]
 pub struct InfoApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/info", get(get_info))
-        .route("/info/realm", get(get_realm_info))
-        .route(
-            "/info/realm/placement",
-            get(get_realm_placement).patch(mutate_realm_placement),
-        )
-        .route("/info/realm/quota", put(set_realm_quota))
-        .route("/info/usage", get(get_usage))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(InfoApiDoc::openapi())
+        .routes(routes!(get_info))
+        .routes(routes!(get_realm_info))
+        .routes(routes!(get_realm_placement, mutate_realm_placement))
+        .routes(routes!(set_realm_quota))
+        .routes(routes!(get_usage))
 }
 
 /// Node information. `node.status`, `node.realm_id` and `api_version` are public:

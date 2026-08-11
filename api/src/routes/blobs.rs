@@ -20,8 +20,7 @@ use aruna_operations::replication::version_replication::{
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -31,18 +30,19 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "blobs", description = "Blob management and replication")),
-    paths(replicate_blob, blob_locations)
+    tags((name = "blobs", description = "Blob management and replication"))
 )]
 pub struct BlobsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/blobs/replicate", post(replicate_blob))
-        .route("/blobs/locations", get(blob_locations))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(BlobsApiDoc::openapi())
+        .routes(routes!(replicate_blob))
+        .routes(routes!(blob_locations))
 }
 
 /// Replication targets are few and operator-controlled, so the fan-out stays

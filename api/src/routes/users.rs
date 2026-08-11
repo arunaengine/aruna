@@ -34,8 +34,7 @@ use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,33 +42,24 @@ use std::sync::Arc;
 use tracing::error;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "users", description = "User operations")),
-    paths(
-        register_user,
-        get_token,
-        get_user_info,
-        patch_user_info,
-        list_users,
-        search_users,
-        resolve_users,
-        get_user,
-        update_user,
-    )
+    tags((name = "users", description = "User operations"))
 )]
 pub struct UsersApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/users/register", post(register_user))
-        .route("/users/token", get(get_token))
-        .route("/users/info", get(get_user_info).patch(patch_user_info))
-        .route("/users", get(list_users))
-        .route("/users/search", get(search_users))
-        .route("/users/resolve", post(resolve_users))
-        .route("/users/{id}", get(get_user).patch(update_user))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(UsersApiDoc::openapi())
+        .routes(routes!(register_user))
+        .routes(routes!(get_token))
+        .routes(routes!(get_user_info, patch_user_info))
+        .routes(routes!(list_users))
+        .routes(routes!(search_users))
+        .routes(routes!(resolve_users))
+        .routes(routes!(get_user, update_user))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
