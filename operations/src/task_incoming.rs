@@ -871,6 +871,9 @@ impl OperationsTaskHandler {
             }
             self.reschedule_with_backoff(retry_key).await;
         } else if closed.deferred > 0 {
+            if closed.deleted > 0 {
+                self.reset_backoff(&retry_key);
+            }
             self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
                 .await;
         } else {
@@ -1390,9 +1393,8 @@ impl OperationsTaskHandler {
         }
 
         if invocation.outcome.retry_needed || invocation.read_failed {
-            rotation.continuations = 0;
-            self.store_rotation(rotation);
-            self.reschedule_with_backoff(retry_key).await;
+            self.finish_retry(retry_key, rotation, invocation.reached_end)
+                .await;
         } else if unvisited {
             if rotation.continuations < self.outbox_limits.continuation_streak {
                 rotation.continuations = rotation.continuations.saturating_add(1);
@@ -1407,6 +1409,21 @@ impl OperationsTaskHandler {
             }
         } else {
             self.close_rotation(retry_key, rotation).await;
+        }
+    }
+
+    async fn finish_retry(
+        &self,
+        retry_key: TaskKey,
+        mut rotation: OutboxRotation,
+        reached_end: bool,
+    ) {
+        rotation.continuations = 0;
+        if reached_end {
+            self.close_rotation(retry_key, rotation).await;
+        } else {
+            self.store_rotation(rotation);
+            self.reschedule_with_backoff(retry_key).await;
         }
     }
 
@@ -2809,6 +2826,71 @@ mod tests {
         assert_eq!(stored.state, JobState::Queued);
     }
 
+    #[tokio::test]
+    async fn start_keeps_job() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let job_id = job_id();
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([2u8; 32])),
+            node(7),
+            1,
+            1,
+            None,
+        );
+        insert_job(&storage, &record).await.expect("insert job");
+        assert!(matches!(
+            claim_job(&storage, job_id, node(7), 2).await,
+            Ok(ClaimOutcome::Claimed(_))
+        ));
+        let runtime = JobsRuntime::new_paused();
+
+        let queues = initialize_task_holder(
+            context,
+            task_handle.clone(),
+            runtime.clone(),
+            RoCrateLimits::default(),
+        )
+        .await;
+        let shutdown = Shutdown::new();
+        queues.start(&shutdown).await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .expect("read job")
+            .expect("job exists");
+        assert_eq!(stored.state, JobState::Claimed);
+        assert!(!runtime.is_started());
+
+        let requested = Duration::from_secs(7200);
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_timer_if_idle(TaskKey::DrainJobQueue, requested)
+            .await
+        else {
+            panic!("expected timer schedule event");
+        };
+        assert_eq!(after, requested, "job queue timer must remain unscheduled");
+        assert!(shutdown.drain(Duration::from_secs(30)).await);
+    }
+
     fn target() -> DocumentSyncTarget {
         DocumentSyncTarget::Group {
             group_id: Ulid::from_parts(7, 1),
@@ -3151,6 +3233,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn close_routes_defer() {
         let (_dir, handler, task_handle) = outbox_handler();
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        handler
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .insert(key.clone(), 3);
         let rotation = OutboxRotation {
             totals: RotationTotals {
                 deferred: 2,
@@ -3161,13 +3249,19 @@ mod tests {
             ..OutboxRotation::default()
         };
 
-        handler
-            .close_rotation(TaskKey::DrainDocumentSyncOutbox, rotation)
-            .await;
+        handler.close_rotation(key.clone(), rotation).await;
 
         assert_eq!(
             scheduled_after(&task_handle).await,
             DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        );
+        assert!(
+            !handler
+                .retry_backoff
+                .lock()
+                .expect("retry backoff mutex poisoned")
+                .contains_key(&key),
+            "progress in the clean suffix resets failure backoff"
         );
     }
 
@@ -3213,6 +3307,8 @@ mod tests {
             .insert(key.clone(), 3);
         let rotation = OutboxRotation {
             totals: RotationTotals {
+                // A retry on an early page followed by a clean suffix made
+                // progress, so the next retry returns to the base interval.
                 deleted: 1,
                 retry_invocations: 1,
                 invocations: 2,
@@ -3227,6 +3323,43 @@ mod tests {
             scheduled_after(&task_handle).await,
             Duration::from_millis(250)
         );
+        assert_eq!(
+            handler
+                .retry_backoff
+                .lock()
+                .expect("retry backoff mutex poisoned")
+                .get(&key),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_suffix_closes() {
+        let (_dir, handler, task_handle) = outbox_handler();
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        // The first page retried; a clean suffix made progress before the
+        // rotation reached its observed high-water boundary.
+        let rotation = OutboxRotation {
+            boundary: Some(b"last".to_vec()),
+            cursor: Some(b"first".to_vec()),
+            totals: RotationTotals {
+                deleted: 1,
+                retry_invocations: 1,
+                invocations: 2,
+                ..RotationTotals::default()
+            },
+            ..OutboxRotation::default()
+        };
+
+        handler.finish_retry(key.clone(), rotation, true).await;
+
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            Duration::from_millis(250)
+        );
+        let rotation = handler.rotation.lock().expect("rotation lock");
+        assert!(rotation.boundary.is_none());
+        assert!(rotation.cursor.is_none());
         assert_eq!(
             handler
                 .retry_backoff
@@ -3298,8 +3431,8 @@ mod tests {
     // A full first page of records for a genesis-less shard topic (all deferred)
     // must not starve records for other topics behind it in the FIFO: the drain
     // pages the whole outbox per run, so a later-page record still publishes.
-    #[tokio::test]
-    async fn drain_paginates_past_a_deferred_head_page_to_publish_later_records() {
+    #[tokio::test(start_paused = true)]
+    async fn deferred_head_paginates() {
         let realm_id = RealmId::from_bytes([44u8; 32]);
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -3316,12 +3449,13 @@ mod tests {
         )
         .await
         .expect("net handle");
+        let task_handle = TaskHandle::new();
         let context = Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
-            task_handle: Some(TaskHandle::new()),
+            task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
 
@@ -3412,6 +3546,11 @@ mod tests {
             OUTBOX_DRAIN_BATCH_SIZE,
             "every deferred record is retained for the next run"
         );
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            DOCUMENT_SYNC_DEFER_RETRY_AFTER,
+            "an early defer followed by a clean suffix keeps the aggregate retry"
+        );
 
         net.shutdown().await;
     }
@@ -3434,12 +3573,13 @@ mod tests {
         )
         .await
         .expect("net handle");
+        let task_handle = TaskHandle::new();
         let context = Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
-            task_handle: None,
+            task_handle: Some(task_handle),
             compute_handle: None,
         });
         let placed_change = || {
@@ -3478,6 +3618,13 @@ mod tests {
             .await;
         }
 
+        let initial_delete = make_record(
+            0,
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            DocumentSyncOutboxEvent::Delete { change: change() },
+        );
+        write_outbox_record(&storage, &initial_delete).await;
+
         let handler =
             OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 2, 1);
         handler.drain_document_sync_outbox().await;
@@ -3502,6 +3649,16 @@ mod tests {
         );
         let appended_key = outbox_key(&appended).to_vec();
         write_outbox_record(&storage, &appended).await;
+        let appended_upsert = make_record(
+            5,
+            target(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"appended-upsert".to_vec(),
+                change: placed_change(),
+            },
+        );
+        let appended_upsert_key = outbox_key(&appended_upsert).to_vec();
+        write_outbox_record(&storage, &appended_upsert).await;
 
         handler.drain_document_sync_outbox().await;
         {
@@ -3517,6 +3674,27 @@ mod tests {
                 .expect("read appended record"),
             Some(appended),
             "records appended after the boundary wait for the next rotation"
+        );
+        assert_eq!(
+            read_outbox_record(&storage, &appended_upsert_key)
+                .await
+                .expect("read appended upsert"),
+            Some(appended_upsert),
+            "appended records from the boundary stream wait for the next rotation"
+        );
+
+        let shard_topic = target().sync_topic_id(realm_id, &placed_change().placement);
+        net.ensure_document_sync_topics(&[shard_topic], Vec::new())
+            .expect("blocked head topic genesis");
+        for _ in 0..6 {
+            handler.drain_document_sync_outbox().await;
+        }
+        let remaining = read_outbox_records(&storage, &[], None, 8)
+            .await
+            .expect("read retried records");
+        assert!(
+            remaining.records.is_empty(),
+            "blocked head and records across all streams must retry after the rotation closes"
         );
 
         net.shutdown().await;
