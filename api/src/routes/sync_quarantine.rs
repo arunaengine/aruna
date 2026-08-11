@@ -204,7 +204,7 @@ fn event_summary(event: &DocumentSyncEvent) -> String {
                         "target": "RealmConfig { realm_id: RealmId(AAECAwQF...) }",
                         "origin_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                         "reason": "unauthorized",
-                        "quarantined_at_ms": 1775744591123,
+                        "quarantined_at_ms": 1775744591123_i64,
                         "acknowledged": false,
                         "event_bytes": 412
                     }
@@ -262,7 +262,7 @@ pub async fn list_quarantine(
                     "target": "RealmConfig { realm_id: RealmId(AAECAwQF...) }",
                     "origin_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                     "reason": "unauthorized",
-                    "quarantined_at_ms": 1775744591123,
+                    "quarantined_at_ms": 1775744591123_i64,
                     "acknowledged": false,
                     "event_bytes": 412
                 },
@@ -319,7 +319,7 @@ pub async fn inspect_quarantine(
                 "target": "RealmConfig { realm_id: RealmId(AAECAwQF...) }",
                 "origin_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                 "reason": "unauthorized",
-                "quarantined_at_ms": 1775744591123,
+                "quarantined_at_ms": 1775744591123_i64,
                 "acknowledged": true,
                 "event_bytes": 412
             })

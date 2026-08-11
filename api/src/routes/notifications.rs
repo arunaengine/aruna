@@ -494,7 +494,7 @@ async fn canonicalize_watch_path(
                         "category": "group.membership",
                         "kind": "added_to_group",
                         "class": "direct",
-                        "created_at_ms": 1775744591123,
+                        "created_at_ms": 1775744591123_i64,
                         "read": false,
                         "group_id": "01JGRP000123456789ABCDEFGH",
                         "actor_user_id": "01JACTR00123456789ABCDEFGH"
@@ -504,7 +504,7 @@ async fn canonicalize_watch_path(
                         "category": "resource.watch",
                         "kind": "data_uploaded",
                         "class": "transient",
-                        "created_at_ms": 1775744501001,
+                        "created_at_ms": 1775744501001_i64,
                         "read": true,
                         "group_id": "01JGRP000123456789ABCDEFGH",
                         "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
@@ -966,7 +966,7 @@ pub async fn stream_notifications(
     request_body(
         content = MarkReadApiRequest,
         description = "Notifications to mark read, by id, by age, or both; at most 512 ids, duplicates are collapsed",
-        example = json!({"ids": ["01JABCDEF0123456789ABCDEFG"], "up_to_ms": 1775744591123})
+        example = json!({"ids": ["01JABCDEF0123456789ABCDEFG"], "up_to_ms": 1775744591123_i64})
     ),
     responses(
         (
@@ -1028,7 +1028,7 @@ pub async fn mark_read(
                         "id": "01JWATCH0123456789ABCDEFGH",
                         "path_prefix": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/",
                         "events": ["data_uploaded"],
-                        "created_at_ms": 1775744591123
+                        "created_at_ms": 1775744591123_i64
                     }
                 ]
             })
@@ -1077,7 +1077,7 @@ pub async fn list_watches(
                 "id": "01JWATCH0123456789ABCDEFGH",
                 "path_prefix": "s3/01JGRP000123456789ABCDEFGH/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/reads/run-42/",
                 "events": ["data_uploaded"],
-                "created_at_ms": 1775744591123
+                "created_at_ms": 1775744591123_i64
             })
         ),
         (status = 400, description = "Invalid or non-canonical path prefix, prefix longer than 1024 bytes, empty event list, or invalid event name", body = ErrorResponse),

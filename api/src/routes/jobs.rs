@@ -583,7 +583,7 @@ pub async fn list_jobs(
             "command": ["fastqc", "--outdir", "/outputs", "/inputs/reads.fastq"],
             "env": {"FASTQC_THREADS": "2"},
             "cpu_cores": 2,
-            "ram_bytes": 4294967296,
+            "ram_bytes": 4294967296_i64,
             "max_walltime_ms": 3600000,
             "inputs": [
                 {"bucket": "project-data", "key": "raw/reads.fastq", "dest_key": "reads.fastq"}

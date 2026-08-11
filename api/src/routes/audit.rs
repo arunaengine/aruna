@@ -114,7 +114,7 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
                                 "user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                                 "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                                 "operation": "upsert_data_entity",
-                                "occurred_at_ms": 1775744591123,
+                                "occurred_at_ms": 1775744591123_i64,
                                 "details": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#data/reads.fastq"
                             }
                         ],
@@ -134,7 +134,7 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
                                 "user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                                 "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
                                 "operation": "create",
-                                "occurred_at_ms": 1775744591123
+                                "occurred_at_ms": 1775744591123_i64
                             }
                         ],
                         "partial": true,

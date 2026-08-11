@@ -694,20 +694,20 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
                 "buckets": 3,
                 "objects": 1284,
                 "stored_blobs": 1190,
-                "stored_bytes": 87412338176,
-                "logical_bytes": 91002113024,
-                "referenced_bytes": 91002113024,
+                "stored_bytes": 87412338176_i64,
+                "logical_bytes": 91002113024_i64,
+                "referenced_bytes": 91002113024_i64,
                 "realm": {
                     "buckets": 5,
                     "objects": 2048,
                     "stored_blobs": 1902,
-                    "stored_bytes": 140733193388,
-                    "logical_bytes": 152882105100,
-                    "referenced_bytes": 152882105100
+                    "stored_bytes": 140733193388_i64,
+                    "logical_bytes": 152882105100_i64,
+                    "referenced_bytes": 152882105100_i64
                 },
                 "quota": {
-                    "quota_bytes": 214748364800,
-                    "ceiling_bytes": 236223201280,
+                    "quota_bytes": 214748364800_i64,
+                    "ceiling_bytes": 236223201280_i64,
                     "warn_threshold_percent": 80,
                     "warning": false
                 }

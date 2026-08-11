@@ -434,7 +434,7 @@ pub async fn create_sync(
                         "state": "enabled",
                         "status": {
                             "last_synced_at": "2026-04-09T15:02:44.907+00:00",
-                            "counters": {"versions_synced": 128, "bytes_synced": 4294967296, "failures": 0, "consecutive_failures": 0}
+                            "counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}
                         }
                     }
                 ],
@@ -527,7 +527,7 @@ pub async fn list_sync(
                     "state": "enabled",
                     "status": {
                         "last_synced_at": "2026-04-09T15:02:44.907+00:00",
-                        "counters": {"versions_synced": 128, "bytes_synced": 4294967296, "failures": 0, "consecutive_failures": 0}
+                        "counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}
                     }
                 },
                 "pending_jobs": 1,
@@ -591,7 +591,7 @@ pub async fn get_sync(
                 "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "state": "enabled",
-                "status": {"counters": {"versions_synced": 128, "bytes_synced": 4294967296, "failures": 0, "consecutive_failures": 0}}
+                "status": {"counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}}
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the relationship is in reference mode and the request asked for anything other than preserve", body = ErrorResponse),

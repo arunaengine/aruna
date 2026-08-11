@@ -895,9 +895,9 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
                                         "storage_bytes_used": 1073741824,
                                         "documents_held": 128,
                                         "load_permille": 120,
-                                        "heartbeat_at_ms": 1775744591123
+                                        "heartbeat_at_ms": 1775744591123_i64
                                     },
-                                    "updated_at_ms": 1775744591123
+                                    "updated_at_ms": 1775744591123_i64
                                 }
                             },
                             {
@@ -911,7 +911,7 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
                             }
                         ],
                         "quota": {
-                            "default_group_quota_bytes": 10737418240,
+                            "default_group_quota_bytes": 10737418240_i64,
                             "grace_factor_percent": 110,
                             "warn_threshold_percent": 80,
                             "group_overrides": [],
@@ -1331,11 +1331,11 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         content = RealmQuotaConfig,
         description = "The complete quota policy to store; it replaces the current one, including all override lists",
         example = json!({
-            "default_group_quota_bytes": 10737418240,
+            "default_group_quota_bytes": 10737418240_i64,
             "grace_factor_percent": 110,
             "warn_threshold_percent": 80,
             "group_overrides": [
-                {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400, "grace_factor_percent": 120}
+                {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120}
             ],
             "max_groups_per_user": 10,
             "user_group_cap_overrides": [
@@ -1350,11 +1350,11 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
             description = "The quota policy now stored in the realm configuration",
             body = RealmQuotaConfig,
             example = json!({
-                "default_group_quota_bytes": 10737418240,
+                "default_group_quota_bytes": 10737418240_i64,
                 "grace_factor_percent": 110,
                 "warn_threshold_percent": 80,
                 "group_overrides": [
-                    {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400, "grace_factor_percent": 120}
+                    {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120}
                 ],
                 "max_groups_per_user": 10,
                 "user_group_cap_overrides": [
@@ -1535,15 +1535,15 @@ pub async fn load_realm_usage(
                 "objects": 128,
                 "stored_blobs": 130,
                 "stored_bytes": 1073741824,
-                "logical_bytes": 1099511627776,
-                "referenced_bytes": 2147483648,
+                "logical_bytes": 1099511627776_i64,
+                "referenced_bytes": 2147483648_i64,
                 "realm": {
                     "buckets": 12,
                     "objects": 512,
                     "stored_blobs": 530,
-                    "stored_bytes": 4294967296,
-                    "logical_bytes": 4398046511104,
-                    "referenced_bytes": 8589934592
+                    "stored_bytes": 4294967296_i64,
+                    "logical_bytes": 4398046511104_i64,
+                    "referenced_bytes": 8589934592_i64
                 },
                 "metadata_documents": 4096
             })

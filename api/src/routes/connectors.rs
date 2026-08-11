@@ -784,7 +784,7 @@ pub async fn check_stored_connector(
                         "path": "datasets/manifest.tsv",
                         "kind": "file",
                         "size": 20480,
-                        "modified_ms": 1775744591123
+                        "modified_ms": 1775744591123_i64
                     }
                 ],
                 "truncated": false
