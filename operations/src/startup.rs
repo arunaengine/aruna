@@ -1079,9 +1079,11 @@ mod tests {
                 .all(|unit| unit.topics.len() <= SHARD_RESTORE_CHUNK_TOPICS),
             "a work unit must never exceed its topic chunk"
         );
+        // Grouping keeps a restart at one unit per topic chunk, never one per
+        // held shard.
         assert!(
-            units.len() > SHARD_RESTORE_UNIT_BUDGET,
-            "the fixture must need more than one pass, got {} units",
+            units.len() < held,
+            "{} units for {held} held shards is not batched",
             units.len()
         );
     }
