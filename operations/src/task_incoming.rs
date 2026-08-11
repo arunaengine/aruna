@@ -24,6 +24,40 @@ use byteview::ByteView;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+#[cfg(debug_assertions)]
+struct OutboxBarrier {
+    marker: std::path::PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl OutboxBarrier {
+    fn new() -> Option<Self> {
+        let marker = std::env::var("ARUNA_TEST_OUTBOX_BARRIER")
+            .ok()
+            .map(std::path::PathBuf::from)?;
+        let barrier = Self { marker };
+        if let Err(error) = std::fs::write(&barrier.marker, b"active") {
+            warn!(error = %error, "Failed to arm outbox test barrier");
+            return None;
+        }
+        Some(barrier)
+    }
+
+    async fn wait_start(&self) {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for OutboxBarrier {
+    fn drop(&mut self) {
+        info!(event = "test.outbox.joined", "Outbox drain joined");
+        if let Err(error) = std::fs::write(&self.marker, b"joined") {
+            warn!(error = %error, "Failed to record outbox join");
+        }
+    }
+}
+
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
@@ -886,6 +920,15 @@ impl OperationsTaskHandler {
     /// overwritten to satisfy a bound.
     async fn drain_document_sync_outbox(&self) {
         let _drain = self.drain_guard.lock().await;
+        #[cfg(debug_assertions)]
+        if let Some(barrier) = OutboxBarrier::new() {
+            barrier.wait_start().await;
+        }
+
+        self.run_drain().await;
+    }
+
+    async fn run_drain(&self) {
         let retry_key = TaskKey::DrainDocumentSyncOutbox;
         let drain_started = Instant::now();
 
@@ -2737,6 +2780,101 @@ mod tests {
         }
     }
 
+    struct InstalledDrainHandler {
+        handler: Arc<OperationsTaskHandler>,
+        completed: mpsc::Sender<()>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for InstalledDrainHandler {
+        async fn handle_timer(&self, key: TaskKey) {
+            self.handler.handle_timer(key.clone()).await;
+            if key == TaskKey::DrainDocumentSyncOutbox {
+                let _ = self.completed.send(()).await;
+            }
+        }
+    }
+
+    struct InstalledHarness {
+        _dir: tempfile::TempDir,
+        storage: aruna_storage::StorageHandle,
+        net: NetHandle,
+        task_handle: TaskHandle,
+        context: Arc<DriverContext>,
+        handler: Arc<OperationsTaskHandler>,
+        completed: mpsc::Receiver<()>,
+    }
+
+    async fn recv_progress(receiver: &mut mpsc::Receiver<()>) -> bool {
+        // Bound polling so a paused clock cannot leave a lost timer waiting forever.
+        for _ in 0..1024 {
+            match receiver.try_recv() {
+                Ok(()) => return true,
+                Err(mpsc::error::TryRecvError::Empty) => tokio::task::yield_now().await,
+                Err(mpsc::error::TryRecvError::Disconnected) => return false,
+            }
+        }
+        false
+    }
+
+    async fn installed_setup() -> InstalledHarness {
+        let realm_id = RealmId::from_bytes([46u8; 32]);
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let net = make_net_handle(realm_id, &storage, [46u8; 32]).await;
+        tokio::time::pause();
+        let target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        net.ensure_document_sync_topics(&[topic], Vec::new())
+            .expect("shared topic genesis");
+        for index in 1..=2u128 {
+            let record = crate::document_sync_outbox::new_outbox_record_with_id(
+                Ulid::from_parts(1, index),
+                node(1),
+                target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: index.to_be_bytes().to_vec(),
+                    change: change(),
+                },
+                aruna_core::structs::PlacementRef::NIL,
+                true,
+            );
+            write_outbox_record(&storage, &record).await;
+        }
+
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let handler = Arc::new(
+            OperationsTaskHandler::new(context.clone(), JobsRuntime::new())
+                .with_outbox_limits(1, 1, 2),
+        );
+        let (completed_tx, completed) = mpsc::channel(4);
+        task_handle
+            .set_inbound_handler(Arc::new(InstalledDrainHandler {
+                handler: handler.clone(),
+                completed: completed_tx,
+            }))
+            .await;
+        InstalledHarness {
+            _dir: dir,
+            storage,
+            net,
+            task_handle,
+            context,
+            handler,
+            completed,
+        }
+    }
+
     fn node(seed: u8) -> aruna_core::NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
@@ -3116,16 +3254,20 @@ mod tests {
         assert!(undeliverable.is_empty());
     }
 
-    fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentSyncOutboxRecord {
+    fn admin_outbox(
+        realm_id: RealmId,
+        origin: aruna_core::NodeId,
+        origin_seq: u64,
+        target: DocumentSyncTarget,
+    ) -> DocumentSyncOutboxRecord {
         use aruna_core::admin_documents::{
             AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
         };
-        let realm_id = RealmId([3; 32]);
         let user_id = aruna_core::types::UserId::nil(realm_id);
         crate::document_sync_outbox::new_outbox_record(
             node(1),
-            target(),
-            vec![node(2)],
+            target,
+            Vec::new(),
             DocumentSyncOutboxEvent::AdminOperation {
                 event: Box::new(AdminDocumentEvent {
                     event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
@@ -3143,9 +3285,27 @@ mod tests {
                     },
                 }),
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::PlacementRef {
+                strategy_id: Ulid::from_bytes([50; 16]),
+                epoch: 0,
+                shard: 1,
+            },
             false,
         )
+    }
+
+    fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentSyncOutboxRecord {
+        admin_outbox(RealmId([3; 32]), origin, origin_seq, target())
+    }
+
+    fn shard_change(seed: u8) -> DocumentSyncChange {
+        let mut value = change();
+        value.placement = aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_bytes([seed; 16]),
+            epoch: 0,
+            shard: 1,
+        };
+        value
     }
 
     // A blocked admin operation blocks the rest of its origin sequence for the
@@ -3176,6 +3336,226 @@ mod tests {
         assert_eq!(deferred.len(), 2);
         assert!(undeliverable.is_empty());
         assert!(defer.blocked_origins.contains(&origin));
+    }
+
+    #[test]
+    fn topic_block_spans() {
+        let topic = irokle::TopicId::hash(b"blocked-topic-pages");
+        let healthy_topic = irokle::TopicId::hash(b"healthy-topic-pages");
+        let mut defer = DrainDeferState::default();
+        let (_, deferred, _) = partition_drain_records(
+            vec![(b"first".to_vec(), shard_topic_record(1), topic)],
+            &mut defer,
+            |_| false,
+            |_| DeferOutcome::Retry,
+        );
+        assert_eq!(deferred.len(), 1);
+
+        let (published, deferred, undeliverable) = partition_drain_records(
+            vec![
+                (b"healthy".to_vec(), shard_topic_record(3), healthy_topic),
+                (b"second".to_vec(), shard_topic_record(2), topic),
+            ],
+            &mut defer,
+            |_| true,
+            |_| DeferOutcome::Retry,
+        );
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, b"healthy".to_vec());
+        assert_eq!(deferred.len(), 1);
+        assert!(undeliverable.is_empty());
+    }
+
+    #[test]
+    fn admin_block_spans() {
+        let origin = node(4);
+        let blocked_topic = irokle::TopicId::hash(b"blocked-admin-page");
+        let healthy_topic = irokle::TopicId::hash(b"healthy-admin-page");
+        let mut defer = DrainDeferState::default();
+        let (_, deferred, _) = partition_drain_records(
+            vec![(b"first".to_vec(), admin_record(origin, 1), blocked_topic)],
+            &mut defer,
+            |_| false,
+            |_| DeferOutcome::Retry,
+        );
+        assert_eq!(deferred.len(), 1);
+
+        let (published, deferred, undeliverable) = partition_drain_records(
+            vec![(b"second".to_vec(), admin_record(origin, 2), healthy_topic)],
+            &mut defer,
+            |_| true,
+            |_| DeferOutcome::Retry,
+        );
+        assert!(published.is_empty());
+        assert_eq!(deferred.len(), 1);
+        assert!(undeliverable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topic_page_blocks() {
+        let realm_id = RealmId::from_bytes([49u8; 32]);
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let net = make_net_handle(realm_id, &storage, [49u8; 32]).await;
+        tokio::time::pause();
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let blocked_target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_parts(10, 1),
+        };
+        let healthy_target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_parts(10, 2),
+        };
+        let placement = shard_change(49).placement;
+        let blocked_topic = blocked_target.sync_topic_id(realm_id, &placement);
+        let healthy_topic = healthy_target.sync_topic_id(realm_id, &placement);
+        net.ensure_document_sync_topics(&[healthy_topic], Vec::new())
+            .expect("healthy topic genesis");
+        let blocked = crate::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, 1),
+            node(1),
+            blocked_target,
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"blocked".to_vec(),
+                change: shard_change(49),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            true,
+        );
+        let healthy = crate::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, 2),
+            node(1),
+            healthy_target,
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"healthy".to_vec(),
+                change: shard_change(49),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            true,
+        );
+        let blocked_key = outbox_key(&blocked).to_vec();
+        let healthy_key = outbox_key(&healthy).to_vec();
+        write_outbox_record(&storage, &blocked).await;
+        write_outbox_record(&storage, &healthy).await;
+        let handler =
+            OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 2);
+
+        handler.drain_document_sync_outbox().await;
+        assert_eq!(
+            read_outbox_record(&storage, &blocked_key)
+                .await
+                .expect("read blocked record"),
+            Some(blocked.clone())
+        );
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+        handler.drain_document_sync_outbox().await;
+        assert_eq!(
+            read_outbox_record(&storage, &healthy_key)
+                .await
+                .expect("read healthy record"),
+            None,
+            "a later page may progress while the blocked topic is retained"
+        );
+        net.ensure_document_sync_topics(&[blocked_topic], Vec::new())
+            .expect("blocked topic genesis");
+        for _ in 0..3 {
+            handler.drain_document_sync_outbox().await;
+        }
+        assert_eq!(
+            read_outbox_record(&storage, &blocked_key)
+                .await
+                .expect("read retried record"),
+            None
+        );
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn admin_page_blocks() {
+        let realm_id = RealmId::from_bytes([50u8; 32]);
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let net = make_net_handle(realm_id, &storage, [50u8; 32]).await;
+        tokio::time::pause();
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let origin = node(4);
+        let blocked_target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_parts(11, 1),
+        };
+        let healthy_target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_parts(11, 2),
+        };
+        let placement = aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_bytes([50; 16]),
+            epoch: 0,
+            shard: 1,
+        };
+        let blocked_topic = blocked_target.sync_topic_id(realm_id, &placement);
+        let healthy_topic = healthy_target.sync_topic_id(realm_id, &placement);
+        net.ensure_document_sync_topics(&[healthy_topic], Vec::new())
+            .expect("healthy topic genesis");
+        let blocked = admin_outbox(realm_id, origin, 1, blocked_target);
+        let healthy = admin_outbox(realm_id, origin, 2, healthy_target);
+        let blocked_key = outbox_key(&blocked).to_vec();
+        let healthy_key = outbox_key(&healthy).to_vec();
+        write_outbox_record(&storage, &blocked).await;
+        write_outbox_record(&storage, &healthy).await;
+        let handler =
+            OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 2);
+
+        handler.drain_document_sync_outbox().await;
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+        handler.drain_document_sync_outbox().await;
+        assert_eq!(
+            read_outbox_record(&storage, &healthy_key)
+                .await
+                .expect("read blocked-origin record"),
+            Some(healthy.clone()),
+            "a later origin sequence must remain blocked across pages"
+        );
+        net.ensure_document_sync_topics(&[blocked_topic], Vec::new())
+            .expect("blocked topic genesis");
+        for _ in 0..3 {
+            handler.drain_document_sync_outbox().await;
+        }
+        assert_eq!(
+            read_outbox_record(&storage, &blocked_key)
+                .await
+                .expect("read admin retry"),
+            None
+        );
+        assert_eq!(
+            read_outbox_record(&storage, &healthy_key)
+                .await
+                .expect("read admin suffix"),
+            None
+        );
+        net.shutdown().await;
     }
 
     // Closing a rotation returns its accumulated totals and clears every
@@ -3370,6 +3750,124 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn midpoint_retry_keeps() {
+        let (_dir, handler, task_handle) = outbox_handler();
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        let topic = irokle::TopicId::hash(b"midpoint-retry-topic");
+        handler
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .insert(key.clone(), 3);
+        let mut rotation = OutboxRotation {
+            boundary: Some(b"last".to_vec()),
+            cursor: Some(b"middle".to_vec()),
+            totals: RotationTotals {
+                retry_invocations: 1,
+                invocations: 1,
+                ..RotationTotals::default()
+            },
+            ..OutboxRotation::default()
+        };
+        rotation.blocked_topics.insert(topic);
+
+        handler.finish_retry(key.clone(), rotation, false).await;
+
+        let rotation = handler.rotation.lock().expect("rotation lock");
+        assert_eq!(rotation.cursor.as_deref(), Some(b"middle".as_slice()));
+        assert!(rotation.blocked_topics.contains(&topic));
+        assert_eq!(rotation.totals.retry_invocations, 1);
+        drop(rotation);
+        assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_resets_backoff() {
+        let (_dir, handler, _task_handle) = outbox_handler();
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        handler
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .insert(key.clone(), 3);
+
+        assert!(
+            handler
+                .open_rotation(&key, OutboxRotation::default())
+                .await
+                .is_none()
+        );
+        assert!(
+            !handler
+                .retry_backoff
+                .lock()
+                .expect("retry backoff mutex poisoned")
+                .contains_key(&key)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_keeps_backoff() {
+        let realm_id = RealmId::from_bytes([48u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = make_net_handle(realm_id, &storage, [48u8; 32]).await;
+        tokio::time::pause();
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let handler =
+            OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        handler
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .insert(key.clone(), 3);
+        let mut blocked_change = change();
+        blocked_change.placement = aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_bytes([48; 16]),
+            epoch: 0,
+            shard: 1,
+        };
+        let record = crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"blocked".to_vec(),
+                change: blocked_change,
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        write_outbox_record(&storage, &record).await;
+
+        handler.drain_document_sync_outbox().await;
+
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        );
+        assert_eq!(
+            handler
+                .retry_backoff
+                .lock()
+                .expect("retry backoff mutex poisoned")
+                .get(&key),
+            Some(&3)
+        );
+        net.shutdown().await;
+    }
+
     // The invocation bound is a work-unit limit, never a latency assertion.
     #[test]
     fn outbox_bound_finite() {
@@ -3555,34 +4053,47 @@ mod tests {
         net.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn drain_boundary_appends() {
-        let realm_id = RealmId::from_bytes([45u8; 32]);
-        let temp_dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
-        let net = NetHandle::new(
-            NetConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+    struct BoundaryHarness {
+        _dir: tempfile::TempDir,
+        storage: aruna_storage::StorageHandle,
+        net: NetHandle,
+        task_handle: TaskHandle,
+        handler: OperationsTaskHandler,
+        realm_id: RealmId,
+        appended: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+    }
+
+    impl BoundaryHarness {
+        async fn new() -> Self {
+            let realm_id = RealmId::from_bytes([45u8; 32]);
+            let dir = tempdir().expect("temp dir");
+            let storage =
+                FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+            let net = make_net_handle(realm_id, &storage, [45u8; 32]).await;
+            tokio::time::pause();
+            let task_handle = TaskHandle::new();
+            let context = Arc::new(DriverContext {
+                storage_handle: storage.clone(),
+                net_handle: Some(net.clone()),
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: Some(task_handle.clone()),
+                compute_handle: None,
+            });
+            let handler =
+                OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
+            Self {
+                _dir: dir,
+                storage,
+                net,
+                task_handle,
+                handler,
                 realm_id,
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                ..NetConfig::default()
-            },
-            storage.clone(),
-        )
-        .await
-        .expect("net handle");
-        let task_handle = TaskHandle::new();
-        let context = Arc::new(DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: Some(net.clone()),
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: Some(task_handle),
-            compute_handle: None,
-        });
-        let placed_change = || {
+                appended: Vec::new(),
+            }
+        }
+
+        fn placed_change(&self) -> DocumentSyncChange {
             let mut value = change();
             value.placement = aruna_core::structs::PlacementRef {
                 strategy_id: Ulid::from_bytes([45; 16]),
@@ -3590,9 +4101,14 @@ mod tests {
                 shard: 1,
             };
             value
-        };
+        }
 
-        let make_record = |id: u128, target: DocumentSyncTarget, event: DocumentSyncOutboxEvent| {
+        fn record(
+            &self,
+            id: u128,
+            target: DocumentSyncTarget,
+            event: DocumentSyncOutboxEvent,
+        ) -> DocumentSyncOutboxRecord {
             crate::document_sync_outbox::new_outbox_record_with_id(
                 Ulid::from_parts(1, id),
                 node(1),
@@ -3602,99 +4118,351 @@ mod tests {
                 aruna_core::structs::PlacementRef::NIL,
                 true,
             )
-        };
-        for id in 1..=3 {
-            write_outbox_record(
-                &storage,
-                &make_record(
+        }
+
+        async fn seed_records(&self) {
+            for id in 1..=3 {
+                let record = self.record(
                     id,
                     target(),
                     DocumentSyncOutboxEvent::Upsert {
                         bytes: id.to_be_bytes().to_vec(),
-                        change: placed_change(),
+                        change: self.placed_change(),
+                    },
+                );
+                write_outbox_record(&self.storage, &record).await;
+            }
+            let initial = self.record(
+                0,
+                DocumentSyncTarget::RealmAuthorization {
+                    realm_id: self.realm_id,
+                },
+                DocumentSyncOutboxEvent::Delete { change: change() },
+            );
+            write_outbox_record(&self.storage, &initial).await;
+        }
+
+        async fn append_records(&mut self) {
+            let shared = DocumentSyncTarget::RealmAuthorization {
+                realm_id: self.realm_id,
+            };
+            let topic =
+                shared.sync_topic_id(self.realm_id, &aruna_core::structs::PlacementRef::NIL);
+            self.net
+                .ensure_document_sync_topics(&[topic], Vec::new())
+                .expect("appended topic genesis");
+            let records = [
+                self.record(
+                    4,
+                    shared,
+                    DocumentSyncOutboxEvent::Delete { change: change() },
+                ),
+                self.record(
+                    5,
+                    target(),
+                    DocumentSyncOutboxEvent::Upsert {
+                        bytes: b"appended-upsert".to_vec(),
+                        change: self.placed_change(),
                     },
                 ),
-            )
-            .await;
+            ];
+            for record in records {
+                let key = outbox_key(&record).to_vec();
+                write_outbox_record(&self.storage, &record).await;
+                self.appended.push((key, record));
+            }
         }
 
-        let initial_delete = make_record(
-            0,
-            DocumentSyncTarget::RealmAuthorization { realm_id },
-            DocumentSyncOutboxEvent::Delete { change: change() },
-        );
-        write_outbox_record(&storage, &initial_delete).await;
+        async fn append_later(&mut self) {
+            let record = self.record(
+                6,
+                target(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: b"appended-later".to_vec(),
+                    change: self.placed_change(),
+                },
+            );
+            let key = outbox_key(&record).to_vec();
+            write_outbox_record(&self.storage, &record).await;
+            self.appended.push((key, record));
+        }
 
-        let handler =
-            OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 2, 1);
-        handler.drain_document_sync_outbox().await;
-        {
-            let rotation = handler.rotation.lock().expect("rotation lock");
+        fn assert_rotation(&self, examined: usize, cursor: bool, continuations: u32) {
+            let rotation = self.handler.rotation.lock().expect("rotation lock");
             assert_eq!(
                 (rotation.totals.examined, rotation.cursor.is_some()),
-                (2, true)
+                (examined, cursor)
             );
-            assert_eq!(rotation.continuations, 1);
+            assert_eq!(rotation.continuations, continuations);
         }
 
-        let appended_target = DocumentSyncTarget::RealmAuthorization { realm_id };
-        let appended_topic =
-            appended_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
-        net.ensure_document_sync_topics(&[appended_topic], Vec::new())
-            .expect("appended topic genesis");
-        let appended = make_record(
-            4,
-            appended_target,
-            DocumentSyncOutboxEvent::Delete { change: change() },
-        );
-        let appended_key = outbox_key(&appended).to_vec();
-        write_outbox_record(&storage, &appended).await;
-        let appended_upsert = make_record(
-            5,
-            target(),
-            DocumentSyncOutboxEvent::Upsert {
-                bytes: b"appended-upsert".to_vec(),
-                change: placed_change(),
-            },
-        );
-        let appended_upsert_key = outbox_key(&appended_upsert).to_vec();
-        write_outbox_record(&storage, &appended_upsert).await;
+        async fn assert_appends(&self) {
+            for (key, record) in &self.appended {
+                assert_eq!(
+                    read_outbox_record(&self.storage, key)
+                        .await
+                        .expect("read appended record"),
+                    Some(record.clone())
+                );
+            }
+        }
 
-        handler.drain_document_sync_outbox().await;
-        {
-            let rotation = handler.rotation.lock().expect("rotation lock");
+        async fn finish_retry(self) {
+            let shard_topic =
+                target().sync_topic_id(self.realm_id, &self.placed_change().placement);
+            self.net
+                .ensure_document_sync_topics(&[shard_topic], Vec::new())
+                .expect("blocked head topic genesis");
+            for _ in 0..6 {
+                self.handler.drain_document_sync_outbox().await;
+            }
+            let remaining = read_outbox_records(&self.storage, &[], None, 8)
+                .await
+                .expect("read retried records");
+            assert!(
+                remaining.records.is_empty(),
+                "records across all streams must retry after the rotation closes"
+            );
+            self.net.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_appends_wait() {
+        let mut harness = BoundaryHarness::new().await;
+        harness.seed_records().await;
+
+        harness.handler.drain_document_sync_outbox().await;
+        harness.assert_rotation(1, true, 1);
+        assert_eq!(
+            scheduled_after(&harness.task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+
+        harness.append_records().await;
+        harness.handler.drain_document_sync_outbox().await;
+        harness.assert_rotation(2, true, 0);
+        assert_eq!(
+            scheduled_after(&harness.task_handle).await,
+            DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        );
+
+        harness.append_later().await;
+        harness.handler.drain_document_sync_outbox().await;
+        harness.assert_rotation(3, true, 1);
+        assert_eq!(
+            scheduled_after(&harness.task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+
+        harness.handler.drain_document_sync_outbox().await;
+        harness.assert_rotation(0, false, 0);
+        harness.assert_appends().await;
+        harness.finish_retry().await;
+    }
+
+    #[tokio::test]
+    async fn rotation_streak() {
+        let realm_id = RealmId::from_bytes([51u8; 32]);
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let net = make_net_handle(realm_id, &storage, [51u8; 32]).await;
+        tokio::time::pause();
+        let target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        net.ensure_document_sync_topics(&[topic], Vec::new())
+            .expect("shared topic genesis");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(
+            1,
+            1,
+            OUTBOX_CONTINUATION_STREAK,
+        );
+        let total = u128::from(OUTBOX_CONTINUATION_STREAK) + 2;
+        for index in 1..=total {
+            let record = crate::document_sync_outbox::new_outbox_record_with_id(
+                Ulid::from_parts(1, index),
+                node(1),
+                target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: index.to_be_bytes().to_vec(),
+                    change: change(),
+                },
+                aruna_core::structs::PlacementRef::NIL,
+                true,
+            );
+            write_outbox_record(&storage, &record).await;
+        }
+
+        for expected in 1..=OUTBOX_CONTINUATION_STREAK {
+            handler.drain_document_sync_outbox().await;
             assert_eq!(
-                (rotation.totals.examined, rotation.cursor.is_some()),
-                (0, false)
+                handler
+                    .rotation
+                    .lock()
+                    .expect("rotation lock")
+                    .continuations,
+                expected
+            );
+            assert_eq!(
+                scheduled_after(&task_handle).await,
+                OUTBOX_CONTINUATION_AFTER
             );
         }
+        handler.drain_document_sync_outbox().await;
         assert_eq!(
-            read_outbox_record(&storage, &appended_key)
-                .await
-                .expect("read appended record"),
-            Some(appended),
-            "records appended after the boundary wait for the next rotation"
+            handler
+                .rotation
+                .lock()
+                .expect("rotation lock")
+                .continuations,
+            0
         );
         assert_eq!(
-            read_outbox_record(&storage, &appended_upsert_key)
-                .await
-                .expect("read appended upsert"),
-            Some(appended_upsert),
-            "appended records from the boundary stream wait for the next rotation"
+            scheduled_after(&task_handle).await,
+            DOCUMENT_SYNC_DEFER_RETRY_AFTER
         );
-
-        let shard_topic = target().sync_topic_id(realm_id, &placed_change().placement);
-        net.ensure_document_sync_topics(&[shard_topic], Vec::new())
-            .expect("blocked head topic genesis");
-        for _ in 0..6 {
+        for _ in 0..4 {
             handler.drain_document_sync_outbox().await;
         }
-        let remaining = read_outbox_records(&storage, &[], None, 8)
-            .await
-            .expect("read retried records");
         assert!(
-            remaining.records.is_empty(),
-            "blocked head and records across all streams must retry after the rotation closes"
+            read_outbox_records(&storage, &[], None, 32)
+                .await
+                .expect("read streak records")
+                .records
+                .is_empty()
+        );
+        net.shutdown().await;
+    }
+
+    struct ConfigHarness {
+        _dir: tempfile::TempDir,
+        storage: aruna_storage::StorageHandle,
+        net: NetHandle,
+        handler: OperationsTaskHandler,
+        config: RealmConfigDocument,
+        realm_id: RealmId,
+        placement: aruna_core::structs::PlacementRef,
+        shard_target: DocumentSyncTarget,
+    }
+
+    async fn config_setup() -> ConfigHarness {
+        let realm_id = RealmId::from_bytes([47u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = make_net_handle(realm_id, &storage, [47u8; 32]).await;
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        write_realm_config(&storage, realm_id, &config, net.node_id()).await;
+        let placement = aruna_core::structs::PlacementRef {
+            strategy_id: config.strategies[0].strategy_id,
+            epoch: 0,
+            shard: 0,
+        };
+        let shared_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let shard_target = DocumentSyncTarget::MetadataRegistry {
+            group_id: Ulid::from_parts(7, 1),
+            document_id: Ulid::from_parts(8, 1),
+        };
+        let shared_topic =
+            shared_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        net.ensure_document_sync_topics(&[shared_topic], Vec::new())
+            .expect("shared topic genesis");
+        let mut shard_change = change();
+        shard_change.placement = placement;
+        let shared = crate::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, 1),
+            node(1),
+            shared_target,
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"shared".to_vec(),
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            true,
+        );
+        let shard = crate::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(1, 2),
+            node(1),
+            shard_target.clone(),
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"shard".to_vec(),
+                change: shard_change,
+            },
+            placement,
+            true,
+        );
+        write_outbox_record(&storage, &shared).await;
+        write_outbox_record(&storage, &shard).await;
+
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let handler =
+            OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 2);
+        ConfigHarness {
+            _dir: temp_dir,
+            storage,
+            net,
+            handler,
+            config,
+            realm_id,
+            placement,
+            shard_target,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_reloads_between() {
+        let ConfigHarness {
+            _dir,
+            storage,
+            net,
+            handler,
+            mut config,
+            realm_id,
+            placement,
+            shard_target,
+        } = config_setup().await;
+        handler.drain_document_sync_outbox().await;
+        {
+            let rotation = handler.rotation.lock().expect("rotation lock");
+            assert!(rotation.cursor.is_some());
+            assert_eq!(rotation.totals.deleted, 1);
+        }
+
+        config.ensure_node(net.node_id(), RealmNodeKind::Server);
+        write_realm_config(&storage, realm_id, &config, net.node_id()).await;
+        let shard_topic = shard_target.sync_topic_id(realm_id, &placement);
+        net.ensure_document_sync_topics(&[shard_topic], Vec::new())
+            .expect("updated holder topic genesis");
+
+        handler.drain_document_sync_outbox().await;
+        assert!(
+            read_outbox_records(&storage, &[], None, 4)
+                .await
+                .expect("read revalidated records")
+                .records
+                .is_empty(),
+            "the continuation must use the updated holder config"
         );
 
         net.shutdown().await;
@@ -3994,7 +4762,7 @@ mod tests {
         assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn restore_document_sync_outbox_timers_keeps_existing_backoff_timer() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -4013,10 +4781,6 @@ mod tests {
         write_outbox_record(&storage, &record).await;
 
         let task_handle = TaskHandle::new();
-        let (seen_tx, mut seen_rx) = mpsc::channel(1);
-        task_handle
-            .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
-            .await;
         match task_handle
             .send_effect(Effect::Task(TaskEffect::ResetTimer {
                 key: TaskKey::DrainDocumentSyncOutbox,
@@ -4030,12 +4794,87 @@ mod tests {
 
         restore_document_sync_outbox_timers(&storage, &task_handle).await;
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), seen_rx.recv())
-                .await
-                .is_err(),
-            "durable rearm must not replace an active backoff timer"
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+            .await
+        else {
+            panic!("expected timer schedule event");
+        };
+        assert_eq!(
+            after,
+            Duration::from_secs(3600),
+            "durable rearm must preserve the active backoff deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn installed_fence() {
+        let InstalledHarness {
+            _dir,
+            task_handle,
+            context,
+            handler,
+            mut completed,
+            net,
+            ..
+        } = installed_setup().await;
+
+        drive_document_sync_outbox_drain(context.clone()).await;
+        assert!(recv_progress(&mut completed).await);
+        {
+            let rotation = handler.rotation.lock().expect("rotation lock");
+            assert_eq!(rotation.totals.examined, 1);
+            assert!(rotation.cursor.is_some());
+            assert_eq!(rotation.continuations, 1);
+        }
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+        assert!(completed.try_recv().is_err());
+
+        drive_document_sync_outbox_drain(context.clone()).await;
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+        assert!(completed.try_recv().is_err());
+
+        drive_document_sync_outbox_drain(context).await;
+        assert_eq!(
+            scheduled_after(&task_handle).await,
+            OUTBOX_CONTINUATION_AFTER
+        );
+        assert!(completed.try_recv().is_err());
+
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn installed_continues() {
+        let InstalledHarness {
+            _dir,
+            storage,
+            net,
+            context,
+            mut completed,
+            ..
+        } = installed_setup().await;
+
+        drive_document_sync_outbox_drain(context).await;
+        assert!(recv_progress(&mut completed).await);
+        tokio::time::advance(OUTBOX_CONTINUATION_AFTER).await;
+        assert!(recv_progress(&mut completed).await);
+        assert!(completed.try_recv().is_err());
+        assert!(
+            read_outbox_records(&storage, &[], None, 4)
+                .await
+                .expect("read drained records")
+                .records
+                .is_empty()
+        );
+
+        net.shutdown().await;
     }
 
     #[tokio::test]

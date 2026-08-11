@@ -28,8 +28,8 @@ pub(crate) async fn persist_task_effect(
     }
 }
 
-// Outbox and materialization drains are re-armed at startup from their own
-// durable queues, so persisting their timers is redundant write churn.
+// Queue-backed tasks below re-arm from durable state, so their timer writes remain
+// redundant. The document-sync outbox keeps its retry deadline across restarts.
 fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
     let key = match effect {
         TaskEffect::ResetTimer { key, .. } | TaskEffect::ShortenTimer { key, .. } => key,
@@ -37,8 +37,7 @@ fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
     };
     matches!(
         key,
-        TaskKey::DrainDocumentSyncOutbox
-            | TaskKey::DrainMetadataMaterializationQueue
+        TaskKey::DrainMetadataMaterializationQueue
             | TaskKey::DrainMetadataGraphPruneQueue
             | TaskKey::DrainBlobReplicationQueue
             | TaskKey::DrainReferenceMetadataRefreshQueue
@@ -287,22 +286,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_outbox_timer_reset_is_not_persisted() {
+    async fn outbox_timer_restores() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
+        let key = TaskKey::DrainDocumentSyncOutbox;
+        let reset_after = Duration::from_secs(3600);
 
         persist_task_effect(
             &storage,
             &TaskEffect::ResetTimer {
-                key: TaskKey::DrainDocumentSyncOutbox,
-                after: Duration::ZERO,
+                key: key.clone(),
+                after: reset_after,
             },
         )
         .await
-        .expect("drain timer persistence is redundant");
+        .expect("drain timer persists");
 
-        assert_eq!(storage.snapshot_metrics().requests_total, 0);
+        let reset_timer = read_timer(&storage, &key)
+            .await
+            .expect("reset timer reads")
+            .expect("reset timer exists");
+
+        let shorten_after = Duration::from_secs(1800);
+        persist_task_effect(
+            &storage,
+            &TaskEffect::ShortenTimer {
+                key: key.clone(),
+                after: shorten_after,
+            },
+        )
+        .await
+        .expect("shortened drain timer persists");
+
+        let shortened_timer = read_timer(&storage, &key)
+            .await
+            .expect("shortened timer reads")
+            .expect("shortened timer exists");
+        assert_eq!(shortened_timer.key, key);
+        assert!(shortened_timer.due_at_unix_millis < reset_timer.due_at_unix_millis);
+
+        let task_handle = TaskHandle::new();
+        restore_persisted_task_timers(&storage, &task_handle).await;
+        let aruna_core::task::TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_timer_if_idle(key, Duration::ZERO)
+            .await
+        else {
+            panic!("expected restored timer");
+        };
+        assert!(
+            after > Duration::ZERO,
+            "restored deadline must retain a non-immediate retry"
+        );
     }
 
     #[tokio::test]
