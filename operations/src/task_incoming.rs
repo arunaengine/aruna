@@ -893,87 +893,107 @@ impl OperationsTaskHandler {
         };
 
         let realm_id = *net_handle.realm_id();
-        // Admin-operation records (group/user document ops) are stamped NIL by
-        // their emitters; resolve their shard placement here from the realm
-        // config so they publish onto the right shard topic. Records that
-        // already carry a real ref (metadata upserts/deletes) keep it.
-        // Re-read every invocation: rotation state must never cache holdership
-        // or publisher authority.
         let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
 
-        let mut rotation = self.take_rotation();
-        let mut totals = DrainSyncOutcome::default();
-        let mut defer_state = DrainDeferState {
-            deferred_topics: rotation.blocked_topics.clone(),
-            blocked_origins: rotation.blocked_origins.clone(),
-            undeliverable_topics: rotation.undeliverable_topics.clone(),
-            ..DrainDeferState::default()
+        let rotation = self.take_rotation();
+        let Some(rotation) = self.open_rotation(&retry_key, rotation).await else {
+            return;
         };
-        let mut realm_config_drained = false;
-        let mut start_after: Option<Vec<u8>> = rotation.cursor.clone();
-        let mut reached_end = false;
-        let mut scan_elapsed = Duration::ZERO;
-        let mut publish_elapsed = Duration::ZERO;
-        let mut record_count = 0usize;
-        let mut deferred_total = 0usize;
-        let mut stuck_total = 0usize;
-        let mut oldest_stuck: Option<(
-            u64,
-            DocumentSyncTarget,
-            irokle::TopicId,
-            aruna_core::structs::PlacementRef,
-        )> = None;
-        let mut undeliverable_total = 0usize;
-        let mut group_count = 0usize;
-        let mut subbatch_count = 0usize;
-        let mut pages = 0usize;
-        let mut oldest_record_ms: Option<u64> = None;
-        let mut read_failed = false;
-
-        // Bounded pages rather than whole-queue traversal: a deferred head must
-        // not starve later topics, and a large queue must not monopolise one
-        // invocation. Deferred records are paged past, not deleted.
+        let mut invocation = DrainInvocation::new(&rotation);
         loop {
-            if record_count >= OUTBOX_INVOCATION_RECORDS || pages >= OUTBOX_INVOCATION_PAGES {
-                break;
-            }
-            let scan_started = Instant::now();
-            let batch = match read_outbox_records(
-                &self.context.storage_handle,
-                &[],
-                start_after.clone(),
-                OUTBOX_DRAIN_BATCH_SIZE,
-            )
-            .await
+            if invocation.records >= self.outbox_limits.records
+                || invocation.pages >= self.outbox_limits.pages
             {
-                Ok(batch) => batch,
-                Err(error) => {
-                    warn!(task_id = ?retry_key, error = %error, "Failed to read document sync outbox record");
-                    read_failed = true;
-                    break;
-                }
-            };
-            scan_elapsed += scan_started.elapsed();
-            let has_more = batch.has_more;
-            start_after = batch.next_start_after;
-            if batch.records.is_empty() {
-                if has_more && start_after.is_some() {
-                    continue;
-                }
-                reached_end = true;
                 break;
             }
-            pages += 1;
-            record_count += batch.records.len();
-            if let Some(page_oldest) = batch
+            match self
+                .read_drain_page(&retry_key, &rotation, &mut invocation)
+                .await
+            {
+                DrainPage::Records {
+                    records,
+                    has_more,
+                    boundary_reached,
+                } => {
+                    self.process_drain_page(
+                        &retry_key,
+                        net_handle,
+                        realm_config.as_ref(),
+                        realm_id,
+                        records,
+                        &mut invocation,
+                    )
+                    .await;
+                    if boundary_reached || !has_more {
+                        invocation.reached_end = true;
+                        break;
+                    }
+                }
+                DrainPage::Skip => continue,
+                DrainPage::Stop => break,
+            }
+        }
+
+        self.finish_drain_invocation(
+            retry_key,
+            net_handle,
+            realm_id,
+            rotation,
+            invocation,
+            drain_started,
+        )
+        .await;
+    }
+
+    async fn read_drain_page(
+        &self,
+        retry_key: &TaskKey,
+        rotation: &OutboxRotation,
+        invocation: &mut DrainInvocation,
+    ) -> DrainPage {
+        let page_limit = OUTBOX_DRAIN_BATCH_SIZE.min(
+            self.outbox_limits
                 .records
-                .iter()
-                .map(|(_, record)| record.outbox_id.timestamp_ms())
-                .min()
-            {
-                oldest_record_ms =
-                    Some(oldest_record_ms.map_or(page_oldest, |current| current.min(page_oldest)));
+                .saturating_sub(invocation.records),
+        );
+        let scan_started = Instant::now();
+        let mut batch = match read_outbox_records(
+            &self.context.storage_handle,
+            &[],
+            invocation.cursor.clone(),
+            page_limit,
+        )
+        .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                warn!(task_id = ?retry_key, error = %error, "Failed to read document sync outbox record");
+                invocation.read_failed = true;
+                return DrainPage::Stop;
             }
+        };
+        invocation.scan_elapsed += scan_started.elapsed();
+        let has_more = batch.has_more;
+        invocation.cursor = batch.next_start_after;
+        let boundary_reached = rotation.at_end(invocation.cursor.as_deref());
+        batch.records.retain(|(key, _)| rotation.admits(key));
+        if !batch.records.is_empty() {
+            return DrainPage::Records {
+                records: batch.records,
+                has_more,
+                boundary_reached,
+            };
+        }
+        if boundary_reached || !has_more {
+            invocation.reached_end = true;
+            DrainPage::Stop
+        } else if invocation.cursor.is_some() {
+            DrainPage::Skip
+        } else {
+            invocation.reached_end = true;
+            DrainPage::Stop
+        }
+    }
 
             let mut records: Vec<DrainRecord> = batch
                 .records
