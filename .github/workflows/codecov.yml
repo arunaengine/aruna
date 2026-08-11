@@ -17,9 +17,10 @@ jobs:
     name: Generate Coverage Report
     environment: coverage
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget. The instrumented build is several times
-    # slower than the plain suite, so this ceiling is higher than the CI tests job.
-    timeout-minutes: 60
+    # Hang cap, not a performance budget. Measured basis: the #453 main run took
+    # 47m53s, and after #454 added the multi-node metadata-interop suites the
+    # instrumented CARGO_BUILD_JOBS=2 run was killed at the old 60-minute cap.
+    timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
