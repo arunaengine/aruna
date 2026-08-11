@@ -63,45 +63,44 @@ pub async fn realm_bootstrap_exists(
     Ok(true)
 }
 
-pub async fn announce_core_documents(
+pub async fn publish_core_documents(
     driver_ctx: &DriverContext,
     node_id: NodeId,
-    realm_id: &aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::RealmId,
     allow_genesis: bool,
+    documents: Vec<DocumentSyncTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let documents = core_document_targets(driver_ctx, node_id, *realm_id).await?;
     if documents.is_empty() {
         return Ok(());
     }
 
-    let driver_ctx = driver_ctx.clone();
-    let realm_id = *realm_id;
-    tokio::spawn(async move {
-        if let Err(error) = drive(
-            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-                realm_id,
-                local_node_id: node_id,
-                excluded_peers: Vec::new(),
-                documents,
-                // Only the realm-bootstrap node may mint shared-topic genesis;
-                // joining/provisioned nodes announce with false and join it.
-                allow_genesis,
-            }),
-            &driver_ctx,
-        )
-        .await
-        {
-            warn!(error = ?error, "Failed to queue core document replication");
-        }
-    });
+    drive(
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node_id,
+            excluded_peers: Vec::new(),
+            documents,
+            // Only the realm-bootstrap node may mint shared-topic genesis;
+            // joining/provisioned nodes announce with false and join it.
+            allow_genesis,
+        }),
+        driver_ctx,
+    )
+    .await?;
 
     Ok(())
 }
 
-async fn core_document_targets(
+fn watch_target_needed(digest_created: bool, allow_genesis: bool, topic_exists: bool) -> bool {
+    digest_created || allow_genesis && !topic_exists
+}
+
+pub async fn prepare_core_documents(
     driver_ctx: &DriverContext,
     node_id: NodeId,
     realm_id: aruna_core::structs::RealmId,
+    allow_genesis: bool,
+    include_node_info: bool,
 ) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
     let digest_created =
         ensure_local_watch_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
@@ -125,16 +124,31 @@ async fn core_document_targets(
             node_id,
             group_id: None,
         },
-        // Announce the shared realm-scoped node-info topic so every realm node
-        // subscribes at bootstrap and sees late joiners' info within the sync
-        // window (closes the <=60s late-joiner visibility gap).
-        DocumentSyncTarget::NodeInfo { realm_id, node_id },
     ];
-    // A first digest has nothing to compare against, so the dirty marker's
-    // publish would skip it; a later restart's unchanged digest needs no second
-    // announcement.
-    if digest_created {
-        documents.push(DocumentSyncTarget::WatchInterest { realm_id, node_id });
+    if include_node_info {
+        // Initial and joining nodes announce before their first heartbeat;
+        // provisioned restarts leave refresh publication to the timer.
+        documents.push(DocumentSyncTarget::NodeInfo { realm_id, node_id });
+    }
+    let watch_target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let topic_exists = if allow_genesis && !digest_created {
+        let net_handle = driver_ctx
+            .net_handle
+            .as_ref()
+            .ok_or("net handle unavailable while checking watch interest genesis")?;
+        net_handle
+            .document_sync_topic_exists(
+                watch_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
+            )
+            .map_err(|error| format!("failed to check watch interest topic: {error}"))?
+    } else {
+        true
+    };
+    // A newly stored digest must be announced once. The authoritative node also
+    // repairs a missing topic after a partial first boot without republishing on
+    // an unchanged healthy restart.
+    if watch_target_needed(digest_created, allow_genesis, topic_exists) {
+        documents.push(watch_target);
     }
 
     match driver_ctx
@@ -407,7 +421,9 @@ pub async fn ensure_initial_local_onboarding_secret(
 
 #[cfg(test)]
 mod tests {
-    use super::{core_document_targets, node_is_ready, unique_user_topic};
+    use super::{
+        node_is_ready, prepare_core_documents, unique_user_topic, watch_target_needed,
+    };
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -448,6 +464,16 @@ mod tests {
         );
         assert!(unique_user_topic(&mut synced_topics, realm_id, &second_shard, &second).is_some());
         assert_eq!(synced_topics.len(), 2);
+    }
+
+    #[test]
+    fn watch_target_cases() {
+        assert!(watch_target_needed(true, true, false));
+        assert!(watch_target_needed(true, false, true));
+        assert!(!watch_target_needed(false, true, true));
+        assert!(watch_target_needed(false, true, false));
+        assert!(!watch_target_needed(false, false, true));
+        assert!(!watch_target_needed(false, false, false));
     }
 
     fn context(storage_handle: aruna_storage::StorageHandle) -> DriverContext {
@@ -536,7 +562,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
 
-        let targets = core_document_targets(&context, node_id, realm_id)
+        let targets = prepare_core_documents(&context, node_id, realm_id, true, true)
             .await
             .unwrap();
 
@@ -574,7 +600,7 @@ mod tests {
             })
             .await;
 
-        core_document_targets(&context, node_id, realm_id)
+        prepare_core_documents(&context, node_id, realm_id, false, true)
             .await
             .unwrap();
 
