@@ -29,7 +29,13 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "policies", description = "Deny-only CEL request policies"))
+    tags((name = "policies", description = "Deny-only CEL request policies")),
+    components(schemas(
+        PolicyTraceDoc,
+        PolicyKindDoc,
+        PolicyResultDoc,
+        ScopedTraceEntry
+    ))
 )]
 pub struct PoliciesApiDoc;
 
@@ -157,15 +163,41 @@ pub struct DryRunResponse {
     pub policy_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    #[schema(value_type = Vec<Object>)]
     pub trace: Vec<ScopedTraceEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScopedTraceEntry {
     pub scope: String,
     #[serde(flatten)]
+    #[schema(value_type = PolicyTraceDoc)]
     pub entry: PolicyTraceEntry,
+}
+
+#[derive(Debug, ToSchema)]
+pub struct PolicyTraceDoc {
+    pub policy_id: String,
+    pub name: String,
+    /// Response values are `Deny` or `Require`; request policy input is lowercase.
+    pub kind: PolicyKindDoc,
+    pub applicable: bool,
+    pub result: PolicyResultDoc,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, ToSchema)]
+pub enum PolicyKindDoc {
+    Deny,
+    Require,
+}
+
+#[derive(Debug, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyResultDoc {
+    Passed,
+    Denied,
+    SkippedDisabled,
+    Error,
 }
 
 fn kind_label(kind: PolicyKind) -> String {
@@ -1166,6 +1198,8 @@ mod tests {
         assert!(run.denied);
         assert_eq!(run.policy_name.as_deref(), Some("dry-run"));
         assert_eq!(run.trace.len(), 1);
+        let body = serde_json::to_value(&run).unwrap();
+        assert_eq!(body["trace"][0]["kind"], serde_json::json!("Deny"));
     }
 
     #[tokio::test]

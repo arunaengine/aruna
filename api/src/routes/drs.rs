@@ -247,9 +247,7 @@ pub async fn get_service_info(
             "supported_types": ["BearerAuth"],
             "passport_auth_issuers": [],
             "bearer_auth_issuers": ["https://login.example.test/realms/aruna"]
-        })),
-        (status = 400, description = "Reserved by the DRS specification for a malformed identifier; this operation does not parse the identifier and so does not return it", body = DrsErrorPayload),
-        (status = 404, description = "Reserved by the DRS specification for an unknown object; this operation does not resolve the identifier and so does not return it", body = DrsErrorPayload)
+        }))
     ),
 )]
 pub async fn get_authorizations(
@@ -930,8 +928,8 @@ impl IntoResponse for DrsError {
 mod tests {
     use super::{
         GetObjectError, RequestedObjectId, ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX,
-        build_object_response, download_error, drs_denied_error, encode_component, get_object,
-        parse_requested_object_id, resolve_object,
+        build_object_response, download_error, drs_denied_error, encode_component,
+        get_authorizations, get_object, parse_requested_object_id, resolve_object,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -1035,6 +1033,23 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected fixture write event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn authorizations_shape() {
+        let (_dir, state) = test_state().await;
+        let response = get_authorizations(State(state), Path("object/id".to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "drs_object_id": "object/id",
+                "supported_types": ["BearerAuth"],
+                "passport_auth_issuers": [],
+                "bearer_auth_issuers": []
+            })
+        );
     }
 
     async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, VersionedObjectArn) {

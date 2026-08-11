@@ -61,7 +61,13 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct BootstrapEndpointDoc {
     pub id: String,
-    pub addrs: Vec<String>,
+    pub addrs: Vec<TransportAddressDoc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub enum TransportAddressDoc {
+    Ip(String),
+    Relay(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]

@@ -774,7 +774,13 @@ pub async fn list_tasks(
     description = "Requests cancellation of a task the calling user created. TES addresses this as a POST whose final path segment is the task id followed by the literal `:cancel` action suffix, and a POST that omits the suffix is a 400. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Cancellation is self scoped exactly like reads: another user's task, a task outside the group of the basic credential and an id that does not parse are all answered with 404 rather than 403. The request is carried out on the node that owns the task, and when that node is unreachable the call fails with a retryable 503. A 200 records only that cancellation was requested, or that the task had already reached a terminal state; the executor may still be winding down, so poll the task until it reports CANCELED.",
     params(("id" = String, Path, description = "TES task id (the JobId) followed by the `:cancel` action suffix, for example `01JABCDEF0123456789ABCDEFG:cancel`; the id itself is the 26 character ULID returned by task creation")),
     responses(
-        (status = 200, description = "Cancellation requested, or the task was already terminal; the body is an empty JSON object and the task may still be stopping"),
+        (
+            status = 200,
+            description = "Cancellation requested, or the task was already terminal; the body is an empty JSON object and the task may still be stopping",
+            body = Object,
+            content_type = "application/json",
+            example = json!({})
+        ),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
         (status = 404, description = "No such task for this caller; also returned for another user's task, a task outside the credential's group and an unparsable id", body = TesErrorPayload),
         (status = 503, description = "The node owning the task is unreachable, so the cancellation was not delivered; the caller may retry", body = TesErrorPayload)
@@ -1637,6 +1643,7 @@ mod tests {
     use std::time::Duration;
 
     use aruna_operations::jobs::service::read_owned_job;
+    use axum::body::to_bytes;
 
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
@@ -2743,6 +2750,8 @@ mod tests {
         )
         .await;
         assert_eq!(ok.status(), StatusCode::OK);
+        let body = to_bytes(ok.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"{}");
 
         // Missing the action suffix is a bad request.
         let bad = cancel_task(
