@@ -664,7 +664,8 @@ mod tests {
         assert!(schema_matches(doc, &media["schema"], runtime));
     }
 
-    fn normalize_addrs(mut value: Value) -> Value {
+    fn normalize_addrs(value: &Value) -> Value {
+        let mut value = value.clone();
         // Iroh stores addresses in a set; their JSON array order is not contractual.
         if let Some(addrs) = value["temporary_bootstrap_endpoint"]["addrs"].as_array_mut() {
             addrs.sort_by_key(|item| item.to_string());
