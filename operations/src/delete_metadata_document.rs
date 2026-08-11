@@ -709,12 +709,20 @@ impl Operation for DeleteMetadataDocumentOperation {
                         )));
                     }
                 };
-                match withdrawal_transition(
-                    existing.as_ref(),
-                    &self.mapping_route,
-                    self.document_id,
-                    unix_timestamp_millis(),
-                ) {
+                // A document that never minted a pid leaves no row: the
+                // registry-row fence in this transaction already blocks any
+                // later mint, and a tombstone would turn the landing 404 into
+                // an existence-leaking 410.
+                let transition = match existing.as_ref() {
+                    None => Ok(None),
+                    Some(mapping) => withdrawal_transition(
+                        Some(mapping),
+                        &self.mapping_route,
+                        self.document_id,
+                        unix_timestamp_millis(),
+                    ),
+                };
+                match transition {
                     Ok(Some((_, writes))) => {
                         self.state = DeleteMetadataDocumentState::WritePidWithdrawal;
                         smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -1295,7 +1303,9 @@ mod tests {
     // The PID tombstone is part of the delete, not a follow-up: a crash after the
     // commit must not be able to leave a deleted document's mapping Active.
     #[test]
-    fn delete_tombstones_pid() {
+    // A delete without a minted pid writes no tombstone: the registry-row
+    // fence blocks later mints and the landing URL must stay a plain 404.
+    fn delete_skips_unminted() {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::generate();
@@ -1324,6 +1334,38 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: ByteView::from(persistent_id_key(record.document_id)),
             value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
+                if *commit_txn == txn_id
+        ));
+    }
+
+    #[test]
+    // A delete of a minted document withdraws the mapping in the same
+    // transaction that removes the registry row.
+    fn delete_withdraws_minted() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let minted = PersistentIdMapping::conceptual(
+            record.document_id,
+            actor.user_id,
+            aruna_core::structs::PersistentIdRevision {
+                event_id: Ulid::generate(),
+                actor: actor.node_id,
+                occurred_at_ms: 1,
+            },
+        );
+        let mut operation =
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(txn_id);
+        operation.state = DeleteMetadataDocumentState::ReadPidMapping;
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(persistent_id_key(record.document_id)),
+            value: Some(ByteView::from(minted.to_bytes().expect("mapping encodes"))),
         }));
         let [
             Effect::Storage(StorageEffect::BatchWrite {
