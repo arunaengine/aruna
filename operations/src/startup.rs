@@ -28,7 +28,12 @@ use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
 /// these; see [`DocumentSyncTarget::sync_topic_id`]).
-fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 5] {
+pub const SHARED_RESTORE_TOPIC_COUNT: usize = 5;
+
+fn shared_targets(
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> [DocumentSyncTarget; SHARED_RESTORE_TOPIC_COUNT] {
     [
         DocumentSyncTarget::RealmAuthorization { realm_id },
         DocumentSyncTarget::RealmConfig { realm_id },
@@ -51,9 +56,6 @@ fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<Node
         .filter(|candidate| *candidate != node_id)
         .collect()
 }
-
-/// Fixed realm-scoped topics restored on every start (see [`shared_targets`]).
-pub const SHARED_RESTORE_TOPIC_COUNT: usize = 6;
 
 /// Work units one bounded restore pass may process. A work-unit limit, never a
 /// wall-clock deadline, so the bound holds however many shards share a
@@ -156,6 +158,17 @@ impl RecoveryError {
             _ => None,
         }
     }
+
+    fn merge(current: Option<Self>, next: Option<Self>) -> Option<Self> {
+        match (current, next) {
+            (Some(Self::Panicked), _) | (_, Some(Self::Panicked)) => Some(Self::Panicked),
+            (Some(Self::Storage), _) | (_, Some(Self::Storage)) => Some(Self::Storage),
+            (Some(Self::PeerUnavailable), _) | (_, Some(Self::PeerUnavailable)) => {
+                Some(Self::PeerUnavailable)
+            }
+            (None, None) => None,
+        }
+    }
 }
 
 /// How a completed pass is counted in `aruna_recovery_pass_total`.
@@ -192,7 +205,7 @@ impl RecoveryOutcome {
 pub struct RecoverySnapshot {
     pub state: RecoveryState,
     pub topics_remaining: u64,
-    /// Unix seconds of the last completed work unit; 0 when none has completed.
+    /// Unix seconds when recovery started or last made measurable progress.
     pub last_progress_timestamp: u64,
     pub last_error: Option<RecoveryError>,
 }
@@ -235,16 +248,26 @@ impl RecoveryStatus {
         self.inner
             .state
             .store(RecoveryState::Running.code(), Ordering::Relaxed);
+        let _ = self.inner.last_progress_ms.compare_exchange(
+            0,
+            unix_timestamp_millis(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     /// Publishes progress after a completed work unit.
     pub fn note_progress(&self, topics_remaining: u64) {
-        self.inner
-            .topics_remaining
-            .store(topics_remaining, Ordering::Relaxed);
+        self.set_remaining(topics_remaining);
         self.inner
             .last_progress_ms
             .store(unix_timestamp_millis(), Ordering::Relaxed);
+    }
+
+    fn set_remaining(&self, topics_remaining: u64) {
+        self.inner
+            .topics_remaining
+            .store(topics_remaining, Ordering::Relaxed);
     }
 
     pub fn finish_pass(&self, outcome: RecoveryOutcome, error: Option<RecoveryError>) {
@@ -306,6 +329,11 @@ async fn recovery_loop(
     let mut cursor = ShardRestoreCursor::default();
     let mut publish_usage = config.publish_full_usage;
     let mut reconcile_placements = true;
+    let mut announce_presence = true;
+    let mut rotation = RecoveryRotation::default();
+    let mut previous_failure: Option<RecoveryFailure> = None;
+    let mut first_rotation = true;
+    let mut invocations = 0u64;
     loop {
         if cancelled.is_cancelled() {
             return;
@@ -314,44 +342,96 @@ async fn recovery_loop(
         let pass = recovery_pass(
             &context,
             &config,
-            &status,
             &cancelled,
             &mut cursor,
             &mut publish_usage,
             &mut reconcile_placements,
+            &mut announce_presence,
         )
         .await;
+        invocations = invocations.saturating_add(1);
         if cancelled.is_cancelled() {
             return;
         }
-        if pass.remaining == 0 && pass.error.is_none() {
+
+        let decision = apply_recovery_pass(
+            &mut rotation,
+            &mut previous_failure,
+            &mut first_rotation,
+            &pass,
+        );
+        if finish_recovery_step(
+            decision,
+            &status,
+            &started,
+            invocations,
+            &mut attempts,
+            &cancelled,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+async fn finish_recovery_step(
+    decision: RecoveryDecision,
+    status: &RecoveryStatus,
+    started: &std::time::Instant,
+    invocations: u64,
+    attempts: &mut u32,
+    cancelled: &CancellationToken,
+) -> bool {
+    let topics_remaining = match &decision {
+        RecoveryDecision::ContinueLocal {
+            topics_remaining, ..
+        } => *topics_remaining,
+        RecoveryDecision::Converged => 0,
+        RecoveryDecision::Retry { failure, .. } => failure.unresolved_topics.len() as u64,
+    };
+    status.set_remaining(topics_remaining);
+    match decision {
+        RecoveryDecision::ContinueLocal {
+            progress, error, ..
+        } => {
+            if progress {
+                status.note_progress(topics_remaining);
+            }
+            status.finish_pass(RecoveryOutcome::Partial, error);
+            tokio::task::yield_now().await;
+            false
+        }
+        RecoveryDecision::Converged => {
             status.note_progress(0);
             status.finish_pass(RecoveryOutcome::Success, None);
             info!(
                 event = "startup.recovery.complete",
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                passes = attempts.saturating_add(1),
+                passes = invocations,
                 "Remote recovery converged"
             );
-            return;
+            true
         }
-        if pass.error.is_none() && pass.more_local_work {
-            tokio::task::yield_now().await;
-            continue;
-        }
-        status.finish_pass(RecoveryOutcome::Partial, pass.error);
-        warn!(
-            event = "startup.recovery.degraded",
-            topics_remaining = pass.remaining,
-            error_class = pass.error.map(RecoveryError::label).unwrap_or("none"),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "Remote recovery left retryable work behind"
-        );
-        let after = recovery_backoff(attempts);
-        attempts = attempts.saturating_add(1);
-        tokio::select! {
-            _ = cancelled.cancelled() => return,
-            _ = tokio::time::sleep(after) => {}
+        RecoveryDecision::Retry { failure, progress } => {
+            if progress {
+                status.note_progress(topics_remaining);
+                *attempts = 0;
+            }
+            status.finish_pass(RecoveryOutcome::Partial, failure.error);
+            warn!(
+                event = "startup.recovery.degraded",
+                topics_remaining = failure.unresolved_topics.len(),
+                error_class = failure.error.map(RecoveryError::label).unwrap_or("none"),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Remote recovery left retryable work behind"
+            );
+            let after = recovery_backoff(*attempts);
+            *attempts = (*attempts).saturating_add(1);
+            tokio::select! {
+                _ = cancelled.cancelled() => true,
+                _ = tokio::time::sleep(after) => false,
+            }
         }
     }
 }
@@ -363,88 +443,219 @@ fn recovery_backoff(attempts: u32) -> Duration {
     Duration::from_millis(base.saturating_mul(1u64 << attempts.min(16)).min(max))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct RecoveryPass {
-    remaining: u64,
+    unresolved_topics: BTreeSet<::irokle::TopicId>,
+    unvisited_topics: usize,
     error: Option<RecoveryError>,
     /// Unvisited units are local work, not a peer problem: retry at once.
     more_local_work: bool,
+    plan_changed: bool,
+    units_processed: usize,
+    topics_completed: usize,
+    phase_progress: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecoveryFailure {
+    unresolved_topics: BTreeSet<::irokle::TopicId>,
+    error: Option<RecoveryError>,
+}
+
+impl RecoveryFailure {
+    fn improves(&self, previous: &Self) -> bool {
+        self.unresolved_topics.len() < previous.unresolved_topics.len()
+            || previous.error.is_some() && self.error.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RecoveryRotation {
+    unresolved_topics: BTreeSet<::irokle::TopicId>,
+    error: Option<RecoveryError>,
+}
+
+impl RecoveryRotation {
+    fn merge(&mut self, pass: &RecoveryPass) {
+        self.unresolved_topics
+            .extend(pass.unresolved_topics.iter().copied());
+        self.error = RecoveryError::merge(self.error, pass.error);
+    }
+
+    fn remaining_topics(&self, unvisited_topics: usize) -> u64 {
+        self.unresolved_topics
+            .len()
+            .saturating_add(unvisited_topics) as u64
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RecoveryDecision {
+    ContinueLocal {
+        progress: bool,
+        topics_remaining: u64,
+        error: Option<RecoveryError>,
+    },
+    Converged,
+    Retry {
+        failure: RecoveryFailure,
+        progress: bool,
+    },
+}
+
+fn apply_recovery_pass(
+    rotation: &mut RecoveryRotation,
+    previous_failure: &mut Option<RecoveryFailure>,
+    first_rotation: &mut bool,
+    pass: &RecoveryPass,
+) -> RecoveryDecision {
+    if pass.plan_changed {
+        *rotation = RecoveryRotation::default();
+        *previous_failure = None;
+        *first_rotation = true;
+    }
+    rotation.merge(pass);
+    let topics_remaining = rotation.remaining_topics(pass.unvisited_topics);
+    let pass_progress = pass.phase_progress || *first_rotation && pass.topics_completed > 0;
+    if pass.more_local_work {
+        return RecoveryDecision::ContinueLocal {
+            progress: pass_progress,
+            topics_remaining,
+            error: rotation.error,
+        };
+    }
+
+    let failure = RecoveryFailure {
+        unresolved_topics: rotation.unresolved_topics.clone(),
+        error: rotation.error,
+    };
+    if failure.unresolved_topics.is_empty() && failure.error.is_none() {
+        return RecoveryDecision::Converged;
+    }
+
+    let improved = previous_failure
+        .as_ref()
+        .is_some_and(|previous| failure.improves(previous));
+    let progress = pass_progress || improved;
+    *previous_failure = Some(failure.clone());
+    *rotation = RecoveryRotation::default();
+    *first_rotation = false;
+    RecoveryDecision::Retry { failure, progress }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PhaseOutcome {
+    progress: bool,
+    error: Option<RecoveryError>,
+}
+
+impl RecoveryPass {
+    fn merge_phase(&mut self, outcome: PhaseOutcome) {
+        self.phase_progress |= outcome.progress;
+        self.error = RecoveryError::merge(self.error, outcome.error);
+    }
 }
 
 async fn recovery_pass(
     context: &Arc<DriverContext>,
     config: &RecoveryConfig,
-    status: &RecoveryStatus,
     cancelled: &CancellationToken,
     cursor: &mut ShardRestoreCursor,
     publish_usage: &mut bool,
     reconcile_placements: &mut bool,
+    announce_presence: &mut bool,
 ) -> RecoveryPass {
     let mut pass = RecoveryPass::default();
 
     let restore =
         restore_shard_pass(context, config.node_id, config.realm_id, cursor, cancelled).await;
-    info!(
-        event = "startup.recovery.progress",
-        phase = "shard_restore",
-        held_shards = restore.summary.held_shards,
-        shard_topics = restore.summary.shard_topics,
-        shared_topics = restore.summary.shared_topics,
-        withheld_topics = restore.summary.withheld_topics,
-        units_processed = restore.units_processed,
-        units_total = restore.units_total,
-        rotation_complete = restore.wrapped,
-        "Restored held shard subscriptions"
-    );
-    pass.remaining += restore.summary.withheld_topics as u64;
-    if restore.summary.withheld_topics > 0 {
-        pass.error = Some(RecoveryError::PeerUnavailable);
+    pass.unresolved_topics = restore.unresolved_topics;
+    pass.unvisited_topics = restore.unvisited_topics;
+    pass.error = restore.error;
+    pass.plan_changed = restore.plan_changed;
+    pass.units_processed = restore.units_processed;
+    pass.topics_completed = restore.topics_completed;
+    if pass.plan_changed {
+        *reconcile_placements = true;
     }
     // Convergence needs the cursor to have walked every unit.
     if !restore.wrapped {
         pass.more_local_work = true;
-        pass.remaining += (restore.units_total - restore.units_processed) as u64;
+        return pass;
     }
-    status.note_progress(pass.remaining);
     if cancelled.is_cancelled() {
         return pass;
     }
 
-    // One scan per driver run: it arms its own durable retry timer, so later
-    // passes must not repeat the whole placement walk.
-    if *reconcile_placements {
-        *reconcile_placements = false;
-        let placements = crate::process_placements::process_shard_placements(
-            context,
-            config.realm_id,
-            config.node_id,
-        )
-        .await;
-        match placements.status {
-            crate::process_placements::PlacementReconcileStatus::Clean => {}
-            crate::process_placements::PlacementReconcileStatus::RetryScheduled => {
-                pass.remaining += 1;
-                pass.error.get_or_insert(RecoveryError::PeerUnavailable);
-            }
-            crate::process_placements::PlacementReconcileStatus::StorageFailure => {
-                pass.remaining += 1;
-                pass.error = Some(RecoveryError::Storage);
-            }
-        }
-        info!(
-            event = "startup.recovery.progress",
-            phase = "placements",
-            retry_scheduled = placements.retry_scheduled,
-            pull_pending = placements.pull_pending,
-            "Reconciled shard placements"
-        );
-        status.note_progress(pass.remaining);
-        if cancelled.is_cancelled() {
-            return pass;
-        }
+    pass.merge_phase(reconcile_phase(context, config, reconcile_placements).await);
+    if cancelled.is_cancelled() {
+        return pass;
     }
+    pass.merge_phase(presence_phase(context, config, announce_presence).await);
+    if cancelled.is_cancelled() {
+        return pass;
+    }
+    pass.merge_phase(usage_phase(context, config, publish_usage).await);
+    pass
+}
 
-    if let Err(error) = crate::driver::drive(
+#[derive(Debug)]
+enum RealmConfigLoad {
+    Found(RealmConfigDocument),
+    Absent,
+    StorageFailure,
+}
+
+async fn reconcile_phase(
+    context: &Arc<DriverContext>,
+    config: &RecoveryConfig,
+    pending: &mut bool,
+) -> PhaseOutcome {
+    if !*pending {
+        return PhaseOutcome::default();
+    }
+    let placements = crate::process_placements::process_shard_placements(
+        context,
+        config.realm_id,
+        config.node_id,
+    )
+    .await;
+    let outcome = match placements.status {
+        crate::process_placements::PlacementReconcileStatus::Clean => {
+            *pending = false;
+            PhaseOutcome {
+                progress: true,
+                error: None,
+            }
+        }
+        crate::process_placements::PlacementReconcileStatus::RetryScheduled => PhaseOutcome {
+            progress: false,
+            error: Some(RecoveryError::PeerUnavailable),
+        },
+        crate::process_placements::PlacementReconcileStatus::StorageFailure => PhaseOutcome {
+            progress: false,
+            error: Some(RecoveryError::Storage),
+        },
+    };
+    info!(
+        event = "startup.recovery.progress",
+        phase = "placements",
+        retry_scheduled = placements.retry_scheduled,
+        pull_pending = placements.pull_pending,
+        "Reconciled shard placements"
+    );
+    outcome
+}
+
+async fn presence_phase(
+    context: &Arc<DriverContext>,
+    config: &RecoveryConfig,
+    pending: &mut bool,
+) -> PhaseOutcome {
+    if !*pending {
+        return PhaseOutcome::default();
+    }
+    let result = crate::driver::drive(
         crate::announce_realm_presence::AnnounceRealmPresenceOperation::new(
             crate::announce_realm_presence::AnnounceRealmPresenceConfig {
                 realm_id: config.realm_id,
@@ -454,30 +665,56 @@ async fn recovery_pass(
         ),
         context.as_ref(),
     )
-    .await
-    {
-        warn!(error = %error, "Failed to announce realm presence during recovery");
-        pass.remaining += 1;
-        pass.error.get_or_insert(RecoveryError::PeerUnavailable);
-    }
-
-    // A failure here leaves its own durable retry marker, so a later pass must
-    // not repeat it.
-    if *publish_usage {
-        *publish_usage = false;
-        if let Err(error) = crate::usage_stats::publish_and_refresh_usage_snapshots(
-            context.as_ref(),
-            config.node_id,
-            config.realm_id,
-            true,
-        )
-        .await
-        {
-            warn!(error = %error, "Failed to publish initial node usage snapshots");
+    .await;
+    match result {
+        Ok(_) => {
+            *pending = false;
+            PhaseOutcome {
+                progress: true,
+                error: None,
+            }
+        }
+        Err(error) => {
+            warn!(error = %error, "Failed to announce realm presence during recovery");
+            PhaseOutcome {
+                progress: false,
+                error: Some(RecoveryError::PeerUnavailable),
+            }
         }
     }
-    status.note_progress(pass.remaining);
-    pass
+}
+
+async fn usage_phase(
+    context: &Arc<DriverContext>,
+    config: &RecoveryConfig,
+    pending: &mut bool,
+) -> PhaseOutcome {
+    if !*pending {
+        return PhaseOutcome::default();
+    }
+    let result = crate::usage_stats::publish_and_refresh_usage_snapshots(
+        context.as_ref(),
+        config.node_id,
+        config.realm_id,
+        true,
+    )
+    .await;
+    match result {
+        Ok(_) => {
+            *pending = false;
+            PhaseOutcome {
+                progress: true,
+                error: None,
+            }
+        }
+        Err(error) => {
+            warn!(error = %error, "Failed to publish initial node usage snapshots");
+            PhaseOutcome {
+                progress: false,
+                error: Some(RecoveryError::Storage),
+            }
+        }
+    }
 }
 
 /// What a [`restore_shard_subscriptions`] pass touched. The load-bearing
@@ -536,20 +773,25 @@ pub async fn restore_shard_subscriptions(
     }
 }
 
-/// Where a bounded restore resumes. Reconstructed from the realm config on every
-/// pass, so a config change simply re-derives the unit list.
+/// Where a bounded restore resumes, bound to the exact current work plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShardRestoreCursor {
     next_unit: usize,
+    plan_hash: Option<[u8; 32]>,
 }
 
 /// What one bounded [`restore_shard_pass`] did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardRestorePass {
     pub summary: RestoreShardSummary,
     /// Never more than [`SHARD_RESTORE_UNIT_BUDGET`].
     pub units_processed: usize,
+    pub topics_completed: usize,
     pub units_total: usize,
+    pub unvisited_topics: usize,
+    pub unresolved_topics: BTreeSet<::irokle::TopicId>,
+    pub error: Option<RecoveryError>,
+    pub plan_changed: bool,
     /// Whether the cursor reached the end and wrapped back to the head.
     pub wrapped: bool,
 }
