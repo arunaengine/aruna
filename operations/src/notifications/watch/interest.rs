@@ -44,12 +44,12 @@ pub const WATCH_INTEREST_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Ensures this node has a document to announce when joining the shared
 /// realm-scoped watch-interest topic. Existing digests may contain live watches
-/// and are therefore never overwritten.
+/// and are therefore never overwritten. Returns whether one was created.
 pub async fn ensure_local_watch_interest_digest(
     storage: &StorageHandle,
     realm_id: RealmId,
     node_id: NodeId,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let key = Key::from(watch_interest_node_key(realm_id, node_id));
     match storage
         .send_storage_effect(StorageEffect::Read {
@@ -59,7 +59,7 @@ pub async fn ensure_local_watch_interest_digest(
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => Ok(()),
+        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => Ok(false),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
             let digest = WatchInterestDigest {
                 node_id,
@@ -74,7 +74,7 @@ pub async fn ensure_local_watch_interest_digest(
                 })
                 .await
             {
-                Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+                Event::Storage(StorageEvent::WriteResult { .. }) => Ok(true),
                 Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
                 other => Err(format!(
                     "unexpected local watch interest digest write result: {other:?}"

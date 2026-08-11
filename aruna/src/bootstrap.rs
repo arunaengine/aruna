@@ -103,9 +103,12 @@ async fn core_document_targets(
     node_id: NodeId,
     realm_id: aruna_core::structs::RealmId,
 ) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
-    ensure_local_watch_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
-        .await
-        .map_err(|error| format!("failed to initialize local watch interest digest: {error}"))?;
+    let digest_created =
+        ensure_local_watch_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
+            .await
+            .map_err(|error| {
+                format!("failed to initialize local watch interest digest: {error}")
+            })?;
     // Rebuild from replicated subscription rows on every startup. This closes
     // crash windows around membership reconciliation and remote row application.
     mark_watch_interest_dirty(driver_ctx, realm_id)
@@ -126,10 +129,13 @@ async fn core_document_targets(
         // subscribes at bootstrap and sees late joiners' info within the sync
         // window (closes the <=60s late-joiner visibility gap).
         DocumentSyncTarget::NodeInfo { realm_id, node_id },
-        // The watch-interest digest is not announced here: the dirty marker above
-        // publishes it only when the rebuilt digest differs, and the shared topic
-        // genesis is ensured by the shard restore pass either way.
     ];
+    // A first digest has nothing to compare against, so the dirty marker's
+    // publish would skip it; a later restart's unchanged digest needs no second
+    // announcement.
+    if digest_created {
+        documents.push(DocumentSyncTarget::WatchInterest { realm_id, node_id });
+    }
 
     match driver_ctx
         .storage_handle
