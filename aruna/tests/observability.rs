@@ -1167,8 +1167,10 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
     let mut node = prepare_shutdown(&env).await?;
 
     node.signal("TERM");
-    wait_children(&mut node).await;
+    // Readiness closes before the children join, so sample it first; waiting for
+    // the joins would leave only the last instant before exit to observe it in.
     let body = node.wait_draining().await;
+    wait_children(&mut node).await;
     let ready: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(ready["ready"], serde_json::json!(false));
     assert_eq!(
