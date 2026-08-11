@@ -141,14 +141,39 @@ pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, 
     write_outbox_effect_with_txn(record, None)
 }
 
+#[cfg(debug_assertions)]
+fn record_ledger(key: &[u8], value: &[u8]) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    let Some(path) = std::env::var_os("ARUNA_TEST_OUTBOX_LEDGER") else {
+        return;
+    };
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let Ok(_guard) = LOCK.get_or_init(|| Mutex::new(())).lock() else {
+        return;
+    };
+    let key_hash = blake3::hash(key).to_hex();
+    let value_hash = blake3::hash(value).to_hex();
+    let line = format!("key_hash={key_hash} value_hash={value_hash}\n");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(path))
+    else {
+        return;
+    };
+    let _ = file.write_all(line.as_bytes());
+}
+
 pub fn outbox_write_entry(
     record: &DocumentSyncOutboxRecord,
 ) -> Result<(String, ByteView, ByteView), postcard::Error> {
-    Ok((
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-        outbox_key(record),
-        ByteView::from(postcard::to_allocvec(record)?),
-    ))
+    let key = outbox_key(record);
+    let value = ByteView::from(postcard::to_allocvec(record)?);
+    #[cfg(debug_assertions)]
+    record_ledger(key.as_ref(), value.as_ref());
+    Ok((DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
 }
 
 pub fn write_outbox_effect_with_txn(

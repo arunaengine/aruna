@@ -37,6 +37,8 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 use aruna_operations::replication::migration::migrate_legacy_sync;
+#[cfg(debug_assertions)]
+use aruna_operations::startup::RecoveryState;
 use aruna_operations::startup::{
     RecoveryConfig, RecoveryStatus, prepare_shard_policy, run_recovery,
 };
@@ -46,6 +48,7 @@ use aruna_tasks::TaskHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 #[cfg(debug_assertions)]
@@ -102,6 +105,76 @@ async fn publish_core(
         documents,
     )
     .await
+}
+
+#[cfg(debug_assertions)]
+struct RecoveryBarrier {
+    path: PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for RecoveryBarrier {
+    fn drop(&mut self) {
+        info!(event = "test.recovery.joined", "Recovery child joined");
+        if let Err(error) = std::fs::write(&self.path, b"joined") {
+            warn!(error = %error, "Failed to record recovery join");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn watch_recovery(
+    barrier: &RecoveryBarrier,
+    status: RecoveryStatus,
+    cancelled: CancellationToken,
+) {
+    loop {
+        if cancelled.is_cancelled() {
+            return;
+        }
+        match status.snapshot().state {
+            RecoveryState::Degraded => {
+                if let Err(error) = std::fs::write(&barrier.path, b"active") {
+                    warn!(error = %error, "Failed to record recovery activity");
+                }
+                cancelled.cancelled().await;
+                return;
+            }
+            RecoveryState::Converged => return,
+            RecoveryState::Pending | RecoveryState::Running => {}
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn recover_child(
+    context: Arc<DriverContext>,
+    config: RecoveryConfig,
+    status: RecoveryStatus,
+    cancelled: CancellationToken,
+) {
+    let Ok(path) = std::env::var("ARUNA_TEST_RECOVERY_BARRIER") else {
+        run_recovery(context, config, status, cancelled).await;
+        return;
+    };
+    let barrier = RecoveryBarrier {
+        path: PathBuf::from(path),
+    };
+    tokio::join!(
+        run_recovery(context, config, status.clone(), cancelled.clone()),
+        watch_recovery(&barrier, status, cancelled),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+async fn recover_child(
+    context: Arc<DriverContext>,
+    config: RecoveryConfig,
+    status: RecoveryStatus,
+    cancelled: CancellationToken,
+) {
+    run_recovery(context, config, status, cancelled).await;
 }
 
 fn main() {
@@ -653,7 +726,7 @@ async fn start_background(background: Background) {
     };
     let cancelled = shutdown.token();
     shutdown.spawn(async move {
-        run_recovery(recovery_ctx, recovery_config, recovery, cancelled).await;
+        recover_child(recovery_ctx, recovery_config, recovery, cancelled).await;
     });
 }
 

@@ -224,6 +224,31 @@ mod process {
         dir: tempfile::TempDir,
     }
 
+    #[derive(Default)]
+    struct LaunchPaths {
+        core: Option<PathBuf>,
+        recovery: Option<PathBuf>,
+        outbox: Option<PathBuf>,
+        ledger: Option<PathBuf>,
+    }
+
+    impl LaunchPaths {
+        fn env_lines(&self) -> String {
+            let mut lines = String::new();
+            for (key, path) in [
+                ("ARUNA_TEST_CORE_PUBLICATION_BARRIER", self.core.as_deref()),
+                ("ARUNA_TEST_RECOVERY_BARRIER", self.recovery.as_deref()),
+                ("ARUNA_TEST_OUTBOX_BARRIER", self.outbox.as_deref()),
+                ("ARUNA_TEST_OUTBOX_LEDGER", self.ledger.as_deref()),
+            ] {
+                if let Some(path) = path {
+                    lines.push_str(&format!("{key}={}\n", path.display()));
+                }
+            }
+            lines
+        }
+    }
+
     struct Ports {
         http: TcpListener,
         p2p: UdpSocket,
@@ -278,11 +303,13 @@ mod process {
             self.root().join("node.log")
         }
 
-        fn write_env_file(&self, http: u16, p2p: u16, ops: u16, s3: u16, barrier: Option<&Path>) {
+        pub fn ledger_path(&self) -> PathBuf {
+            self.root().join("outbox.ledger")
+        }
+
+        fn write_env_file(&self, http: u16, p2p: u16, ops: u16, s3: u16, paths: &LaunchPaths) {
             let storage = self.storage_path();
-            let barrier = barrier
-                .map(|path| format!("ARUNA_TEST_CORE_PUBLICATION_BARRIER={}\n", path.display()))
-                .unwrap_or_default();
+            let test_env = paths.env_lines();
             let body = format!(
                 "STORAGE_PATH={storage}\n\
                  BLOB_ROOT={storage}/blobstore\n\
@@ -296,7 +323,7 @@ mod process {
                  REALM_DESCRIPTION=\"observability harness realm\"\n\
                  ARUNA_COMPUTE_EXECUTOR=none\n\
                  ARUNA_SHUTDOWN_GRACE_SECS=16\n\
-                 {barrier}\
+                 {test_env}\
                  RUST_LOG=info\n",
                 storage = storage.display(),
                 http = http,
@@ -308,16 +335,47 @@ mod process {
         }
 
         pub fn launch(&self) -> NodeProcess {
-            self.launch_mode(None)
+            self.launch_mode(LaunchPaths::default())
         }
 
         pub fn launch_core(&self) -> NodeProcess {
-            let barrier = self.root().join("core-publication.barrier");
-            let _ = std::fs::remove_file(&barrier);
-            self.launch_mode(Some(barrier))
+            let mut paths = LaunchPaths::default();
+            paths.core = Some(self.root().join("core-publication.barrier"));
+            self.clear_paths(&paths);
+            self.launch_mode(paths)
         }
 
-        fn launch_mode(&self, barrier: Option<PathBuf>) -> NodeProcess {
+        pub fn launch_ledger(&self) -> NodeProcess {
+            let mut paths = LaunchPaths::default();
+            let ledger = self.ledger_path();
+            paths.ledger = Some(ledger.clone());
+            self.clear_paths(&paths);
+            std::fs::File::create(ledger).expect("create outbox ledger");
+            self.launch_mode(paths)
+        }
+
+        pub fn launch_recovery(&self) -> NodeProcess {
+            let mut paths = LaunchPaths::default();
+            paths.recovery = Some(self.root().join("recovery.barrier"));
+            paths.outbox = Some(self.root().join("outbox.barrier"));
+            self.clear_paths(&paths);
+            self.launch_mode(paths)
+        }
+
+        fn clear_paths(&self, paths: &LaunchPaths) {
+            for path in [
+                paths.core.as_deref(),
+                paths.recovery.as_deref(),
+                paths.outbox.as_deref(),
+                paths.ledger.as_deref(),
+            ] {
+                if let Some(path) = path {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        fn launch_mode(&self, paths: LaunchPaths) -> NodeProcess {
             let ports = Ports::new();
             let (http_port, p2p_port, ops_port, s3_port) = ports.values();
             let log = std::fs::OpenOptions::new()
@@ -331,7 +389,7 @@ mod process {
             let log_start = std::fs::metadata(self.log_path())
                 .map(|meta| meta.len() as usize)
                 .unwrap_or(0);
-            self.write_env_file(http_port, p2p_port, ops_port, s3_port, barrier.as_deref());
+            self.write_env_file(http_port, p2p_port, ops_port, s3_port, &paths);
             let mut command = Command::new(env!("CARGO_BIN_EXE_aruna"));
             command
                 .current_dir(self.root())
@@ -346,7 +404,7 @@ mod process {
                 rest_url: format!("http://127.0.0.1:{http_port}"),
                 log_path: self.log_path(),
                 log_start,
-                barrier,
+                paths,
             }
         }
 
@@ -419,7 +477,7 @@ mod process {
         pub rest_url: String,
         log_path: PathBuf,
         log_start: usize,
-        barrier: Option<PathBuf>,
+        paths: LaunchPaths,
     }
 
     impl NodeProcess {
@@ -518,10 +576,37 @@ mod process {
         /// Waits for the tracked core publication barrier to reach `expected`.
         pub async fn wait_core(&mut self, expected: &str) {
             let path = self
-                .barrier
+                .paths
+                .core
                 .as_ref()
                 .expect("core barrier path is present")
                 .clone();
+            self.wait_path(path, expected).await;
+        }
+
+        /// Waits for the tracked recovery child barrier to reach `expected`.
+        pub async fn wait_recovery(&mut self, expected: &str) {
+            let path = self
+                .paths
+                .recovery
+                .as_ref()
+                .expect("recovery barrier path is present")
+                .clone();
+            self.wait_path(path, expected).await;
+        }
+
+        /// Waits for the tracked outbox drain barrier to reach `expected`.
+        pub async fn wait_outbox(&mut self, expected: &str) {
+            let path = self
+                .paths
+                .outbox
+                .as_ref()
+                .expect("outbox barrier path is present")
+                .clone();
+            self.wait_path(path, expected).await;
+        }
+
+        async fn wait_path(&mut self, path: PathBuf, expected: &str) {
             let deadline = Instant::now() + HANG_GUARD;
             while Instant::now() < deadline {
                 if std::fs::read_to_string(&path)
@@ -532,13 +617,13 @@ mod process {
                 }
                 if !self.is_running() {
                     panic!(
-                        "process exited before core barrier reached {expected}\n{}",
+                        "process exited before test barrier reached {expected}\n{}",
                         self.logs()
                     );
                 }
                 tokio::task::yield_now().await;
             }
-            panic!("core barrier never reached {expected}\n{}", self.logs());
+            panic!("test barrier never reached {expected}\n{}", self.logs());
         }
 
         /// Waits for a complete drain invocation before sampling the store.
@@ -571,18 +656,27 @@ mod process {
             assert!(status.success(), "kill -{name} failed");
         }
 
+        pub fn freeze(&self) {
+            self.signal("STOP");
+        }
+
         /// Sends SIGTERM and waits for exit inside the hang guard.
         pub async fn terminate(mut self) -> std::process::ExitStatus {
             self.signal("TERM");
             self.wait_exit().await
         }
 
-        /// Freezes a quiescent process before delivering SIGTERM.
-        pub async fn stop_terminate(mut self) -> std::process::ExitStatus {
-            self.signal("STOP");
+        /// Resumes a frozen process after delivering SIGTERM.
+        pub async fn resume_term(mut self) -> std::process::ExitStatus {
             self.signal("TERM");
             self.signal("CONT");
             self.wait_exit().await
+        }
+
+        /// Freezes a quiescent process before delivering SIGTERM.
+        pub async fn stop_terminate(self) -> std::process::ExitStatus {
+            self.freeze();
+            self.resume_term().await
         }
 
         /// Waits for this launch to exit inside the deadlock guard.
@@ -848,14 +942,26 @@ async fn restart_preserves_outbox() -> TestResult<()> {
     second.wait_status("/healthz", StatusCode::OK).await;
     second.wait_log("startup.recovery.degraded").await;
     second.wait_drain_quiet().await;
-    second.stop_terminate().await;
+    assert!(
+        second.stop_terminate().await.success(),
+        "baseline shutdown must complete durably"
+    );
     let before = env.outbox_rows().await;
 
-    let mut third = env.launch();
+    let mut third = env.launch_ledger();
     third.wait_status("/healthz", StatusCode::OK).await;
     third.wait_log("startup.recovery.degraded").await;
     third.wait_drain_quiet().await;
-    third.stop_terminate().await;
+    third.freeze();
+    let ledger = std::fs::read_to_string(env.ledger_path()).expect("read outbox ledger");
+    assert!(
+        ledger.is_empty(),
+        "unchanged restart attempted outbox enqueues:\n{ledger}"
+    );
+    assert!(
+        third.resume_term().await.success(),
+        "restart shutdown must complete durably"
+    );
     let after = env.outbox_rows().await;
 
     assert_eq!(
@@ -900,6 +1006,72 @@ async fn sigterm_joins_core() -> TestResult<()> {
     assert!(!logs.contains("storage.write.after_fence"), "{logs}");
     assert!(logs.contains("rejected_writes=0"), "{logs}");
     Ok(())
+}
+
+async fn prepare_shutdown(env: &process::NodeEnv) -> TestResult<process::NodeProcess> {
+    let mut first = env.launch();
+    first.wait_status("/readyz", StatusCode::OK).await;
+    first.terminate().await;
+
+    inject_offline_peers(env, 1).await?;
+    let outbox_key = inject_outbox(env).await?;
+    assert!(
+        env.outbox_rows()
+            .await
+            .iter()
+            .any(|(key, _)| key == &outbox_key),
+        "the shutdown case must start with durable outbox work"
+    );
+
+    let mut node = env.launch_recovery();
+    node.wait_status("/readyz", StatusCode::OK).await;
+    node.wait_recovery("active").await;
+    node.wait_outbox("active").await;
+    Ok(node)
+}
+
+async fn wait_children(node: &mut process::NodeProcess) {
+    node.wait_recovery("joined").await;
+    node.wait_outbox("joined").await;
+}
+
+fn assert_shutdown(logs: &str) {
+    let recovery = logs
+        .find("event=\"test.recovery.joined\"")
+        .expect("recovery join must be observable");
+    let outbox = logs
+        .find("event=\"test.outbox.joined\"")
+        .expect("outbox join must be observable");
+    let draining = logs
+        .find("Shutdown: readiness gate closed, draining")
+        .expect("shutdown must close readiness first");
+    let tasks = logs
+        .find("Shutdown: task scheduler drained")
+        .unwrap_or_else(|| panic!("task children did not finish\n{logs}"));
+    let background = logs
+        .find("phase=\"background\"")
+        .unwrap_or_else(|| panic!("background phase missing\n{logs}"));
+    // Completion is logged only after storage seal and final sync.
+    let sealed = logs
+        .find("Shutdown complete")
+        .expect("shutdown must finish after storage sync");
+    assert!(
+        draining < outbox
+            && draining < recovery
+            && outbox < tasks
+            && recovery < background
+            && outbox < sealed
+            && recovery < sealed
+            && background < sealed,
+        "{logs}"
+    );
+    assert!(
+        !logs.contains("Background children failed to drain before shutdown continued"),
+        "{logs}"
+    );
+    assert!(!logs.contains("storage.write.after_seal"), "{logs}");
+    assert!(!logs.contains("storage.write.after_fence"), "{logs}");
+    assert!(logs.contains("rejected_writes=0"), "{logs}");
 }
 
 /// With unreachable peers the node must still bind its listeners, keep
@@ -992,28 +1164,10 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
     use std::os::unix::process::ExitStatusExt;
 
     let env = process::NodeEnv::new();
-
-    let mut first = env.launch();
-    first.wait_status("/readyz", StatusCode::OK).await;
-    first.terminate().await;
-
-    inject_offline_peers(&env, 1).await?;
-    let outbox_key = inject_outbox(&env).await?;
-    assert!(
-        env.outbox_rows()
-            .await
-            .iter()
-            .any(|(key, _)| key == &outbox_key),
-        "the shutdown case must start with durable outbox work"
-    );
-
-    let mut node = env.launch();
-    node.wait_status("/readyz", StatusCode::OK).await;
-    // Recovery is blocked on unreachable peers and the outbox drain is active.
-    node.wait_log("startup.recovery.degraded").await;
-    node.wait_log("pipeline.publish.summary").await;
+    let mut node = prepare_shutdown(&env).await?;
 
     node.signal("TERM");
+    wait_children(&mut node).await;
     let body = node.wait_draining().await;
     let ready: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(ready["ready"], serde_json::json!(false));
@@ -1033,34 +1187,7 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
         None,
         "the process must not be killed by a signal"
     );
-    let logs = node.own_logs();
-    assert!(
-        logs.contains("pipeline.drain.summary"),
-        "outbox drain missing\n{logs}"
-    );
-    let draining = logs
-        .find("Shutdown: readiness gate closed, draining")
-        .expect("shutdown must close readiness first");
-    let tasks = logs
-        .find("Shutdown: task scheduler drained")
-        .unwrap_or_else(|| panic!("task children did not finish\n{logs}"));
-    let background = logs
-        .find("phase=\"background\"")
-        .unwrap_or_else(|| panic!("background phase missing\n{logs}"));
-    let complete = logs
-        .find("Shutdown complete")
-        .expect("shutdown must finish after storage sync");
-    assert!(
-        draining < tasks && tasks < background && background < complete,
-        "{logs}"
-    );
-    assert!(
-        !logs.contains("Background children failed to drain before shutdown continued"),
-        "{logs}"
-    );
-    assert!(!logs.contains("storage.write.after_seal"), "{logs}");
-    assert!(!logs.contains("storage.write.after_fence"), "{logs}");
-    assert!(logs.contains("rejected_writes=0"), "{logs}");
+    assert_shutdown(&node.own_logs());
     Ok(())
 }
 
