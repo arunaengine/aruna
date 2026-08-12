@@ -1906,14 +1906,22 @@ mod tests {
         (status, cancelled, driver)
     }
 
+    /// Advances virtual time only while the driver sleeps between passes, so
+    /// deadlines guarding real work inside a pass can never fire spuriously.
+    async fn advance_quiet(status: &RecoveryStatus, step: Duration) {
+        tokio::task::yield_now().await;
+        if status.snapshot().state == RecoveryState::Degraded {
+            tokio::time::advance(step).await;
+        }
+    }
+
     async fn wait_state(status: &RecoveryStatus, expected: RecoveryState) {
         let wait = async {
             loop {
                 if status.snapshot().state == expected {
                     return;
                 }
-                tokio::task::yield_now().await;
-                tokio::time::advance(Duration::from_millis(100)).await;
+                advance_quiet(status, Duration::from_millis(100)).await;
             }
         };
         tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
@@ -1927,8 +1935,7 @@ mod tests {
                 if status.pass_total(RecoveryOutcome::Partial) >= target {
                     return;
                 }
-                tokio::task::yield_now().await;
-                tokio::time::advance(Duration::from_millis(100)).await;
+                advance_quiet(status, Duration::from_millis(100)).await;
             }
         };
         tokio::time::timeout(RECOVERY_TEST_GUARD, wait)
@@ -1943,12 +1950,10 @@ mod tests {
             loop {
                 let partial = status.pass_total(RecoveryOutcome::Partial);
                 if partial <= observed || status.snapshot().state != RecoveryState::Degraded {
-                    tokio::task::yield_now().await;
-                    tokio::time::advance(Duration::from_millis(100)).await;
+                    advance_quiet(status, Duration::from_millis(100)).await;
                     continue;
                 }
-                tokio::task::yield_now().await;
-                tokio::time::advance(RECOVERY_RETRY_BASE / 2).await;
+                advance_quiet(status, RECOVERY_RETRY_BASE / 2).await;
                 if status.snapshot().state == RecoveryState::Degraded
                     && status.pass_total(RecoveryOutcome::Partial) == partial
                 {
@@ -2180,6 +2185,60 @@ mod tests {
         assert!(!baseline.note_failure(&cleared));
     }
 
+    #[test]
+    fn storage_fail_stalls() {
+        // A pass that could not enumerate work must not claim progress or
+        // wipe the baseline, so the stall signal survives storage hiccups.
+        let topic = ::irokle::TopicId::from_bytes([8; 32]);
+        let mut rotation = RecoveryRotation::default();
+        let mut baseline = None;
+        let mut first_rotation = true;
+        let stalled = RecoveryPass {
+            unresolved_topics: BTreeSet::from([topic]),
+            error: Some(RecoveryError::PeerUnavailable),
+            enumerated: true,
+            ..RecoveryPass::default()
+        };
+        let seeded =
+            apply_recovery_pass(&mut rotation, &mut baseline, &mut first_rotation, &stalled);
+        assert!(matches!(
+            seeded,
+            RecoveryDecision::Retry {
+                progress: false,
+                ..
+            }
+        ));
+
+        let blind = RecoveryPass {
+            error: Some(RecoveryError::Storage),
+            ..RecoveryPass::default()
+        };
+        let decision =
+            apply_recovery_pass(&mut rotation, &mut baseline, &mut first_rotation, &blind);
+        assert_eq!(
+            decision,
+            RecoveryDecision::Retry {
+                failure: RecoveryFailure {
+                    unresolved_topics: BTreeSet::new(),
+                    error: Some(RecoveryError::Storage),
+                },
+                progress: false,
+                enumerated: false,
+            }
+        );
+
+        let repeat =
+            apply_recovery_pass(&mut rotation, &mut baseline, &mut first_rotation, &stalled);
+        assert!(matches!(
+            repeat,
+            RecoveryDecision::Retry {
+                progress: false,
+                enumerated: true,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn restore_stops_cancelled() {
         let dir = tempdir().expect("tempdir must open");
@@ -2250,16 +2309,24 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         });
+        // A failed config read must not unbind the cursor from its plan.
+        let bound = ShardRestoreCursor {
+            next_unit: 3,
+            plan_hash: Some([7; 32]),
+        };
+        let mut cursor = bound;
         let pass = restore_shard_pass(
             &context,
             node(1),
             realm_id,
-            &mut ShardRestoreCursor::default(),
+            &mut cursor,
             &CancellationToken::new(),
         )
         .await;
         assert_eq!(pass.error, Some(RecoveryError::Storage));
         assert!(pass.wrapped);
+        assert!(!pass.enumerated);
+        assert_eq!(cursor, bound);
     }
 
     #[test]
@@ -2333,6 +2400,8 @@ mod tests {
         tokio::time::pause();
         let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
         let (partial, progress, remaining) = wait_stall(&status).await;
+        // A stalled recovery must keep reporting its outstanding topics.
+        assert!(remaining > 0);
 
         wait_partial(&status, partial.saturating_add(3)).await;
         assert_eq!(
