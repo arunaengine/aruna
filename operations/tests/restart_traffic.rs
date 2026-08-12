@@ -1279,37 +1279,13 @@ async fn wait_outbox(
     drainer: &aruna_operations::task_incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
-    // One bounded invocation exceeds five minutes under instrumentation, so
-    // only a much longer interval without a shrinking key count is a stall.
-    let drain = async {
-        loop {
-            drainer.run_once().await;
-            if outbox_keys(&nodes[0]).await?.is_empty() {
-                return Ok::<(), BoxError>(());
-            }
-            sleep(Duration::from_millis(50)).await;
+    loop {
+        tokio::time::timeout(HANG_CAP.saturating_mul(3), drainer.run_once())
+            .await
+            .map_err(|_| "outbox drain invocation stalled")?;
+        if outbox_keys(&nodes[0]).await?.is_empty() {
+            return Ok(());
         }
-    };
-    let watch = async {
-        let mut best = usize::MAX;
-        let mut deadline = Instant::now() + HANG_CAP.saturating_mul(3);
-        loop {
-            let pending = outbox_keys(&nodes[0]).await?.len();
-            if pending < best {
-                best = pending;
-                deadline = Instant::now() + HANG_CAP.saturating_mul(3);
-            }
-            if Instant::now() >= deadline {
-                return Err::<(), BoxError>(
-                    format!("outbox did not drain (still pending: {pending})").into(),
-                );
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    tokio::select! {
-        result = drain => result,
-        result = watch => result,
     }
 }
 

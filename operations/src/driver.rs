@@ -1616,6 +1616,12 @@ mod test {
         type Error = ();
 
         fn start(&mut self) -> aruna_core::types::Effects {
+            if let Some(txn_id) = self.txn_id {
+                self.state = 3;
+                return smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                    txn_id
+                },)];
+            }
             self.state = 1;
             smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false
@@ -2039,6 +2045,7 @@ mod test {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (actor_done_tx, actor_done_rx) = std::sync::mpsc::channel();
         let actor = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2067,14 +2074,15 @@ mod test {
                 };
                 let committed_event =
                     committed_effect && matches!(&event, StorageEvent::TransactionCommitted { .. });
-                let _ = response.send(event);
                 if committed_event {
                     committed_for_actor.store(true, Ordering::Release);
                 }
+                let _ = response.send(event);
                 if gated && let Some(sender) = done_tx.take() {
                     let _ = sender.send(());
                 }
             }
+            let _ = actor_done_tx.send(());
         });
         let net_handle = aruna_net::NetHandle::new(
             aruna_net::NetConfig {
@@ -2094,13 +2102,32 @@ mod test {
             task_handle: None,
             compute_handle: None,
         };
+        let txn_id = match storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected transaction start: {other:?}"),
+        };
+        match storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"commit-outcome"),
+                value: ByteView::from(*b"committed"),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected transaction write: {other:?}"),
+        }
         let task_context = context.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             crate::driver::drive_until(
                 CommitOutcome {
                     state: 0,
                     failed: false,
-                    txn_id: None,
+                    txn_id: Some(txn_id),
                 },
                 &task_context,
                 tokio::time::Instant::now() + std::time::Duration::from_millis(100),
@@ -2108,16 +2135,35 @@ mod test {
             .await
         });
 
-        started_rx.await.unwrap();
-        assert!(task.await.unwrap().is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! {
+                started = started_rx => started.unwrap(),
+                result = &mut task => panic!("drive finished before commit refresh: {result:?}"),
+            }
+        })
+        .await
+        .expect("commit refresh did not start");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), &mut task)
+                .await
+                .expect("commit refresh did not honor its own timeout")
+                .unwrap()
+                .is_ok()
+        );
 
         committed.store(false, Ordering::Release);
         release_tx.send(()).unwrap();
-        done_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), done_rx)
+            .await
+            .expect("released refresh did not finish")
+            .unwrap();
         net_handle.shutdown().await;
         drop(context);
         drop(net_handle);
         drop(storage_handle);
+        actor_done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("storage proxy did not stop");
         actor.join().unwrap();
     }
 
