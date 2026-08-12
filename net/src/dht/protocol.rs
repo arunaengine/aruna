@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use aruna_core::DistributedTraceContext;
+use aruna_core::effects::DhtCompletion;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
@@ -37,7 +38,13 @@ pub enum DhtCmd {
         op_id: OpId,
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        completion: DhtCompletion,
         trace_context: Option<DistributedTraceContext>,
+    },
+    /// Releases an operation whose deadline elapsed or whose caller went away.
+    Cancel {
+        op_id: OpId,
+        error: DhtIoError,
     },
     Bootstrap {
         op_id: OpId,
@@ -89,6 +96,7 @@ pub enum DhtGetCompletedReason {
     LocalValue,
     RemoteValue,
     LookupExhausted,
+    FirstUsable,
 }
 
 impl DhtGetCompletedReason {
@@ -97,6 +105,7 @@ impl DhtGetCompletedReason {
             Self::LocalValue => "local_value",
             Self::RemoteValue => "remote_value",
             Self::LookupExhausted => "lookup_exhausted",
+            Self::FirstUsable => "first_usable",
         }
     }
 }

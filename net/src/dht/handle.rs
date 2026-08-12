@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use aruna_core::effects::DhtGetOptions;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
@@ -153,18 +154,21 @@ impl DhtHandle {
         &self,
         key: &DhtKeyId,
         realm_filter: Option<RealmId>,
+        options: DhtGetOptions,
     ) -> Result<Vec<DhtEntry>> {
         let started = Instant::now();
         trace!(
             event = "dht.get.started",
             key = %key,
             realm_id = ?realm_filter,
+            deadline_ms = duration_ms(options.deadline),
             "Starting DHT get"
         );
         let result = self
             .request(|reply| DriverCmd::Get {
                 key: *key,
                 realm_filter,
+                options,
                 trace_context: current_trace_context(),
                 reply,
             })

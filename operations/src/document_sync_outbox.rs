@@ -26,6 +26,16 @@ use ulid::Ulid;
 pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
     4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
 const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
+const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
+const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
+
+fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
+    [
+        ADMIN_OUTBOX_PREFIX,
+        DELETE_OUTBOX_PREFIX,
+        UPSERT_OUTBOX_PREFIX,
+    ]
+}
 
 // Keys order by kind then outbox id (a ULID), with admin operations additionally
 // ordered by origin sequence, so drains are FIFO instead of following the random
@@ -131,14 +141,39 @@ pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, 
     write_outbox_effect_with_txn(record, None)
 }
 
+#[cfg(debug_assertions)]
+fn record_ledger(key: &[u8], value: &[u8]) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    let Some(path) = std::env::var_os("ARUNA_TEST_OUTBOX_LEDGER") else {
+        return;
+    };
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let Ok(_guard) = LOCK.get_or_init(|| Mutex::new(())).lock() else {
+        return;
+    };
+    let key_hash = blake3::hash(key).to_hex();
+    let value_hash = blake3::hash(value).to_hex();
+    let line = format!("key_hash={key_hash} value_hash={value_hash}\n");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(path))
+    else {
+        return;
+    };
+    let _ = file.write_all(line.as_bytes());
+}
+
 pub fn outbox_write_entry(
     record: &DocumentSyncOutboxRecord,
 ) -> Result<(String, ByteView, ByteView), postcard::Error> {
-    Ok((
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-        outbox_key(record),
-        ByteView::from(postcard::to_allocvec(record)?),
-    ))
+    let key = outbox_key(record);
+    let value = ByteView::from(postcard::to_allocvec(record)?);
+    #[cfg(debug_assertions)]
+    record_ledger(key.as_ref(), value.as_ref());
+    Ok((DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
 }
 
 pub fn write_outbox_effect_with_txn(
@@ -231,6 +266,29 @@ pub async fn read_outbox_records(
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
     }
+}
+
+pub async fn read_outbox_tails(storage: &StorageHandle) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+    let mut tails = Vec::with_capacity(3);
+    for prefix in outbox_stream_prefixes() {
+        match storage
+            .send_storage_effect(StorageEffect::Last {
+                key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: Some(prefix.to_vec().into()),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                if let Some((key, _)) = values.into_iter().next() {
+                    tails.push((prefix.to_vec(), key.to_vec()));
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected outbox tail result: {other:?}")),
+        }
+    }
+    Ok(tails)
 }
 
 pub async fn delete_outbox_records(

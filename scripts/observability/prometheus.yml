@@ -2,6 +2,13 @@ global:
   scrape_interval: 15s
   scrape_timeout: 5s
 
+# Only the application-native rules whose inputs this scrape actually ingests.
+# No-ready, restart-loop, and forced-shutdown alerts need Kubernetes or log
+# telemetry that is not scraped here; they stay manual checks in
+# docs/operational-recovery.md rather than inert rules.
+rule_files:
+  - aruna-alerts.yml
+
 scrape_configs:
   - job_name: aruna
     metrics_path: /metrics

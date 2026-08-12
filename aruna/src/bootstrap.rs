@@ -63,54 +63,56 @@ pub async fn realm_bootstrap_exists(
     Ok(true)
 }
 
-pub async fn announce_core_documents(
+pub async fn publish_core_documents(
     driver_ctx: &DriverContext,
     node_id: NodeId,
-    realm_id: &aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::RealmId,
     allow_genesis: bool,
+    documents: Vec<DocumentSyncTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let documents = core_document_targets(driver_ctx, node_id, *realm_id).await?;
     if documents.is_empty() {
         return Ok(());
     }
 
-    let driver_ctx = driver_ctx.clone();
-    let realm_id = *realm_id;
-    tokio::spawn(async move {
-        if let Err(error) = drive(
-            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-                realm_id,
-                local_node_id: node_id,
-                excluded_peers: Vec::new(),
-                documents,
-                // Only the realm-bootstrap node may mint shared-topic genesis;
-                // joining/provisioned nodes announce with false and join it.
-                allow_genesis,
-            }),
-            &driver_ctx,
-        )
-        .await
-        {
-            warn!(error = ?error, "Failed to queue core document replication");
-        }
-    });
+    drive(
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node_id,
+            excluded_peers: Vec::new(),
+            documents,
+            // Only the realm-bootstrap node may mint shared-topic genesis;
+            // joining/provisioned nodes announce with false and join it.
+            allow_genesis,
+        }),
+        driver_ctx,
+    )
+    .await?;
 
     Ok(())
 }
 
-async fn core_document_targets(
+fn watch_target_needed(digest_created: bool, allow_genesis: bool, topic_exists: bool) -> bool {
+    digest_created || allow_genesis && !topic_exists
+}
+
+pub async fn prepare_core_documents(
     driver_ctx: &DriverContext,
     node_id: NodeId,
     realm_id: aruna_core::structs::RealmId,
+    allow_genesis: bool,
+    include_node_info: bool,
 ) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
-    ensure_local_watch_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
-        .await
-        .map_err(|error| format!("failed to initialize local watch interest digest: {error}"))?;
-    // Rebuild from replicated subscription rows on every startup. This closes
-    // crash windows around membership reconciliation and remote row application.
-    mark_watch_interest_dirty(driver_ctx, realm_id)
-        .await
-        .map_err(|error| format!("failed to mark local watch interest dirty: {error}"))?;
+    let digest_created =
+        ensure_local_watch_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
+            .await
+            .map_err(|error| {
+                format!("failed to initialize local watch interest digest: {error}")
+            })?;
+    if digest_created {
+        mark_watch_interest_dirty(driver_ctx, realm_id)
+            .await
+            .map_err(|error| format!("failed to mark local watch interest dirty: {error}"))?;
+    }
 
     let mut documents = vec![
         DocumentSyncTarget::RealmAuthorization { realm_id },
@@ -122,14 +124,32 @@ async fn core_document_targets(
             node_id,
             group_id: None,
         },
-        // Announce the shared realm-scoped node-info topic so every realm node
-        // subscribes at bootstrap and sees late joiners' info within the sync
-        // window (closes the <=60s late-joiner visibility gap).
-        DocumentSyncTarget::NodeInfo { realm_id, node_id },
-        // Announce the shared realm-scoped watch-interest topic so every realm
-        // node subscribes to it and receives all peers' watch-interest digests.
-        DocumentSyncTarget::WatchInterest { realm_id, node_id },
     ];
+    if include_node_info {
+        // Initial and joining nodes announce before their first heartbeat;
+        // provisioned restarts leave refresh publication to the timer.
+        documents.push(DocumentSyncTarget::NodeInfo { realm_id, node_id });
+    }
+    let watch_target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let topic_exists = if allow_genesis {
+        let net_handle = driver_ctx
+            .net_handle
+            .as_ref()
+            .ok_or("net handle unavailable while checking watch interest genesis")?;
+        net_handle
+            .document_sync_topic_exists(
+                watch_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
+            )
+            .map_err(|error| format!("failed to check watch interest topic: {error}"))?
+    } else {
+        true
+    };
+    // A newly stored digest must be announced once. The authoritative node also
+    // repairs a missing topic after a partial first boot without republishing on
+    // an unchanged healthy restart.
+    if watch_target_needed(digest_created, allow_genesis, topic_exists) {
+        documents.push(watch_target);
+    }
 
     match driver_ctx
         .storage_handle
@@ -401,18 +421,29 @@ pub async fn ensure_initial_local_onboarding_secret(
 
 #[cfg(test)]
 mod tests {
-    use super::{core_document_targets, node_is_ready, unique_user_topic};
-    use aruna_core::document::DocumentSyncTarget;
+    use super::{
+        node_is_ready, prepare_core_documents, publish_core_documents, sync_topic_from_peer,
+        unique_user_topic, watch_target_needed,
+    };
+    use aruna_core::NodeId;
+    use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::NOTIFICATION_WATCH_INTEREST_KEYSPACE;
+    use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
-        NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind, WatchEventKind,
-        WatchEventMask, WatchInterestDigest, WatchInterestEntry, watch_interest_node_key,
+        Actor, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
+        WatchEventKind, WatchEventMask, WatchInterestDigest, WatchInterestEntry,
+        watch_interest_dirty_key, watch_interest_node_key,
     };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_operations::document_sync_outbox::read_outbox_records;
     use aruna_operations::driver::DriverContext;
+    use aruna_operations::incoming::initialize_net_incoming;
+    use aruna_operations::notifications::watch::interest::publish_watch_interest;
+    use aruna_operations::task_incoming::OutboxDrainer;
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -444,6 +475,16 @@ mod tests {
         assert_eq!(synced_topics.len(), 2);
     }
 
+    #[test]
+    fn watch_target_cases() {
+        assert!(watch_target_needed(true, true, false));
+        assert!(watch_target_needed(true, false, true));
+        assert!(!watch_target_needed(false, true, true));
+        assert!(watch_target_needed(false, true, false));
+        assert!(!watch_target_needed(false, false, true));
+        assert!(!watch_target_needed(false, false, false));
+    }
+
     fn context(storage_handle: aruna_storage::StorageHandle) -> DriverContext {
         DriverContext {
             storage_handle,
@@ -453,6 +494,436 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         }
+    }
+
+    fn context_net(
+        storage_handle: aruna_storage::StorageHandle,
+        net_handle: NetHandle,
+    ) -> DriverContext {
+        DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    async fn net_context(
+        realm_id: RealmId,
+        seed: u8,
+    ) -> (tempfile::TempDir, DriverContext, NetHandle) {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let context = context_net(storage, net.clone());
+        (dir, context, net)
+    }
+
+    async fn write_digest(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+        digest: &WatchInterestDigest,
+    ) {
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                    key: watch_interest_node_key(realm_id, node_id).into(),
+                    value: ByteView::from(digest.to_bytes().unwrap()),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn read_marker(context: &DriverContext, realm_id: RealmId) -> Option<ByteView> {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key: watch_interest_dirty_key(realm_id).into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => panic!("unexpected marker read result: {other:?}"),
+        }
+    }
+
+    async fn write_config(context: &DriverContext, realm_id: RealmId, node_id: NodeId) {
+        write_config_nodes(context, realm_id, node_id, &[node_id]).await;
+    }
+
+    async fn write_config_nodes(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+        nodes: &[NodeId],
+    ) {
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        for node in nodes {
+            config.ensure_node(*node, RealmNodeKind::Server);
+        }
+        config.seed_default_placement();
+        config.placement_map = nodes
+            .iter()
+            .map(|node| NodePlacementEntry {
+                node_id: *node,
+                location: String::new(),
+                weight: 100,
+                full: false,
+                draining: false,
+                labels: Default::default(),
+            })
+            .collect();
+        let actor = Actor {
+            node_id,
+            user_id: aruna_core::UserId::nil(realm_id),
+            realm_id,
+        };
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                    key: realm_id.as_bytes().to_vec().into(),
+                    value: ByteView::from(config.to_bytes(&actor).unwrap()),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn repair_topic(
+        context: &Arc<DriverContext>,
+        node_id: NodeId,
+        realm_id: RealmId,
+        target: &DocumentSyncTarget,
+    ) {
+        for _ in 0..2 {
+            let targets = prepare_core_documents(context, node_id, realm_id, true, false)
+                .await
+                .unwrap();
+            assert!(targets.contains(target));
+        }
+        publish_core_documents(context, node_id, realm_id, true, vec![target.clone()])
+            .await
+            .unwrap();
+        OutboxDrainer::new(context.clone()).run_once().await;
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        assert!(
+            context
+                .net_handle
+                .as_ref()
+                .unwrap()
+                .document_sync_topic_exists(topic)
+                .unwrap()
+        );
+    }
+
+    async fn seed_topic(
+        context: &Arc<DriverContext>,
+        net: &NetHandle,
+        realm_id: RealmId,
+        node_id: NodeId,
+        peer_id: NodeId,
+    ) -> ::irokle::TopicId {
+        let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+        prepare_core_documents(context, node_id, realm_id, true, false)
+            .await
+            .unwrap();
+        publish_core_documents(context, node_id, realm_id, true, vec![target.clone()])
+            .await
+            .unwrap();
+        OutboxDrainer::new(context.clone()).run_once().await;
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        assert!(net.document_sync_topic_exists(topic).unwrap());
+        assert_eq!(net.realm_peers().await, vec![peer_id]);
+        net.reconcile_document_sync_topics(vec![topic])
+            .await
+            .unwrap();
+        topic
+    }
+
+    #[tokio::test]
+    async fn first_boot_watch() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let (_dir, context, net) = net_context(realm_id, 7).await;
+        let node_id = net.node_id();
+        write_config(&context, realm_id, node_id).await;
+        let targets = prepare_core_documents(&context, node_id, realm_id, true, false)
+            .await
+            .unwrap();
+        let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+
+        assert!(targets.contains(&target));
+        publish_core_documents(&context, node_id, realm_id, true, vec![target.clone()])
+            .await
+            .unwrap();
+        let batch = read_outbox_records(&context.storage_handle, &[], None, 8)
+            .await
+            .unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert!(batch.records[0].1.allow_genesis);
+        OutboxDrainer::new(Arc::new(context)).run_once().await;
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        assert!(net.document_sync_topic_exists(topic).unwrap());
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn missing_topic_repair() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let (_dir, context, net) = net_context(realm_id, 8).await;
+        let node_id = net.node_id();
+        write_config(&context, realm_id, node_id).await;
+        write_digest(
+            &context,
+            realm_id,
+            node_id,
+            &WatchInterestDigest {
+                node_id,
+                entries: Vec::new(),
+            },
+        )
+        .await;
+        let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        assert!(!net.document_sync_topic_exists(topic).unwrap());
+
+        let targets = prepare_core_documents(&context, node_id, realm_id, true, false)
+            .await
+            .unwrap();
+
+        assert!(targets.contains(&target));
+        publish_core_documents(&context, node_id, realm_id, true, vec![target.clone()])
+            .await
+            .unwrap();
+        let batch = read_outbox_records(&context.storage_handle, &[], None, 8)
+            .await
+            .unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert!(batch.records[0].1.allow_genesis);
+        OutboxDrainer::new(Arc::new(context)).run_once().await;
+        assert!(net.document_sync_topic_exists(topic).unwrap());
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_stays_quiet() {
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let (_dir, context, net) = net_context(realm_id, 9).await;
+        let node_id = net.node_id();
+        let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+        write_config(&context, realm_id, node_id).await;
+        write_digest(
+            &context,
+            realm_id,
+            node_id,
+            &WatchInterestDigest {
+                node_id,
+                entries: Vec::new(),
+            },
+        )
+        .await;
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        net.ensure_document_sync_topics(&[topic], Vec::new())
+            .unwrap();
+
+        for _ in 0..2 {
+            let targets = prepare_core_documents(&context, node_id, realm_id, true, false)
+                .await
+                .unwrap();
+            assert!(!targets.contains(&target));
+            assert!(!publish_watch_interest(&context, node_id).await.unwrap());
+            assert!(read_marker(&context, realm_id).await.is_none());
+            let batch = read_outbox_records(&context.storage_handle, &[], None, 8)
+                .await
+                .unwrap();
+            assert!(batch.records.is_empty());
+        }
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn joiner_announces_watch() {
+        let realm_id = RealmId::from_bytes([10u8; 32]);
+        let (_bootstrap_dir, bootstrap_context, bootstrap_net) = net_context(realm_id, 10).await;
+        let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 11).await;
+        let bootstrap_context = Arc::new(bootstrap_context);
+        let joiner_context = Arc::new(joiner_context);
+        initialize_net_incoming(bootstrap_context.clone());
+        initialize_net_incoming(joiner_context.clone());
+        let bootstrap_id = bootstrap_net.node_id();
+        let joiner_id = joiner_net.node_id();
+        write_config_nodes(
+            &bootstrap_context,
+            realm_id,
+            bootstrap_id,
+            &[bootstrap_id, joiner_id],
+        )
+        .await;
+        write_config_nodes(
+            &joiner_context,
+            realm_id,
+            joiner_id,
+            &[bootstrap_id, joiner_id],
+        )
+        .await;
+        bootstrap_net.reload_realm_peers().await.unwrap();
+        joiner_net.reload_realm_peers().await.unwrap();
+        bootstrap_net
+            .add_peer_addr(joiner_net.endpoint_addr())
+            .await;
+        joiner_net
+            .add_peer_addr(bootstrap_net.endpoint_addr())
+            .await;
+
+        let bootstrap_target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: bootstrap_id,
+        };
+        let topic = seed_topic(
+            &bootstrap_context,
+            &bootstrap_net,
+            realm_id,
+            bootstrap_id,
+            joiner_id,
+        )
+        .await;
+        sync_topic_from_peer(&joiner_net, topic, bootstrap_id, &bootstrap_target)
+            .await
+            .unwrap();
+        assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
+
+        let target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: joiner_id,
+        };
+        let targets = prepare_core_documents(&joiner_context, joiner_id, realm_id, false, false)
+            .await
+            .unwrap();
+
+        assert!(targets.contains(&target));
+        publish_core_documents(
+            &joiner_context,
+            joiner_id,
+            realm_id,
+            false,
+            vec![target.clone()],
+        )
+        .await
+        .unwrap();
+        let batch = read_outbox_records(&joiner_context.storage_handle, &[], None, 8)
+            .await
+            .unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert!(!batch.records[0].1.allow_genesis);
+        OutboxDrainer::new(joiner_context.clone()).run_once().await;
+        assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
+        bootstrap_net.shutdown().await;
+        joiner_net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn publication_retries() {
+        let realm_id = RealmId::from_bytes([11u8; 32]);
+        let (_dir, context, net) = net_context(realm_id, 11).await;
+        let context = Arc::new(context);
+        let node_id = net.node_id();
+        write_config(&context, realm_id, node_id).await;
+        let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+        let targets = prepare_core_documents(&context, node_id, realm_id, true, false)
+            .await
+            .unwrap();
+        assert!(targets.contains(&target));
+        assert!(read_marker(&context, realm_id).await.is_some());
+
+        // A restart after the digest write must repair the missing shared topic.
+        repair_topic(&context, node_id, realm_id, &target).await;
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        assert!(net.document_sync_topic_exists(topic).unwrap());
+
+        write_digest(
+            &context,
+            realm_id,
+            node_id,
+            &WatchInterestDigest {
+                node_id,
+                entries: vec![WatchInterestEntry {
+                    path_prefix: "bucket/".to_string(),
+                    event_mask: WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+                }],
+            },
+        )
+        .await;
+        assert!(read_marker(&context, realm_id).await.is_some());
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                    key: realm_id.as_bytes().to_vec().into(),
+                    value: ByteView::from(b"corrupt".to_vec()),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert!(publish_watch_interest(&context, node_id).await.is_err());
+        assert!(read_marker(&context, realm_id).await.is_some());
+
+        write_config(&context, realm_id, node_id).await;
+        let restarted = Arc::new(context_net(context.storage_handle.clone(), net.clone()));
+        let targets = prepare_core_documents(&restarted, node_id, realm_id, true, false)
+            .await
+            .unwrap();
+        assert!(!targets.contains(&target));
+        assert!(read_marker(&restarted, realm_id).await.is_some());
+        publish_core_documents(&restarted, node_id, realm_id, false, vec![target.clone()])
+            .await
+            .unwrap();
+        let batch = read_outbox_records(&restarted.storage_handle, &[], None, 8)
+            .await
+            .unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert!(!batch.records[0].1.allow_genesis);
+        let DocumentSyncOutboxEvent::Upsert { bytes, .. } = &batch.records[0].1.event else {
+            panic!("watch digest publication must enqueue an upsert")
+        };
+        assert_eq!(
+            WatchInterestDigest::from_bytes(bytes)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        OutboxDrainer::new(restarted.clone()).run_once().await;
+        assert!(net.document_sync_topic_exists(topic).unwrap());
+        assert!(publish_watch_interest(&restarted, node_id).await.unwrap());
+        assert!(read_marker(&restarted, realm_id).await.is_none());
+
+        net.shutdown().await;
     }
 
     #[test]
@@ -523,14 +994,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_targets_initialize_empty_local_watch_interest_digest() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = context(storage);
+    async fn initial_watch_digest() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let (_dir, context, net) = net_context(realm_id, 4).await;
+        let node_id = net.node_id();
 
-        let targets = core_document_targets(&context, node_id, realm_id)
+        let targets = prepare_core_documents(&context, node_id, realm_id, true, true)
             .await
             .unwrap();
 
@@ -542,10 +1011,11 @@ mod tests {
                 entries: Vec::new(),
             }
         );
+        net.shutdown().await;
     }
 
     #[tokio::test]
-    async fn core_targets_preserve_existing_local_watch_interest_digest() {
+    async fn existing_watch_digest() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = context(storage);
@@ -568,7 +1038,7 @@ mod tests {
             })
             .await;
 
-        core_document_targets(&context, node_id, realm_id)
+        prepare_core_documents(&context, node_id, realm_id, false, true)
             .await
             .unwrap();
 

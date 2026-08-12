@@ -31,8 +31,7 @@ use aruna_operations::sync_relationship::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
@@ -42,22 +41,20 @@ use std::time::SystemTime;
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "sync", description = "S3 bucket synchronization")),
-    paths(create_sync, list_sync, get_sync, update_sync, run_sync, delete_sync)
+    tags((name = "sync", description = "S3 bucket synchronization"))
 )]
 pub struct SyncApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/data/sync-relationships", post(create_sync).get(list_sync))
-        .route(
-            "/data/sync-relationships/{id}",
-            get(get_sync).patch(update_sync).delete(delete_sync),
-        )
-        .route("/data/sync-relationships/{id}/run", post(run_sync))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(SyncApiDoc::openapi())
+        .routes(routes!(create_sync, list_sync))
+        .routes(routes!(get_sync, update_sync, delete_sync))
+        .routes(routes!(run_sync))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
@@ -228,15 +225,47 @@ pub struct SyncListParams {
     post,
     path = "/data/sync-relationships",
     tag = "sync",
-    request_body = CreateSyncRequest,
+    summary = "Create a bucket sync relationship",
+    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused outright, because this surface cannot honour that confinement. The source always lives on this node and needs READ on the source bucket; the target node additionally checks WRITE on the target bucket before it accepts its half of the relationship, so a caller without write rights there is forbidden. Source and target must differ, bucket names must be non-empty and free of `/`, workspace buckets are refused, and a prefix, when given, must be a confined relative path. A 201 means the relationship record is durable here and its mirror is durable on the target node; no data has been copied yet. For `once` and `reference` mode an initial backfill run is queued as part of creation, and `continuous` instead replicates versions as they are written. Completion is observed by polling the relationship, whose `pending_jobs`, `last_synced_at` and counters advance as replication drains. `reference` mode forces `preserve` reference handling regardless of what the body asks for. An enabled relationship with the same source, target and mode already existing is a conflict. A target node that cannot be reached fails the whole creation with 502 and the caller may retry; a partially created mirror is repaired in the background.",
+    request_body(
+        content = CreateSyncRequest,
+        description = "Source endpoint on this node, target endpoint on the receiving node, and the sync mode. `reference_handling` defaults to `materialize` and `replicate_deletes` to false.",
+        example = json!({
+            "source": {"bucket": "research-raw", "prefix": "2026/"},
+            "target": {
+                "node_id": "2a3b4c5d6e7f80910a1b2c3d4e5f60710a1b2c3d4e5f60710a1b2c3d4e5f6071",
+                "bucket": "research-mirror",
+                "prefix": "2026/"
+            },
+            "mode": "once",
+            "reference_handling": "materialize",
+            "replicate_deletes": false
+        })
+    ),
     responses(
-        (status = 201, description = "Sync relationship created", body = SyncRelationshipResponse),
-        (status = 400, description = "Invalid relationship", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Bucket not found", body = ErrorResponse),
-        (status = 409, description = "Duplicate relationship", body = ErrorResponse),
-        (status = 502, description = "Target unavailable", body = ErrorResponse)
+        (
+            status = 201,
+            description = "The relationship as stored, with its initial backfill queued for once and reference mode; counters are still zero because nothing has replicated yet",
+            body = SyncRelationshipResponse,
+            example = json!({
+                "id": "01JSYNC0123456789ABCDEFGHJ",
+                "source": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/research-raw/2026/",
+                "target": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:2a3b4c5d6e7f80910a1b2c3d4e5f60710a1b2c3d4e5f60710a1b2c3d4e5f6071:s3/research-mirror/2026/",
+                "mode": "once",
+                "reference_handling": "materialize",
+                "replicate_deletes": false,
+                "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "created_at": "2026-04-09T14:23:11.123+00:00",
+                "state": "enabled",
+                "status": {"counters": {"versions_synced": 0, "bytes_synced": 0, "failures": 0, "consecutive_failures": 0}}
+            })
+        ),
+        (status = 400, description = "The endpoints are identical, a bucket name is empty or contains `/`, the bucket is a workspace bucket, the prefix is not a confined relative path, or the target node id does not parse", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or is path-restricted, the caller lacks READ on the source bucket, or the target node refused the mirror", body = ErrorResponse),
+        (status = 404, description = "The source bucket is unknown to this node, or the target node does not know the target bucket", body = ErrorResponse),
+        (status = 409, description = "An enabled relationship with the same source, target and mode already exists", body = ErrorResponse),
+        (status = 502, description = "The target node could not be reached to store its mirror; nothing was created and the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -379,16 +408,42 @@ pub async fn create_sync(
     get,
     path = "/data/sync-relationships",
     tag = "sync",
+    summary = "List the sync relationships held on this node",
+    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only relationships created by the calling user are returned, so this is not a realm-wide view and another user's relationships are never listed. `outgoing` holds relationships whose source bucket lives on this node, `incoming` holds the mirror records this node keeps as a replication target; a relationship therefore appears in `outgoing` on one node and in `incoming` on the other. Detached serving stubs, left behind when a reference relationship is deleted, are hidden. The read is node-local and unpaginated: every matching record is returned in one response, and no ordering is guaranteed.",
     params(
-        ("bucket" = Option<String>, Query, description = "Endpoint bucket filter"),
-        ("prefix" = Option<String>, Query, description = "Overlapping endpoint prefix filter"),
-        ("direction" = Option<String>, Query, description = "out, in, or both (default)")
+        ("bucket" = Option<String>, Query, description = "Keep only relationships whose endpoint for the listed direction uses this bucket; the source bucket for outgoing, the target bucket for incoming. Omit for all buckets; an empty value is rejected"),
+        ("prefix" = Option<String>, Query, description = "Keep only relationships whose endpoint prefix overlaps this one, in either direction, so `2026/` matches both `2026/runs/` and `2026`. A relationship covering a whole bucket always matches. Omit for no prefix filter; an empty value is rejected"),
+        ("direction" = Option<String>, Query, description = "Which lists to populate: `out` for source-side relationships, `in` for mirrors held here, `both` for either. Defaults to `both`; the list that is not requested comes back empty")
     ),
     responses(
-        (status = 200, description = "Local sync relationships", body = SyncListResponse),
-        (status = 400, description = "Invalid filter", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The caller's own relationships held on this node, split by direction, with either list empty when it was filtered out or has no matches",
+            body = SyncListResponse,
+            example = json!({
+                "outgoing": [
+                    {
+                        "id": "01JSYNC0123456789ABCDEFGHJ",
+                        "source": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/research-raw/2026/",
+                        "target": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:2a3b4c5d6e7f80910a1b2c3d4e5f60710a1b2c3d4e5f60710a1b2c3d4e5f6071:s3/research-mirror/2026/",
+                        "mode": "continuous",
+                        "reference_handling": "materialize",
+                        "replicate_deletes": true,
+                        "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "created_at": "2026-04-09T14:23:11.123+00:00",
+                        "state": "enabled",
+                        "status": {
+                            "last_synced_at": "2026-04-09T15:02:44.907+00:00",
+                            "counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}
+                        }
+                    }
+                ],
+                "incoming": []
+            })
+        ),
+        (status = 400, description = "The bucket or prefix filter was present but empty", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or is path-restricted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -451,13 +506,39 @@ pub async fn list_sync(
     get,
     path = "/data/sync-relationships/{id}",
     tag = "sync",
-    params(("id" = String, Path, description = "Relationship ULID")),
+    summary = "Read one sync relationship and its progress",
+    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the user who created the relationship may read it, and a relationship created by somebody else is refused rather than hidden. The lookup checks this node's source-side records first and then its mirror records, so the same id can be inspected from either end on the node that holds it; a node holding neither reports it as not found, as does a detached serving stub left behind by a deleted reference relationship. `pending_jobs` and `oldest_lag_ms` come from this node's own replication queue: `pending_jobs` counts the replication jobs still queued for this relationship and `oldest_lag_ms` is the age in milliseconds of the oldest of them, omitted once the queue holds none. `pending_jobs` reaching zero with no `last_error` is how a caller sees an accepted run finish; the counters advance only as replication reports back, so they lag the objects already written.",
+    params(("id" = String, Path, description = "Relationship id as a 26-character ULID, as returned when the relationship was created")),
     responses(
-        (status = 200, description = "Sync relationship status", body = SyncDetailResponse),
-        (status = 400, description = "Invalid relationship id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Relationship not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The relationship with its queue depth and last outcome; the lag, last sync time and last error are omitted when there is nothing to report",
+            body = SyncDetailResponse,
+            example = json!({
+                "relationship": {
+                    "id": "01JSYNC0123456789ABCDEFGHJ",
+                    "source": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/research-raw/2026/",
+                    "target": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:2a3b4c5d6e7f80910a1b2c3d4e5f60710a1b2c3d4e5f60710a1b2c3d4e5f6071:s3/research-mirror/2026/",
+                    "mode": "once",
+                    "reference_handling": "materialize",
+                    "replicate_deletes": false,
+                    "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                    "created_at": "2026-04-09T14:23:11.123+00:00",
+                    "state": "enabled",
+                    "status": {
+                        "last_synced_at": "2026-04-09T15:02:44.907+00:00",
+                        "counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}
+                    }
+                },
+                "pending_jobs": 1,
+                "oldest_lag_ms": 8421,
+                "last_synced_at": "2026-04-09T15:02:44.907+00:00"
+            })
+        ),
+        (status = 400, description = "The path segment is not a valid relationship ULID", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or is path-restricted, or the relationship was created by another user", body = ErrorResponse),
+        (status = 404, description = "This node holds no relationship with that id, or it is a detached serving stub", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -487,15 +568,37 @@ pub async fn get_sync(
     patch,
     path = "/data/sync-relationships/{id}",
     tag = "sync",
-    params(("id" = String, Path, description = "Relationship ULID")),
-    request_body = UpdateSyncRequest,
+    summary = "Change how a relationship handles referenced objects",
+    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the creator may change a relationship, and READ on the source bucket is checked as well. Only the source side can be changed: a mirror this node merely holds as a target reads as not found, so the call must go to the node that owns the source bucket. Reference handling is the only mutable field; the mode, endpoints and delete behaviour are fixed at creation. A relationship in `reference` mode only accepts `preserve`. Submitting the value the relationship already has returns it unchanged and touches nothing. Otherwise the target node's mirror is updated first and the local record second, so an unreachable target fails the whole change with 502, leaves the stored value as it was, and the caller may retry once the target is back. The new handling applies to versions replicated after the change; objects already copied or already left as references are not rewritten, and a relationship that has ever used `preserve` keeps serving the references it handed out even after switching to `materialize`.",
+    params(("id" = String, Path, description = "Relationship id as a 26-character ULID; must name a relationship whose source bucket is on this node")),
+    request_body(
+        content = UpdateSyncRequest,
+        description = "The new reference handling: `materialize` copies referenced source bytes, `preserve` replicates the reference itself, `skip` leaves referenced objects out of the sync.",
+        example = json!({"reference_handling": "preserve"})
+    ),
     responses(
-        (status = 200, description = "Sync relationship updated", body = SyncRelationshipResponse),
-        (status = 400, description = "Invalid relationship id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Relationship not found", body = ErrorResponse),
-        (status = 502, description = "Target unavailable", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The relationship after the change, or unchanged when the requested handling was already in effect",
+            body = SyncRelationshipResponse,
+            example = json!({
+                "id": "01JSYNC0123456789ABCDEFGHJ",
+                "source": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978:s3/research-raw/2026/",
+                "target": "arn:aruna:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:2a3b4c5d6e7f80910a1b2c3d4e5f60710a1b2c3d4e5f60710a1b2c3d4e5f6071:s3/research-mirror/2026/",
+                "mode": "continuous",
+                "reference_handling": "preserve",
+                "replicate_deletes": false,
+                "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "created_at": "2026-04-09T14:23:11.123+00:00",
+                "state": "enabled",
+                "status": {"counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}}
+            })
+        ),
+        (status = 400, description = "The path segment is not a valid relationship ULID, or the relationship is in reference mode and the request asked for anything other than preserve", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or is path-restricted, the relationship was created by another user, or the caller lacks READ on the source bucket", body = ErrorResponse),
+        (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
+        (status = 502, description = "The target node could not be reached to update its mirror; the stored handling is unchanged and the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -570,13 +673,20 @@ pub async fn update_sync(
     post,
     path = "/data/sync-relationships/{id}/run",
     tag = "sync",
-    params(("id" = String, Path, description = "Relationship ULID")),
+    summary = "Trigger a backfill run of an existing relationship",
+    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the creator may run a relationship, and READ on the source bucket is checked as well. Only the source node can run it: a mirror this node merely holds as a target reads as not found. A relationship left in the failed state is returned to enabled first, with its last error and consecutive-failure count cleared, so a run is also how a stalled relationship is resumed. The 202 means one backfill job covering the relationship's whole scope, the source bucket or its prefix, is durably queued on this node; nothing has been copied and no object has been compared yet. The call is idempotent per relationship: the queued job is keyed by the relationship and its scope, so triggering a run while one is already in flight does not start a second pass, it re-arms the drain over the same job. `queued` reports how many scope jobs were enqueued and is 1 on every success, not a count of objects. Progress and completion are observed by polling the relationship, whose `pending_jobs` returns to zero when the run has drained.",
+    params(("id" = String, Path, description = "Relationship id as a 26-character ULID; must name a relationship whose source bucket is on this node")),
     responses(
-        (status = 202, description = "Backfill queued", body = SyncRunResponse),
-        (status = 400, description = "Relationship cannot run here", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Relationship not found", body = ErrorResponse),
+        (
+            status = 202,
+            description = "A backfill job for the relationship is durably queued; the copy itself happens afterwards",
+            body = SyncRunResponse,
+            example = json!({"relationship_id": "01JSYNC0123456789ABCDEFGHJ", "queued": 1})
+        ),
+        (status = 400, description = "The path segment is not a valid relationship ULID, or the stored relationship has no usable source bucket", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or is path-restricted, the relationship was created by another user, or the caller lacks READ on the source bucket", body = ErrorResponse),
+        (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -619,13 +729,15 @@ pub async fn run_sync(
     delete,
     path = "/data/sync-relationships/{id}",
     tag = "sync",
-    params(("id" = String, Path, description = "Relationship ULID")),
+    summary = "Delete a sync relationship",
+    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the creator may delete a relationship, and WRITE is checked on whichever bucket this node holds for it: the source bucket for a source-side relationship, the target bucket for a mirror. Either end may be deleted from the node that holds it. Objects already synchronized are never removed, on either side; only the relationship goes away, and continuous replication simply stops. Deleting a source-side `reference` relationship leaves a detached serving stub behind so that data the target still holds as references stays readable; the stub is invisible to this API, so reading or deleting the same id afterwards is not found. Other modes are removed outright. The peer is asked to drop its half as part of the call, and a peer that cannot be reached does not fail the delete: the removal is retried in the background until the mirror is gone.",
+    params(("id" = String, Path, description = "Relationship id as a 26-character ULID, from either end of the relationship")),
     responses(
-        (status = 204, description = "Relationship removed; synchronized data is retained"),
-        (status = 400, description = "Invalid relationship id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Relationship not found", body = ErrorResponse)
+        (status = 204, description = "The relationship is removed on this node and the peer's mirror is being dropped; the response has no body and synchronized objects are retained on both sides"),
+        (status = 400, description = "The path segment is not a valid relationship ULID, or the stored relationship has no usable bucket for this node's side", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or is path-restricted, the relationship was created by another user, or the caller lacks WRITE on this node's endpoint bucket", body = ErrorResponse),
+        (status = 404, description = "This node holds no relationship with that id, it is already a detached serving stub, or the endpoint bucket has gone", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

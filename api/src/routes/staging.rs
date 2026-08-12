@@ -37,8 +37,7 @@ use aruna_operations::staging::snapshot::{
 };
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -47,28 +46,22 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "staging", description = "Blob staging")),
-    paths(
-        stage_blob,
-        stage_batch,
-        submit_staging,
-        list_staging_jobs,
-        get_staging_job,
-        list_references
-    )
+    tags((name = "staging", description = "Blob staging"))
 )]
 pub struct StagingApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/staging/", post(stage_blob))
-        .route("/staging/batch", post(stage_batch))
-        .route("/staging/jobs", get(list_staging_jobs).post(submit_staging))
-        .route("/staging/jobs/{job_id}", get(get_staging_job))
-        .route("/staging/references", get(list_references))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(StagingApiDoc::openapi())
+        .routes(routes!(stage_blob))
+        .routes(routes!(stage_batch))
+        .routes(routes!(list_staging_jobs, submit_staging))
+        .routes(routes!(get_staging_job))
+        .routes(routes!(list_references))
 }
 
 const DEFAULT_REFERENCE_LIMIT: usize = 500;
@@ -252,15 +245,42 @@ pub struct StagingJobListResponse {
     post,
     path = "/staging/",
     tag = "staging",
-    request_body = StageBlobRequest,
+    summary = "Stage a single source object into a bucket",
+    description = "Requires a bearer token issued for this realm. The body is chosen by its `strategy` field. `snapshot` reads the object from the source connector and commits its bytes to this node's storage before answering, so it is as slow as the transfer; `reference` records the object as a pointer to its source and copies nothing, so the bytes are fetched on demand at read time; `sync` is accepted by the schema but not implemented and always fails. The caller needs WRITE on the target bucket key and READ on the connector's source path, and both are checked against the concrete path, not a prefix alone. The bucket must exist on this node and belong to the given group; a bucket owned by a different group is reported as not found rather than forbidden. Source paths must be relative and confined, so a leading slash or any `.` or `..` segment is rejected. A snapshot is also charged against the realm's quota ceiling for the group and is refused with 403 when it would exceed it. A 201 means the new object version is committed here and immediately readable through S3; propagating that version to any sync target is queued afterwards and is neither awaited nor reported by this response.",
+    request_body(
+        content = StageBlobRequest,
+        description = "The staging strategy and the source and target it applies to. All five target fields are required, and `strategy` selects between copying the bytes now and recording a reference.",
+        example = json!({
+            "strategy": "snapshot",
+            "group_id": "01JABCDEF0123456789ABCDEFG",
+            "connector_id": "01JCONNECTOR0123456789ABCD",
+            "source_path": "refseq/2026/genome.fna.gz",
+            "bucket": "research-raw",
+            "key": "genomes/2026/genome.fna.gz"
+        })
+    ),
     responses(
-        (status = 201, description = "Blob staged", body = StageBlobResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 501, description = "Not implemented", body = ErrorResponse),
-        (status = 502, description = "Bad gateway", body = ErrorResponse)
+        (
+            status = 201,
+            description = "The object version committed on this node; the content type, entity tag and modification time are echoed from the source and omitted when it reported none",
+            body = StageBlobResponse,
+            example = json!({
+                "strategy": "snapshot",
+                "bucket": "research-raw",
+                "key": "genomes/2026/genome.fna.gz",
+                "version_id": "01JVERSION0123456789ABCDE",
+                "size": 1048576,
+                "content_type": "application/gzip",
+                "etag": "9b2cf5d8a1e04c7fb3d20e6a5c81f47b",
+                "last_modified": "2026-04-09T14:23:11.123+00:00"
+            })
+        ),
+        (status = 400, description = "The group or connector id does not parse, or the source path is empty, absolute or contains a `.` or `..` segment", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, the caller lacks WRITE on the target key or READ on the source path, or the snapshot would exceed the group's quota ceiling", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node or belongs to another group, the connector does not exist, or the source object is absent", body = ErrorResponse),
+        (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
+        (status = 502, description = "The source connector could not be read; nothing was staged and the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -282,12 +302,39 @@ pub async fn stage_blob(
     post,
     path = "/staging/batch",
     tag = "staging",
-    request_body = StageBatchRequest,
+    summary = "Stage many source objects in one blocking request",
+    description = "Requires a bearer token issued for this realm. Every object is staged inside this request, one after another, so the call blocks for the whole transfer and a large batch is better submitted as a job instead. The outcome is per item and best effort: a 200 only means the batch ran, and each entry in `results` carries its own `ok` or `error` status, so a caller must inspect them rather than trust the status code. Objects can be named directly in `items` and expanded from `prefixes`, which lists the connector recursively and takes files only; using prefixes additionally requires READ on the group's data path, while individual items are authorized exactly as the single-object endpoint authorizes them. Named and expanded objects together may not exceed 1000, and a prefix that would expand past that limit fails the entire request rather than truncating. `node_id` is optional and, when given, must be this node: staging always runs where the request lands. The `sync` strategy is not implemented and fails the whole request. Error text on a result is deliberately coarse for server-side and upstream failures, which appear only as `Internal server error` and `Bad gateway`. A prefix that cannot be listed contributes one error entry naming that prefix instead of its objects. Items that succeeded are committed here and their propagation to sync targets is queued afterwards.",
+    request_body(
+        content = StageBatchRequest,
+        description = "One connector and target bucket for the whole batch, plus explicit `items`, `prefixes` to expand, or both; leaving both out runs an empty batch. `node_id` defaults to this node.",
+        example = json!({
+            "group_id": "01JABCDEF0123456789ABCDEFG",
+            "connector_id": "01JCONNECTOR0123456789ABCD",
+            "bucket": "research-raw",
+            "strategy": "reference",
+            "items": [
+                {"source_path": "refseq/2026/a.fna.gz", "target_key": "genomes/2026/a.fna.gz"}
+            ],
+            "prefixes": [
+                {"source_prefix": "refseq/2026/batch-7", "target_prefix": "genomes/2026/batch-7"}
+            ]
+        })
+    ),
     responses(
-        (status = 200, description = "Batch staging results", body = StageBatchResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 501, description = "Not implemented", body = ErrorResponse)
+        (
+            status = 200,
+            description = "One result per staged object plus one per prefix that could not be expanded, in that order; individual failures are reported here rather than as a status code",
+            body = StageBatchResponse,
+            example = json!({
+                "results": [
+                    {"source_path": "refseq/2026/a.fna.gz", "target_key": "genomes/2026/a.fna.gz", "status": "ok"},
+                    {"source_path": "refseq/2026/batch-7/b.fna.gz", "target_key": "genomes/2026/batch-7/b.fna.gz", "status": "error", "error": "Not found"}
+                ]
+            })
+        ),
+        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a prefix is not a confined relative path, or the batch would exceed 1000 objects", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -403,13 +450,32 @@ pub async fn stage_batch(
     post,
     path = "/staging/jobs",
     tag = "staging",
-    request_body = StageBatchRequest,
+    summary = "Submit a staging job to run in the background",
+    description = "Requires a bearer token issued for this realm. Takes the same body as the blocking batch endpoint but returns as soon as the work is recorded: a 202 means the job is durable and queued on this node, and no object has been read, copied or referenced yet. Every named item and every prefix is authorized before the job is accepted, so acceptance already implies READ on each connector source path or prefix and WRITE on each target key or target prefix; nothing is authorized later while the job runs. The bucket must exist on this node and belong to the given group, otherwise the request is not found, and at least one item or prefix is required. Source paths must be relative and confined, target keys must not be blank, and `node_id`, when given, must be this node, because the job runs where it was submitted. The `sync` strategy is not implemented. Unlike the blocking endpoint there is no cap on the number of items, and no request-side prefix expansion happens: prefixes are stored and walked by the job. There is no idempotency key, so every call creates a new job, `created` is always true, and resubmitting the same body stages the same objects a second time. Progress and completion are observed by reading the job by its id.",
+    request_body(
+        content = StageBatchRequest,
+        description = "One connector and target bucket for the job, plus the `items` and `prefixes` it should stage; at least one of the two must be non-empty. `node_id` defaults to this node.",
+        example = json!({
+            "group_id": "01JABCDEF0123456789ABCDEFG",
+            "connector_id": "01JCONNECTOR0123456789ABCD",
+            "bucket": "research-raw",
+            "strategy": "snapshot",
+            "prefixes": [
+                {"source_prefix": "refseq/2026", "target_prefix": "genomes/2026"}
+            ]
+        })
+    ),
     responses(
-        (status = 202, description = "Staging job accepted", body = SubmitStagingJobResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (
+            status = 202,
+            description = "The job is durably queued on this node; `created` is always true because staging jobs are never deduplicated",
+            body = SubmitStagingJobResponse,
+            example = json!({"job_id": "01JJOB0123456789ABCDEFGHJ", "created": true})
+        ),
+        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path or prefix is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller lacks READ on a source path or WRITE on a target key", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -530,13 +596,44 @@ pub async fn submit_staging(
     get,
     path = "/staging/jobs",
     tag = "staging",
+    summary = "List the staging jobs you submitted to this node",
+    description = "Requires a bearer token issued for this realm. Lists only the calling user's own staging jobs that are owned by this node, so a job submitted to another node is not visible here and must be listed there; other users' jobs and non-staging jobs never appear. A path-restricted token sees only the jobs submitted under exactly the same restrictions. Jobs come back oldest first by submission time. Each entry carries the job's own progress and per-object errors as last checkpointed by the runner, so a running job's counts trail the work slightly and a job that has not started yet reports the queued phase with zero progress.",
     params(
-        ("limit" = Option<usize>, Query, description = "Max jobs to return (default 50, max 200)"),
-        ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous page")
+        ("limit" = Option<usize>, Query, description = "Page size; defaults to 50 when absent or zero and is capped at 200"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor returned as `next_cursor` by the previous page, passed back unchanged. Omit for the first page; a cursor that does not decode is rejected")
     ),
     responses(
-        (status = 200, description = "Node-local staging jobs; jobs owned by other nodes are omitted", body = StagingJobListResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (
+            status = 200,
+            description = "One page of the caller's staging jobs on this node, with `next_cursor` present only when a further page exists",
+            body = StagingJobListResponse,
+            example = json!({
+                "jobs": [
+                    {
+                        "job_id": "01JJOB0123456789ABCDEFGHJ",
+                        "strategy": "snapshot",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "connector_id": "01JCONNECTOR0123456789ABCD",
+                        "bucket": "research-raw",
+                        "state": "running",
+                        "phase": "downloading",
+                        "submitted_at": "2026-04-09T14:23:11.123+00:00",
+                        "finished_at": null,
+                        "error": null,
+                        "progress": {
+                            "items_current": 12,
+                            "items_total": 40,
+                            "bytes_current": 5242880,
+                            "bytes_total": 20971520,
+                            "current_path": "refseq/2026/genome.fna.gz"
+                        },
+                        "errors": []
+                    }
+                ],
+                "next_cursor": "AAABkWPGovsBAgMEBQYHCAkKCwwNDg8Q"
+            })
+        ),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -578,12 +675,44 @@ pub async fn list_staging_jobs(
     get,
     path = "/staging/jobs/{job_id}",
     tag = "staging",
-    params(("job_id" = String, Path, description = "Staging job identifier")),
+    summary = "Read one staging job and its progress",
+    description = "Requires a bearer token issued for this realm. The job is always answered by the node that owns it: a request that lands anywhere else is forwarded to that owner with the caller's own token, so the same id can be read from any node in the realm and the answer is the owner's current record rather than a replica. Only the owner decides that a job does not exist, and a job created by another user, a non-staging job, and a job whose restrictions do not match the presenting token are all reported as not found rather than forbidden. `state` collapses the lifecycle into queued, running, done or failed, while `phase` names the stage the runner last checkpointed, so a job can read as running long before any bytes move. `progress` and `errors` come from that same checkpoint, so they trail the work slightly; per-object failures are listed in `errors` while the job as a whole may still succeed, and `finished_at` is set only once the job has stopped.",
+    params(("job_id" = String, Path, description = "Staging job id as a 26-character ULID, as returned when the job was submitted")),
     responses(
-        (status = 200, description = "Staging job", body = StagingJobResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The job as the owning node currently records it, including per-object errors gathered so far",
+            body = StagingJobResponse,
+            example = json!({
+                "job_id": "01JJOB0123456789ABCDEFGHJ",
+                "strategy": "snapshot",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "connector_id": "01JCONNECTOR0123456789ABCD",
+                "bucket": "research-raw",
+                "state": "done",
+                "phase": "completed",
+                "submitted_at": "2026-04-09T14:23:11.123+00:00",
+                "finished_at": "2026-04-09T14:41:02.884+00:00",
+                "error": null,
+                "progress": {
+                    "items_current": 40,
+                    "items_total": 40,
+                    "bytes_current": 20971520,
+                    "bytes_total": 20971520,
+                    "current_path": null
+                },
+                "errors": [
+                    {
+                        "source_path": "refseq/2026/broken.fna.gz",
+                        "target_key": "genomes/2026/broken.fna.gz",
+                        "error": "Not found"
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "No bearer token was presented, or the owning node rejected the forwarded token", body = ErrorResponse),
+        (status = 404, description = "The owning node holds no staging job with that id for this caller", body = ErrorResponse),
+        (status = 503, description = "The node that owns the job could not be reached; the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -617,18 +746,38 @@ pub async fn get_staging_job(
     get,
     path = "/staging/references",
     tag = "staging",
+    summary = "List a bucket's objects with their source bindings",
+    description = "Requires a bearer token issued for this realm and READ on the bucket; the bucket's owning group is resolved first, so a bucket unknown to this node is not found and the permission check always runs against the group that owns it. This is a node-local listing of the bucket as this node currently sees it, so objects written elsewhere appear once they have replicated here. Every live object is returned, materialized and referenced alike, which is what lets a caller total a bucket in one pass: `referenced` false means the bytes are stored here and `size` is the stored blob size, while `referenced` true means the object is still only a pointer, `size` is the length its source reported, and `kind` with `source_path` describe where it points, `connector_id` for an external source connector or `origin_node_id` for another Aruna node. Those four fields are omitted entirely for a materialized object. Objects are listed in key order and pagination is by opaque cursor.",
     params(
-        ("bucket" = String, Query, description = "Bucket to list"),
-        ("prefix" = Option<String>, Query, description = "Optional object-key prefix"),
-        ("limit" = Option<usize>, Query, description = "Page size (default 500, max 1000)"),
-        ("cursor" = Option<String>, Query, description = "Opaque cursor from the previous page")
+        ("bucket" = String, Query, description = "Bucket to list, as used by the S3 surface; required"),
+        ("prefix" = Option<String>, Query, description = "Return only objects whose key starts with this prefix; an empty value is treated as no prefix"),
+        ("limit" = Option<usize>, Query, description = "Page size; defaults to 500 when absent or zero and is capped at 1000"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor returned as `next_cursor` by the previous page, passed back unchanged. Omit for the first page; a cursor that does not decode is rejected")
     ),
     responses(
-        (status = 200, description = "All objects with reference binding details", body = ReferenceListResponse),
-        (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Bucket not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "One page of the bucket's objects with their binding details, with `next_cursor` present only when a further page exists",
+            body = ReferenceListResponse,
+            example = json!({
+                "entries": [
+                    {"key": "genomes/2026/a.fna.gz", "size": 1048576, "referenced": false},
+                    {
+                        "key": "genomes/2026/b.fna.gz",
+                        "size": 2097152,
+                        "referenced": true,
+                        "kind": "http",
+                        "source_path": "refseq/2026/b.fna.gz",
+                        "connector_id": "01JCONNECTOR0123456789ABCD"
+                    }
+                ],
+                "next_cursor": "AWdlbm9tZXMvMjAyNi9iLmZuYS5neg"
+            })
+        ),
+        (status = 400, description = "The cursor could not be decoded", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller lacks READ on the bucket", body = ErrorResponse),
+        (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

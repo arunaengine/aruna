@@ -10,7 +10,6 @@ ignore = [
     "RUSTSEC-2023-0089", # atomic-polyfill unmaintained (transitive)
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained (transitive)
     "RUSTSEC-2024-0436", # paste unmaintained (transitive)
-    "RUSTSEC-2025-0052", # async-std discontinued (transitive)
     "RUSTSEC-2026-0194", # quick-xml quadratic parse via RDF stack (upstream craqle)
     "RUSTSEC-2026-0195", # quick-xml namespace allocation via RDF stack (upstream craqle)
 ]

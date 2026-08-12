@@ -28,8 +28,7 @@ use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
 use aruna_operations::reserve_onboarding_secret::ReserveOnboardingSecretError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use base64::Engine;
 use crypto_box::{
     PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
@@ -41,36 +40,34 @@ use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const DEFAULT_ONBOARDING_SECRET_TTL_SECS: u64 = 3600;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "onboarding", description = "Node onboarding and bootstrap operations")),
-    paths(
-        create_onboarding_secret,
-        list_onboarding_secrets,
-        revoke_onboarding_secret,
-        bootstrap_onboarding
-    )
+    tags((name = "onboarding", description = "Node onboarding and bootstrap operations"))
 )]
 pub struct OnboardingApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/onboarding/bootstrap", post(bootstrap_onboarding))
-        .route("/admin/onboarding/secrets", post(create_onboarding_secret))
-        .route("/admin/onboarding/secrets", get(list_onboarding_secrets))
-        .route(
-            "/admin/onboarding/secrets/{id}",
-            delete(revoke_onboarding_secret),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(OnboardingApiDoc::openapi())
+        .routes(routes!(bootstrap_onboarding))
+        .routes(routes!(create_onboarding_secret, list_onboarding_secrets))
+        .routes(routes!(revoke_onboarding_secret))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct BootstrapEndpointDoc {
     pub id: String,
-    pub addrs: Vec<String>,
+    pub addrs: Vec<TransportAddressDoc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub enum TransportAddressDoc {
+    Ip(String),
+    Relay(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -187,11 +184,30 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
     post,
     path = "/admin/onboarding/secrets",
     tag = "onboarding",
-    request_body = CreateOnboardingSecretRequestDoc,
+    summary = "Mint a node enrollment secret",
+    description = "Requires a bearer token of this realm with WRITE on the realm's onboarding admin path, and only a management node serves it; any other node answers 403. The response carries the enrollment secret exactly once: the node stores only its hash, so a secret that is lost cannot be recovered and must be revoked and minted again. Treat the value like a credential, hand it to exactly one joining node, and expect it to be single-use. `mode` fixes what the joiner may become and is one of `Management`, `Server` or `Local`; a Management secret later lets the joiner receive the realm private key wrapped to its transport key, so it is the most sensitive of the three. `expires_in_seconds` defaults to 3600 and is clamped to 60..=86400, and `expires_at` is the resulting absolute expiry in Unix seconds. Every expired secret that is not already mid-enrollment is discarded before the new one is created.",
+    request_body(
+        content = CreateOnboardingSecretRequestDoc,
+        description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
+        example = json!({
+            "seed_url": "https://node.example.test/api/v1",
+            "mode": "Server",
+            "expires_in_seconds": 3600
+        })
+    ),
     responses(
-        (status = 201, description = "Onboarding secret created", body = CreateOnboardingSecretResponseDoc),
-        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
-        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse)
+        (
+            status = 201,
+            description = "Secret created; `onboarding_secret` is shown here and never again",
+            body = CreateOnboardingSecretResponseDoc,
+            example = json!({
+                "onboarding_secret": "<onboarding-secret-shown-once>",
+                "mode": "Server",
+                "expires_at": 1775748191
+            })
+        ),
+        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -253,10 +269,32 @@ pub async fn create_onboarding_secret(
     get,
     path = "/admin/onboarding/secrets",
     tag = "onboarding",
+    summary = "List outstanding node enrollment secrets",
+    description = "Requires a bearer token of this realm with WRITE on the realm's onboarding admin path, and only a management node serves it; any other node answers 403. Returns bookkeeping only: the enrollment id, the mode, the absolute expiry in Unix seconds and, once a joiner has claimed the secret, the node id it was claimed by. The secret value itself is never returned here, because only its hash was kept when it was minted. Expired secrets that are not mid-enrollment are discarded before the list is built, so the list holds live and in-flight enrollments; entries are ordered by expiry, soonest first. The list is this management node's local state, not a realm-wide fan-out.",
     responses(
-        (status = 200, description = "List onboarding secrets", body = ListOnboardingSecretsResponse),
-        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
-        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse)
+        (
+            status = 200,
+            description = "Live and in-flight enrollment secrets, soonest expiry first",
+            body = ListOnboardingSecretsResponse,
+            example = json!({
+                "secrets": [
+                    {
+                        "enrollment_id": "01JABCDEF0123456789ABCDEFG",
+                        "mode": "Server",
+                        "expires_at": 1775748191,
+                        "claimed_node_id": null
+                    },
+                    {
+                        "enrollment_id": "01JMETADATA0123456789ABCDE",
+                        "mode": "Local",
+                        "expires_at": 1775751791,
+                        "claimed_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -286,12 +324,14 @@ pub async fn list_onboarding_secrets(
     delete,
     path = "/admin/onboarding/secrets/{id}",
     tag = "onboarding",
-    params(("id" = String, Path, description = "Onboarding secret enrollment id")),
+    summary = "Revoke a pending node enrollment secret",
+    description = "Requires a bearer token of this realm with WRITE on the realm's onboarding admin path, and only a management node serves it; any other node answers 403. Deletes the enrollment record on this node, which makes the secret unredeemable from here on. This is the remedy for a secret that leaked or was never used, and it is the only remedy, since the secret value itself was never stored. Revocation does not undo an enrollment that already completed: a node that finished bootstrapping stays a member of the realm and has to be removed through the realm configuration instead. A secret that is already gone, expired and pruned or revoked by an earlier call, answers 404.",
+    params(("id" = String, Path, description = "Enrollment id of the secret, the ULID reported when it was minted and by the list endpoint")),
     responses(
-        (status = 204, description = "Secret revoked"),
-        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
-        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse),
-        (status = 404, description = "Secret not found", body = crate::error::ErrorResponse)
+        (status = 204, description = "Secret deleted and no longer redeemable; no response body"),
+        (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, this is not a management node, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
+        (status = 404, description = "No enrollment secret with this id on this node", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -317,12 +357,47 @@ pub async fn revoke_onboarding_secret(
     post,
     path = "/onboarding/bootstrap",
     tag = "onboarding",
-    request_body = BootstrapOnboardingRequestDoc,
+    summary = "Redeem an enrollment secret and join the realm",
+    description = "Deliberately unauthenticated: a joining node has no realm token yet. The enrollment secret plus a signature by the joiner's own node key are the credentials, so an unknown, expired, already claimed or unmatched secret and any signature that does not verify are refused with 401, without saying which of the two failed. Only a management node serves this; any other node answers 403. The secret is single-use and is consumed when enrollment finalizes, which also adds the joiner to the realm configuration; a rejected attempt leaves the secret usable so an operator does not have to mint a new one after a typo. What must be sent depends on the mode the secret was minted for: a Server secret additionally requires `issuer_public_key` and a matching `issuer_proof` and returns a delegation signature; a Management secret requires `transport_public_key` and returns the realm private key encrypted to it, along with the nonce and the ephemeral public key needed to open it; a Local secret needs neither. The response always carries the realm id, the temporary endpoint to dial and a one-time sync ticket the joiner uses to fetch the realm's core documents. `node_location`, `node_weight` and `node_labels` seed the joiner's placement entry and are optional. Everything returned here is one-time joining material and must never be logged or reused.",
+    request_body(
+        content = BootstrapOnboardingRequestDoc,
+        description = "The enrollment secret, the joiner's node id, its proof of possession of the node key, and any mode-specific key material",
+        example = json!({
+            "onboarding_secret": "<onboarding-secret-shown-once>",
+            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+            "node_proof": "<node-key-proof-signature>",
+            "issuer_public_key": "<issuer-public-key>",
+            "issuer_proof": "<issuer-proof-signature>",
+            "node_location": "dc-a",
+            "node_weight": 100,
+            "node_labels": {"zone": "dc-a"}
+        })
+    ),
     responses(
-        (status = 200, description = "Bootstrap material for joiner", body = BootstrapOnboardingResponseDoc),
-        (status = 400, description = "Invalid request", body = crate::error::ErrorResponse),
-        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
-        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse)
+        (
+            status = 200,
+            description = "Enrollment finalized; joining material for the mode the secret was minted for. `addrs` entries are tagged transport addresses, either `Ip` or `Relay`",
+            body = BootstrapOnboardingResponseDoc,
+            example = json!({
+                "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "mode": "Server",
+                "temporary_bootstrap_endpoint": {
+                    "id": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+                    "addrs": [
+                        {"Ip": "192.0.2.10:4433"},
+                        {"Relay": "https://relay.example.test/"}
+                    ]
+                },
+                "wrapped_realm_private_key": null,
+                "wrapped_realm_private_key_nonce": null,
+                "wrapping_public_key": null,
+                "delegation_signature": "<realm-delegation-signature>",
+                "onboarding_sync_ticket": "<one-time-onboarding-sync-ticket>"
+            })
+        ),
+        (status = 400, description = "Malformed node id, key material or proof, or key material missing for the mode the secret was minted for", body = crate::error::ErrorResponse),
+        (status = 401, description = "Unknown, expired, already claimed or non-matching enrollment secret, or a proof that does not verify", body = crate::error::ErrorResponse),
+        (status = 403, description = "This node does not serve enrollment, or the secret was not minted for node enrollment", body = crate::error::ErrorResponse)
     )
 )]
 pub async fn bootstrap_onboarding(

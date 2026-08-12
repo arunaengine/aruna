@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use aruna_core::DistributedTraceContext;
+use aruna_core::effects::DhtCompletion;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
 use aruna_core::structs::RealmId;
@@ -144,6 +145,7 @@ struct PutOp {
 struct GetOp {
     key: DhtKeyId,
     realm_filter: Option<RealmId>,
+    completion: DhtCompletion,
     values: Vec<DhtEntry>,
     value_indices: HashMap<(NodeId, RealmId), usize>,
     value_versions: HashMap<(NodeId, RealmId), u64>,
@@ -341,8 +343,10 @@ impl DhtStateMachine {
                 op_id,
                 key,
                 realm_filter,
+                completion,
                 trace_context,
-            } => self.handle_cmd_get(op_id, key, realm_filter, trace_context, out),
+            } => self.handle_cmd_get(op_id, key, realm_filter, completion, trace_context, out),
+            DhtCmd::Cancel { op_id, error } => self.handle_cmd_cancel(op_id, error, out),
             DhtCmd::Bootstrap {
                 op_id,
                 nodes,
@@ -427,6 +431,27 @@ impl DhtStateMachine {
         self.ops.insert(op_id, op);
     }
 
+    /// Releases an operation the driver gave up on. Dropping its pending map is
+    /// what makes late RPC replies inert: they no longer match a live op.
+    #[tracing::instrument(
+        name = "dht.state.cmd_cancel",
+        level = "debug",
+        skip(self, out),
+        fields(op_id, error = %error)
+    )]
+    fn handle_cmd_cancel(
+        &mut self,
+        op_id: OpId,
+        error: DhtIoError,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if self.ops.remove(&op_id).is_none() {
+            return;
+        }
+        out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "dht.state.cmd_get",
         level = "debug",
@@ -438,6 +463,7 @@ impl DhtStateMachine {
         op_id: OpId,
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        completion: DhtCompletion,
         trace_context: Option<DistributedTraceContext>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
@@ -452,6 +478,7 @@ impl DhtStateMachine {
         let mut op = OpState::Get(GetOp {
             key,
             realm_filter,
+            completion,
             values: Vec::new(),
             value_indices: HashMap::new(),
             value_versions: HashMap::new(),
@@ -822,9 +849,16 @@ impl DhtStateMachine {
                     };
                     op.cache_entries = merged;
                     if entry_is_fresh(entry.expires_at, self.now_secs) {
+                        let first_usable = first_usable_match(&op, record_key.0, record_key.1);
                         if insert_get_value(&mut op, entry) {
                             op.remote_values.insert(record_key);
                             op.remote_entries.insert(record_key, stored);
+                        }
+                        if first_usable {
+                            op.frontier.responsive.insert(peer);
+                            self.insert_peer(peer, out);
+                            complete_get(op_id, op, DhtGetCompletedReason::FirstUsable, out);
+                            return;
                         }
                     } else if insert_get_floor(&mut op, &entry) {
                         op.remote_entries.insert(record_key, stored);
@@ -1161,7 +1195,12 @@ impl DhtStateMachine {
                         continue;
                     }
                     if entry_is_fresh(value.expires_at, self.now_secs) {
+                        let first_usable = first_usable_match(&op, value.publisher, value.realm_id);
                         insert_get_value(&mut op, value);
+                        if first_usable {
+                            complete_get(op_id, op, DhtGetCompletedReason::FirstUsable, out);
+                            return;
+                        }
                     } else {
                         insert_get_floor(&mut op, &value);
                     }
@@ -2110,6 +2149,19 @@ impl DhtStateMachine {
     }
 }
 
+/// A validated entry from the expected publisher ends a `FirstUsable` read. The
+/// entry already passed signature, realm-filter and expiry checks, so no weaker
+/// record can complete the lookup, and an `Exhaustive` read never matches here.
+fn first_usable_match(op: &GetOp, publisher: NodeId, realm_id: RealmId) -> bool {
+    match op.completion {
+        DhtCompletion::Exhaustive => false,
+        DhtCompletion::FirstUsable {
+            realm_id: expected_realm,
+            publisher: expected_publisher,
+        } => expected_publisher == publisher && expected_realm == realm_id,
+    }
+}
+
 fn complete_get(
     op_id: OpId,
     mut op: GetOp,
@@ -2355,6 +2407,7 @@ fn dht_cmd_kind(cmd: &DhtCmd) -> &'static str {
     match cmd {
         DhtCmd::Put { .. } => "put",
         DhtCmd::Get { .. } => "get",
+        DhtCmd::Cancel { .. } => "cancel",
         DhtCmd::Bootstrap { .. } => "bootstrap",
         DhtCmd::RoutingTableSize { .. } => "routing_table_size",
         DhtCmd::AddPeer { .. } => "add_peer",
@@ -2493,6 +2546,7 @@ mod tests {
             op_id,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2514,6 +2568,234 @@ mod tests {
                     )
             )
         }));
+    }
+
+    fn start_scoped(
+        state: &mut DhtStateMachine,
+        op_id: OpId,
+        key: DhtKeyId,
+        peer: NodeId,
+        completion: DhtCompletion,
+    ) {
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id,
+            key,
+            realm_filter: None,
+            completion,
+            trace_context: None,
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn cancel_releases_op() {
+        // A released operation drops its pending RPC bookkeeping, so a late
+        // reply cannot resurrect it or reach the caller a second time.
+        let local_secret = make_secret(150);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"cancel-releases-op");
+        let peer = make_node(151);
+        start_get(&mut state, 200, key, peer);
+        assert!(state.contains_op(200));
+
+        let released = state.step(DhtInput::Cmd(DhtCmd::Cancel {
+            op_id: 200,
+            error: DhtIoError::Timeout,
+        }));
+        assert!(matches!(
+            released.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed {
+                op_id: 200,
+                error: DhtIoError::Timeout
+            })]
+        ));
+        assert!(!state.contains_op(200));
+
+        let late = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 200,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(152, key, make_realm(1), b"late", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(late.is_empty());
+        assert!(!state.contains_op(200));
+
+        // A second release is inert rather than a duplicate caller reply.
+        let again = state.step(DhtInput::Cmd(DhtCmd::Cancel {
+            op_id: 200,
+            error: DhtIoError::Timeout,
+        }));
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn first_usable_stops() {
+        let local_secret = make_secret(153);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"first-usable-stops");
+        let realm_id = make_realm(1);
+        let peer = make_node(154);
+        let publisher = make_node(155);
+        start_scoped(
+            &mut state,
+            201,
+            key,
+            peer,
+            DhtCompletion::FirstUsable {
+                realm_id,
+                publisher,
+            },
+        );
+
+        let completed = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 201,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(155, key, realm_id, b"endpoint", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(completed.iter().any(|effect| matches!(
+            effect,
+            DhtEffect::Output(DhtOutput::Completed {
+                result: DhtOutputValue::GetValues { values, stats },
+                ..
+            }) if values.len() == 1
+                && values[0].node_id == publisher
+                && stats.completed_reason == DhtGetCompletedReason::FirstUsable
+        )));
+        assert!(!state.contains_op(201));
+    }
+
+    #[test]
+    fn first_usable_filters() {
+        // Wrong publisher, wrong realm, expired, and forged records may not
+        // complete an expected-publisher lookup.
+        let local_secret = make_secret(156);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"first-usable-filters");
+        let realm_id = make_realm(1);
+        let other_realm = make_realm(2);
+        let peer = make_node(157);
+        let publisher = make_node(158);
+        start_scoped(
+            &mut state,
+            202,
+            key,
+            peer,
+            DhtCompletion::FirstUsable {
+                realm_id,
+                publisher,
+            },
+        );
+
+        let pending = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 202,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![
+                    make_value(159, key, realm_id, b"other-publisher", 2_000),
+                    make_value(158, key, other_realm, b"other-realm", 2_000),
+                    make_value(158, key, realm_id, b"expired", 900),
+                    {
+                        let mut invalid =
+                            make_value(158, key, realm_id, b"invalid-signature", 2_000);
+                        let attacker = make_secret(160);
+                        let signed = signed_record_bytes(
+                            &key,
+                            &invalid.publisher,
+                            &invalid.realm_id,
+                            &invalid.value,
+                            invalid.expires_at,
+                            invalid.revision,
+                        );
+                        invalid.signature = attacker.sign(&signed);
+                        invalid
+                    },
+                ],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(
+            pending
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+        assert!(state.contains_op(202));
+    }
+
+    #[test]
+    fn exhaustive_keeps_publishers() {
+        // The default policy may not stop on the first verified record; every
+        // publisher answered before frontier completion stays in the result.
+        let local_secret = make_secret(160);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"exhaustive-keeps-publishers");
+        let realm_id = make_realm(1);
+        let first_peer = make_node(161);
+        let second_peer = make_node(162);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: first_peer,
+        }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: second_peer,
+        }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 203,
+            key,
+            realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
+            trace_context: None,
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 203,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let first = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 203,
+            phase: RpcPhase::GetLookup,
+            peer: first_peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(163, key, realm_id, b"first", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(
+            first
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let pending = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 203,
+            phase: RpcPhase::GetLookup,
+            peer: second_peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(164, key, realm_id, b"second", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        let complete = finish_get(&mut state, 203, &pending);
+        assert!(complete.iter().any(|effect| matches!(
+            effect,
+            DhtEffect::Output(DhtOutput::Completed {
+                result: DhtOutputValue::GetValues { values, stats },
+                ..
+            }) if values.len() == 2
+                && stats.completed_reason == DhtGetCompletedReason::RemoteValue
+        )));
     }
 
     fn finish_get(
@@ -2731,6 +3013,7 @@ mod tests {
             op_id: 80,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -2828,6 +3111,7 @@ mod tests {
             op_id: 82,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2996,6 +3280,7 @@ mod tests {
             op_id: 84,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -3043,6 +3328,7 @@ mod tests {
             op_id: 85,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -3382,6 +3668,7 @@ mod tests {
             op_id: 91,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
         let OpState::Get(mut op) = state.ops.remove(&91).expect("get operation") else {
@@ -3532,6 +3819,7 @@ mod tests {
             op_id: 79,
             key: get_key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -3710,6 +3998,7 @@ mod tests {
             op_id: 9,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -3775,6 +4064,7 @@ mod tests {
             op_id: 10,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: Some(trace_context.clone()),
         }));
 
@@ -4178,6 +4468,7 @@ mod tests {
             op_id: 15,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -4255,6 +4546,7 @@ mod tests {
             op_id: 92,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
         let lookup = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -4303,6 +4595,7 @@ mod tests {
             op_id: 22,
             key,
             realm_filter: Some(make_realm(1)),
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -4335,6 +4628,7 @@ mod tests {
             op_id: 23,
             key,
             realm_filter: Some(realm_filter),
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -4379,6 +4673,7 @@ mod tests {
             op_id: 16,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -4465,6 +4760,7 @@ mod tests {
             op_id,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 
@@ -4643,6 +4939,7 @@ mod tests {
             op_id: 19,
             key,
             realm_filter: None,
+            completion: DhtCompletion::Exhaustive,
             trace_context: None,
         }));
 

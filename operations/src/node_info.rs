@@ -263,7 +263,7 @@ async fn replicate_node_info(
             local_node_id: node_id,
             excluded_peers: Vec::new(),
             documents: vec![DocumentSyncTarget::NodeInfo { realm_id, node_id }],
-            // Shared-topic genesis is bootstrapped by announce_core_documents;
+            // Shared-topic genesis is bootstrapped by publish_core_documents;
             // explicit publishes and periodic heartbeats only publish into it.
             allow_genesis: false,
         }),

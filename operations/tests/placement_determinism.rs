@@ -590,15 +590,30 @@ async fn install_realm_config(
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
     seed_realm_config_sync_topic(nodes, realm_id, &config).await?;
-    // Config apply hook: the shard's rank-0 holder eagerly creates each
-    // shard topic genesis (mirrors the production realm-config apply path).
-    for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
-            &node.context,
-            realm_id,
-            node.net.node_id(),
-        )
-        .await;
+    // Config apply hook: restore shared topics and converge shard membership
+    // before the fixture starts publishing or changing placement.
+    for _ in 0..5 {
+        for node in nodes {
+            aruna_operations::startup::restore_shard_subscriptions(
+                &node.context,
+                node.net.node_id(),
+                realm_id,
+            )
+            .await;
+        }
+        let mut retry = false;
+        for node in nodes {
+            retry |= aruna_operations::process_placements::process_shard_placements(
+                &node.context,
+                realm_id,
+                node.net.node_id(),
+            )
+            .await
+            .retry_scheduled;
+        }
+        if !retry {
+            break;
+        }
     }
     Ok(())
 }

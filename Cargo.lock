@@ -307,6 +307,7 @@ dependencies = [
  "ulid 3.0.0",
  "url",
  "utoipa",
+ "utoipa-axum",
  "utoipa-swagger-ui",
 ]
 
@@ -444,6 +445,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek 3.0.0",
  "fjall",
+ "flate2",
  "hex",
  "iroh",
  "jsonwebtoken",
@@ -452,6 +454,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -520,7 +524,7 @@ dependencies = [
  "iroh",
  "irokle",
  "jsonwebtoken",
- "lru 0.18.1",
+ "lru 0.18.2",
  "opentelemetry",
  "oxrdf",
  "oxttl",
@@ -3830,7 +3834,7 @@ dependencies = [
  "iroh-base",
  "iroh-dns",
  "iroh-metrics",
- "lru 0.18.1",
+ "lru 0.18.2",
  "n0-error",
  "n0-future",
  "noq",
@@ -4326,9 +4330,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -8489,6 +8493,19 @@ dependencies = [
  "serde",
  "serde_json",
  "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-axum"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c25bae5bccc842449ec0c5ddc5cbb6a3a1eaeac4503895dc105a1138f8234a0"
+dependencies = [
+ "axum",
+ "paste",
+ "tower-layer",
+ "tower-service",
+ "utoipa",
 ]
 
 [[package]]

@@ -23,7 +23,7 @@ use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
 };
 use aruna_core::effects::StorageEffect;
-use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::effects::{DhtGetOptions, Effect, NetEffect};
 use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
@@ -53,7 +53,7 @@ use tracing::{Instrument, Span, debug, warn};
 use ulid::Ulid;
 
 pub use ::irokle::net::IrohRuntimeConfig;
-pub use connection_pool::Monitor;
+pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
 pub use document_sync::{DocumentSyncService, ShardGenesisProbe};
 pub use error::{NetError, Result};
@@ -316,8 +316,11 @@ const PEER_MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 const PEER_SUCCESS_REFRESH_DELAY: Duration = Duration::from_secs(300);
 const PEER_MANAGER_IDLE_DELAY: Duration = Duration::from_secs(300);
 // Overall open_stream budget: first open attempt, DHT-signed endpoint
-// re-resolution (an otherwise unbounded DHT lookup), and the retry combined.
+// re-resolution, and the retry combined.
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+// The DHT sub-budget of OPEN_STREAM_TIMEOUT, enforced inside the driver so the
+// lookup is released rather than left running when the caller stops waiting.
+const DHT_SIGNED_LOOKUP_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug)]
 struct PeerConnectivityManagerState {
@@ -617,24 +620,29 @@ impl NetHandle {
 
         let (effect_tx, mut effect_rx) = mpsc::channel::<EffectHandle>(256);
 
+        // Inbound handlers and presence refreshes write to storage, so shutdown
+        // has to be able to join them instead of leaving them detached behind
+        // the final sync.
+        let inbound_tasks = TaskTracker::new();
+        let effect_context = Arc::new(effect_handlers::NetEffectContext {
+            dht: dht.clone(),
+            document_sync: document_sync.clone(),
+            presence: effect_handlers::RealmPresenceCache::default(),
+            tasks: inbound_tasks.clone(),
+            shutdown: shutdown.clone(),
+            #[cfg(test)]
+            refresh_probe: None,
+        });
         let shutdown_for_effects = shutdown.clone();
-        let dht_for_effects = dht.clone();
-        let document_sync_for_effects = document_sync.clone();
         let effect_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown_for_effects.cancelled() => break,
                     maybe_effect = effect_rx.recv() => {
                         let Some((effect, response_tx, span)) = maybe_effect else { break };
-                        let dht = dht_for_effects.clone();
-                        let document_sync = document_sync_for_effects.clone();
+                        let context = effect_context.clone();
                         tokio::spawn(async move {
-                            let event = effect_handlers::handle_net_effect(
-                                &dht,
-                                &document_sync,
-                                effect,
-                            )
-                            .await;
+                            let event = effect_handlers::handle_net_effect(&context, effect).await;
                             let _ = response_tx.send(event);
                         }.instrument(span));
                     }
@@ -661,9 +669,6 @@ impl NetHandle {
         let dht_for_streams = dht.clone();
         let inbound_handler_for_streams = inbound_handler.clone();
         let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
-        // Inbound handlers write to storage, so shutdown has to be able to join
-        // them instead of leaving them detached behind the final sync.
-        let inbound_tasks = TaskTracker::new();
         let inbound_tasks_for_streams = inbound_tasks.clone();
         let stream_task = tokio::spawn(async move {
             while let Some((alpn, stream, peer_id)) = stream_rx.recv().await {
@@ -780,6 +785,7 @@ impl NetHandle {
         let peer_connectivity_task = tokio::spawn(run_peer_connectivity_manager(
             dht.clone(),
             address_lookup.clone(),
+            connection_pool.clone(),
             discovery_method.clone(),
             config.realm_id,
             dht_signed_authorized_nodes.clone(),
@@ -988,6 +994,17 @@ impl NetHandle {
         Ok(applied)
     }
 
+    /// Connection-attempt counters behind the structured connection
+    /// diagnostics; fixed outcome classes with no peer dimension.
+    pub fn pool_counts(&self) -> PoolCounts {
+        self.inner.connection_pool.counts()
+    }
+
+    #[doc(hidden)]
+    pub fn pool_counts_for(&self, node_id: NodeId, alpn: Alpn) -> PoolCounts {
+        self.inner.connection_pool.counts_for(node_id, alpn)
+    }
+
     pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
         if endpoint_addr.id == self.inner.node_id {
             return;
@@ -997,6 +1014,16 @@ impl NetHandle {
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
+        // A newly installed address invalidates the failures recorded against
+        // the previous one.
+        if let Err(error) = self
+            .inner
+            .connection_pool
+            .clear_failures(endpoint_addr.id)
+            .await
+        {
+            debug!(node_id = %endpoint_addr.id, %error, "Connection pool stopped during address installation");
+        }
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -1317,11 +1344,13 @@ impl NetHandle {
                     .await
                     {
                         Ok(Some(endpoint_addr)) => {
-                            install_dht_signed_endpoint(
+                            install_signed_endpoint(
                                 &self.inner.address_lookup,
                                 &self.inner.dht,
+                                &self.inner.connection_pool,
                                 endpoint_addr,
-                            );
+                            )
+                            .await;
                             debug!(
                                 node_id = %node_id,
                                 "Retrying stream after DHT-signed endpoint resolution"
@@ -1615,7 +1644,16 @@ async fn lookup_dht_signed_endpoint(
     }
 
     let key = realm_endpoint_key(&realm_id, &peer);
-    let entries = dht.get(&key, Some(realm_id)).await?;
+    // The announcement is only usable when `peer` published it in this realm, so
+    // the driver may stop at the first valid record from that publisher. The
+    // sub-budget keeps the whole resolve inside OPEN_STREAM_TIMEOUT.
+    let entries = dht
+        .get(
+            &key,
+            Some(realm_id),
+            DhtGetOptions::first_usable(DHT_SIGNED_LOOKUP_TIMEOUT, realm_id, peer),
+        )
+        .await?;
     let now = unix_timestamp_secs();
 
     Ok(select_dht_signed_endpoint(
@@ -1764,13 +1802,19 @@ fn validate_realm_endpoint_announcement(
         .map_err(|err| err.to_string())
 }
 
-fn install_dht_signed_endpoint(
+async fn install_signed_endpoint(
     address_lookup: &MemoryLookup,
     dht: &DhtHandle,
+    connection_pool: &ConnectionPool,
     endpoint_addr: EndpointAddr,
 ) {
     let node_id = endpoint_addr.id;
     address_lookup.set_endpoint_info(endpoint_addr);
+    // The newly validated address invalidates the failures recorded against the
+    // previous one, so the next request dials instead of failing fast.
+    if let Err(error) = connection_pool.clear_failures(node_id).await {
+        debug!(node_id = %node_id, %error, "Connection pool stopped during signed address installation");
+    }
     if let Err(err) = dht.add_peer(node_id) {
         debug!(
             node_id = %node_id,
@@ -2069,6 +2113,7 @@ async fn peer_connectivity_status(
 async fn run_peer_connectivity_manager(
     dht: Arc<DhtHandle>,
     address_lookup: MemoryLookup,
+    connection_pool: ConnectionPool,
     discovery_method: DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
@@ -2093,6 +2138,7 @@ async fn run_peer_connectivity_manager(
                     _ = run_peer_connectivity_attempt(
                         &dht,
                         &address_lookup,
+                        &connection_pool,
                         &discovery_method,
                         realm_id,
                         &authorized_nodes,
@@ -2161,6 +2207,7 @@ async fn apply_peer_connectivity_event(
 async fn run_peer_connectivity_attempt(
     dht: &DhtHandle,
     address_lookup: &MemoryLookup,
+    connection_pool: &ConnectionPool,
     discovery_method: &DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: &[NodeId],
@@ -2183,14 +2230,7 @@ async fn run_peer_connectivity_attempt(
         .await
         {
             Ok(Some(endpoint_addr)) => {
-                address_lookup.set_endpoint_info(endpoint_addr.clone());
-                if let Err(err) = dht.add_peer(endpoint_addr.id) {
-                    debug!(
-                        node_id = %endpoint_addr.id,
-                        error = %err,
-                        "Failed to add DHT-signed endpoint peer before retry"
-                    );
-                }
+                install_signed_endpoint(address_lookup, dht, connection_pool, endpoint_addr).await;
                 result = dht.bootstrap_nodes(&[peer]).await;
             }
             Ok(None) => {}

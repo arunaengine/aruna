@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::effects::{DhtEffect, Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, DhtError, StorageError};
 use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::id::DhtKeyId;
@@ -273,13 +273,16 @@ impl Operation for GetBlobHoldersOperation {
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: self.key,
             realm_filter: Some(self.realm_id),
+            // Holder discovery must see every publisher, so it stays exhaustive
+            // under the default read budget.
+            options: DhtGetOptions::default(),
         }))]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             GetState::Read => match event {
-                Event::Net(NetEvent::Dht(DhtEvent::GetResult { key, values }))
+                Event::Net(NetEvent::Dht(DhtEvent::GetResult { key, values, .. }))
                     if key == self.key =>
                 {
                     self.finish(values)
@@ -443,6 +446,7 @@ mod tests {
         operation.start();
         operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_bytes([4; 32]),
+            stale: false,
             values: vec![
                 entry(node(3), realm_id),
                 entry(node(1), realm_id),
@@ -462,6 +466,7 @@ mod tests {
         operation.start();
         operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_bytes([4; 32]),
+            stale: false,
             values: vec![
                 entry(self_node, realm_id),
                 entry(other, realm_id),

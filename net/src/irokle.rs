@@ -10907,6 +10907,13 @@ mod tests {
         let realm_id = RealmId::from_bytes([64; 32]);
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let assert_stable = |before: &[u8], after: &[u8]| {
+            let mut before = RealmConfigDocument::from_bytes(before).expect("decode prior config");
+            let after = RealmConfigDocument::from_bytes(after).expect("decode current config");
+            assert!(after.revocation_floor >= before.revocation_floor);
+            before.revocation_floor = after.revocation_floor;
+            assert_eq!(before, after);
+        };
         let actor_a = test_actor(
             18,
             UserId::local(Ulid::from_parts(1_690, 1), realm_id),
@@ -10959,16 +10966,14 @@ mod tests {
         apply_admin_document_operation_to_storage(&storage, document_target.clone(), first)
             .await
             .expect("duplicate revocation applies");
-        assert_eq!(
-            before,
-            read_storage_value(
-                &storage,
-                document_target.storage_keyspace(),
-                document_target.storage_key(),
-            )
-            .await
-            .expect("config exists after duplicate revocation")
-        );
+        let duplicate = read_storage_value(
+            &storage,
+            document_target.storage_keyspace(),
+            document_target.storage_key(),
+        )
+        .await
+        .expect("config exists after duplicate revocation");
+        assert_stable(&before, &duplicate);
 
         let second = test_admin_event(
             Ulid::from_parts(1_691, 1),
@@ -10988,7 +10993,7 @@ mod tests {
         let after = read_storage_value(&storage, document_target.storage_keyspace(), config_key)
             .await
             .expect("config remains after redundant revocation");
-        assert_eq!(before, after);
+        assert_stable(&before, &after);
         let state = read_admin_reducer_state(&storage, &target)
             .await
             .expect("reducer state reads")

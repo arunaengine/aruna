@@ -1,8 +1,11 @@
 #![allow(clippy::result_large_err)]
+// The tracked recovery child overflows the default query depth in a fresh build.
+#![recursion_limit = "256"]
 
 use aruna::bootstrap::{
-    announce_core_documents, ensure_initial_local_onboarding_secret,
-    fetch_core_onboarding_documents, realm_bootstrap_exists, wait_for_onboarding_placement,
+    ensure_initial_local_onboarding_secret, fetch_core_onboarding_documents,
+    prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
+    wait_for_onboarding_placement,
 };
 use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::portal;
@@ -17,6 +20,7 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::OnboardingPhase;
@@ -24,9 +28,6 @@ use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::NodeCapabilities;
 use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
@@ -36,12 +37,145 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 use aruna_operations::replication::migration::migrate_legacy_sync;
-use aruna_operations::startup::restore_shard_subscriptions;
-use aruna_operations::task_incoming::initialize_task_holder;
+#[cfg(debug_assertions)]
+use aruna_operations::startup::RecoveryState;
+use aruna_operations::startup::{
+    RecoveryConfig, RecoveryStatus, prepare_shard_policy, run_recovery,
+};
+use aruna_operations::task_incoming::{TaskQueues, initialize_task_holder};
 use aruna_tasks::TaskHandle;
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+#[cfg(debug_assertions)]
+struct CoreBarrier {
+    path: PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for CoreBarrier {
+    fn drop(&mut self) {
+        info!(
+            event = "test.core_publication.joined",
+            "Core publication joined"
+        );
+        if let Err(error) = std::fs::write(&self.path, b"joined") {
+            warn!(error = %error, "Failed to record core publication join");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn core_barrier() {
+    let Ok(path) = std::env::var("ARUNA_TEST_CORE_PUBLICATION_BARRIER") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Err(error) = std::fs::write(&path, b"active") {
+        warn!(error = %error, "Failed to arm core publication test barrier");
+        return;
+    }
+    let _barrier = CoreBarrier { path };
+    std::future::pending::<()>().await;
+}
+
+async fn publish_core(
+    core_ctx: Arc<DriverContext>,
+    node_id: iroh::PublicKey,
+    realm_id: aruna_core::structs::RealmId,
+    allow_genesis: bool,
+    documents: Vec<DocumentSyncTarget>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        core_barrier().await;
+    }
+    publish_core_documents(
+        core_ctx.as_ref(),
+        node_id,
+        realm_id,
+        allow_genesis,
+        documents,
+    )
+    .await
+}
+
+#[cfg(debug_assertions)]
+struct RecoveryBarrier {
+    path: PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for RecoveryBarrier {
+    fn drop(&mut self) {
+        info!(event = "test.recovery.joined", "Recovery child joined");
+        if let Err(error) = std::fs::write(&self.path, b"joined") {
+            warn!(error = %error, "Failed to record recovery join");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn watch_recovery(
+    barrier: &RecoveryBarrier,
+    status: RecoveryStatus,
+    cancelled: CancellationToken,
+) {
+    loop {
+        if cancelled.is_cancelled() {
+            return;
+        }
+        match status.snapshot().state {
+            RecoveryState::Degraded => {
+                if let Err(error) = std::fs::write(&barrier.path, b"active") {
+                    warn!(error = %error, "Failed to record recovery activity");
+                }
+                cancelled.cancelled().await;
+                return;
+            }
+            RecoveryState::Converged => return,
+            RecoveryState::Pending | RecoveryState::Running => {}
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn recover_child(
+    context: Arc<DriverContext>,
+    config: RecoveryConfig,
+    status: RecoveryStatus,
+    cancelled: CancellationToken,
+) {
+    let Ok(path) = std::env::var("ARUNA_TEST_RECOVERY_BARRIER") else {
+        run_recovery(context, config, status, cancelled).await;
+        return;
+    };
+    let barrier = RecoveryBarrier {
+        path: PathBuf::from(path),
+    };
+    tokio::join!(
+        run_recovery(context, config, status.clone(), cancelled.clone()),
+        watch_recovery(&barrier, status, cancelled),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+async fn recover_child(
+    context: Arc<DriverContext>,
+    config: RecoveryConfig,
+    status: RecoveryStatus,
+    cancelled: CancellationToken,
+) {
+    run_recovery(context, config, status, cancelled).await;
+}
 
 fn main() {
     // Both ring and aws-lc-rs are in the graph; rustls needs one picked before any TLS init.
@@ -68,7 +202,23 @@ async fn async_main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+struct Runtime {
+    config: Config,
+    driver_ctx: Arc<DriverContext>,
+    net_handle: NetHandle,
+    s3_mounts_available: bool,
+    shutdown: Shutdown,
+    metrics: Arc<NodeMetrics>,
+    readiness: Readiness,
+    recovery: RecoveryStatus,
+    jobs_runtime: Arc<JobsRuntime>,
+    task_handle: TaskHandle,
+    task_queues: TaskQueues,
+    usage_counters_rebuilt: bool,
+    ops_handle: tokio::task::JoinHandle<()>,
+}
+
+async fn setup_runtime() -> Result<Runtime, Box<dyn std::error::Error>> {
     let (config, storage_handle) = load().await?;
     let net_handle = NetHandle::new(
         NetConfig {
@@ -129,27 +279,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // here so an ordered shutdown can drain them before storage is sealed.
     let shutdown = Shutdown::new();
 
-    // Start the ops listener before realm bootstrap so `/readyz` reports 503
-    // (startup) and `/metrics` is scrapable while the node is still coming up.
-    // Its handle survives the drain and is aborted only after final storage sync.
+    // Start ops before realm bootstrap so readiness reports startup failure.
     let metrics = Arc::new(NodeMetrics::new());
     let readiness = Readiness::new();
-    let ops_handle = {
-        let ops_state = OpsState::new(driver_ctx.clone(), metrics.clone(), readiness.clone()).await;
-        let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
-        let bound = ops_listener.local_addr()?;
-        let handle = tokio::spawn(async move {
-            if let Err(error) = serve_ops(ops_listener, ops_state).await {
-                error!(error = %error, "Ops server stopped");
-            }
-        });
-        info!(ops_address = %bound, "Ops server listening");
-        handle
-    };
+    let recovery = RecoveryStatus::new();
+    let ops_state = OpsState::with_recovery(
+        driver_ctx.clone(),
+        metrics.clone(),
+        readiness.clone(),
+        recovery.clone(),
+    )
+    .await;
+    let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
+    let bound = ops_listener.local_addr()?;
+    let ops_handle = tokio::spawn(async move {
+        if let Err(error) = serve_ops(ops_listener, ops_state).await {
+            error!(error = %error, "Ops server stopped");
+        }
+    });
+    info!(ops_address = %bound, "Ops server listening");
 
-    ensure_usage_counters(driver_ctx.as_ref()).await?;
+    // A rebuild is the only local evidence that counters were not carried over.
+    let usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
 
-    // Task initialization binds the compute reconciler before startup recovery.
+    // Bind compute reconciliation before startup recovery.
     let jobs_runtime = JobsRuntime::new_paused();
     initialize_net_holder(
         driver_ctx.clone(),
@@ -157,29 +310,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         jobs_runtime.clone(),
         &shutdown,
     );
-    initialize_task_holder(
+    let task_queues = initialize_task_holder(
         driver_ctx.clone(),
         task_handle.clone(),
         jobs_runtime.clone(),
         config.rocrate_limits.clone(),
-        &shutdown,
     )
     .await;
 
-    // Republish a full set of node usage snapshots at startup so realm peers see
-    // this node's totals again after a restart, dirty-marker loss, or a counter
-    // rebuild. Best-effort: failures are retried by the debounced publisher.
-    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        true,
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to publish initial node usage snapshots");
-    }
+    Ok(Runtime {
+        config,
+        driver_ctx,
+        net_handle,
+        s3_mounts_available,
+        shutdown,
+        metrics,
+        readiness,
+        recovery,
+        jobs_runtime,
+        task_handle,
+        task_queues,
+        usage_counters_rebuilt,
+        ops_handle,
+    })
+}
 
+struct CoreAnnouncement {
+    documents: Vec<DocumentSyncTarget>,
+    allow_genesis: bool,
+}
+
+async fn prepare_startup(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
     let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
@@ -187,138 +352,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Replayed metadata event log during startup"
         );
     }
-    spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
-    match &config.startup_mode {
-        StartupMode::InitializeRealm { realm_description } => {
-            if !realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
-                drive(
-                    CreateRealmOperation::new(CreateRealmConfig {
-                        actor: Actor {
-                            node_id: config.node_id,
-                            user_id: UserId::nil(config.realm_id),
-                            realm_id: config.realm_id,
-                        },
-                        realm_description: realm_description.clone(),
-                        oidc_providers: config.oidc_providers.clone(),
-                        node_location: config.node_location.clone(),
-                        node_weight: config.node_weight,
-                        node_labels: config.node_labels.clone(),
-                    }),
-                    driver_ctx.as_ref(),
-                )
-                .await?;
-            }
-            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
-            // CreateRealm mints the realm-auth/realm-config genesis via its admin
-            // operation outbox records, but not the shared realm topics. Seed
-            // NodeInfo first so its stored document is included in bootstrap.
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, true)
-                .await?;
-
-            if config.is_initial_node() {
-                match ensure_initial_local_onboarding_secret(
-                    driver_ctx.as_ref(),
-                    format!("http://{}", config.http_socket_addr),
-                    &config.node_state.net_secret_key,
-                    config.realm_id,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        info!("Created initial local onboarding secret for first user registration")
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "failed to create initial local onboarding secret: {error}"
-                        )
-                        .into());
-                    }
-                }
-            }
-
-            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
-        }
-        StartupMode::JoinRealm { phase } => {
-            let bootstrap_peer = config
-                .peer_endpoints
-                .first()
-                .map(|endpoint| endpoint.id)
-                .or_else(|| config.peer_nodes.first().copied());
-            if matches!(phase, OnboardingPhase::Bootstrapped) {
-                fetch_core_onboarding_documents(
-                    driver_ctx.as_ref(),
-                    &config.node_state,
-                    &config.realm_id,
-                    bootstrap_peer,
-                )
-                .await?;
-            }
-            wait_for_onboarding_placement(
-                driver_ctx.as_ref(),
-                config.realm_id,
-                config.node_id,
-                bootstrap_peer,
-            )
-            .await?;
-            if matches!(phase, OnboardingPhase::Bootstrapped) {
-                mark_onboarding_phase(
-                    &driver_ctx.storage_handle,
-                    &config.node_state,
-                    OnboardingPhase::CoreDocumentsFetched,
-                )
-                .await?;
-                if let Err(error) = net_handle.reload_realm_peers().await {
-                    warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
-                }
-            }
-            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
-            // A joining node is never the realm-bootstrap node: it announces the
-            // shared topics with allow_genesis=false after onboarding fetched a
-            // representative target for each.
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
-                .await?;
-            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
-        }
-        StartupMode::Provisioned => {
-            if matches!(
-                &config.node_capabilities,
-                NodeCapabilities::Management { .. }
-            ) {
-                drive(
-                    EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
-                        actor: Actor {
-                            node_id: config.node_id,
-                            user_id: UserId::nil(config.realm_id),
-                            realm_id: config.realm_id,
-                        },
-                        target_node_id: config.node_id,
-                        target_node_kind: RealmNodeKind::Management,
-                        default_metadata_replication_factor: config
-                            .default_metadata_replication_factor,
-                        realm_description: config.realm_description.clone(),
-                        create_if_missing: true,
-                        reject_kind_mismatch: false,
-                    }),
-                    driver_ctx.as_ref(),
-                )
-                .await?;
-            }
-
-            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
-            // The realm-bootstrap node retains genesis authority so a missing
-            // shared topic can be repaired after a partial first boot. Onboarded
-            // nodes still wait for that authoritative genesis.
-            announce_core_documents(
-                driver_ctx.as_ref(),
-                config.node_id,
-                &config.realm_id,
-                config.is_initial_node(),
-            )
-            .await?;
-        }
-    }
-
+    let announcement = prepare_mode(config, driver_ctx, net_handle).await?;
     match migrate_legacy_sync(driver_ctx.as_ref(), config.node_id, config.realm_id).await {
         Ok(summary) if summary.failed > 0 => warn!(
             migrated = summary.migrated,
@@ -335,50 +370,198 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => warn!(%error, "Failed to migrate legacy S3 replication configs"),
     }
 
-    // Republish a full set of node usage snapshots after startup-mode core
-    // document announcement has had a chance to queue the shared node-usage topic
-    // genesis. Best-effort: failures are retried by the debounced publisher.
-    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
+    // Prepare local topics before binding; remote convergence stays behind the gate.
+    prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    Ok(announcement)
+}
+
+async fn prepare_mode(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    match &config.startup_mode {
+        StartupMode::InitializeRealm { realm_description } => {
+            init_realm(config, driver_ctx, realm_description).await
+        }
+        StartupMode::JoinRealm { phase } => join_realm(config, driver_ctx, net_handle, phase).await,
+        StartupMode::Provisioned => provision_realm(config, driver_ctx).await,
+    }
+}
+
+async fn init_realm(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    realm_description: &str,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    if !realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id: config.node_id,
+                    user_id: UserId::nil(config.realm_id),
+                    realm_id: config.realm_id,
+                },
+                realm_description: realm_description.to_string(),
+                oidc_providers: config.oidc_providers.clone(),
+                node_location: config.node_location.clone(),
+                node_weight: config.node_weight,
+                node_labels: config.node_labels.clone(),
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await?;
+    }
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    let documents = prepare_core_documents(
         driver_ctx.as_ref(),
         config.node_id,
         config.realm_id,
         true,
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to publish initial node usage snapshots");
-    }
-
-    // All startup modes: join the held shard topics (a freshly onboarded node
-    // pulls existing shard data from its co-holders here), then create the
-    // geneses of the shards this node is rank-0 holder of.
-    let restore_summary =
-        restore_shard_subscriptions(&driver_ctx, config.node_id, config.realm_id).await;
-    tracing::info!(
-        held_shards = restore_summary.held_shards,
-        shard_topics = restore_summary.shard_topics,
-        shared_topics = restore_summary.shared_topics,
-        "Restored held shard subscriptions",
-    );
-    aruna_operations::process_placements::process_shard_placements(
-        &driver_ctx,
-        config.realm_id,
-        config.node_id,
-    )
-    .await;
-
-    drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: config.realm_id,
-            node_id: config.node_id,
-            schedule_refresh: true,
-        }),
-        driver_ctx.as_ref(),
+        true,
     )
     .await?;
 
-    // REST Server
+    if config.is_initial_node() {
+        match ensure_initial_local_onboarding_secret(
+            driver_ctx.as_ref(),
+            format!("http://{}", config.http_socket_addr),
+            &config.node_state.net_secret_key,
+            config.realm_id,
+        )
+        .await
+        {
+            Ok(_) => info!("Created initial local onboarding secret for first user registration"),
+            Err(error) => {
+                return Err(
+                    format!("failed to create initial local onboarding secret: {error}").into(),
+                );
+            }
+        }
+    }
+
+    mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+    Ok(CoreAnnouncement {
+        documents,
+        allow_genesis: true,
+    })
+}
+
+async fn join_realm(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+    phase: &OnboardingPhase,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    let bootstrap_peer = config
+        .peer_endpoints
+        .first()
+        .map(|endpoint| endpoint.id)
+        .or_else(|| config.peer_nodes.first().copied());
+    if matches!(phase, OnboardingPhase::Bootstrapped) {
+        fetch_core_onboarding_documents(
+            driver_ctx.as_ref(),
+            &config.node_state,
+            &config.realm_id,
+            bootstrap_peer,
+        )
+        .await?;
+    }
+    wait_for_onboarding_placement(
+        driver_ctx.as_ref(),
+        config.realm_id,
+        config.node_id,
+        bootstrap_peer,
+    )
+    .await?;
+    if matches!(phase, OnboardingPhase::Bootstrapped) {
+        mark_onboarding_phase(
+            &driver_ctx.storage_handle,
+            &config.node_state,
+            OnboardingPhase::CoreDocumentsFetched,
+        )
+        .await?;
+        if let Err(error) = net_handle.reload_realm_peers().await {
+            warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
+        }
+    }
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    let documents = prepare_core_documents(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        false,
+        true,
+    )
+    .await?;
+    mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+    Ok(CoreAnnouncement {
+        documents,
+        allow_genesis: false,
+    })
+}
+
+async fn provision_realm(
+    config: &Config,
+    driver_ctx: &Arc<DriverContext>,
+) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    if matches!(
+        &config.node_capabilities,
+        NodeCapabilities::Management { .. }
+    ) {
+        drive(
+            EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+                actor: Actor {
+                    node_id: config.node_id,
+                    user_id: UserId::nil(config.realm_id),
+                    realm_id: config.realm_id,
+                },
+                target_node_id: config.node_id,
+                target_node_kind: RealmNodeKind::Management,
+                default_metadata_replication_factor: config.default_metadata_replication_factor,
+                realm_description: config.realm_description.clone(),
+                create_if_missing: true,
+                reject_kind_mismatch: false,
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await?;
+    }
+
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    let allow_genesis = config.is_initial_node();
+    let documents = prepare_core_documents(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        allow_genesis,
+        false,
+    )
+    .await?;
+    Ok(CoreAnnouncement {
+        documents,
+        allow_genesis,
+    })
+}
+
+struct ServerBindings {
+    rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
+    s3_handle: tokio::task::JoinHandle<()>,
+    realm_id: aruna_core::structs::RealmId,
+    node_id: iroh::PublicKey,
+    is_initial_boot: bool,
+}
+
+async fn bind_servers(
+    config: Config,
+    driver_ctx: Arc<DriverContext>,
+    jobs_runtime: Arc<JobsRuntime>,
+    metrics: Arc<NodeMetrics>,
+    s3_mounts_available: bool,
+    shutdown: &Shutdown,
+) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
+    let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
@@ -387,7 +570,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.node_capabilities,
             is_initial_node,
             Some(Arc::new(OidcValidator::new()?)),
-            jobs_runtime.clone(),
+            jobs_runtime,
         )
         .await
         .with_metrics(metrics.clone())
@@ -414,17 +597,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server::new(state.clone(), server_config)
         .with_api_public_url(config.api_public_url.clone());
 
-    // S3 Server
     let s3_server = S3Server::new(
         &config.s3_address,
         &config.s3_host,
-        driver_ctx.clone(),
+        driver_ctx,
         config.realm_id,
         config.node_id,
         aruna_core::credential_seal::CredentialSealKey::derive(&config.node_state.net_secret_key),
         config.rocrate_limits.clone(),
         cors,
-        metrics.clone(),
+        metrics,
     )
     .await
     .unwrap()
@@ -449,9 +631,80 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.s3_public_url.as_deref().unwrap_or(&config.s3_host),
         )
         .await;
-    let (_s3_addr, server_handle) = s3_server
+    let (_s3_addr, s3_handle) = s3_server
         .run_with_listener(s3_listener, shutdown.token())
         .unwrap();
+
+    let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+    let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
+
+    Ok(ServerBindings {
+        rest_handle,
+        s3_handle,
+        realm_id: config.realm_id,
+        node_id: config.node_id,
+        is_initial_boot,
+    })
+}
+
+struct Background {
+    realm_id: aruna_core::structs::RealmId,
+    node_id: iroh::PublicKey,
+    is_initial_boot: bool,
+    driver_ctx: Arc<DriverContext>,
+    shutdown: Shutdown,
+    readiness: Readiness,
+    recovery: RecoveryStatus,
+    jobs_runtime: Arc<JobsRuntime>,
+    task_handle: TaskHandle,
+    task_queues: TaskQueues,
+    usage_counters_rebuilt: bool,
+    core_announcement: CoreAnnouncement,
+}
+
+async fn start_background(background: Background) {
+    let Background {
+        realm_id,
+        node_id,
+        is_initial_boot,
+        driver_ctx,
+        shutdown,
+        readiness,
+        recovery,
+        jobs_runtime,
+        task_handle,
+        task_queues,
+        usage_counters_rebuilt,
+        core_announcement,
+    } = background;
+    // Both listeners are bound and the local safety gate is satisfied.
+    readiness.set_ready();
+
+    let core_ctx = driver_ctx.clone();
+    let core_cancelled = shutdown.token();
+    let CoreAnnouncement {
+        documents: core_documents,
+        allow_genesis: allow_core_genesis,
+    } = core_announcement;
+    let core_publish = publish_core(
+        core_ctx,
+        node_id,
+        realm_id,
+        allow_core_genesis,
+        core_documents,
+    );
+    shutdown.spawn(async move {
+        tokio::select! {
+            result = core_publish => {
+                if let Err(error) = result {
+                    warn!(error = ?error, "Failed to queue core document replication");
+                }
+            }
+            _ = core_cancelled.cancelled() => {}
+        }
+    });
+
+    // Durable background queues run after admission opens.
     if let Err(error) = jobs_runtime
         .recover_stale_jobs(&driver_ctx.storage_handle)
         .await
@@ -459,18 +712,82 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %error, "Failed to recover stale jobs at startup");
     }
     jobs_runtime.start();
+    task_queues.start(&shutdown).await;
     restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
+    spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
-    let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
-    let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
+    let recovery_ctx = driver_ctx.clone();
+    let recovery_config = RecoveryConfig {
+        realm_id,
+        node_id,
+        // An unchanged restart republishes nothing: accepted outbox work and
+        // document sync history already carry convergence.
+        publish_full_usage: usage_counters_rebuilt || is_initial_boot,
+    };
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
+        recover_child(recovery_ctx, recovery_config, recovery, cancelled).await;
+    });
+}
 
-    // Both request listeners are bound and bootstrap has completed: the node is
-    // ready to serve, so `/readyz` may now return 200.
-    readiness.set_ready();
-
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before any startup work: readiness opens and background children start
+    // long before this point, and an uninstalled handler would let the signal
+    // kill the node instead of draining it.
     let mut signal = tokio::spawn(wait_for_signal());
+
+    let Runtime {
+        config,
+        driver_ctx,
+        net_handle,
+        s3_mounts_available,
+        shutdown,
+        metrics,
+        readiness,
+        recovery,
+        jobs_runtime,
+        task_handle,
+        task_queues,
+        usage_counters_rebuilt,
+        ops_handle,
+    } = setup_runtime().await?;
+
+    let core_announcement = prepare_startup(&config, &driver_ctx, &net_handle).await?;
+
+    let ServerBindings {
+        rest_handle,
+        s3_handle,
+        realm_id,
+        node_id,
+        is_initial_boot,
+    } = bind_servers(
+        config,
+        driver_ctx.clone(),
+        jobs_runtime.clone(),
+        metrics.clone(),
+        s3_mounts_available,
+        &shutdown,
+    )
+    .await?;
+
+    start_background(Background {
+        realm_id,
+        node_id,
+        is_initial_boot,
+        driver_ctx: driver_ctx.clone(),
+        shutdown: shutdown.clone(),
+        readiness: readiness.clone(),
+        recovery: recovery.clone(),
+        jobs_runtime: jobs_runtime.clone(),
+        task_handle: task_handle.clone(),
+        task_queues,
+        usage_counters_rebuilt,
+        core_announcement,
+    })
+    .await;
+
     let mut rest_handle = Some(rest_handle);
-    let mut s3_handle = Some(server_handle);
+    let mut s3_handle = Some(s3_handle);
 
     // A server that returns before shutdown was requested has failed: the node
     // is no longer serving, so it must not exit as success.
@@ -828,10 +1145,11 @@ fn container_local_endpoint(endpoint: &str) -> bool {
             .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
 }
 
-/// Ensures the maintained usage counter shards exist before background writes start.
+/// Ensures the maintained usage counter shards exist before background writes
+/// start, and reports whether that required a rebuild.
 async fn ensure_usage_counters(
     driver_ctx: &DriverContext,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
@@ -862,6 +1180,7 @@ async fn ensure_usage_counters(
             }
             if values.iter().any(|(_, value)| value.is_none()) {
                 drive(RebuildUsageStatsOperation::new(), driver_ctx).await?;
+                return Ok(true);
             }
         }
         Event::Storage(StorageEvent::Error { error }) => {
@@ -871,7 +1190,7 @@ async fn ensure_usage_counters(
             return Err(format!("usage counter probe received unexpected event: {other:?}").into());
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -933,7 +1252,14 @@ mod tests {
         .expect("storage opens");
         let driver_ctx = test_driver_ctx(storage_handle.clone());
 
-        ensure_usage_counters(&driver_ctx).await.unwrap();
+        assert!(
+            ensure_usage_counters(&driver_ctx).await.unwrap(),
+            "missing shards must report a rebuild"
+        );
+        assert!(
+            !ensure_usage_counters(&driver_ctx).await.unwrap(),
+            "intact shards must report no rebuild"
+        );
 
         for key in usage_global_shard_keys() {
             let event = storage_handle

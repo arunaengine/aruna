@@ -2,10 +2,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-DEPLOY_ROOT="$ROOT_DIR/target/test-deploy"
-ARUNA_BIN="$ROOT_DIR/target/release/aruna"
-ARUNA_DOCTOR_BIN="$ROOT_DIR/target/release/aruna-doctor"
+DEPLOY_ROOT="${ARUNA_TEST_DEPLOY_ROOT:-$ROOT_DIR/target/test-deploy}"
+ARUNA_BIN="${ARUNA_TEST_DEPLOY_ARUNA_BIN:-$ROOT_DIR/target/release/aruna}"
+ARUNA_DOCTOR_BIN="${ARUNA_TEST_DEPLOY_DOCTOR_BIN:-$ROOT_DIR/target/release/aruna-doctor}"
 READY_TIMEOUT_SECS="${ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS:-90}"
+# Strictly above the ops listener's five-second whole-request deadline, so a
+# slow readiness probe answers instead of being cut off by the client.
+READY_ATTEMPT_TIMEOUT_SECS="${ARUNA_TEST_DEPLOY_READY_ATTEMPT_TIMEOUT_SECS:-6}"
+SKIP_BUILD="${ARUNA_TEST_DEPLOY_SKIP_BUILD:-0}"
+LOG_TAIL_LINES=50
 EXIT_AFTER_READY="${ARUNA_TEST_DEPLOY_EXIT_AFTER_READY:-0}"
 BASE_PORT="${ARUNA_TEST_DEPLOY_BASE_PORT:-43000}"
 NODE_COUNT="${ARUNA_TEST_DEPLOY_NODE_COUNT:-3}"
@@ -36,6 +41,8 @@ NODE_P2P_PORTS=()
 NODE_S3_PORTS=()
 NODE_OPS_PORTS=()
 STARTED_PID=""
+LAST_READY_CODE=""
+LAST_READY_BODY=""
 
 log() {
   printf '==> %s\n' "$*"
@@ -49,23 +56,38 @@ die() {
 usage() {
   cat <<'EOF'
 Usage: bash scripts/local_cluster_deploy.sh [--with-keycloak] [--node-count N] [--portal-dir P]
-                                           [--auto-portal-dir]
+                                           [--auto-portal-dir] [--help]
 
 Behavior:
   default          Build the workspace in release mode and launch 3 local Aruna nodes.
   --with-keycloak  Start a local Keycloak instance and configure every node for OIDC.
-  --node-count N   Launch N total Aruna nodes. Defaults to 3.
+  --node-count N   Launch N total Aruna nodes. Defaults to 3. Also --node-count=N.
   --portal-dir P   Serve the portal dist at P from every node's REST port and
-                   allow the node origins via CORS on REST and S3.
+                   allow the node origins via CORS on REST and S3. Also --portal-dir=P.
   --auto-portal-dir
                    If no portal dir is set, download the latest portal prerelease
                    from arunaengine/website into the deployment temp directory.
+                   An explicit --portal-dir always wins over the download.
+  --help, -h       Print this help and exit.
+
+  Values may arrive in the Just parameter form, so --node-count nodes=2 and
+  --portal-dir portal_dir=P are accepted, and --portal-dir nodes=2 sets the
+  node count that `just preview nodes=2` intends.
+
+Readiness:
+  Every node is awaited on /readyz on its generated ops port. A 503 keeps
+  waiting, and the last body is reported if the deadline expires.
 
 Environment overrides:
   ARUNA_TEST_DEPLOY_BASE_PORT
   ARUNA_TEST_DEPLOY_EXIT_AFTER_READY
   ARUNA_TEST_DEPLOY_NODE_COUNT
   ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS
+  ARUNA_TEST_DEPLOY_READY_ATTEMPT_TIMEOUT_SECS
+  ARUNA_TEST_DEPLOY_ROOT               deployment directory, target/test-deploy by default
+  ARUNA_TEST_DEPLOY_SKIP_BUILD         1 reuses already built release binaries
+  ARUNA_TEST_DEPLOY_ARUNA_BIN
+  ARUNA_TEST_DEPLOY_DOCTOR_BIN
   ARUNA_TEST_DEPLOY_KEYCLOAK_PORT
   ARUNA_TEST_DEPLOY_KEYCLOAK_PROJECT
   ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_USER
@@ -92,6 +114,84 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+require_positive_int() {
+  local name=$1
+  local value=$2
+
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer, got: $value"
+}
+
+# Single-quote a generated .env value so paths with spaces stay one value;
+# dotenvy treats single-quoted values literally.
+env_quote() {
+  local value=$1
+
+  [[ "$value" != *"'"* ]] || die "env value must not contain a single quote: $value"
+  printf "'%s'" "$value"
+}
+
+# Just forwards `nodes=2` and `portal_dir=P` verbatim as positional values, so
+# unpack them instead of failing or silently keeping the default.
+strip_named_value() {
+  local key=$1
+  local value=$2
+
+  printf '%s\n' "${value#"$key"=}"
+}
+
+apply_portal_value() {
+  local value=$1
+
+  case "$value" in
+    nodes=*) NODE_COUNT="${value#nodes=}" ;;
+    *) PORTAL_DIR="$(strip_named_value portal_dir "$value")" ;;
+  esac
+}
+
+require_flag() {
+  local name=$1
+  local value=$2
+
+  [[ "$value" == "0" || "$value" == "1" ]] || die "$name must be 0 or 1, got: $value"
+}
+
+# Refuses to clear the filesystem root, the home directory, the repository, or
+# any directory containing the repository.
+assert_removable() {
+  local dir=$1
+  local base
+  local parent
+  local resolved
+
+  parent="$(cd -- "$(dirname -- "$dir")" 2>/dev/null && pwd -P)" \
+    || die "deployment root parent does not exist: $(dirname -- "$dir")"
+  base="$(basename -- "$dir")"
+  if [[ "$base" == "/" ]]; then
+    resolved="/"
+  else
+    resolved="${parent%/}/$base"
+  fi
+  case "$resolved" in
+    / | "${HOME:-}" | "$ROOT_DIR")
+      die "refusing to remove $resolved; point ARUNA_TEST_DEPLOY_ROOT at a dedicated directory"
+      ;;
+  esac
+  [[ "$resolved" == /*/* ]] || die "refusing to remove the top-level directory $resolved"
+  case "$ROOT_DIR/" in
+    "$resolved"/*)
+      die "refusing to remove $resolved because it contains the repository root"
+      ;;
+  esac
+}
+
+log_tail() {
+  local log_file=$1
+
+  [[ -f "$log_file" ]] || return 0
+  printf 'last %s log lines from %s:\n' "$LOG_TAIL_LINES" "$log_file" >&2
+  tail -n "$LOG_TAIL_LINES" "$log_file" >&2 || true
+}
+
 cleanup() {
   local status=$?
 
@@ -114,6 +214,8 @@ cleanup() {
   if [[ $status -ne 0 && $status -ne 130 ]]; then
     printf 'Deployment failed. Inspect logs in %s\n' "$DEPLOY_ROOT" >&2
   fi
+
+  exit "$status"
 }
 
 handle_signal() {
@@ -163,8 +265,8 @@ write_node_env() {
 
   mkdir -p "$node_dir/storage" "$node_dir/blob"
   {
-    printf 'STORAGE_PATH=%s\n' "$node_dir/storage"
-    printf 'BLOB_ROOT=%s\n' "$node_dir/blob"
+    printf 'STORAGE_PATH=%s\n' "$(env_quote "$node_dir/storage")"
+    printf 'BLOB_ROOT=%s\n' "$(env_quote "$node_dir/blob")"
     printf 'BLOB_MULTIPART_BUCKET=%s\n' "parts"
     printf 'BLOB_MAX_BUCKET_SIZE=10000\n'
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"
@@ -188,7 +290,7 @@ write_node_env() {
         case "$compute_var" in
           ARUNA_COMPUTE_EXECUTOR | ARUNA_COMPUTE_OPTIONAL | ARUNA_COMPUTE_S3_URL) continue ;;
         esac
-        printf '%s=%s\n' "$compute_var" "${!compute_var}"
+        printf '%s=%s\n' "$compute_var" "$(env_quote "${!compute_var}")"
       done
     else
       printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
@@ -197,7 +299,7 @@ write_node_env() {
     printf 'METADATA_REPLICATION_FACTOR=3\n'
     if [[ -n "$PORTAL_DIR" ]]; then
       printf 'PORTAL_MODE=artifact\n'
-      printf 'PORTAL_DIR=%s\n' "$PORTAL_DIR"
+      printf 'PORTAL_DIR=%s\n' "$(env_quote "$PORTAL_DIR")"
       printf 'CORS_ALLOWED_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
       printf 'PORTAL_CSP_EXTRA_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
     fi
@@ -243,77 +345,100 @@ generate_test_token() {
   printf '%s\n' "$token"
 }
 
-extract_onboarding_secret_from_log() {
-  local log_file=$1
-  local line
-  local secret=""
+# The node never reveals its initial secret, so mint a fresh one against the
+# stopped node's storage. The caller owns the single-writer lock.
+mint_onboarding_secret() {
+  local node_dir=$1
+  local raw_output
 
-  [[ -f "$log_file" ]] || return 0
+  raw_output="$(
+    cd "$node_dir" || exit 1
+    env -i PATH="$PATH" "$ARUNA_DOCTOR_BIN" recover-admin
+  )" || die "aruna-doctor recover-admin failed in $node_dir"
 
-  while IFS= read -r line; do
-    case "$line" in
-      *onboarding_secret=*)
-        secret="${line#*onboarding_secret=}"
-        secret="${secret%%[[:space:]]*}"
-        ;;
-    esac
-  done <"$log_file"
+  raw_output="${raw_output%$'\n'}"
+  local secret="${raw_output##*$'\n'}"
+  [[ -n "$secret" ]] || die "aruna-doctor recover-admin printed no secret"
 
   printf '%s\n' "$secret"
 }
 
-wait_for_initial_onboarding_secret() {
-  local log_file=$1
-  local pid=$2
+probe_readiness() {
+  local url=$1
+  local response
+
+  response="$(
+    curl --silent --max-time "$READY_ATTEMPT_TIMEOUT_SECS" \
+      --write-out $'\n%{http_code}' "$url" 2>/dev/null || true
+  )"
+  LAST_READY_CODE="${response##*$'\n'}"
+  LAST_READY_BODY="${response%$'\n'*}"
+
+  [[ "$LAST_READY_CODE" == "200" ]]
+}
+
+wait_for_ready() {
+  local name=$1
+  local ops_port=$2
+  local pid=$3
+  local log_file="$DEPLOY_ROOT/$name/$name.log"
+  local url="http://127.0.0.1:$ops_port/readyz"
   local deadline=$((SECONDS + READY_TIMEOUT_SECS))
-  local secret
 
-  while true; do
-    secret="$(extract_onboarding_secret_from_log "$log_file")"
-    if [[ -n "$secret" ]]; then
-      printf '%s\n' "$secret"
-      return 0
-    fi
-
+  until probe_readiness "$url"; do
     if ! kill -0 "$pid" >/dev/null 2>&1; then
-      die "node-1 exited before it logged the initial onboarding secret; inspect $log_file"
+      log_tail "$log_file"
+      die "$name exited before it became ready; inspect $log_file"
     fi
     if ((SECONDS >= deadline)); then
-      die "timed out waiting for the initial onboarding secret in $log_file"
+      log_tail "$log_file"
+      die "timed out waiting for $name readiness at $url (last status ${LAST_READY_CODE:-none}: ${LAST_READY_BODY:-no body}); inspect $log_file"
     fi
     sleep 1
   done
 }
 
-wait_for_http() {
+# The portal is a separate contract from node readiness: a healthy ops endpoint
+# must never be reported as a served portal.
+verify_portal_route() {
   local name=$1
   local base_url=$2
-  local pid=$3
-  local deadline=$((SECONDS + READY_TIMEOUT_SECS))
+  local code
 
-  until curl --silent --fail --output /dev/null "$base_url/swagger-ui"
-  do
-    if ! kill -0 "$pid" >/dev/null 2>&1; then
-      die "$name exited before it became ready; inspect $DEPLOY_ROOT/$name/$name.log"
-    fi
-    if ((SECONDS >= deadline)); then
-      die "timed out waiting for $name at $base_url"
-    fi
-    sleep 1
-  done
+  code="$(
+    curl --silent --location --max-time "$READY_ATTEMPT_TIMEOUT_SECS" \
+      --output /dev/null --write-out '%{http_code}' "$base_url/" 2>/dev/null || true
+  )"
+  [[ "$code" == "200" ]] \
+    || die "$name does not serve the portal at $base_url/ (status ${code:-none}); check PORTAL_DIR=$PORTAL_DIR"
 }
 
 wait_for_keycloak() {
   local discovery_url=$1
   local deadline=$((SECONDS + READY_TIMEOUT_SECS))
 
-  until curl --silent --fail --output /dev/null "$discovery_url"
+  until curl --silent --fail --max-time "$READY_ATTEMPT_TIMEOUT_SECS" \
+    --output /dev/null "$discovery_url"
   do
     if ((SECONDS >= deadline)); then
       die "timed out waiting for Keycloak at $discovery_url"
     fi
     sleep 1
   done
+}
+
+# OIDC readiness is proven from the configured issuer, not from node readiness.
+verify_oidc_issuer() {
+  local document
+  local issuer
+
+  document="$(
+    curl --silent --fail --max-time "$READY_ATTEMPT_TIMEOUT_SECS" "$KEYCLOAK_DISCOVERY_URL" 2>/dev/null
+  )" || die "configured OIDC discovery document is not reachable at $KEYCLOAK_DISCOVERY_URL"
+
+  issuer="$(json_string_field "$document" "issuer")"
+  [[ "$issuer" == "$KEYCLOAK_ISSUER" ]] \
+    || die "OIDC discovery reports issuer $issuer but nodes are configured for $KEYCLOAK_ISSUER"
 }
 
 start_keycloak() {
@@ -360,13 +485,12 @@ onboard_server_node() {
   local p2p_port=$4
   local s3_port=$5
   local ops_port=$6
-  local base_url=$7
   local secret
 
   secret="$(create_server_onboarding_secret)"
   write_node_env "$node_dir" "$http_port" "$p2p_port" "$s3_port" "$ops_port" "$secret"
   start_node "$name" "$node_dir"
-  wait_for_http "$name" "$base_url" "$STARTED_PID"
+  wait_for_ready "$name" "$ops_port" "$STARTED_PID"
 }
 
 start_node() {
@@ -493,18 +617,18 @@ while (($# > 0)); do
     --node-count)
       shift
       [[ $# -gt 0 ]] || die "missing value for --node-count"
-      NODE_COUNT=$1
+      NODE_COUNT="$(strip_named_value nodes "$1")"
       ;;
     --node-count=*)
-      NODE_COUNT="${1#*=}"
+      NODE_COUNT="$(strip_named_value nodes "${1#*=}")"
       ;;
     --portal-dir)
       shift
       [[ $# -gt 0 ]] || die "missing value for --portal-dir"
-      PORTAL_DIR=$1
+      apply_portal_value "$1"
       ;;
     --portal-dir=*)
-      PORTAL_DIR="${1#*=}"
+      apply_portal_value "${1#*=}"
       ;;
     --auto-portal-dir)
       AUTO_PORTAL_DIR=1
@@ -521,6 +645,21 @@ while (($# > 0)); do
 done
 
 [[ "$NODE_COUNT" =~ ^[1-9][0-9]*$ ]] || die "--node-count must be a positive integer"
+require_positive_int ARUNA_TEST_DEPLOY_BASE_PORT "$BASE_PORT"
+require_positive_int ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS "$READY_TIMEOUT_SECS"
+require_positive_int ARUNA_TEST_DEPLOY_READY_ATTEMPT_TIMEOUT_SECS "$READY_ATTEMPT_TIMEOUT_SECS"
+((READY_ATTEMPT_TIMEOUT_SECS >= 6)) \
+  || die "ARUNA_TEST_DEPLOY_READY_ATTEMPT_TIMEOUT_SECS must be at least 6, above the ops request deadline"
+require_flag ARUNA_TEST_DEPLOY_EXIT_AFTER_READY "$EXIT_AFTER_READY"
+require_flag ARUNA_TEST_DEPLOY_SKIP_BUILD "$SKIP_BUILD"
+((BASE_PORT >= 1024)) || die "ARUNA_TEST_DEPLOY_BASE_PORT must be at least 1024, got: $BASE_PORT"
+((BASE_PORT + NODE_COUNT * 10 + 1 <= 65535)) \
+  || die "ARUNA_TEST_DEPLOY_BASE_PORT $BASE_PORT leaves no port range for $NODE_COUNT nodes"
+if [[ -n "$KEYCLOAK_HTTP_PORT" ]]; then
+  require_positive_int ARUNA_TEST_DEPLOY_KEYCLOAK_PORT "$KEYCLOAK_HTTP_PORT"
+  ((KEYCLOAK_HTTP_PORT >= 1024 && KEYCLOAK_HTTP_PORT <= 65535)) \
+    || die "ARUNA_TEST_DEPLOY_KEYCLOAK_PORT must be between 1024 and 65535, got: $KEYCLOAK_HTTP_PORT"
+fi
 
 if [[ "$AUTO_PORTAL_DIR" == "1" && -z "$PORTAL_DIR" ]]; then
   PORTAL_DIR="$DEPLOY_ROOT/portal"
@@ -539,10 +678,14 @@ if [[ -z "$KEYCLOAK_HTTP_PORT" ]]; then
   KEYCLOAK_HTTP_PORT=$((BASE_PORT + NODE_COUNT * 10 + 1))
 fi
 
+assert_removable "$DEPLOY_ROOT"
+
 trap cleanup EXIT
 trap handle_signal INT TERM
 
-require_command cargo
+if [[ "$SKIP_BUILD" != "1" ]]; then
+  require_command cargo
+fi
 require_command curl
 require_command ss
 
@@ -550,7 +693,7 @@ if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   require_command docker
 fi
 
-mkdir -p "$ROOT_DIR/target"
+mkdir -p "$(dirname -- "$DEPLOY_ROOT")"
 rm -rf "$DEPLOY_ROOT"
 mkdir -p "$DEPLOY_ROOT"
 
@@ -565,8 +708,12 @@ if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   assert_port_free "$KEYCLOAK_HTTP_PORT"
 fi
 
-log "Building the full release workspace"
-cargo build --workspace --release --locked
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  log "Reusing already built release binaries"
+else
+  log "Building the full release workspace"
+  cargo build --workspace --release --locked
+fi
 
 [[ -x "$ARUNA_BIN" ]] || die "missing binary: $ARUNA_BIN"
 [[ -x "$ARUNA_DOCTOR_BIN" ]] || die "missing binary: $ARUNA_DOCTOR_BIN"
@@ -590,18 +737,26 @@ write_node_env "${NODE_DIRS[0]}" "${NODE_HTTP_PORTS[0]}" "${NODE_P2P_PORTS[0]}" 
 
 start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
 NODE_1_PID="$STARTED_PID"
-wait_for_http "${NODE_NAMES[0]}" "$NODE_1_BASE_URL" "$NODE_1_PID"
+wait_for_ready "${NODE_NAMES[0]}" "${NODE_OPS_PORTS[0]}" "$NODE_1_PID"
 
-log "Reading the initial onboarding secret from ${NODE_NAMES[0]}"
-INITIAL_LOCAL_ONBOARDING_SECRET="$(wait_for_initial_onboarding_secret "${NODE_DIRS[0]}/${NODE_NAMES[0]}.log" "$NODE_1_PID")"
+log "Stopping ${NODE_NAMES[0]} to unlock local storage for bootstrap"
+kill "$NODE_1_PID" >/dev/null 2>&1 || true
+wait "$NODE_1_PID" 2>/dev/null || true
+PIDS=()
+
+log "Minting the initial onboarding secret on ${NODE_NAMES[0]}"
+INITIAL_LOCAL_ONBOARDING_SECRET="$(mint_onboarding_secret "${NODE_DIRS[0]}")"
+
+# The OIDC token exchange runs against the live node; the direct path needs the
+# storage lock the stopped node just released.
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  log "Restarting ${NODE_NAMES[0]} before the OIDC token exchange"
+  start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
+  NODE_1_PID="$STARTED_PID"
+  wait_for_ready "${NODE_NAMES[0]}" "${NODE_OPS_PORTS[0]}" "$NODE_1_PID"
+fi
 
 log "Generating the bootstrap admin token from ${NODE_NAMES[0]}"
-if [[ "$WITH_KEYCLOAK" != "1" ]]; then
-  log "Stopping ${NODE_NAMES[0]} to unlock local storage for bootstrap token creation"
-  kill "$NODE_1_PID" >/dev/null 2>&1 || true
-  wait "$NODE_1_PID" 2>/dev/null || true
-  PIDS=()
-fi
 INITIAL_ADMIN_TOKEN="$(generate_test_token "${NODE_DIRS[0]}" "$INITIAL_LOCAL_ONBOARDING_SECRET")"
 printf 'ADMIN_TOKEN=%s\n' "$INITIAL_ADMIN_TOKEN"
 
@@ -609,7 +764,7 @@ if [[ "$WITH_KEYCLOAK" != "1" ]]; then
   log "Restarting ${NODE_NAMES[0]} after bootstrap token creation"
   start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
   NODE_1_PID="$STARTED_PID"
-  wait_for_http "${NODE_NAMES[0]}" "$NODE_1_BASE_URL" "$NODE_1_PID"
+  wait_for_ready "${NODE_NAMES[0]}" "${NODE_OPS_PORTS[0]}" "$NODE_1_PID"
 fi
 
 for node_index in "${!NODE_NAMES[@]}"; do
@@ -624,9 +779,20 @@ for node_index in "${!NODE_NAMES[@]}"; do
     "${NODE_HTTP_PORTS[$node_index]}" \
     "${NODE_P2P_PORTS[$node_index]}" \
     "${NODE_S3_PORTS[$node_index]}" \
-    "${NODE_OPS_PORTS[$node_index]}" \
-    "${NODE_BASE_URLS[$node_index]}"
+    "${NODE_OPS_PORTS[$node_index]}"
 done
+
+if [[ -n "$PORTAL_DIR" ]]; then
+  log "Verifying the portal route on every node"
+  for node_index in "${!NODE_NAMES[@]}"; do
+    verify_portal_route "${NODE_NAMES[$node_index]}" "${NODE_BASE_URLS[$node_index]}"
+  done
+fi
+
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  log "Verifying the configured OIDC issuer"
+  verify_oidc_issuer
+fi
 
 write_summary_file "$DEPLOY_ROOT/summary.txt"
 

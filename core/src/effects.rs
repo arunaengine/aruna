@@ -213,6 +213,12 @@ pub enum StorageEffect {
         limit: usize,
         txn_id: Option<TxnId>,
     },
+    /// Read the lexicographically last entry in a keyspace, optionally by prefix.
+    Last {
+        key_space: KeySpace,
+        prefix: Option<Key>,
+        txn_id: Option<TxnId>,
+    },
 }
 
 /// Dispatch lane for a storage effect. Foreground is always served before Bulk,
@@ -267,6 +273,71 @@ pub struct AuditPageEffect {
     pub request: AuditPageRequest,
 }
 
+/// Default wall-clock budget for a DHT read whose caller has no tighter
+/// contract of its own.
+pub const DHT_GET_DEADLINE: Duration = Duration::from_secs(10);
+
+/// When a DHT read is allowed to stop early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhtCompletion {
+    /// Runs the lookup frontier to exhaustion, keeping multi-publisher reads
+    /// whole. This is the only policy valid for realm presence and blob-holder
+    /// discovery.
+    Exhaustive,
+    /// Stops at the first signature-valid, unexpired entry published by
+    /// `publisher` in `realm_id`. Only a caller that knows both may use it.
+    FirstUsable {
+        realm_id: RealmId,
+        publisher: NodeId,
+    },
+}
+
+/// Deadline and completion policy the DHT driver enforces for one read. The
+/// driver owns the deadline, so a timed-out or cancelled read releases its
+/// operation and pending RPC state instead of running on detached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DhtGetOptions {
+    pub deadline: Duration,
+    pub completion: DhtCompletion,
+    /// Realm whose bounded-stale presence snapshot may answer this read. Every
+    /// other read always reaches the DHT.
+    pub presence: Option<RealmId>,
+}
+
+impl DhtGetOptions {
+    pub fn exhaustive(deadline: Duration) -> Self {
+        Self {
+            deadline,
+            completion: DhtCompletion::Exhaustive,
+            presence: None,
+        }
+    }
+
+    pub fn first_usable(deadline: Duration, realm_id: RealmId, publisher: NodeId) -> Self {
+        Self {
+            deadline,
+            completion: DhtCompletion::FirstUsable {
+                realm_id,
+                publisher,
+            },
+            presence: None,
+        }
+    }
+
+    pub fn presence(deadline: Duration, realm_id: RealmId) -> Self {
+        Self {
+            presence: Some(realm_id),
+            ..Self::exhaustive(deadline)
+        }
+    }
+}
+
+impl Default for DhtGetOptions {
+    fn default() -> Self {
+        Self::exhaustive(DHT_GET_DEADLINE)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DhtEffect {
     Put {
@@ -278,6 +349,7 @@ pub enum DhtEffect {
     Get {
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        options: DhtGetOptions,
     },
 }
 

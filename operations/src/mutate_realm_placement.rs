@@ -830,11 +830,9 @@ impl Operation for MutateRealmPlacementOperation {
 }
 
 /// Drives a realm placement mutation, then — when it drains the local node —
-/// flushes the local outbox synchronously (drain fence) so records this node
-/// accepted before its holdership loss reach the shard topics right away, while
-/// it is still a member, rather than waiting for the asynchronous drain timer. The
-/// flush is best-effort: `classify_deferred_record` keeps any leftovers deliverable on the
-/// retryable drain regardless, so a flush failure never strands a record.
+/// kicks the installed outbox drain owner so records accepted before holdership
+/// loss are retried without creating a second concurrent drainer or replacing a
+/// persisted failure deadline.
 pub async fn drive_realm_placement_mutation(
     config: MutateRealmPlacementConfig,
     context: &crate::driver::DriverContext,

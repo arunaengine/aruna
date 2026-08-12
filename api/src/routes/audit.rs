@@ -12,24 +12,24 @@ use aruna_operations::metadata::audit::{
 use aruna_operations::metadata::forward::is_user_origin;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "audit", description = "Audit trail reads")),
-    paths(list_audit)
+    tags((name = "audit", description = "Audit trail reads"))
 )]
 pub struct AuditApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/audit", get(list_audit))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(AuditApiDoc::openapi()).routes(routes!(list_audit))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -89,18 +89,67 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
     get,
     path = "/audit",
     tag = "audit",
+    summary = "List a group's metadata audit trail",
+    description = "Requires a bearer token of this realm. On a server or management node the caller needs WRITE on the group's admin path; on a user-kind node the read is forwarded to the realm under the caller's own token and every peer re-checks that same group-admin authority, so a bearer token must be present there. Audit rows are node-local, so a page is a realm fan-out: every sync-eligible realm node is asked for its slice and the slices are merged in trail order under a 30 second deadline. Partial results are part of the contract: `partial` is true when a node did not answer in time, when realm membership or its digest changed under the read, or when a peer's slice was rejected, and a partial page never carries `next_cursor` because a caller must not page over an incomplete merge. `missing_nodes` names up to 64 nodes that did not contribute and `missing_overflow` counts the ones beyond that bound. A complete page without `next_cursor` is the end of the trail. Concurrent audit reads are admission-limited, so a saturated node answers 503 rather than queueing.",
     params(
-        ("group_id" = String, Query, description = "Group id"),
-        ("document_id" = Option<String>, Query, description = "Optional document id"),
-        ("cursor" = Option<String>, Query, description = "Continuation token"),
-        ("limit" = Option<usize>, Query, description = "Page size (max 200)")
+        ("group_id" = String, Query, description = "ULID of the group whose audit trail is read; required"),
+        ("document_id" = Option<String>, Query, description = "ULID of one metadata document; narrows the trail to that document. Default: the whole group trail"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous page's `next_cursor`. It is bound to this realm, the realm membership digest, the group and the document filter, and is rejected with 400 once any of those differ. Absent starts at the beginning of the trail"),
+        ("limit" = Option<usize>, Query, description = "Maximum records in one page. Default 50, clamped to 1..=200")
     ),
     responses(
-        (status = 200, description = "Audit records", body = AuditPageResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 503, description = "Audit service unavailable", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Merged audit page, oldest first. `partial` reports whether some node's rows are missing; a partial page carries no continuation token",
+            body = AuditPageResponse,
+            examples(
+                ("Complete page" = (
+                    summary = "Every node answered; the cursor continues the trail",
+                    value = json!({
+                        "records": [
+                            {
+                                "group_id": "01JABCDEF0123456789ABCDEFG",
+                                "document_id": "01JMETADATA0123456789ABCDE",
+                                "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                "user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                                "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                                "operation": "upsert_data_entity",
+                                "occurred_at_ms": 1775744591123_i64,
+                                "details": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#data/reads.fastq"
+                            }
+                        ],
+                        "next_cursor": "AQECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "partial": false,
+                        "missing_overflow": 0
+                    })
+                )),
+                ("Partial page" = (
+                    summary = "One node did not answer, so the page is incomplete and has no cursor",
+                    value = json!({
+                        "records": [
+                            {
+                                "group_id": "01JABCDEF0123456789ABCDEFG",
+                                "document_id": "01JMETADATA0123456789ABCDE",
+                                "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                "user_id": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                                "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                                "operation": "create",
+                                "occurred_at_ms": 1775744591123_i64
+                            }
+                        ],
+                        "partial": true,
+                        "missing_nodes": [
+                            "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a"
+                        ],
+                        "missing_overflow": 0
+                    })
+                ))
+            )
+        ),
+        (status = 400, description = "Malformed group or document id, or a cursor that does not belong to this query", body = ErrorResponse),
+        (status = 401, description = "Missing or unusable bearer token, or a forwarded token the realm peers rejected", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the group's admin path", body = ErrorResponse),
+        (status = 503, description = "Audit reads are saturated, the realm configuration is unavailable, or the deadline expired before a merge could complete; retryable, the response carries a Retry-After header", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

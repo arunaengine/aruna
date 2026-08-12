@@ -15,37 +15,26 @@ use aruna_operations::s3::bucket_routing::{
 };
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "storage-routing", description = "Write routing rules for buckets and groups")),
-    paths(
-        get_bucket_routing,
-        put_bucket_routing,
-        get_group_routing,
-        put_group_routing
-    )
+    tags((name = "storage-routing", description = "Write routing rules for buckets and groups"))
 )]
 pub struct StorageRoutingApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route(
-            "/buckets/{bucket}/storage-routing",
-            get(get_bucket_routing).put(put_bucket_routing),
-        )
-        .route(
-            "/groups/{group_id}/storage-routing",
-            get(get_group_routing).put(put_group_routing),
-        )
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(StorageRoutingApiDoc::openapi())
+        .routes(routes!(get_bucket_routing, put_bucket_routing))
+        .routes(routes!(get_group_routing, put_group_routing))
 }
 
 /// A rule target names either a group storage backend or a storage class, and
@@ -227,12 +216,26 @@ pub(crate) async fn ensure_group_admin(
     get,
     path = "/buckets/{bucket}/storage-routing",
     tag = "storage-routing",
-    params(("bucket" = String, Path, description = "Bucket name")),
+    summary = "Read a bucket's write routing rules",
+    description = "Requires a bearer token issued for this realm and WRITE on the owning group's admin path: routing decides where a group's bytes physically land, so the write rights that suffice for objects are not enough. The bucket's owning group is resolved first, so a bucket unknown to this node is not found and the admin check always runs against the group that owns it. This is a node-local read of the replicated bucket record: rules written on another node can be missing until they arrive here, and a bucket that has never been given rules returns an empty list. The `warnings` list is advisory only and is recomputed per request from the storage classes this node offers to tenants plus the backends the group itself registered, so the same stored rules can warn here and not on another node.",
+    params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface, without a leading slash")),
     responses(
-        (status = 200, description = "Bucket routing rules", body = BucketRoutingResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Bucket not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The rules stored for this bucket, in the order they were submitted, plus advisory warnings for targets this node cannot serve",
+            body = BucketRoutingResponse,
+            example = json!({
+                "bucket": "research-raw",
+                "rules": [
+                    {"key_prefix": "archive/", "exact": false, "target": {"class": "cold"}},
+                    {"key_prefix": "", "exact": false, "target": {"backend_id": "01JBACKEND0123456789ABCDE"}}
+                ],
+                "warnings": ["storage class `cold` is not offered to tenants by this node"]
+            })
+        ),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -270,14 +273,37 @@ pub async fn get_bucket_routing(
     put,
     path = "/buckets/{bucket}/storage-routing",
     tag = "storage-routing",
-    params(("bucket" = String, Path, description = "Bucket name")),
-    request_body = BucketRoutingRequest,
+    summary = "Replace a bucket's write routing rules",
+    description = "Requires a bearer token issued for this realm and WRITE on the owning group's admin path. The submitted list replaces the bucket's whole rule set; sending an empty list clears it. Each rule target must set exactly one of `backend_id` or `class`: a `backend_id` must be the ULID of a backend the group itself registered, so tenant rules can never name an operator's node backend, and a `class` must be a valid storage-class name. Two rules may not share the same `key_prefix` and `exact` combination. At write time the most specific rule wins, in this order: an exact-key rule, then the longest matching `key_prefix` rule (an empty prefix is the bucket default), then the group default, then the operator's own node rules, then the node's default backend. This only steers data written after the change; objects already stored are never moved. Rules are stored even when this node cannot serve their target, because the bucket record replicates to nodes that may offer it, and the unserved targets come back in `warnings`.",
+    params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface, without a leading slash")),
+    request_body(
+        content = BucketRoutingRequest,
+        description = "The complete rule set for this bucket. `key_prefix` defaults to the empty string (the bucket default) and `exact` defaults to false (prefix match).",
+        example = json!({
+            "rules": [
+                {"key_prefix": "archive/", "exact": false, "target": {"class": "cold"}},
+                {"key_prefix": "index/manifest.json", "exact": true, "target": {"backend_id": "01JBACKEND0123456789ABCDE"}}
+            ]
+        })
+    ),
     responses(
-        (status = 200, description = "Bucket routing rules stored", body = BucketRoutingResponse),
-        (status = 400, description = "Invalid rules", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Bucket not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The rule set as stored, echoed back with advisory warnings for targets this node cannot serve",
+            body = BucketRoutingResponse,
+            example = json!({
+                "bucket": "research-raw",
+                "rules": [
+                    {"key_prefix": "archive/", "exact": false, "target": {"class": "cold"}},
+                    {"key_prefix": "index/manifest.json", "exact": true, "target": {"backend_id": "01JBACKEND0123456789ABCDE"}}
+                ],
+                "warnings": ["storage class `cold` is not offered to tenants by this node"]
+            })
+        ),
+        (status = 400, description = "A target sets neither or both of `backend_id` and `class`, names a backend the group does not own, uses an invalid storage-class name, or two rules share the same prefix and match mode", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "No bucket of that name is known to this node, or it no longer belongs to the authorized group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -319,12 +345,23 @@ pub async fn put_bucket_routing(
     get,
     path = "/groups/{group_id}/storage-routing",
     tag = "storage-routing",
-    params(("group_id" = String, Path, description = "Group id")),
+    summary = "Read a group's default write target",
+    description = "Requires a bearer token issued for this realm and WRITE on that group's admin path. The group default applies to every bucket of the group and is consulted only after the bucket's own rules: an exact-key rule and then the longest matching key prefix on the bucket take precedence over it, and it in turn takes precedence over the operator's node rules and the node's default backend. This is a node-local read of the replicated group routing record; a group that has never set a default returns `default_target` omitted. The `warnings` list is advisory only and is recomputed per request against the classes this node offers to tenants and the backends the group registered, so it can differ between nodes for the same stored default.",
+    params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 200, description = "Group routing default", body = GroupRoutingResponse),
-        (status = 400, description = "Invalid group id", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The group's default target, omitted when none is set, plus advisory warnings when this node cannot serve it",
+            body = GroupRoutingResponse,
+            example = json!({
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "default_target": {"class": "warm"},
+                "warnings": []
+            })
+        ),
+        (status = 400, description = "The path segment is not a valid group ULID", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -357,13 +394,28 @@ pub async fn get_group_routing(
     put,
     path = "/groups/{group_id}/storage-routing",
     tag = "storage-routing",
-    params(("group_id" = String, Path, description = "Group id")),
-    request_body = GroupRoutingRequest,
+    summary = "Set or clear a group's default write target",
+    description = "Requires a bearer token issued for this realm and WRITE on that group's admin path. The submitted value replaces the group's default outright, and omitting `default_target` or sending it as null clears it, which returns the group to the operator's node rules and the node default. The target must set exactly one of `backend_id` or `class`: a `backend_id` must be the ULID of a backend the group itself registered, so a tenant can never bind an operator's node backend, and a `class` must be a valid storage-class name. The default is scoped to the whole group and is weaker than any matching rule on an individual bucket. It only steers data written after the change; objects already stored are never moved. The record is stored even when this node cannot serve the target, because it replicates to nodes that may, and the unserved target comes back in `warnings`. Each write records the caller and the time as the last decider.",
+    params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
+    request_body(
+        content = GroupRoutingRequest,
+        description = "The new default target, or an empty object to clear the group default.",
+        example = json!({"default_target": {"class": "warm"}})
+    ),
     responses(
-        (status = 200, description = "Group routing default stored", body = GroupRoutingResponse),
-        (status = 400, description = "Invalid target", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 200,
+            description = "The default as stored, omitted when the request cleared it, plus advisory warnings when this node cannot serve it",
+            body = GroupRoutingResponse,
+            example = json!({
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "default_target": {"class": "warm"},
+                "warnings": ["storage class `warm` is not offered to tenants by this node"]
+            })
+        ),
+        (status = 400, description = "The path segment is not a valid group ULID, or the target sets neither or both of `backend_id` and `class`, names a backend the group does not own, or uses an invalid storage-class name", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller lacks WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

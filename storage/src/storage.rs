@@ -95,7 +95,8 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
         StorageEffect::Read { key_space, .. }
         | StorageEffect::Write { key_space, .. }
         | StorageEffect::Delete { key_space, .. }
-        | StorageEffect::Iter { key_space, .. } => Some(key_space),
+        | StorageEffect::Iter { key_space, .. }
+        | StorageEffect::Last { key_space, .. } => Some(key_space),
         StorageEffect::BatchRead { reads, .. } => {
             reads.first().map(|(key_space, _)| key_space.as_str())
         }
@@ -205,6 +206,7 @@ pub struct FjallStorage {
     next_reader: usize,
     bulk_read_pool: Vec<EffectSender>,
     next_bulk_reader: usize,
+    pool_threads: Vec<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -284,6 +286,7 @@ pub struct StorageHandle {
     priority: StoragePriority,
     metrics: Arc<StorageMetrics>,
     transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+    worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 #[derive(Debug)]
@@ -385,9 +388,24 @@ impl StorageHandle {
                 priority: StoragePriority::Foreground,
                 metrics: Arc::new(StorageMetrics::default()),
                 transaction_cleanup: Arc::new(Mutex::new(BTreeMap::new())),
+                worker: Arc::new(Mutex::new(None)),
             },
             StorageReceivers { foreground, bulk },
         )
+    }
+
+    /// Closes the store and waits until the worker released it, including the
+    /// file lock. Blocks forever when another handle clone is still alive.
+    pub async fn close(self) {
+        let worker = self
+            .worker
+            .lock()
+            .expect("storage worker mutex poisoned")
+            .take();
+        drop(self);
+        if let Some(worker) = worker {
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+        }
     }
 
     /// A handle whose effects dispatch on the bulk lane, served only when the
@@ -908,6 +926,7 @@ fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         StorageEffect::Read { .. }
         | StorageEffect::BatchRead { .. }
         | StorageEffect::Iter { .. }
+        | StorageEffect::Last { .. }
         | StorageEffect::AbortTransaction { .. }
         | StorageEffect::SyncAll => false,
     }
@@ -943,6 +962,10 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
             txn_id: Some(txn_id),
             ..
         }
+        | StorageEffect::Last {
+            txn_id: Some(txn_id),
+            ..
+        }
         | StorageEffect::CommitTransaction { txn_id }
         | StorageEffect::AbortTransaction { txn_id } => Some(*txn_id),
         StorageEffect::StartTransaction { .. }
@@ -953,7 +976,8 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::BatchWrite { txn_id: None, .. }
         | StorageEffect::Delete { txn_id: None, .. }
         | StorageEffect::BatchDelete { txn_id: None, .. }
-        | StorageEffect::Iter { txn_id: None, .. } => None,
+        | StorageEffect::Iter { txn_id: None, .. }
+        | StorageEffect::Last { txn_id: None, .. } => None,
     }
 }
 
@@ -1338,27 +1362,44 @@ impl FjallStorage {
         let mut storage = Self::new(Store::new(db), policy, &sender);
         let channel_closed = sender.metrics.channel_closed.clone();
 
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let _lifecycle = WorkerLifecycleGuard(channel_closed);
             storage.receive_loop(receivers);
+            storage.close();
         });
+        sender
+            .worker
+            .lock()
+            .expect("storage worker mutex poisoned")
+            .replace(worker);
 
         Ok(sender)
+    }
+
+    /// Joins the read pools so every store clone is gone when this returns;
+    /// the fjall lock is released by the final store drop right after.
+    fn close(mut self) {
+        self.read_pool.clear();
+        self.bulk_read_pool.clear();
+        for reader in std::mem::take(&mut self.pool_threads) {
+            let _ = reader.join();
+        }
     }
 
     /// Worker sharing the handle's cleanup map and metrics, including the
     /// mutation fence it reads before starting any mutation.
     fn new(store: Store, policy: FjallPersistPolicy, handle: &StorageHandle) -> Self {
-        let read_pool = spawn_read_pool(
+        let (read_pool, mut pool_threads) = spawn_read_pool(
             store.clone(),
             READ_POOL_THREADS,
             STORAGE_EFFECT_QUEUE_CAPACITY,
         );
-        let bulk_read_pool = spawn_read_pool(
+        let (bulk_read_pool, bulk_threads) = spawn_read_pool(
             store.clone(),
             BULK_READ_POOL_THREADS,
             BULK_EFFECT_QUEUE_CAPACITY,
         );
+        pool_threads.extend(bulk_threads);
         Self {
             store,
             persist_policy: policy,
@@ -1369,6 +1410,7 @@ impl FjallStorage {
             next_reader: 0,
             bulk_read_pool,
             next_bulk_reader: 0,
+            pool_threads,
         }
     }
 
@@ -1446,6 +1488,11 @@ impl FjallStorage {
                 limit,
                 txn_id,
             } => self.iterate(key_space, prefix, start, limit, txn_id),
+            StorageEffect::Last {
+                key_space,
+                prefix,
+                txn_id,
+            } => self.last(key_space, prefix, txn_id),
         }
     }
 
@@ -2325,6 +2372,28 @@ impl FjallStorage {
             Err(error) => StorageEvent::Error { error },
         }
     }
+
+    fn last(
+        &mut self,
+        key_space: String,
+        prefix: Option<ByteView>,
+        txn_id: Option<Ulid>,
+    ) -> StorageEvent {
+        let keyspace = match self.store.resolve_keyspace(&key_space) {
+            Ok(keyspace) => keyspace,
+            Err(error) => return StorageEvent::Error { error },
+        };
+        if let Some(txn_id) = txn_id {
+            return match self.txns.get(&txn_id) {
+                Some(Txn::Read(txn)) => read_last_with(txn, &keyspace, prefix.as_ref()),
+                Some(Txn::Write(txn)) => read_last_with(txn.as_ref(), &keyspace, prefix.as_ref()),
+                None => StorageEvent::Error {
+                    error: StorageError::TransactionNotFound,
+                },
+            };
+        }
+        store_last(&self.store, keyspace, prefix)
+    }
 }
 
 fn store_read(store: &Store, keyspace: OptimisticTxKeyspace, key: ByteView) -> StorageEvent {
@@ -2368,6 +2437,47 @@ fn store_batch_read(store: &Store, reads: Vec<(String, ByteView)>) -> StorageEve
     batch_read_with(store, &snapshot, reads)
 }
 
+fn read_last_with<R: Readable>(
+    reader: &R,
+    keyspace: &OptimisticTxKeyspace,
+    prefix: Option<&ByteView>,
+) -> StorageEvent {
+    let guard = match prefix {
+        Some(prefix) => {
+            let prefix = prefix.as_ref().to_vec();
+            let mut range = match prefix_upper_bound(&prefix) {
+                Some(end) => reader.range(keyspace, (Included(prefix), Excluded(end))),
+                None => reader.range(keyspace, (Included(prefix), Unbounded::<Vec<u8>>)),
+            };
+            range.next_back()
+        }
+        None => reader.last_key_value(keyspace),
+    };
+    let Some(guard) = guard else {
+        return StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        };
+    };
+    match guard.into_inner() {
+        Ok((key, value)) => StorageEvent::IterResult {
+            values: vec![(ByteView::from(key.as_ref()), ByteView::from(value.as_ref()))],
+            next_start_after: None,
+        },
+        Err(_) => StorageEvent::Error {
+            error: StorageError::ReadError,
+        },
+    }
+}
+
+fn store_last(
+    store: &Store,
+    keyspace: OptimisticTxKeyspace,
+    prefix: Option<ByteView>,
+) -> StorageEvent {
+    read_last_with(&store.db.read_tx(), &keyspace, prefix.as_ref())
+}
+
 fn store_iterate(
     store: &Store,
     keyspace: OptimisticTxKeyspace,
@@ -2401,6 +2511,7 @@ fn is_poolable_read(effect: &StorageEffect) -> bool {
         StorageEffect::Read { txn_id: None, .. }
             | StorageEffect::BatchRead { txn_id: None, .. }
             | StorageEffect::Iter { txn_id: None, .. }
+            | StorageEffect::Last { txn_id: None, .. }
     )
 }
 
@@ -2491,6 +2602,11 @@ impl PendingWriteIndex {
                 limit,
                 txn_id: None,
             } => *limit != 0 && self.contains_iter_key(key_space, prefix.as_ref(), start.as_ref()),
+            StorageEffect::Last {
+                key_space,
+                prefix,
+                txn_id: None,
+            } => self.contains_iter_key(key_space, prefix.as_ref(), None),
             _ => false,
         }
     }
@@ -2678,15 +2794,20 @@ fn reject_bulk_read(item: EffectHandle) {
     });
 }
 
-fn spawn_read_pool(store: Store, threads: usize, capacity: usize) -> Vec<EffectSender> {
+fn spawn_read_pool(
+    store: Store,
+    threads: usize,
+    capacity: usize,
+) -> (Vec<EffectSender>, Vec<thread::JoinHandle<()>>) {
     let mut senders = Vec::with_capacity(threads);
+    let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
         let (sender, receiver) = mpsc::bounded_blocking(capacity);
         let store = store.clone();
-        thread::spawn(move || read_pool_loop(store, receiver));
+        handles.push(thread::spawn(move || read_pool_loop(store, receiver)));
         senders.push(sender);
     }
-    senders
+    (senders, handles)
 }
 
 fn read_pool_loop(store: Store, receiver: EffectReceiver) {
@@ -2706,6 +2827,14 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                 txn_id: None,
             } => match store.resolve_keyspace(&key_space) {
                 Ok(keyspace) => store_read(&store, keyspace, key),
+                Err(error) => StorageEvent::Error { error },
+            },
+            StorageEffect::Last {
+                key_space,
+                prefix,
+                txn_id: None,
+            } => match store.resolve_keyspace(&key_space) {
+                Ok(keyspace) => store_last(&store, keyspace, prefix),
                 Err(error) => StorageEvent::Error { error },
             },
             StorageEffect::BatchRead {
@@ -2908,6 +3037,19 @@ fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
                 span.record("txn_id", field::display(txn_id));
             }
         }
+        StorageEffect::Last {
+            key_space,
+            prefix,
+            txn_id,
+        } => {
+            span.record("key_space", field::display(key_space));
+            if let Some(prefix) = prefix {
+                span.record("key_len", prefix.as_ref().len() as u64);
+            }
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
         StorageEffect::SyncAll => {}
     }
 }
@@ -2925,6 +3067,7 @@ fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::AbortTransaction { .. } => "abort_transaction",
         StorageEffect::SyncAll => "sync_all",
         StorageEffect::Iter { .. } => "iter",
+        StorageEffect::Last { .. } => "last",
     }
 }
 
@@ -3049,6 +3192,7 @@ mod tests {
             transaction_cleanup: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
+            worker: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         (handle, super::StorageReceivers { foreground, bulk })
     }
@@ -3346,6 +3490,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: vec![bulk_sender],
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
         let metrics = std::sync::Arc::new(super::StorageMetrics::default());
         let read_effect = || StorageEffect::Read {
@@ -3559,6 +3704,7 @@ mod tests {
             priority: _,
             metrics,
             transaction_cleanup: _,
+            worker: _,
         } = handle;
 
         assert!(!metrics.channel_closed.load(Ordering::Relaxed));
@@ -4225,6 +4371,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
 
         let event = storage.commit_transaction(txn_id);
@@ -4268,6 +4415,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
 
         for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
@@ -4308,6 +4456,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
 
         storage.retry_cleanup();
@@ -5003,6 +5152,53 @@ mod tests {
         assert_eq!(
             keys,
             vec![b"p/a".to_vec(), b"p/b".to_vec(), b"p/c".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn last_returns_tail() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        for key in [b"a".as_slice(), b"c", b"b", b"b/1", b"b/2"] {
+            assert_write_result(
+                handle
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: "last_key".to_string(),
+                        key: key.to_vec().into(),
+                        value: key.to_vec().into(),
+                        txn_id: None,
+                    })
+                    .await,
+                key,
+            );
+        }
+
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = handle
+            .send_storage_effect(StorageEffect::Last {
+                key_space: "last_key".to_string(),
+                prefix: None,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("expected last result");
+        };
+        assert_eq!(values, vec![(b"c".to_vec().into(), b"c".to_vec().into())]);
+
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = handle
+            .send_storage_effect(StorageEffect::Last {
+                key_space: "last_key".to_string(),
+                prefix: Some(b"b/".to_vec().into()),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("expected prefixed last result");
+        };
+        assert_eq!(
+            values,
+            vec![(b"b/2".to_vec().into(), b"b/2".to_vec().into())]
         );
     }
 

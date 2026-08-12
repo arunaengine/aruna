@@ -138,6 +138,7 @@ pub enum OidcError {
 ///
 /// All API endpoints return this structure for error responses.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({"error": "Not found", "code": "Not found"}))]
 pub struct ErrorResponse {
     /// Error message describing what went wrong.
     pub error: String,

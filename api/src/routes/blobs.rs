@@ -20,8 +20,7 @@ use aruna_operations::replication::version_replication::{
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -31,18 +30,19 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "blobs", description = "Blob management and replication")),
-    paths(replicate_blob, blob_locations)
+    tags((name = "blobs", description = "Blob management and replication"))
 )]
 pub struct BlobsApiDoc;
 
-pub fn router() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/blobs/replicate", post(replicate_blob))
-        .route("/blobs/locations", get(blob_locations))
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(BlobsApiDoc::openapi())
+        .routes(routes!(replicate_blob))
+        .routes(routes!(blob_locations))
 }
 
 /// Replication targets are few and operator-controlled, so the fan-out stays
@@ -97,12 +97,33 @@ async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketIn
     post,
     path = "/blobs/replicate",
     tag = "blobs",
-    request_body = ReplicateBlobRequest,
+    summary = "Queue a copy of a bucket, object or version onto another node",
+    description = "Requires a bearer token issued by this realm; a token from another realm is refused with 403. The caller needs WRITE on the object when path is given and WRITE on the whole bucket when it is not. The 202 means the replication job was written durably on this node and nothing more: no bytes have been copied, the target node has not been contacted, and the copy may still fail or be retried in the background, so a caller that needs the outcome polls the locations endpoint until the target reports the copy as present. The response echoes the accepted scope rather than any progress. Scope follows the fields: no path replicates the whole bucket, a path replicates that object, and a path with version_id replicates exactly that version; a version_id without a path is rejected with 400, and a bucket that does not exist on this node is reported as 404. Delete markers are included in the queued work. Submitting the same scope again queues the work again, so the request is not idempotent.",
+    request_body(
+        content = ReplicateBlobRequest,
+        description = "Bucket to replicate from, the optional object path and version that narrow the scope, and the hex id of the destination node",
+        example = json!({
+            "bucket": "lab-raw",
+            "path": "runs/2026-04-09/reads.fastq.gz",
+            "version_id": "01JABCDEF0123456789ABCDEFG",
+            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
+        })
+    ),
     responses(
-        (status = 202, description = "Replication accepted", body = ReplicateBlobResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (
+            status = 202,
+            description = "Replication work was durably queued; the copy is not complete and its progress is observed through the locations endpoint",
+            body = ReplicateBlobResponse,
+            example = json!({
+                "bucket": "lab-raw",
+                "path": "runs/2026-04-09/reads.fastq.gz",
+                "version_id": "01JABCDEF0123456789ABCDEFG",
+                "target_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
+            })
+        ),
+        (status = 400, description = "Malformed destination node id or version id, or a version_id sent without a path", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the bucket or object", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -330,17 +351,54 @@ fn copy_response(
     get,
     path = "/blobs/locations",
     tag = "blobs",
+    summary = "List the nodes holding one object version",
+    description = "Requires a bearer token issued by this realm and READ on the object; a token from another realm is refused with 403. The local node resolves the version, then asks every node that might hold a copy: the destinations a sync relationship maps this key to, the bucket's configured replication targets, the destinations with queued replication work, and the nodes the durable holder index names for these bytes. At most 64 destinations are asked, at most 8 at a time, each with a 5 second answer window inside a 30 second budget for the whole request, so a stalled peer costs the deadline once rather than once per node. One entry is returned per destination path, so a node reachable under two bucket-and-key pairs appears twice and only the whole node, bucket and key triple identifies an entry. Per-copy state is present when the node reports the bytes, pending when the copy is expected but not there yet, not-stored when the version carries no bytes anywhere such as a delete marker, denied when the node refused to answer under the caller's identity, and unreachable when it gave no answer at all. An unreachable holder does not fail the request: the answer is still 200 with complete false and unreachable listed in limits, and repeating the request may reach that node and complete the picture. complete is true only when every candidate was enumerated and answered; otherwise limits names each reason, and a copy may be missing from the list rather than genuinely absent. Copies are ordered local first, then by node, bucket and key.",
     params(
-        ("bucket" = String, Query, description = "Bucket holding the object"),
-        ("path" = String, Query, description = "Object key"),
-        ("version_id" = Option<String>, Query, description = "Version to inspect, defaulting to the current one")
+        ("bucket" = String, Query, description = "Bucket holding the object, as known to this node"),
+        ("path" = String, Query, description = "Object key within the bucket, without a leading slash"),
+        ("version_id" = Option<String>, Query, description = "Version to inspect, given as a ULID; defaults to the current version and a malformed value returns 400")
     ),
     responses(
-        (status = 200, description = "Copies of one version", body = BlobLocationsResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Object or version not found", body = ErrorResponse)
+        (
+            status = 200,
+            description = "Copies of one version; authoritative only when complete is true, otherwise limits explains what the search could not cover and the caller may retry",
+            body = BlobLocationsResponse,
+            example = json!({
+                "bucket": "lab-raw",
+                "key": "runs/2026-04-09/reads.fastq.gz",
+                "version_id": "01JABCDEF0123456789ABCDEFG",
+                "copies": [
+                    {
+                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "local": true,
+                        "bucket": "lab-raw",
+                        "key": "runs/2026-04-09/reads.fastq.gz",
+                        "state": "present",
+                        "storage": "node-managed",
+                        "storage_class": "standard",
+                        "group_backend_id": null,
+                        "group_backend_name": null
+                    },
+                    {
+                        "node_id": "2a3b4c5d6e7f89900a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f6789",
+                        "local": false,
+                        "bucket": "lab-mirror",
+                        "key": "runs/2026-04-09/reads.fastq.gz",
+                        "state": "pending",
+                        "storage": null,
+                        "storage_class": null,
+                        "group_backend_id": null,
+                        "group_backend_name": null
+                    }
+                ],
+                "complete": false,
+                "limits": ["holder-unreachable"]
+            })
+        ),
+        (status = 400, description = "Malformed version id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the object", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node, or the object has no such version", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

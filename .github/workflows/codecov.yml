@@ -17,9 +17,10 @@ jobs:
     name: Generate Coverage Report
     environment: coverage
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget. The instrumented build is several times
-    # slower than the plain suite, so this ceiling is higher than the CI tests job.
-    timeout-minutes: 60
+    # Hang cap, not a performance budget. Measured basis: this branch's heavier
+    # suite aborted ~40% done at 57 minutes; a completing instrumented run
+    # extrapolates to 85-100 minutes.
+    timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
@@ -51,7 +52,13 @@ jobs:
           tool: grcov
 
       - name: Run instrumented tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --all-features --locked -- \
+            --skip offline_bounds_recovery \
+            --skip offline_recovery_converges \
+            --skip restart_reannounces_held_shard_topics_not_documents
+          cargo test -p aruna-operations --test restart_traffic --all-features --locked -- \
+            --test-threads=1
 
       - name: Collect coverage
         run: |

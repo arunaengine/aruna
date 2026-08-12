@@ -45,11 +45,15 @@ pub async fn update_portal(
 }
 
 async fn latest_website_prerelease_artifact_url() -> Result<String, CliError> {
+    fetch_prerelease_url(WEBSITE_RELEASES_URL).await
+}
+
+async fn fetch_prerelease_url(releases_url: &str) -> Result<String, CliError> {
     let client = reqwest::Client::builder()
         .user_agent("aruna-doctor")
         .build()?;
     let mut request = client
-        .get(WEBSITE_RELEASES_URL)
+        .get(releases_url)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28");
     if let Some(token) = nonempty_env("GITHUB_TOKEN") {
@@ -97,7 +101,139 @@ struct GithubReleaseAsset {
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubRelease, GithubReleaseAsset, select_website_prerelease_artifact};
+    use super::{
+        GithubRelease, GithubReleaseAsset, PORTAL_ARTIFACT_NAME, fetch_prerelease_url,
+        select_website_prerelease_artifact, update_portal,
+    };
+    use axum::{Router, body::Bytes, routing::get};
+    use flate2::{Compression, write::GzEncoder};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn selects_prerelease_artifact() {
+        let (base_url, _checksum) = start_server(portal_tarball()).await;
+
+        let artifact_url = fetch_prerelease_url(&format!("{base_url}/releases"))
+            .await
+            .unwrap();
+
+        assert_eq!(artifact_url, format!("{base_url}/{PORTAL_ARTIFACT_NAME}"));
+    }
+
+    #[tokio::test]
+    async fn installs_selected_prerelease() {
+        // Selection, download, extraction, and index.html validation in one path.
+        let (base_url, checksum) = start_server(portal_tarball()).await;
+        let root = tempdir().unwrap();
+        let portal_dir = root.path().join("portal");
+        let artifact_url = fetch_prerelease_url(&format!("{base_url}/releases"))
+            .await
+            .unwrap();
+
+        update_portal(
+            Some(portal_dir.clone()),
+            Some(artifact_url),
+            Some(checksum),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(portal_dir.join("index.html")).unwrap(),
+            "<html>portal</html>"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_checksum() {
+        let (base_url, _checksum) = start_server(portal_tarball()).await;
+        let root = tempdir().unwrap();
+        let portal_dir = root.path().join("portal");
+
+        let result = update_portal(
+            Some(portal_dir.clone()),
+            Some(format!("{base_url}/{PORTAL_ARTIFACT_NAME}")),
+            Some("0".repeat(64)),
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!portal_dir.exists());
+    }
+
+    fn portal_tarball() -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let body = b"<html>portal</html>";
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "index.html", &body[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        encoder.finish().unwrap()
+    }
+
+    /// Serves the release list, the artifact, and its checksum sidecar locally.
+    async fn start_server(tarball: Vec<u8>) -> (String, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let checksum = hex::encode(Sha256::digest(&tarball));
+        let releases = releases_body(&base_url);
+        let sidecar = format!("{checksum}  {PORTAL_ARTIFACT_NAME}\n");
+        let artifact_route = format!("/{PORTAL_ARTIFACT_NAME}");
+        let app = Router::new()
+            .route(
+                "/releases",
+                get(move || {
+                    let releases = releases.clone();
+                    async move { releases }
+                }),
+            )
+            .route(
+                &artifact_route,
+                get(move || {
+                    let tarball = tarball.clone();
+                    async move { Bytes::from(tarball) }
+                }),
+            )
+            .route(
+                &format!("{artifact_route}.sha256"),
+                get(move || {
+                    let sidecar = sidecar.clone();
+                    async move { sidecar }
+                }),
+            );
+
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        (base_url, checksum)
+    }
+
+    /// A stable release and a draft prerelease precede the wanted prerelease.
+    fn releases_body(base_url: &str) -> String {
+        format!(
+            r#"[
+              {{"draft": false, "prerelease": false,
+                "assets": [{{"name": "{PORTAL_ARTIFACT_NAME}", "browser_download_url": "{base_url}/stable"}}]}},
+              {{"draft": true, "prerelease": true,
+                "assets": [{{"name": "{PORTAL_ARTIFACT_NAME}", "browser_download_url": "{base_url}/draft"}}]}},
+              {{"draft": false, "prerelease": true,
+                "assets": [{{"name": "other.tar.gz", "browser_download_url": "{base_url}/other"}},
+                           {{"name": "{PORTAL_ARTIFACT_NAME}", "browser_download_url": "{base_url}/{PORTAL_ARTIFACT_NAME}"}}]}}
+            ]"#
+        )
+    }
 
     #[test]
     fn selects_first_prerelease_with_portal_artifact() {

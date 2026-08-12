@@ -1,4 +1,6 @@
 # Development-only stack. Do not use in production.
+# The ARUNA_* variables exist so an isolated test run can pick its own ports and
+# config paths; every default reproduces the normal interactive stack.
 services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.6
@@ -7,12 +9,12 @@ services:
     command:
       - start-dev
       - --import-realm
-      - --http-port=8080
+      - --http-port=${ARUNA_KEYCLOAK_PORT:-8080}
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${ARUNA_KEYCLOAK_ADMIN_USER:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${ARUNA_KEYCLOAK_ADMIN_PASSWORD:-admin}
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${ARUNA_KEYCLOAK_PORT:-8080}:${ARUNA_KEYCLOAK_PORT:-8080}"
     volumes:
       - ./keycloak/realm-import:/opt/keycloak/data/import:ro
     healthcheck:
@@ -21,7 +23,7 @@ services:
         - bash
         - -c
         - >-
-          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          exec 3<>/dev/tcp/127.0.0.1/${ARUNA_KEYCLOAK_PORT:-8080} &&
           printf 'GET /realms/aruna/.well-known/openid-configuration HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 &&
           read -r line <&3 &&
           [[ "$$line" == *" 200 "* ]]
@@ -40,24 +42,26 @@ services:
     network_mode: host
     volumes:
       - ${ARUNA_COMPOSE_DATA_DIR:-../target/node/storage}:/data
-      - ./compose.aruna.env:/run/.env:ro
+      - ${ARUNA_COMPOSE_ENV_FILE:-./compose.aruna.env}:/run/.env:ro
     restart: unless-stopped
   prometheus:
     image: prom/prometheus:v3.5.3@sha256:ddc2493835a1509976d5e4e0c94199c4f843ce1f42dd6bcfc8231ba734a93ff7
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --web.listen-address=127.0.0.1:9090
+      - --web.listen-address=127.0.0.1:${ARUNA_PROMETHEUS_PORT:-9090}
     network_mode: host
     volumes:
-      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${ARUNA_PROMETHEUS_CONFIG:-./observability/prometheus.yml}:/etc/prometheus/prometheus.yml:ro
+      # prometheus.yml loads this rule file relative to its own directory.
+      - ./observability/aruna-alerts.yml:/etc/prometheus/aruna-alerts.yml:ro
       - prometheus-data:/prometheus
     restart: unless-stopped
   grafana:
     image: grafana/grafana:12.1.0@sha256:6ac590e7cabc2fbe8d7b8fc1ce9c9f0582177b334e0df9c927ebd9670469440f
     environment:
       GF_SERVER_HTTP_ADDR: 127.0.0.1
-      GF_SERVER_HTTP_PORT: 3003
+      GF_SERVER_HTTP_PORT: ${ARUNA_GRAFANA_PORT:-3003}
       GF_USERS_ALLOW_SIGN_UP: "false"
     network_mode: host
     volumes:

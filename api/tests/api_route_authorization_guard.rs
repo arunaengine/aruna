@@ -409,6 +409,7 @@ fn collect_sources(dir: &Path, files: &mut Vec<PathBuf>) {
 
 /// Handler idents registered by the module router, plus a count check so a route
 /// form this scanner cannot read fails loudly instead of going unnoticed.
+/// Modules register through `routes!`, whose arguments are the routed handlers.
 fn router_handlers(source: &str) -> Vec<String> {
     let mut handlers = Vec::new();
     let mut routes = 0usize;
@@ -418,6 +419,18 @@ fn router_handlers(source: &str) -> Vec<String> {
             continue;
         };
         routes += occurrences(body, ".route(").len();
+        for at in occurrences(body, "routes!(") {
+            routes += 1;
+            let Some(group) = group_at(body, at) else {
+                continue;
+            };
+            for item in group.split(',') {
+                let item = item.trim();
+                if !item.is_empty() && item.bytes().all(is_ident_byte) {
+                    handlers.push(item.to_owned());
+                }
+            }
+        }
         for method in METHODS {
             for at in occurrences(body, method) {
                 if at > 0 && is_ident_byte(body.as_bytes()[at - 1]) {
@@ -439,6 +452,29 @@ fn router_handlers(source: &str) -> Vec<String> {
     handlers.sort();
     handlers.dedup();
     handlers
+}
+
+/// Returns the balanced parenthesis group that follows `from`, without its
+/// delimiters.
+fn group_at(source: &str, from: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    let open = from + source[from..].find('(')?;
+    let mut depth = 0usize;
+
+    for (index, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[open + 1..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Reads `(handler)` directly after a method-router name.

@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{DhtEffect, Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::{
     ConnectionAddressStatus, PeerConnectionStatus, RealmConfigDocument, RealmId, RealmNodeKind,
 };
@@ -166,6 +167,7 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
             .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
                 key,
                 realm_filter: None,
+                options: DhtGetOptions::default(),
             })))
             .await;
 
@@ -392,6 +394,223 @@ async fn test_open_stream_rejects_internal_alpn() -> Result<(), Box<dyn std::err
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn offline_peer_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    // Repeated requests to a peer that went away must not repay a dial each
+    // time, and the peer must become reachable again once its address returns.
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let temp_c = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_c = FjallStorage::open(temp_c.path().to_str().ok_or("invalid temp path")?)?;
+
+    let secret_b = iroh::SecretKey::from_bytes(&[71u8; 32]);
+    let node_b = secret_b.public();
+    let cfg = |secret_key: Option<iroh::SecretKey>| NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(None), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(Some(secret_b.clone())), storage_b).await?;
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+
+    handle_a
+        .open_stream(node_b, Alpn::Bao)
+        .await
+        .expect("reachable peer accepts a stream");
+
+    handle_b.shutdown().await;
+    let before = handle_a.pool_counts();
+    for _ in 0..5 {
+        assert!(handle_a.open_stream(node_b, Alpn::Bao).await.is_err());
+    }
+    let after = handle_a.pool_counts();
+
+    assert!(
+        after.dials - before.dials < 5,
+        "expected the cooldown to suppress dials, saw {}",
+        after.dials - before.dials
+    );
+    assert!(after.cooldown_hits > before.cooldown_hits);
+
+    let handle_c = NetHandle::new(cfg(Some(secret_b)), storage_c).await?;
+    handle_c.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    handle_a.add_peer_addr(handle_c.endpoint_addr()).await;
+    handle_a
+        .open_stream(node_b, Alpn::Bao)
+        .await
+        .expect("returned peer is reachable again");
+
+    handle_a.shutdown().await;
+    handle_c.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn realm_fanout_recovers() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(120), realm_fanout_inner())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "realm fan-out test exceeded 120 seconds",
+            )
+        })?
+}
+
+struct RealmFixture {
+    a: NetHandle,
+    b: NetHandle,
+    c: NetHandle,
+    b_storage: aruna_storage::StorageHandle,
+    b_secret: iroh::SecretKey,
+    node_b: NodeId,
+    node_c: NodeId,
+    realm_id: RealmId,
+    _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
+}
+
+async fn setup_realm() -> Result<RealmFixture, Box<dyn std::error::Error>> {
+    let realm_id = RealmId::from_bytes([72u8; 32]);
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let temp_c = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let b_storage = storage_b.clone();
+    let storage_c = FjallStorage::open(temp_c.path().to_str().ok_or("invalid temp path")?)?;
+    let secret_a = iroh::SecretKey::from_bytes(&[72u8; 32]);
+    let b_secret = iroh::SecretKey::from_bytes(&[73u8; 32]);
+    let secret_c = iroh::SecretKey::from_bytes(&[74u8; 32]);
+    let node_b = b_secret.public();
+    let node_c = secret_c.public();
+    let cfg = |secret_key: iroh::SecretKey, peers: Vec<NodeId>| NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key: Some(secret_key),
+        realm_id,
+        peer_nodes: peers,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+    let a = NetHandle::new(cfg(secret_a, vec![node_b, node_c]), storage_a).await?;
+    let b = NetHandle::new(cfg(b_secret.clone(), vec![a.node_id(), node_c]), storage_b).await?;
+    let c = NetHandle::new(cfg(secret_c, vec![a.node_id(), node_b]), storage_c).await?;
+    a.add_peer_addr(b.endpoint_addr()).await;
+    a.add_peer_addr(c.endpoint_addr()).await;
+    b.add_peer_addr(a.endpoint_addr()).await;
+    c.add_peer_addr(a.endpoint_addr()).await;
+    c.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    Ok(RealmFixture {
+        a,
+        b,
+        c,
+        b_storage,
+        b_secret,
+        node_b,
+        node_c,
+        realm_id,
+        _dirs: (temp_a, temp_b, temp_c),
+    })
+}
+
+async fn seed_presence(
+    handle: &NetHandle,
+    key: DhtKeyId,
+    realm_id: RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let published = handle
+        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            key,
+            realm_id,
+            value: Vec::new(),
+            ttl: Duration::from_secs(300),
+        })))
+        .await;
+    assert!(matches!(
+        published,
+        Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
+    ));
+    Ok(())
+}
+
+async fn realm_fanout_inner() -> Result<(), Box<dyn std::error::Error>> {
+    // Exercise the same DHT and metadata stream paths used by process routes
+    // while one configured peer is unavailable and then returns.
+    let fixture = setup_realm().await?;
+    let realm_id = fixture.realm_id;
+    let key = realm_presence_key(&realm_id);
+    seed_presence(&fixture.b, key, realm_id).await?;
+
+    fixture.b.shutdown().await;
+    let first = fixture.a.pool_counts();
+    let request = || {
+        Effect::Net(NetEffect::Dht(DhtEffect::Get {
+            key,
+            realm_filter: Some(realm_id),
+            options: DhtGetOptions::presence(Duration::from_secs(4), realm_id),
+        }))
+    };
+    let _ = fixture.a.send_effect(request()).await;
+    let after_first = fixture.a.pool_counts();
+    assert!(after_first.dials > first.dials);
+    let _ = fixture.a.send_effect(request()).await;
+    let after_retry = fixture.a.pool_counts();
+    assert_eq!(after_retry.dials, after_first.dials);
+
+    let failed_metadata = fixture.a.open_stream(fixture.node_b, Alpn::Metadata).await;
+    assert!(failed_metadata.is_err());
+    let partial = fixture
+        .a
+        .open_stream(fixture.node_c, Alpn::Metadata)
+        .await?;
+    drop(partial);
+
+    let restarted = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            secret_key: Some(fixture.b_secret.clone()),
+            realm_id,
+            peer_nodes: vec![fixture.a.node_id(), fixture.node_c],
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        fixture.b_storage,
+    )
+    .await?;
+    restarted.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    fixture.a.add_peer_addr(restarted.endpoint_addr()).await;
+    let before_return = fixture.a.pool_counts();
+    let recovered = fixture.a.send_effect(request()).await;
+    assert!(matches!(
+        recovered,
+        Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, stale: false, .. }))
+            if values.iter().any(|entry| entry.node_id == fixture.node_b)
+    ));
+    let after_return = fixture.a.pool_counts();
+    assert_eq!(after_return.dials - before_return.dials, 1);
+
+    let metadata = fixture
+        .a
+        .open_stream(fixture.node_b, Alpn::Metadata)
+        .await?;
+    drop(metadata);
+    tokio::join!(
+        fixture.a.shutdown(),
+        fixture.c.shutdown(),
+        restarted.shutdown()
+    );
     Ok(())
 }
 

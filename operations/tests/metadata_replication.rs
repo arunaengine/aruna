@@ -57,7 +57,7 @@ use aruna_operations::placement::{
     strategy_for_target, subject_bytes,
 };
 use aruna_operations::sync_placement::sort_node_ids;
-use aruna_operations::task_incoming::{drive_document_sync_outbox_drain, initialize_task_incoming};
+use aruna_operations::task_incoming::{OutboxDrainer, initialize_task_incoming};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
 };
@@ -422,8 +422,9 @@ async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
 // push that loses a race under load is retried instead of stranding the record;
 // an undeliverable record is retained forever and trips the deadline.
 async fn drain_until_empty(node: &TestNode) -> Result<(), Box<dyn std::error::Error>> {
+    let drainer = OutboxDrainer::new(node.context.clone());
     wait_for_convergence("outbox never drained", || async {
-        drive_document_sync_outbox_drain(node.context.clone()).await;
+        drainer.run_once().await;
         let remaining = read_outbox_records(&node.context.storage_handle, &[], None, 16).await?;
         Ok(remaining.records.len())
     })

@@ -45,6 +45,7 @@ postcard = { workspace = true }
 rand = { workspace = true }
 iroh = { workspace = true }
 utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 
 # S3

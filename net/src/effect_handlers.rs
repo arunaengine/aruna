@@ -1,25 +1,140 @@
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
 use aruna_core::audit::AuditPageBatch;
-use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
+use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
-use aruna_core::events::{DhtEvent, JobControlEvent, NetEvent, StreamEvent};
-use aruna_core::id::{NodeId, hex_prefix};
-use tracing::{trace, warn};
+use aruna_core::events::{DhtEntry, DhtEvent, JobControlEvent, NetEvent, StreamEvent};
+use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
+use aruna_core::structs::RealmId;
+use parking_lot::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tracing::{debug, trace, warn};
 
 use crate::{DhtHandle, DocumentSyncService};
+
+/// A snapshot younger than this answers without any DHT work.
+const PRESENCE_FRESH: Duration = Duration::from_secs(10);
+/// Beyond this age the snapshot is not served at all and the caller waits for a
+/// bounded cold lookup.
+const PRESENCE_MAX_STALE: Duration = Duration::from_secs(60);
+
+/// Everything a net effect needs besides the effect itself.
+pub struct NetEffectContext {
+    pub dht: Arc<DhtHandle>,
+    pub document_sync: Arc<DocumentSyncService>,
+    pub presence: RealmPresenceCache,
+    pub tasks: TaskTracker,
+    pub shutdown: CancellationToken,
+    #[cfg(test)]
+    pub(crate) refresh_probe: Option<Arc<RefreshProbe>>,
+}
+
+#[cfg(test)]
+pub(crate) struct RefreshProbe {
+    started: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl RefreshProbe {
+    fn new() -> Self {
+        Self {
+            started: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PresenceSnapshot {
+    values: Vec<DhtEntry>,
+    observed: Instant,
+}
+
+/// Per-`NetHandle` realm-presence snapshots. Cached entries are discovery
+/// candidates: callers still filter them through the current realm config, and
+/// they never mark a peer connected or grant authority.
+#[derive(Clone, Default)]
+pub struct RealmPresenceCache {
+    snapshots: Arc<Mutex<HashMap<RealmId, PresenceSnapshot>>>,
+    refreshing: Arc<Mutex<HashSet<RealmId>>>,
+}
+
+impl std::fmt::Debug for RealmPresenceCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealmPresenceCache")
+            .field("realms", &self.snapshots.lock().len())
+            .finish()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PresenceServe {
+    Fresh(Vec<DhtEntry>),
+    Stale {
+        values: Vec<DhtEntry>,
+        refresh: bool,
+    },
+    Cold,
+}
+
+impl RealmPresenceCache {
+    fn serve(&self, realm_id: RealmId, now: Instant) -> PresenceServe {
+        let snapshots = self.snapshots.lock();
+        let Some(snapshot) = snapshots.get(&realm_id) else {
+            return PresenceServe::Cold;
+        };
+        let age = now.saturating_duration_since(snapshot.observed);
+        if age <= PRESENCE_FRESH {
+            return PresenceServe::Fresh(snapshot.values.clone());
+        }
+        if age > PRESENCE_MAX_STALE {
+            return PresenceServe::Cold;
+        }
+        PresenceServe::Stale {
+            values: snapshot.values.clone(),
+            refresh: self.refreshing.lock().insert(realm_id),
+        }
+    }
+
+    /// An empty answer holds no candidate to serve, so caching it would only
+    /// hide a peer that announces during the freshness window.
+    fn store(&self, realm_id: RealmId, values: Vec<DhtEntry>, now: Instant) {
+        if values.is_empty() {
+            self.snapshots.lock().remove(&realm_id);
+            return;
+        }
+        self.snapshots.lock().insert(
+            realm_id,
+            PresenceSnapshot {
+                values,
+                observed: now,
+            },
+        );
+    }
+
+    fn release(&self, realm_id: RealmId) {
+        self.refreshing.lock().remove(&realm_id);
+    }
+}
 
 #[tracing::instrument(
     name = "net.effect",
     level = "debug",
-    skip(dht, document_sync, effect),
+    skip(ctx, effect),
     fields(effect = net_effect_kind(&effect))
 )]
-pub async fn handle_net_effect(
-    dht: &DhtHandle,
-    document_sync: &DocumentSyncService,
-    effect: NetEffect,
-) -> NetEvent {
+pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> NetEvent {
+    let document_sync = ctx.document_sync.as_ref();
     match effect {
-        NetEffect::Dht(dht_effect) => handle_dht_effect(dht, dht_effect).await,
+        NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, dht_effect).await,
         NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
             aruna_core::DocumentSyncEffect::PublishDocuments { documents, peers } => {
                 NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
@@ -56,10 +171,11 @@ fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
 #[tracing::instrument(
     name = "net.effect.dht",
     level = "debug",
-    skip(dht, effect),
+    skip(ctx, effect),
     fields(effect = dht_effect_kind(&effect))
 )]
-async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
+async fn handle_dht_effect(ctx: &NetEffectContext, effect: DhtEffect) -> NetEvent {
+    let dht = ctx.dht.as_ref();
     match effect {
         DhtEffect::Put {
             key,
@@ -89,24 +205,143 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
                 }
             }
         }
-        DhtEffect::Get { key, realm_filter } => {
+        DhtEffect::Get {
+            key,
+            realm_filter,
+            options,
+        } => {
             trace!(
                 event = "dht.get.started",
                 key = %hex_prefix(key.as_bytes()),
                 realm_id = ?realm_filter,
+                deadline_ms = options.deadline.as_millis(),
                 "Starting DHT get"
             );
-            match dht.get(&key, realm_filter).await {
-                Ok(values) => NetEvent::Dht(DhtEvent::GetResult { key, values }),
-                Err(error) => {
-                    warn!(key = %hex_prefix(key.as_bytes()), error = %error, "DHT get failed");
-                    NetEvent::Dht(DhtEvent::Error {
-                        error: DhtError::Other(error.to_string()),
-                    })
-                }
+            if let Some(realm_id) = options.presence {
+                return serve_presence(ctx, realm_id, key, realm_filter, options).await;
             }
+            run_get(dht, key, realm_filter, options).await
         }
     }
+}
+
+async fn run_get(
+    dht: &DhtHandle,
+    key: DhtKeyId,
+    realm_filter: Option<RealmId>,
+    options: DhtGetOptions,
+) -> NetEvent {
+    match dht.get(&key, realm_filter, options).await {
+        Ok(values) => NetEvent::Dht(DhtEvent::GetResult {
+            key,
+            values,
+            stale: false,
+        }),
+        Err(error) => {
+            warn!(key = %hex_prefix(key.as_bytes()), error = %error, "DHT get failed");
+            NetEvent::Dht(DhtEvent::Error {
+                error: DhtError::Other(error.to_string()),
+            })
+        }
+    }
+}
+
+/// Serves realm presence from the snapshot when it is young enough, refreshing
+/// a stale one exactly once in the background instead of blocking the caller.
+async fn serve_presence(
+    ctx: &NetEffectContext,
+    realm_id: RealmId,
+    key: DhtKeyId,
+    realm_filter: Option<RealmId>,
+    options: DhtGetOptions,
+) -> NetEvent {
+    match ctx.presence.serve(realm_id, Instant::now()) {
+        PresenceServe::Fresh(values) => NetEvent::Dht(DhtEvent::GetResult {
+            key,
+            values,
+            stale: false,
+        }),
+        PresenceServe::Stale { values, refresh } => {
+            if refresh {
+                spawn_refresh(ctx, realm_id, key, realm_filter, options);
+            }
+            NetEvent::Dht(DhtEvent::GetResult {
+                key,
+                values,
+                stale: true,
+            })
+        }
+        PresenceServe::Cold => {
+            let event = run_get(ctx.dht.as_ref(), key, realm_filter, options).await;
+            if let NetEvent::Dht(DhtEvent::GetResult { values, .. }) = &event {
+                ctx.presence.store(realm_id, values.clone(), Instant::now());
+            }
+            event
+        }
+    }
+}
+
+fn spawn_refresh(
+    ctx: &NetEffectContext,
+    realm_id: RealmId,
+    key: DhtKeyId,
+    realm_filter: Option<RealmId>,
+    options: DhtGetOptions,
+) {
+    if ctx.tasks.is_closed() || ctx.shutdown.is_cancelled() {
+        ctx.presence.release(realm_id);
+        return;
+    }
+
+    let dht = ctx.dht.clone();
+    #[cfg(test)]
+    let refresh_probe = ctx.refresh_probe.clone();
+    spawn_refresh_task(
+        &ctx.presence,
+        &ctx.tasks,
+        &ctx.shutdown,
+        realm_id,
+        move |shutdown| async move {
+            #[cfg(test)]
+            if let Some(probe) = refresh_probe {
+                probe.started.notify_one();
+                tokio::select! {
+                    _ = shutdown.cancelled() => return None,
+                    _ = probe.release.notified() => {}
+                }
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => None,
+                result = dht.get(&key, realm_filter, options) => {
+                    Some(result.map_err(|error| error.to_string()))
+                }
+            }
+        },
+    );
+}
+
+fn spawn_refresh_task<F, Fut>(
+    presence: &RealmPresenceCache,
+    tasks: &TaskTracker,
+    shutdown: &CancellationToken,
+    realm_id: RealmId,
+    refresh: F,
+) where
+    F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = Option<Result<Vec<DhtEntry>, String>>> + Send + 'static,
+{
+    let presence = presence.clone();
+    let shutdown = shutdown.clone();
+    tasks.spawn(async move {
+        match refresh(shutdown).await {
+            Some(Ok(values)) => presence.store(realm_id, values, Instant::now()),
+            Some(Err(error)) => {
+                debug!(error = %error, "realm presence refresh failed; keeping the previous snapshot")
+            }
+            None => {}
+        }
+        presence.release(realm_id);
+    });
 }
 
 #[tracing::instrument(
@@ -158,12 +393,553 @@ fn stream_effect_kind(effect: &StreamEffect) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::audit_fallback;
+    use super::*;
     use aruna_core::audit::MAX_AUDIT_PEERS;
+    use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
+    use aruna_core::events::{DhtEvent, NetEvent};
     use aruna_core::id::NodeId;
+    use aruna_core::keys::realm_presence_key;
+    use aruna_storage::FjallStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    async fn handler_context(seed: u8) -> (crate::NetHandle, NetEffectContext, TempDir, RealmId) {
+        let directory = tempfile::tempdir().expect("test storage directory");
+        let storage = FjallStorage::open(directory.path().to_str().expect("test path"))
+            .expect("test storage");
+        let realm_id = RealmId::from_bytes([seed; 32]);
+        let handle = crate::NetHandle::new(
+            crate::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
+                realm_id,
+                discovery_method: crate::DiscoveryMethod::None,
+                relay_method: crate::RelayMethod::None,
+                ..crate::NetConfig::default()
+            },
+            storage,
+        )
+        .await
+        .expect("test net handle");
+        let context = NetEffectContext {
+            dht: handle.inner.dht.clone(),
+            document_sync: handle.inner.document_sync.clone(),
+            presence: RealmPresenceCache::default(),
+            tasks: TaskTracker::new(),
+            shutdown: CancellationToken::new(),
+            refresh_probe: None,
+        };
+        (handle, context, directory, realm_id)
+    }
+
+    async fn handler_pair(
+        seed: u8,
+    ) -> (
+        crate::NetHandle,
+        crate::NetHandle,
+        NetEffectContext,
+        TempDir,
+        TempDir,
+        RealmId,
+    ) {
+        let first_directory = tempfile::tempdir().expect("first storage directory");
+        let second_directory = tempfile::tempdir().expect("second storage directory");
+        let first_storage =
+            FjallStorage::open(first_directory.path().to_str().expect("first storage path"))
+                .expect("first storage");
+        let second_storage = FjallStorage::open(
+            second_directory
+                .path()
+                .to_str()
+                .expect("second storage path"),
+        )
+        .expect("second storage");
+        let realm_id = RealmId::from_bytes([seed; 32]);
+        let first_secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+        let second_secret = iroh::SecretKey::from_bytes(&[seed + 1; 32]);
+        let second_id = second_secret.public();
+        let first = crate::NetHandle::new(
+            crate::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("first bind address"),
+                secret_key: Some(first_secret),
+                realm_id,
+                peer_nodes: vec![second_id],
+                discovery_method: crate::DiscoveryMethod::None,
+                relay_method: crate::RelayMethod::None,
+                ..crate::NetConfig::default()
+            },
+            first_storage,
+        )
+        .await
+        .expect("first net handle");
+        let second = crate::NetHandle::new(
+            crate::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("second bind address"),
+                secret_key: Some(second_secret),
+                realm_id,
+                peer_nodes: vec![first.node_id()],
+                discovery_method: crate::DiscoveryMethod::None,
+                relay_method: crate::RelayMethod::None,
+                ..crate::NetConfig::default()
+            },
+            second_storage,
+        )
+        .await
+        .expect("second net handle");
+        first.add_peer_addr(second.endpoint_addr()).await;
+        second.add_peer_addr(first.endpoint_addr()).await;
+        let context = NetEffectContext {
+            dht: first.inner.dht.clone(),
+            document_sync: first.inner.document_sync.clone(),
+            presence: RealmPresenceCache::default(),
+            tasks: TaskTracker::new(),
+            shutdown: CancellationToken::new(),
+            refresh_probe: None,
+        };
+        (
+            first,
+            second,
+            context,
+            first_directory,
+            second_directory,
+            realm_id,
+        )
+    }
+
+    fn presence_effect(realm_id: RealmId) -> NetEffect {
+        NetEffect::Dht(DhtEffect::Get {
+            key: realm_presence_key(&realm_id),
+            realm_filter: Some(realm_id),
+            options: DhtGetOptions::presence(Duration::from_secs(4), realm_id),
+        })
+    }
+
+    fn stale_entry(realm_id: RealmId, seed: u8) -> DhtEntry {
+        make_entry(seed, realm_id)
+    }
+
+    async fn finish_tasks(context: &NetEffectContext) {
+        context.tasks.close();
+        context.tasks.wait().await;
+    }
 
     fn make_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn make_entry(seed: u8, realm_id: RealmId) -> DhtEntry {
+        DhtEntry {
+            node_id: make_node(seed),
+            realm_id,
+            value: Vec::new(),
+            expires_at: 0,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serves_fresh() {
+        let cache = RealmPresenceCache::default();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(1, realm_id)], start);
+
+        assert!(matches!(
+            cache.serve(realm_id, start + Duration::from_secs(5)),
+            PresenceServe::Fresh(values) if values.len() == 1
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_once() {
+        // A stale snapshot serves every caller but starts one refresh.
+        let cache = RealmPresenceCache::default();
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(2, realm_id)], start);
+        let stale = start + Duration::from_secs(20);
+
+        assert!(matches!(
+            cache.serve(realm_id, stale),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+        assert!(matches!(
+            cache.serve(realm_id, stale),
+            PresenceServe::Stale { refresh: false, .. }
+        ));
+
+        cache.release(realm_id);
+        assert!(matches!(
+            cache.serve(realm_id, stale),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_success() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(5, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, move |_| async move {
+            Some(Ok(vec![make_entry(6, realm_id)]))
+        });
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Fresh(values) if values[0].node_id == make_node(6)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_empty() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(6, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, |_| async {
+            Some(Ok(Vec::new()))
+        });
+        tasks.close();
+        tasks.wait().await;
+
+        assert_eq!(cache.serve(realm_id, Instant::now()), PresenceServe::Cold);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(7, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, |_| async {
+            Some(Err("offline".to_string()))
+        });
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, values } if values[0].node_id == make_node(7)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_cancel() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(8, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, |shutdown| async move {
+            shutdown.cancelled().await;
+            None
+        });
+        shutdown.cancel();
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_single_flight() {
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(9, realm_id)], start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let stale = Instant::now();
+        let first = cache.serve(realm_id, stale);
+        assert!(matches!(&first, PresenceServe::Stale { refresh: true, .. }));
+        let second = cache.serve(realm_id, stale);
+        assert!(matches!(
+            &second,
+            PresenceServe::Stale { refresh: false, .. }
+        ));
+
+        let calls_for_task = calls.clone();
+        if matches!(&first, PresenceServe::Stale { refresh: true, .. }) {
+            spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, move |_| async move {
+                calls_for_task.fetch_add(1, Ordering::SeqCst);
+                Some(Ok(vec![make_entry(10, realm_id)]))
+            });
+        }
+        tasks.close();
+        tasks.wait().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refreshes_through_handler() {
+        let (handle, context, _directory, realm_id) = handler_context(11).await;
+        let key = realm_presence_key(&realm_id);
+        let put = handle_net_effect(
+            &context,
+            NetEffect::Dht(DhtEffect::Put {
+                key,
+                realm_id,
+                value: Vec::new(),
+                ttl: Duration::from_secs(300),
+            }),
+        )
+        .await;
+        assert!(matches!(put, NetEvent::Dht(DhtEvent::PutComplete { .. })));
+
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 12)],
+            Instant::now() - Duration::from_secs(20),
+        );
+        let event = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            event,
+            NetEvent::Dht(DhtEvent::GetResult {
+                stale: true,
+                values,
+                ..
+            }) if values[0].node_id == make_node(12)
+        ));
+
+        finish_tasks(&context).await;
+        assert!(matches!(
+            context.presence.serve(realm_id, Instant::now()),
+            PresenceServe::Fresh(values) if values.iter().any(|entry| entry.node_id == handle.node_id())
+        ));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn empty_refresh_handler() {
+        let (handle, peer, context, _first_directory, _second_directory, realm_id) =
+            handler_pair(13).await;
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 13)],
+            Instant::now() - Duration::from_secs(20),
+        );
+
+        let event = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            event,
+            NetEvent::Dht(DhtEvent::GetResult {
+                stale: true,
+                values,
+                ..
+            }) if values.len() == 1
+        ));
+        finish_tasks(&context).await;
+        assert_eq!(
+            context.presence.serve(realm_id, Instant::now()),
+            PresenceServe::Cold
+        );
+        handle.shutdown().await;
+        peer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_handler() {
+        let (handle, context, _directory, realm_id) = handler_context(14).await;
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 14)],
+            Instant::now() - Duration::from_secs(20),
+        );
+        handle.shutdown().await;
+
+        let event = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            event,
+            NetEvent::Dht(DhtEvent::GetResult {
+                stale: true,
+                values,
+                ..
+            }) if values.len() == 1
+        ));
+        finish_tasks(&context).await;
+        assert!(matches!(
+            context.presence.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, values } if values.len() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_handler() {
+        let (handle, context, _directory, realm_id) = handler_context(15).await;
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 15)],
+            Instant::now() - Duration::from_secs(20),
+        );
+        context.shutdown.cancel();
+
+        let event = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            event,
+            NetEvent::Dht(DhtEvent::GetResult { stale: true, .. })
+        ));
+        assert!(matches!(
+            context.presence.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn single_flight_handler() {
+        let (handle, mut context, _directory, realm_id) = handler_context(16).await;
+        let probe = Arc::new(RefreshProbe::new());
+        context.refresh_probe = Some(probe.clone());
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 16)],
+            Instant::now() - Duration::from_secs(20),
+        );
+
+        let started = probe.started.notified();
+        let first = handle_net_effect(&context, presence_effect(realm_id)).await;
+        tokio::time::timeout(Duration::from_secs(30), started)
+            .await
+            .expect("presence refresh must start");
+        let second = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            first,
+            NetEvent::Dht(DhtEvent::GetResult { stale: true, .. })
+        ));
+        assert!(matches!(
+            second,
+            NetEvent::Dht(DhtEvent::GetResult { stale: true, .. })
+        ));
+        assert!(matches!(
+            context.presence.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: false, .. }
+        ));
+        probe.release.notify_one();
+        finish_tasks(&context).await;
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn closed_tracker_handler() {
+        let (handle, context, _directory, realm_id) = handler_context(17).await;
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 17)],
+            Instant::now() - Duration::from_secs(20),
+        );
+        context.tasks.close();
+
+        let event = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            event,
+            NetEvent::Dht(DhtEvent::GetResult { stale: true, .. })
+        ));
+        assert!(matches!(
+            context.presence.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn expired_presence_handler() {
+        let (handle, peer, context, _first_directory, _second_directory, realm_id) =
+            handler_pair(18).await;
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 18)],
+            Instant::now() - PRESENCE_MAX_STALE - Duration::from_secs(1),
+        );
+
+        let event = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            event,
+            NetEvent::Dht(DhtEvent::GetResult {
+                stale: false,
+                values,
+                ..
+            }) if values.is_empty()
+        ));
+        finish_tasks(&context).await;
+        assert_eq!(
+            context.presence.serve(realm_id, Instant::now()),
+            PresenceServe::Cold
+        );
+        handle.shutdown().await;
+        peer.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expires_when_old() {
+        let cache = RealmPresenceCache::default();
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(3, realm_id)], start);
+
+        assert_eq!(
+            cache.serve(
+                realm_id,
+                start + PRESENCE_MAX_STALE + Duration::from_secs(1)
+            ),
+            PresenceServe::Cold
+        );
+        assert_eq!(
+            cache.serve(RealmId::from_bytes([9u8; 32]), start),
+            PresenceServe::Cold
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skips_empty() {
+        // Caching "nobody announced yet" would delay discovery of a peer that
+        // announces inside the freshness window.
+        let cache = RealmPresenceCache::default();
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, Vec::new(), start);
+        assert_eq!(cache.serve(realm_id, start), PresenceServe::Cold);
+
+        cache.store(realm_id, vec![make_entry(4, realm_id)], start);
+        cache.store(realm_id, Vec::new(), start);
+        assert_eq!(cache.serve(realm_id, start), PresenceServe::Cold);
     }
 
     #[test]

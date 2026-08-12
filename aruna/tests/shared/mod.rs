@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use aruna::bootstrap::{
-    announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
-    wait_for_onboarding_placement,
+    fetch_core_onboarding_documents, prepare_core_documents, publish_core_documents,
+    realm_bootstrap_exists, wait_for_onboarding_placement,
 };
 use aruna::config::{Config, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna_api::cors::CorsConfig;
@@ -621,7 +621,9 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     )
     .await
     .map_err(std::io::Error::other)?;
-    announce_core_documents(context.as_ref(), net.node_id(), &realm_id, true).await?;
+    let documents =
+        prepare_core_documents(context.as_ref(), net.node_id(), realm_id, true, true).await?;
+    publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
     // Mirrors the startup path in main.rs: the seed is rank-0 holder of every
     // shard in its single-node realm and must create the shard topic geneses
     // eagerly, or its first shard-classed writes defer forever.
@@ -751,11 +753,20 @@ async fn spawn_joiner_node_with_mode(
     )
     .await
     .map_err(std::io::Error::other)?;
-    announce_core_documents(
+    let documents = prepare_core_documents(
         joiner_context.as_ref(),
         config.node_id,
-        &config.realm_id,
+        config.realm_id,
         false,
+        true,
+    )
+    .await?;
+    publish_core_documents(
+        joiner_context.as_ref(),
+        config.node_id,
+        config.realm_id,
+        false,
+        documents,
     )
     .await?;
     mark_node_state_complete(&joiner_context.storage_handle, &config.node_state).await?;

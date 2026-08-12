@@ -43,3 +43,6 @@ ulid = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }

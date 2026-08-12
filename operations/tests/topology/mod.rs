@@ -47,7 +47,6 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::{
@@ -150,8 +149,6 @@ impl Topology {
             )
             .await?;
         }
-        wait_for_realm_nodes(&nodes, realm_id).await?;
-
         let config = install_realm_config(&nodes, realm_id, user_id, replication_factor).await?;
 
         Ok(Self {
@@ -742,21 +739,6 @@ async fn read_realm_config(node: &TestNode, realm_id: RealmId) -> TestResult<Rea
         }
         other => Err(format!("unexpected realm config read event: {other:?}").into()),
     }
-}
-
-async fn wait_for_realm_nodes(nodes: &[TestNode], realm_id: RealmId) -> TestResult<()> {
-    let expected: HashSet<NodeId> = nodes.iter().map(TestNode::node_id).collect();
-    wait_for_convergence("realm nodes did not converge", || async {
-        let mut pending = 0;
-        for node in nodes {
-            match drive(GetRealmNodesOperation::new(realm_id), node.context.as_ref()).await {
-                Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => pending += 1,
-            }
-        }
-        Ok(pending)
-    })
-    .await
 }
 
 /// Polls `predicate` until it holds, resilient to a slow-but-converging run via

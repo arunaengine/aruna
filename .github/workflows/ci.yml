@@ -22,9 +22,9 @@ env:
 jobs:
   tests:
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget: far above the minutes a healthy run
-    # takes, so only a deadlocked or unbounded-wait test trips it.
-    timeout-minutes: 45
+    # Hang cap, not a performance budget: a healthy cold-cache run measures
+    # ~48 minutes, so only a deadlocked or unbounded-wait test trips this.
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -152,7 +152,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Run ShellCheck
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh scripts/tests/*.sh
 
   compose-config:
     runs-on: ubuntu-latest
@@ -165,3 +165,437 @@ jobs:
         run: |
           docker compose -f scripts/compose.yaml config --quiet
           docker compose -f scripts/keycloak/docker-compose.yml config --quiet
+
+  alert-rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # promtool comes from the Compose-pinned Prometheus image, so rule
+      # validation adds no toolchain and runs without network access.
+      - name: Validate and test alert rules
+        env:
+          PROMETHEUS_IMAGE: prom/prometheus:v3.5.3@sha256:ddc2493835a1509976d5e4e0c94199c4f843ce1f42dd6bcfc8231ba734a93ff7
+        run: |
+          set -euo pipefail
+          for file in aruna-alerts.yml aruna-alerts.test.yml; do
+            test -f "scripts/observability/$file" \
+              || { echo "missing scripts/observability/$file" >&2; exit 1; }
+          done
+          promtool() {
+            docker run --rm --network none \
+              --volume "$PWD/scripts/observability:/rules:ro" \
+              --entrypoint /bin/promtool \
+              "$PROMETHEUS_IMAGE" "$@"
+          }
+          promtool check rules /rules/aruna-alerts.yml
+          promtool test rules /rules/aruna-alerts.test.yml
+
+  just-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install just
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: just
+
+      - name: Run recipe contract tests
+        run: bash scripts/tests/just_recipes.sh
+
+  cluster-start:
+    runs-on: ubuntu-latest
+    # Hang cap for the four cluster recipes plus one release build.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install just
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: just
+
+      - name: Build the deployment binaries once
+        run: cargo build --release --locked -p aruna -p aruna-doctor
+
+      - name: Start the cluster recipes
+        run: |
+          set -euo pipefail
+          set -m
+          WORK_DIR="$(mktemp -d)"
+          FIXTURE_DIR="$WORK_DIR/artifacts"
+          PORTAL_SRC="$WORK_DIR/portal fixture"
+          KEYCLOAK_PROJECT="aruna-cluster-start-$GITHUB_RUN_ID"
+          DEPLOY_ROOT=""
+          RECIPE_LOG=""
+          ARTIFACT_PID=""
+          RECIPE_PID=""
+          mkdir -p "$FIXTURE_DIR" "$PORTAL_SRC"
+
+          cleanup() {
+            local status=$?
+            [ -z "$RECIPE_PID" ] || kill -INT -"$RECIPE_PID" 2>/dev/null || true
+            [ -z "$ARTIFACT_PID" ] || kill "$ARTIFACT_PID" 2>/dev/null || true
+            docker compose --project-name "$KEYCLOAK_PROJECT" \
+              --file scripts/keycloak/docker-compose.yml down --volumes >/dev/null 2>&1 || true
+            rm -rf "$WORK_DIR"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          die() { echo "startup check failure: $*" >&2; exit 1; }
+
+          # A contiguous, currently unused window for four ports per node plus Keycloak.
+          pick_base_port() {
+            local listeners base port busy
+            listeners="$(ss -ltnH | awk '{ n = split($4, parts, ":"); print parts[n] }')"
+            for _ in $(seq 1 40); do
+              base=$(( (RANDOM % 200) * 100 + 30000 ))
+              busy=0
+              for port in $(seq "$base" $((base + 49))); do
+                if printf '%s\n' "$listeners" | grep -qx "$port"; then busy=1; break; fi
+              done
+              if [ "$busy" -eq 0 ]; then printf '%s\n' "$base"; return 0; fi
+            done
+            die "no free test port range"
+          }
+
+          BASE_PORT="$(pick_base_port)"
+          ARTIFACT_PORT=$((BASE_PORT + 60))
+          KEYCLOAK_PORT=$((BASE_PORT + 21))
+
+          # Local portal artifact: no release API and no remote download.
+          printf '<html>portal fixture</html>\n' >"$PORTAL_SRC/index.html"
+          tar -czf "$FIXTURE_DIR/aruna-portal-dist.tar.gz" -C "$PORTAL_SRC" index.html
+          ( cd "$FIXTURE_DIR" \
+            && sha256sum aruna-portal-dist.tar.gz >aruna-portal-dist.tar.gz.sha256 )
+          python3 -m http.server --bind 127.0.0.1 --directory "$FIXTURE_DIR" "$ARTIFACT_PORT" \
+            >"$WORK_DIR/artifact-server.log" 2>&1 &
+          ARTIFACT_PID=$!
+          for _ in $(seq 1 30); do
+            curl -sf --max-time 6 -o /dev/null \
+              "http://127.0.0.1:$ARTIFACT_PORT/aruna-portal-dist.tar.gz" && break
+            sleep 1
+          done
+          curl -sf --max-time 6 -o /dev/null \
+            "http://127.0.0.1:$ARTIFACT_PORT/aruna-portal-dist.tar.gz" \
+            || die "the local artifact server never answered"
+
+          export ARUNA_TEST_DEPLOY_SKIP_BUILD=1
+          export ARUNA_TEST_DEPLOY_BASE_PORT="$BASE_PORT"
+          export ARUNA_TEST_DEPLOY_KEYCLOAK_PORT="$KEYCLOAK_PORT"
+          export ARUNA_TEST_DEPLOY_KEYCLOAK_PROJECT="$KEYCLOAK_PROJECT"
+          export ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS=180
+          export PORTAL_ARTIFACT_URL="http://127.0.0.1:$ARTIFACT_PORT/aruna-portal-dist.tar.gz"
+
+          dump_log() {
+            echo "--- last 80 lines of $1"
+            tail -n 80 "$1" || true
+            for node_log in "$DEPLOY_ROOT"/node-*/*.log; do
+              [ -f "$node_log" ] || continue
+              echo "--- last 40 lines of $node_log"
+              tail -n 40 "$node_log" || true
+            done
+          }
+
+          start_recipe() {
+            local name=$1
+            shift
+            DEPLOY_ROOT="$WORK_DIR/$name"
+            RECIPE_LOG="$WORK_DIR/$name.log"
+            export ARUNA_TEST_DEPLOY_ROOT="$DEPLOY_ROOT"
+            just "$@" >"$RECIPE_LOG" 2>&1 &
+            RECIPE_PID=$!
+
+            local deadline=$((SECONDS + 420))
+            until grep -q 'Deployment summary:' "$RECIPE_LOG"; do
+              if ! kill -0 "$RECIPE_PID" 2>/dev/null; then
+                dump_log "$RECIPE_LOG"
+                die "$name exited before it was ready"
+              fi
+              if ((SECONDS >= deadline)); then
+                dump_log "$RECIPE_LOG"
+                die "$name never reported a deployment summary"
+              fi
+              sleep 2
+            done
+          }
+
+          stop_recipe() {
+            kill -INT -"$RECIPE_PID" 2>/dev/null || true
+            wait "$RECIPE_PID" 2>/dev/null || true
+            RECIPE_PID=""
+          }
+
+          expect_status() {
+            local url=$1
+            local expected=$2
+            local actual
+            actual="$(curl -s -L --max-time 10 -o /dev/null -w '%{http_code}' "$url" || true)"
+            [ "$actual" = "$expected" ] || die "expected $expected from $url, got $actual"
+          }
+
+          assert_common() {
+            local name=$1
+            local nodes=$2
+            local index port pid
+
+            grep -Eq '^ADMIN_TOKEN=.+' "$RECIPE_LOG" || die "$name printed no admin token"
+            [ "$(grep -c '^node-' "$DEPLOY_ROOT/summary.txt")" = "$nodes" ] \
+              || die "$name summary does not list $nodes nodes"
+            for index in $(seq 1 "$nodes"); do
+              pid="$(cat "$DEPLOY_ROOT/node-$index/node-$index.pid")"
+              kill -0 "$pid" 2>/dev/null || die "$name node-$index is not running"
+              port=$((BASE_PORT + (index - 1) * 10 + 4))
+              expect_status "http://127.0.0.1:$port/healthz" 200
+              expect_status "http://127.0.0.1:$port/readyz" 200
+            done
+          }
+
+          assert_keycloak() {
+            local expected=$1
+            local actual
+            actual="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' \
+              "http://127.0.0.1:$KEYCLOAK_PORT/realms/aruna/.well-known/openid-configuration" || true)"
+            if [ "$expected" = "up" ]; then
+              [ "$actual" = "200" ] || die "Keycloak discovery answered $actual"
+            else
+              [ "$actual" != "200" ] || die "Keycloak is running for a non-OIDC recipe"
+            fi
+          }
+
+          assert_portal() {
+            local nodes=$1
+            local index port body
+            for index in $(seq 1 "$nodes"); do
+              port=$((BASE_PORT + (index - 1) * 10 + 1))
+              expect_status "http://127.0.0.1:$port/" 200
+              expect_status "http://127.0.0.1:$port/api-docs/openapi.json" 200
+              body="$(curl -s -L --max-time 10 "http://127.0.0.1:$port/")"
+              case "$body" in
+                *"<html"*) ;;
+                *) die "node-$index served no portal document" ;;
+              esac
+            done
+            grep -q '^portal dir=' "$DEPLOY_ROOT/summary.txt" || die "no portal summary entry"
+          }
+
+          assert_stopped() {
+            local index port
+            for index in $(seq 1 2); do
+              for port in $((BASE_PORT + (index - 1) * 10 + 1)) $((BASE_PORT + (index - 1) * 10 + 4)); do
+                [ -z "$(ss -ltnH "sport = :$port")" ] || die "port $port still has a listener"
+              done
+            done
+          }
+
+          echo "::group::just local-cluster nodes=2"
+          start_recipe local-cluster local-cluster nodes=2
+          assert_common local-cluster 2
+          assert_keycloak down
+          stop_recipe
+          assert_stopped
+          echo "::endgroup::"
+
+          echo "::group::just local-cluster-oidc nodes=2"
+          start_recipe local-cluster-oidc local-cluster-oidc nodes=2
+          assert_common local-cluster-oidc 2
+          assert_keycloak up
+          stop_recipe
+          assert_stopped
+          echo "::endgroup::"
+
+          echo "::group::just preview nodes=2"
+          start_recipe preview preview nodes=2
+          assert_common preview 2
+          assert_keycloak up
+          assert_portal 2
+          grep -q 'portal fixture' "$DEPLOY_ROOT/portal/index.html" \
+            || die "preview did not install the locally served portal artifact"
+          stop_recipe
+          assert_stopped
+          echo "::endgroup::"
+
+          echo "::group::just preview-no-oidc with an explicit portal dir"
+          start_recipe preview-no-oidc preview-no-oidc "portal_dir=$PORTAL_SRC" nodes=2
+          assert_common preview-no-oidc 2
+          assert_keycloak down
+          assert_portal 2
+          stop_recipe
+          assert_stopped
+          echo "::endgroup::"
+
+          echo "all cluster recipes started and stopped cleanly"
+
+  compose-start:
+    runs-on: ubuntu-latest
+    # Hang cap for the container image build plus both compose recipes.
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install just
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: just
+
+      - name: Build the compose image once
+        run: docker compose --file scripts/compose.yaml build aruna
+
+      - name: Start the compose recipes
+        run: |
+          set -euo pipefail
+          WORK_DIR="$(mktemp -d)"
+          DATA_DIR="$WORK_DIR/state"
+          PROJECT="aruna-compose-start-$GITHUB_RUN_ID"
+          mkdir -p "$DATA_DIR"
+
+          cleanup() {
+            local status=$?
+            docker compose --file scripts/compose.yaml --project-name "$PROJECT" \
+              down --volumes --remove-orphans >/dev/null 2>&1 || true
+            sudo rm -rf "$WORK_DIR"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          die() { echo "startup check failure: $*" >&2; exit 1; }
+
+          pick_base_port() {
+            local listeners base port busy
+            listeners="$(ss -ltnH | awk '{ n = split($4, parts, ":"); print parts[n] }')"
+            for _ in $(seq 1 40); do
+              base=$(( (RANDOM % 200) * 100 + 30000 ))
+              busy=0
+              for port in $(seq "$base" $((base + 9))); do
+                if printf '%s\n' "$listeners" | grep -qx "$port"; then busy=1; break; fi
+              done
+              if [ "$busy" -eq 0 ]; then printf '%s\n' "$base"; return 0; fi
+            done
+            die "no free test port range"
+          }
+
+          BASE_PORT="$(pick_base_port)"
+          REST_PORT=$((BASE_PORT + 1))
+          P2P_PORT=$((BASE_PORT + 2))
+          OPS_PORT=$((BASE_PORT + 3))
+          S3_PORT=$((BASE_PORT + 4))
+          KEYCLOAK_PORT=$((BASE_PORT + 5))
+          PROMETHEUS_PORT=$((BASE_PORT + 6))
+          GRAFANA_PORT=$((BASE_PORT + 7))
+
+          {
+            echo "STORAGE_PATH=/data"
+            echo "ARUNA_FJALL_PERSIST_MODE=buffer"
+            echo "SOCKET_ADDRESS=127.0.0.1:$REST_PORT"
+            echo "P2P_SOCKET_ADDRESS=127.0.0.1:$P2P_PORT"
+            echo "OPS_SOCKET_ADDRESS=127.0.0.1:$OPS_PORT"
+            echo "API_PUBLIC_URL=http://127.0.0.1:$REST_PORT"
+            echo "S3_HOST=127.0.0.1:$S3_PORT"
+            echo "S3_PUBLIC_URL=http://127.0.0.1:$S3_PORT"
+            echo "S3_ADDRESS=127.0.0.1:$S3_PORT"
+            echo "REALM_DESCRIPTION=\"Compose Start Realm\""
+            echo "OIDC_PROVIDER_IDS=main"
+            echo "OIDC_MAIN_ISSUER=http://localhost:$KEYCLOAK_PORT/realms/aruna"
+            echo "OIDC_MAIN_AUDIENCE=aruna-api"
+            echo "OIDC_MAIN_DISCOVERY_URL=http://localhost:$KEYCLOAK_PORT/realms/aruna/.well-known/openid-configuration"
+            echo "RUST_LOG=info"
+          } >"$WORK_DIR/compose.aruna.env"
+
+          {
+            echo "global:"
+            echo "  scrape_interval: 15s"
+            echo "  scrape_timeout: 5s"
+            echo "rule_files:"
+            echo "  - aruna-alerts.yml"
+            echo "scrape_configs:"
+            echo "  - job_name: aruna"
+            echo "    metrics_path: /metrics"
+            echo "    static_configs:"
+            echo "      - targets:"
+            echo "          - 127.0.0.1:$OPS_PORT"
+          } >"$WORK_DIR/prometheus.yml"
+
+          export ARUNA_COMPOSE_PROJECT_NAME="$PROJECT"
+          export ARUNA_COMPOSE_DATA_DIR="$DATA_DIR"
+          export ARUNA_COMPOSE_ENV_FILE="$WORK_DIR/compose.aruna.env"
+          export ARUNA_COMPOSE_SKIP_BUILD=1
+          export ARUNA_COMPOSE_READY_TIMEOUT_SECS=240
+          export ARUNA_KEYCLOAK_PORT="$KEYCLOAK_PORT"
+          export ARUNA_PROMETHEUS_PORT="$PROMETHEUS_PORT"
+          export ARUNA_PROMETHEUS_CONFIG="$WORK_DIR/prometheus.yml"
+          export ARUNA_GRAFANA_PORT="$GRAFANA_PORT"
+
+          compose() {
+            docker compose --file scripts/compose.yaml --project-name "$PROJECT" "$@"
+          }
+
+          dump_logs() {
+            echo "--- last 80 lines of $1"
+            tail -n 80 "$1" || true
+            compose logs --no-color --tail 80 || true
+          }
+
+          expect_status() {
+            local url=$1
+            local expected=$2
+            local actual
+            actual="$(curl -s -L --max-time 10 -o /dev/null -w '%{http_code}' "$url" || true)"
+            [ "$actual" = "$expected" ] || die "expected $expected from $url, got $actual"
+          }
+
+          assert_stack() {
+            local name=$1
+            local running
+            grep -Eq '^ADMIN_TOKEN=.+' "$WORK_DIR/$name.log" || die "$name printed no admin token"
+            running="$(compose ps --status running --services | sort | tr '\n' ' ')"
+            [ "$running" = "aruna grafana keycloak prometheus " ] \
+              || die "$name has unexpected running services: $running"
+            expect_status "http://127.0.0.1:$OPS_PORT/healthz" 200
+            expect_status "http://127.0.0.1:$OPS_PORT/readyz" 200
+            expect_status "http://127.0.0.1:$REST_PORT/api-docs/openapi.json" 200
+          }
+
+          echo "::group::just local-new"
+          if ! just local-new >"$WORK_DIR/local-new.log" 2>&1; then
+            dump_logs "$WORK_DIR/local-new.log"
+            die "just local-new failed"
+          fi
+          assert_stack local-new
+          echo "::endgroup::"
+
+          echo "::group::just local"
+          if ! just local >"$WORK_DIR/local.log" 2>&1; then
+            dump_logs "$WORK_DIR/local.log"
+            die "just local failed"
+          fi
+          assert_stack local
+          echo "::endgroup::"
+
+          compose down --volumes --remove-orphans
+          [ -z "$(docker ps --quiet --filter "label=com.docker.compose.project=$PROJECT")" ] \
+            || die "test containers leaked"
+
+          echo "both compose recipes started and stopped cleanly"
