@@ -731,6 +731,11 @@ async fn start_background(background: Background) {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before any startup work: readiness opens and background children start
+    // long before this point, and an uninstalled handler would let the signal
+    // kill the node instead of draining it.
+    let mut signal = tokio::spawn(wait_for_signal());
+
     let Runtime {
         config,
         driver_ctx,
@@ -781,7 +786,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
 
-    let mut signal = tokio::spawn(wait_for_signal());
     let mut rest_handle = Some(rest_handle);
     let mut s3_handle = Some(s3_handle);
 

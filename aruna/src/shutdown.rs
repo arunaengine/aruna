@@ -397,37 +397,37 @@ async fn second_signal_code() -> Option<i32> {
     tokio::signal::ctrl_c().await.ok().map(|_| 130)
 }
 
-/// Resolves on SIGTERM (what Kubernetes sends) or SIGINT.
+/// Installs the handlers now; the returned future resolves on SIGTERM (what
+/// Kubernetes sends) or SIGINT. Installing before startup work is the point:
+/// a signal with no handler kills the process outright, skipping the drain.
 #[cfg(unix)]
-pub async fn wait_for_signal() {
+pub fn wait_for_signal() -> impl Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(signal) => signal,
-        Err(error) => {
-            error!(error = %error, "Failed to install SIGTERM handler");
-            return;
-        }
-    };
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-        Ok(signal) => signal,
-        Err(error) => {
-            error!(error = %error, "Failed to install SIGINT handler");
-            return;
-        }
-    };
-
-    let signal_name = tokio::select! {
-        _ = terminate.recv() => "SIGTERM",
-        _ = interrupt.recv() => "SIGINT",
-    };
-    info!(signal = signal_name, "Received termination signal");
+    let installed = signal(SignalKind::terminate())
+        .and_then(|term| signal(SignalKind::interrupt()).map(|interrupt| (term, interrupt)));
+    async move {
+        let (mut terminate, mut interrupt) = match installed {
+            Ok(handlers) => handlers,
+            Err(error) => {
+                error!(error = %error, "Failed to install termination handlers");
+                return;
+            }
+        };
+        let signal_name = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        info!(signal = signal_name, "Received termination signal");
+    }
 }
 
 #[cfg(not(unix))]
-pub async fn wait_for_signal() {
-    if tokio::signal::ctrl_c().await.is_ok() {
-        info!(signal = "CTRL_C", "Received termination signal");
+pub fn wait_for_signal() -> impl Future<Output = ()> {
+    async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!(signal = "CTRL_C", "Received termination signal");
+        }
     }
 }
 
