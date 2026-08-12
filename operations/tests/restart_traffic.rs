@@ -210,10 +210,11 @@ async fn seed_restart_documents(
     let group_id = Ulid::generate();
     let targets = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
     let created = run_writer(realm_id, group_id, SEED_DOCUMENTS, "seed", targets).await?;
+    let sample_stride = created.len().div_ceil(40);
     let sample: Vec<(GroupId, Ulid)> = created
         .iter()
-        .rev()
-        .take(40)
+        .step_by(sample_stride)
+        .chain(created.last())
         .map(|(group_id, document_id)| (*group_id, *document_id))
         .collect();
     wait_sample_visible(&nodes[2].context, &sample).await?;
