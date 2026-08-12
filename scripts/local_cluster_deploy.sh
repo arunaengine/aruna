@@ -336,46 +336,22 @@ generate_test_token() {
   printf '%s\n' "$token"
 }
 
-extract_onboarding_secret_from_log() {
-  local log_file=$1
-  local line
-  local secret=""
+# The node never reveals its initial secret, so mint a fresh one against the
+# stopped node's storage. The caller owns the single-writer lock.
+mint_onboarding_secret() {
+  local node_dir=$1
+  local raw_output
 
-  [[ -f "$log_file" ]] || return 0
+  raw_output="$(
+    cd "$node_dir" || exit 1
+    env -i PATH="$PATH" "$ARUNA_DOCTOR_BIN" recover-admin
+  )" || die "aruna-doctor recover-admin failed in $node_dir"
 
-  while IFS= read -r line; do
-    case "$line" in
-      *onboarding_secret=*)
-        secret="${line#*onboarding_secret=}"
-        secret="${secret%%[[:space:]]*}"
-        ;;
-    esac
-  done <"$log_file"
+  raw_output="${raw_output%$'\n'}"
+  local secret="${raw_output##*$'\n'}"
+  [[ -n "$secret" ]] || die "aruna-doctor recover-admin printed no secret"
 
   printf '%s\n' "$secret"
-}
-
-wait_for_initial_onboarding_secret() {
-  local log_file=$1
-  local pid=$2
-  local deadline=$((SECONDS + READY_TIMEOUT_SECS))
-  local secret
-
-  while true; do
-    secret="$(extract_onboarding_secret_from_log "$log_file")"
-    if [[ -n "$secret" ]]; then
-      printf '%s\n' "$secret"
-      return 0
-    fi
-
-    if ! kill -0 "$pid" >/dev/null 2>&1; then
-      die "node-1 exited before it logged the initial onboarding secret; inspect $log_file"
-    fi
-    if ((SECONDS >= deadline)); then
-      die "timed out waiting for the initial onboarding secret in $log_file"
-    fi
-    sleep 1
-  done
 }
 
 probe_readiness() {
@@ -754,16 +730,24 @@ start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
 NODE_1_PID="$STARTED_PID"
 wait_for_ready "${NODE_NAMES[0]}" "${NODE_OPS_PORTS[0]}" "$NODE_1_PID"
 
-log "Reading the initial onboarding secret from ${NODE_NAMES[0]}"
-INITIAL_LOCAL_ONBOARDING_SECRET="$(wait_for_initial_onboarding_secret "${NODE_DIRS[0]}/${NODE_NAMES[0]}.log" "$NODE_1_PID")"
+log "Stopping ${NODE_NAMES[0]} to unlock local storage for bootstrap"
+kill "$NODE_1_PID" >/dev/null 2>&1 || true
+wait "$NODE_1_PID" 2>/dev/null || true
+PIDS=()
+
+log "Minting the initial onboarding secret on ${NODE_NAMES[0]}"
+INITIAL_LOCAL_ONBOARDING_SECRET="$(mint_onboarding_secret "${NODE_DIRS[0]}")"
+
+# The OIDC token exchange runs against the live node; the direct path needs the
+# storage lock the stopped node just released.
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  log "Restarting ${NODE_NAMES[0]} before the OIDC token exchange"
+  start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
+  NODE_1_PID="$STARTED_PID"
+  wait_for_ready "${NODE_NAMES[0]}" "${NODE_OPS_PORTS[0]}" "$NODE_1_PID"
+fi
 
 log "Generating the bootstrap admin token from ${NODE_NAMES[0]}"
-if [[ "$WITH_KEYCLOAK" != "1" ]]; then
-  log "Stopping ${NODE_NAMES[0]} to unlock local storage for bootstrap token creation"
-  kill "$NODE_1_PID" >/dev/null 2>&1 || true
-  wait "$NODE_1_PID" 2>/dev/null || true
-  PIDS=()
-fi
 INITIAL_ADMIN_TOKEN="$(generate_test_token "${NODE_DIRS[0]}" "$INITIAL_LOCAL_ONBOARDING_SECRET")"
 printf 'ADMIN_TOKEN=%s\n' "$INITIAL_ADMIN_TOKEN"
 

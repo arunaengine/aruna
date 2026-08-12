@@ -194,59 +194,18 @@ wait_until_ready() {
   done
 }
 
-strip_ansi_sequences() {
-  local value=$1
-  local esc=$'\033'
-  local prefix
-  local rest
+# The node never reveals its initial secret, so mint a fresh one against the
+# state directory. Storage is single-writer, so the aruna service must be down.
+mint_onboarding_secret() {
+  local raw_output
 
-  while [[ "$value" == *"${esc}["* ]]; do
-    prefix="${value%%"${esc}["*}"
-    rest="${value#*"${esc}["}"
+  raw_output="$(compose run --rm --no-deps aruna /run/aruna-doctor recover-admin)" || return 1
 
-    if [[ "$rest" != *[[:alpha:]]* ]]; then
-      break
-    fi
+  raw_output="${raw_output%$'\n'}"
+  local secret="${raw_output##*$'\n'}"
+  [[ -n "$secret" ]] || return 1
 
-    rest="${rest#*[[:alpha:]]}"
-    value="${prefix}${rest}"
-  done
-
-  printf '%s\n' "$value"
-}
-
-wait_for_initial_onboarding_secret() {
-  local deadline=$((SECONDS + READY_TIMEOUT_SECS))
-  local secret
-  local logs
-  local line
-  local plain_line
-
-  while true; do
-    logs="$(compose logs --no-color --tail 200 aruna 2>/dev/null || true)"
-    secret=""
-
-    while IFS= read -r line; do
-      plain_line="$(strip_ansi_sequences "$line")"
-
-      case "$plain_line" in
-        *onboarding_secret=*)
-          secret="${plain_line#*onboarding_secret=}"
-          secret="${secret%%[[:space:]]*}"
-          ;;
-      esac
-    done <<<"$logs"
-
-    if [[ -n "$secret" ]]; then
-      printf '%s\n' "$secret"
-      return 0
-    fi
-
-    if ((SECONDS >= deadline)); then
-      die "timed out waiting for the initial onboarding secret"
-    fi
-    sleep 1
-  done
+  printf '%s\n' "$secret"
 }
 
 create_admin_token() {
@@ -296,10 +255,13 @@ bootstrap_fresh_state() {
   start_stack
   wait_until_ready "$OPS_READY_URL"
 
-  log "Reading initial onboarding secret"
-  if ! bootstrap_secret="$(wait_for_initial_onboarding_secret)"; then
-    die "failed to read the initial onboarding secret"
+  log "Minting the initial onboarding secret"
+  compose stop aruna >/dev/null 2>&1 || die "failed to stop the aruna service"
+  if ! bootstrap_secret="$(mint_onboarding_secret)"; then
+    die "failed to mint the initial onboarding secret"
   fi
+  compose start aruna >/dev/null 2>&1 || die "failed to restart the aruna service"
+  wait_until_ready "$OPS_READY_URL"
 
   log "Bootstrapping initial admin user via OIDC"
   if ! token="$(create_admin_token "$bootstrap_secret")"; then
