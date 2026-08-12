@@ -22,9 +22,9 @@ env:
 jobs:
   tests:
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget: far above the minutes a healthy run
-    # takes, so only a deadlocked or unbounded-wait test trips it.
-    timeout-minutes: 45
+    # Hang cap, not a performance budget: a healthy cold-cache run measures
+    # ~48 minutes, so only a deadlocked or unbounded-wait test trips this.
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
