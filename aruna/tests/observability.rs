@@ -615,18 +615,24 @@ mod process {
 
         async fn wait_path(&mut self, path: PathBuf, expected: &str) {
             let deadline = Instant::now() + HANG_GUARD;
-            while Instant::now() < deadline {
-                if std::fs::read_to_string(&path)
+            let reached = |path: &PathBuf| {
+                std::fs::read_to_string(path)
                     .map(|value| value.trim() == expected)
                     .unwrap_or(false)
-                {
+            };
+            while Instant::now() < deadline {
+                if reached(&path) {
                     return;
                 }
                 if !self.is_running() {
-                    panic!(
+                    // The exit check races the write, so the file decides: an
+                    // exited process cannot have written the barrier late.
+                    assert!(
+                        reached(&path),
                         "process exited before test barrier reached {expected}\n{}",
                         self.logs()
                     );
+                    return;
                 }
                 tokio::task::yield_now().await;
             }
