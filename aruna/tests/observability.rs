@@ -1213,17 +1213,11 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
 async fn second_signal_exits() -> TestResult<()> {
     use std::os::unix::process::ExitStatusExt;
 
+    // The pinned recovery and outbox children keep the drain active until the
+    // second signal lands; without them shutdown can win the /readyz probe.
     let env = process::NodeEnv::new();
-    let mut first = env.launch();
-    first.wait_status("/readyz", StatusCode::OK).await;
-    first.terminate().await;
+    let mut node = prepare_shutdown(&env).await?;
 
-    inject_offline_peers(&env, 1).await?;
-    inject_outbox(&env).await?;
-
-    let mut node = env.launch();
-    node.wait_status("/readyz", StatusCode::OK).await;
-    node.wait_log("startup.recovery.degraded").await;
     node.signal("TERM");
     node.wait_draining().await;
     node.signal("TERM");
