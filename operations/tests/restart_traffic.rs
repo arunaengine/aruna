@@ -216,7 +216,7 @@ async fn seed_restart_documents(
         .take(40)
         .map(|(group_id, document_id)| (*group_id, *document_id))
         .collect();
-    wait_for_any_visibility(&nodes[2].context, &sample).await?;
+    wait_sample_visible(&nodes[2].context, &sample).await?;
     println!(
         "seeded {} docs, node 2 holds replicated state",
         created.len()
@@ -432,27 +432,27 @@ async fn wait_for_visibility(
     }
 }
 
-async fn wait_for_any_visibility(
+/// Waits for every sampled document to become readable on the node. Replicas
+/// cover all nodes here, so each arrival is progress that resets the window.
+async fn wait_sample_visible(
     context: &Arc<DriverContext>,
     pairs: &[(GroupId, Ulid)],
 ) -> Result<(), BoxError> {
-    wait_for_convergence(
-        "visibility timeout; no sampled documents visible",
-        || async {
-            for &(group_id, document_id) in pairs {
-                if drive(
-                    GetMetadataDocumentOperation::new(group_id, document_id),
-                    context.as_ref(),
-                )
-                .await
-                .is_ok()
-                {
-                    return Ok(0);
-                }
+    wait_for_convergence("sampled documents not fully visible", || async {
+        let mut pending = 0;
+        for &(group_id, document_id) in pairs {
+            if drive(
+                GetMetadataDocumentOperation::new(group_id, document_id),
+                context.as_ref(),
+            )
+            .await
+            .is_err()
+            {
+                pending += 1;
             }
-            Ok(1)
-        },
-    )
+        }
+        Ok::<usize, BoxError>(pending)
+    })
     .await
 }
 
@@ -1279,11 +1279,25 @@ async fn wait_outbox(
     drainer: &aruna_operations::task_incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
-    wait_for_convergence("outbox did not drain", || async {
-        drainer.run_once().await;
+    // One bounded rotation is minutes of CPU work on an instrumented runner,
+    // so it runs beside the watchdog instead of inside its hang-capped poll;
+    // the watchdog itself only reads the shrinking outbox key count.
+    let drain = async {
+        loop {
+            drainer.run_once().await;
+            if outbox_keys(&nodes[0]).await?.is_empty() {
+                return Ok::<(), BoxError>(());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let watch = wait_for_convergence("outbox did not drain", || async {
         Ok::<usize, BoxError>(outbox_keys(&nodes[0]).await?.len())
-    })
-    .await
+    });
+    tokio::select! {
+        result = drain => result,
+        result = watch => result,
+    }
 }
 
 async fn wait_registry(
