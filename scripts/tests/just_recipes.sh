@@ -336,11 +336,11 @@ test_argument_flow() {
   check_lacks "explicit portal dir wins over the artifact override" "$(cat "$DOCTOR_LOG")" \
     "portal update"
   check_has "explicit portal dir reaches the node env" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
-    "PORTAL_DIR=$PORTAL_FIXTURE"
+    "PORTAL_DIR='$PORTAL_FIXTURE'"
 
   output="$(run_recipe preview-no-oidc "$PORTAL_FIXTURE" 2)"
   check_has "a portal path with spaces survives positionally" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
-    "PORTAL_DIR=$PORTAL_FIXTURE"
+    "PORTAL_DIR='$PORTAL_FIXTURE'"
 }
 
 test_readiness_contract() {
