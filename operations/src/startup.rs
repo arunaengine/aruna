@@ -383,20 +383,16 @@ async fn finish_recovery_step(
     attempts: &mut u32,
     cancelled: &CancellationToken,
 ) -> bool {
-    let topics_remaining = match &decision {
-        RecoveryDecision::ContinueLocal {
-            topics_remaining, ..
-        } => *topics_remaining,
-        RecoveryDecision::Converged => 0,
-        RecoveryDecision::Retry { failure, .. } => failure.unresolved_topics.len() as u64,
-    };
-    status.set_remaining(topics_remaining);
     match decision {
         RecoveryDecision::ContinueLocal {
-            progress, error, ..
+            progress,
+            topics_remaining,
+            error,
         } => {
             if progress {
                 status.note_progress(topics_remaining);
+            } else {
+                status.set_remaining(topics_remaining);
             }
             status.finish_pass(RecoveryOutcome::Partial, error);
             tokio::task::yield_now().await;
@@ -413,10 +409,17 @@ async fn finish_recovery_step(
             );
             true
         }
-        RecoveryDecision::Retry { failure, progress } => {
+        RecoveryDecision::Retry {
+            failure,
+            progress,
+            enumerated,
+        } => {
+            let topics_remaining = failure.unresolved_topics.len() as u64;
             if progress {
                 status.note_progress(topics_remaining);
                 *attempts = 0;
+            } else if enumerated {
+                status.set_remaining(topics_remaining);
             }
             status.finish_pass(RecoveryOutcome::Partial, failure.error);
             warn!(
@@ -454,6 +457,8 @@ struct RecoveryPass {
     units_processed: usize,
     topics_completed: usize,
     phase_progress: bool,
+    /// False when the pass could not enumerate outstanding work.
+    enumerated: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -517,6 +522,9 @@ enum RecoveryDecision {
     Retry {
         failure: RecoveryFailure,
         progress: bool,
+        /// False when the pass never measured outstanding work, so the
+        /// published remaining count must keep its last enumerated value.
+        enumerated: bool,
     },
 }
 
@@ -541,6 +549,18 @@ fn apply_recovery_pass(
             error: rotation.error,
         };
     }
+    // A pass that failed to enumerate work observed nothing: keep the
+    // rotation and baseline, and retry without claiming progress.
+    if !pass.enumerated {
+        return RecoveryDecision::Retry {
+            failure: RecoveryFailure {
+                unresolved_topics: rotation.unresolved_topics.clone(),
+                error: rotation.error,
+            },
+            progress: false,
+            enumerated: false,
+        };
+    }
 
     let failure = RecoveryFailure {
         unresolved_topics: rotation.unresolved_topics.clone(),
@@ -560,7 +580,11 @@ fn apply_recovery_pass(
     let progress = pass_progress || improved;
     *rotation = RecoveryRotation::default();
     *first_rotation = false;
-    RecoveryDecision::Retry { failure, progress }
+    RecoveryDecision::Retry {
+        failure,
+        progress,
+        enumerated: true,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -595,6 +619,7 @@ async fn recovery_pass(
     pass.plan_changed = restore.plan_changed;
     pass.units_processed = restore.units_processed;
     pass.topics_completed = restore.topics_completed;
+    pass.enumerated = restore.enumerated;
     if pass.plan_changed {
         *reconcile_placements = true;
     }
@@ -603,7 +628,9 @@ async fn recovery_pass(
         pass.more_local_work = true;
         return pass;
     }
-    if cancelled.is_cancelled() {
+    // Without an enumerated plan the pass observed nothing; skip the phases
+    // and retry with backoff.
+    if !pass.enumerated || cancelled.is_cancelled() {
         return pass;
     }
 
@@ -814,6 +841,9 @@ pub struct ShardRestorePass {
     pub plan_changed: bool,
     /// Whether the cursor reached the end and wrapped back to the head.
     pub wrapped: bool,
+    /// False when storage failed before the plan could be read: the pass
+    /// observed nothing about outstanding work.
+    pub enumerated: bool,
 }
 
 /// Runs at most [`SHARD_RESTORE_UNIT_BUDGET`] restore work units from `cursor`,
@@ -833,11 +863,13 @@ pub async fn restore_shard_pass(
             *cursor = ShardRestoreCursor::default();
             return ShardRestorePass {
                 wrapped: true,
+                enumerated: true,
                 ..ShardRestorePass::default()
             };
         }
         RealmConfigLoad::StorageFailure => {
-            *cursor = ShardRestoreCursor::default();
+            // Keep the cursor: a failed config read says nothing about the
+            // plan, and the next successful load re-binds by hash anyway.
             return ShardRestorePass {
                 error: Some(RecoveryError::Storage),
                 wrapped: true,
@@ -849,6 +881,7 @@ pub async fn restore_shard_pass(
         *cursor = ShardRestoreCursor::default();
         return ShardRestorePass {
             wrapped: true,
+            enumerated: true,
             ..ShardRestorePass::default()
         };
     };
@@ -865,6 +898,7 @@ pub async fn restore_shard_pass(
             units_total: 0,
             plan_changed,
             wrapped: true,
+            enumerated: true,
             ..ShardRestorePass::default()
         };
     }
@@ -919,6 +953,7 @@ pub async fn restore_shard_pass(
         error: batch.error,
         plan_changed,
         wrapped: batch.wrapped,
+        enumerated: true,
     }
 }
 
