@@ -69,7 +69,7 @@ enum TaskCommand {
         response: oneshot::Sender<()>,
     },
     AbortAllRunningHandlers {
-        response: oneshot::Sender<usize>,
+        response: oneshot::Sender<Vec<JoinHandle<()>>>,
     },
 }
 
@@ -422,10 +422,13 @@ impl SchedulerState {
         self.running_by_id.len()
     }
 
-    fn abort_all_handlers(&mut self) -> usize {
-        let aborted = self.running_by_id.len();
+    /// Aborts every running handler and hands back the join handles so the
+    /// caller can await the futures actually being dropped.
+    fn abort_all_handlers(&mut self) -> Vec<JoinHandle<()>> {
+        let mut aborted = Vec::with_capacity(self.running_by_id.len());
         for (_, entry) in self.running_by_id.drain() {
             entry.task.abort();
+            aborted.push(entry.task);
         }
         self.running_warn_deadlines.clear();
         self.in_flight_keys.clear();
@@ -788,17 +791,22 @@ impl TaskHandle {
             };
         }
 
-        let (response, aborted) = oneshot::channel();
-        let aborted = if self
+        let (response, handles) = oneshot::channel();
+        let handles = if self
             .command_tx
             .send(TaskCommand::AbortAllRunningHandlers { response })
             .await
             .is_ok()
         {
-            aborted.await.unwrap_or(0)
+            handles.await.unwrap_or_default()
         } else {
-            0
+            Vec::new()
         };
+        // Await the drops: no handler future may outlive the drained report.
+        let aborted = handles.len();
+        for handle in handles {
+            let _ = handle.await;
+        }
         if aborted > 0 {
             warn!(
                 aborted,
@@ -1272,9 +1280,10 @@ mod tests {
 
         assert_eq!(report.aborted, 1);
         assert!(!report.drained());
-        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+        // The permit must already be stored: no future outlives the report.
+        tokio::time::timeout(Duration::ZERO, dropped.notified())
             .await
-            .expect("stuck handler future should be dropped");
+            .expect("handler future must drop before shutdown returns");
     }
 
     // Admission stops first: timers that fire after shutdown find no handler.
