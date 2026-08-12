@@ -1279,9 +1279,8 @@ async fn wait_outbox(
     drainer: &aruna_operations::task_incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
-    // One bounded rotation is minutes of CPU work on an instrumented runner,
-    // so it runs beside the watchdog instead of inside its hang-capped poll;
-    // the watchdog itself only reads the shrinking outbox key count.
+    // One bounded invocation exceeds five minutes under instrumentation, so
+    // only a much longer interval without a shrinking key count is a stall.
     let drain = async {
         loop {
             drainer.run_once().await;
@@ -1291,9 +1290,23 @@ async fn wait_outbox(
             sleep(Duration::from_millis(50)).await;
         }
     };
-    let watch = wait_for_convergence("outbox did not drain", || async {
-        Ok::<usize, BoxError>(outbox_keys(&nodes[0]).await?.len())
-    });
+    let watch = async {
+        let mut best = usize::MAX;
+        let mut deadline = Instant::now() + HANG_CAP.saturating_mul(3);
+        loop {
+            let pending = outbox_keys(&nodes[0]).await?.len();
+            if pending < best {
+                best = pending;
+                deadline = Instant::now() + HANG_CAP.saturating_mul(3);
+            }
+            if Instant::now() >= deadline {
+                return Err::<(), BoxError>(
+                    format!("outbox did not drain (still pending: {pending})").into(),
+                );
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
     tokio::select! {
         result = drain => result,
         result = watch => result,
