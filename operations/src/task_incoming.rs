@@ -3809,11 +3809,12 @@ mod tests {
 
         handler.finish_retry(key.clone(), rotation, false).await;
 
-        let rotation = handler.rotation.lock().expect("rotation lock");
-        assert_eq!(rotation.cursor.as_deref(), Some(b"middle".as_slice()));
-        assert!(rotation.blocked_topics.contains(&topic));
-        assert_eq!(rotation.totals.retry_invocations, 1);
-        drop(rotation);
+        {
+            let rotation = handler.rotation.lock().expect("rotation lock");
+            assert_eq!(rotation.cursor.as_deref(), Some(b"middle".as_slice()));
+            assert!(rotation.blocked_topics.contains(&topic));
+            assert_eq!(rotation.totals.retry_invocations, 1);
+        }
         assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
     }
 

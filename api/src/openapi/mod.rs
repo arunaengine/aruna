@@ -302,10 +302,10 @@ mod tests {
                 }
             }
         }
-        if let Some(schema) = media.get("schema").and_then(|schema| resolve(doc, schema)) {
-            if let Some(example) = schema.get("example") {
-                values.push(example.clone());
-            }
+        if let Some(schema) = media.get("schema").and_then(|schema| resolve(doc, schema))
+            && let Some(example) = schema.get("example")
+        {
+            values.push(example.clone());
         }
         values
     }

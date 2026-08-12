@@ -873,15 +873,14 @@ pub async fn restore_shard_pass(
     // durably verified; join verification below happens after this restore.
     let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
 
-    let (start, end, wrapped) = restore_range(*cursor, units_total);
+    let range = restore_range(*cursor, units_total);
+    let start = range.start;
     let batch = restore_batch(
         context,
         &net_handle,
         node_id,
         &units,
-        start,
-        end,
-        wrapped,
+        range,
         &verified,
         cancelled,
     )
@@ -937,12 +936,15 @@ async fn restore_batch(
     net_handle: &aruna_net::NetHandle,
     node_id: NodeId,
     units: &[RestoreUnit],
-    start: usize,
-    end: usize,
-    wrapped: bool,
+    range: RestoreRange,
     verified: &BTreeSet<::irokle::TopicId>,
     cancelled: &CancellationToken,
 ) -> RestoreBatch {
+    let RestoreRange {
+        start,
+        end,
+        wrapped,
+    } = range;
     let mut batch_end = end;
     let mut batch_wrapped = wrapped;
     let mut topics_completed = 0usize;
@@ -1114,10 +1116,21 @@ pub async fn prepare_shard_policy(
 }
 
 /// The half-open unit range one bounded pass processes, and whether it wraps.
-fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> (usize, usize, bool) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RestoreRange {
+    start: usize,
+    end: usize,
+    wrapped: bool,
+}
+
+fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> RestoreRange {
     let start = cursor.next_unit.min(units_total);
     let end = (start + SHARD_RESTORE_UNIT_BUDGET).min(units_total);
-    (start, end, end >= units_total)
+    RestoreRange {
+        start,
+        end,
+        wrapped: end >= units_total,
+    }
 }
 
 /// One bounded unit of restore work: one co-holder group's ensure and sync over
@@ -1557,7 +1570,11 @@ mod tests {
         let mut cursor = ShardRestoreCursor::default();
         let mut visited = Vec::new();
         for _ in 0..3 {
-            let (start, end, wrapped) = restore_range(cursor, units_total);
+            let RestoreRange {
+                start,
+                end,
+                wrapped,
+            } = restore_range(cursor, units_total);
             assert!(end - start <= SHARD_RESTORE_UNIT_BUDGET);
             visited.extend(start..end);
             cursor.next_unit = if wrapped { 0 } else { end };
@@ -2157,9 +2174,11 @@ mod tests {
             &net,
             node(1),
             &units,
-            0,
-            1,
-            false,
+            RestoreRange {
+                start: 0,
+                end: 1,
+                wrapped: false,
+            },
             &BTreeSet::new(),
             &cancelled,
         )

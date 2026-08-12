@@ -365,7 +365,7 @@ mod tests {
         assert!(files.len() > 1, "route modules must be discoverable");
         for file in files {
             let source = std::fs::read_to_string(&file).expect("readable route module");
-            for form in raw_gaps(&file, &source) {
+            if let Some(form) = raw_gaps(&file, &source).first() {
                 panic!(
                     "{} registers {form} outside routes!; use routes! or routes_at",
                     file.display()

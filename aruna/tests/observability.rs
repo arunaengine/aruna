@@ -339,25 +339,31 @@ mod process {
         }
 
         pub fn launch_core(&self) -> NodeProcess {
-            let mut paths = LaunchPaths::default();
-            paths.core = Some(self.root().join("core-publication.barrier"));
+            let paths = LaunchPaths {
+                core: Some(self.root().join("core-publication.barrier")),
+                ..LaunchPaths::default()
+            };
             self.clear_paths(&paths);
             self.launch_mode(paths)
         }
 
         pub fn launch_ledger(&self) -> NodeProcess {
-            let mut paths = LaunchPaths::default();
             let ledger = self.ledger_path();
-            paths.ledger = Some(ledger.clone());
+            let paths = LaunchPaths {
+                ledger: Some(ledger.clone()),
+                ..LaunchPaths::default()
+            };
             self.clear_paths(&paths);
             std::fs::File::create(ledger).expect("create outbox ledger");
             self.launch_mode(paths)
         }
 
         pub fn launch_recovery(&self) -> NodeProcess {
-            let mut paths = LaunchPaths::default();
-            paths.recovery = Some(self.root().join("recovery.barrier"));
-            paths.outbox = Some(self.root().join("outbox.barrier"));
+            let paths = LaunchPaths {
+                recovery: Some(self.root().join("recovery.barrier")),
+                outbox: Some(self.root().join("outbox.barrier")),
+                ..LaunchPaths::default()
+            };
             self.clear_paths(&paths);
             self.launch_mode(paths)
         }
@@ -368,10 +374,11 @@ mod process {
                 paths.recovery.as_deref(),
                 paths.outbox.as_deref(),
                 paths.ledger.as_deref(),
-            ] {
-                if let Some(path) = path {
-                    let _ = std::fs::remove_file(path);
-                }
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let _ = std::fs::remove_file(path);
             }
         }
 
@@ -795,7 +802,7 @@ async fn load_state(
         }) => Ok(postcard::from_bytes::<aruna::config::PersistedNodeState>(
             &value,
         )?),
-        other => return Err(format!("unexpected node state event: {other:?}").into()),
+        other => Err(format!("unexpected node state event: {other:?}").into()),
     }
 }
 
@@ -821,7 +828,7 @@ async fn load_realm(
             .into_iter()
             .find_map(|(_, value)| RealmConfigDocument::from_bytes(&value).ok())
             .ok_or("realm config missing")?),
-        other => return Err(format!("unexpected realm config event: {other:?}").into()),
+        other => Err(format!("unexpected realm config event: {other:?}").into()),
     }
 }
 
