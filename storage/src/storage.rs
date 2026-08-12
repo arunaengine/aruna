@@ -206,6 +206,7 @@ pub struct FjallStorage {
     next_reader: usize,
     bulk_read_pool: Vec<EffectSender>,
     next_bulk_reader: usize,
+    pool_threads: Vec<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -285,6 +286,7 @@ pub struct StorageHandle {
     priority: StoragePriority,
     metrics: Arc<StorageMetrics>,
     transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+    worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 #[derive(Debug)]
@@ -386,9 +388,24 @@ impl StorageHandle {
                 priority: StoragePriority::Foreground,
                 metrics: Arc::new(StorageMetrics::default()),
                 transaction_cleanup: Arc::new(Mutex::new(BTreeMap::new())),
+                worker: Arc::new(Mutex::new(None)),
             },
             StorageReceivers { foreground, bulk },
         )
+    }
+
+    /// Closes the store and waits until the worker released it, including the
+    /// file lock. Blocks forever when another handle clone is still alive.
+    pub async fn close(self) {
+        let worker = self
+            .worker
+            .lock()
+            .expect("storage worker mutex poisoned")
+            .take();
+        drop(self);
+        if let Some(worker) = worker {
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+        }
     }
 
     /// A handle whose effects dispatch on the bulk lane, served only when the
@@ -1345,27 +1362,44 @@ impl FjallStorage {
         let mut storage = Self::new(Store::new(db), policy, &sender);
         let channel_closed = sender.metrics.channel_closed.clone();
 
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let _lifecycle = WorkerLifecycleGuard(channel_closed);
             storage.receive_loop(receivers);
+            storage.close();
         });
+        sender
+            .worker
+            .lock()
+            .expect("storage worker mutex poisoned")
+            .replace(worker);
 
         Ok(sender)
+    }
+
+    /// Joins the read pools so every store clone is gone when this returns;
+    /// the fjall lock is released by the final store drop right after.
+    fn close(mut self) {
+        self.read_pool.clear();
+        self.bulk_read_pool.clear();
+        for reader in std::mem::take(&mut self.pool_threads) {
+            let _ = reader.join();
+        }
     }
 
     /// Worker sharing the handle's cleanup map and metrics, including the
     /// mutation fence it reads before starting any mutation.
     fn new(store: Store, policy: FjallPersistPolicy, handle: &StorageHandle) -> Self {
-        let read_pool = spawn_read_pool(
+        let (read_pool, mut pool_threads) = spawn_read_pool(
             store.clone(),
             READ_POOL_THREADS,
             STORAGE_EFFECT_QUEUE_CAPACITY,
         );
-        let bulk_read_pool = spawn_read_pool(
+        let (bulk_read_pool, bulk_threads) = spawn_read_pool(
             store.clone(),
             BULK_READ_POOL_THREADS,
             BULK_EFFECT_QUEUE_CAPACITY,
         );
+        pool_threads.extend(bulk_threads);
         Self {
             store,
             persist_policy: policy,
@@ -1376,6 +1410,7 @@ impl FjallStorage {
             next_reader: 0,
             bulk_read_pool,
             next_bulk_reader: 0,
+            pool_threads,
         }
     }
 
@@ -2759,15 +2794,20 @@ fn reject_bulk_read(item: EffectHandle) {
     });
 }
 
-fn spawn_read_pool(store: Store, threads: usize, capacity: usize) -> Vec<EffectSender> {
+fn spawn_read_pool(
+    store: Store,
+    threads: usize,
+    capacity: usize,
+) -> (Vec<EffectSender>, Vec<thread::JoinHandle<()>>) {
     let mut senders = Vec::with_capacity(threads);
+    let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
         let (sender, receiver) = mpsc::bounded_blocking(capacity);
         let store = store.clone();
-        thread::spawn(move || read_pool_loop(store, receiver));
+        handles.push(thread::spawn(move || read_pool_loop(store, receiver)));
         senders.push(sender);
     }
-    senders
+    (senders, handles)
 }
 
 fn read_pool_loop(store: Store, receiver: EffectReceiver) {

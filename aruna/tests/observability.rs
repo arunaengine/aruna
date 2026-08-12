@@ -439,7 +439,9 @@ mod process {
         ) -> Vec<(Vec<u8>, aruna_core::document::DocumentSyncOutboxRecord)> {
             let storage = self.open_storage().await;
             let rows = read_outbox(&storage).await;
-            drop(storage);
+            // close() waits for the lock release a plain drop only schedules;
+            // the next launch would die on a still-locked store.
+            storage.close().await;
             rows
         }
     }
@@ -784,7 +786,7 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
         "unexpected realm config write event: {event:?}"
     );
     storage.sync_all().await?;
-    drop(storage);
+    storage.close().await;
     Ok(())
 }
 
@@ -935,7 +937,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
         "unexpected outbox write event: {event:?}"
     );
     storage.sync_all().await?;
-    drop(storage);
+    storage.close().await;
     Ok(key.to_vec())
 }
 
