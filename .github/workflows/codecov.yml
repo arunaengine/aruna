@@ -52,7 +52,13 @@ jobs:
           tool: grcov
 
       - name: Run instrumented tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --all-features --locked -- \
+            --skip offline_bounds_recovery \
+            --skip offline_recovery_converges \
+            --skip restart_reannounces_held_shard_topics_not_documents
+          cargo test -p aruna-operations --test restart_traffic --all-features --locked -- \
+            --test-threads=1
 
       - name: Collect coverage
         run: |
