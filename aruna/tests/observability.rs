@@ -733,7 +733,9 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::{PlacementStrategy, RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::{
+        PlacementStrategy, RealmConfigDocument, RealmDiscoveryConfig, RealmNodeKind,
+    };
 
     let storage = env.open_storage().await;
     let event = storage
@@ -757,6 +759,9 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
         let peer = iroh::SecretKey::from_bytes(&[0xA0 + seed; 32]).public();
         config.ensure_node(peer, RealmNodeKind::Server);
     }
+    config.discovery = RealmDiscoveryConfig::Static {
+        endpoints: Vec::new(),
+    };
     // Keep outage recovery bounded to the fewest synthetic topics.
     for strategy in &mut config.strategies {
         strategy.shard_count = if count == 1 { 1 } else { 2 };
