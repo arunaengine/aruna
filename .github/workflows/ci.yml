@@ -210,7 +210,7 @@ jobs:
       - name: Run recipe contract tests
         run: bash scripts/tests/just_recipes.sh
 
-  cluster-smoke:
+  cluster-start:
     runs-on: ubuntu-latest
     # Hang cap for the four cluster recipes plus one release build.
     timeout-minutes: 60
@@ -238,14 +238,14 @@ jobs:
       - name: Build the deployment binaries once
         run: cargo build --release --locked -p aruna -p aruna-doctor
 
-      - name: Smoke the cluster recipes
+      - name: Start the cluster recipes
         run: |
           set -euo pipefail
           set -m
           WORK_DIR="$(mktemp -d)"
           FIXTURE_DIR="$WORK_DIR/artifacts"
           PORTAL_SRC="$WORK_DIR/portal fixture"
-          KEYCLOAK_PROJECT="aruna-smoke-$GITHUB_RUN_ID"
+          KEYCLOAK_PROJECT="aruna-cluster-start-$GITHUB_RUN_ID"
           DEPLOY_ROOT=""
           RECIPE_LOG=""
           ARTIFACT_PID=""
@@ -263,7 +263,7 @@ jobs:
           }
           trap cleanup EXIT
 
-          die() { echo "smoke failure: $*" >&2; exit 1; }
+          die() { echo "startup check failure: $*" >&2; exit 1; }
 
           # A contiguous, currently unused window for four ports per node plus Keycloak.
           pick_base_port() {
@@ -285,7 +285,7 @@ jobs:
           KEYCLOAK_PORT=$((BASE_PORT + 21))
 
           # Local portal artifact: no release API and no remote download.
-          printf '<html>smoke portal</html>\n' >"$PORTAL_SRC/index.html"
+          printf '<html>portal fixture</html>\n' >"$PORTAL_SRC/index.html"
           tar -czf "$FIXTURE_DIR/aruna-portal-dist.tar.gz" -C "$PORTAL_SRC" index.html
           ( cd "$FIXTURE_DIR" \
             && sha256sum aruna-portal-dist.tar.gz >aruna-portal-dist.tar.gz.sha256 )
@@ -430,7 +430,7 @@ jobs:
           assert_common preview 2
           assert_keycloak up
           assert_portal 2
-          grep -q 'smoke portal' "$DEPLOY_ROOT/portal/index.html" \
+          grep -q 'portal fixture' "$DEPLOY_ROOT/portal/index.html" \
             || die "preview did not install the locally served portal artifact"
           stop_recipe
           assert_stopped
@@ -445,9 +445,9 @@ jobs:
           assert_stopped
           echo "::endgroup::"
 
-          echo "all cluster recipes completed their smoke path"
+          echo "all cluster recipes started and stopped cleanly"
 
-  compose-smoke:
+  compose-start:
     runs-on: ubuntu-latest
     # Hang cap for the container image build plus both compose recipes.
     timeout-minutes: 90
@@ -464,12 +464,12 @@ jobs:
       - name: Build the compose image once
         run: docker compose --file scripts/compose.yaml build aruna
 
-      - name: Smoke the compose recipes
+      - name: Start the compose recipes
         run: |
           set -euo pipefail
           WORK_DIR="$(mktemp -d)"
           DATA_DIR="$WORK_DIR/state"
-          PROJECT="aruna-compose-smoke-$GITHUB_RUN_ID"
+          PROJECT="aruna-compose-start-$GITHUB_RUN_ID"
           mkdir -p "$DATA_DIR"
 
           cleanup() {
@@ -481,7 +481,7 @@ jobs:
           }
           trap cleanup EXIT
 
-          die() { echo "smoke failure: $*" >&2; exit 1; }
+          die() { echo "startup check failure: $*" >&2; exit 1; }
 
           pick_base_port() {
             local listeners base port busy
@@ -516,7 +516,7 @@ jobs:
             echo "S3_HOST=127.0.0.1:$S3_PORT"
             echo "S3_PUBLIC_URL=http://127.0.0.1:$S3_PORT"
             echo "S3_ADDRESS=127.0.0.1:$S3_PORT"
-            echo "REALM_DESCRIPTION=\"Compose Smoke Realm\""
+            echo "REALM_DESCRIPTION=\"Compose Start Realm\""
             echo "OIDC_PROVIDER_IDS=main"
             echo "OIDC_MAIN_ISSUER=http://localhost:$KEYCLOAK_PORT/realms/aruna"
             echo "OIDC_MAIN_AUDIENCE=aruna-api"
@@ -598,4 +598,4 @@ jobs:
           [ -z "$(docker ps --quiet --filter "label=com.docker.compose.project=$PROJECT")" ] \
             || die "test containers leaked"
 
-          echo "both compose recipes completed their smoke path"
+          echo "both compose recipes started and stopped cleanly"

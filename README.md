@@ -121,7 +121,7 @@ Useful overrides:
 - `ARUNA_TEST_DEPLOY_BASE_PORT` shifts the entire local port range
 - `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` exits once the cluster is ready instead of keeping it running
 
-`just local-cluster-oidc` extends the same 3-node smoke test with a local Keycloak instance.
+`just local-cluster-oidc` extends the same 3-node startup check with a local Keycloak instance.
 
 ### Run a single node from source
 
