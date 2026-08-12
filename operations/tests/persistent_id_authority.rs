@@ -205,7 +205,7 @@ async fn replica_delete_routes_to_pid_authority() -> TestResult<()> {
     let authority = realm.find(holders[0]);
     let replica = realm.find(holders[1]);
 
-    mint_routed(&realm, replica, document_id).await?;
+    mint_routed(&realm, authority, document_id).await?;
     wait_until("mint reaches the replica", replica.node_id(), || {
         mapping_active(replica, document_id)
     })
