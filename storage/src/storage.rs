@@ -3192,6 +3192,7 @@ mod tests {
             transaction_cleanup: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
+            worker: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         (handle, super::StorageReceivers { foreground, bulk })
     }
@@ -3489,6 +3490,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: vec![bulk_sender],
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
         let metrics = std::sync::Arc::new(super::StorageMetrics::default());
         let read_effect = || StorageEffect::Read {
@@ -3702,6 +3704,7 @@ mod tests {
             priority: _,
             metrics,
             transaction_cleanup: _,
+            worker: _,
         } = handle;
 
         assert!(!metrics.channel_closed.load(Ordering::Relaxed));
@@ -4368,6 +4371,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
 
         let event = storage.commit_transaction(txn_id);
@@ -4411,6 +4415,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
 
         for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
@@ -4451,6 +4456,7 @@ mod tests {
             next_reader: 0,
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
+            pool_threads: Vec::new(),
         };
 
         storage.retry_cleanup();
