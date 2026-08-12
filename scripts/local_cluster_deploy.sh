@@ -121,6 +121,15 @@ require_positive_int() {
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer, got: $value"
 }
 
+# Single-quote a generated .env value so paths with spaces stay one value;
+# dotenvy treats single-quoted values literally.
+env_quote() {
+  local value=$1
+
+  [[ "$value" != *"'"* ]] || die "env value must not contain a single quote: $value"
+  printf "'%s'" "$value"
+}
+
 # Just forwards `nodes=2` and `portal_dir=P` verbatim as positional values, so
 # unpack them instead of failing or silently keeping the default.
 strip_named_value() {
@@ -256,8 +265,8 @@ write_node_env() {
 
   mkdir -p "$node_dir/storage" "$node_dir/blob"
   {
-    printf 'STORAGE_PATH=%s\n' "$node_dir/storage"
-    printf 'BLOB_ROOT=%s\n' "$node_dir/blob"
+    printf 'STORAGE_PATH=%s\n' "$(env_quote "$node_dir/storage")"
+    printf 'BLOB_ROOT=%s\n' "$(env_quote "$node_dir/blob")"
     printf 'BLOB_MULTIPART_BUCKET=%s\n' "parts"
     printf 'BLOB_MAX_BUCKET_SIZE=10000\n'
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"
@@ -281,7 +290,7 @@ write_node_env() {
         case "$compute_var" in
           ARUNA_COMPUTE_EXECUTOR | ARUNA_COMPUTE_OPTIONAL | ARUNA_COMPUTE_S3_URL) continue ;;
         esac
-        printf '%s=%s\n' "$compute_var" "${!compute_var}"
+        printf '%s=%s\n' "$compute_var" "$(env_quote "${!compute_var}")"
       done
     else
       printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
@@ -290,7 +299,7 @@ write_node_env() {
     printf 'METADATA_REPLICATION_FACTOR=3\n'
     if [[ -n "$PORTAL_DIR" ]]; then
       printf 'PORTAL_MODE=artifact\n'
-      printf 'PORTAL_DIR=%s\n' "$PORTAL_DIR"
+      printf 'PORTAL_DIR=%s\n' "$(env_quote "$PORTAL_DIR")"
       printf 'CORS_ALLOWED_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
       printf 'PORTAL_CSP_EXTRA_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
     fi
