@@ -457,7 +457,8 @@ mod tests {
     }
 
     #[test]
-    fn api_url_joins_once() {
+    fn url_joins_once() {
+        // The API base keeps exactly one /api/v1, with or without a trailing slash.
         assert_eq!(
             super::api_base_url("https://api.test/"),
             "https://api.test/api/v1"
