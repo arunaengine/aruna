@@ -785,7 +785,7 @@ async fn spawn_joiner_node_with_mode(
         config.realm_id,
     )
     .await;
-    aruna_operations::process_placements::process_shard_placements(
+    aruna_operations::process_placements::reconcile_shard_topics(
         &joiner_context,
         config.realm_id,
         config.node_id,

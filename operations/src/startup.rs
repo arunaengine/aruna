@@ -661,12 +661,12 @@ async fn reconcile_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let placements = crate::process_placements::process_shard_placements(
-        context,
-        config.realm_id,
-        config.node_id,
-    )
-    .await;
+    // Transition steps run on the SyncPlacements timer instead of inline:
+    // recovery must not gate presence and readiness on a cluster-wide
+    // transition draining.
+    let placements =
+        crate::process_placements::reconcile_shard_topics(context, config.realm_id, config.node_id)
+            .await;
     let outcome = match placements.status {
         crate::process_placements::PlacementReconcileStatus::Clean => {
             *pending = false;

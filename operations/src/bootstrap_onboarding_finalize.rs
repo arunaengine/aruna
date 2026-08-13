@@ -27,14 +27,11 @@ use crate::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
     IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
-use crate::mutate_realm_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
-    RealmPlacementMutation,
-};
+use crate::mutate_realm_placement::{MutateRealmPlacementError, RealmPlacementMutation};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::notifications::watch::interest::mark_watch_interest_dirty;
-use crate::process_placements::process_shard_placements;
+use crate::process_placements::reconcile_shard_topics;
 use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
@@ -306,12 +303,10 @@ async fn set_joiner_placement_entry(
     entry: NodePlacementEntry,
     context: &DriverContext,
 ) -> Result<(), BootstrapOnboardingFinalizeError> {
-    drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
-            actor: realm_actor(input),
-            mutation: RealmPlacementMutation::UpsertNode(entry),
-        }),
+    crate::expand_placement::mutate(
         context,
+        &realm_actor(input),
+        RealmPlacementMutation::UpsertNode(entry),
     )
     .await?;
     Ok(())
@@ -321,7 +316,10 @@ async fn process_pending_placements(
     input: &BootstrapOnboardingFinalizeInput,
     context: &Arc<DriverContext>,
 ) {
-    process_shard_placements(context, input.realm_id, input.local_node_id).await;
+    // Transition steps stay out of the bootstrap request: the expansion's
+    // mutations armed zero-delay SyncPlacements timers that run them in the
+    // background, so only topic membership is reconciled inline here.
+    reconcile_shard_topics(context, input.realm_id, input.local_node_id).await;
 }
 
 struct OnboardingSyncTopics {

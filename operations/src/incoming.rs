@@ -19,7 +19,7 @@ use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::permission_rules::GroupPermissionRules;
-use crate::process_placements::process_shard_placements;
+use crate::process_placements::reconcile_shard_topics;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::replication::bao_read::IncomingBaoReadOperation;
 use crate::replication::incoming_version_replication::{
@@ -505,7 +505,9 @@ async fn reconcile_inbound_document_sync_topics(
         .iter()
         .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }));
     if realm_config_changed {
-        process_shard_placements(context, *net_handle.realm_id(), net_handle.node_id()).await;
+        // Transition-free: a heavy transition step here would stall document
+        // application; the reconcile arms the SyncPlacements timer instead.
+        reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
     }
     refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
     refresh_watch_interest_for_targets(context, &targets.targets).await;

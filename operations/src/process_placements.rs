@@ -369,6 +369,26 @@ pub async fn process_shard_placements(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> PlacementReconcileOutcome {
+    reconcile_placements(context, realm_id, local_node_id, true).await
+}
+
+/// [`process_shard_placements`] minus transition-step execution, for request
+/// paths: every placement mutation arms a zero-delay `SyncPlacements` timer,
+/// so barriers and completion proofs run in the background instead of inline.
+pub async fn reconcile_shard_topics(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+) -> PlacementReconcileOutcome {
+    reconcile_placements(context, realm_id, local_node_id, false).await
+}
+
+async fn reconcile_placements(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    run_transitions: bool,
+) -> PlacementReconcileOutcome {
     let config = match load_realm_config_outcome(context, realm_id).await {
         RealmConfigLoadOutcome::Found(config) => config,
         RealmConfigLoadOutcome::Absent => {
@@ -400,13 +420,26 @@ pub async fn process_shard_placements(
     )
     .await;
     let mut retry_needed = held.withheld || held.pull_pending;
-    retry_needed |= crate::process_transitions::process_placement_transitions(
-        context,
-        realm_id,
-        local_node_id,
-        &config,
-    )
-    .await;
+    if run_transitions {
+        retry_needed |= crate::process_transitions::process_placement_transitions(
+            context,
+            realm_id,
+            local_node_id,
+            &config,
+        )
+        .await;
+    } else if has_transition_work(&config)
+        && let Some(task_handle) = context.task_handle.as_ref()
+    {
+        // A pure transition target never mutates the config, so nothing else
+        // arms its timer; fire the deferred execution now.
+        let effect = crate::sync_placement::schedule_placement_retry_after(
+            realm_id,
+            local_node_id,
+            std::time::Duration::ZERO,
+        );
+        let _ = task_handle.send_effect(effect).await;
+    }
 
     let mut start_after: Option<Key> = None;
     loop {
@@ -557,6 +590,20 @@ pub async fn process_shard_placements(
         return PlacementReconcileOutcome::retry_scheduled(held.pull_pending);
     }
     PlacementReconcileOutcome::clean()
+}
+
+/// Whether the transitions engine may have local steps to run: an unsettled
+/// transition, or a strategy whose activations nobody initialized yet.
+fn has_transition_work(config: &RealmConfigDocument) -> bool {
+    config
+        .placement_transitions
+        .iter()
+        .any(|transition| !transition.is_terminal())
+        || (config.newest_map_epoch().is_some()
+            && config
+                .strategies
+                .iter()
+                .any(|strategy| config.activation(&strategy.strategy_id, 0).is_none()))
 }
 
 async fn load_realm_config_outcome(
