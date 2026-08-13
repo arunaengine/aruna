@@ -22,7 +22,7 @@ mod convergence;
 
 use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::DocumentSyncTarget;
@@ -62,18 +62,13 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use futures_util::future::join_all;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use tempfile::TempDir;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 pub use convergence::{hang_cap, wait_for_convergence};
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-const TOPOLOGY_FIXTURE_LIMIT: usize = 2;
 const TOPOLOGY_SHARD_COUNT: u32 = 8;
-
-static TOPOLOGY_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(TOPOLOGY_FIXTURE_LIMIT)));
 
 /// Two stable locations, so `distinct_locations` strategies stay satisfiable
 /// and location ranking is exercised rather than degenerate.
@@ -105,7 +100,6 @@ pub struct Topology {
     pub config: RealmConfigDocument,
     pub nodes: Vec<TestNode>,
     signing_key: SigningKey,
-    _permit: OwnedSemaphorePermit,
 }
 
 impl Topology {
@@ -123,7 +117,6 @@ impl Topology {
         users: usize,
         replication_factor: u32,
     ) -> TestResult<Self> {
-        let permit = TOPOLOGY_PERMITS.clone().acquire_owned().await?;
         assert!(
             management > replication_factor as usize,
             "non-holder fixture needs more sync-eligible nodes than the replication factor: \
@@ -162,7 +155,6 @@ impl Topology {
         let config = install_realm_config(&nodes, realm_id, user_id, replication_factor).await?;
 
         Ok(Self {
-            _permit: permit,
             realm_id,
             user_id,
             replication_factor,
@@ -498,7 +490,7 @@ impl Topology {
 
 async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNode> {
     let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
+    let storage = FjallStorage::open_test(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
