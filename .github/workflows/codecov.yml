@@ -12,24 +12,35 @@ concurrency:
   group: coverage-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Source-based coverage reads __llvm_covmap from the binary, so DWARF is
+  # dead weight that OOM-kills the 16 GB runner during linking.
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_BUILD_JOBS: 2
+  RUSTFLAGS: -Cinstrument-coverage -Cdebuginfo=0
+
 jobs:
-  report:
-    name: Generate Coverage Report
-    environment: coverage
+  instrumented:
+    name: Instrumented tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget. Measured basis: this branch's heavier
-    # suite aborted ~40% done at 57 minutes; a completing instrumented run
-    # extrapolates to 85-100 minutes.
-    timeout-minutes: 120
+    # Hang cap, not a performance budget. Every target runs once in a bounded
+    # lane so one topology or process test cannot starve the whole report.
+    timeout-minutes: 90
     env:
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: 0
-      # Source-based coverage reads __llvm_covmap from the binary, so DWARF is
-      # dead weight that OOM-kills the 16 GB runner during linking.
-      CARGO_PROFILE_TEST_DEBUG: 0
-      CARGO_BUILD_JOBS: 2
-      RUSTFLAGS: -Cinstrument-coverage -Cdebuginfo=0
-      LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
+      LLVM_PROFILE_FILE: cargo-test-${{ matrix.shard }}-%p-%m.profraw
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard:
+          - unit
+          - application
+          - operations-a
+          - operations-b
+          - topology
+          - restart
 
     steps:
       - name: Check out repository
@@ -39,8 +50,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang mold
 
       - name: Install Rust with LLVM tools
-        # rust-toolchain.toml overrides any pinned toolchain, so add the
-        # component to the channel that actually builds the instrumented tests.
+        # rust-toolchain.toml supplies the channel used to build the tests.
         run: rustup component add llvm-tools-preview
 
       - name: Cache Rust build artifacts
@@ -52,32 +62,138 @@ jobs:
           tool: grcov
 
       - name: Run instrumented tests
+        env:
+          CARGO_BUILD_JOBS: 2
         run: |
-          cargo test --workspace --all-features --locked -- \
-            --skip offline_bounds_recovery \
-            --skip offline_recovery_converges \
-            --skip restart_reannounces_held_shard_topics_not_documents
-          cargo test -p aruna-operations --test restart_traffic --all-features --locked -- \
-            --test-threads=1
+          set -euo pipefail
 
-      - name: Collect coverage
+          run_test() {
+            cargo test "$@" --all-features --locked -- --test-threads=1
+          }
+
+          case "${{ matrix.shard }}" in
+            unit)
+              cargo test --workspace --lib --all-features --locked
+              cargo test --workspace --doc --all-features --locked
+              cargo test -p aruna --bin aruna --all-features --locked
+              cargo test -p aruna-doctor --bin aruna-doctor --all-features --locked
+              cargo test -p aruna-compute-helper --bin aruna-compute-helper --all-features --locked
+              ;;
+            application)
+              for target in \
+                compute_execution cors credentials drs groups network_recovery \
+                observability oidc_registration onboarding public_access \
+                replication s3_attributes s3_copy s3_operations s3_security \
+                self_service_groups startup_ownership; do
+                run_test -p aruna --test "$target"
+              done
+              for target in \
+                api_effect_boundary_guard api_route_authorization_guard \
+                document_sync_publish_architecture_guard domain_guard; do
+                run_test -p aruna-api --test "$target"
+              done
+              run_test -p aruna-compute --test docker_backend
+              run_test -p aruna-compute --test units
+              run_test -p aruna-net --test integration
+              ;;
+            operations-a)
+              for target in \
+                auth_validation group_replication harvest_pipeline \
+                job_framework_restart metadata_cold_start \
+                metadata_create_backpressure metadata_create_concurrency \
+                metadata_crud metadata_forwarding metadata_materialization_recovery \
+                metadata_propagation_tail metadata_query_concurrency \
+                metadata_replication metadata_restart_persistence; do
+                run_test -p aruna-operations --test "$target"
+              done
+              ;;
+            operations-b)
+              for target in \
+                metadata_throughput multipart notification_delivery \
+                placement_determinism resource_watch_delivery rocrate_drivers \
+                rocrate_remote shard_genesis_confirmation shard_manifest \
+                shard_manifest_convergence shard_manifest_protocol \
+                sync_quarantine_capacity token_revocation usage_deltas \
+                usage_replication user_access_replication; do
+                run_test -p aruna-operations --test "$target"
+              done
+              ;;
+            topology)
+              for target in audit_topology non_holder_topology persistent_id_authority; do
+                run_test -p aruna-operations --test "$target"
+              done
+              ;;
+            restart)
+              # The 8k/16k incident fixtures run in the non-instrumented stress
+              # lane below; keep the small restart contract in coverage.
+              cargo test -p aruna-operations --test restart_traffic \
+                --all-features --locked -- --test-threads=1 \
+                --skip offline_scale_bound \
+                --skip offline_scale_converges
+              ;;
+            *)
+              echo "unknown coverage shard: ${{ matrix.shard }}" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Collect coverage fragment
         run: |
           grcov . \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \
-            --output-path coverage.lcov \
+            --output-path "coverage-${{ matrix.shard }}.lcov" \
             --branch \
             --ignore-not-existing \
             --ignore "/*" \
             --ignore "target/*" \
             --keep-only "*/src/*"
-          # grcov exits 0 even when llvm-profdata is missing; refuse an empty report.
-          records=$(grep -c '^DA:' coverage.lcov || true)
-          if [ "$records" -lt 1000 ]; then
-            echo "coverage.lcov has only $records DA records; grcov produced no data" >&2
+          records=$(grep -c '^DA:' "coverage-${{ matrix.shard }}.lcov" || true)
+          if [ "$records" -lt 1 ]; then
+            echo "coverage-${{ matrix.shard }}.lcov has no DA records" >&2
             exit 1
           fi
+
+      - name: Upload coverage fragment
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: coverage-${{ matrix.shard }}.lcov
+          if-no-files-found: error
+          retention-days: 1
+
+  report:
+    name: Generate Coverage Report
+    environment: coverage
+    needs: [instrumented, restart-stress]
+    if: ${{ needs.instrumented.result == 'success' && needs.restart-stress.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Download coverage fragments
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: coverage-*
+          path: coverage-parts
+          merge-multiple: true
+
+      - name: Merge and validate coverage
+        run: |
+          set -euo pipefail
+          find coverage-parts -type f -name '*.lcov' -print0 \
+            | sort -z \
+            | xargs -0 cat > coverage.lcov
+          records=$(grep -c '^DA:' coverage.lcov || true)
+          if [ "$records" -lt 1000 ]; then
+            echo "coverage.lcov has only $records DA records" >&2
+            exit 1
+          fi
+          test "$(find coverage-parts -type f -name '*.lcov' | wc -l)" -eq 6
 
       - name: Upload coverage report
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
@@ -85,3 +201,38 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.lcov
           fail_ci_if_error: true
+
+  restart-stress:
+    name: Restart scale stress
+    runs-on: ubuntu-latest
+    # This is a non-instrumented functional stress lane, not a normal timing
+    # assertion; keep it bounded so a deadlock still fails the PR promptly.
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      RUSTFLAGS: -Cdebuginfo=0
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Install Rust
+        run: rustup show active-toolchain
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run restart scale tests
+        run: |
+          set -euo pipefail
+          cargo test -p aruna-operations --test restart_traffic \
+            --all-features --locked -- \
+            --test-threads=1 --ignored --exact offline_scale_bound
+          cargo test -p aruna-operations --test restart_traffic \
+            --all-features --locked -- \
+            --test-threads=1 --ignored --exact offline_scale_converges
