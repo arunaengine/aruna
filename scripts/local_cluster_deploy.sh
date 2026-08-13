@@ -678,6 +678,7 @@ if [[ -z "$KEYCLOAK_HTTP_PORT" ]]; then
   KEYCLOAK_HTTP_PORT=$((BASE_PORT + NODE_COUNT * 10 + 1))
 fi
 
+mkdir -p "$(dirname -- "$DEPLOY_ROOT")"
 assert_removable "$DEPLOY_ROOT"
 
 trap cleanup EXIT
@@ -693,7 +694,6 @@ if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   require_command docker
 fi
 
-mkdir -p "$(dirname -- "$DEPLOY_ROOT")"
 rm -rf "$DEPLOY_ROOT"
 mkdir -p "$DEPLOY_ROOT"
 
