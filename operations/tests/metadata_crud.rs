@@ -488,32 +488,31 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
     assert!(before_recovery.is_empty());
 
     schedule_pending_metadata_projection_drain(test.context.as_ref(), Duration::ZERO).await?;
+    let task_handle = TaskHandle::new();
     initialize_task_incoming(
         test.context.clone(),
-        TaskHandle::new(),
+        task_handle.clone(),
         aruna_operations::jobs::runtime::JobsRuntime::new(),
     )
     .await;
 
-    wait_for_projected_record(&test, group_id, &record).await?;
-    // The restored background timer may materialize the job before this manual batch runs.
+    let report = task_handle.shutdown(Duration::from_secs(30)).await;
+    assert!(report.drained(), "projection task did not drain");
+    assert_eq!(
+        iter_keyspace_count(&test, METADATA_PENDING_PROJECTION_KEYSPACE).await?,
+        0
+    );
     let materialized = process_metadata_materialization_batch(test.context.as_ref()).await?;
     assert!(materialized.processed <= 1);
-
-    let mut fetched = None;
-    for _ in 0..200 {
-        if let Ok(document) = drive(
-            GetMetadataDocumentOperation::new(group_id, document_id),
-            test.context.as_ref(),
-        )
-        .await
-        {
-            fetched = Some(document);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let fetched = fetched.ok_or("timed out waiting for metadata materialization")?;
+    assert_eq!(
+        iter_keyspace_count(&test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        0
+    );
+    let fetched = drive(
+        GetMetadataDocumentOperation::new(group_id, document_id),
+        test.context.as_ref(),
+    )
+    .await?;
     assert_eq!(fetched.record, record);
     assert!(fetched.jsonld.contains("Scheduled Recovery Dataset"));
     Ok(())
@@ -1016,25 +1015,6 @@ async fn iter_keyspace_count(
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(format!("unexpected storage iter result: {other:?}").into()),
     }
-}
-
-async fn wait_for_projected_record(
-    test: &TestContext,
-    group_id: Ulid,
-    expected: &MetadataRegistryRecord,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..200 {
-        let listed = drive(
-            ListMetadataDocumentsOperation::new(group_id),
-            test.context.as_ref(),
-        )
-        .await?;
-        if listed == vec![expected.clone()] {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Err("timed out waiting for metadata projection".into())
 }
 
 async fn read_create_events(
