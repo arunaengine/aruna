@@ -903,7 +903,6 @@ mod tests {
                 http_addr: addr,
                 max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
-                portal_csp: aruna_api::csp::PortalCspConfig::default(),
             },
         )
         .build_router();

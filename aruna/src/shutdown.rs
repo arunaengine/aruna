@@ -103,6 +103,9 @@ pub struct NodeShutdown {
     /// `None` once a server has already terminated on its own.
     pub rest: Option<JoinHandle<Result<(), ServerSetupError>>>,
     pub s3: Option<JoinHandle<()>>,
+    /// Portal SPA listener; drains with the other ingress listeners and is
+    /// absent when no portal is configured.
+    pub portal: Option<JoinHandle<()>>,
     pub task_handle: TaskHandle,
     pub jobs_runtime: Arc<JobsRuntime>,
     pub net_handle: Option<NetHandle>,
@@ -130,6 +133,7 @@ impl NodeShutdown {
         let ingress = ingress_budget(self.grace, budget.remaining());
         let mut rest = self.rest;
         let mut s3 = self.s3;
+        let mut portal = self.portal;
         let mut ingress_complete = false;
         phase("ingress", ingress, async {
             if let Some(rest) = rest.as_mut() {
@@ -140,6 +144,10 @@ impl NodeShutdown {
                 let _ = s3.await;
             }
             s3 = None;
+            if let Some(portal) = portal.as_mut() {
+                let _ = portal.await;
+            }
+            portal = None;
             ingress_complete = true;
         })
         .await;
@@ -150,11 +158,17 @@ impl NodeShutdown {
             if let Some(s3) = s3.as_ref() {
                 s3.abort();
             }
+            if let Some(portal) = portal.as_ref() {
+                portal.abort();
+            }
             if let Some(rest) = rest {
                 let _ = rest.await;
             }
             if let Some(s3) = s3 {
                 let _ = s3.await;
+            }
+            if let Some(portal) = portal {
+                let _ = portal.await;
             }
         }
 
@@ -446,6 +460,7 @@ mod tests {
             readiness: Readiness::new(),
             rest: None,
             s3: None,
+            portal: None,
             task_handle: TaskHandle::new(),
             jobs_runtime: JobsRuntime::new(),
             net_handle: None,

@@ -7,7 +7,9 @@ use aruna::bootstrap::{
     prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
     wait_for_onboarding_placement,
 };
-use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
+use aruna::config::{
+    Config, PortalConfig, StartupMode, load, mark_node_state_complete, mark_onboarding_phase,
+};
 use aruna::portal;
 use aruna::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_for_signal};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
@@ -547,6 +549,7 @@ async fn provision_realm(
 struct ServerBindings {
     rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
     s3_handle: tokio::task::JoinHandle<()>,
+    portal_handle: Option<tokio::task::JoinHandle<()>>,
     realm_id: aruna_core::structs::RealmId,
     node_id: iroh::PublicKey,
     is_initial_boot: bool,
@@ -592,10 +595,18 @@ async fn bind_servers(
         http_addr: config.http_socket_addr,
         max_http_body_size: config.max_http_body_size,
         cors: cors.clone(),
-        portal_csp: PortalCspConfig::new(config.portal_csp_extra_origins.clone()),
     };
     let server = Server::new(state.clone(), server_config)
         .with_api_public_url(config.api_public_url.clone());
+
+    let portal_handle = bind_portal(
+        &config.portal,
+        config.api_public_url.as_deref(),
+        PortalCspConfig::new(config.portal_csp_extra_origins.clone()),
+        state.clone(),
+        shutdown,
+    )
+    .await?;
 
     let s3_server = S3Server::new(
         &config.s3_address,
@@ -641,10 +652,57 @@ async fn bind_servers(
     Ok(ServerBindings {
         rest_handle,
         s3_handle,
+        portal_handle,
         realm_id: config.realm_id,
         node_id: config.node_id,
         is_initial_boot,
     })
+}
+
+/// Binds the portal SPA listener when a portal is configured. `API_PUBLIC_URL`
+/// is required alongside it, so the served config always carries an absolute
+/// API base.
+async fn bind_portal(
+    portal: &PortalConfig,
+    api_public_url: Option<&str>,
+    csp: PortalCspConfig,
+    state: Arc<ServerState>,
+    shutdown: &Shutdown,
+) -> Result<Option<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error>> {
+    let PortalConfig::Artifact { socket_addr, .. } = portal else {
+        return Ok(None);
+    };
+    let Some(api_public_url) = api_public_url else {
+        return Ok(None);
+    };
+
+    let listener = TcpListener::bind(socket_addr).await?;
+    let bound = listener.local_addr()?;
+    let portal_config = aruna_api::portal::PortalConfig {
+        api_public_url: api_public_url.to_string(),
+        csp,
+    };
+    let token = shutdown.token();
+    let handle = tokio::spawn(async move {
+        if let Err(error) = aruna_api::portal::serve(listener, state, portal_config, token).await {
+            error!(error = %error, "Portal server stopped");
+        }
+    });
+    info!(portal_address = %bound, "Portal server listening");
+    Ok(Some(handle))
+}
+
+/// Resolves when a configured portal listener exits, and never without one, so
+/// a portal is supervised like the other ingress listeners while an unconfigured
+/// portal never fails the node.
+async fn portal_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+    match handle {
+        Some(handle) => match handle.await {
+            Ok(()) => "Portal server stopped unexpectedly".to_string(),
+            Err(error) => format!("Portal server panicked: {error}"),
+        },
+        None => std::future::pending().await,
+    }
 }
 
 struct Background {
@@ -757,6 +815,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ServerBindings {
         rest_handle,
         s3_handle,
+        mut portal_handle,
         realm_id,
         node_id,
         is_initial_boot,
@@ -808,6 +867,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => format!("REST server panicked: {error}"),
             });
         }
+        message = portal_exit(portal_handle.as_mut()) => {
+            portal_handle = None;
+            failure = Some(message);
+        }
         _ = &mut signal => {}
     }
 
@@ -831,6 +894,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         readiness,
         rest: rest_handle,
         s3: s3_handle,
+        portal: portal_handle,
         task_handle,
         jobs_runtime,
         net_handle: driver_ctx.net_handle.clone(),
@@ -1229,6 +1293,29 @@ mod tests {
         assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[tokio::test]
+    async fn portal_exit_reports() {
+        // A dead portal is a node failure, and a panic must not lose its error.
+        let mut stopped = tokio::spawn(async {});
+        assert_eq!(
+            portal_exit(Some(&mut stopped)).await,
+            "Portal server stopped unexpectedly"
+        );
+
+        let mut panicked = tokio::spawn(async { panic!("portal panicked") });
+        assert!(portal_exit(Some(&mut panicked)).await.contains("panicked"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn portal_exit_pends() {
+        // Without a configured portal the failure select must never fire for it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), portal_exit(None))
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(feature = "kubernetes")]

@@ -40,6 +40,8 @@ NODE_HTTP_PORTS=()
 NODE_P2P_PORTS=()
 NODE_S3_PORTS=()
 NODE_OPS_PORTS=()
+NODE_PORTAL_PORTS=()
+NODE_PORTAL_URLS=()
 STARTED_PID=""
 LAST_READY_CODE=""
 LAST_READY_BODY=""
@@ -62,8 +64,9 @@ Behavior:
   default          Build the workspace in release mode and launch 3 local Aruna nodes.
   --with-keycloak  Start a local Keycloak instance and configure every node for OIDC.
   --node-count N   Launch N total Aruna nodes. Defaults to 3. Also --node-count=N.
-  --portal-dir P   Serve the portal dist at P from every node's REST port and
-                   allow the node origins via CORS on REST and S3. Also --portal-dir=P.
+  --portal-dir P   Serve the portal dist at P on every node's own portal port,
+                   separate from the REST port, and allow the portal origins via
+                   CORS on REST and S3. Also --portal-dir=P.
   --auto-portal-dir
                    If no portal dir is set, download the latest portal prerelease
                    from arunaengine/website into the deployment temp directory.
@@ -258,7 +261,8 @@ write_node_env() {
   local p2p_port=$3
   local s3_port=$4
   local ops_port=$5
-  local onboarding_secret=${6:-}
+  local portal_port=$6
+  local onboarding_secret=${7:-}
   local max_concurrent_uni_streams="${MAX_CONCURRENT_UNI_STREAMS:-}"
   local max_concurrent_bidi_streams="${MAX_CONCURRENT_BIDI_STREAMS:-}"
   local compute_var
@@ -300,8 +304,9 @@ write_node_env() {
     if [[ -n "$PORTAL_DIR" ]]; then
       printf 'PORTAL_MODE=artifact\n'
       printf 'PORTAL_DIR=%s\n' "$(env_quote "$PORTAL_DIR")"
-      printf 'CORS_ALLOWED_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
-      printf 'PORTAL_CSP_EXTRA_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
+      printf 'PORTAL_SOCKET_ADDRESS=127.0.0.1:%s\n' "$portal_port"
+      printf 'CORS_ALLOWED_ORIGINS=%s\n' "$(env_quote "$PORTAL_CORS_ORIGINS")"
+      printf 'PORTAL_CSP_EXTRA_ORIGINS=%s\n' "$(env_quote "$PORTAL_CORS_ORIGINS")"
     fi
     if [[ "$WITH_KEYCLOAK" == "1" ]]; then
       printf 'OIDC_PROVIDER_IDS=main\n'
@@ -398,19 +403,29 @@ wait_for_ready() {
   done
 }
 
-# The portal is a separate contract from node readiness: a healthy ops endpoint
-# must never be reported as a served portal.
+# The portal is a separate contract from node readiness. Redirects are not
+# followed, so a REST listener answering with the swagger redirect can never be
+# mistaken for a served portal, and the config payload is checked as well.
 verify_portal_route() {
   local name=$1
-  local base_url=$2
+  local portal_url=$2
+  local api_url=$3
   local code
+  local config
 
   code="$(
-    curl --silent --location --max-time "$READY_ATTEMPT_TIMEOUT_SECS" \
-      --output /dev/null --write-out '%{http_code}' "$base_url/" 2>/dev/null || true
+    curl --silent --max-time "$READY_ATTEMPT_TIMEOUT_SECS" \
+      --output /dev/null --write-out '%{http_code}' "$portal_url/" 2>/dev/null || true
   )"
   [[ "$code" == "200" ]] \
-    || die "$name does not serve the portal at $base_url/ (status ${code:-none}); check PORTAL_DIR=$PORTAL_DIR"
+    || die "$name does not serve the portal at $portal_url/ (status ${code:-none}); check PORTAL_DIR=$PORTAL_DIR"
+
+  config="$(
+    curl --silent --max-time "$READY_ATTEMPT_TIMEOUT_SECS" \
+      "$portal_url/portal-config.json" 2>/dev/null || true
+  )"
+  [[ "$(compact_json "$config")" == *"\"apiBaseUrl\":\"$api_url/api/v1\""* ]] \
+    || die "$name serves an unexpected portal config at $portal_url/portal-config.json: ${config:-empty}"
 }
 
 wait_for_keycloak() {
@@ -485,10 +500,12 @@ onboard_server_node() {
   local p2p_port=$4
   local s3_port=$5
   local ops_port=$6
+  local portal_port=$7
   local secret
 
   secret="$(create_server_onboarding_secret)"
-  write_node_env "$node_dir" "$http_port" "$p2p_port" "$s3_port" "$ops_port" "$secret"
+  write_node_env "$node_dir" "$http_port" "$p2p_port" "$s3_port" "$ops_port" \
+    "$portal_port" "$secret"
   start_node "$name" "$node_dir"
   wait_for_ready "$name" "$ops_port" "$STARTED_PID"
 }
@@ -523,6 +540,7 @@ prepare_nodes() {
   local p2p_port
   local s3_port
   local ops_port
+  local portal_port
 
   for ((node_index = 1; node_index <= NODE_COUNT; node_index++)); do
     offset=$(((node_index - 1) * 10))
@@ -532,6 +550,7 @@ prepare_nodes() {
     p2p_port=$((BASE_PORT + offset + 2))
     s3_port=$((BASE_PORT + offset + 3))
     ops_port=$((BASE_PORT + offset + 4))
+    portal_port=$((BASE_PORT + offset + 5))
 
     mkdir -p "$node_dir"
     NODE_NAMES+=("$node_name")
@@ -541,6 +560,8 @@ prepare_nodes() {
     NODE_P2P_PORTS+=("$p2p_port")
     NODE_S3_PORTS+=("$s3_port")
     NODE_OPS_PORTS+=("$ops_port")
+    NODE_PORTAL_PORTS+=("$portal_port")
+    NODE_PORTAL_URLS+=("http://127.0.0.1:$portal_port")
   done
 }
 
@@ -552,48 +573,79 @@ assert_node_ports_free() {
     assert_port_free "${NODE_P2P_PORTS[$node_index]}"
     assert_port_free "${NODE_S3_PORTS[$node_index]}"
     assert_port_free "${NODE_OPS_PORTS[$node_index]}"
+    # The portal port is only bound when a portal dist is deployed.
+    [[ -z "$PORTAL_DIR" ]] || assert_port_free "${NODE_PORTAL_PORTS[$node_index]}"
   done
+}
+
+# One labelled value per line so anything here can be copied straight into a
+# browser, a curl call or an .env file.
+summary_entry() {
+  printf '  %-22s %s\n' "$1" "$2"
 }
 
 write_summary_file() {
   local summary_file=$1
+  local credentials_file=$2
   local node_index
 
   : >"$summary_file"
-  for node_index in "${!NODE_NAMES[@]}"; do
-    printf '%s http=%s s3=http://127.0.0.1:%s dir=%s log=%s\n' \
-      "${NODE_NAMES[$node_index]}" \
-      "${NODE_BASE_URLS[$node_index]}" \
-      "${NODE_S3_PORTS[$node_index]}" \
-      "${NODE_DIRS[$node_index]}" \
-      "${NODE_DIRS[$node_index]}/${NODE_NAMES[$node_index]}.log" \
-      >>"$summary_file"
-  done
+  {
+    for node_index in "${!NODE_NAMES[@]}"; do
+      printf '%s\n' "${NODE_NAMES[$node_index]}"
+      summary_entry "API and Swagger UI" "${NODE_BASE_URLS[$node_index]}/"
+      if [[ -n "$PORTAL_DIR" ]]; then
+        summary_entry "Portal" "${NODE_PORTAL_URLS[$node_index]}/"
+      fi
+      summary_entry "S3" "http://127.0.0.1:${NODE_S3_PORTS[$node_index]}"
+      summary_entry "Ops readiness" "http://127.0.0.1:${NODE_OPS_PORTS[$node_index]}/readyz"
+      summary_entry "Ops metrics" "http://127.0.0.1:${NODE_OPS_PORTS[$node_index]}/metrics"
+      summary_entry "Directory" "${NODE_DIRS[$node_index]}"
+      summary_entry "Log" "${NODE_DIRS[$node_index]}/${NODE_NAMES[$node_index]}.log"
+      printf '\n'
+    done
 
-  if [[ "$WITH_KEYCLOAK" == "1" ]]; then
-    printf 'keycloak issuer=%s discovery=%s admin=%s/%s\n' \
-      "$KEYCLOAK_ISSUER" \
-      "$KEYCLOAK_DISCOVERY_URL" \
-      "$KEYCLOAK_ADMIN_USER" \
-      "$KEYCLOAK_ADMIN_PASSWORD" \
-      >>"$summary_file"
-  fi
+    printf 'Credentials\n'
+    summary_entry "File" "$credentials_file"
 
-  if [[ -n "$PORTAL_DIR" ]]; then
-    printf 'portal dir=%s urls=%s\n' \
-      "$PORTAL_DIR" \
-      "$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}")" \
-      >>"$summary_file"
-  fi
+    if [[ -n "$PORTAL_DIR" ]]; then
+      printf '\nPortal\n'
+      summary_entry "Dist directory" "$PORTAL_DIR"
+    fi
+  } >>"$summary_file"
 }
 
-print_summary() {
-  local summary_file=$1
+# The token and the OIDC logins stay out of the retained summary; a private file
+# keeps them readable for the caller alone.
+write_credentials_file() {
+  local credentials_file=$1
+
+  (
+    umask 077
+    rm -f "$credentials_file"
+    {
+      printf 'Test credentials\n'
+      summary_entry "Aruna admin token" "$INITIAL_ADMIN_TOKEN"
+      if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+        summary_entry "Keycloak admin" "$KEYCLOAK_ADMIN_USER / $KEYCLOAK_ADMIN_PASSWORD"
+        summary_entry "Keycloak console" "http://127.0.0.1:$KEYCLOAK_HTTP_PORT/admin"
+        summary_entry "OIDC test user" "$KEYCLOAK_OIDC_USERNAME / $KEYCLOAK_OIDC_PASSWORD"
+        summary_entry "OIDC issuer" "$KEYCLOAK_ISSUER"
+        summary_entry "OIDC discovery" "$KEYCLOAK_DISCOVERY_URL"
+      else
+        summary_entry "OIDC" "not configured, started without --with-keycloak"
+      fi
+    } >"$credentials_file"
+  )
+}
+
+print_file() {
+  local file=$1
   local line
 
   while IFS= read -r line; do
     printf '%s\n' "$line"
-  done <"$summary_file"
+  done <"$file"
 }
 
 monitor_nodes() {
@@ -700,7 +752,9 @@ mkdir -p "$DEPLOY_ROOT"
 prepare_nodes
 
 if [[ -n "$PORTAL_DIR" ]]; then
-  PORTAL_CORS_ORIGINS="$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}"),$(printf 'http://127.0.0.1:%s,' "${NODE_S3_PORTS[@]}")http://localhost:5173"
+  # The browser now loads the SPA from the portal origins, so those are the
+  # origins the REST and S3 listeners have to admit.
+  PORTAL_CORS_ORIGINS="$(IFS=,; printf '%s' "${NODE_PORTAL_URLS[*]}"),$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}"),$(printf 'http://127.0.0.1:%s,' "${NODE_S3_PORTS[@]}")http://localhost:5173"
 fi
 
 assert_node_ports_free
@@ -733,7 +787,8 @@ if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   start_keycloak
 fi
 
-write_node_env "${NODE_DIRS[0]}" "${NODE_HTTP_PORTS[0]}" "${NODE_P2P_PORTS[0]}" "${NODE_S3_PORTS[0]}" "${NODE_OPS_PORTS[0]}"
+write_node_env "${NODE_DIRS[0]}" "${NODE_HTTP_PORTS[0]}" "${NODE_P2P_PORTS[0]}" \
+  "${NODE_S3_PORTS[0]}" "${NODE_OPS_PORTS[0]}" "${NODE_PORTAL_PORTS[0]}"
 
 start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
 NODE_1_PID="$STARTED_PID"
@@ -779,13 +834,17 @@ for node_index in "${!NODE_NAMES[@]}"; do
     "${NODE_HTTP_PORTS[$node_index]}" \
     "${NODE_P2P_PORTS[$node_index]}" \
     "${NODE_S3_PORTS[$node_index]}" \
-    "${NODE_OPS_PORTS[$node_index]}"
+    "${NODE_OPS_PORTS[$node_index]}" \
+    "${NODE_PORTAL_PORTS[$node_index]}"
 done
 
 if [[ -n "$PORTAL_DIR" ]]; then
   log "Verifying the portal route on every node"
   for node_index in "${!NODE_NAMES[@]}"; do
-    verify_portal_route "${NODE_NAMES[$node_index]}" "${NODE_BASE_URLS[$node_index]}"
+    verify_portal_route \
+      "${NODE_NAMES[$node_index]}" \
+      "${NODE_PORTAL_URLS[$node_index]}" \
+      "${NODE_BASE_URLS[$node_index]}"
   done
 fi
 
@@ -794,7 +853,8 @@ if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   verify_oidc_issuer
 fi
 
-write_summary_file "$DEPLOY_ROOT/summary.txt"
+write_credentials_file "$DEPLOY_ROOT/credentials.txt"
+write_summary_file "$DEPLOY_ROOT/summary.txt" "$DEPLOY_ROOT/credentials.txt"
 
 if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   log "$NODE_COUNT aruna nodes and Keycloak are up"
@@ -803,7 +863,9 @@ else
 fi
 
 log "Deployment summary:"
-print_summary "$DEPLOY_ROOT/summary.txt"
+print_file "$DEPLOY_ROOT/summary.txt"
+printf '\n'
+print_file "$DEPLOY_ROOT/credentials.txt"
 
 if [[ "$EXIT_AFTER_READY" == "1" ]]; then
   log "Exiting after readiness because ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1"

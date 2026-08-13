@@ -29,6 +29,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::jobs::service::{read_job_routed, submit_mint_pid};
 use aruna_operations::jobs::store::{find_dedup_job, read_job_record};
+use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
@@ -56,8 +57,9 @@ async fn mint_routes_holder() -> TestResult<()> {
     let forwarder = realm.non_holder(&placement);
     let holders = realm.assert_not_holder(forwarder.node_id(), &placement);
 
-    let (mapping, minted) = mint_routed(&realm, forwarder, document_id).await?;
-    assert!(minted);
+    // A retried mint whose first attempt lost its response reports no change, so
+    // the flag is covered without I/O in `persistent_id::tests` instead.
+    let (mapping, _) = mint_routed(&realm, forwarder, document_id).await?;
     assert_eq!(mapping.status, PersistentIdStatus::Active);
 
     for holder in &holders {
@@ -98,18 +100,7 @@ async fn withdraw_precedes_mint() -> TestResult<()> {
 
     // The submitted job is accepted here; the worker's mint runs after the
     // withdrawal below, exactly as the race orders it.
-    let submitted = submit_mint_pid(
-        &realm.node(0).context,
-        MintPersistentIdSpec {
-            document_id,
-            minted_by: realm.user_id,
-        },
-        realm.node(0).node_id(),
-        JOB_RETENTION_MS,
-        Some(realm.bearer_token()),
-    )
-    .await?;
-    assert!(submitted.created);
+    submit_routed(&realm, realm.node(0), document_id, realm.user_id).await?;
 
     let withdrawn = withdraw_routed(&realm, forwarder, document_id).await?;
     assert_eq!(withdrawn.status, PersistentIdStatus::Withdrawn);
@@ -160,14 +151,7 @@ async fn delete_withdraws_mapping() -> TestResult<()> {
     let record = registry_record(holder, document_id)
         .await
         .expect("the holder carries the registry row");
-    delete_metadata_document_routed(
-        &holder.context,
-        realm.actor(holder),
-        Some(&record),
-        document_id,
-        Some(realm.bearer_token()),
-    )
-    .await?;
+    delete_until_applied(&realm, holder, &record, document_id).await?;
 
     let mapping = read_mapping(holder.context.as_ref(), document_id)
         .await?
@@ -213,14 +197,7 @@ async fn replica_delete_routes_to_pid_authority() -> TestResult<()> {
     let record = registry_record(replica, document_id)
         .await
         .expect("the replica carries the registry row");
-    delete_metadata_document_routed(
-        &replica.context,
-        realm.actor(replica),
-        Some(&record),
-        document_id,
-        Some(realm.bearer_token()),
-    )
-    .await?;
+    delete_until_applied(&realm, replica, &record, document_id).await?;
 
     let mapping = read_mapping(authority.context.as_ref(), document_id)
         .await?
@@ -352,30 +329,11 @@ async fn mint_dedups_ingress() -> TestResult<()> {
     let ingress = realm.non_holder_ids(&placement);
     let (first_node, second_node) = (realm.find(ingress[0]), realm.find(ingress[1]));
 
-    let first = submit_mint_pid(
-        &first_node.context,
-        MintPersistentIdSpec {
-            document_id,
-            minted_by: realm.user_id,
-        },
-        first_node.node_id(),
-        JOB_RETENTION_MS,
-        Some(realm.bearer_token()),
-    )
-    .await?;
-    let second = submit_mint_pid(
-        &second_node.context,
-        MintPersistentIdSpec {
-            document_id,
-            minted_by: other,
-        },
-        second_node.node_id(),
-        JOB_RETENTION_MS,
-        Some(realm.bearer_for(other)),
-    )
-    .await?;
+    let first = submit_routed(&realm, first_node, document_id, realm.user_id).await?;
+    let second = submit_routed(&realm, second_node, document_id, other).await?;
 
-    assert!(first.created);
+    // A retried submission joins its own lost attempt, so only the second
+    // submitter's join carries the dedup contract.
     assert!(!second.created, "the second user joins the first job");
     assert_eq!(first.job_id, second.job_id);
 
@@ -614,6 +572,42 @@ async fn routed_delete(
     .await
 }
 
+/// A routed delete, retried while the forward reports it undeliverable: a
+/// response lost on a starved machine leaves the write possibly sent. The frozen
+/// record routes the first attempt only, so a replay can still answer
+/// `NotFound` once the row is gone from the current holders.
+async fn delete_until_applied(
+    realm: &Topology,
+    node: &TestNode,
+    record: &aruna_core::structs::MetadataRegistryRecord,
+    document_id: Ulid,
+) -> TestResult<()> {
+    let attempted = std::cell::Cell::new(false);
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed delete reached the authority",
+        || async {
+            let replay = attempted.replace(true);
+            match delete_metadata_document_routed(
+                &node.context,
+                realm.actor(node),
+                (!replay).then_some(record),
+                document_id,
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataWriteError::Undeliverable(_)) => Ok(1),
+                Err(MetadataWriteError::NotFound) if replay => Ok(0),
+                other => {
+                    other?;
+                    Ok(0)
+                }
+            }
+        },
+    )
+    .await
+}
+
 fn revision(occurred_at_ms: u64) -> PersistentIdRevision {
     PersistentIdRevision {
         event_id: Ulid::generate(),
@@ -673,35 +667,113 @@ async fn write_entry(
     }
 }
 
+/// A routed mint submission, retried while the authority reports it
+/// unavailable: the document-global dedup key makes a replay join the job the
+/// lost attempt created rather than open a second one.
+async fn submit_routed(
+    realm: &Topology,
+    node: &TestNode,
+    document_id: Ulid,
+    minted_by: aruna_core::UserId,
+) -> TestResult<SubmitJobResult> {
+    let submitted = std::cell::RefCell::new(None);
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no mint submission reached the authority",
+        || async {
+            match submit_mint_pid(
+                &node.context,
+                MintPersistentIdSpec {
+                    document_id,
+                    minted_by,
+                },
+                node.node_id(),
+                JOB_RETENTION_MS,
+                Some(realm.bearer_for(minted_by)),
+            )
+            .await
+            {
+                Err(SubmitJobError::PlacementUnavailable(_)) => Ok(1),
+                other => {
+                    *submitted.borrow_mut() = Some(other?);
+                    Ok(0)
+                }
+            }
+        },
+    )
+    .await?;
+    Ok(submitted
+        .into_inner()
+        .ok_or("the mint submission produced no job")?)
+}
+
+/// A routed mint, retried while the fan-out reports it unavailable: the mint is
+/// idempotent on the authority, so a replay after a lost response returns the
+/// existing mapping instead of a second one.
 async fn mint_routed(
     realm: &Topology,
     node: &TestNode,
     document_id: Ulid,
 ) -> TestResult<(aruna_core::structs::PersistentIdMapping, bool)> {
-    Ok(mint_pid_routed(
-        &node.context,
-        realm.realm_id,
-        document_id,
-        realm.user_id,
-        aruna_core::util::unix_timestamp_millis(),
-        Some(realm.bearer_token()),
+    let minted = std::cell::RefCell::new(None);
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed mint reached the authority",
+        || async {
+            match mint_pid_routed(
+                &node.context,
+                realm.realm_id,
+                document_id,
+                realm.user_id,
+                aruna_core::util::unix_timestamp_millis(),
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataApiError::ServiceUnavailable) => Ok(1),
+                other => {
+                    *minted.borrow_mut() = Some(other?);
+                    Ok(0)
+                }
+            }
+        },
     )
-    .await?)
+    .await?;
+    Ok(minted
+        .into_inner()
+        .ok_or("the routed mint produced no mapping")?)
 }
 
+/// A routed withdrawal, retried on the same terms as the mint: withdrawing an
+/// already withdrawn mapping returns it unchanged.
 async fn withdraw_routed(
     realm: &Topology,
     node: &TestNode,
     document_id: Ulid,
 ) -> TestResult<aruna_core::structs::PersistentIdMapping> {
-    Ok(withdraw_pid_routed(
-        &node.context,
-        realm.realm_id,
-        document_id,
-        aruna_core::util::unix_timestamp_millis(),
-        Some(realm.bearer_token()),
+    let withdrawn = std::cell::RefCell::new(None);
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "no routed withdrawal reached the authority",
+        || async {
+            match withdraw_pid_routed(
+                &node.context,
+                realm.realm_id,
+                document_id,
+                aruna_core::util::unix_timestamp_millis(),
+                Some(realm.bearer_token()),
+            )
+            .await
+            {
+                Err(MetadataApiError::ServiceUnavailable) => Ok(1),
+                other => {
+                    *withdrawn.borrow_mut() = Some(other?);
+                    Ok(0)
+                }
+            }
+        },
     )
-    .await?)
+    .await?;
+    Ok(withdrawn
+        .into_inner()
+        .ok_or("the routed withdrawal produced no mapping")?)
 }
 
 /// A routed resolve, retried while the fan-out reports it unavailable: the first
