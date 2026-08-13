@@ -384,20 +384,32 @@ jobs:
             fi
           }
 
+          # The portal owns its own listener, so it is probed there without
+          # following redirects: the REST root only redirects to swagger and
+          # must never pass for a served portal.
           assert_portal() {
             local nodes=$1
-            local index port body
+            local index rest_port portal_port code config
             for index in $(seq 1 "$nodes"); do
-              port=$((BASE_PORT + (index - 1) * 10 + 1))
-              expect_status "http://127.0.0.1:$port/" 200
-              expect_status "http://127.0.0.1:$port/api-docs/openapi.json" 200
-              body="$(curl -s -L --max-time 10 "http://127.0.0.1:$port/")"
-              case "$body" in
-                *"<html"*) ;;
-                *) die "node-$index served no portal document" ;;
+              rest_port=$((BASE_PORT + (index - 1) * 10 + 1))
+              portal_port=$((BASE_PORT + (index - 1) * 10 + 5))
+              expect_status "http://127.0.0.1:$rest_port/" 200
+              expect_status "http://127.0.0.1:$rest_port/api-docs/openapi.json" 200
+              code="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' \
+                "http://127.0.0.1:$portal_port/" || true)"
+              [ "$code" = "200" ] \
+                || die "node-$index answered $code on portal port $portal_port"
+              config="$(curl -s --max-time 10 \
+                "http://127.0.0.1:$portal_port/portal-config.json" || true)"
+              case "$(printf '%s' "$config" | tr -d ' \t\r\n')" in
+                *"\"apiBaseUrl\":\"http://127.0.0.1:$rest_port/api/v1\""*) ;;
+                *) die "node-$index served no portal config: ${config:-empty}" ;;
               esac
             done
-            grep -q '^portal dir=' "$DEPLOY_ROOT/summary.txt" || die "no portal summary entry"
+            [ "$(grep -c '^  Portal  ' "$DEPLOY_ROOT/summary.txt")" = "$nodes" ] \
+              || die "summary lists no portal url per node"
+            grep -q '^  Dist directory  ' "$DEPLOY_ROOT/summary.txt" \
+              || die "no portal dist directory in the summary"
           }
 
           assert_stopped() {
