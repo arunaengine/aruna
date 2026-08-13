@@ -2556,6 +2556,13 @@ pub struct OutboxDrainer {
     handler: Arc<OperationsTaskHandler>,
 }
 
+#[doc(hidden)]
+pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
+    OperationsTaskHandler::new(context, JobsRuntime::new())
+        .drain_notification_outbox()
+        .await;
+}
+
 impl OutboxDrainer {
     pub fn new(context: Arc<DriverContext>) -> Self {
         Self {

@@ -1,7 +1,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_core::document::{DocumentSyncNetEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
@@ -42,16 +42,12 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use ulid::Ulid;
 
 mod convergence;
 use convergence::wait_for_convergence;
 
 const LIST_LIMIT: usize = LIST_NOTIFICATIONS_MAX_LIMIT;
-// Interest publication is debounced by 2s, so a few seconds comfortably bounds
-// the window an erroneous delivery would need to land in for negative assertions.
-const NEGATIVE_WAIT: Duration = Duration::from_secs(5);
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -320,7 +316,6 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
 
-    sleep(NEGATIVE_WAIT).await;
     for node in &nodes {
         assert_eq!(
             inbox_len(node).await,

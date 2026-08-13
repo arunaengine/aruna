@@ -1,7 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -24,13 +23,11 @@ use aruna_operations::notifications::dispatch::{
 };
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
-use aruna_operations::notifications::outbox::NOTIFICATION_DELIVERY_RETRY_AFTER;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::task_incoming::{drain_notification_outbox, initialize_task_incoming};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use ulid::Ulid;
 
 mod convergence;
@@ -96,10 +93,16 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
     let record = added_to_group_record(recipient, realm_id, unix_timestamp_millis());
     let target = record.notification_id;
 
+    nodes[0]
+        .context
+        .task_handle
+        .as_ref()
+        .expect("task handle")
+        .clear_inbound_handler()
+        .await;
     nodes[2].net.shutdown().await;
     emit_on(&nodes[0], vec![record]).await?;
-
-    sleep(NOTIFICATION_DELIVERY_RETRY_AFTER + Duration::from_secs(5)).await;
+    drain_notification_outbox(nodes[0].context.clone()).await;
     let retained = outbox_records(&nodes[0]).await;
     assert!(
         retained
@@ -111,6 +114,7 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
     nodes[2] = spawn_node_reusing_storage(realm_id, secrets[2], holder_storage.clone()).await?;
     mesh_nodes(&nodes).await;
     install_realm_config(&nodes, realm_id).await?;
+    drain_notification_outbox(nodes[0].context.clone()).await;
 
     wait_for(|| {
         let nodes = &nodes;
