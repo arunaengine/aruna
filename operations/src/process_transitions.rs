@@ -40,6 +40,10 @@ pub async fn process_placement_transitions(
     }
     let mut pending = ensure_strategy_activations(context, realm_id, local_node_id, config).await;
     let mut departed = false;
+    // Steps are gathered and committed as one batch: per-bucket commits on a
+    // realm-scale transition would grind the config document through hundreds
+    // of serialized, conflict-prone transactions (one per bucket per node).
+    let mut steps: Vec<RealmPlacementMutation> = Vec::new();
     for transition in &config.placement_transitions {
         let mut in_flight = 0u32;
         for bucket in &transition.plan.buckets {
@@ -63,15 +67,25 @@ pub async fn process_placement_transitions(
                 shard: bucket.bucket,
             };
             if bucket.old_holders.contains(&local_node_id) {
-                pending |=
-                    report_barrier(context, realm_id, local_node_id, transition, &placement).await;
+                match barrier_step(context, realm_id, local_node_id, transition, &placement).await {
+                    StepPlan::Ready(mutation) => steps.push(mutation),
+                    StepPlan::Pending => pending = true,
+                    StepPlan::Done => {}
+                }
             }
             if bucket.target_holders.contains(&local_node_id) {
-                pending |=
-                    submit_completion(context, realm_id, local_node_id, transition, &placement)
-                        .await;
+                match completion_step(context, realm_id, local_node_id, transition, &placement)
+                    .await
+                {
+                    StepPlan::Ready(mutation) => steps.push(mutation),
+                    StepPlan::Pending => pending = true,
+                    StepPlan::Done => {}
+                }
             }
         }
+    }
+    if !steps.is_empty() {
+        pending |= submit_steps(context, realm_id, local_node_id, steps).await;
     }
     // Flush-then-leave (DECISIONS K3): a bucket this node just handed over
     // leaves it a member only until the grace elapses, so whatever it accepted
@@ -82,66 +96,68 @@ pub async fn process_placement_transitions(
     pending
 }
 
+/// One bucket step this node owes: a mutation ready to batch, work still
+/// blocked on a precondition, or nothing left to do.
+enum StepPlan {
+    Ready(RealmPlacementMutation),
+    Pending,
+    Done,
+}
+
 /// Freezes this old holder's frontier for the bucket, once.
-async fn report_barrier(
+async fn barrier_step(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     local_node_id: NodeId,
     transition: &PlacementTransition,
     placement: &PlacementRef,
-) -> bool {
+) -> StepPlan {
     if transition
         .barriers
         .iter()
         .any(|barrier| barrier.bucket == placement.shard && barrier.reported_by == local_node_id)
     {
-        return false;
+        return StepPlan::Done;
     }
     let frontier = match assemble_shard_manifest(context, realm_id, *placement).await {
         Ok(manifest) => manifest.cursor,
         Err(error) => {
             debug!(error = %error, "Cannot assemble a transition barrier frontier yet");
-            return true;
+            return StepPlan::Pending;
         }
     };
-    submit_mutation(
-        context,
-        realm_id,
-        local_node_id,
-        RealmPlacementMutation::ReportBarrier {
-            transition_id: transition.plan.transition_id,
-            bucket: placement.shard,
-            reported_by: local_node_id,
-            frontier,
-        },
-    )
-    .await
+    StepPlan::Ready(RealmPlacementMutation::ReportBarrier {
+        transition_id: transition.plan.transition_id,
+        bucket: placement.shard,
+        reported_by: local_node_id,
+        frontier,
+    })
 }
 
 /// Joins, pulls, verifies, and proves the bucket from the target side.
-async fn submit_completion(
+async fn completion_step(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     local_node_id: NodeId,
     transition: &PlacementTransition,
     placement: &PlacementRef,
-) -> bool {
+) -> StepPlan {
     if transition
         .proofs_for(placement.shard)
         .any(|proof| proof.holder == local_node_id)
     {
-        return false;
+        return StepPlan::Done;
     }
     let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
-        return false;
+        return StepPlan::Done;
     };
     // Until every old holder has fenced there is no reference frontier, so a
     // proof would attest to a moving target.
     if !transition.barrier_established(placement.shard, &bucket.old_holders) {
-        return true;
+        return StepPlan::Pending;
     }
     let Some(net_handle) = context.net_handle.clone() else {
-        return true;
+        return StepPlan::Pending;
     };
     let sources: Vec<NodeId> = bucket
         .old_holders
@@ -170,7 +186,7 @@ async fn submit_completion(
             Ok(manifest) => manifest.digest,
             Err(error) => {
                 debug!(error = %error, "Cannot assemble a source-less transition checkpoint");
-                return true;
+                return StepPlan::Pending;
             }
         }
     } else {
@@ -191,13 +207,13 @@ async fn submit_completion(
                     shard = placement.shard,
                     "No old holder served a verifiable shard copy yet"
                 );
-                return true;
+                return StepPlan::Pending;
             }
         }
     };
 
     let Some(activation) = config_activation(context, realm_id, placement).await else {
-        return true;
+        return StepPlan::Pending;
     };
     let claim = ProofClaim {
         realm_id,
@@ -211,17 +227,32 @@ async fn submit_completion(
         holder: local_node_id,
     };
     let proof = claim.signed_with(|message| net_handle.sign(message));
-    submit_mutation(
-        context,
+    StepPlan::Ready(RealmPlacementMutation::SubmitCompletion {
+        transition_id: transition.plan.transition_id,
+        strategy_id: transition.plan.strategy_id,
+        proof,
+    })
+}
+
+/// Commits one pass's gathered steps in a single transaction.
+async fn submit_steps(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    steps: Vec<RealmPlacementMutation>,
+) -> bool {
+    let actor = Actor {
+        node_id: local_node_id,
+        user_id: UserId::nil(realm_id),
         realm_id,
-        local_node_id,
-        RealmPlacementMutation::SubmitCompletion {
-            transition_id: transition.plan.transition_id,
-            strategy_id: transition.plan.strategy_id,
-            proof,
-        },
-    )
-    .await
+    };
+    match drive(MutateRealmPlacementOperation::batch(actor, steps), context).await {
+        Ok(_) => false,
+        Err(error) => {
+            warn!(error = %error, "Placement transition steps did not apply");
+            true
+        }
+    }
 }
 
 /// Activates the newest map for a strategy that has none, so a strategy that

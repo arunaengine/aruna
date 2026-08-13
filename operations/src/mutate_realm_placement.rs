@@ -478,7 +478,8 @@ pub struct MutateRealmPlacementConfig {
 
 #[derive(Debug, PartialEq)]
 pub struct MutateRealmPlacementOperation {
-    config: MutateRealmPlacementConfig,
+    actor: Actor,
+    mutations: Vec<RealmPlacementMutation>,
     txn_id: Option<TxnId>,
     state: MutateRealmPlacementState,
     output: Option<Result<RealmConfigDocument, MutateRealmPlacementError>>,
@@ -560,8 +561,16 @@ pub enum MutateRealmPlacementError {
 
 impl MutateRealmPlacementOperation {
     pub fn new(config: MutateRealmPlacementConfig) -> Self {
+        Self::batch(config.actor, vec![config.mutation])
+    }
+
+    /// One transaction, one reduced event per mutation, applied in order
+    /// against the evolving document. The whole batch commits or none of it
+    /// does. `RemoveStrategy` must be driven alone.
+    pub fn batch(actor: Actor, mutations: Vec<RealmPlacementMutation>) -> Self {
         Self {
-            config,
+            actor,
+            mutations,
             txn_id: None,
             state: MutateRealmPlacementState::Init,
             output: None,
@@ -570,13 +579,13 @@ impl MutateRealmPlacementOperation {
 
     fn document_ref(&self) -> DocumentSyncTarget {
         DocumentSyncTarget::RealmConfig {
-            realm_id: self.config.actor.realm_id,
+            realm_id: self.actor.realm_id,
         }
     }
 
     fn admin_target(&self) -> AdminDocumentTarget {
         AdminDocumentTarget::RealmConfig {
-            realm_id: self.config.actor.realm_id,
+            realm_id: self.actor.realm_id,
         }
     }
 
@@ -611,8 +620,12 @@ impl MutateRealmPlacementOperation {
         let Some(document_value) = document_value else {
             return Err(MutateRealmPlacementError::RealmConfigNotFound);
         };
+        if self.mutations.is_empty() {
+            return Err(MutateRealmPlacementError::InvalidInput(
+                "empty placement mutation batch".to_string(),
+            ));
+        }
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
-        self.config.mutation.validate(&document)?;
 
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
@@ -634,14 +647,19 @@ impl MutateRealmPlacementOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        let admin_event = reducer_state
-            .apply_operation(&self.config.actor, self.config.mutation.admin_operation())?;
         let pre_document = document.clone();
-        overlay_realm_config_placement_reducer_materialization(
-            &mut document,
-            &reducer_state,
-            unix_timestamp_millis(),
-        );
+        let mut admin_events = Vec::with_capacity(self.mutations.len());
+        for mutation in &self.mutations {
+            mutation.validate(&document)?;
+            let admin_event =
+                reducer_state.apply_operation(&self.actor, mutation.admin_operation())?;
+            overlay_realm_config_placement_reducer_materialization(
+                &mut document,
+                &reducer_state,
+                unix_timestamp_millis(),
+            );
+            admin_events.push(admin_event);
+        }
 
         if let Some((node_id, placement)) =
             crate::placement::first_draining_holder_set_change(&pre_document, &document)
@@ -668,22 +686,24 @@ impl MutateRealmPlacementOperation {
             (
                 document_target.storage_keyspace().to_string(),
                 document_target.storage_key(),
-                document.to_bytes(&self.config.actor)?.into(),
+                document.to_bytes(&self.actor)?.into(),
             ),
             admin_document_reducer_state_write_entry(&reducer_state)?,
         ];
-        let record = new_outbox_record_with_id(
-            admin_event.event_id,
-            self.config.actor.node_id,
-            document_target,
-            Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(admin_event),
-            },
-            placement,
-            false,
-        );
-        writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        for admin_event in admin_events {
+            let record = new_outbox_record_with_id(
+                admin_event.event_id,
+                self.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: Box::new(admin_event),
+                },
+                placement,
+                false,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
@@ -705,11 +725,21 @@ impl MutateRealmPlacementOperation {
         let Some(document_value) = document_value else {
             return Err(MutateRealmPlacementError::RealmConfigNotFound);
         };
-        let document = RealmConfigDocument::from_bytes(&document_value)?;
-        self.config.mutation.validate(&document)?;
-        let strategy_id = match &self.config.mutation {
-            RealmPlacementMutation::RemoveStrategy(strategy_id) => *strategy_id,
-            _ => {
+        let strategy_id = match self.mutations.as_slice() {
+            [RealmPlacementMutation::RemoveStrategy(strategy_id)] => {
+                let document = RealmConfigDocument::from_bytes(&document_value)?;
+                RealmPlacementMutation::RemoveStrategy(*strategy_id).validate(&document)?;
+                *strategy_id
+            }
+            mutations => {
+                if mutations
+                    .iter()
+                    .any(|mutation| matches!(mutation, RealmPlacementMutation::RemoveStrategy(_)))
+                {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "strategy removal cannot be batched".to_string(),
+                    ));
+                }
                 return self.emit_write_document_and_admin_state(
                     Some(document_value),
                     reducer_state_value,
@@ -761,7 +791,7 @@ impl MutateRealmPlacementOperation {
     }
 
     fn reference_matches(&self, record: &MetadataRegistryRecord, strategy_id: Ulid) -> bool {
-        record.realm_id == self.config.actor.realm_id
+        record.realm_id == self.actor.realm_id
             && record.placement != PlacementRef::NIL
             && record.placement.strategy_id == strategy_id
     }
@@ -986,16 +1016,16 @@ impl Operation for MutateRealmPlacementOperation {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
                     smallvec![schedule_placement_revalidation_effect(
-                        self.config.actor.realm_id,
-                        self.config.actor.node_id,
+                        self.actor.realm_id,
+                        self.actor.node_id,
                     )]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
                     self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
                     smallvec![schedule_placement_revalidation_effect(
-                        self.config.actor.realm_id,
-                        self.config.actor.node_id,
+                        self.actor.realm_id,
+                        self.actor.node_id,
                     )]
                 }
                 other => self.unexpected_event(
