@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +24,9 @@ const PRESENCE_FRESH: Duration = Duration::from_secs(10);
 /// Beyond this age the snapshot is not served at all and the caller waits for a
 /// bounded cold lookup.
 const PRESENCE_MAX_STALE: Duration = Duration::from_secs(60);
+/// A stale reader gives up this long before its own deadline, so a refresh that
+/// cannot finish still yields the snapshot instead of an expired read.
+const PRESENCE_ANSWER_MARGIN: Duration = Duration::from_millis(250);
 
 /// Everything a net effect needs besides the effect itself.
 pub struct NetEffectContext {
@@ -40,6 +43,7 @@ pub struct NetEffectContext {
 pub(crate) struct RefreshProbe {
     started: Notify,
     release: Notify,
+    starts: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -48,6 +52,7 @@ impl RefreshProbe {
         Self {
             started: Notify::new(),
             release: Notify::new(),
+            starts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -64,7 +69,9 @@ struct PresenceSnapshot {
 #[derive(Clone, Default)]
 pub struct RealmPresenceCache {
     snapshots: Arc<Mutex<HashMap<RealmId, PresenceSnapshot>>>,
-    refreshing: Arc<Mutex<HashSet<RealmId>>>,
+    /// Token per in-flight refresh, cancelled when it settles so every stale
+    /// reader can join the one refresh instead of starting its own.
+    refreshing: Arc<Mutex<HashMap<RealmId, CancellationToken>>>,
 }
 
 impl std::fmt::Debug for RealmPresenceCache {
@@ -75,33 +82,62 @@ impl std::fmt::Debug for RealmPresenceCache {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum PresenceServe {
     Fresh(Vec<DhtEntry>),
     Stale {
         values: Vec<DhtEntry>,
+        /// True for the reader that has to start the refresh.
         refresh: bool,
+        /// Cancelled once that refresh settled.
+        settled: CancellationToken,
     },
     Cold,
 }
 
 impl RealmPresenceCache {
     fn serve(&self, realm_id: RealmId, now: Instant) -> PresenceServe {
-        let snapshots = self.snapshots.lock();
-        let Some(snapshot) = snapshots.get(&realm_id) else {
-            return PresenceServe::Cold;
+        let values = {
+            let snapshots = self.snapshots.lock();
+            let Some(snapshot) = snapshots.get(&realm_id) else {
+                return PresenceServe::Cold;
+            };
+            let age = now.saturating_duration_since(snapshot.observed);
+            if age <= PRESENCE_FRESH {
+                return PresenceServe::Fresh(snapshot.values.clone());
+            }
+            if age > PRESENCE_MAX_STALE {
+                return PresenceServe::Cold;
+            }
+            snapshot.values.clone()
         };
-        let age = now.saturating_duration_since(snapshot.observed);
-        if age <= PRESENCE_FRESH {
-            return PresenceServe::Fresh(snapshot.values.clone());
+
+        let mut refreshing = self.refreshing.lock();
+        match refreshing.get(&realm_id) {
+            Some(settled) => PresenceServe::Stale {
+                values,
+                refresh: false,
+                settled: settled.clone(),
+            },
+            None => {
+                let settled = CancellationToken::new();
+                refreshing.insert(realm_id, settled.clone());
+                PresenceServe::Stale {
+                    values,
+                    refresh: true,
+                    settled,
+                }
+            }
         }
-        if age > PRESENCE_MAX_STALE {
-            return PresenceServe::Cold;
-        }
-        PresenceServe::Stale {
-            values: snapshot.values.clone(),
-            refresh: self.refreshing.lock().insert(realm_id),
-        }
+    }
+
+    /// Side-effect free freshness check: a reader that waited for a refresh
+    /// must not claim the next single-flight slot while re-reading.
+    fn fresh(&self, realm_id: RealmId, now: Instant) -> Option<Vec<DhtEntry>> {
+        let snapshots = self.snapshots.lock();
+        let snapshot = snapshots.get(&realm_id)?;
+        (now.saturating_duration_since(snapshot.observed) <= PRESENCE_FRESH)
+            .then(|| snapshot.values.clone())
     }
 
     /// An empty answer holds no candidate to serve, so caching it would only
@@ -121,7 +157,9 @@ impl RealmPresenceCache {
     }
 
     fn release(&self, realm_id: RealmId) {
-        self.refreshing.lock().remove(&realm_id);
+        if let Some(settled) = self.refreshing.lock().remove(&realm_id) {
+            settled.cancel();
+        }
     }
 }
 
@@ -246,8 +284,10 @@ async fn run_get(
     }
 }
 
-/// Serves realm presence from the snapshot when it is young enough, refreshing
-/// a stale one exactly once in the background instead of blocking the caller.
+/// Serves realm presence from the snapshot when it is young enough. A stale
+/// snapshot starts one refresh that every stale reader awaits inside its own
+/// deadline, so a peer is only reported as unseen when the refresh cannot
+/// answer in time.
 async fn serve_presence(
     ctx: &NetEffectContext,
     realm_id: RealmId,
@@ -261,9 +301,25 @@ async fn serve_presence(
             values,
             stale: false,
         }),
-        PresenceServe::Stale { values, refresh } => {
+        PresenceServe::Stale {
+            values,
+            refresh,
+            settled,
+        } => {
             if refresh {
                 spawn_refresh(ctx, realm_id, key, realm_filter, options);
+            }
+            let wait = options.deadline.saturating_sub(PRESENCE_ANSWER_MARGIN);
+            if tokio::time::timeout(wait, settled.cancelled())
+                .await
+                .is_ok()
+                && let Some(values) = ctx.presence.fresh(realm_id, Instant::now())
+            {
+                return NetEvent::Dht(DhtEvent::GetResult {
+                    key,
+                    values,
+                    stale: false,
+                });
             }
             NetEvent::Dht(DhtEvent::GetResult {
                 key,
@@ -304,6 +360,9 @@ fn spawn_refresh(
         move |shutdown| async move {
             #[cfg(test)]
             if let Some(probe) = refresh_probe {
+                probe
+                    .starts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 probe.started.notify_one();
                 tokio::select! {
                     _ = shutdown.cancelled() => return None,
@@ -620,7 +679,10 @@ mod tests {
         tasks.close();
         tasks.wait().await;
 
-        assert_eq!(cache.serve(realm_id, Instant::now()), PresenceServe::Cold);
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Cold
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -645,7 +707,7 @@ mod tests {
 
         assert!(matches!(
             cache.serve(realm_id, Instant::now()),
-            PresenceServe::Stale { refresh: true, values } if values[0].node_id == make_node(7)
+            PresenceServe::Stale { refresh: true, values, .. } if values[0].node_id == make_node(7)
         ));
     }
 
@@ -729,21 +791,19 @@ mod tests {
             vec![stale_entry(realm_id, 12)],
             Instant::now() - Duration::from_secs(20),
         );
+        // The stale reader waits for the refresh instead of flapping the peer
+        // to unseen for a whole freshness window.
         let event = handle_net_effect(&context, presence_effect(realm_id)).await;
         assert!(matches!(
             event,
             NetEvent::Dht(DhtEvent::GetResult {
-                stale: true,
+                stale: false,
                 values,
                 ..
-            }) if values[0].node_id == make_node(12)
+            }) if values.iter().any(|entry| entry.node_id == handle.node_id())
         ));
 
         finish_tasks(&context).await;
-        assert!(matches!(
-            context.presence.serve(realm_id, Instant::now()),
-            PresenceServe::Fresh(values) if values.iter().any(|entry| entry.node_id == handle.node_id())
-        ));
         handle.shutdown().await;
     }
 
@@ -767,10 +827,10 @@ mod tests {
             }) if values.len() == 1
         ));
         finish_tasks(&context).await;
-        assert_eq!(
+        assert!(matches!(
             context.presence.serve(realm_id, Instant::now()),
             PresenceServe::Cold
-        );
+        ));
         handle.shutdown().await;
         peer.shutdown().await;
     }
@@ -797,7 +857,7 @@ mod tests {
         finish_tasks(&context).await;
         assert!(matches!(
             context.presence.serve(realm_id, Instant::now()),
-            PresenceServe::Stale { refresh: true, values } if values.len() == 1
+            PresenceServe::Stale { refresh: true, values, .. } if values.len() == 1
         ));
     }
 
@@ -825,34 +885,87 @@ mod tests {
 
     #[tokio::test]
     async fn single_flight_handler() {
+        // Concurrent stale readers join one refresh and both answer fresh.
         let (handle, mut context, _directory, realm_id) = handler_context(16).await;
         let probe = Arc::new(RefreshProbe::new());
         context.refresh_probe = Some(probe.clone());
+        let put = handle_net_effect(
+            &context,
+            NetEffect::Dht(DhtEffect::Put {
+                key: realm_presence_key(&realm_id),
+                realm_id,
+                value: Vec::new(),
+                ttl: Duration::from_secs(300),
+            }),
+        )
+        .await;
+        assert!(matches!(put, NetEvent::Dht(DhtEvent::PutComplete { .. })));
         context.presence.store(
             realm_id,
             vec![stale_entry(realm_id, 16)],
             Instant::now() - Duration::from_secs(20),
         );
 
-        let started = probe.started.notified();
-        let first = handle_net_effect(&context, presence_effect(realm_id)).await;
-        tokio::time::timeout(Duration::from_secs(30), started)
-            .await
-            .expect("presence refresh must start");
-        let second = handle_net_effect(&context, presence_effect(realm_id)).await;
+        let releaser = {
+            let probe = probe.clone();
+            tokio::spawn(async move {
+                probe.started.notified().await;
+                probe.release.notify_one();
+            })
+        };
+        let (first, second) = tokio::join!(
+            handle_net_effect(&context, presence_effect(realm_id)),
+            handle_net_effect(&context, presence_effect(realm_id)),
+        );
+        releaser.await.expect("releaser joins");
+
+        for event in [first, second] {
+            assert!(matches!(
+                event,
+                NetEvent::Dht(DhtEvent::GetResult {
+                    stale: false,
+                    values,
+                    ..
+                }) if values.iter().any(|entry| entry.node_id == handle.node_id())
+            ));
+        }
+        assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+        finish_tasks(&context).await;
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deadline_keeps_stale() {
+        // A refresh that outlives the caller's deadline still answers from the
+        // snapshot rather than reporting the realm as unseen.
+        let (handle, mut context, _directory, realm_id) = handler_context(19).await;
+        let probe = Arc::new(RefreshProbe::new());
+        context.refresh_probe = Some(probe.clone());
+        context.presence.store(
+            realm_id,
+            vec![stale_entry(realm_id, 19)],
+            Instant::now() - Duration::from_secs(20),
+        );
+
+        let event = handle_net_effect(
+            &context,
+            NetEffect::Dht(DhtEffect::Get {
+                key: realm_presence_key(&realm_id),
+                realm_filter: Some(realm_id),
+                options: DhtGetOptions::presence(Duration::from_millis(300), realm_id),
+            }),
+        )
+        .await;
         assert!(matches!(
-            first,
-            NetEvent::Dht(DhtEvent::GetResult { stale: true, .. })
+            event,
+            NetEvent::Dht(DhtEvent::GetResult {
+                stale: true,
+                values,
+                ..
+            }) if values[0].node_id == make_node(19)
         ));
-        assert!(matches!(
-            second,
-            NetEvent::Dht(DhtEvent::GetResult { stale: true, .. })
-        ));
-        assert!(matches!(
-            context.presence.serve(realm_id, Instant::now()),
-            PresenceServe::Stale { refresh: false, .. }
-        ));
-        probe.release.notify_one();
+
+        context.shutdown.cancel();
         finish_tasks(&context).await;
         handle.shutdown().await;
     }
@@ -899,10 +1012,10 @@ mod tests {
             }) if values.is_empty()
         ));
         finish_tasks(&context).await;
-        assert_eq!(
+        assert!(matches!(
             context.presence.serve(realm_id, Instant::now()),
             PresenceServe::Cold
-        );
+        ));
         handle.shutdown().await;
         peer.shutdown().await;
     }
@@ -914,17 +1027,17 @@ mod tests {
         let start = Instant::now();
         cache.store(realm_id, vec![make_entry(3, realm_id)], start);
 
-        assert_eq!(
+        assert!(matches!(
             cache.serve(
                 realm_id,
                 start + PRESENCE_MAX_STALE + Duration::from_secs(1)
             ),
             PresenceServe::Cold
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             cache.serve(RealmId::from_bytes([9u8; 32]), start),
             PresenceServe::Cold
-        );
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -935,11 +1048,11 @@ mod tests {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let start = Instant::now();
         cache.store(realm_id, Vec::new(), start);
-        assert_eq!(cache.serve(realm_id, start), PresenceServe::Cold);
+        assert!(matches!(cache.serve(realm_id, start), PresenceServe::Cold));
 
         cache.store(realm_id, vec![make_entry(4, realm_id)], start);
         cache.store(realm_id, Vec::new(), start);
-        assert_eq!(cache.serve(realm_id, start), PresenceServe::Cold);
+        assert!(matches!(cache.serve(realm_id, start), PresenceServe::Cold));
     }
 
     #[test]
