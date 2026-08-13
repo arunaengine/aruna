@@ -9,7 +9,8 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::{
-    ConnectionAddressStatus, PeerConnectionStatus, RealmConfigDocument, RealmId, RealmNodeKind,
+    ConnectionAddressStatus, NetState, PeerConnectionStatus, RealmConfigDocument, RealmId,
+    RealmNodeKind,
 };
 use aruna_net::streams::BiStream;
 use aruna_net::{
@@ -21,6 +22,60 @@ use byteview::ByteView;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 use ulid::Ulid;
+
+const NETWORK_HANG_CAP: Duration = Duration::from_secs(45);
+
+fn peer_connected(status: &NetState, node_id: NodeId) -> bool {
+    status.connections.iter().any(|peer| {
+        peer.node_id == node_id
+            && peer.status == PeerConnectionStatus::Connected
+            && peer.active_addresses.iter().any(|address| {
+                address.status == ConnectionAddressStatus::Active
+                    && !address.address.is_empty()
+                    && !address.protocol_connections.is_empty()
+            })
+    })
+}
+
+async fn wait_for_connection(
+    handle: &NetHandle,
+    node_id: NodeId,
+) -> Result<NetState, Box<dyn std::error::Error>> {
+    tokio::time::timeout(NETWORK_HANG_CAP, async {
+        let mut poll = Duration::from_millis(10);
+        loop {
+            let status = handle.get_status().await;
+            if peer_connected(&status, node_id) {
+                return Ok(status);
+            }
+            tokio::time::sleep(poll).await;
+            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("connection to {node_id} did not become active"),
+        )
+    })?
+}
+
+async fn wait_for_dht(handle: &NetHandle) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(NETWORK_HANG_CAP, async {
+        let mut poll = Duration::from_millis(10);
+        loop {
+            if handle.get_status().await.routing_table_size.unwrap_or(0) > 0 {
+                return;
+            }
+            tokio::time::sleep(poll).await;
+            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
+        }
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "DHT peer never appeared"))?;
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 struct TestInboundHandler {
@@ -125,63 +180,48 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
+    wait_for_dht(&handle_a).await?;
+    wait_for_dht(&handle_b).await?;
+
     let key = aruna_core::id::DhtKeyId::from_bytes([42u8; 32]);
     let value = b"replicated-value".to_vec();
 
-    let mut put_succeeded = false;
-    let mut last_put_event = None;
-    for _ in 0..10 {
-        let put = handle_a
-            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
-                key,
-                realm_id: RealmId::from_bytes([1u8; 32]),
-                value: value.clone(),
-                ttl: Duration::from_secs(3600),
-            })))
-            .await;
-        last_put_event = Some(format!("{put:?}"));
-
-        if matches!(
+    let put = handle_a
+        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            key,
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            value: value.clone(),
+            ttl: Duration::from_secs(3600),
+        })))
+        .await;
+    assert!(
+        matches!(
             put,
             Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
                 remote_store_count: 1..,
                 ..
             }))
-        ) {
-            put_succeeded = true;
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    assert!(
-        put_succeeded,
-        "expected strict PUT to receive at least one remote acknowledgement, last event: {}",
-        last_put_event.unwrap_or_else(|| "<none>".to_string())
+        ),
+        "expected strict PUT to receive a remote acknowledgement, event: {put:?}"
     );
 
-    let mut found = false;
-    for _ in 0..10 {
-        let get = handle_b
-            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
-                key,
-                realm_filter: None,
-                options: DhtGetOptions::default(),
-            })))
-            .await;
-
-        if let Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) = get
-            && values.iter().any(|entry| entry.value == value)
-        {
-            found = true;
-            break;
+    let get = handle_b
+        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+            key,
+            realm_filter: None,
+            options: DhtGetOptions::default(),
+        })))
+        .await;
+    let found = match &get {
+        Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => {
+            values.iter().any(|entry| entry.value == value)
         }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    assert!(found, "expected replicated DHT value on second node");
+        _ => false,
+    };
+    assert!(
+        found,
+        "expected replicated DHT value on second node, event: {get:?}"
+    );
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
@@ -258,46 +298,28 @@ async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
     handle_b.add_peer_addr(handle_c.endpoint_addr()).await;
     handle_c.add_peer_addr(handle_b.endpoint_addr()).await;
 
-    let mut opened_stream = None;
-    for _ in 0..20 {
-        if let Ok(stream) = handle_a.open_stream(node_b, Alpn::Bao).await {
-            opened_stream = Some(stream);
-            break;
+    let opened_stream = tokio::time::timeout(NETWORK_HANG_CAP, async {
+        let mut poll = Duration::from_millis(10);
+        loop {
+            if let Ok(stream) = handle_a.open_stream(node_b, Alpn::Bao).await {
+                break stream;
+            }
+            tokio::time::sleep(poll).await;
+            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "DHT-signed fallback did not resolve node_b",
+        )
+    })?;
 
-    assert!(
-        opened_stream.is_some(),
-        "expected DHT-signed fallback to resolve node_b"
-    );
-    let mut status = handle_a.get_status().await;
-    for _ in 0..50 {
-        if status.connections.iter().any(|peer| {
-            peer.node_id == node_b
-                && peer.status == PeerConnectionStatus::Connected
-                && peer.active_addresses.iter().any(|address| {
-                    address.status == ConnectionAddressStatus::Active
-                        && !address.address.is_empty()
-                        && !address.protocol_connections.is_empty()
-                })
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        status = handle_a.get_status().await;
-    }
+    let status = wait_for_connection(&handle_a, node_b).await?;
     assert!(status.discovery_methods.contains(&"dht_signed".to_string()));
     assert!(status.requests.total > 0);
-    assert!(status.connections.iter().any(|peer| {
-        peer.node_id == node_b
-            && peer.status == PeerConnectionStatus::Connected
-            && peer.active_addresses.iter().any(|address| {
-                address.status == ConnectionAddressStatus::Active
-                    && !address.address.is_empty()
-                    && !address.protocol_connections.is_empty()
-            })
-    }));
+    assert!(peer_connected(&status, node_b));
 
     drop(opened_stream);
     drop(stream_rx);
@@ -431,10 +453,25 @@ async fn offline_peer_bounded() -> Result<(), Box<dyn std::error::Error>> {
 
     handle_b.shutdown().await;
     let before = handle_a.pool_counts();
-    for _ in 0..5 {
-        assert!(handle_a.open_stream(node_b, Alpn::Bao).await.is_err());
-    }
-    let after = handle_a.pool_counts();
+    let after = tokio::time::timeout(NETWORK_HANG_CAP, async {
+        let mut poll = Duration::from_millis(10);
+        loop {
+            assert!(handle_a.open_stream(node_b, Alpn::Bao).await.is_err());
+            let counts = handle_a.pool_counts();
+            if counts.cooldown_hits > before.cooldown_hits {
+                break counts;
+            }
+            tokio::time::sleep(poll).await;
+            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "offline peer never entered dial cooldown",
+        )
+    })?;
 
     assert!(
         after.dials - before.dials < 5,
