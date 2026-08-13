@@ -2325,12 +2325,25 @@ impl DocumentSyncService {
             let mut deferred_admin_events = Vec::new();
             let mut satisfied_admin_dependencies = BTreeSet::new();
             let mut cross_topic_dependencies = BTreeSet::new();
+            let mut config_run: Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)> = None;
+            let mut validation_cache = ConfigValidationCache::default();
             for (event, actor_id, actor_seq) in batch.events {
                 let identity = SyncQuarantineIdentity {
                     topic: topic_id,
                     actor: actor_id,
                     actor_seq,
                 };
+                // Any event outside the run must observe the run's state, so
+                // the buffer flushes before anything else applies.
+                let run_candidate = matches!(
+                    &event,
+                    DocumentSyncEvent::AdminOperation { target, event, .. }
+                        if matches!(target, DocumentSyncTarget::RealmConfig { .. })
+                            && coalescible_config_op(&event.op)
+                );
+                if !run_candidate {
+                    flush_config_run(&self.storage, &mut config_run, &mut validation_cache).await?;
+                }
                 if self
                     .shard_publishers
                     .read()
@@ -3056,6 +3069,7 @@ impl DocumentSyncService {
                             &event,
                             self.realm_id,
                             &placement,
+                            &mut validation_cache,
                         )
                         .await?
                         {
@@ -3096,12 +3110,28 @@ impl DocumentSyncService {
 
                         let dependencies =
                             satisfied_document_sync_dependencies(&target, event.as_ref());
-                        apply_admin_document_operation_to_storage(
-                            &self.storage,
-                            target.clone(),
-                            *event,
-                        )
-                        .await?;
+                        if matches!(target, DocumentSyncTarget::RealmConfig { .. })
+                            && coalescible_config_op(&event.op)
+                        {
+                            match &mut config_run {
+                                Some((run_target, events)) if *run_target == target => {
+                                    events.push(*event);
+                                }
+                                run => {
+                                    flush_config_run(&self.storage, run, &mut validation_cache)
+                                        .await?;
+                                    *run = Some((target.clone(), vec![*event]));
+                                }
+                            }
+                        } else {
+                            apply_admin_document_operation_to_storage(
+                                &self.storage,
+                                target.clone(),
+                                *event,
+                            )
+                            .await?;
+                            validation_cache.invalidate();
+                        }
                         satisfied_admin_dependencies.extend(dependencies);
                         applied_targets.push(target);
                     }
@@ -3127,6 +3157,7 @@ impl DocumentSyncService {
                     }
                 }
             }
+            flush_config_run(&self.storage, &mut config_run, &mut validation_cache).await?;
             let mut pending = deferred_admin_events;
             loop {
                 let mut progressed = false;
@@ -3140,6 +3171,7 @@ impl DocumentSyncService {
                         &event,
                         self.realm_id,
                         &placement,
+                        &mut validation_cache,
                     )
                     .await?
                     {
@@ -3152,6 +3184,7 @@ impl DocumentSyncService {
                                 event,
                             )
                             .await?;
+                            validation_cache.invalidate();
                             satisfied_admin_dependencies.extend(dependencies);
                             applied_targets.push(target);
                             progressed = true;
@@ -6034,6 +6067,267 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     ))
 }
 
+/// Realm-config ops the reducer stores as order-insensitive immutable values
+/// and whose validation no other such op can influence: a consecutive run of
+/// them may apply as one read-reduce-write cycle instead of one per event.
+fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
+    matches!(
+        op,
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+    )
+}
+
+/// Flushes a buffered run of coalescible realm-config events, if any, and
+/// drops the validation snapshot the applied events just outdated.
+async fn flush_config_run(
+    storage: &StorageHandle,
+    run: &mut Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)>,
+    validation_cache: &mut ConfigValidationCache,
+) -> Result<()> {
+    if let Some((target, events)) = run.take() {
+        apply_config_events(storage, target, events).await?;
+        validation_cache.invalidate();
+    }
+    Ok(())
+}
+
+/// Applies a run of coalescible realm-config events in one transaction. A
+/// realm-scale transition replicates hundreds of barrier and proof values;
+/// decoding and rewriting the reducer state per event is quadratic and stalls
+/// every later document behind the batch, so the run pays for state, document,
+/// materialization, and commit once.
+async fn apply_config_events(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    events: Vec<AdminDocumentEvent>,
+) -> Result<()> {
+    let DocumentSyncTarget::RealmConfig { realm_id } = document_target.clone() else {
+        return Err(NetError::Bootstrap(
+            "realm config admin operation sync only supports realm config targets".to_string(),
+        ));
+    };
+    for event in &events {
+        let AdminDocumentTarget::RealmConfig {
+            realm_id: event_realm_id,
+        } = event.target
+        else {
+            return Err(NetError::Bootstrap(
+                "admin document operation payload target is not a realm config".to_string(),
+            ));
+        };
+        if event_realm_id != realm_id {
+            return Err(NetError::Bootstrap(format!(
+                "replicated realm config admin operation target {realm_id} does not match payload realm id {event_realm_id}"
+            )));
+        }
+        if !coalescible_config_op(&event.op) {
+            return Err(NetError::Bootstrap(
+                "realm config event run only supports transition updates".to_string(),
+            ));
+        }
+        if event.origin_node_id != event.actor.node_id
+            || event.actor.realm_id != realm_id
+            || event.actor.user_id.realm_id != realm_id
+        {
+            return Err(NetError::Bootstrap(
+                "realm config event actor and origin do not match the target realm".to_string(),
+            ));
+        }
+    }
+    let Some(actor) = events.last().map(|event| event.actor.clone()) else {
+        return Ok(());
+    };
+
+    for _ in 0..3 {
+        let raw_now = unix_timestamp_secs();
+        let txn_id = start_storage_transaction(storage).await?;
+        let previous_state = match storage_read_from_transaction(
+            storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id }),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| decode_admin_document_reducer_state(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        let previous_config = match storage_read_from_transaction(
+            storage,
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+
+        let effective_now = previous_state
+            .as_ref()
+            .map_or(raw_now, |state| state.revocation_floor.max(raw_now));
+        let mut reducer_state = previous_state.clone().unwrap_or_else(|| {
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id })
+        });
+        for event in &events {
+            if let Err(error) = reducer_state.apply(event) {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        }
+        reducer_state.advance_revocation_floor(effective_now);
+        let needs_index = needs_revocation_index(
+            false,
+            previous_config.is_some(),
+            &reducer_state,
+            effective_now,
+        );
+        let mut revocation_index =
+            needs_index.then(|| reducer_state.revocation_index(effective_now));
+        if let Some(index) = revocation_index.as_mut() {
+            index.compact(&mut reducer_state);
+        }
+
+        let (config, config_changed) = match previous_config {
+            Some(mut config) => {
+                if config.realm_id != realm_id {
+                    return Err(
+                        abort_error(
+                            storage,
+                            txn_id,
+                            NetError::Bootstrap(format!(
+                                "stored realm config document id {realm_id} does not match payload realm id {}",
+                                config.realm_id
+                            )),
+                        )
+                        .await,
+                    );
+                }
+                let before = config.clone();
+                overlay_realm_config_reducer_materialization(
+                    &mut config,
+                    &reducer_state,
+                    effective_now,
+                    revocation_index.as_ref(),
+                );
+                let changed = config != before;
+                (Some(config), changed)
+            }
+            None => {
+                let config = realm_config_from_reducer_materialization(
+                    realm_id,
+                    &reducer_state,
+                    effective_now,
+                    revocation_index.as_ref(),
+                );
+                let changed = config.is_some();
+                (config, changed)
+            }
+        };
+        if previous_state
+            .as_ref()
+            .is_some_and(|previous| previous == &reducer_state)
+            && !config_changed
+        {
+            abort_txn(storage, txn_id).await?;
+            return Ok(());
+        }
+
+        let mut writes = Vec::new();
+        if config_changed && let Some(config) = config {
+            let bytes = match config.to_bytes(&actor) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.push((
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+                bytes.into(),
+            ));
+        }
+        let reducer_write = match admin_document_reducer_state_write_entry(&reducer_state) {
+            Ok(write) => write,
+            Err(error) => {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        };
+        writes.push(reducer_write);
+        if previous_state
+            .as_ref()
+            .is_none_or(|previous| previous.conflicts != reducer_state.conflicts)
+        {
+            let conflict_writes = match admin_document_conflict_write_entries(&reducer_state) {
+                Ok(writes) => writes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.extend(conflict_writes);
+        }
+
+        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
+            previous_state.as_ref(),
+            Some(&reducer_state),
+        );
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            stale_conflict_deletes,
+            writes,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                abort_txn(storage, txn_id).await?;
+            }
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+    }
+    Err(NetError::Dht(
+        "realm config admin operation conflicted three times".to_string(),
+    ))
+}
+
 fn materialize_group_authorization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
@@ -7130,6 +7424,50 @@ enum AdminEventValidation {
     },
 }
 
+/// Per-batch snapshot of the realm-config document and reducer state that
+/// admin-event validation consults. Decoding both per event is quadratic over
+/// a transition batch; a buffered run applies nothing, so the snapshot holds
+/// until the caller applies events and invalidates it.
+#[derive(Default)]
+struct ConfigValidationCache {
+    entry: Option<(
+        RealmId,
+        Option<RealmConfigDocument>,
+        Option<AdminDocumentReducerState>,
+    )>,
+}
+
+impl ConfigValidationCache {
+    fn invalidate(&mut self) {
+        self.entry = None;
+    }
+
+    async fn load(
+        &mut self,
+        storage: &StorageHandle,
+        realm_id: RealmId,
+    ) -> Result<(
+        Option<&RealmConfigDocument>,
+        Option<&AdminDocumentReducerState>,
+    )> {
+        if self
+            .entry
+            .as_ref()
+            .is_none_or(|(cached, ..)| *cached != realm_id)
+        {
+            let config = read_admin_realm_config(storage, realm_id).await?;
+            let state =
+                read_admin_reducer_state(storage, &AdminDocumentTarget::RealmConfig { realm_id })
+                    .await?;
+            self.entry = Some((realm_id, config, state));
+        }
+        match &self.entry {
+            Some((_, config, state)) => Ok((config.as_ref(), state.as_ref())),
+            None => Ok((None, None)),
+        }
+    }
+}
+
 fn satisfied_document_sync_dependencies(
     target: &DocumentSyncTarget,
     event: &AdminDocumentEvent,
@@ -7225,6 +7563,7 @@ async fn validate_replicated_admin_event(
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     placement: &PlacementRef,
+    config_cache: &mut ConfigValidationCache,
 ) -> Result<AdminEventValidation> {
     let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
 
@@ -7506,23 +7845,43 @@ async fn validate_replicated_admin_event(
         }
     }
 
-    let previous_state = read_admin_reducer_state(storage, &event.target).await?;
-    let authorized = match family {
+    let previous_state = match family {
         AdminOperationFamily::RealmConfig => {
-            validate_realm_config_admin_authority(storage, event, previous_state.as_ref()).await?
+            let AdminDocumentTarget::RealmConfig {
+                realm_id: event_realm_id,
+            } = event.target
+            else {
+                return reject("admin event target is not a realm config");
+            };
+            let (current_config, cached_state) = config_cache.load(storage, event_realm_id).await?;
+            let authorized = validate_config_authority(current_config, event, cached_state)?;
+            if !matches!(authorized, AdminEventValidation::Accepted) {
+                return Ok(authorized);
+            }
+            cached_state.cloned()
         }
-        AdminOperationFamily::RealmAuthorization => {
-            validate_realm_authorization_admin_authority(storage, event, previous_state.as_ref())
-                .await?
-        }
-        AdminOperationFamily::Group => validate_group_admin_authority(storage, event).await?,
-        AdminOperationFamily::User => {
-            validate_user_admin_authority(storage, event, previous_state.as_ref()).await?
+        family => {
+            let previous_state = read_admin_reducer_state(storage, &event.target).await?;
+            let authorized = match family {
+                AdminOperationFamily::RealmAuthorization => {
+                    validate_realm_authorization_admin_authority(
+                        storage,
+                        event,
+                        previous_state.as_ref(),
+                    )
+                    .await?
+                }
+                AdminOperationFamily::Group => {
+                    validate_group_admin_authority(storage, event).await?
+                }
+                _ => validate_user_admin_authority(storage, event, previous_state.as_ref()).await?,
+            };
+            if !matches!(authorized, AdminEventValidation::Accepted) {
+                return Ok(authorized);
+            }
+            previous_state
         }
     };
-    if !matches!(authorized, AdminEventValidation::Accepted) {
-        return Ok(authorized);
-    }
 
     if previous_state
         .as_ref()
@@ -7653,8 +8012,8 @@ fn configured_node_kind<'a>(
         .map(|node| &node.kind)
 }
 
-async fn validate_realm_config_admin_authority(
-    storage: &StorageHandle,
+fn validate_config_authority(
+    current_config: Option<&RealmConfigDocument>,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentReducerState>,
 ) -> Result<AdminEventValidation> {
@@ -7663,11 +8022,7 @@ async fn validate_realm_config_admin_authority(
             "admin event target is not a realm config".to_string(),
         ));
     };
-    let current_config = read_admin_realm_config(storage, realm_id).await?;
-    if current_config
-        .as_ref()
-        .is_some_and(|config| config.realm_id != realm_id)
-    {
+    if current_config.is_some_and(|config| config.realm_id != realm_id) {
         return Ok(AdminEventValidation::Rejected(
             "stored realm config has the wrong realm".to_string(),
         ));
@@ -7676,7 +8031,7 @@ async fn validate_realm_config_admin_authority(
         &event.op,
         AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
-        if !revocation_origin_known(current_config.as_ref(), previous_state, event, realm_id) {
+        if !revocation_origin_known(current_config, previous_state, event, realm_id) {
             return Ok(AdminEventValidation::Deferred {
                 dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
                 reason: if current_config.is_some() {
@@ -7689,16 +8044,28 @@ async fn validate_realm_config_admin_authority(
         }
         return Ok(AdminEventValidation::Accepted);
     }
-    // Placement reducer state precedes full config materialization at bootstrap.
-    let mut placement_config = current_config
-        .clone()
-        .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
-    if let Some(state) = previous_state {
-        overlay_realm_config_placement_reducer_materialization(&mut placement_config, state, 0);
-    }
+    // Placement reducer state precedes full config materialization at
+    // bootstrap. Only band and handle checks consult it, so the full-state
+    // overlay is not paid for the other, far more frequent operations.
+    let placement_config = matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+    )
+    .then(|| {
+        let mut placement_config = current_config
+            .cloned()
+            .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
+        if let Some(state) = previous_state {
+            overlay_realm_config_placement_reducer_materialization(&mut placement_config, state, 0);
+        }
+        placement_config
+    });
     // Band pools form a causal delegation tree; reject a forged or
     // non-owning issuer, and defer a child until its parent replicates.
-    if let AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } = &event.op {
+    if let (AdminDocumentOperation::RealmConfigBandPoolAssigned { pool }, Some(placement_config)) =
+        (&event.op, placement_config.as_ref())
+    {
         match admit_band_pool(&placement_config.band_pools, pool, &event.origin_node_id) {
             PoolAdmission::Reject => {
                 return Ok(AdminEventValidation::Rejected(
@@ -7714,7 +8081,11 @@ async fn validate_realm_config_admin_authority(
             PoolAdmission::Accept => {}
         }
     }
-    if let AdminDocumentOperation::RealmConfigHandleRangeGranted { range } = &event.op {
+    if let (
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+        Some(placement_config),
+    ) = (&event.op, placement_config.as_ref())
+    {
         let canonical = range.len() == HANDLE_RANGE_SIZE
             && range
                 .start
@@ -7742,7 +8113,7 @@ async fn validate_realm_config_admin_authority(
             ));
         }
     }
-    if let Some(config) = current_config.as_ref() {
+    if let Some(config) = current_config {
         let server_binding = match (
             configured_node_kind(config, &event.origin_node_id),
             &event.op,
@@ -10586,6 +10957,7 @@ mod tests {
                 &event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("validation runs"),
@@ -10614,6 +10986,7 @@ mod tests {
                 &event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("unonboarded origin validation runs"),
@@ -10647,6 +11020,7 @@ mod tests {
                 &long_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("long expiry validation runs"),
@@ -10686,6 +11060,7 @@ mod tests {
                 &user_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("onboarded user origin validation runs"),
@@ -10776,6 +11151,7 @@ mod tests {
                 &flood_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("flood validation runs"),
@@ -10803,6 +11179,7 @@ mod tests {
                 &neighbour_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("neighbour validation runs"),
@@ -12198,6 +12575,7 @@ mod tests {
             &event,
             realm_id,
             &placement,
+            &mut ConfigValidationCache::default(),
         )
         .await
         .expect("validation runs");
@@ -16054,6 +16432,7 @@ mod tests {
                         &event,
                         realm_id,
                         &placement,
+                        &mut ConfigValidationCache::default(),
                     )
                     .await
                     .expect("storage succeeds"),
@@ -16092,6 +16471,7 @@ mod tests {
                 &ensure,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16120,6 +16500,7 @@ mod tests {
                 &description,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16155,6 +16536,7 @@ mod tests {
                 &genesis_role,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16215,6 +16597,7 @@ mod tests {
                     &event,
                     realm_id,
                     &placement,
+                    &mut ConfigValidationCache::default(),
                 )
                 .await
                 .expect("storage succeeds"),
@@ -16285,6 +16668,7 @@ mod tests {
                 &forged_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16316,6 +16700,7 @@ mod tests {
                 &orphan_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16396,6 +16781,7 @@ mod tests {
                     &event,
                     realm_id,
                     &PlacementRef::NIL,
+                    &mut ConfigValidationCache::default(),
                 )
                 .await
                 .expect("storage succeeds"),
@@ -16439,6 +16825,7 @@ mod tests {
                 &waiting,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16492,6 +16879,7 @@ mod tests {
                 &wrong_target,
                 realm_id,
                 &placement,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16510,7 +16898,14 @@ mod tests {
         );
         assert!(matches!(
             validate_replicated_admin_event(
-                &storage, topic_id, publisher, &target, &malformed, realm_id, &placement,
+                &storage,
+                topic_id,
+                publisher,
+                &target,
+                &malformed,
+                realm_id,
+                &placement,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
