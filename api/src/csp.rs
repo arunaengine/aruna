@@ -57,7 +57,7 @@ impl PortalCspConfig {
     /// The API now answers on its own origin, so the portal document has to be
     /// allowed to reach it without the operator repeating it in the extras.
     pub fn with_api_url(mut self, api_url: &str) -> Self {
-        self.api_origin = normalize_origin(api_url);
+        self.api_origin = api_origin(api_url);
         self
     }
 }
@@ -314,6 +314,22 @@ fn normalize_origin(value: &str) -> Option<String> {
     (origin != "null").then_some(origin)
 }
 
+/// The API url is deliberate operator configuration and the portal is served
+/// over the same scheme, so a plain-http LAN origin is admitted with a warning
+/// instead of blocking every fetch the SPA makes.
+fn api_origin(api_url: &str) -> Option<String> {
+    let url = Url::parse(api_url.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        warn!(origin = %api_url, "Portal CSP ignores a non-HTTP API url");
+        return None;
+    }
+    if !is_secure_origin(&url) {
+        warn!(origin = %api_url, "Portal CSP admits an insecure API origin");
+    }
+    let origin = url.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
+}
+
 fn is_secure_origin(url: &Url) -> bool {
     match url.scheme() {
         "https" => true,
@@ -334,7 +350,8 @@ fn is_loopback_host(host: Option<Host<&str>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        NPM_ORIGIN, PYPI_ORIGIN, ResolvedOrigins, content_security_policy, normalize_origin,
+        NPM_ORIGIN, PYPI_ORIGIN, PortalCspConfig, ResolvedOrigins, content_security_policy,
+        normalize_origin,
     };
 
     fn origins(connect: &[&str], img: &[&str]) -> ResolvedOrigins {
@@ -375,6 +392,25 @@ mod tests {
         assert_eq!(
             normalize_origin("http://[::1]:9000"),
             Some("http://[::1]:9000".to_string())
+        );
+    }
+
+    #[test]
+    fn admits_http_api() {
+        // A plain-http LAN API url is operator config, so it stays allowed
+        // while the same origin in the extras list is still dropped.
+        let config = PortalCspConfig::default().with_api_url("http://lan-host:8080/api/v1");
+        assert_eq!(config.api_origin.as_deref(), Some("http://lan-host:8080"));
+        assert!(
+            PortalCspConfig::new(vec!["http://lan-host:8080".to_string()])
+                .extra_connect_origins
+                .is_empty()
+        );
+        assert_eq!(
+            PortalCspConfig::default()
+                .with_api_url("ftp://lan-host")
+                .api_origin,
+            None
         );
     }
 
