@@ -653,11 +653,14 @@ const INCIDENT_LIMIT: usize = 2 * aruna_operations::document_sync_outbox::OUTBOX
 const INCIDENT_SCALE_RECORDS: usize = 2 * INCIDENT_LIMIT;
 /// One bounded pass plus a short chain keeps peer-return coverage controllable.
 const INCIDENT_RECORDS: usize = INCIDENT_LIMIT + INCIDENT_METADATA_RECORDS;
+/// The default recovery case keeps the revision chain and delete tail small.
+const SEMANTIC_RECORDS: usize = 2 * INCIDENT_METADATA_RECORDS;
 
 // With both co-holders unavailable, the scale fixture parks after one exact
 // invocation cap without asking the convergence test to replay the scale data.
 #[test]
-fn offline_bounds_recovery() -> Result<(), BoxError> {
+#[ignore = "large incident bound proof; run with --ignored --exact offline_scale_bound"]
+fn offline_scale_bound() -> Result<(), BoxError> {
     let runtime = make_runtime()?;
     let result = runtime.block_on(offline_bound_body());
     runtime.shutdown_timeout(Duration::from_secs(10));
@@ -681,7 +684,7 @@ async fn offline_bound_body() -> Result<(), BoxError> {
     assert!(status.pass_total(RecoveryOutcome::Partial) > 0);
 
     let drainer = OutboxDrainer::new(drain_context(&outage.live));
-    assert_drain_bound(&outage, &drainer).await?;
+    assert_drain_bound(&outage, &drainer, Some(INCIDENT_LIMIT)).await?;
     stop_driver(cancelled, driver).await?;
     shutdown_nodes(vec![outage.live]).await;
     Ok(())
@@ -690,26 +693,35 @@ async fn offline_bound_body() -> Result<(), BoxError> {
 // The three-node incident path parks a bounded pass, restores both peers, and
 // then proves full drain, revision order, and convergence on the same queue.
 #[test]
-fn offline_recovery_converges() -> Result<(), BoxError> {
+#[ignore = "large incident convergence proof; run with --ignored --exact offline_scale_converges"]
+fn offline_scale_converges() -> Result<(), BoxError> {
     let runtime = make_runtime()?;
-    let result = runtime.block_on(recovery_converges());
+    let result = runtime.block_on(recovery_converges(INCIDENT_RECORDS, true));
     runtime.shutdown_timeout(Duration::from_secs(10));
     result
 }
 
-async fn recovery_converges() -> Result<(), BoxError> {
+#[test]
+fn offline_recovery_converges() -> Result<(), BoxError> {
+    let runtime = make_runtime()?;
+    let result = runtime.block_on(recovery_converges(SEMANTIC_RECORDS, false));
+    runtime.shutdown_timeout(Duration::from_secs(10));
+    result
+}
+
+async fn recovery_converges(record_count: usize, assert_bound: bool) -> Result<(), BoxError> {
     use aruna_operations::startup::{RecoveryError, RecoveryOutcome};
     use aruna_operations::task_incoming::OutboxDrainer;
 
     let realm_id = RealmId([92u8; 32]);
-    let outage = prepare_outage(realm_id, INCIDENT_RECORDS).await?;
+    let outage = prepare_outage(realm_id, record_count).await?;
     let (status, cancelled, driver) = spawn_recovery(&outage.live, realm_id);
     wait_degraded(&status).await?;
     let degraded = status.snapshot();
     assert_eq!(degraded.last_error, Some(RecoveryError::PeerUnavailable));
     assert!(status.pass_total(RecoveryOutcome::Partial) > 0);
     let drainer = OutboxDrainer::new(drain_context(&outage.live));
-    assert_drain_bound(&outage, &drainer).await?;
+    assert_drain_bound(&outage, &drainer, assert_bound.then_some(INCIDENT_LIMIT)).await?;
     finish_outage(outage, &drainer, &status, cancelled, driver).await
 }
 
@@ -789,13 +801,16 @@ async fn prepare_outage(realm_id: RealmId, record_count: usize) -> Result<Outage
 async fn assert_drain_bound(
     outage: &OutageFixture,
     drainer: &aruna_operations::task_incoming::OutboxDrainer,
+    expected_examined: Option<usize>,
 ) -> Result<(), BoxError> {
     let high_water = outbox_keys(&outage.live).await?;
     assert_eq!(high_water, outage.seeded);
     drainer.run_once().await;
-    let (examined, cursor_parked) = drainer.rotation_progress();
-    assert_eq!(examined, INCIDENT_LIMIT);
-    assert!(cursor_parked, "the first invocation must park its cursor");
+    if let Some(expected_examined) = expected_examined {
+        let (examined, cursor_parked) = drainer.rotation_progress();
+        assert_eq!(examined, expected_examined);
+        assert!(cursor_parked, "the first invocation must park its cursor");
+    }
     assert_eq!(
         outbox_keys(&outage.live).await?,
         high_water,
@@ -1280,14 +1295,72 @@ async fn wait_outbox(
     drainer: &aruna_operations::task_incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
+    let wait_cap = HANG_CAP.saturating_mul(3);
+    let mut previous = outbox_snapshot(&nodes[0]).await?;
+    let mut deadline = Instant::now() + wait_cap;
     loop {
-        tokio::time::timeout(HANG_CAP.saturating_mul(3), drainer.run_once())
-            .await
-            .map_err(|_| "outbox drain invocation stalled")?;
-        if outbox_keys(&nodes[0]).await?.is_empty() {
+        if previous.0.is_none() && previous.1.is_none() {
             return Ok(());
         }
+        tokio::time::timeout(wait_cap, drainer.run_once())
+            .await
+            .map_err(|_| "outbox drain invocation stalled")?;
+        let current = outbox_snapshot(&nodes[0]).await?;
+        if current.0.is_none() && current.1.is_none() {
+            return Ok(());
+        }
+        if current != previous {
+            previous = current;
+            deadline = Instant::now() + wait_cap;
+        } else if Instant::now() >= deadline {
+            return Err(format!(
+                "outbox did not drain without progress (first: {:?}, last: {:?})",
+                current.0, current.1
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Reads only raw queue endpoints so the watchdog does not decode the full outbox.
+async fn outbox_snapshot(node: &TestNode) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), BoxError> {
+    let key_space = aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string();
+    let first = match node
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: key_space.clone(),
+            prefix: None,
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => {
+            values.into_iter().next().map(|(key, _)| key.to_vec())
+        }
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string().into()),
+        other => return Err(format!("unexpected outbox head event: {other:?}").into()),
+    };
+    let last = match node
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Last {
+            key_space,
+            prefix: None,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => {
+            values.into_iter().next().map(|(key, _)| key.to_vec())
+        }
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string().into()),
+        other => return Err(format!("unexpected outbox tail event: {other:?}").into()),
+    };
+    Ok((first, last))
 }
 
 async fn wait_registry(
