@@ -573,7 +573,8 @@ assert_node_ports_free() {
     assert_port_free "${NODE_P2P_PORTS[$node_index]}"
     assert_port_free "${NODE_S3_PORTS[$node_index]}"
     assert_port_free "${NODE_OPS_PORTS[$node_index]}"
-    assert_port_free "${NODE_PORTAL_PORTS[$node_index]}"
+    # The portal port is only bound when a portal dist is deployed.
+    [[ -z "$PORTAL_DIR" ]] || assert_port_free "${NODE_PORTAL_PORTS[$node_index]}"
   done
 }
 
