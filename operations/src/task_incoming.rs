@@ -1124,15 +1124,19 @@ impl OperationsTaskHandler {
             invocation.outcome.merge(outcome);
         }
 
-        // Publish to live holders, but keep stamped peers above as genesis sources.
+        // Publish to the transition membership (holders plus every set an
+        // active transition still names), but keep stamped peers above as
+        // genesis sources: a target must see writes made during the window.
         if let Some(config) = config {
+            let now_ms = aruna_core::util::unix_timestamp_millis();
             for (_, record, _) in &mut records {
                 if record.peers.is_empty() || !record.target.uses_shard_topic() {
                     continue;
                 }
-                let holders = crate::placement::resolve_shard_holders(config, &record.placement);
-                if !holders.is_empty() {
-                    record.peers = holders;
+                let members =
+                    crate::placement::transition_members(config, &record.placement, now_ms);
+                if !members.is_empty() {
+                    record.peers = members;
                 }
             }
         }
