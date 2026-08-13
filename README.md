@@ -115,6 +115,11 @@ This demo deployment:
 - waits for readiness at `http://127.0.0.1:<port>/swagger-ui`
 - writes per-node logs and `summary.txt` to `target/test-deploy/`
 - prints an `ADMIN_TOKEN=...` line for use in authenticated API calls during the session
+- prints a summary listing every node's API, portal, S3 and ops url next to the test logins
+
+`just preview` additionally serves the portal. The portal has its own listener,
+so each node exposes the SPA on a separate port from the REST API; the REST port
+redirects `/` to the Swagger UI.
 
 Useful overrides:
 
