@@ -8,6 +8,7 @@
 //! full barrier/pull/verify/proof machinery still runs. Weight changes,
 //! removals, and drains are never auto-issued.
 
+use aruna_core::errors::StorageError;
 use aruna_core::structs::{Actor, CandidatePlacementMap, RealmConfigDocument, TransitionLimits};
 use aruna_core::util::unix_timestamp_millis;
 use ulid::Ulid;
@@ -163,17 +164,33 @@ async fn read_config(
         .map_err(|_| MutateRealmPlacementError::RealmConfigNotFound)
 }
 
-async fn mutate(
+const MUTATION_CONFLICT_RETRIES: usize = 10;
+
+/// Drives one placement mutation, re-driving on SSI conflict: the node's own
+/// reconciler submits transition steps against the same realm config document
+/// concurrently, so bounded interference is expected, not an error.
+pub(crate) async fn mutate(
     context: &DriverContext,
     actor: &Actor,
     mutation: RealmPlacementMutation,
 ) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
-    drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
-            actor: actor.clone(),
-            mutation,
-        }),
-        context,
-    )
-    .await
+    let mut attempts = 0;
+    loop {
+        let result = drive(
+            MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+                actor: actor.clone(),
+                mutation: mutation.clone(),
+            }),
+            context,
+        )
+        .await;
+        match result {
+            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
+                if attempts < MUTATION_CONFLICT_RETRIES =>
+            {
+                attempts += 1;
+            }
+            other => return other,
+        }
+    }
 }
