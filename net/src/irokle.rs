@@ -18818,10 +18818,7 @@ mod tests {
                 .unwrap()
                 .as_ulid()
         };
-        let placed = |shard: u32| PlacementRef {
-            strategy_id,
-            shard,
-        };
+        let placed = |shard: u32| PlacementRef { strategy_id, shard };
         let mapping = |document_id, actor, seed: u64| {
             PersistentIdMapping::conceptual(
                 document_id,
