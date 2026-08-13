@@ -2118,6 +2118,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requires_portal_address() {
+        // An enabled portal has its own listener, so a missing address is an
+        // error rather than a silent default.
+        let _guard = env_lock().lock().await;
+        let previous: Vec<_> = portal_env_keys()
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        let portal_dir = tempdir().unwrap();
+        clear_portal_env();
+        unsafe {
+            std::env::set_var("PORTAL_MODE", "artifact");
+            std::env::set_var("PORTAL_DIR", portal_dir.path());
+        }
+
+        let error = portal_config_env().expect_err("missing portal address should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::MissingConfigValue("PORTAL_SOCKET_ADDRESS")
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
     async fn portal_config_allows_existing_portal_without_download_fields() {
         let _guard = env_lock().lock().await;
         let previous: Vec<_> = portal_env_keys()
