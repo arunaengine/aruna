@@ -288,9 +288,11 @@ impl ReplicationHarness {
             .into());
         }
 
+        // A joiner mid-expansion applies the member update behind the queued
+        // transition events, so this liveness wait uses the standard cap.
         wait_until(
             "sync creator membership convergence",
-            Duration::from_secs(10),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let base_url = self.joiner.base_url.clone();
@@ -490,7 +492,7 @@ async fn keyspace_empty(context: &DriverContext, keyspace: &str) -> bool {
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn continuous_remaps_prefix() -> TestResult<()> {
     let harness = ReplicationHarness::new("continuous-remap-group").await?;
 
@@ -638,7 +640,7 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn once_syncs_prefix() -> TestResult<()> {
     let harness = ReplicationHarness::new("once-prefix-group").await?;
 
@@ -724,7 +726,7 @@ async fn once_syncs_prefix() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn reference_syncs_lazily() -> TestResult<()> {
     async fn read_value(
         context: &DriverContext,
@@ -1014,7 +1016,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn quota_surfaces_failure() -> TestResult<()> {
     let harness = ReplicationHarness::new("quota-failure-group").await?;
 
@@ -1153,7 +1155,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn permission_rechecks_creator() -> TestResult<()> {
     let harness = ReplicationHarness::new("permission-recheck-group").await?;
 
@@ -1246,7 +1248,7 @@ async fn permission_rechecks_creator() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn chain_blocks_cycle() -> TestResult<()> {
     let harness = ReplicationHarness::new("chain-cycle-group").await?;
 
@@ -1408,7 +1410,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn replication_live_put_reaches_joined_node() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-live-put-e2e-group").await?;
 
@@ -1448,7 +1450,7 @@ async fn replication_live_put_reaches_joined_node() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-delete-marker-e2e-group").await?;
 
@@ -1560,7 +1562,7 @@ async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn creates_destination_bucket() -> TestResult<()> {
     // Incoming replication now auto-creates a missing destination bucket, so a
     // target-side pre-create is no longer required for delivery.
@@ -1603,7 +1605,7 @@ async fn creates_destination_bucket() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn repair_honors_restrictions() -> TestResult<()> {
     // A lost enqueue is replayed from the durable obligation, so that record
     // must still carry the writer's scope or the write escalates to unscoped.
@@ -1699,7 +1701,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-scoped-credential-group").await?;
 

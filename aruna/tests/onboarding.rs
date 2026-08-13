@@ -44,7 +44,7 @@ async fn read_user(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     sleep(Duration::from_millis(50)).await;
@@ -135,7 +135,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn server_onboarding_bootstraps_joiner_over_http_and_completes() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     sleep(Duration::from_millis(50)).await;

@@ -31,7 +31,7 @@ async fn iter_hash_path_index(
         .map_err(Into::into)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let onboarding_secret =
@@ -166,7 +166,7 @@ async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> Test
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn drs_historical_materialized_hash_resolves_non_current_version() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let onboarding_secret =

@@ -229,7 +229,7 @@ async fn check_recovery(
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn realm_outage_recovers() -> TestResult<()> {
     let seed = spawn_full_seed_node().await?;
     let onboarding =
