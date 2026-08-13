@@ -391,6 +391,12 @@ fn spawn_refresh_task<F, Fut>(
     let presence = presence.clone();
     let shutdown = shutdown.clone();
     tasks.spawn(async move {
+        // Released on drop, so a panicking refresh cannot park stale readers
+        // behind a slot that is never handed back.
+        let _slot = RefreshSlot {
+            presence: presence.clone(),
+            realm_id,
+        };
         match refresh(shutdown).await {
             Some(Ok(values)) => presence.store(realm_id, values, Instant::now()),
             Some(Err(error)) => {
@@ -398,8 +404,18 @@ fn spawn_refresh_task<F, Fut>(
             }
             None => {}
         }
-        presence.release(realm_id);
     });
+}
+
+struct RefreshSlot {
+    presence: RealmPresenceCache,
+    realm_id: RealmId,
+}
+
+impl Drop for RefreshSlot {
+    fn drop(&mut self) {
+        self.presence.release(self.realm_id);
+    }
 }
 
 #[tracing::instrument(
@@ -729,6 +745,32 @@ mod tests {
             None
         });
         shutdown.cancel();
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_panic() {
+        // A panicking refresh must still hand the single-flight slot back.
+        let cache = RealmPresenceCache::default();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        cache.store(realm_id, vec![make_entry(12, realm_id)], Instant::now());
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.serve(realm_id, Instant::now()),
+            PresenceServe::Stale { refresh: true, .. }
+        ));
+
+        spawn_refresh_task(&cache, &tasks, &shutdown, realm_id, |_| async {
+            panic!("refresh panicked")
+        });
         tasks.close();
         tasks.wait().await;
 
