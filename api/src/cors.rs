@@ -93,7 +93,9 @@ impl CorsConfig {
                     Method::OPTIONS,
                 ])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
-                .expose_headers([header::CONTENT_DISPOSITION])
+                // The portal is always cross-origin now, so its retry backoff
+                // and download filenames depend on these being readable.
+                .expose_headers([header::CONTENT_DISPOSITION, header::RETRY_AFTER])
                 .max_age(CORS_MAX_AGE),
         )
     }
@@ -219,7 +221,7 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
                 .unwrap(),
-            "content-disposition"
+            "content-disposition,retry-after"
         );
     }
 
