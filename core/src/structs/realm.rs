@@ -416,11 +416,19 @@ impl RealmConfigDocument {
         // Transitions are excluded for the same reason as revocations: their
         // barrier and proof sets converge independently, and only the
         // activation they advance changes where a request routes. Candidate
-        // maps follow them: an unreferenced map is pruned once the transition
-        // that named it is released, which is a per-node moment, and a map an
-        // activation still names is immutable and fails closed when divergent.
+        // maps an activation references are retained: holders depend on their
+        // contents, so a divergent same-epoch map must break digest agreement.
+        // Unreferenced maps stay excluded because pruning is a per-node moment.
         canonical.placement_transitions.clear();
-        canonical.candidate_maps.clear();
+        let referenced: std::collections::BTreeSet<u64> = canonical
+            .placement_activations
+            .iter()
+            .map(|activation| activation.candidate_map_epoch)
+            .collect();
+        canonical
+            .candidate_maps
+            .retain(|map| referenced.contains(&map.epoch));
+        sort_canonical(&mut canonical.candidate_maps)?;
         // Revocations are excluded: the digest binds routing agreement between
         // nodes, and a deny-list that converges independently would otherwise
         // make every revocation reject forwarded requests until it replicated.
@@ -1239,6 +1247,47 @@ mod test {
         };
         config.candidate_maps.push(conflicting);
         assert!(config.candidate_map(2).is_none());
+    }
+
+    #[test]
+    fn digest_binds_maps() {
+        // Identical activations over divergent same-epoch map contents must
+        // digest differently, while unreferenced maps stay excluded.
+        let mut config = RealmConfigDocument::new(RealmId([6u8; 32]), Vec::new(), 3);
+        config.seed_default_placement();
+        config.ensure_node(
+            iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            RealmNodeKind::Management,
+        );
+        config.snapshot_candidate_map();
+        let base = config.digest().unwrap();
+
+        let mut divergent = config.clone();
+        divergent.candidate_maps[0].nodes[0].weight += 1;
+        assert_ne!(base, divergent.digest().unwrap());
+
+        // Reordered equivalent maps digest identically.
+        let mut reordered = config.clone();
+        let extra = reordered.freeze_map(9);
+        reordered.candidate_maps.push(extra.clone());
+        reordered
+            .placement_activations
+            .push(crate::structs::PlacementActivation {
+                strategy_id: reordered.default_strategy_id.unwrap(),
+                shard: 63,
+                activation_epoch: 2,
+                candidate_map_epoch: 9,
+                transition_id: None,
+            });
+        let mut swapped = reordered.clone();
+        swapped.candidate_maps.swap(0, 1);
+        assert_eq!(reordered.digest().unwrap(), swapped.digest().unwrap());
+
+        // An unreferenced newest map does not perturb the digest.
+        let mut unreferenced = config.clone();
+        let newest = unreferenced.freeze_map(10);
+        unreferenced.candidate_maps.push(newest);
+        assert_eq!(base, unreferenced.digest().unwrap());
     }
 
     #[test]
