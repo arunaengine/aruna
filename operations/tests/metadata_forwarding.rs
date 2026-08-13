@@ -502,6 +502,7 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
             None => sleep(Duration::from_millis(50)).await,
         }
     }
+    wait_for_record_on_holders(&nodes, &holders, document_id).await?;
 
     // Plant a delete for the document's bucket into the non-holder's outbox: a
     // record it can never publish and that the removed relay used to hand to a
