@@ -128,7 +128,12 @@ impl Default for RateLimitSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PortalConfig {
     Disabled,
-    Artifact(PortalArtifactConfig),
+    /// The portal serves the SPA on its own listener, so an enabled portal
+    /// without an address is a configuration error rather than a default.
+    Artifact {
+        artifact: PortalArtifactConfig,
+        socket_addr: SocketAddr,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -427,6 +432,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .filter(|value| !value.trim().is_empty());
     let oidc_providers = load_oidc_providers_from_env()?;
     let portal = portal_config_env()?;
+    // The SPA is served from another origin than the API, so it cannot reach a
+    // relative API path and needs the advertised one.
+    if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
+        return Err(SetupError::MissingConfigValue("API_PUBLIC_URL"));
+    }
 
     let storage_handle =
         FjallStorage::open_with_persist_policy(&storage_path, fjall_persist_policy)?;
@@ -721,11 +731,18 @@ fn portal_config_env() -> Result<PortalConfig, SetupError> {
                 .map(|value| normalize_sha256_env("PORTAL_ARTIFACT_SHA256", &value))
                 .transpose()?;
             let portal_dir = PathBuf::from(required_nonempty_env("PORTAL_DIR")?);
-            Ok(PortalConfig::Artifact(PortalArtifactConfig {
-                artifact_url,
-                artifact_sha256,
-                portal_dir,
-            }))
+            const ADDRESS_KEY: &str = "PORTAL_SOCKET_ADDRESS";
+            let address = required_nonempty_env(ADDRESS_KEY)?;
+            let socket_addr = SocketAddr::from_str(address.trim())
+                .map_err(|error| invalid_config_value(ADDRESS_KEY, address, error))?;
+            Ok(PortalConfig::Artifact {
+                artifact: PortalArtifactConfig {
+                    artifact_url,
+                    artifact_sha256,
+                    portal_dir,
+                },
+                socket_addr,
+            })
         }
         _ => Err(invalid_config_value(
             MODE_KEY,
@@ -1572,12 +1589,13 @@ mod tests {
         }
     }
 
-    fn portal_env_keys() -> [&'static str; 4] {
+    fn portal_env_keys() -> [&'static str; 5] {
         [
             "PORTAL_MODE",
             "PORTAL_ARTIFACT_URL",
             "PORTAL_ARTIFACT_SHA256",
             "PORTAL_DIR",
+            "PORTAL_SOCKET_ADDRESS",
         ]
     }
 
@@ -2056,11 +2074,17 @@ mod tests {
                 "0DCA71F9A1193B09A55843B1D5ABC1E99445A9E1226CE42FBA05EDBC80B5DB61",
             );
             std::env::set_var("PORTAL_DIR", portal_dir.path());
+            std::env::set_var("PORTAL_SOCKET_ADDRESS", "127.0.0.1:3005");
         }
 
-        let PortalConfig::Artifact(config) = portal_config_env().unwrap() else {
+        let PortalConfig::Artifact {
+            artifact: config,
+            socket_addr,
+        } = portal_config_env().unwrap()
+        else {
             panic!("expected artifact portal config");
         };
+        assert_eq!(socket_addr, "127.0.0.1:3005".parse().unwrap());
         assert_eq!(
             config.artifact_url.as_deref(),
             Some("https://example.test/portal.tar.gz")
@@ -2105,9 +2129,13 @@ mod tests {
         unsafe {
             std::env::set_var("PORTAL_MODE", "artifact");
             std::env::set_var("PORTAL_DIR", portal_dir.path());
+            std::env::set_var("PORTAL_SOCKET_ADDRESS", "127.0.0.1:3005");
         }
 
-        let PortalConfig::Artifact(config) = portal_config_env().unwrap() else {
+        let PortalConfig::Artifact {
+            artifact: config, ..
+        } = portal_config_env().unwrap()
+        else {
             panic!("expected artifact portal config");
         };
         assert_eq!(config.artifact_url, None);

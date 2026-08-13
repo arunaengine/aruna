@@ -37,6 +37,7 @@ const CROSS_ORIGIN_OPENER_POLICY: HeaderName =
 #[derive(Clone, Debug, Default)]
 pub struct PortalCspConfig {
     extra_connect_origins: Vec<String>,
+    api_origin: Option<String>,
 }
 
 impl PortalCspConfig {
@@ -49,7 +50,15 @@ impl PortalCspConfig {
         }
         Self {
             extra_connect_origins,
+            api_origin: None,
         }
+    }
+
+    /// The API now answers on its own origin, so the portal document has to be
+    /// allowed to reach it without the operator repeating it in the extras.
+    pub fn with_api_url(mut self, api_url: &str) -> Self {
+        self.api_origin = normalize_origin(api_url);
+        self
     }
 }
 
@@ -100,13 +109,15 @@ impl PortalSecurity {
 
     async fn resolve(&self) -> ResolvedOrigins {
         let s3 = self.s3_origin().await;
+        let api = self.config.api_origin.clone();
         let mut connect = BTreeSet::new();
         connect.extend(s3.iter().cloned());
+        connect.extend(api.iter().cloned());
         connect.extend(self.oidc_origins().await);
         connect.extend(self.config.extra_connect_origins.iter().cloned());
         ResolvedOrigins {
             connect,
-            img: s3.into_iter().collect(),
+            img: s3.into_iter().chain(api).collect(),
         }
     }
 

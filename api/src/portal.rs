@@ -1,50 +1,90 @@
 use crate::csp::{PortalCspConfig, PortalSecurity, portal_security_headers};
+use crate::error::ServerSetupError;
 use crate::server_state::{PortalRuntimeState, ServerState};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
-use axum::middleware::from_fn_with_state;
+use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
-const API_BASE_URL: &str = "/api/v1";
+const API_PATH: &str = "/api/v1";
 const ASSETS_PREFIX: &str = "/assets/";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const NO_CACHE: &str = "no-cache";
 
-pub fn router(state: Arc<ServerState>, csp: PortalCspConfig) -> Router {
-    let security = PortalSecurity::new(state.clone(), csp);
+/// The portal listener serves the SPA on its own origin, so the document has to
+/// be told where the API lives instead of assuming its own.
+#[derive(Clone, Debug)]
+pub struct PortalConfig {
+    pub api_public_url: String,
+    pub csp: PortalCspConfig,
+}
+
+#[derive(Clone)]
+struct PortalState {
+    server: Arc<ServerState>,
+    api_base_url: Arc<str>,
+}
+
+pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
+    let api_base_url = api_base_url(&config.api_public_url);
+    let security = PortalSecurity::new(state.clone(), config.csp.with_api_url(&api_base_url));
     Router::new()
         .route("/portal-config.json", get(portal_config))
         .fallback(serve_portal)
         .layer(from_fn_with_state(security, portal_security_headers))
-        .with_state(state)
+        .layer(from_fn(crate::csp::baseline_security_headers))
+        .with_state(PortalState {
+            server: state,
+            api_base_url: Arc::from(api_base_url),
+        })
+}
+
+/// Serves until `shutdown` is cancelled: the listener stops accepting and
+/// requests already in flight run to completion before this returns.
+pub async fn serve(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    config: PortalConfig,
+    shutdown: CancellationToken,
+) -> Result<(), ServerSetupError> {
+    axum::serve(listener, router(state, config).into_make_service())
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+        .map_err(|error| ServerSetupError::Runtime(error.to_string()))
+}
+
+fn api_base_url(api_public_url: &str) -> String {
+    format!("{}{API_PATH}", api_public_url.trim_end_matches('/'))
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PortalRuntimeConfig {
-    api_base_url: &'static str,
+struct PortalRuntimeConfig<'a> {
+    api_base_url: &'a str,
 }
 
-async fn portal_config(State(state): State<Arc<ServerState>>) -> Response {
-    match portal_dir(&state).await {
+async fn portal_config(State(state): State<PortalState>) -> Response {
+    match portal_dir(&state.server).await {
         Ok(_) => Json(PortalRuntimeConfig {
-            api_base_url: API_BASE_URL,
+            api_base_url: &state.api_base_url,
         })
         .into_response(),
         Err(error) => error.into_response(),
     }
 }
 
-async fn serve_portal(State(state): State<Arc<ServerState>>, request: Request) -> Response {
-    serve_portal_request(&state, request).await
+async fn serve_portal(State(state): State<PortalState>, request: Request) -> Response {
+    serve_portal_request(&state.server, request).await
 }
 
 async fn serve_portal_request(state: &ServerState, request: Request) -> Response {
@@ -158,7 +198,7 @@ impl IntoResponse for PortalServeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{IMMUTABLE_CACHE, NO_CACHE, serve_portal_request};
+    use super::{IMMUTABLE_CACHE, NO_CACHE, PortalConfig, serve_portal_request};
     use crate::cors::CorsConfig;
     use crate::csp::PortalCspConfig;
     use crate::server::{DEFAULT_MAX_HTTP_BODY_SIZE, Server, ServerConfig};
@@ -213,6 +253,8 @@ mod tests {
         (state, tempdir)
     }
 
+    const TEST_API_URL: &str = "http://127.0.0.1:8080";
+
     /// Realm config with an OIDC provider, an S3 interface and an installed
     /// portal: everything the served policy derives its origins from.
     async fn setup_serving_node(portal_dir: &std::path::Path) -> (Router, TempDir, String) {
@@ -263,18 +305,31 @@ mod tests {
         std::fs::write(portal_dir.join("assets/app.js"), "console.log('portal');").unwrap();
         enable_portal(&state, portal_dir).await;
 
+        let router = super::router(
+            state,
+            PortalConfig {
+                api_public_url: TEST_API_URL.to_string(),
+                csp: PortalCspConfig::new(vec!["https://peer.test/".to_string()]),
+            },
+        );
+
+        (router, tempdir, discovery_origin)
+    }
+
+    /// The REST listener no longer merges the portal, so its baseline headers
+    /// need a router of their own.
+    async fn setup_api_router() -> (Router, TempDir) {
+        let (state, tempdir) = setup_state().await;
         let router = Server::new(
             state,
             ServerConfig {
                 http_addr: "127.0.0.1:0".parse().unwrap(),
                 max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
                 cors: CorsConfig::default(),
-                portal_csp: PortalCspConfig::new(vec!["https://peer.test/".to_string()]),
             },
         )
         .build_router();
-
-        (router, tempdir, discovery_origin)
+        (router, tempdir)
     }
 
     async fn enable_portal(state: &ServerState, dir: &std::path::Path) {
@@ -375,19 +430,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_config_returns_api_base_url_when_portal_is_available() {
-        let (state, tempdir) = setup_state().await;
-        let portal_dir = tempdir.path().join("portal");
-        std::fs::create_dir_all(&portal_dir).unwrap();
-        std::fs::write(portal_dir.join("index.html"), "<html>portal</html>").unwrap();
-        enable_portal(&state, &portal_dir).await;
+    async fn carries_api_url() {
+        // The SPA is served from its own origin, so the advertised API base has
+        // to be absolute and the root has to answer with the SPA document.
+        let tempdir = tempdir().unwrap();
+        let (router, _state_dir, _discovery_origin) =
+            setup_serving_node(&tempdir.path().join("portal")).await;
 
-        let response = super::portal_config(axum::extract::State(state)).await;
-
+        let response = router
+            .clone()
+            .oneshot(request(Method::GET, "/portal-config.json"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(config, serde_json::json!({ "apiBaseUrl": "/api/v1" }));
+        assert_eq!(
+            config,
+            serde_json::json!({ "apiBaseUrl": format!("{TEST_API_URL}/api/v1") })
+        );
+
+        let index = router.oneshot(request(Method::GET, "/")).await.unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        let body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"<html>portal</html>");
+    }
+
+    #[test]
+    fn api_url_joins_once() {
+        assert_eq!(
+            super::api_base_url("https://api.test/"),
+            "https://api.test/api/v1"
+        );
+        assert_eq!(
+            super::api_base_url("https://api.test"),
+            "https://api.test/api/v1"
+        );
     }
 
     #[tokio::test]
@@ -512,6 +590,7 @@ mod tests {
         assert!(connect_src.contains(&discovery_origin), "{connect_src}");
         assert!(connect_src.contains("https://tokens.test"), "{connect_src}");
         assert!(connect_src.contains("https://peer.test"), "{connect_src}");
+        assert!(connect_src.contains(TEST_API_URL), "{connect_src}");
 
         let img_src = policy
             .split("; ")
@@ -519,14 +598,13 @@ mod tests {
             .unwrap();
         assert!(img_src.contains("blob:"), "{img_src}");
         assert!(img_src.contains("https://s3.test"), "{img_src}");
+        assert!(img_src.contains(TEST_API_URL), "{img_src}");
     }
 
     #[tokio::test]
     async fn api_routes_baseline() {
         // API and swagger get the anti-clickjacking baseline, but not the strict portal CSP.
-        let tempdir = tempdir().unwrap();
-        let (router, _state_dir, _discovery_origin) =
-            setup_serving_node(&tempdir.path().join("portal")).await;
+        let (router, _state_dir) = setup_api_router().await;
 
         for path in ["/api/v1/info", "/api-docs/openapi.json"] {
             let response = router

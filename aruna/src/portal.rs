@@ -21,7 +21,9 @@ pub async fn initialize(config: PortalConfig, state: Arc<ServerState>) {
         PortalConfig::Disabled => {
             state.set_portal_status(PortalStatus::default()).await;
         }
-        PortalConfig::Artifact(config) => {
+        PortalConfig::Artifact {
+            artifact: config, ..
+        } => {
             state
                 .set_portal_status(artifact_status_base(&config, false))
                 .await;

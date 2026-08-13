@@ -1,12 +1,11 @@
 use crate::cors::CorsConfig;
-use crate::csp::{PortalCspConfig, baseline_security_headers};
+use crate::csp::baseline_security_headers;
 use crate::error::ServerSetupError;
-use crate::portal;
 use crate::routes::rest_router;
 pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
-use axum::http::{Method, StatusCode, Uri, header};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
+use axum::http::{Method, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
 use std::net::SocketAddr;
@@ -41,7 +40,6 @@ pub struct ServerConfig {
     pub http_addr: SocketAddr,
     pub max_http_body_size: usize,
     pub cors: CorsConfig,
-    pub portal_csp: PortalCspConfig,
 }
 
 impl Server {
@@ -62,11 +60,6 @@ impl Server {
         let api_v1 = Router::new()
             .merge(rest_router(self.state.clone()))
             .layer(from_fn(rest_timeout));
-        let api_authority = self
-            .api_public_url
-            .as_deref()
-            .and_then(|url| url.parse::<Uri>().ok())
-            .and_then(|url| url.authority().map(ToString::to_string));
 
         // Build the root router with body size limit for REST API
 
@@ -74,11 +67,7 @@ impl Server {
             .nest("/api/v1", api_v1)
             .layer(DefaultBodyLimit::max(self.config.max_http_body_size))
             .merge(swagger_ui())
-            .merge(portal::router(
-                self.state.clone(),
-                self.config.portal_csp.clone(),
-            ))
-            .layer(from_fn_with_state(api_authority, redirect_swagger))
+            .layer(from_fn(redirect_swagger))
             .layer(from_fn(baseline_security_headers));
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
@@ -159,24 +148,9 @@ async fn rest_timeout(request: Request, next: Next) -> Response {
     }
 }
 
-async fn redirect_swagger(
-    State(api_authority): State<Option<String>>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn redirect_swagger(request: Request, next: Next) -> Response {
     let is_alias = matches!(request.uri().path(), "/" | "/api/v1" | "/swagger");
-    let is_api_host = api_authority.as_deref().is_some_and(|authority| {
-        request
-            .headers()
-            .get(header::HOST)
-            .and_then(|host| host.to_str().ok())
-            .is_some_and(|host| host.eq_ignore_ascii_case(authority))
-    });
-
-    if (request.method() == Method::GET || request.method() == Method::HEAD)
-        && is_alias
-        && is_api_host
-    {
+    if (request.method() == Method::GET || request.method() == Method::HEAD) && is_alias {
         return Redirect::temporary("/swagger-ui/").into_response();
     }
 
@@ -191,9 +165,9 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::extract::MatchedPath;
-    use axum::http::{Method, Request, StatusCode};
+    use axum::http::{Method, Request, StatusCode, header};
     use axum::middleware::{Next, from_fn};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
@@ -241,7 +215,6 @@ mod tests {
                 http_addr: "127.0.0.1:0".parse().unwrap(),
                 max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
                 cors: crate::cors::CorsConfig::default(),
-                portal_csp: crate::csp::PortalCspConfig::default(),
             },
         )
         .build_router();
@@ -258,6 +231,35 @@ mod tests {
         let _second = router.clone().oneshot(request()).await.unwrap();
         let third = router.oneshot(request()).await.unwrap();
         assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn root_redirects_swagger() {
+        // The portal has its own listener, so the API origin no longer depends
+        // on a Host header to decide that `/` belongs to swagger.
+        let router = Router::new()
+            .route("/swagger-ui/", get(|| async { StatusCode::OK }))
+            .layer(from_fn(super::redirect_swagger));
+
+        for path in ["/", "/api/v1", "/swagger"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::HOST, "portal.test")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+            assert_eq!(
+                response.headers().get(header::LOCATION).unwrap(),
+                "/swagger-ui/"
+            );
+        }
     }
 
     #[test]

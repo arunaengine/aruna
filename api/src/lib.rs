@@ -10,7 +10,7 @@ pub mod error;
 pub mod forwarded;
 pub mod openapi;
 pub mod ops;
-mod portal;
+pub mod portal;
 pub mod rate_limit;
 pub mod routes;
 pub mod s3;
