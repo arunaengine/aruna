@@ -692,6 +692,19 @@ async fn bind_portal(
     Ok(Some(handle))
 }
 
+/// Resolves when a configured portal listener exits, and never without one, so
+/// a portal is supervised like the other ingress listeners while an unconfigured
+/// portal never fails the node.
+async fn portal_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+    match handle {
+        Some(handle) => match handle.await {
+            Ok(()) => "Portal server stopped unexpectedly".to_string(),
+            Err(error) => format!("Portal server panicked: {error}"),
+        },
+        None => std::future::pending().await,
+    }
+}
+
 struct Background {
     realm_id: aruna_core::structs::RealmId,
     node_id: iroh::PublicKey,
@@ -802,7 +815,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ServerBindings {
         rest_handle,
         s3_handle,
-        portal_handle,
+        mut portal_handle,
         realm_id,
         node_id,
         is_initial_boot,
@@ -853,6 +866,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Err(error)) => format!("REST server failed: {error}"),
                 Err(error) => format!("REST server panicked: {error}"),
             });
+        }
+        message = portal_exit(portal_handle.as_mut()) => {
+            portal_handle = None;
+            failure = Some(message);
         }
         _ = &mut signal => {}
     }
@@ -1276,6 +1293,29 @@ mod tests {
         assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[tokio::test]
+    async fn portal_exit_reports() {
+        // A dead portal is a node failure, and a panic must not lose its error.
+        let mut stopped = tokio::spawn(async {});
+        assert_eq!(
+            portal_exit(Some(&mut stopped)).await,
+            "Portal server stopped unexpectedly"
+        );
+
+        let mut panicked = tokio::spawn(async { panic!("portal panicked") });
+        assert!(portal_exit(Some(&mut panicked)).await.contains("panicked"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn portal_exit_pends() {
+        // Without a configured portal the failure select must never fire for it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), portal_exit(None))
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(feature = "kubernetes")]
