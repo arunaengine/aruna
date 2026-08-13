@@ -70,7 +70,8 @@ struct PresenceSnapshot {
 pub struct RealmPresenceCache {
     snapshots: Arc<Mutex<HashMap<RealmId, PresenceSnapshot>>>,
     /// Token per in-flight refresh, cancelled when it settles so every stale
-    /// reader can join the one refresh instead of starting its own.
+    /// reader can join the one refresh instead of starting its own. Locked
+    /// before `snapshots` whenever both are needed.
     refreshing: Arc<Mutex<HashMap<RealmId, CancellationToken>>>,
 }
 
@@ -112,7 +113,17 @@ impl RealmPresenceCache {
             snapshot.values.clone()
         };
 
+        self.claim_slot(realm_id, now, values)
+    }
+
+    /// Joins or opens the single-flight slot for a stale read. The in-flight
+    /// refresh may have stored and released since that read, so freshness is
+    /// re-checked under this lock instead of starting a redundant refresh.
+    fn claim_slot(&self, realm_id: RealmId, now: Instant, values: Vec<DhtEntry>) -> PresenceServe {
         let mut refreshing = self.refreshing.lock();
+        if let Some(fresh) = self.fresh(realm_id, now) {
+            return PresenceServe::Fresh(fresh);
+        }
         match refreshing.get(&realm_id) {
             Some(settled) => PresenceServe::Stale {
                 values,
@@ -778,6 +789,26 @@ mod tests {
             cache.serve(realm_id, Instant::now()),
             PresenceServe::Stale { refresh: true, .. }
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recheck_before_claim() {
+        // The refresh stores and releases between the stale read and the slot.
+        let cache = RealmPresenceCache::default();
+        let realm_id = RealmId::from_bytes([13u8; 32]);
+        let start = Instant::now();
+        cache.store(realm_id, vec![make_entry(13, realm_id)], start);
+        let stale_now = start + Duration::from_secs(20);
+        let stale_values = vec![make_entry(13, realm_id)];
+
+        cache.store(realm_id, vec![make_entry(14, realm_id)], stale_now);
+        let served = cache.claim_slot(realm_id, stale_now, stale_values);
+
+        assert!(matches!(
+            served,
+            PresenceServe::Fresh(values) if values[0].node_id == make_node(14)
+        ));
+        assert!(cache.refreshing.lock().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
