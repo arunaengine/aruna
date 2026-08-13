@@ -284,10 +284,9 @@ async fn run_get(
     }
 }
 
-/// Serves realm presence from the snapshot when it is young enough. A stale
-/// snapshot starts one refresh that every stale reader awaits inside its own
-/// deadline, so a peer is only reported as unseen when the refresh cannot
-/// answer in time.
+/// Serves realm presence from a young snapshot. A stale one starts a single
+/// refresh that every stale reader awaits inside its own deadline, so a peer
+/// is reported unseen only when that refresh cannot answer in time.
 async fn serve_presence(
     ctx: &NetEffectContext,
     realm_id: RealmId,
