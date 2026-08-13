@@ -32,7 +32,6 @@ jobs:
       LLVM_PROFILE_FILE: cargo-test-${{ matrix.shard }}-%p-%m.profraw
     strategy:
       fail-fast: false
-      max-parallel: 4
       matrix:
         shard:
           - unit
@@ -67,67 +66,60 @@ jobs:
         run: |
           set -euo pipefail
 
-          run_test() {
-            cargo test "$@" --all-features --locked -- --test-threads=1
+          run_tests() {
+            local package="$1"
+            shift
+            local targets=()
+            for target in "$@"; do
+              targets+=(--test "$target")
+            done
+            cargo test -p "$package" "${targets[@]}" --all-features --locked
           }
 
           case "${{ matrix.shard }}" in
             unit)
-              cargo test --workspace --lib --all-features --locked
+              cargo test --workspace --lib --bins --all-features --locked
               cargo test --workspace --doc --all-features --locked
-              cargo test -p aruna --bin aruna --all-features --locked
-              cargo test -p aruna-doctor --bin aruna-doctor --all-features --locked
-              cargo test -p aruna-compute-helper --bin aruna-compute-helper --all-features --locked
               ;;
             application)
-              for target in \
+              run_tests aruna \
                 compute_execution cors credentials drs groups network_recovery \
                 observability oidc_registration onboarding public_access \
                 replication s3_attributes s3_copy s3_operations s3_security \
-                self_service_groups startup_ownership; do
-                run_test -p aruna --test "$target"
-              done
-              for target in \
+                self_service_groups startup_ownership
+              run_tests aruna-api \
                 api_effect_boundary_guard api_route_authorization_guard \
-                document_sync_publish_architecture_guard domain_guard; do
-                run_test -p aruna-api --test "$target"
-              done
-              run_test -p aruna-compute --test docker_backend
-              run_test -p aruna-compute --test units
-              run_test -p aruna-net --test integration
+                document_sync_publish_architecture_guard domain_guard
+              run_tests aruna-compute docker_backend units
+              run_tests aruna-net integration
               ;;
             operations-a)
-              for target in \
+              run_tests aruna-operations \
                 auth_validation group_replication harvest_pipeline \
                 job_framework_restart metadata_cold_start \
                 metadata_create_backpressure metadata_create_concurrency \
                 metadata_crud metadata_forwarding metadata_materialization_recovery \
                 metadata_propagation_tail metadata_query_concurrency \
-                metadata_replication metadata_restart_persistence; do
-                run_test -p aruna-operations --test "$target"
-              done
+                metadata_replication metadata_restart_persistence
               ;;
             operations-b)
-              for target in \
+              run_tests aruna-operations \
                 metadata_throughput multipart notification_delivery \
                 placement_determinism resource_watch_delivery rocrate_drivers \
                 rocrate_remote shard_genesis_confirmation shard_manifest \
                 shard_manifest_convergence shard_manifest_protocol \
                 sync_quarantine_capacity token_revocation usage_deltas \
-                usage_replication user_access_replication; do
-                run_test -p aruna-operations --test "$target"
-              done
+                usage_replication user_access_replication
               ;;
             topology)
-              for target in audit_topology non_holder_topology persistent_id_authority; do
-                run_test -p aruna-operations --test "$target"
-              done
+              run_tests aruna-operations \
+                audit_topology non_holder_topology persistent_id_authority
               ;;
             restart)
               # The 8k/16k incident fixtures run in the non-instrumented stress
               # lane below; keep the small restart contract in coverage.
               cargo test -p aruna-operations --test restart_traffic \
-                --all-features --locked -- --test-threads=1 \
+                --all-features --locked -- \
                 --skip offline_scale_bound \
                 --skip offline_scale_converges
               ;;
@@ -231,8 +223,4 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p aruna-operations --test restart_traffic \
-            --all-features --locked -- \
-            --test-threads=1 --ignored --exact offline_scale_bound
-          cargo test -p aruna-operations --test restart_traffic \
-            --all-features --locked -- \
-            --test-threads=1 --ignored --exact offline_scale_converges
+            --all-features --locked offline_scale_ -- --ignored
