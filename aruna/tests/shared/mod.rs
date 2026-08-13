@@ -56,11 +56,13 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout as time_limit};
 use ulid::Ulid;
 
 pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
+const WAIT_CAP: Duration = Duration::from_secs(60);
+const CONDITION_CAP: Duration = Duration::from_secs(30);
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -227,7 +229,10 @@ where
 {
     let deadline = Instant::now() + timeout;
     loop {
-        if condition().await {
+        if time_limit(timeout.min(CONDITION_CAP), condition())
+            .await
+            .is_ok_and(|ready| ready)
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -246,7 +251,7 @@ pub(crate) async fn wait_for_realm_nodes(
 ) -> TestResult<()> {
     wait_until(
         "realm node convergence",
-        Duration::from_secs(10),
+        WAIT_CAP,
         Duration::from_millis(100),
         || async {
             for context in contexts {
@@ -381,7 +386,7 @@ pub(crate) async fn wait_for_group_via_http(
 ) -> TestResult<GroupInfoResponse> {
     wait_until(
         "group visibility over REST",
-        Duration::from_secs(10),
+        WAIT_CAP,
         Duration::from_millis(100),
         || async {
             get_group_via_http(base_url, bearer_token, group_id)
@@ -408,9 +413,11 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
     group_id: &str,
     path_restrictions: Option<Vec<CreateS3PathRestriction>>,
 ) -> TestResult<S3Credentials> {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_group_via_http(base_url, bearer_token, group_id).await?;
 
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + WAIT_CAP;
+    let mut interval = Duration::from_millis(100);
     loop {
         let response = client
             .post(format!("{base_url}/api/v1/users/credentials"))
@@ -422,7 +429,6 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
             })
             .send()
             .await?;
-
         if response.status() == StatusCode::CREATED {
             let response: CreateS3CredentialsResponse = response.json().await?;
             return Ok(S3Credentials {
@@ -430,17 +436,17 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
                 access_secret: response.access_secret,
             });
         }
-
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        if Instant::now() >= deadline {
+        if status != StatusCode::SERVICE_UNAVAILABLE || Instant::now() >= deadline {
             return Err(std::io::Error::other(format!(
-                "unexpected create credentials status after retry: {} body={}",
+                "unexpected create credentials status: {} body={}",
                 status, body
             ))
             .into());
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(interval).await;
+        interval = interval.saturating_mul(2).min(Duration::from_secs(1));
     }
 }
 

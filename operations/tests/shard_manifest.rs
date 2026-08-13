@@ -1,7 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use aruna_core::StructuredId;
 use aruna_core::document::{DocumentSyncTarget, ShardManifest};
@@ -29,8 +28,10 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use ulid::Ulid;
+
+mod convergence;
+use convergence::wait_for_convergence;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -84,8 +85,17 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
     assert!(resolve_shard_holders(&config, &placement).contains(&nodes[0].net.node_id()));
 
     // The receiver only writes its manifest row once the lifecycle syncs and
-    // applies, so poll node B until the document appears.
-    let receiver = wait_for_manifest_entry(&nodes[1], realm_id, placement, &target).await?;
+    // applies, so wait until node B observes the document.
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "receiver manifest entry did not arrive",
+        || async {
+            let manifest =
+                assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
+            Ok(usize::from(!manifest_contains(&manifest, &target)))
+        },
+    )
+    .await?;
+    let receiver = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
     let origin = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
 
     assert!(
@@ -124,25 +134,6 @@ fn manifest_revision(
         .find(|entry| &entry.target == target)
         .map(|entry| entry.revision)
         .expect("manifest entry present")
-}
-
-async fn wait_for_manifest_entry(
-    node: &TestNode,
-    realm_id: RealmId,
-    placement: PlacementRef,
-    target: &DocumentSyncTarget,
-) -> Result<ShardManifest, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let manifest = assemble_shard_manifest(node.context.as_ref(), realm_id, placement).await?;
-        if manifest_contains(&manifest, target) {
-            return Ok(manifest);
-        }
-        if Instant::now() >= deadline {
-            return Err("timed out waiting for receiver manifest entry".into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
 }
 
 async fn build_realm_nodes(
@@ -275,31 +266,27 @@ async fn wait_for_realm_node_convergence(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected: std::collections::HashSet<NodeId> =
         nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut converged = true;
-        for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
-                Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "realm nodes did not converge",
+        || async {
+            let mut pending = 0;
+            for node in nodes {
+                match drive(
+                    GetRealmNodesOperation::new(*realm_id),
+                    node.context.as_ref(),
+                )
+                .await
+                {
+                    Ok(realm_nodes) if realm_nodes == expected => {}
+                    _ => {
+                        pending += 1;
+                    }
                 }
             }
-        }
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+            Ok(pending)
+        },
+    )
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

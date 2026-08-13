@@ -4,7 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_core::structs::{JobId, JobPayload, JobRecord, JobState, RealmId};
 use aruna_core::types::{NodeId, UserId};
@@ -120,33 +120,28 @@ async fn drive_until_terminal(
     context: &Arc<DriverContext>,
     runtime: &Arc<JobsRuntime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let batch = process_job_queue_batch(
-            &context.storage_handle,
-            node_id(1),
-            JobClassBudget {
-                in_process: 8,
-                external: 8,
-            },
-            None,
-        )
-        .await?;
-        for record in batch.claimed {
-            runtime.spawn(context.clone(), record);
-        }
-        let a = read_job_record(&context.storage_handle, job_a(), None).await?;
-        let b = read_job_record(&context.storage_handle, job_b(), None).await?;
-        let done = a.is_some_and(|record| record.state.is_terminal())
-            && b.is_some_and(|record| record.state.is_terminal());
-        if done {
-            return Ok(());
-        }
-        if Instant::now() > deadline {
-            return Err("jobs did not reach terminal state after restart".into());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let batch = process_job_queue_batch(
+        &context.storage_handle,
+        node_id(1),
+        JobClassBudget {
+            in_process: 8,
+            external: 8,
+        },
+        None,
+    )
+    .await?;
+    for record in batch.claimed {
+        runtime.spawn(context.clone(), record);
     }
+
+    let (a, b) = tokio::join!(
+        runtime.wait_for_terminal(&context.storage_handle, job_a(), Duration::from_secs(60)),
+        runtime.wait_for_terminal(&context.storage_handle, job_b(), Duration::from_secs(60)),
+    );
+    if a.is_none() || b.is_none() {
+        return Err("jobs did not reach terminal state after restart".into());
+    }
+    Ok(())
 }
 
 /// Simulates a crash mid-flight: claims two jobs, flags one for cancellation, leaves

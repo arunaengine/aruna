@@ -210,6 +210,7 @@ mod process {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
     use aruna_storage::{FjallStorage, StorageHandle};
+    use std::io::{Read, Seek, SeekFrom};
     use std::net::{TcpListener, UdpSocket};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -508,6 +509,21 @@ mod process {
             logs.get(self.log_start..).unwrap_or_default().to_string()
         }
 
+        fn own_log_chunk(&self, offset: &mut u64) -> String {
+            let Ok(mut log) = std::fs::File::open(&self.log_path) else {
+                return String::new();
+            };
+            if log.seek(SeekFrom::Start(*offset)).is_err() {
+                return String::new();
+            }
+            let mut bytes = Vec::new();
+            if log.read_to_end(&mut bytes).is_err() {
+                return String::new();
+            }
+            *offset = (*offset).saturating_add(bytes.len() as u64);
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
         /// Waits until the ops listener answers `path` with `expect`.
         pub async fn wait_status(&mut self, path: &str, expect: StatusCode) -> String {
             self.wait_body(path, expect, "").await
@@ -570,9 +586,15 @@ mod process {
         /// Waits until `needle` appears in this launch's own log output.
         pub async fn wait_log(&mut self, needle: &str) {
             let deadline = Instant::now() + HANG_GUARD;
+            let mut offset = self.log_start as u64;
+            let mut pending = String::new();
             while Instant::now() < deadline {
-                if self.own_logs().contains(needle) {
+                pending.push_str(&self.own_log_chunk(&mut offset));
+                if pending.contains(needle) {
                     return;
+                }
+                if let Some(index) = pending.rfind('\n') {
+                    pending = pending.split_off(index + 1);
                 }
                 if !self.is_running() {
                     panic!("process exited before logging {needle}\n{}", self.logs());
@@ -636,7 +658,7 @@ mod process {
                     );
                     return;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
             panic!("test barrier never reached {expected}\n{}", self.logs());
         }
@@ -644,12 +666,15 @@ mod process {
         /// Waits for a complete drain invocation before sampling the store.
         pub async fn wait_drain_quiet(&mut self) {
             let deadline = Instant::now() + HANG_GUARD;
+            let mut offset = self.log_start as u64;
+            let mut pending = String::new();
+            let mut summary_seen = false;
             while Instant::now() < deadline {
                 if !self.is_running() {
                     panic!("process exited before a quiescent drain\n{}", self.logs());
                 }
-                let mut summary_seen = false;
-                for line in self.own_logs().lines() {
+                pending.push_str(&self.own_log_chunk(&mut offset));
+                for line in pending.lines() {
                     summary_seen |= line.contains("pipeline.drain.summary")
                         && line.contains("rotation_complete=true")
                         && line.contains("has_unvisited=false");
@@ -657,7 +682,10 @@ mod process {
                         return;
                     }
                 }
-                tokio::task::yield_now().await;
+                if let Some(index) = pending.rfind('\n') {
+                    pending = pending.split_off(index + 1);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
             panic!("never reached a quiescent drain\n{}", self.logs());
         }

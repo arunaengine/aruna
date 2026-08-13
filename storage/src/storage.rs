@@ -1345,6 +1345,11 @@ impl FjallStorage {
         Self::open_with_persist_policy(path, FjallPersistPolicy::default())
     }
 
+    #[doc(hidden)]
+    pub fn open_test(path: &str) -> Result<StorageHandle, StorageLibError> {
+        Self::open_pools(path, FjallPersistPolicy::default(), 1, 1)
+    }
+
     #[tracing::instrument(
         name = "storage.open",
         level = "debug",
@@ -1354,12 +1359,21 @@ impl FjallStorage {
         path: &str,
         policy: FjallPersistPolicy,
     ) -> Result<StorageHandle, StorageLibError> {
+        Self::open_pools(path, policy, READ_POOL_THREADS, BULK_READ_POOL_THREADS)
+    }
+
+    fn open_pools(
+        path: &str,
+        policy: FjallPersistPolicy,
+        read_threads: usize,
+        bulk_threads: usize,
+    ) -> Result<StorageHandle, StorageLibError> {
         let db = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
             .open()?;
 
         let (sender, receivers) = StorageHandle::new();
-        let mut storage = Self::new(Store::new(db), policy, &sender);
+        let mut storage = Self::new(Store::new(db), policy, &sender, read_threads, bulk_threads);
         let channel_closed = sender.metrics.channel_closed.clone();
 
         let worker = thread::spawn(move || {
@@ -1388,17 +1402,17 @@ impl FjallStorage {
 
     /// Worker sharing the handle's cleanup map and metrics, including the
     /// mutation fence it reads before starting any mutation.
-    fn new(store: Store, policy: FjallPersistPolicy, handle: &StorageHandle) -> Self {
-        let (read_pool, mut pool_threads) = spawn_read_pool(
-            store.clone(),
-            READ_POOL_THREADS,
-            STORAGE_EFFECT_QUEUE_CAPACITY,
-        );
-        let (bulk_read_pool, bulk_threads) = spawn_read_pool(
-            store.clone(),
-            BULK_READ_POOL_THREADS,
-            BULK_EFFECT_QUEUE_CAPACITY,
-        );
+    fn new(
+        store: Store,
+        policy: FjallPersistPolicy,
+        handle: &StorageHandle,
+        read_threads: usize,
+        bulk_threads: usize,
+    ) -> Self {
+        let (read_pool, mut pool_threads) =
+            spawn_read_pool(store.clone(), read_threads, STORAGE_EFFECT_QUEUE_CAPACITY);
+        let (bulk_read_pool, bulk_threads) =
+            spawn_read_pool(store.clone(), bulk_threads, BULK_EFFECT_QUEUE_CAPACITY);
         pool_threads.extend(bulk_threads);
         Self {
             store,
@@ -3839,7 +3853,13 @@ mod tests {
             .manual_journal_persist(true)
             .open()
             .expect("database opens");
-        FjallStorage::new(super::Store::new(db), FjallPersistPolicy::default(), handle)
+        FjallStorage::new(
+            super::Store::new(db),
+            FjallPersistPolicy::default(),
+            handle,
+            super::READ_POOL_THREADS,
+            super::BULK_READ_POOL_THREADS,
+        )
     }
 
     fn keyed_write(key: &str) -> StorageEffect {

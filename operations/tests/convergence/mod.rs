@@ -20,6 +20,7 @@ pub const HANG_CAP: Duration = Duration::from_secs(300);
 pub const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Polls `check` until it reports zero still-pending units. The lost-progress
 /// deadline resets whenever the pending count strictly decreases, so the wait
@@ -37,6 +38,7 @@ where
 {
     let mut best = usize::MAX;
     let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
+    let mut poll_interval = POLL_INTERVAL;
     loop {
         let pending = match timeout(HANG_CAP, check()).await {
             Ok(result) => result?,
@@ -48,11 +50,13 @@ where
         if pending < best {
             best = pending;
             deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
+            poll_interval = POLL_INTERVAL;
         }
         if Instant::now() >= deadline {
             return Err(format!("{context} (still pending: {pending})").into());
         }
-        sleep(POLL_INTERVAL).await;
+        sleep(poll_interval).await;
+        poll_interval = poll_interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
     }
 }
 

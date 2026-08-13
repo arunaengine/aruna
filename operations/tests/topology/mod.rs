@@ -59,6 +59,7 @@ use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use futures_util::future::join_all;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -66,6 +67,8 @@ use ulid::Ulid;
 pub use convergence::{hang_cap, wait_for_convergence};
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+const TOPOLOGY_SHARD_COUNT: u32 = 8;
 
 /// Two stable locations, so `distinct_locations` strategies stay satisfiable
 /// and location ranking is exercised rather than degenerate.
@@ -487,13 +490,14 @@ impl Topology {
 
 async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNode> {
     let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
+    let storage = FjallStorage::open_test(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
             realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
+            document_sync_storage_path: Some(temp_dir.path().join("document-sync")),
             ..NetConfig::default()
         },
         storage.clone(),
@@ -557,6 +561,9 @@ async fn install_realm_config(
 ) -> TestResult<RealmConfigDocument> {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), replication_factor);
     config.seed_default_placement();
+    for strategy in &mut config.strategies {
+        strategy.shard_count = TOPOLOGY_SHARD_COUNT;
+    }
     let mut band = 0u32;
     for (index, node) in nodes.iter().enumerate() {
         let node_id = node.node_id();
@@ -639,27 +646,26 @@ async fn install_realm_config(
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "shard placement reconciliation never reported clean",
         || async {
-            for node in nodes {
+            join_all(nodes.iter().map(|node| {
                 aruna_operations::startup::restore_shard_subscriptions(
                     &node.context,
                     node.node_id(),
                     realm_id,
                 )
-                .await;
-            }
-            let mut pending = 0;
-            for node in nodes {
-                if aruna_operations::process_placements::process_shard_placements(
+            }))
+            .await;
+            let outcomes = join_all(nodes.iter().map(|node| {
+                aruna_operations::process_placements::process_shard_placements(
                     &node.context,
                     realm_id,
                     node.node_id(),
                 )
-                .await
-                .retry_scheduled
-                {
-                    pending += 1;
-                }
-            }
+            }))
+            .await;
+            let pending = outcomes
+                .iter()
+                .filter(|outcome| outcome.retry_scheduled)
+                .count();
             Ok(pending)
         },
     )

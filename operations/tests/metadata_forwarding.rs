@@ -34,8 +34,7 @@ use aruna_operations::create_metadata_document::{
     mint_forward_document, mint_local_document,
 };
 use aruna_operations::document_sync_outbox::{
-    new_outbox_record, outbox_key, read_outbox_record, schedule_outbox_drain_effect,
-    write_outbox_effect,
+    new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
@@ -48,7 +47,7 @@ use aruna_operations::metadata::forward::{
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::set_realm_policies::{SetRealmPoliciesConfig, SetRealmPoliciesOperation};
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::task_incoming::{OutboxDrainer, initialize_task_incoming};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
@@ -268,8 +267,10 @@ async fn user_node_group_survives() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // Give the drain time to run: it must not have deleted the records.
-    sleep(Duration::from_secs(2)).await;
+    // Drive one drain invocation: it must not delete the records.
+    OutboxDrainer::new(user_node.context.clone())
+        .run_once()
+        .await;
     assert!(read_group_auth(user_node, group.group_id).await?.is_some());
     assert!(
         outbox_len(user_node).await? > 0,
@@ -501,6 +502,7 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
             None => sleep(Duration::from_millis(50)).await,
         }
     }
+    wait_for_record_on_holders(&nodes, &holders, document_id).await?;
 
     // Plant a delete for the document's bucket into the non-holder's outbox: a
     // record it can never publish and that the removed relay used to hand to a
@@ -525,14 +527,9 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => return Err(format!("unexpected forged outbox write event: {other:?}").into()),
     }
-    outsider
-        .context
-        .task_handle
-        .as_ref()
-        .expect("task handle")
-        .send_effect(schedule_outbox_drain_effect())
+    OutboxDrainer::new(outsider.context.clone())
+        .run_once()
         .await;
-    sleep(Duration::from_secs(2)).await;
 
     // Neither relayed nor deleted: the forged record is still in the outbox.
     assert_eq!(

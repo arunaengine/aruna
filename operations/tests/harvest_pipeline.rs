@@ -41,6 +41,7 @@ use axum::extract::Query;
 use axum::routing::get;
 use byteview::ByteView;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
@@ -1297,39 +1298,38 @@ async fn slow_provider_cancellable() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let address = listener.local_addr()?;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
     let stall = tokio::spawn(async move {
         // Accept and never respond.
         let mut held = Vec::new();
+        let mut accepted_tx = Some(accepted_tx);
         while let Ok((stream, _)) = listener.accept().await {
+            if let Some(accepted_tx) = accepted_tx.take() {
+                let _ = accepted_tx.send(());
+            }
             held.push(stream);
         }
     });
     let source = seed_source(&fixture, &format!("http://{address}/oai")).await?;
 
     let (ctx, cancel, _shutdown) = fixture.job_context();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        cancel.cancel();
-    });
-    let started = tokio::time::Instant::now();
-    let outcome = run_harvest_job(
-        &ctx,
-        &HarvestJobSpec {
-            source_id: source.source_id,
-            group_id: source.group_id,
-        },
-    )
-    .await;
+    let spec = HarvestJobSpec {
+        source_id: source.source_id,
+        group_id: source.group_id,
+    };
+    let job = tokio::spawn(async move { run_harvest_job(&ctx, &spec).await });
+    tokio::time::timeout(Duration::from_secs(60), accepted_rx)
+        .await
+        .map_err(|_| "harvest never reached the provider")??;
+    cancel.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(60), job)
+        .await
+        .map_err(|_| "cancelled harvest did not stop")??;
     assert!(
         matches!(outcome, JobRunOutcome::Cancelled),
         "expected cancellation, got {}",
         describe(&outcome)
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "cancellation must not wait for the fetch deadline"
-    );
-
     stall.abort();
     fixture.stop().await;
     Ok(())

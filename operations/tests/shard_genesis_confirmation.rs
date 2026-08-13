@@ -2,7 +2,7 @@
 #![recursion_limit = "256"]
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_core::document::shard_topic_id;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -12,7 +12,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{
     Actor, PlacementOverride, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
@@ -25,7 +25,9 @@ use aruna_tasks::TaskHandle;
 use irokle::oplog::Oplog;
 use irokle::{ReplicationPolicy, TopicGenesis};
 use tempfile::TempDir;
-use tokio::time::sleep;
+
+mod convergence;
+use convergence::wait_for_convergence;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -120,18 +122,20 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
     // calls process_shard_placements itself past this point — convergence proves
     // the armed retry, not a hand-driven loop, re-creates the genesis.
     mesh_nodes(&nodes).await;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        fire_sync_placements_retry(rank0, realm_id).await;
-        if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "genesis was not created after the co-holder became reachable"
-        );
-        sleep(Duration::from_millis(200)).await;
-    }
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "genesis retry did not create topic",
+        || async {
+            fire_sync_placements_retry(rank0, realm_id).await;
+            Ok(
+                if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
+                    0
+                } else {
+                    1
+                },
+            )
+        },
+    )
+    .await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -140,10 +144,8 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
 // Fires the SyncPlacements timer now (compressing the 30s production retry), so
 // the task handler re-runs the reconciler through its real dispatch path.
 async fn fire_sync_placements_retry(node: &TestNode, realm_id: RealmId) {
-    let Some(task_handle) = node.context.task_handle.as_ref() else {
-        return;
-    };
-    let _ = task_handle
+    let task_handle = node.context.task_handle.as_ref().expect("task handle");
+    let event = task_handle
         .send_effect(Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::SyncPlacements {
                 realm_id,
@@ -152,6 +154,10 @@ async fn fire_sync_placements_retry(node: &TestNode, realm_id: RealmId) {
             after: Duration::ZERO,
         }))
         .await;
+    assert!(
+        matches!(event, Event::Task(TaskEvent::TimerScheduled { .. })),
+        "placement retry timer was not scheduled: {event:?}"
+    );
 }
 
 // A co-holder that HAS the topic but has not yet admitted the prober silently
@@ -193,18 +199,20 @@ async fn never_member_rank0_adopts_existing_genesis_after_top_up()
     // The co-holder's member top-up admits the rank-0 holder.
     process_shard_placements(&co_holder.context, realm_id, co_holder.net.node_id()).await;
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
-        if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the rank-0 holder never adopted the existing genesis after the top-up"
-        );
-        sleep(Duration::from_millis(200)).await;
-    }
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "genesis top-up did not adopt topic",
+        || async {
+            process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+            Ok(
+                if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
+                    0
+                } else {
+                    1
+                },
+            )
+        },
+    )
+    .await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
