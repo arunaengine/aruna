@@ -1820,7 +1820,6 @@ mod tests {
         for (shard, peer) in peers.iter().enumerate() {
             let placement = PlacementRef {
                 strategy_id,
-                epoch: 0,
                 shard: shard as u32,
             };
             config.placement_overrides.push(PlacementOverride {

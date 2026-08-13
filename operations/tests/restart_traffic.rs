@@ -970,7 +970,6 @@ fn incident_target(
 
     let placement = aruna_core::structs::PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: 5,
     };
     let document_id: Ulid = MetaResourceId::from_parts(
@@ -1004,7 +1003,6 @@ fn ensure_incident_topics(
                 realm_id,
                 &aruna_core::structs::PlacementRef {
                     strategy_id: strategy.strategy_id,
-                    epoch: 0,
                     shard,
                 },
             )

@@ -18105,7 +18105,6 @@ mod tests {
 
         let placement = PlacementRef {
             strategy_id: Ulid::from_parts(7_200, 1),
-            epoch: 0,
             shard: 5,
         };
         let target = DocumentSyncTarget::PersistentIdMapping {
@@ -18236,12 +18235,10 @@ mod tests {
         let group_id = Ulid::from_parts(2_152, 1);
         let mismatched = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 9,
         };
         let matching = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let bad_document = document(4, 2_153);
@@ -18550,7 +18547,6 @@ mod tests {
 
         let placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let document = |seed: u64| {
@@ -18824,7 +18820,6 @@ mod tests {
         };
         let placed = |shard: u32| PlacementRef {
             strategy_id,
-            epoch: 0,
             shard,
         };
         let mapping = |document_id, actor, seed: u64| {

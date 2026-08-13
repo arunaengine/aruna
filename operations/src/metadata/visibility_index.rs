@@ -857,7 +857,6 @@ mod tests {
             ),
             placement: PlacementRef {
                 strategy_id: Ulid::nil(),
-                epoch: 0,
                 shard: 0,
             },
             holder_node_ids: Vec::new(),

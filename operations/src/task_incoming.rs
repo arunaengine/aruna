@@ -3279,7 +3279,6 @@ mod tests {
     fn admin_placement(shard: u32) -> aruna_core::structs::PlacementRef {
         aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_bytes([50; 16]),
-            epoch: 0,
             shard,
         }
     }
@@ -3335,7 +3334,6 @@ mod tests {
         let mut value = change();
         value.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_bytes([seed; 16]),
-            epoch: 0,
             shard: 1,
         };
         value
@@ -3880,7 +3878,6 @@ mod tests {
         let mut blocked_change = change();
         blocked_change.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_bytes([48; 16]),
-            epoch: 0,
             shard: 1,
         };
         let record = crate::document_sync_outbox::new_outbox_record(
@@ -4142,7 +4139,6 @@ mod tests {
             let mut value = change();
             value.placement = aruna_core::structs::PlacementRef {
                 strategy_id: Ulid::from_bytes([45; 16]),
-                epoch: 0,
                 shard: 1,
             };
             value
@@ -4414,7 +4410,6 @@ mod tests {
         write_realm_config(&storage, realm_id, &config, net.node_id()).await;
         let placement = aruna_core::structs::PlacementRef {
             strategy_id: config.strategies[0].strategy_id,
-            epoch: 0,
             shard: 0,
         };
         let shared_target = DocumentSyncTarget::RealmAuthorization { realm_id };

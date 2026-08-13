@@ -52,7 +52,6 @@ use aruna_operations::announce_realm_presence::{
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::expand_placement::expand_realm_placement;
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::mutate_realm_placement::{
@@ -174,8 +173,6 @@ impl Topology {
             )
             .await?;
         }
-        wait_for_realm_nodes(&nodes, realm_id).await?;
-
         let config =
             install_realm_config(&nodes, realm_id, user_id, replication_factor, shard_count)
                 .await?;

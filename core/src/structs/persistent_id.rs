@@ -293,7 +293,6 @@ mod tests {
         let mapping = PersistentIdMapping::conceptual(id, user(), revision(7, 42));
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([3; 16]),
-            epoch: 0,
             shard: 4,
         };
         let change = persistent_id_change(&mapping, placement);
