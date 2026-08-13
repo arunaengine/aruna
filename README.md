@@ -113,7 +113,7 @@ This demo deployment:
 - builds the workspace in release mode
 - launches 3 local Aruna nodes
 - waits for readiness at `http://127.0.0.1:<port>/swagger-ui`
-- writes per-node logs and `summary.txt` to `target/test-deploy/`
+- writes per-node logs, `summary.txt` and a private `credentials.txt` to `target/test-deploy/`
 - prints an `ADMIN_TOKEN=...` line for use in authenticated API calls during the session
 - prints a summary listing every node's API, portal, S3 and ops url next to the test logins
 

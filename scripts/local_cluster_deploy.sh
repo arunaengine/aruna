@@ -586,6 +586,7 @@ summary_entry() {
 
 write_summary_file() {
   local summary_file=$1
+  local credentials_file=$2
   local node_index
 
   : >"$summary_file"
@@ -604,18 +605,8 @@ write_summary_file() {
       printf '\n'
     done
 
-    printf 'Test credentials\n'
-    summary_entry "Aruna admin token" "$INITIAL_ADMIN_TOKEN"
-    summary_entry "Aruna admin secret" "$INITIAL_LOCAL_ONBOARDING_SECRET"
-    if [[ "$WITH_KEYCLOAK" == "1" ]]; then
-      summary_entry "Keycloak admin" "$KEYCLOAK_ADMIN_USER / $KEYCLOAK_ADMIN_PASSWORD"
-      summary_entry "Keycloak console" "http://127.0.0.1:$KEYCLOAK_HTTP_PORT/admin"
-      summary_entry "OIDC test user" "$KEYCLOAK_OIDC_USERNAME / $KEYCLOAK_OIDC_PASSWORD"
-      summary_entry "OIDC issuer" "$KEYCLOAK_ISSUER"
-      summary_entry "OIDC discovery" "$KEYCLOAK_DISCOVERY_URL"
-    else
-      summary_entry "OIDC" "not configured, started without --with-keycloak"
-    fi
+    printf 'Credentials\n'
+    summary_entry "File" "$credentials_file"
 
     if [[ -n "$PORTAL_DIR" ]]; then
       printf '\nPortal\n'
@@ -624,13 +615,37 @@ write_summary_file() {
   } >>"$summary_file"
 }
 
-print_summary() {
-  local summary_file=$1
+# The token and the OIDC logins stay out of the retained summary; a private file
+# keeps them readable for the caller alone.
+write_credentials_file() {
+  local credentials_file=$1
+
+  (
+    umask 077
+    rm -f "$credentials_file"
+    {
+      printf 'Test credentials\n'
+      summary_entry "Aruna admin token" "$INITIAL_ADMIN_TOKEN"
+      if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+        summary_entry "Keycloak admin" "$KEYCLOAK_ADMIN_USER / $KEYCLOAK_ADMIN_PASSWORD"
+        summary_entry "Keycloak console" "http://127.0.0.1:$KEYCLOAK_HTTP_PORT/admin"
+        summary_entry "OIDC test user" "$KEYCLOAK_OIDC_USERNAME / $KEYCLOAK_OIDC_PASSWORD"
+        summary_entry "OIDC issuer" "$KEYCLOAK_ISSUER"
+        summary_entry "OIDC discovery" "$KEYCLOAK_DISCOVERY_URL"
+      else
+        summary_entry "OIDC" "not configured, started without --with-keycloak"
+      fi
+    } >"$credentials_file"
+  )
+}
+
+print_file() {
+  local file=$1
   local line
 
   while IFS= read -r line; do
     printf '%s\n' "$line"
-  done <"$summary_file"
+  done <"$file"
 }
 
 monitor_nodes() {
@@ -838,7 +853,8 @@ if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   verify_oidc_issuer
 fi
 
-write_summary_file "$DEPLOY_ROOT/summary.txt"
+write_credentials_file "$DEPLOY_ROOT/credentials.txt"
+write_summary_file "$DEPLOY_ROOT/summary.txt" "$DEPLOY_ROOT/credentials.txt"
 
 if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   log "$NODE_COUNT aruna nodes and Keycloak are up"
@@ -847,7 +863,9 @@ else
 fi
 
 log "Deployment summary:"
-print_summary "$DEPLOY_ROOT/summary.txt"
+print_file "$DEPLOY_ROOT/summary.txt"
+printf '\n'
+print_file "$DEPLOY_ROOT/credentials.txt"
 
 if [[ "$EXIT_AFTER_READY" == "1" ]]; then
   log "Exiting after readiness because ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1"
