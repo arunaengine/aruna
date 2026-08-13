@@ -6,9 +6,10 @@ use crate::structs::structs::{Permission, Role};
 use crate::structs::{
     Actor, BandPool, BindingDirectory, BindingError, BindingScope, CandidateMapNode,
     CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
-    DocumentClass, HandleRange, HandleRangeDirectory, JobId, KIND_LABEL_KEY, METADATA_HANDLE,
-    NodePlacementEntry, PlacementActivation, PlacementBinding, PlacementOverride, PlacementScope,
-    PlacementStrategy, PlacementTransition, StrategyBinding, coordinator_spans,
+    DocumentClass, FrozenStrategySelector, HandleRange, HandleRangeDirectory, JobId,
+    KIND_LABEL_KEY, METADATA_HANDLE, NodePlacementEntry, PlacementActivation, PlacementBinding,
+    PlacementOverride, PlacementScope, PlacementStrategy, PlacementTransition, SHARD_SUBJECT_LEN,
+    StrategyBinding, coordinator_spans,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -681,12 +682,35 @@ impl RealmConfigDocument {
     /// caller MUST pair it with a reduced `PublishCandidateMap` plus
     /// `InitializeActivations`, or the buckets can never advance: the reducer
     /// re-derives activations only for strategies it owns a path for.
-    pub fn snapshot_candidate_map(&mut self) -> u64 {
-        let epoch = self.newest_map_epoch().unwrap_or(0) + 1;
-        self.candidate_maps.push(CandidatePlacementMap {
+    /// Freezes the current view, strategy selectors, and shard overrides into
+    /// a candidate map at `epoch`. The single constructor for published maps,
+    /// so snapshot and expansion can never freeze different inputs.
+    pub fn freeze_map(&self, epoch: u64) -> CandidatePlacementMap {
+        CandidatePlacementMap {
             epoch,
             nodes: self.candidate_nodes(),
-        });
+            selectors: self
+                .strategies
+                .iter()
+                .map(|strategy| FrozenStrategySelector {
+                    strategy_id: strategy.strategy_id,
+                    replica_count: strategy.replica_count,
+                    distinct_locations: strategy.distinct_locations,
+                    affinity: strategy.affinity.clone(),
+                })
+                .collect(),
+            shard_overrides: self
+                .placement_overrides
+                .iter()
+                .filter(|record| record.subject.len() == SHARD_SUBJECT_LEN)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    pub fn snapshot_candidate_map(&mut self) -> u64 {
+        let epoch = self.newest_map_epoch().unwrap_or(0) + 1;
+        self.candidate_maps.push(self.freeze_map(epoch));
         for strategy in &self.strategies {
             for shard in 0..strategy.shard_count {
                 if self
@@ -1210,6 +1234,8 @@ mod test {
         let conflicting = CandidatePlacementMap {
             epoch: 2,
             nodes: Vec::new(),
+            selectors: Vec::new(),
+            shard_overrides: Vec::new(),
         };
         config.candidate_maps.push(conflicting);
         assert!(config.candidate_map(2).is_none());

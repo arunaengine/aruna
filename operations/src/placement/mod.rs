@@ -7,8 +7,8 @@ pub mod transition;
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
-    DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument,
-    shard_for_subject,
+    CandidatePlacementMap, DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy,
+    RealmConfigDocument, shard_for_subject,
 };
 use aruna_core::types::GroupId;
 use ulid::Ulid;
@@ -202,10 +202,8 @@ pub fn resolve_shard_holders_checked(
             .ok_or(PlacementResolveError::StrategyUnknown(
                 placement.strategy_id,
             ))?;
-    let view = view_for_epoch(config, selection_epoch(config, placement)?)?;
-    Ok(resolve_shard_holders_from_view(
-        config, &view, strategy, placement,
-    ))
+    let selection = frozen_selection(config, strategy, selection_epoch(config, placement)?)?;
+    Ok(selection.resolve(placement))
 }
 
 pub(crate) const MAX_READ_HOLDERS: usize = 32;
@@ -233,17 +231,10 @@ fn holders_limit_checked(
             .ok_or(PlacementResolveError::StrategyUnknown(
                 placement.strategy_id,
             ))?;
-    let target = limit.min(u32::MAX as usize) as u32;
-    let mut bounded = strategy.clone();
-    bounded.replica_count = Some(
-        strategy
-            .replica_count
-            .map_or(target, |replicas| replicas.min(target)),
-    );
-    let view = view_for_epoch(config, selection_epoch(config, placement)?)?;
-    Ok(resolve_shard_holders_from_view(
-        config, &view, &bounded, placement,
-    ))
+    let mut selection = frozen_selection(config, strategy, selection_epoch(config, placement)?)?;
+    // The read cap bounds the frozen replica count, never the live one.
+    selection.bound_replicas(limit.min(u32::MAX as usize) as u32);
+    Ok(selection.resolve(placement))
 }
 
 /// Read fan-out for a bucket: its activated holders first, then every holder a
@@ -300,17 +291,81 @@ fn selection_epoch(
     }
 }
 
-fn view_for_epoch(
-    config: &RealmConfigDocument,
-    epoch: Option<u64>,
-) -> Result<PlacementView, PlacementResolveError> {
-    match epoch {
-        None => Ok(build_view(config)),
-        Some(epoch) => config
-            .candidate_map(epoch)
-            .map(view_from_map)
-            .ok_or(PlacementResolveError::CandidateMapUnavailable(epoch)),
+/// The complete selection inputs a bucket resolves from: either the live
+/// config (bootstrap, before any map) or one frozen candidate map whose
+/// selector and shard overrides never see later config edits.
+pub(crate) struct FrozenSelection<'a> {
+    view: PlacementView,
+    strategy: PlacementStrategy,
+    map: Option<&'a CandidatePlacementMap>,
+    config: &'a RealmConfigDocument,
+}
+
+impl FrozenSelection<'_> {
+    pub(crate) fn resolve(&self, placement: &PlacementRef) -> Vec<NodeId> {
+        let subject = shard_subject_bytes(placement);
+        let override_ = match self.map {
+            Some(map) => map.shard_override(&subject),
+            None => shard_override(self.config, placement),
+        };
+        resolve_holders(&self.view, &self.strategy, &subject, override_)
     }
+
+    fn bound_replicas(&mut self, limit: u32) {
+        self.strategy.replica_count = Some(
+            self.strategy
+                .replica_count
+                .map_or(limit, |replicas| replicas.min(limit)),
+        );
+    }
+}
+
+/// Builds the selection inputs for `strategy` at `epoch`. A map that predates
+/// the strategy fails closed: an activated bucket must never fall back to
+/// live selector fields.
+pub(crate) fn frozen_selection<'a>(
+    config: &'a RealmConfigDocument,
+    strategy: &PlacementStrategy,
+    epoch: Option<u64>,
+) -> Result<FrozenSelection<'a>, PlacementResolveError> {
+    match epoch {
+        None => Ok(FrozenSelection {
+            view: build_view(config),
+            strategy: strategy.clone(),
+            map: None,
+            config,
+        }),
+        Some(epoch) => {
+            let map = config
+                .candidate_map(epoch)
+                .ok_or(PlacementResolveError::CandidateMapUnavailable(epoch))?;
+            map_selection(config, strategy, map)
+                .ok_or(PlacementResolveError::CandidateMapUnavailable(epoch))
+        }
+    }
+}
+
+/// Selection inputs for one explicit map; `None` when the map predates the
+/// strategy and carries no frozen selector for it.
+pub(crate) fn map_selection<'a>(
+    config: &'a RealmConfigDocument,
+    strategy: &PlacementStrategy,
+    map: &'a CandidatePlacementMap,
+) -> Option<FrozenSelection<'a>> {
+    let selector = map.selector(&strategy.strategy_id)?;
+    Some(FrozenSelection {
+        view: view_from_map(map),
+        strategy: PlacementStrategy {
+            strategy_id: strategy.strategy_id,
+            name: strategy.name.clone(),
+            replica_count: selector.replica_count,
+            distinct_locations: selector.distinct_locations,
+            affinity: selector.affinity.clone(),
+            shard_count: strategy.shard_count,
+        },
+        map: Some(map),
+        config,
+    })
 }
 
 /// First shard of a referenced strategy that resolves to zero holders while the
@@ -321,14 +376,14 @@ fn view_for_epoch(
 pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<PlacementRef> {
     // Checked against the newest map, which is what a future activation would
     // pin: activated buckets are already frozen and cannot be emptied by an edit.
-    let view = match config
+    let newest_epoch = config
         .newest_map_epoch()
-        .and_then(|epoch| config.candidate_map(epoch))
-    {
+        .filter(|epoch| config.candidate_map(*epoch).is_some());
+    let capacity_view = match newest_epoch.and_then(|epoch| config.candidate_map(epoch)) {
         Some(map) => view_from_map(map),
         None => build_view(config),
     };
-    let has_capacity = view.nodes.iter().any(|node| {
+    let has_capacity = capacity_view.nodes.iter().any(|node| {
         node.kind.is_sync_eligible() && !node.full && !node.draining && node.weight > 0
     });
     if !has_capacity {
@@ -352,12 +407,22 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
         if !referenced {
             continue;
         }
+        // A strategy the newest map predates checks against the live view: a
+        // future map publication is what would freeze it.
+        let epoch = newest_epoch.filter(|epoch| {
+            config
+                .candidate_map(*epoch)
+                .is_some_and(|map| map.selector(&id).is_some())
+        });
+        let Ok(selection) = frozen_selection(config, strategy, epoch) else {
+            continue;
+        };
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: id,
                 shard,
             };
-            if resolve_shard_holders_from_view(config, &view, strategy, &placement).is_empty() {
+            if selection.resolve(&placement).is_empty() {
                 return Some(placement);
             }
         }
@@ -520,8 +585,8 @@ pub fn held_buckets(
     node_id: NodeId,
 ) -> Vec<u32> {
     // Buckets of one strategy usually share an activated epoch, so the frozen
-    // views are built once each rather than once per bucket.
-    let mut views: std::collections::BTreeMap<Option<u64>, PlacementView> =
+    // selections are built once each rather than once per bucket.
+    let mut selections: std::collections::BTreeMap<Option<u64>, FrozenSelection<'_>> =
         std::collections::BTreeMap::new();
     let mut held = Vec::new();
     for shard in 0..strategy.shard_count {
@@ -532,16 +597,16 @@ pub fn held_buckets(
         let Ok(epoch) = selection_epoch(config, &placement) else {
             continue;
         };
-        let view = match views.entry(epoch) {
+        let selection = match selections.entry(epoch) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
-                let Ok(view) = view_for_epoch(config, epoch) else {
+                let Ok(selection) = frozen_selection(config, strategy, epoch) else {
                     continue;
                 };
-                entry.insert(view)
+                entry.insert(selection)
             }
         };
-        if resolve_shard_holders_from_view(config, view, strategy, &placement).contains(&node_id) {
+        if selection.resolve(&placement).contains(&node_id) {
             held.push(shard);
         }
     }
@@ -600,10 +665,13 @@ mod tests {
     };
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::structs::{
-        Actor, BindingScope, CandidateMapNode, CandidatePlacementMap, MetadataRegistryRecord,
-        NodePlacementEntry, RealmId, RealmNodeKind, StrategyBinding,
+        Actor, AffinityRule, BindingScope, CandidateMapNode, CandidatePlacementMap,
+        MetadataRegistryRecord, NodePlacementEntry, PlacementActivation, RealmId, RealmNodeKind,
+        StrategyBinding,
     };
     use ulid::Ulid;
+
+    use crate::placement::transition::holders_in_map;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -878,6 +946,84 @@ mod tests {
     }
 
     #[test]
+    fn edits_stay_inert() {
+        // After activation, selector edits (replica count, affinity, distinct
+        // locations) and a shard override must not move holders: selection
+        // reads only the activated map's frozen selector inputs.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let pinned = resolve_shard_holders(&config, &placement);
+        assert_eq!(pinned.len(), 2);
+
+        let strategy_id = placement.strategy_id;
+        let strategy = config
+            .strategies
+            .iter_mut()
+            .find(|strategy| strategy.strategy_id == strategy_id)
+            .expect("strategy");
+        strategy.replica_count = Some(4);
+        strategy.distinct_locations = true;
+        strategy.affinity.push(AffinityRule {
+            matcher: aruna_core::structs::LabelMatch {
+                key: "zone".to_string(),
+                value: "a".to_string(),
+            },
+            effect: aruna_core::structs::AffinityEffect::Filter,
+        });
+        config.placement_overrides.push(PlacementOverride {
+            subject: shard_subject_bytes(&placement),
+            pinned: vec![node(4)],
+            excluded: vec![pinned[0]],
+            strategy_id: None,
+        });
+        assert_eq!(resolve_shard_holders(&config, &placement), pinned);
+
+        // A fresh snapshot freezes the edits, but only activation applies it.
+        config.snapshot_candidate_map();
+        assert_eq!(resolve_shard_holders(&config, &placement), pinned);
+        let newest = config.candidate_map(2).expect("newest map");
+        assert_ne!(
+            holders_in_map(&config, strategy_of(&config), &placement, newest)
+                .expect("frozen selector"),
+            pinned
+        );
+    }
+
+    #[test]
+    fn missing_selector_fails() {
+        // A strategy added after the activated map was published must fail
+        // closed rather than fall back to live selector fields.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let late = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            name: "late".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 4,
+        };
+        config.strategies.push(late.clone());
+        config.placement_activations.push(PlacementActivation {
+            strategy_id: late.strategy_id,
+            shard: 0,
+            activation_epoch: 1,
+            candidate_map_epoch: 1,
+            transition_id: None,
+        });
+        assert_eq!(
+            resolve_shard_holders_checked(
+                &config,
+                &PlacementRef {
+                    strategy_id: late.strategy_id,
+                    shard: 0,
+                }
+            ),
+            Err(PlacementResolveError::CandidateMapUnavailable(1))
+        );
+    }
+
+    #[test]
     fn missing_activation_fails_closed() {
         let (mut config, placement) = config_and_placement();
         config.snapshot_candidate_map();
@@ -920,6 +1066,8 @@ mod tests {
         config.candidate_maps.push(CandidatePlacementMap {
             epoch: 5,
             nodes: Vec::new(),
+            selectors: Vec::new(),
+            shard_overrides: Vec::new(),
         });
         assert_eq!(
             resolve_shard_holders_checked(&config, &placement),
@@ -1037,6 +1185,13 @@ mod tests {
                     labels: std::collections::BTreeMap::new(),
                 })
                 .collect(),
+            selectors: vec![aruna_core::structs::FrozenStrategySelector {
+                strategy_id,
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+            }],
+            shard_overrides: Vec::new(),
         };
         for operation in [
             AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {

@@ -218,6 +218,20 @@ impl RealmPlacementMutation {
                     "placement strategy replica_count must not be zero".to_string(),
                 ))
             }
+            // Per-shard activations cannot survive a bucket-space reshape.
+            Self::UpsertStrategy(strategy)
+                if document
+                    .strategy(&strategy.strategy_id)
+                    .is_some_and(|existing| existing.shard_count != strategy.shard_count)
+                    && document
+                        .placement_activations
+                        .iter()
+                        .any(|entry| entry.strategy_id == strategy.strategy_id) =>
+            {
+                Err(MutateRealmPlacementError::InvalidInput(
+                    "shard_count cannot change while the strategy has activations".to_string(),
+                ))
+            }
             Self::SetDefaultStrategy(strategy_id) => {
                 require_strategy(document, strategy_id, "default strategy")?;
                 require_metadata_binding(
@@ -1501,6 +1515,31 @@ mod tests {
                 Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
             ));
         }
+    }
+
+    #[test]
+    fn shard_count_frozen() {
+        // A bucket-space reshape would orphan per-shard activations.
+        let realm_id = RealmId::from_bytes([15; 32]);
+        let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        document.seed_default_placement();
+        document.snapshot_candidate_map();
+        let strategy_id = document.default_strategy_id.unwrap();
+        let mut reshaped = document.strategy(&strategy_id).unwrap().clone();
+        reshaped.shard_count *= 2;
+
+        assert!(matches!(
+            RealmPlacementMutation::UpsertStrategy(reshaped).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("shard_count")
+        ));
+
+        // Selector edits without a shard_count change stay allowed.
+        let mut edited = document.strategy(&strategy_id).unwrap().clone();
+        edited.replica_count = Some(1);
+        assert_eq!(
+            RealmPlacementMutation::UpsertStrategy(edited).validate(&document),
+            Ok(())
+        );
     }
 
     #[test]

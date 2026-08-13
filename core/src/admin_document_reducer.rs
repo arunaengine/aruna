@@ -7242,6 +7242,13 @@ mod tests {
                     labels: BTreeMap::new(),
                 })
                 .collect(),
+            selectors: vec![crate::structs::FrozenStrategySelector {
+                strategy_id: transition_strategy().strategy_id,
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+            }],
+            shard_overrides: Vec::new(),
         }
     }
 

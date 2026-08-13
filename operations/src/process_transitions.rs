@@ -280,7 +280,11 @@ async fn ensure_strategy_activations(
             strategy_id: strategy.strategy_id,
             shard: 0,
         };
-        if holders_in_map(config, strategy, &placement, map).first() != Some(&local_node_id) {
+        // A map without this strategy's selector cannot activate it; a newer
+        // map publication is what resolves that, so just stay pending.
+        if holders_in_map(config, strategy, &placement, map)
+            .is_none_or(|holders| holders.first() != Some(&local_node_id))
+        {
             pending = true;
             continue;
         }

@@ -135,6 +135,10 @@ pub struct StrategyBinding {
     pub strategy_id: Ulid,
 }
 
+/// Byte length of a shard override subject: strategy id (16) plus shard (4).
+/// Longer subjects address documents and never pin holders.
+pub const SHARD_SUBJECT_LEN: usize = 20;
+
 /// Fixed zero slot every key and topic derivation that once carried a
 /// placement epoch keeps writing, so those byte layouts stay stable now that
 /// placement identity is epoch-free.

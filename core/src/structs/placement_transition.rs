@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{RealmId, RealmNodeKind};
+use crate::structs::{AffinityRule, PlacementOverride, RealmId, RealmNodeKind};
 
 /// Domain tag for the tuple a target holder signs to prove it verified a bucket.
 pub const TRANSITION_PROOF_DOMAIN: &[u8] = b"aruna-transition-proof-v1";
@@ -33,6 +33,17 @@ pub struct CandidateMapNode {
     pub labels: BTreeMap<String, String>,
 }
 
+/// Holder-affecting strategy fields as frozen into a candidate map, so a live
+/// strategy edit can never move an activated bucket's holders. `shard_count`
+/// is deliberately live: edits to it are rejected while activations exist.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct FrozenStrategySelector {
+    pub strategy_id: Ulid,
+    pub replica_count: Option<u32>,
+    pub distinct_locations: bool,
+    pub affinity: Vec<AffinityRule>,
+}
+
 /// Immutable snapshot of the placement view at one publisher-chosen epoch.
 /// Two different maps at one epoch conflict: the epoch stays unusable rather
 /// than picking a winner.
@@ -40,6 +51,25 @@ pub struct CandidateMapNode {
 pub struct CandidatePlacementMap {
     pub epoch: u64,
     pub nodes: Vec<CandidateMapNode>,
+    /// One frozen selector per strategy known when the map was published.
+    pub selectors: Vec<FrozenStrategySelector>,
+    /// Shard-subject pin/exclude overrides frozen with the map. Document
+    /// overrides stay live: they steer strategy selection, never holders.
+    pub shard_overrides: Vec<PlacementOverride>,
+}
+
+impl CandidatePlacementMap {
+    pub fn selector(&self, strategy_id: &Ulid) -> Option<&FrozenStrategySelector> {
+        self.selectors
+            .iter()
+            .find(|selector| selector.strategy_id == *strategy_id)
+    }
+
+    pub fn shard_override(&self, subject: &[u8]) -> Option<&PlacementOverride> {
+        self.shard_overrides
+            .iter()
+            .find(|record| record.subject == subject)
+    }
 }
 
 /// The authoritative holder-set input for one bucket. Advances only by
@@ -451,6 +481,8 @@ mod tests {
                 draining: true,
                 labels: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
             }],
+            selectors: Vec::new(),
+            shard_overrides: Vec::new(),
         };
         let bytes = postcard::to_allocvec(&map).unwrap();
         assert_eq!(

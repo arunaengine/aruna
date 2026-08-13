@@ -10,8 +10,7 @@ use aruna_core::structs::{
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::placement::resolver::view_from_map;
-use crate::placement::{resolve_holders, shard_override, shard_subject_bytes};
+use crate::placement::map_selection;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TransitionPlanError {
@@ -84,19 +83,15 @@ pub fn transition_health(config: &RealmConfigDocument, now_ms: u64) -> Transitio
     health
 }
 
-/// Rank-ordered holders of `placement` under one frozen candidate map.
+/// Rank-ordered holders of `placement` under one frozen candidate map, or
+/// `None` when the map predates the strategy and carries no selector for it.
 pub fn holders_in_map(
     config: &RealmConfigDocument,
     strategy: &PlacementStrategy,
     placement: &PlacementRef,
     map: &CandidatePlacementMap,
-) -> Vec<NodeId> {
-    resolve_holders(
-        &view_from_map(map),
-        strategy,
-        &shard_subject_bytes(placement),
-        shard_override(config, placement),
-    )
+) -> Option<Vec<NodeId>> {
+    Some(map_selection(config, strategy, map)?.resolve(placement))
 }
 
 /// Holders of `placement` under its activated map, or `None` when the bucket
@@ -108,7 +103,7 @@ pub fn activation_holders(
 ) -> Option<Vec<NodeId>> {
     let activation = config.activation(&placement.strategy_id, placement.shard)?;
     let map = config.candidate_map(activation.candidate_map_epoch)?;
-    Some(holders_in_map(config, strategy, placement, map))
+    holders_in_map(config, strategy, placement, map)
 }
 
 /// Per-bucket effect of moving `buckets` of `strategy_id` onto
@@ -145,7 +140,8 @@ pub fn preview_transition(
         };
         let old_holders = activation_holders(config, strategy, &placement)
             .ok_or(TransitionPlanError::ActivationUnavailable(bucket))?;
-        let new_holders = holders_in_map(config, strategy, &placement, target);
+        let new_holders = holders_in_map(config, strategy, &placement, target)
+            .ok_or(TransitionPlanError::MapUnavailable(target_map_epoch))?;
         if new_holders.is_empty() {
             return Err(TransitionPlanError::TargetHoldersEmpty(bucket));
         }

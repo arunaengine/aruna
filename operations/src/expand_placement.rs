@@ -142,13 +142,7 @@ pub async fn expand_realm_placement(
 /// The next epoch and the map that freezes the current view into it.
 fn next_map(config: &RealmConfigDocument) -> (u64, CandidatePlacementMap) {
     let epoch = config.newest_map_epoch().unwrap_or(0) + 1;
-    (
-        epoch,
-        CandidatePlacementMap {
-            epoch,
-            nodes: config.candidate_nodes(),
-        },
-    )
+    (epoch, config.freeze_map(epoch))
 }
 
 fn invalid(error: crate::placement::transition::TransitionPlanError) -> MutateRealmPlacementError {
