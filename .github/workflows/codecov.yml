@@ -23,23 +23,13 @@ env:
 
 jobs:
   instrumented:
-    name: Instrumented tests (${{ matrix.shard }})
+    name: Instrumented tests
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget. Every target runs once in a bounded
-    # lane so one topology or process test cannot starve the whole report.
+    # Hang cap, not a performance budget. Tests use libtest's default
+    # parallelism; the large restart profiles run in the stress job below.
     timeout-minutes: 90
     env:
-      LLVM_PROFILE_FILE: cargo-test-${{ matrix.shard }}-%p-%m.profraw
-    strategy:
-      fail-fast: false
-      matrix:
-        shard:
-          - unit
-          - application
-          - operations-a
-          - operations-b
-          - topology
-          - restart
+      LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
 
     steps:
       - name: Check out repository
@@ -63,95 +53,31 @@ jobs:
       - name: Run instrumented tests
         env:
           CARGO_BUILD_JOBS: 2
-        run: |
-          set -euo pipefail
+        run: cargo test --workspace --all-features --locked
 
-          run_tests() {
-            local package="$1"
-            shift
-            local targets=()
-            for target in "$@"; do
-              targets+=(--test "$target")
-            done
-            cargo test -p "$package" "${targets[@]}" --all-features --locked
-          }
-
-          case "${{ matrix.shard }}" in
-            unit)
-              cargo test --workspace --lib --bins --all-features --locked
-              cargo test --workspace --doc --all-features --locked
-              ;;
-            application)
-              run_tests aruna \
-                compute_execution cors credentials drs groups network_recovery \
-                observability oidc_registration onboarding public_access \
-                replication s3_attributes s3_copy s3_operations s3_security \
-                self_service_groups startup_ownership
-              run_tests aruna-api \
-                api_effect_boundary_guard api_route_authorization_guard \
-                document_sync_publish_architecture_guard domain_guard
-              run_tests aruna-compute docker_backend units
-              run_tests aruna-net integration
-              ;;
-            operations-a)
-              run_tests aruna-operations \
-                auth_validation group_replication harvest_pipeline \
-                job_framework_restart metadata_cold_start \
-                metadata_create_backpressure metadata_create_concurrency \
-                metadata_crud metadata_forwarding metadata_materialization_recovery \
-                metadata_propagation_tail metadata_query_concurrency \
-                metadata_replication metadata_restart_persistence
-              ;;
-            operations-b)
-              run_tests aruna-operations \
-                metadata_throughput multipart notification_delivery \
-                placement_determinism resource_watch_delivery rocrate_drivers \
-                rocrate_remote shard_genesis_confirmation shard_manifest \
-                shard_manifest_convergence shard_manifest_protocol \
-                sync_quarantine_capacity token_revocation usage_deltas \
-                usage_replication user_access_replication
-              ;;
-            topology)
-              run_tests aruna-operations \
-                audit_topology non_holder_topology persistent_id_authority
-              ;;
-            restart)
-              # The 8k/16k incident fixtures run in the non-instrumented stress
-              # lane below; keep the small restart contract in coverage.
-              cargo test -p aruna-operations --test restart_traffic \
-                --all-features --locked -- \
-                --skip offline_scale_bound \
-                --skip offline_scale_converges
-              ;;
-            *)
-              echo "unknown coverage shard: ${{ matrix.shard }}" >&2
-              exit 2
-              ;;
-          esac
-
-      - name: Collect coverage fragment
+      - name: Collect coverage
         run: |
           grcov . \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \
-            --output-path "coverage-${{ matrix.shard }}.lcov" \
+            --output-path coverage.lcov \
             --branch \
             --ignore-not-existing \
             --ignore "/*" \
             --ignore "target/*" \
             --keep-only "*/src/*"
-          records=$(grep -c '^DA:' "coverage-${{ matrix.shard }}.lcov" || true)
-          if [ "$records" -lt 1 ]; then
-            echo "coverage-${{ matrix.shard }}.lcov has no DA records" >&2
+          records=$(grep -c '^DA:' coverage.lcov || true)
+          if [ "$records" -lt 1000 ]; then
+            echo "coverage.lcov has only $records DA records" >&2
             exit 1
           fi
 
-      - name: Upload coverage fragment
+      - name: Upload coverage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage-${{ matrix.shard }}
-          path: coverage-${{ matrix.shard }}.lcov
+          name: coverage
+          path: coverage.lcov
           if-no-files-found: error
           retention-days: 1
 
@@ -167,31 +93,26 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Download coverage fragments
+      - name: Download coverage artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: coverage-*
+          name: coverage
           path: coverage-parts
-          merge-multiple: true
 
-      - name: Merge and validate coverage
+      - name: Validate coverage
         run: |
           set -euo pipefail
-          find coverage-parts -type f -name '*.lcov' -print0 \
-            | sort -z \
-            | xargs -0 cat > coverage.lcov
-          records=$(grep -c '^DA:' coverage.lcov || true)
+          records=$(grep -c '^DA:' coverage-parts/coverage.lcov || true)
           if [ "$records" -lt 1000 ]; then
             echo "coverage.lcov has only $records DA records" >&2
             exit 1
           fi
-          test "$(find coverage-parts -type f -name '*.lcov' | wc -l)" -eq 6
 
       - name: Upload coverage report
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage.lcov
+          files: coverage-parts/coverage.lcov
           fail_ci_if_error: true
 
   restart-stress:
