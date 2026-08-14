@@ -175,8 +175,11 @@ fn transition_stale(config: &RealmConfigDocument, transition: &PlacementTransiti
     incomplete > 0 && stale == incomplete
 }
 
-/// Only a management node's abort passes inbound admission; everyone else
-/// keeps watching until one issues it.
+/// Only a management node's realm-config mutation passes inbound admission;
+/// everyone else keeps watching until one issues it. Holder rank alone is not
+/// enough: Server and Local nodes are holder-eligible, so a rank-0 Server would
+/// apply locally, enqueue, and then be rejected by every peer, advancing alone
+/// while the realm never converges.
 fn is_management(config: &RealmConfigDocument, node_id: NodeId) -> bool {
     let node_id = node_id.to_string();
     config.nodes.iter().any(|node| {
@@ -445,6 +448,11 @@ async fn ensure_expansions(
     let Some(map) = config.candidate_map(epoch) else {
         return false;
     };
+    // Management nodes race and the predecessor gate coalesces the winner; a
+    // non-management issuer would only ever be rejected by its peers.
+    if !is_management(config, local_node_id) {
+        return false;
+    }
     let mut pending = false;
     for strategy in &config.strategies {
         if config.placement_transitions.iter().any(|transition| {
@@ -474,9 +482,9 @@ async fn ensure_expansions(
             strategy_id: strategy.strategy_id,
             shard: 0,
         };
-        if holders_in_map(config, strategy, &placement, map)
-            .is_none_or(|holders| holders.first() != Some(&local_node_id))
-        {
+        // A map that cannot resolve this strategy's holders cannot plan it; a
+        // newer publication resolves that, so just stay pending.
+        if holders_in_map(config, strategy, &placement, map).is_none() {
             continue;
         }
         let transition_id = ulid::Ulid::generate();
@@ -529,6 +537,11 @@ async fn ensure_strategy_activations(
     let Some(map) = config.candidate_map(epoch) else {
         return false;
     };
+    // The activation record is an immutable value, so concurrent management
+    // issuers coalesce; a non-management issuer never lands at all.
+    if !is_management(config, local_node_id) {
+        return false;
+    }
     let mut pending = false;
     for strategy in &config.strategies {
         if config.activation(&strategy.strategy_id, 0).is_some() {
@@ -540,9 +553,7 @@ async fn ensure_strategy_activations(
         };
         // A map without this strategy's selector cannot activate it; a newer
         // map publication is what resolves that, so just stay pending.
-        if holders_in_map(config, strategy, &placement, map)
-            .is_none_or(|holders| holders.first() != Some(&local_node_id))
-        {
+        if holders_in_map(config, strategy, &placement, map).is_none() {
             pending = true;
             continue;
         }
