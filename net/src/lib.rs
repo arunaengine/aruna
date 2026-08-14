@@ -748,12 +748,8 @@ impl NetHandle {
             .await;
         });
 
-        // Drains genesis tie-break evictions (from irokle's own accept/resync
-        // loops and this service's bootstrap/batch-sync paths) into the durable
-        // eviction journal, then hands each entry to the registered inbound
-        // handler for outbox re-enqueue. An entry is released only once its
-        // replacement records are committed, so a missing handler, a failed
-        // write, a shutdown, or a crash all leave the payload recoverable.
+        // Irokle journals before reset; this task converts entries to the outbox.
+        // Entries remain until conversion commits, so retries and restarts are safe.
         let eviction_document_sync = document_sync.clone();
         let eviction_inbound_handler = inbound_handler.clone();
         let eviction_inbound_handler_registered = inbound_handler_registered.clone();
@@ -2708,7 +2704,7 @@ mod tests {
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
         let entry = PendingEviction {
-            key: byteview::ByteView::from(b"eviction-test".to_vec()),
+            key: ::irokle::EvictionKey::from_bytes([17; 32]),
             documents: vec![test_evicted_document(11), test_evicted_document(12)],
         };
         let mut pending = vec![entry.clone()];

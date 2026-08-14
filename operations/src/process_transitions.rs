@@ -228,6 +228,13 @@ async fn drain_step(
             start_after = batch.next_start_after;
         }
     }
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return StepPlan::Pending;
+    };
+    match net_handle.document_sync_node().pending_evictions() {
+        Ok(evictions) if evictions.is_empty() => {}
+        Ok(_) | Err(_) => return StepPlan::Pending,
+    }
     StepPlan::Ready(RealmPlacementMutation::ReportDrained {
         transition_id: transition.plan.transition_id,
         bucket: placement.shard,

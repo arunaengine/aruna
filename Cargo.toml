@@ -68,7 +68,7 @@ chacha20poly1305 = "0.10.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.4", features = ["derive"] }
 console-subscriber = "0.5.0"
-craqle = { git = "https://github.com/arunaengine/craqle", branch = "main", features = [
+craqle = { git = "https://github.com/arunaengine/craqle", branch = "fix/irokle-dangling-op-meta", features = [
     "iroh",
 ] }
 crc-fast = "1.10.0"
@@ -99,7 +99,7 @@ hyper-util = { version = "0.1.20", features = [
 ipnet = "2.12.0"
 iroh = "1.0.3"
 iroh-base = "1.0.3"
-irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "fix/dangling-op-meta", features = [
     "fjall",
     "iroh",
 ] }

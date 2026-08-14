@@ -34,12 +34,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-    DOCUMENT_SYNC_EVICTION_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE,
-    GROUP_OWNER_INDEX_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
-    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
+    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
+    SYNC_QUARANTINE_USAGE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -186,27 +185,8 @@ struct DocumentEventBatch {
 /// plus the key that releases them once their outbox rows are committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingEviction {
-    pub key: ByteView,
+    pub key: irokle_crate::EvictionKey,
     pub documents: Vec<DocumentSyncEvictedDocument>,
-}
-
-/// Journal entries a restart replays in one pass. Far above any realistic
-/// backlog: an entry only survives an interrupted handoff.
-const EVICTION_JOURNAL_SCAN_LIMIT: usize = 1024;
-
-/// Derives one stable key per eviction so repeating the journal write, or the
-/// recovery it drives, never multiplies entries.
-fn eviction_journal_key(
-    topic_id: irokle_crate::TopicId,
-    documents: &[DocumentSyncEvictedDocument],
-) -> ByteView {
-    let mut identity = topic_id.as_bytes().to_vec();
-    for document in documents {
-        identity.extend_from_slice(&document.event_id.to_bytes());
-    }
-    let mut key = topic_id.as_bytes().to_vec();
-    key.extend_from_slice(irokle_crate::OpId::hash(&identity).as_bytes());
-    ByteView::from(key)
 }
 
 /// Placement fence outcome. The transactional read of the realm config is the
@@ -1692,96 +1672,35 @@ impl DocumentSyncService {
         }
     }
 
-    /// Decodes a genesis tie-break eviction, journals the recovered payload
-    /// durably, and drops the replaced chain's cursors. Irokle has already
-    /// removed the losing chain, so the journal entry is the only remaining copy
-    /// until every replacement outbox row is committed.
+    /// Decodes an eviction Irokle already journalled with its reset and drops
+    /// the replaced chain's cursors. The journal remains until every replacement
+    /// outbox row is committed.
     pub async fn consume_eviction(&self, eviction: TopicEviction) -> Option<PendingEviction> {
         let topic_id = eviction.topic_id;
+        let key = eviction.key();
         let documents = self.decode_eviction(eviction);
         self.reset_applied_cursor(topic_id).await;
-        if documents.is_empty() {
-            return None;
-        }
-        let pending = PendingEviction {
-            key: eviction_journal_key(topic_id, &documents),
-            documents,
-        };
-        match postcard::to_allocvec(&pending.documents) {
-            Ok(value) => {
-                if let Err(error) = self
-                    .storage_write(
-                        DOCUMENT_SYNC_EVICTION_KEYSPACE.to_string(),
-                        pending.key.clone(),
-                        value.into(),
-                    )
-                    .await
-                {
-                    // Deliver anyway: the in-memory copy is all that is left.
-                    warn!(%topic_id, %error, "Failed to journal evicted document sync payloads");
-                }
-            }
-            Err(error) => {
-                warn!(%topic_id, %error, "Failed to encode evicted document sync payloads");
-            }
-        }
-        Some(pending)
+        Some(PendingEviction { key, documents })
     }
 
-    /// Journal entries left by an interrupted eviction handoff, oldest first.
-    /// The net layer replays them before it treats recovery as complete.
+    /// Irokle journal entries left by an interrupted eviction handoff.
     pub async fn pending_evictions(&self) -> Result<Vec<PendingEviction>> {
-        let entries = match self
-            .storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: DOCUMENT_SYNC_EVICTION_KEYSPACE.to_string(),
-                prefix: None,
-                start: None,
-                limit: EVICTION_JOURNAL_SCAN_LIMIT,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(NetError::Bootstrap(error.to_string()));
-            }
-            other => {
-                return Err(NetError::Bootstrap(format!(
-                    "unexpected eviction journal scan event: {other:?}"
-                )));
-            }
-        };
-        Ok(entries
-            .into_iter()
-            .filter_map(|(key, value)| {
-                match postcard::from_bytes::<Vec<DocumentSyncEvictedDocument>>(value.as_ref()) {
-                    Ok(documents) => Some(PendingEviction { key, documents }),
-                    Err(error) => {
-                        warn!(%error, "Skipping undecodable eviction journal entry");
-                        None
-                    }
-                }
-            })
-            .collect())
+        let evictions = self
+            .node
+            .pending_evictions()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let mut pending = Vec::with_capacity(evictions.len());
+        for eviction in evictions {
+            pending.extend(self.consume_eviction(eviction).await);
+        }
+        Ok(pending)
     }
 
     /// Releases a journal entry once every replacement outbox row is durable.
-    pub async fn clear_eviction(&self, key: ByteView) -> Result<()> {
-        match self
-            .storage
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: DOCUMENT_SYNC_EVICTION_KEYSPACE.to_string(),
-                key,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-            other => Err(NetError::Bootstrap(format!(
-                "unexpected eviction journal delete event: {other:?}"
-            ))),
-        }
+    pub async fn clear_eviction(&self, key: irokle_crate::EvictionKey) -> Result<()> {
+        self.node
+            .clear_eviction(&key)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 
     /// Drops the applied-ops cursor of a topic whose chain was replaced by a
