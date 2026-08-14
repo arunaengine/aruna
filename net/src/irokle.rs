@@ -17096,9 +17096,9 @@ mod tests {
             applied_cursor_clock(store, topic_id, genesis, value).expect("cursor reads")
         };
 
-        assert_eq!(read(Some(encoded.clone().into()), genesis), clock);
+        assert_eq!(read(Some(encoded.clone()), genesis), clock);
         assert_eq!(
-            read(Some(encoded.clone().into()), test_genesis(2)),
+            read(Some(encoded.clone()), test_genesis(2)),
             irokle_crate::ActorClock::default(),
             "another genesis is another history"
         );

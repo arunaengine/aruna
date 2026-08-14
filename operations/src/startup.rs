@@ -1664,7 +1664,7 @@ mod tests {
     #[test]
     fn realm_minter_agrees() {
         let realm_id = RealmId([7; 32]);
-        let mut ids = vec![node(1), node(2), node(3)];
+        let mut ids = [node(1), node(2), node(3)];
         ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         let (user, minter, follower) = (ids[0], ids[1], ids[2]);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
