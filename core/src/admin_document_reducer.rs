@@ -1947,10 +1947,15 @@ impl AdminDocumentReducerState {
                     let Some((strategy_id, proof)) = transition_proof_from_value(value) else {
                         continue;
                     };
+                    // A proof from outside the planned target set never enters
+                    // the record; the tuple predicate rejects the rest lazily.
                     if strategy_id == transition.plan.strategy_id
                         && proof.bucket == bucket
                         && proof.holder == holder
-                        && transition.plan.covers(bucket)
+                        && transition
+                            .plan
+                            .bucket_plan(bucket)
+                            .is_some_and(|plan| plan.target_holders.contains(&holder))
                     {
                         transition.proofs.push(proof);
                     }
@@ -7287,6 +7292,20 @@ mod tests {
         }
     }
 
+    /// The digest of the fixture's reduced barrier set (holders 1 and 2).
+    fn fixture_digest(plan: &TransitionPlan, bucket: u32) -> [u8; 32] {
+        let mut transition = crate::structs::PlacementTransition::new(plan.clone());
+        transition.barriers = [1u8, 2]
+            .iter()
+            .map(|seed| crate::structs::BucketBarrier {
+                bucket,
+                reported_by: node(*seed),
+                frontier: vec![*seed],
+            })
+            .collect();
+        transition.barrier_digest(bucket)
+    }
+
     fn proof_for(plan: &TransitionPlan, bucket: u32, seed: u8) -> CompletionProof {
         ProofClaim {
             realm_id: realm_id(),
@@ -7295,7 +7314,7 @@ mod tests {
             bucket,
             old_activation_epoch: 1,
             target_map_epoch: plan.target_map_epoch,
-            barrier_digest: [0; 32],
+            barrier_digest: fixture_digest(plan, bucket),
             checkpoint_root: [7; 32],
             holder: node(seed),
         }

@@ -1260,6 +1260,21 @@ mod tests {
                     )
                     .expect("applies");
             }
+            let mut fenced = aruna_core::structs::PlacementTransition::new(plan.clone());
+            fenced.barriers = bucket
+                .old_holders
+                .iter()
+                .map(|holder| aruna_core::structs::BucketBarrier {
+                    bucket: bucket.bucket,
+                    reported_by: *holder,
+                    frontier: vec![
+                        (1..=4u8)
+                            .find(|seed| node(*seed) == *holder)
+                            .expect("known"),
+                    ],
+                })
+                .collect();
+            let digest = fenced.barrier_digest(bucket.bucket);
             for holder in &bucket.target_holders {
                 let seed = (1..=4u8)
                     .find(|seed| node(*seed) == *holder)
@@ -1271,7 +1286,7 @@ mod tests {
                     bucket: bucket.bucket,
                     old_activation_epoch: 1,
                     target_map_epoch: 2,
-                    barrier_digest: [0; 32],
+                    barrier_digest: digest,
                     checkpoint_root: [1; 32],
                     holder: *holder,
                 }

@@ -258,6 +258,11 @@ async fn completion_step(
     let Some(activation) = config_activation(context, realm_id, placement).await else {
         return StepPlan::Pending;
     };
+    // Never sign a tuple the reducer will ignore: the stored activation must
+    // still be the epoch this plan moves from.
+    if activation != bucket.predecessor_epoch {
+        return StepPlan::Pending;
+    }
     let claim = ProofClaim {
         realm_id,
         transition_id: transition.plan.transition_id,

@@ -332,10 +332,25 @@ impl PlacementTransition {
             .count()
     }
 
+    /// The one structural predicate a counted proof must pass: a planned
+    /// target attesting exactly this bucket's predecessor epoch, the plan's
+    /// target epoch, and the bucket's reduced barrier digest. Signatures are
+    /// verified at admission, not re-checked here.
+    pub fn proof_valid(&self, bucket: u32, proof: &CompletionProof) -> bool {
+        let Some(plan) = self.plan.bucket_plan(bucket) else {
+            return false;
+        };
+        proof.bucket == bucket
+            && plan.target_holders.contains(&proof.holder)
+            && proof.old_activation_epoch == plan.predecessor_epoch
+            && proof.target_map_epoch == self.plan.target_map_epoch
+            && proof.barrier_digest == self.barrier_digest(bucket)
+    }
+
     /// Whether the bucket may cut over: every old holder reported its barrier
-    /// and every target holder proved it verified the handoff. A forced bucket
-    /// needs one verified proof instead, so the last verified copy is never
-    /// the one being cut away.
+    /// and every target holder proved the full tuple against one shared
+    /// checkpoint root. A forced bucket needs one valid proof instead, so the
+    /// last verified copy is never the one being cut away.
     ///
     /// Deliberately independent of [`TransitionStatus`]: a bucket whose proofs
     /// are all in has cut over, and an abort that arrives afterwards must not
@@ -345,26 +360,40 @@ impl PlacementTransition {
         let Some(plan) = self.plan.bucket_plan(bucket) else {
             return false;
         };
+        let valid_roots: Vec<[u8; 32]> = self
+            .proofs_for(bucket)
+            .filter(|proof| self.proof_valid(bucket, proof))
+            .map(|proof| proof.checkpoint_root)
+            .collect();
+        let single_root = valid_roots.windows(2).all(|pair| pair[0] == pair[1]);
         let proved = |holder: &NodeId| {
-            self.proofs
-                .iter()
-                .any(|proof| proof.bucket == bucket && proof.holder == *holder)
+            self.proofs_for(bucket)
+                .any(|proof| proof.holder == *holder && self.proof_valid(bucket, proof))
         };
         if self.forced.iter().any(|entry| entry.bucket == bucket) {
-            return plan.target_holders.iter().any(proved);
+            return single_root && plan.target_holders.iter().any(proved);
         }
         self.barrier_established(bucket, &plan.old_holders)
             && !plan.target_holders.is_empty()
+            && single_root
             && plan.target_holders.iter().all(proved)
     }
 
     /// Digest over the bucket's reduced barrier join: the sorted
-    /// `(holder, frontier)` pairs a proof commits to.
+    /// `(holder, frontier)` pairs a proof commits to. Only planned old holders
+    /// enter it, so a foreign report can never move the digest proofs match.
     pub fn barrier_digest(&self, bucket: u32) -> [u8; 32] {
+        let old_holders: &[NodeId] = self
+            .plan
+            .bucket_plan(bucket)
+            .map(|plan| plan.old_holders.as_slice())
+            .unwrap_or_default();
         let mut reported: Vec<(&NodeId, &Vec<u8>)> = self
             .barriers
             .iter()
-            .filter(|barrier| barrier.bucket == bucket)
+            .filter(|barrier| {
+                barrier.bucket == bucket && old_holders.contains(&barrier.reported_by)
+            })
             .map(|barrier| (&barrier.reported_by, &barrier.frontier))
             .collect();
         reported.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
@@ -595,7 +624,8 @@ mod tests {
 
     #[test]
     fn ready_needs_barrier_and_every_proof() {
-        // Old holders 1 and 2 must fence; target holders 2 and 3 must prove.
+        // Old holders 1 and 2 must fence; target holders 2 and 3 must prove
+        // against the final barrier digest.
         let mut transition = PlacementTransition::new(plan());
         let barrier = |seed: u8| BucketBarrier {
             bucket: 1,
@@ -603,15 +633,28 @@ mod tests {
             frontier: vec![seed],
         };
         transition.barriers.push(barrier(1));
+        let partial = transition.barrier_digest(1);
         transition
             .proofs
-            .push(claim(1, secret(2).public(), [0; 32]).sign(&secret(2)));
+            .push(claim(1, secret(2).public(), partial).sign(&secret(2)));
         transition
             .proofs
-            .push(claim(1, secret(3).public(), [0; 32]).sign(&secret(3)));
+            .push(claim(1, secret(3).public(), partial).sign(&secret(3)));
         assert!(!transition.bucket_ready(1));
 
+        // The barrier completing invalidates proofs signed over a partial one.
         transition.barriers.push(barrier(2));
+        assert!(!transition.bucket_ready(1));
+
+        let digest = transition.barrier_digest(1);
+        transition.proofs.clear();
+        transition
+            .proofs
+            .push(claim(1, secret(2).public(), digest).sign(&secret(2)));
+        assert!(!transition.bucket_ready(1), "one target proof missing");
+        transition
+            .proofs
+            .push(claim(1, secret(3).public(), digest).sign(&secret(3)));
         assert!(transition.bucket_ready(1));
         assert!(!transition.bucket_ready(3));
         assert!(!transition.bucket_ready(9));
@@ -620,6 +663,67 @@ mod tests {
         transition.status = TransitionStatus::Aborted;
         assert!(transition.bucket_ready(1));
         assert!(!transition.bucket_ready(3));
+    }
+
+    #[test]
+    fn stale_proof_ignored() {
+        // A stale predecessor epoch, wrong target epoch, or foreign holder
+        // never counts toward completion.
+        let mut transition = PlacementTransition::new(plan());
+        for seed in [1u8, 2] {
+            transition.barriers.push(BucketBarrier {
+                bucket: 1,
+                reported_by: secret(seed).public(),
+                frontier: vec![seed],
+            });
+        }
+        let digest = transition.barrier_digest(1);
+        let mut stale_epoch = claim(1, secret(2).public(), digest);
+        stale_epoch.old_activation_epoch = 9;
+        let mut wrong_target = claim(1, secret(3).public(), digest);
+        wrong_target.target_map_epoch = 9;
+        let foreign = claim(1, secret(7).public(), digest);
+        transition.proofs.push(stale_epoch.sign(&secret(2)));
+        transition.proofs.push(wrong_target.sign(&secret(3)));
+        transition.proofs.push(foreign.sign(&secret(7)));
+        assert!(!transition.bucket_ready(1));
+
+        transition.proofs.clear();
+        transition
+            .proofs
+            .push(claim(1, secret(2).public(), digest).sign(&secret(2)));
+        transition
+            .proofs
+            .push(claim(1, secret(3).public(), digest).sign(&secret(3)));
+        assert!(transition.bucket_ready(1));
+    }
+
+    #[test]
+    fn split_roots_block() {
+        // Two targets proving different checkpoint roots must not cut over.
+        let mut transition = PlacementTransition::new(plan());
+        for seed in [1u8, 2] {
+            transition.barriers.push(BucketBarrier {
+                bucket: 1,
+                reported_by: secret(seed).public(),
+                frontier: vec![seed],
+            });
+        }
+        let digest = transition.barrier_digest(1);
+        let mut split = claim(1, secret(3).public(), digest);
+        split.checkpoint_root = [9; 32];
+        transition
+            .proofs
+            .push(claim(1, secret(2).public(), digest).sign(&secret(2)));
+        transition.proofs.push(split.sign(&secret(3)));
+        assert!(!transition.bucket_ready(1));
+
+        // Resubmitting the shared root completes the bucket.
+        transition.proofs.pop();
+        transition
+            .proofs
+            .push(claim(1, secret(3).public(), digest).sign(&secret(3)));
+        assert!(transition.bucket_ready(1));
     }
 
     #[test]
@@ -658,9 +762,10 @@ mod tests {
             at_risk_report: "old holders lost".to_string(),
         });
         assert!(!transition.bucket_ready(3));
+        let digest = transition.barrier_digest(3);
         transition
             .proofs
-            .push(claim(3, secret(3).public(), [0; 32]).sign(&secret(3)));
+            .push(claim(3, secret(3).public(), digest).sign(&secret(3)));
         assert!(transition.bucket_ready(3));
     }
 }
