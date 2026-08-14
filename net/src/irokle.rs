@@ -1914,8 +1914,13 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))??;
         let r1_process = r1_process_started.elapsed();
         if responded_topics.len() != known_topics.len() {
+            let refused: Vec<String> = known_topics
+                .iter()
+                .filter(|topic| !responded_topics.contains(*topic))
+                .map(|topic| topic.to_string())
+                .collect();
             return Err(NetError::Bootstrap(format!(
-                "peer {peer} responded for {}/{} document sync batch topics",
+                "peer {peer} responded for {}/{} document sync batch topics (refused: {refused:?})",
                 responded_topics.len(),
                 known_topics.len()
             )));
@@ -5252,6 +5257,8 @@ fn metadata_document_delete_matches_registry(
         && delete.tombstone.document_id == document_id
 }
 
+const APPLY_CONFLICT_ATTEMPTS: usize = 64;
+
 async fn apply_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
@@ -5439,7 +5446,12 @@ async fn apply_user_admin_document_operation_to_storage(
         return storage_batch_delete_and_write_transactionally(storage, deletes, writes).await;
     }
 
-    for _ in 0..3 {
+    // A transient SSI conflict must never become stream-fatal: an aborted
+    // inbound apply leaves ops without meta and wedges the topic. Local
+    // interleavings are finite, so retry with yields; the bound stays a
+    // safety valve against a genuine livelock.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
         let txn_id = start_storage_transaction(storage).await?;
         let mut attempt_writes = writes.clone();
         let mut attempt_deletes = deletes.clone();
@@ -5525,7 +5537,7 @@ async fn apply_user_admin_document_operation_to_storage(
         }
     }
     Err(NetError::Dht(
-        "user subject claim apply conflicted three times".to_string(),
+        "user subject claim apply conflict retries exhausted".to_string(),
     ))
 }
 
@@ -5837,7 +5849,12 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         ));
     }
 
-    for _ in 0..3 {
+    // A transient SSI conflict must never become stream-fatal: an aborted
+    // inbound apply leaves ops without meta and wedges the topic. Local
+    // interleavings are finite, so retry with yields; the bound stays a
+    // safety valve against a genuine livelock.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
         let raw_now = unix_timestamp_secs();
         let txn_id = start_storage_transaction(storage).await?;
         let previous_state = match storage_read_from_transaction(
@@ -6067,7 +6084,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         }
     }
     Err(NetError::Dht(
-        "realm config admin operation conflicted three times".to_string(),
+        "realm config admin operation conflict retries exhausted".to_string(),
     ))
 }
 
@@ -6150,7 +6167,12 @@ async fn apply_config_events(
         return Ok(());
     };
 
-    for _ in 0..3 {
+    // A transient SSI conflict must never become stream-fatal: an aborted
+    // inbound apply leaves ops without meta and wedges the topic. Local
+    // interleavings are finite, so retry with yields; the bound stays a
+    // safety valve against a genuine livelock.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
         let raw_now = unix_timestamp_secs();
         let txn_id = start_storage_transaction(storage).await?;
         let previous_state = match storage_read_from_transaction(
@@ -6329,7 +6351,7 @@ async fn apply_config_events(
         }
     }
     Err(NetError::Dht(
-        "realm config admin operation conflicted three times".to_string(),
+        "realm config admin operation conflict retries exhausted".to_string(),
     ))
 }
 
@@ -7208,18 +7230,39 @@ async fn storage_batch_delete_and_write_transactionally(
     deletes: Vec<(String, ByteView)>,
     writes: Vec<(String, ByteView, Value)>,
 ) -> Result<()> {
-    let txn_id = start_storage_transaction(storage).await?;
-
-    if let Err(error) =
-        storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
-    {
-        let _ = storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Err(error);
+    // Same conflict discipline as the realm-config applies: a transient SSI
+    // conflict must never abort inbound stream processing, or ops land
+    // without meta and the topic wedges.
+    let mut last = None;
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
+        let txn_id = start_storage_transaction(storage).await?;
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            deletes.clone(),
+            writes.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                last = Some(NetError::Dht(message));
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-
-    Ok(())
+    Err(last.unwrap_or_else(|| NetError::Dht("apply conflict retries exhausted".to_string())))
 }
 
 async fn storage_batch_delete_and_write_in_transaction(
@@ -8151,8 +8194,10 @@ fn validate_config_authority(
     match report_participation(&event.op, current_config, previous_state) {
         ReportParticipation::NotReport | ReportParticipation::Participant => {}
         ReportParticipation::UnknownPlan => {
+            // A real dependency: a plan arriving in a later batch re-registers
+            // the topic instead of quarantining the causally early report.
             return Ok(AdminEventValidation::Deferred {
-                dependency: None,
+                dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
                 reason: "transition plan is not yet replicated".to_string(),
             });
         }
