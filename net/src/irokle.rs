@@ -8238,11 +8238,12 @@ fn validate_config_authority(
     match report_participation(&event.op, current_config, previous_state) {
         ReportParticipation::NotReport | ReportParticipation::Participant => {}
         ReportParticipation::UnknownPlan => {
-            // A real dependency: a plan arriving in a later batch re-registers
-            // the topic instead of quarantining the causally early report.
+            // Same-topic retry only. A participant can report only after
+            // observing the plan, so a plan absent after the buffered run
+            // flushes has no causal evidence and must not park the cursor.
             return Ok(AdminEventValidation::Deferred {
-                dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
-                reason: "transition plan is not yet replicated".to_string(),
+                dependency: None,
+                reason: "transition plan is not yet materialized".to_string(),
             });
         }
         ReportParticipation::Foreign => {
@@ -10113,6 +10114,36 @@ mod tests {
         }
     }
 
+    /// Drops a topic's applied-ops cursor so the next reconcile replays it from
+    /// the start, whatever lineage the stored cursor carried.
+    async fn reset_test_cursor(service: &DocumentSyncService, topic_id: irokle_crate::TopicId) {
+        match service
+            .storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                key: topic_cursor_key(topic_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            other => panic!("unexpected cursor delete event: {other:?}"),
+        }
+    }
+
+    async fn read_test_cursor(
+        storage: &StorageHandle,
+        topic_id: irokle_crate::TopicId,
+    ) -> Option<irokle_crate::ActorClock> {
+        let bytes = read_storage_value(
+            storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await?;
+        Some(postcard::from_bytes(&bytes).expect("cursor decodes"))
+    }
+
     fn test_actor(seed: u8, user_id: UserId, realm_id: RealmId) -> Actor {
         Actor {
             node_id: node(seed),
@@ -10263,7 +10294,8 @@ mod tests {
         };
         assert!(rejected(&foreign_proof));
 
-        // A report naming an unknown transition defers until its plan arrives.
+        // A report naming an unknown transition defers on the same topic only:
+        // a cross-topic dependency would park realm-config replay forever.
         let unknown = {
             let actor = test_actor(1, UserId::nil(realm_id), realm_id);
             test_admin_event(
@@ -10281,7 +10313,10 @@ mod tests {
         };
         assert!(matches!(
             validate_config_authority(Some(&config), &unknown, None),
-            Ok(AdminEventValidation::Deferred { .. })
+            Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                ..
+            })
         ));
     }
 
@@ -17861,6 +17896,255 @@ mod tests {
             ));
         }
         assert_eq!(quarantine_usage(&storage).await.records, 4);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_report_quarantined() {
+        // An invented transition report must not park realm-config replay: it
+        // is quarantined after the same-topic retry and the valid mutation
+        // behind it still applies.
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([74; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(74).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+
+        let local_actor = test_actor(74, UserId::nil(realm_id), realm_id);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                target.clone(),
+                config
+                    .to_bytes(&local_actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let invented = test_admin_event(
+            Ulid::from_parts(1_740, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            1,
+            AdminDocumentOperation::RealmConfigTransitionStallReported {
+                transition_id: Ulid::from_parts(1_741, 1),
+                bucket: 0,
+                reported_by: local_actor.node_id,
+                reason: "invented".to_string(),
+            },
+        );
+        let mut later = test_admin_event(
+            Ulid::from_parts(1_742, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            2,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "progress after the invented report".to_string(),
+            },
+        );
+        later.observed.advance(local_actor.node_id, 1);
+
+        assert!(matches!(
+            service
+                .publish_documents(
+                    vec![
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(invented),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(later),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                    ],
+                    Vec::new(),
+                )
+                .await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        reset_test_cursor(&service, topic_id).await;
+
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("an unknown transition report never blocks reconciliation");
+
+        assert_eq!(
+            read_realm_config_doc(&storage, realm_id).await.description,
+            "progress after the invented report",
+            "a valid mutation behind an invented report must still apply"
+        );
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            read_test_cursor(&storage, topic_id)
+                .await
+                .is_some_and(|cursor| cursor.dominates(&topic_clock)),
+            "the cursor must advance past a quarantined report, not park on it"
+        );
+        let deferred: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
+            postcard::from_bytes(
+                &read_storage_value(
+                    &storage,
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                    deferred_topics_key(),
+                )
+                .await
+                .expect("deferred registry persists"),
+            )
+            .expect("deferred registry decodes");
+        assert!(
+            !deferred
+                .get(&DocumentSyncDependency::RealmConfig(realm_id))
+                .is_some_and(|topics| topics.contains(&topic_id)),
+            "a report must never register the config topic against its own realm config"
+        );
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].reason.contains("transition plan"));
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plan_and_report_coalesce() {
+        // Plan and report share one coalesced run, so the report is unknown on
+        // the first pass and must be accepted by the post-flush retry.
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([75; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(75).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+
+        let local_actor = test_actor(75, UserId::nil(realm_id), realm_id);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
+        config.ensure_node(node(76), RealmNodeKind::Management);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                target.clone(),
+                config
+                    .to_bytes(&local_actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let transition_id = Ulid::from_parts(1_750, 1);
+        let plan = aruna_core::structs::TransitionPlan {
+            transition_id,
+            strategy_id: Ulid::from_parts(1_751, 1),
+            buckets: vec![aruna_core::structs::BucketPlan {
+                bucket: 0,
+                old_holders: vec![local_actor.node_id],
+                target_holders: vec![node(76)],
+                predecessor_epoch: 1,
+            }],
+            target_map_epoch: 2,
+            limits: Default::default(),
+            created_by: local_actor.node_id,
+            created_at_ms: 1,
+        };
+        let started = test_admin_event(
+            Ulid::from_parts(1_752, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            1,
+            AdminDocumentOperation::RealmConfigTransitionStarted { plan },
+        );
+        let mut barrier = test_admin_event(
+            Ulid::from_parts(1_753, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            2,
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                transition_id,
+                bucket: 0,
+                reported_by: local_actor.node_id,
+                frontier: vec![7],
+            },
+        );
+        barrier.observed.advance(local_actor.node_id, 1);
+
+        assert!(matches!(
+            service
+                .publish_documents(
+                    vec![
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(started),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(barrier),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                    ],
+                    Vec::new(),
+                )
+                .await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        reset_test_cursor(&service, topic_id).await;
+
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("a plan and its report reconcile in one batch");
+
+        let stored = read_realm_config_doc(&storage, realm_id).await;
+        let transition = stored
+            .transition(&transition_id)
+            .expect("the plan materialized");
+        assert!(
+            transition
+                .barriers
+                .iter()
+                .any(|reported| reported.reported_by == local_actor.node_id),
+            "the participant's barrier must survive the same-batch retry"
+        );
+        assert!(quarantine_rows(&storage).await.is_empty());
 
         service.shutdown().await;
     }
