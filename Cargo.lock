@@ -1837,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.1"
-source = "git+https://github.com/arunaengine/craqle?branch=fix%2Firokle-dangling-op-meta#f7c95c610f90345708e238a0575cac7612520a06"
+source = "git+https://github.com/arunaengine/craqle?branch=main#f4032cda717db5aefafc33dd635e7983b8793c9e"
 dependencies = [
  "blake3",
  "chrono",
@@ -2161,7 +2161,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3862,7 +3862,7 @@ dependencies = [
 [[package]]
 name = "irokle"
 version = "0.1.3"
-source = "git+https://github.com/arunaengine/irokle.git?branch=fix%2Fdangling-op-meta#01fc475bd1d46aca92325c781a9f9a906406ab0d"
+source = "git+https://github.com/arunaengine/irokle.git?branch=main#ec8750aeecfea826d5c905ab170c1dc41f6600e0"
 dependencies = [
  "blake3",
  "bytes",
@@ -3882,7 +3882,7 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?branch=fix%2Fdangling-op-meta#01fc475bd1d46aca92325c781a9f9a906406ab0d"
+source = "git+https://github.com/arunaengine/irokle.git?branch=main#ec8750aeecfea826d5c905ab170c1dc41f6600e0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5446,7 +5446,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxsdatatypes",
- "rand 0.8.7",
+ "rand 0.9.5",
  "serde",
  "thiserror 2.0.19",
 ]
@@ -7374,7 +7374,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "oxsdatatypes",
- "rand 0.8.7",
+ "rand 0.9.5",
  "regex",
  "rustc-hash",
  "sha1 0.10.7",
@@ -7395,7 +7395,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "peg",
- "rand 0.8.7",
+ "rand 0.9.5",
  "thiserror 2.0.19",
 ]
 
@@ -7406,7 +7406,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aed7a854b8ea67618f8ce69aabb0e904d7704226060e9d5a2930eb3136c3fa3b"
 dependencies = [
  "oxrdf",
- "rand 0.8.7",
+ "rand 0.9.5",
  "spargebra",
 ]
 
@@ -7785,7 +7785,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
