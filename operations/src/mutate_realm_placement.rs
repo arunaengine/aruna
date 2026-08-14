@@ -214,9 +214,6 @@ impl RealmPlacementMutation {
         actor: &Actor,
     ) -> Result<(), MutateRealmPlacementError> {
         let kind = node_kind(document, actor.node_id);
-        if matches!(kind, Some(RealmNodeKind::Management)) {
-            return Ok(());
-        }
         let rejected = MutateRealmPlacementError::Unauthorized {
             node_id: actor.node_id,
         };
@@ -264,6 +261,18 @@ impl RealmPlacementMutation {
             }),
             _ => false,
         };
+        if matches!(
+            self,
+            Self::ReportBarrier { .. }
+                | Self::SubmitCompletion { .. }
+                | Self::ReportStall { .. }
+                | Self::ReportDrained { .. }
+        ) {
+            return allowed.then_some(()).ok_or(rejected);
+        }
+        if matches!(kind, Some(RealmNodeKind::Management)) {
+            return Ok(());
+        }
         allowed.then_some(()).ok_or(rejected)
     }
 
@@ -2235,6 +2244,12 @@ mod tests {
         assert!(
             barrier(old)
                 .authorize(&document, &issuer(realm_id, target))
+                .is_err()
+        );
+        document.ensure_node(node(6), RealmNodeKind::Management);
+        assert!(
+            barrier(old)
+                .authorize(&document, &issuer(realm_id, node(6)))
                 .is_err()
         );
 
