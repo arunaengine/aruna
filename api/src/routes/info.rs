@@ -1149,7 +1149,13 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
                         "excluded": [],
                         "strategy_id": null
                     }
-                ]
+                ],
+                "transitions": {
+                    "active": 1,
+                    "incomplete_buckets": 2,
+                    "stalled_buckets": 0,
+                    "overdue": 0
+                }
             })
         ),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
@@ -1245,7 +1251,13 @@ pub async fn get_realm_placement(
                 "bindings": [
                     {"scope": {"kind": "realm"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
                 ],
-                "overrides": []
+                "overrides": [],
+                "transitions": {
+                    "active": 0,
+                    "incomplete_buckets": 0,
+                    "stalled_buckets": 0,
+                    "overdue": 0
+                }
             })
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
