@@ -1333,6 +1333,7 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         | MutateRealmPlacementError::ForceWithoutProof { .. }) => {
             ServerError::BadRequestReason(error.to_string())
         }
+        MutateRealmPlacementError::Unauthorized { .. } => ServerError::Forbidden,
         MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
             format!("placement strategy {strategy_id} is currently referenced"),
         ),

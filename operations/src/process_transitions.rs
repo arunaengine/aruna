@@ -22,6 +22,7 @@ use tracing::{debug, warn};
 use crate::driver::{DriverContext, drive};
 use crate::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
+    is_management,
 };
 use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
@@ -173,19 +174,6 @@ fn transition_stale(config: &RealmConfigDocument, transition: &PlacementTransiti
         }
     }
     incomplete > 0 && stale == incomplete
-}
-
-/// Only a management node's realm-config mutation passes inbound admission;
-/// everyone else keeps watching until one issues it. Holder rank alone is not
-/// enough: Server and Local nodes are holder-eligible, so a rank-0 Server would
-/// apply locally, enqueue, and then be rejected by every peer, advancing alone
-/// while the realm never converges.
-fn is_management(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    let node_id = node_id.to_string();
-    config.nodes.iter().any(|node| {
-        node.node_id == node_id
-            && matches!(node.kind, aruna_core::structs::RealmNodeKind::Management)
-    })
 }
 
 /// Reports the bucket drained once no outbox record for its placement
