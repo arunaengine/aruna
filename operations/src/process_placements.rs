@@ -203,6 +203,86 @@ async fn ensure_held_shard_topics(
 ///
 /// Returns whether any genesis was withheld (or an adopt failed to land), so the
 /// caller schedules a placement retry instead of deferring writes forever.
+/// Splits `topics` into the ones this node may safely hold or create and a flag
+/// saying whether any creation was withheld.
+///
+/// A topic a co-holder already holds is adopted by anti-entropy; one every
+/// reached co-holder positively confirmed unknown is safe to create; but if any
+/// co-holder was unreachable, or a reached one refused the topic (it holds the
+/// genesis but the prober may not open it yet), creation is withheld — either
+/// might hold a genesis, and forking a second one is a permanent split-brain.
+/// A sole holder creates immediately: no peer can hold a divergent genesis.
+/// The withheld flag tells the caller to retry rather than strand the topic.
+pub(crate) async fn resolve_creatable_topics(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    local_node_id: NodeId,
+    co_members: &[NodeId],
+    topics: Vec<::irokle::TopicId>,
+) -> (Vec<::irokle::TopicId>, bool) {
+    let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
+    let mut missing: Vec<::irokle::TopicId> = Vec::new();
+    for topic in topics {
+        if net_handle
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false)
+        {
+            to_ensure.push(topic);
+        } else {
+            missing.push(topic);
+        }
+    }
+
+    let mut withheld = false;
+    if missing.is_empty() {
+        return (to_ensure, withheld);
+    }
+    if co_members.is_empty() {
+        to_ensure.extend(missing);
+        return (to_ensure, withheld);
+    }
+
+    let probe = net_handle
+        .probe_shard_topic_geneses(missing.clone(), co_members.to_vec())
+        .await;
+    let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
+    for topic in missing {
+        if probe.known_by_co_holder.contains(&topic) {
+            to_adopt.push(topic);
+        } else if probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
+            to_ensure.push(topic);
+        } else {
+            withheld = true;
+        }
+    }
+    if !to_adopt.is_empty() {
+        let event = net_handle
+            .sync_document_topics(to_adopt.clone(), co_members.to_vec())
+            .await;
+        crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+        // Only keep topics whose genesis actually landed; an adopt that failed
+        // must not fall through to a fresh create - retry it on the next pass.
+        for topic in to_adopt {
+            if net_handle
+                .document_sync_topic_exists(topic)
+                .unwrap_or(false)
+            {
+                to_ensure.push(topic);
+            } else {
+                withheld = true;
+            }
+        }
+    }
+    if !probe.unreachable.is_empty() || !probe.unconfirmed.is_empty() {
+        warn!(
+            unreachable = ?probe.unreachable,
+            unconfirmed = ?probe.unconfirmed,
+            "Withholding genesis creation: co-holder unreachable or topic possibly-existing"
+        );
+    }
+    (to_ensure, withheld)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure_rank0_shard_group(
     context: &Arc<DriverContext>,
@@ -229,68 +309,8 @@ pub(crate) async fn ensure_rank0_shard_group(
         )
         .await;
 
-    let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
-    let mut missing: Vec<::irokle::TopicId> = Vec::new();
-    for topic in topics {
-        if net_handle
-            .document_sync_topic_exists(topic)
-            .unwrap_or(false)
-        {
-            to_ensure.push(topic);
-        } else {
-            missing.push(topic);
-        }
-    }
-
-    let mut withheld = false;
-    if !missing.is_empty() {
-        if co_members.is_empty() {
-            to_ensure.extend(missing);
-        } else {
-            let probe = net_handle
-                .probe_shard_topic_geneses(missing.clone(), co_members.clone())
-                .await;
-            let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
-            for topic in missing {
-                if probe.known_by_co_holder.contains(&topic) {
-                    to_adopt.push(topic);
-                } else if probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
-                    to_ensure.push(topic);
-                } else {
-                    // A co-holder was unreachable, or a reached one refused the
-                    // topic (holds it but the prober may not open it yet):
-                    // withhold this genesis rather than fork a second one.
-                    withheld = true;
-                }
-            }
-            if !to_adopt.is_empty() {
-                let event = net_handle
-                    .sync_document_topics(to_adopt.clone(), co_members.clone())
-                    .await;
-                crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
-                // Only ensure membership on topics whose genesis actually landed;
-                // an adopt that failed (co-holder now unreachable) must not fall
-                // through to a fresh create — retry it on the next pass instead.
-                for topic in to_adopt {
-                    if net_handle
-                        .document_sync_topic_exists(topic)
-                        .unwrap_or(false)
-                    {
-                        to_ensure.push(topic);
-                    } else {
-                        withheld = true;
-                    }
-                }
-            }
-            if !probe.unreachable.is_empty() || !probe.unconfirmed.is_empty() {
-                warn!(
-                    unreachable = ?probe.unreachable,
-                    unconfirmed = ?probe.unconfirmed,
-                    "Withholding shard genesis creation: co-holder unreachable or topic possibly-existing"
-                );
-            }
-        }
-    }
+    let (to_ensure, mut withheld) =
+        resolve_creatable_topics(context, net_handle, local_node_id, &co_members, topics).await;
 
     if !to_ensure.is_empty() {
         match net_handle.ensure_document_sync_topics(&to_ensure, co_members) {

@@ -1315,33 +1315,37 @@ async fn restore_shared(
     unit: &RestoreUnit,
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
-    let missing: Vec<::irokle::TopicId> = unit
-        .topics
-        .iter()
-        .copied()
-        .filter(|topic| {
-            !net_handle
-                .document_sync_topic_exists(*topic)
-                .unwrap_or(false)
-        })
-        .collect();
-    if !missing.is_empty() {
-        let event = net_handle
-            .sync_document_topics(missing.clone(), unit.peers.clone())
-            .await;
-        if !apply_restored_reconcile(context, node_id, event).await {
-            outcome.fail_topics(missing);
-        }
+    // A peer that is unreachable, or that refuses a topic it already holds,
+    // might hold this genesis; minting a second one forks the realm document
+    // permanently. Withheld topics stay unresolved so recovery retries them.
+    let (to_ensure, withheld) = crate::process_placements::resolve_creatable_topics(
+        context,
+        net_handle,
+        node_id,
+        &unit.peers,
+        unit.topics.clone(),
+    )
+    .await;
+    if withheld {
+        outcome.fail_topics(
+            unit.topics
+                .iter()
+                .copied()
+                .filter(|topic| !to_ensure.contains(topic)),
+        );
     }
-    if let Err(error) = net_handle.ensure_document_sync_topics(&unit.topics, unit.peers.clone()) {
+    if to_ensure.is_empty() {
+        return outcome;
+    }
+    if let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, unit.peers.clone()) {
         warn!(error = %error, "Failed to ensure shared realm topics on restart");
-        outcome.fail_topics(unit.topics.iter().copied());
+        outcome.fail_topics(to_ensure.iter().copied());
     }
     let event = net_handle
-        .sync_document_topics(unit.topics.clone(), unit.peers.clone())
+        .sync_document_topics(to_ensure.clone(), unit.peers.clone())
         .await;
     if !apply_restored_reconcile(context, node_id, event).await {
-        outcome.fail_topics(unit.topics.iter().copied());
+        outcome.fail_topics(to_ensure);
     }
     outcome
 }

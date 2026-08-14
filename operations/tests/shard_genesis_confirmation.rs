@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::document::shard_topic_id;
+use aruna_core::document::{DocumentSyncTarget, shard_topic_id};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -19,6 +19,7 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::placement::{resolve_shard_holders, shard_subject_bytes};
 use aruna_operations::process_placements::process_shard_placements;
+use aruna_operations::startup::{ShardRestoreCursor, restore_shard_pass};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -479,4 +480,44 @@ async fn shutdown_nodes(nodes: Vec<TestNode>) {
     for node in nodes {
         node.net.shutdown().await;
     }
+}
+
+// The realm-config document is a SHARED restore target (see `shared_targets`)
+// and it carries every transition barrier and proof. A peer that cannot be
+// reached might already hold its genesis, so a restart must withhold rather
+// than mint a second one: a forked realm config splits membership, makes peers
+// refuse each other's topics, and wedges transitions permanently.
+#[tokio::test]
+async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([154u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    install_realm_config(&nodes, realm_id).await?;
+    // Deliberately NOT meshed: neither node has a path to the other.
+
+    let node = &nodes[0];
+    let topic = DocumentSyncTarget::RealmConfig { realm_id }
+        .sync_topic_id(realm_id, &PlacementRef::NIL);
+    let mut cursor = ShardRestoreCursor::default();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+
+    let pass = restore_shard_pass(
+        &node.context,
+        node.net.node_id(),
+        realm_id,
+        &mut cursor,
+        &cancelled,
+    )
+    .await;
+
+    assert!(
+        !node.net.document_sync_topic_exists(topic).unwrap_or(false),
+        "an unreachable peer must withhold the shared realm-config genesis (a fork is permanent)"
+    );
+    assert!(
+        pass.unresolved_topics.contains(&topic),
+        "withholding must leave the topic unresolved so recovery retries it"
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
 }
