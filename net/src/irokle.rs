@@ -2478,8 +2478,9 @@ impl DocumentSyncService {
             if topic.event_type_id != DocumentSyncEvent::TYPE_ID {
                 continue;
             }
-            // Lineage self-heals the cursor: an eviction callback that was lost
-            // or failed cannot make the winner's early ops look already applied.
+            // The cursor self-heals here: an eviction callback that was lost or
+            // failed cannot make a rebuilt chain's early ops look already
+            // applied, because every recorded position is re-checked.
             let genesis = topic.genesis;
             let cursor_key = topic_cursor_key(topic_id);
             let mut cursor = applied_cursor_clock(
