@@ -142,6 +142,7 @@ impl Topology {
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_writer(std::io::stderr)
             .try_init();
+
         assert!(
             management > replication_factor as usize,
             "non-holder fixture needs more sync-eligible nodes than the replication factor: \
@@ -150,6 +151,11 @@ impl Topology {
 
         let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        tracing::info!(
+            realm_config_topic = %DocumentSyncTarget::RealmConfig { realm_id }
+                .sync_topic_id(realm_id, &PlacementRef::NIL),
+            "spawned realm"
+        );
         let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let mut nodes = Vec::with_capacity(management + users);
@@ -622,14 +628,20 @@ impl Topology {
             || async move {
                 let mut pending = 0;
                 for node in nodes {
-                    if aruna_operations::process_placements::process_shard_placements(
-                        &node.context,
-                        realm_id,
-                        node.node_id(),
+                    let span = tracing::info_span!(
+                        "node_pass",
+                        node = %&node.node_id().to_string()[..8]
+                    );
+                    let outcome = tracing::Instrument::instrument(
+                        aruna_operations::process_placements::process_shard_placements(
+                            &node.context,
+                            realm_id,
+                            node.node_id(),
+                        ),
+                        span,
                     )
-                    .await
-                    .retry_scheduled
-                    {
+                    .await;
+                    if outcome.retry_scheduled {
                         pending += 1;
                     }
                 }
@@ -649,10 +661,17 @@ impl Topology {
             "placement transition never released",
             || async move {
                 for node in nodes {
-                    aruna_operations::process_placements::process_shard_placements(
-                        &node.context,
-                        realm_id,
-                        node.node_id(),
+                    let span = tracing::info_span!(
+                        "node_pass",
+                        node = %&node.node_id().to_string()[..8]
+                    );
+                    tracing::Instrument::instrument(
+                        aruna_operations::process_placements::process_shard_placements(
+                            &node.context,
+                            realm_id,
+                            node.node_id(),
+                        ),
+                        span,
                     )
                     .await;
                 }
@@ -681,10 +700,17 @@ impl Topology {
             "placement transition never completed",
             || async move {
                 for node in nodes {
-                    aruna_operations::process_placements::process_shard_placements(
-                        &node.context,
-                        realm_id,
-                        node.node_id(),
+                    let span = tracing::info_span!(
+                        "node_pass",
+                        node = %&node.node_id().to_string()[..8]
+                    );
+                    tracing::Instrument::instrument(
+                        aruna_operations::process_placements::process_shard_placements(
+                            &node.context,
+                            realm_id,
+                            node.node_id(),
+                        ),
+                        span,
                     )
                     .await;
                 }
@@ -698,12 +724,20 @@ impl Topology {
                     // bucket over; `start_transition` already waited for it to
                     // replicate, so absence here is completion.
                     if let Some(transition) = config.transition(&transition_id) {
-                        pending += transition
-                            .plan
-                            .buckets
-                            .iter()
-                            .filter(|bucket| transition.completion(bucket.bucket).is_none())
-                            .count();
+                        // An aborted record is terminal: its incomplete
+                        // buckets either advanced under a rival plan or will
+                        // never move; nothing further can be awaited on it.
+                        if !matches!(
+                            transition.status,
+                            aruna_core::structs::TransitionStatus::Aborted
+                        ) {
+                            pending += transition
+                                .plan
+                                .buckets
+                                .iter()
+                                .filter(|bucket| transition.completion(bucket.bucket).is_none())
+                                .count();
+                        }
                     }
                 }
                 Ok(pending)
@@ -739,8 +773,29 @@ impl Topology {
                         })
                         .map(|holder| holder.to_string()[..8].to_string())
                         .collect();
+                    let mut views: Vec<String> = Vec::new();
+                    for node in &self.nodes {
+                        let short = node.node_id().to_string()[..8].to_string();
+                        let Ok(config) = read_realm_config(node, self.realm_id).await else {
+                            views.push(format!("{short}:noconfig"));
+                            continue;
+                        };
+                        match config.transition(&transition_id) {
+                            Some(record) => views.push(format!(
+                                "{short}:fenced={} proofs={} barriers={}",
+                                record.barrier_established(bucket.bucket, &bucket.old_holders),
+                                record.proofs_for(bucket.bucket).count(),
+                                record
+                                    .barriers
+                                    .iter()
+                                    .filter(|barrier| barrier.bucket == bucket.bucket)
+                                    .count(),
+                            )),
+                            None => views.push(format!("{short}:norecord")),
+                        }
+                    }
                     stuck.push_str(&format!(
-                        " bucket {}: fenced={} proofs={proofs:?} missing={missing:?};",
+                        " bucket {}: fenced={} proofs={proofs:?} missing={missing:?} topics={views:?};",
                         bucket.bucket,
                         transition.barrier_established(bucket.bucket, &bucket.old_holders),
                     ));
@@ -820,6 +875,21 @@ impl Topology {
             });
         }
         self.apply_config(config).await?;
+        // Production onboarding admits the joiner to the shared realm topics
+        // (`bootstrap_onboarding_finalize`); mirror it, or the joiner's own
+        // published events are refused by every peer and only reach the realm
+        // through incidental back-pulls of push sessions.
+        let shared_topic = DocumentSyncTarget::RealmConfig {
+            realm_id: self.realm_id,
+        }
+        .sync_topic_id(self.realm_id, &PlacementRef::NIL);
+        self.nodes[0]
+            .net
+            .ensure_document_sync_topics(&[shared_topic], vec![node_id])?;
+        self.nodes[0]
+            .net
+            .allow_document_sync_peers(&[shared_topic], vec![node_id])?;
+
         // The joiner runs the startup hook and joins the realm-config topic, as
         // a freshly started node does; without it no admin event reaches it.
         let node = self.find(node_id);
@@ -1225,8 +1295,15 @@ async fn seed_config_topic(
 /// drain timer and a gossip round.
 async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
     for node in nodes {
-        aruna_operations::task_incoming::drive_document_sync_outbox_drain(node.context.clone())
-            .await;
+        let span = tracing::info_span!(
+            "node_drain",
+            node = %&node.node_id().to_string()[..8]
+        );
+        tracing::Instrument::instrument(
+            aruna_operations::task_incoming::drive_document_sync_outbox_drain(node.context.clone()),
+            span,
+        )
+        .await;
     }
     let topic =
         DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
