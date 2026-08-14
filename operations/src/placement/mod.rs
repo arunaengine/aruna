@@ -1140,6 +1140,7 @@ mod tests {
                         bucket: placement.shard,
                         old_holders: activated.clone(),
                         target_holders: targets.clone(),
+                        predecessor_epoch: 1,
                     }],
                     target_map_epoch: 2,
                     limits: Default::default(),

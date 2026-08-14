@@ -118,6 +118,10 @@ pub struct BucketPlan {
     pub bucket: u32,
     pub old_holders: Vec<NodeId>,
     pub target_holders: Vec<NodeId>,
+    /// The bucket's activation epoch when the plan was derived. A transition
+    /// applies only from exactly this epoch, so two concurrent plans from one
+    /// base can never replay as each other's successor.
+    pub predecessor_epoch: u64,
 }
 
 /// The operator-authored part of a transition. Immutable once admitted; every
@@ -407,6 +411,7 @@ mod tests {
             bucket,
             old_holders: vec![secret(1).public(), secret(2).public()],
             target_holders: vec![secret(2).public(), secret(3).public()],
+            predecessor_epoch: 1,
         }
     }
 

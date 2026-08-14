@@ -7268,6 +7268,7 @@ mod tests {
             bucket,
             old_holders: old.iter().map(|seed| node(*seed)).collect(),
             target_holders: target.iter().map(|seed| node(*seed)).collect(),
+            predecessor_epoch: 1,
         };
         TransitionPlan {
             transition_id: Ulid::from_bytes([31; 16]),

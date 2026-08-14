@@ -41,6 +41,8 @@ pub struct BucketPreview {
     pub old_locations: Vec<String>,
     pub new_locations: Vec<String>,
     pub disjoint: bool,
+    /// The activation epoch the move starts from.
+    pub predecessor_epoch: u64,
 }
 
 /// What operators need to see about the realm's transitions. Counts only: a
@@ -138,6 +140,9 @@ pub fn preview_transition(
             strategy_id,
             shard: bucket,
         };
+        let activation = config
+            .activation(&strategy_id, bucket)
+            .ok_or(TransitionPlanError::ActivationUnavailable(bucket))?;
         let old_holders = activation_holders(config, strategy, &placement)
             .ok_or(TransitionPlanError::ActivationUnavailable(bucket))?;
         let new_holders = holders_in_map(config, strategy, &placement, target)
@@ -158,6 +163,7 @@ pub fn preview_transition(
             overlap,
             old_holders,
             new_holders,
+            predecessor_epoch: activation.activation_epoch,
         });
     }
     Ok(previews)
@@ -213,6 +219,7 @@ pub fn plan_transition(
         bucket: preview.bucket,
         old_holders: preview.old_holders,
         target_holders: preview.new_holders,
+        predecessor_epoch: preview.predecessor_epoch,
     })
     .collect();
     Ok(TransitionPlan {
@@ -256,6 +263,7 @@ pub fn plan_is_derivable(config: &RealmConfigDocument, plan: &TransitionPlan) ->
             plan.bucket_plan(preview.bucket).is_some_and(|bucket| {
                 bucket.old_holders == preview.old_holders
                     && bucket.target_holders == preview.new_holders
+                    && bucket.predecessor_epoch == preview.predecessor_epoch
             })
         })
 }
