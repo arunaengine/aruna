@@ -137,13 +137,24 @@ pub async fn expand_realm_placement(
             },
         )
         .map_err(invalid)?;
-        config = mutate(
+        match mutate(
             context,
             actor,
             RealmPlacementMutation::StartTransition(plan),
         )
-        .await?;
-        started.push(transition_id);
+        .await
+        {
+            Ok(next) => {
+                config = next;
+                started.push(transition_id);
+            }
+            // Another driver won the start race; its transition covers the
+            // strategy, so this one follows instead of failing onboarding.
+            Err(MutateRealmPlacementError::TransitionInFlight { transition_id }) => {
+                tracing::debug!(%strategy_id, %transition_id, "Expansion start race lost");
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(started)
 }

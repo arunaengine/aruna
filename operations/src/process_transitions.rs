@@ -452,6 +452,17 @@ async fn ensure_expansions(
         }) {
             continue;
         }
+        // Successors only: the first expansion is onboarding's to issue, so a
+        // record for the strategy must already exist. A lagging node that has
+        // the newest map but not yet the started record can then never
+        // double-issue inside the publish-to-start window.
+        if !config
+            .placement_transitions
+            .iter()
+            .any(|transition| transition.plan.strategy_id == strategy.strategy_id)
+        {
+            continue;
+        }
         let Ok(buckets) = expansion_buckets(config, strategy.strategy_id, epoch) else {
             continue;
         };
