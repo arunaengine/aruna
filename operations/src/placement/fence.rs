@@ -18,6 +18,7 @@ use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
+use tracing::warn;
 
 const CLOSE_ATTEMPTS: usize = 4;
 
@@ -41,14 +42,22 @@ pub fn fence_read(realm_id: &RealmId, placement: &PlacementRef) -> (String, Key)
     )
 }
 
-/// The highest generation the stored fence value closes.
-pub fn closed_generation(value: Option<&Value>) -> u64 {
+/// The generation the stored fence value closes, or `None` when the bytes do
+/// not parse. Only `close` may act on the difference: every other reader must
+/// treat an unparseable value as closed rather than reopen the bucket.
+fn stored_generation(value: Option<&Value>) -> Option<u64> {
     match value {
-        None => 0,
+        None => Some(0),
         Some(bytes) => <[u8; 8]>::try_from(bytes.as_ref())
             .map(u64::from_be_bytes)
-            .unwrap_or(u64::MAX),
+            .ok(),
     }
+}
+
+/// The highest generation the stored fence value closes. A truncated value
+/// reads as closed at every generation, never as an open bucket.
+pub fn closed_generation(value: Option<&Value>) -> u64 {
+    stored_generation(value).unwrap_or(u64::MAX)
 }
 
 /// Whether a write that resolved holders at `generation` may still commit.
@@ -122,7 +131,9 @@ impl WriteFence {
 
 /// Durably closes `placement` through `generation`, so no later transaction
 /// can be admitted at it and every uncommitted one conflicts. Monotone and
-/// idempotent: a repeat after a crash re-closes the same generation.
+/// idempotent: a repeat after a crash re-closes the same generation. An
+/// unparseable stored value is overwritten, since it admits no generation at
+/// all and would otherwise leave the bucket permanently unwritable.
 pub async fn close(
     storage: &StorageHandle,
     realm_id: &RealmId,
@@ -148,7 +159,7 @@ pub async fn close(
             .await
         {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                closed_generation(value.as_ref())
+                stored_generation(value.as_ref())
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 let _ = storage
@@ -163,11 +174,16 @@ pub async fn close(
                 return Err(format!("unexpected fence read result: {other:?}"));
             }
         };
-        if current >= generation {
+        if current.is_some_and(|current| current >= generation) {
             let _ = storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
             return Ok(());
+        }
+        if current.is_none() {
+            // Unparseable bytes admit nothing, so leaving them would brick the
+            // bucket for good while this close reported success.
+            warn!(?placement, "Rewriting an unparseable placement write fence");
         }
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -371,5 +387,47 @@ mod tests {
         lower.unwrap();
         higher.unwrap();
         assert_eq!(stored().await, 6);
+    }
+
+    #[tokio::test]
+    async fn close_heals_malformed() {
+        // An unparseable value admits no generation, so a close that reported
+        // success without rewriting it would brick the bucket for good.
+        let directory = tempdir().unwrap();
+        let storage =
+            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([12; 32]);
+        let placement = placement();
+        let (key_space, key) = fence_read(&realm_id, &placement);
+        let write = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.clone(),
+                key: key.clone(),
+                value: ByteView::from(vec![9u8; 3]),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            write,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        close(&storage, &realm_id, &placement, 4).await.unwrap();
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("the healed fence reads back");
+        };
+        assert_eq!(closed_generation(value.as_ref()), 4);
+        assert!(
+            admits(value.as_ref(), 5),
+            "a successor generation must be writable again"
+        );
     }
 }
