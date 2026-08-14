@@ -484,7 +484,26 @@ async fn reconcile_placements(
                 continue;
             }
 
-            let holders = resolve_shard_holders(&config, &record.placement);
+            // A resolution failure keeps the durable record: deleting it on a
+            // missing or conflicted activation would destroy the only retry.
+            let holders =
+                match crate::placement::resolve_shard_holders_checked(&config, &record.placement) {
+                    Ok(holders) => holders,
+                    Err(error) => {
+                        debug!(error = %error, "Keeping placement record for unresolvable bucket");
+                        let refreshed = new_placement(
+                            realm_id,
+                            record.placement,
+                            local_node_id,
+                            record.selected_peers.clone(),
+                        );
+                        if let Ok(effect) = write_placement_effect(&refreshed) {
+                            let _ = context.storage_handle.send_effect(effect).await;
+                        }
+                        retry_needed = true;
+                        continue;
+                    }
+                };
             if !holders.contains(&local_node_id) {
                 // The local node is no longer a holder of this shard. Drop the
                 // verification marker too so a later re-entry re-verifies.

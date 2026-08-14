@@ -114,52 +114,34 @@ pub struct TargetPlacementPlan {
     pub placement: PlacementRef,
 }
 
+/// `Ok(None)` only when no strategy governs the target; a governed target
+/// whose bucket cannot resolve is an error the caller must retry durably,
+/// never an empty placement.
 pub fn plan_target_placement(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
     context: PlacementResolutionContext<'_>,
-) -> Option<TargetPlacementPlan> {
-    let (strategy, _override) = strategy_for_target(config, target, context)?;
+) -> Result<Option<TargetPlacementPlan>, PlacementResolveError> {
+    let Some((strategy, _override)) = strategy_for_target(config, target, context) else {
+        return Ok(None);
+    };
     let placement = PlacementRef {
         strategy_id: strategy.strategy_id,
         shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
     };
-    let holders = resolve_shard_holders_with(config, strategy, &placement);
-    let desired_count = match strategy.replica_count {
+    let selection = frozen_selection(config, strategy, selection_epoch(config, &placement)?)?;
+    let holders = selection.resolve(&placement);
+    // The nominal replica target is the effective selector's: frozen once the
+    // bucket is pinned, live only during bootstrap.
+    let desired_count = match selection.replica_count() {
         Some(count) => count as usize,
         None => holders.len(),
     };
-    Some(TargetPlacementPlan {
+    Ok(Some(TargetPlacementPlan {
         holders,
         desired_count,
         placement,
-    })
-}
-
-/// Full eligible-node ranking for the shard that `target` hashes into
-/// (ignoring the strategy's replica cap) so callers can top up beyond
-/// `replica_count`. Rank order is the shard's, not the individual document's.
-pub fn rank_eligible_holders(
-    config: &RealmConfigDocument,
-    target: &DocumentSyncTarget,
-    context: PlacementResolutionContext<'_>,
-) -> Vec<NodeId> {
-    let Some((strategy, _override)) = strategy_for_target(config, target, context) else {
-        return Vec::new();
-    };
-    let placement = PlacementRef {
-        strategy_id: strategy.strategy_id,
-        shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
-    };
-    let mut uncapped = strategy.clone();
-    uncapped.replica_count = None;
-    let view = build_view(config);
-    resolve_holders(
-        &view,
-        &uncapped,
-        &shard_subject_bytes(&placement),
-        shard_override(config, &placement),
-    )
+    }))
 }
 
 /// Why a bucket resolves no holder. Routing fails closed on these: they mean
@@ -317,6 +299,10 @@ impl FrozenSelection<'_> {
                 .replica_count
                 .map_or(limit, |replicas| replicas.min(limit)),
         );
+    }
+
+    pub(crate) fn replica_count(&self) -> Option<u32> {
+        self.strategy.replica_count
     }
 }
 
@@ -987,6 +973,34 @@ mod tests {
                 .expect("frozen selector"),
             pinned
         );
+    }
+
+    #[test]
+    fn planner_pins_activation() {
+        // A published-but-unactivated newer map must not move the planner:
+        // selected peers stay on the activated holder set.
+        let (mut config, _) = config_and_placement();
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::Group),
+            strategy_id: config.default_strategy_id.unwrap(),
+        }];
+        config.snapshot_candidate_map();
+        let target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_bytes([6u8; 16]),
+        };
+        let pinned = plan_target_placement(&config, &target, Default::default())
+            .expect("resolves")
+            .expect("governed");
+
+        for seed in 5..=8u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        config.snapshot_candidate_map();
+        let after = plan_target_placement(&config, &target, Default::default())
+            .expect("resolves")
+            .expect("governed");
+        assert_eq!(after.holders, pinned.holders);
+        assert_eq!(after.desired_count, pinned.desired_count);
     }
 
     #[test]
