@@ -2733,6 +2733,67 @@ mod tests {
         service.shutdown().await;
     }
 
+    /// A tie-break eviction of one locally authored delete on `placement`.
+    fn local_eviction(
+        service: &DocumentSyncService,
+        placement: aruna_core::structs::PlacementRef,
+        evicted: bool,
+    ) -> ::irokle::TopicEviction {
+        let event_id = ulid::Ulid::from_bytes([31; 16]);
+        let event = aruna_core::document::DocumentSyncEvent::Delete {
+            event_id,
+            target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: event_id,
+            },
+            change: aruna_core::document::DocumentSyncChange {
+                base: None,
+                current: aruna_core::document::DocumentSyncRevision {
+                    generation: 0,
+                    event_id,
+                    actor: make_secret(31).public(),
+                    updated_at_ms: 1,
+                },
+                kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+                placement,
+            },
+        };
+        let topic_id = ::irokle::TopicId::from_bytes([31; 32]);
+        let author = service.node().peer_id();
+        ::irokle::TopicEviction {
+            topic_id,
+            losing_genesis: ::irokle::OpId::from_bytes([32; 32]),
+            winning_genesis: ::irokle::OpId::from_bytes([33; 32]),
+            evicted: evicted
+                .then(|| ::irokle::EvictedOp {
+                    op_id: ::irokle::OpId::from_bytes([34; 32]),
+                    actor_id: ::irokle::actor_id_for(topic_id, author),
+                    author,
+                    actor_seq: 2,
+                    payload: ::irokle::TopicPayload::Event(
+                        ::irokle::EventEnvelope::encode_event(&event).expect("the event encodes"),
+                    ),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_eviction_stays_unpending() {
+        // Irokle writes no record for an eviction with no payloads, so treating
+        // one as pending would arm the retry timer against a phantom forever.
+        let (_dir, service) = eviction_test_service().await;
+        let placement = aruna_core::structs::PlacementRef::NIL;
+        assert!(
+            service
+                .consume_eviction(local_eviction(&service, placement, false))
+                .await
+                .is_none()
+        );
+
+        service.shutdown().await;
+    }
+
     #[test]
     fn ordered_discovery() {
         let method = DiscoveryMethod::ordered(vec![

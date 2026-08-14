@@ -1678,9 +1678,12 @@ impl DocumentSyncService {
     pub async fn consume_eviction(&self, eviction: TopicEviction) -> Option<PendingEviction> {
         let topic_id = eviction.topic_id;
         let key = eviction.key();
+        // Irokle journals nothing for an eviction with no payloads, so treating
+        // one as pending would arm the retry timer against a phantom entry.
+        let journalled = !eviction.evicted.is_empty();
         let documents = self.decode_eviction(eviction);
         self.reset_applied_cursor(topic_id).await;
-        Some(PendingEviction { key, documents })
+        journalled.then_some(PendingEviction { key, documents })
     }
 
     /// Irokle journal entries left by an interrupted eviction handoff.
