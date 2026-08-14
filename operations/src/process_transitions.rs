@@ -83,6 +83,10 @@ pub async fn process_placement_transitions(
                     };
                     match drain_step(context, transition, &placement, local_node_id).await {
                         StepPlan::Ready(mutation) => steps.push(mutation),
+                        StepPlan::Stalled(mutation) => {
+                            steps.push(mutation);
+                            pending = true;
+                        }
                         StepPlan::Pending => pending = true,
                         StepPlan::Done => {}
                     }
@@ -105,6 +109,10 @@ pub async fn process_placement_transitions(
             if bucket.old_holders.contains(&local_node_id) {
                 match barrier_step(context, realm_id, local_node_id, transition, &placement).await {
                     StepPlan::Ready(mutation) => steps.push(mutation),
+                    StepPlan::Stalled(mutation) => {
+                        steps.push(mutation);
+                        pending = true;
+                    }
                     StepPlan::Pending => pending = true,
                     StepPlan::Done => {}
                 }
@@ -114,6 +122,12 @@ pub async fn process_placement_transitions(
                     .await
                 {
                     StepPlan::Ready(mutation) => steps.push(mutation),
+                    StepPlan::Stalled(mutation) => {
+                        // A stall is diagnostics: reduce it once and keep the
+                        // retry armed for a later convergence.
+                        steps.push(mutation);
+                        pending = true;
+                    }
                     StepPlan::Pending => pending = true,
                     StepPlan::Done => {}
                 }
@@ -211,9 +225,11 @@ async fn drain_step(
 }
 
 /// One bucket step this node owes: a mutation ready to batch, work still
-/// blocked on a precondition, or nothing left to do.
+/// blocked on a precondition, a stall report worth reducing while the retry
+/// stays armed, or nothing left to do.
 enum StepPlan {
     Ready(RealmPlacementMutation),
+    Stalled(RealmPlacementMutation),
     Pending,
     Done,
 }
@@ -341,6 +357,18 @@ async fn completion_step(
                     shard = placement.shard,
                     "No old holder served a verifiable shard copy yet"
                 );
+                // Surface the bounded failure exactly once per reporter; the
+                // reduced record keeps the report idempotent across retries.
+                if !transition.stalls.iter().any(|stall| {
+                    stall.bucket == placement.shard && stall.reported_by == local_node_id
+                }) {
+                    return StepPlan::Stalled(RealmPlacementMutation::ReportStall {
+                        transition_id: transition.plan.transition_id,
+                        bucket: placement.shard,
+                        reported_by: local_node_id,
+                        reason: "no old holder served a verifiable copy".to_string(),
+                    });
+                }
                 return StepPlan::Pending;
             }
         }
