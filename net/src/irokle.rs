@@ -5815,6 +5815,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
             | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
             | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
             | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
         return Err(NetError::Bootstrap(
@@ -6084,6 +6085,7 @@ fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
             | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
             | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
     )
 }
 
@@ -7644,6 +7646,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
         | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
         | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+        | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
         | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
@@ -7814,6 +7817,11 @@ async fn validate_replicated_admin_event(
             }
             if reason.len() > aruna_core::structs::MAX_STALL_REASON_BYTES {
                 return reject("transition stall reason exceeds its size bound");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. } => {
+            if *reported_by != event.origin_node_id {
+                return reject("transition report does not come from the node it names");
             }
         }
         AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
@@ -8053,6 +8061,7 @@ fn report_participation(
         Old,
         Target,
         Union,
+        Departing,
     }
     let (transition_id, bucket, reporter, role) = match op {
         AdminDocumentOperation::RealmConfigTransitionBarrierReported {
@@ -8072,6 +8081,11 @@ fn report_participation(
             reported_by,
             ..
         } => (*transition_id, *bucket, *reported_by, Role::Union),
+        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+            transition_id,
+            bucket,
+            reported_by,
+        } => (*transition_id, *bucket, *reported_by, Role::Departing),
         _ => return ReportParticipation::NotReport,
     };
     let from_config = current_config.and_then(|config| {
@@ -8103,6 +8117,10 @@ fn report_participation(
         Role::Union => {
             bucket_plan.old_holders.contains(&reporter)
                 || bucket_plan.target_holders.contains(&reporter)
+        }
+        Role::Departing => {
+            bucket_plan.old_holders.contains(&reporter)
+                && !bucket_plan.target_holders.contains(&reporter)
         }
     };
     if allowed {
@@ -8249,6 +8267,7 @@ fn validate_config_authority(
             &event.op,
             AdminDocumentOperation::RealmConfigTransitionBarrierReported { reported_by, .. }
             | AdminDocumentOperation::RealmConfigTransitionStallReported { reported_by, .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. }
                 if *reported_by == event.origin_node_id
         ) || matches!(
             &event.op,

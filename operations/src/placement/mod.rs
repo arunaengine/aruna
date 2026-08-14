@@ -471,15 +471,19 @@ pub fn bucket_membership(
                 }
             }
             Some(completion) => {
+                // Retention ends on grace AND the holder's reduced drain
+                // report, so an acknowledged pre-cutover write is never cut
+                // off by the clock alone.
                 let retained_until = completion
                     .completed_at_ms
                     .saturating_add(transition.plan.limits.grace_ms);
-                if now_ms < retained_until {
-                    for node_id in &bucket.old_holders {
-                        if !bucket.target_holders.contains(node_id) {
-                            push_unique(&mut members, *node_id);
-                            push_unique(&mut publishers, *node_id);
-                        }
+                for node_id in &bucket.old_holders {
+                    if !bucket.target_holders.contains(node_id)
+                        && (now_ms < retained_until
+                            || !transition.drain_reported(bucket.bucket, *node_id))
+                    {
+                        push_unique(&mut members, *node_id);
+                        push_unique(&mut publishers, *node_id);
                     }
                 }
             }
@@ -495,6 +499,24 @@ fn push_unique(nodes: &mut Vec<NodeId>, node_id: NodeId) {
     if !nodes.contains(&node_id) {
         nodes.push(node_id);
     }
+}
+
+/// Whether `node_id` is a cut-over old holder whose retention has not ended:
+/// its queued pre-cutover records stay deliverable until grace elapses AND its
+/// drain report reduces (never a clock alone).
+pub fn retained_departing_holder(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    node_id: NodeId,
+) -> bool {
+    config.placement_transitions.iter().any(|transition| {
+        transition.plan.strategy_id == placement.strategy_id
+            && transition.completion(placement.shard).is_some()
+            && transition
+                .departing_holders(placement.shard)
+                .contains(&node_id)
+            && !transition.drain_reported(placement.shard, node_id)
+    })
 }
 
 /// Whether `node_id` holds `placement`, and may therefore publish onto its
@@ -1038,6 +1060,10 @@ mod tests {
                 bucket: 7,
                 completed_at_ms: 100,
             });
+        transition.drained.push(aruna_core::structs::BucketDrain {
+            bucket: 7,
+            reported_by: node(9),
+        });
         config.placement_transitions.push(transition);
         (config, strategy_id)
     }
@@ -1397,6 +1423,24 @@ mod tests {
                             bucket: bucket.bucket,
                             reported_by: *holder,
                             frontier: vec![seed],
+                        },
+                    )
+                    .expect("applies");
+            }
+            for holder in &bucket.old_holders {
+                if bucket.target_holders.contains(holder) {
+                    continue;
+                }
+                let seed = (1..=4u8)
+                    .find(|seed| node(*seed) == *holder)
+                    .expect("known");
+                state
+                    .apply_operation(
+                        &actor(seed),
+                        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                            transition_id: plan.transition_id,
+                            bucket: bucket.bucket,
+                            reported_by: *holder,
                         },
                     )
                     .expect("applies");

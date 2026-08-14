@@ -82,6 +82,11 @@ pub enum RealmPlacementMutation {
         reported_by: NodeId,
         reason: String,
     },
+    ReportDrained {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+    },
 }
 
 impl RealmPlacementMutation {
@@ -186,6 +191,15 @@ impl RealmPlacementMutation {
                 bucket: *bucket,
                 reported_by: *reported_by,
                 reason: reason.clone(),
+            },
+            Self::ReportDrained {
+                transition_id,
+                bucket,
+                reported_by,
+            } => AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                reported_by: *reported_by,
             },
         }
     }
@@ -348,6 +362,11 @@ impl RealmPlacementMutation {
                 ..
             }
             | Self::ReportStall {
+                transition_id,
+                bucket,
+                ..
+            }
+            | Self::ReportDrained {
                 transition_id,
                 bucket,
                 ..

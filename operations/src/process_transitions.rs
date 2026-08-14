@@ -63,9 +63,30 @@ pub async fn process_placement_transitions(
             .map(|bucket| bucket.bucket)
             .collect();
         for bucket in &transition.plan.buckets {
-            if transition.completion(bucket.bucket).is_some() {
-                departed |= bucket.old_holders.contains(&local_node_id)
+            if let Some(completion) = transition.completion(bucket.bucket) {
+                let departing = bucket.old_holders.contains(&local_node_id)
                     && !bucket.target_holders.contains(&local_node_id);
+                departed |= departing;
+                // Past the bucket's grace, a departing holder owes a drain
+                // report before its retention may end (F7).
+                let grace_passed = aruna_core::util::unix_timestamp_millis()
+                    >= completion
+                        .completed_at_ms
+                        .saturating_add(transition.plan.limits.grace_ms);
+                if departing
+                    && grace_passed
+                    && !transition.drain_reported(bucket.bucket, local_node_id)
+                {
+                    let placement = PlacementRef {
+                        strategy_id: transition.plan.strategy_id,
+                        shard: bucket.bucket,
+                    };
+                    match drain_step(context, transition, &placement, local_node_id).await {
+                        StepPlan::Ready(mutation) => steps.push(mutation),
+                        StepPlan::Pending => pending = true,
+                        StepPlan::Done => {}
+                    }
+                }
                 continue;
             }
             // An observed abort stops this node from submitting anything
@@ -141,6 +162,51 @@ fn is_management(config: &RealmConfigDocument, node_id: NodeId) -> bool {
     config.nodes.iter().any(|node| {
         node.node_id == node_id
             && matches!(node.kind, aruna_core::structs::RealmNodeKind::Management)
+    })
+}
+
+/// Reports the bucket drained once no outbox record for its placement
+/// remains; until then the pass stays pending and keeps driving the drain.
+async fn drain_step(
+    context: &Arc<DriverContext>,
+    transition: &PlacementTransition,
+    placement: &PlacementRef,
+    local_node_id: NodeId,
+) -> StepPlan {
+    for prefix in crate::document_sync_outbox::outbox_stream_prefixes() {
+        let mut start_after: Option<Vec<u8>> = None;
+        loop {
+            let batch = match crate::document_sync_outbox::read_outbox_records(
+                &context.storage_handle,
+                prefix,
+                start_after.take(),
+                256,
+            )
+            .await
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    debug!(error = %error, "Transition drain scan failed");
+                    return StepPlan::Pending;
+                }
+            };
+            if batch
+                .records
+                .iter()
+                .any(|(_, record)| record.placement == *placement)
+            {
+                return StepPlan::Pending;
+            }
+            if !batch.has_more {
+                break;
+            }
+            start_after = batch.next_start_after;
+        }
+    }
+    StepPlan::Ready(RealmPlacementMutation::ReportDrained {
+        transition_id: transition.plan.transition_id,
+        bucket: placement.shard,
+        reported_by: local_node_id,
     })
 }
 

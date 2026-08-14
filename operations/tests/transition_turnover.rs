@@ -110,8 +110,9 @@ async fn turnover_moves_holder() -> TestResult<()> {
     // A complete local copy is not holdership: only the activation is.
     assert!(!holds_placement(&realm.config, &placement, leaver));
     assert!(document_present(realm.find(leaver), group_id, document_id).await);
-    // The record carried a zero grace, so the leaver was released with the
-    // cutover and membership collapsed from `|old U new|` back to the holders.
+    // Zero grace releases only once the leaver's drain report reduces, then
+    // membership collapses from `|old U new|` back to the holders.
+    realm.await_release(transition).await?;
     assert_eq!(realm.members(&placement), after);
 
     let node = realm.find(joiner);

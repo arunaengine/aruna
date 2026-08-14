@@ -993,6 +993,7 @@ impl AdminDocumentReducerState {
                 | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
                 | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
                 | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+                | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
         ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_is_stale_for_path(event, path));
@@ -1445,6 +1446,23 @@ impl AdminDocumentReducerState {
                     event,
                     transition_stall_path(transition_id, *bucket, reported_by),
                     reason.clone(),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                    transition_id,
+                    bucket,
+                    reported_by,
+                },
+            ) => {
+                if *reported_by != event.origin_node_id {
+                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                }
+                self.apply_transition_report(
+                    event,
+                    transition_drain_path(transition_id, *bucket, reported_by),
+                    true.to_string(),
                 );
             }
             (
@@ -1996,6 +2014,18 @@ impl AdminDocumentReducerState {
                         });
                     }
                 }
+                TransitionPart::Drain(bucket, reported_by) => {
+                    // Only a departing old holder owes (or may end) retention.
+                    if transition.plan.bucket_plan(bucket).is_some_and(|plan| {
+                        plan.old_holders.contains(&reported_by)
+                            && !plan.target_holders.contains(&reported_by)
+                    }) {
+                        transition.drained.push(crate::structs::BucketDrain {
+                            bucket,
+                            reported_by,
+                        });
+                    }
+                }
             }
         }
 
@@ -2005,6 +2035,13 @@ impl AdminDocumentReducerState {
             transition.proofs.sort_by(order_proofs);
             transition.forced.sort_by_key(|entry| entry.bucket);
             transition.stalls.sort_by(order_stalls);
+            transition.drained.sort_by(|left, right| {
+                left.bucket.cmp(&right.bucket).then_with(|| {
+                    left.reported_by
+                        .as_bytes()
+                        .cmp(right.reported_by.as_bytes())
+                })
+            });
             transition.completed = transition
                 .plan
                 .buckets
@@ -2840,6 +2877,13 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         } => {
             vec![transition_stall_path(transition_id, *bucket, reported_by)]
         }
+        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+            transition_id,
+            bucket,
+            reported_by,
+        } => {
+            vec![transition_drain_path(transition_id, *bucket, reported_by)]
+        }
         AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
             vec![handle_range_path(range.range_id)]
         }
@@ -2954,6 +2998,13 @@ pub fn transition_force_path(transition_id: &Ulid, bucket: u32) -> String {
 pub fn transition_stall_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
     format!(
         "{}.stalls.{bucket}.{node_id}",
+        transition_path(transition_id)
+    )
+}
+
+pub fn transition_drain_path(transition_id: &Ulid, bucket: u32, node_id: &NodeId) -> String {
+    format!(
+        "{}.drained.{bucket}.{node_id}",
         transition_path(transition_id)
     )
 }
@@ -3231,6 +3282,7 @@ enum TransitionPart {
     Proof(u32, NodeId),
     Forced(u32),
     Stall(u32, NodeId),
+    Drain(u32, NodeId),
 }
 
 fn transition_part(path: &str) -> Option<(Ulid, TransitionPart)> {
@@ -3249,6 +3301,9 @@ fn transition_part(path: &str) -> Option<(Ulid, TransitionPart)> {
         }
         (Some("stalls"), Some(bucket), Some(node)) => {
             TransitionPart::Stall(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
+        }
+        (Some("drained"), Some(bucket), Some(node)) => {
+            TransitionPart::Drain(bucket.parse().ok()?, NodeId::from_str(node).ok()?)
         }
         _ => return None,
     };
@@ -7925,6 +7980,22 @@ mod tests {
                     3,
                     AdminDocumentClock::default(),
                     op,
+                ))
+                .unwrap();
+        }
+        // Release additionally needs every departing holder's drain report.
+        for (event_seed, seed, bucket) in [(64u8, 1u8, 0u32), (65, 2, 0), (66, 1, 1), (67, 2, 1)] {
+            state
+                .apply(&realm_config_event(
+                    event_seed,
+                    node(seed),
+                    4 + u64::from(bucket),
+                    AdminDocumentClock::default(),
+                    AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                        transition_id: plan.transition_id,
+                        bucket,
+                        reported_by: node(seed),
+                    },
                 ))
                 .unwrap();
         }

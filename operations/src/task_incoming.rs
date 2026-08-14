@@ -605,6 +605,7 @@ fn classify_deferred_record(
     // its pre-cutover ops.
     if crate::placement::holds_placement(config, &record.placement, node_id)
         || crate::placement::is_draining_former_holder(config, &record.placement, node_id)
+        || crate::placement::retained_departing_holder(config, &record.placement, node_id)
     {
         DeferOutcome::Retry
     } else {

@@ -258,6 +258,14 @@ pub enum AdminDocumentOperation {
     GroupPoliciesSet {
         policies: Vec<crate::request_policy::RequestPolicy>,
     },
+    /// A departing old holder's statement that its outbox holds nothing for
+    /// the bucket any more, so its retention may end (postcard append-only:
+    /// new variants only at the enum end).
+    RealmConfigTransitionDrainReported {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+    },
 }
 
 #[cfg(test)]

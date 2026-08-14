@@ -282,6 +282,14 @@ pub struct StallReport {
     pub reason: String,
 }
 
+/// A departing old holder's reduced statement that its outbox drained for the
+/// bucket. Retention ends only on grace AND this.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct BucketDrain {
+    pub bucket: u32,
+    pub reported_by: NodeId,
+}
+
 /// One transition of a strategy's buckets from their activated map to a target
 /// map. Every field but `plan` is reduced from replicated events.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -293,6 +301,7 @@ pub struct PlacementTransition {
     pub completed: Vec<BucketCompletion>,
     pub forced: Vec<BucketForceFinalize>,
     pub stalls: Vec<StallReport>,
+    pub drained: Vec<BucketDrain>,
 }
 
 impl PlacementTransition {
@@ -305,7 +314,30 @@ impl PlacementTransition {
             completed: Vec::new(),
             forced: Vec::new(),
             stalls: Vec::new(),
+            drained: Vec::new(),
         }
+    }
+
+    /// Whether `node_id`'s drain report for `bucket` has reduced.
+    pub fn drain_reported(&self, bucket: u32, node_id: NodeId) -> bool {
+        self.drained
+            .iter()
+            .any(|drain| drain.bucket == bucket && drain.reported_by == node_id)
+    }
+
+    /// Departing old holders of a completed bucket: old minus target. Only
+    /// these ever retain, and only these owe a drain report.
+    pub fn departing_holders(&self, bucket: u32) -> Vec<NodeId> {
+        self.plan
+            .bucket_plan(bucket)
+            .map(|plan| {
+                plan.old_holders
+                    .iter()
+                    .filter(|holder| !plan.target_holders.contains(holder))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn completion(&self, bucket: u32) -> Option<&BucketCompletion> {
@@ -323,14 +355,16 @@ impl PlacementTransition {
                 .all(|plan| self.completion(plan.bucket).is_some())
     }
 
-    /// Whether the record has outlived its purpose: it is terminal and its last
-    /// cut-over is older than the grace window.
+    /// Whether the record has outlived its purpose: it is terminal, its last
+    /// cut-over is older than the grace window, and every departing old
+    /// holder of every completed bucket has a reduced drain report.
     ///
     /// The grace is what keeps a departing old holder in the topic while a
-    /// reader mid-cutover may still need it and its outbox drains. `now_ms`
-    /// only ever ends that window; the window starts at `completed_at_ms`,
-    /// carried data every replica reduces identically. An aborted record that
-    /// cut nothing over releases at once - it moved nobody.
+    /// reader mid-cutover may still need it; the drain report is what proves
+    /// its accepted writes reached the topic. A permanently dead holder keeps
+    /// the record alive until an operator removes the node from the realm,
+    /// never a clock. An aborted record that cut nothing over releases at
+    /// once - it moved nobody.
     pub fn released(&self, now_ms: u64) -> bool {
         self.is_terminal()
             && self
@@ -339,6 +373,11 @@ impl PlacementTransition {
                 .map(|entry| entry.completed_at_ms)
                 .max()
                 .is_none_or(|at| now_ms >= at.saturating_add(self.plan.limits.grace_ms))
+            && self.completed.iter().all(|entry| {
+                self.departing_holders(entry.bucket)
+                    .into_iter()
+                    .all(|holder| self.drain_reported(entry.bucket, holder))
+            })
     }
 
     /// Covered buckets that have not cut over yet.
@@ -762,6 +801,12 @@ mod tests {
             completed_at_ms: 40,
         });
         assert_eq!(transition.incomplete_buckets(), 0);
+        for bucket in [1, 3] {
+            transition.drained.push(BucketDrain {
+                bucket,
+                reported_by: secret(1).public(),
+            });
+        }
         // The window runs from the newest cut-over, not the first.
         assert!(!transition.released(139));
         assert!(transition.released(140));
@@ -770,6 +815,33 @@ mod tests {
         aborted.status = TransitionStatus::Aborted;
         assert_eq!(aborted.incomplete_buckets(), 2);
         assert!(aborted.released(0));
+    }
+
+    #[test]
+    fn drain_gates_release() {
+        // Grace alone never releases: the departing holder (node 1) must have
+        // a reduced drain report for every completed bucket.
+        let mut transition = PlacementTransition::new(plan());
+        transition.plan.limits.grace_ms = 100;
+        for bucket in [1, 3] {
+            transition.completed.push(BucketCompletion {
+                bucket,
+                completed_at_ms: 10,
+            });
+        }
+        assert!(!transition.released(u64::MAX));
+
+        transition.drained.push(BucketDrain {
+            bucket: 1,
+            reported_by: secret(1).public(),
+        });
+        assert!(!transition.released(u64::MAX), "one bucket still undrained");
+        transition.drained.push(BucketDrain {
+            bucket: 3,
+            reported_by: secret(1).public(),
+        });
+        assert!(transition.released(200));
+        assert!(!transition.released(50), "grace still gates");
     }
 
     #[test]

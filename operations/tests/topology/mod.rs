@@ -138,6 +138,10 @@ impl Topology {
         replication_factor: u32,
         shard_count: u32,
     ) -> TestResult<Self> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
         assert!(
             management > replication_factor as usize,
             "non-holder fixture needs more sync-eligible nodes than the replication factor: \
@@ -526,14 +530,28 @@ impl Topology {
     ) -> TestResult<()> {
         let node = &self.nodes[node_index];
         let actor = self.actor(node);
-        let config = hang_cap(
-            "placement mutation",
-            drive_realm_placement_mutation(
-                MutateRealmPlacementConfig { actor, mutation },
-                node.context.as_ref(),
-            ),
-        )
-        .await?;
+        // Inbound replication applies concurrently on the same storage, so a
+        // conflicted RMW is re-driven like the production mutation paths do.
+        let mut attempts = 0;
+        let config = loop {
+            let result = hang_cap(
+                "placement mutation",
+                drive_realm_placement_mutation(
+                    MutateRealmPlacementConfig {
+                        actor: actor.clone(),
+                        mutation: mutation.clone(),
+                    },
+                    node.context.as_ref(),
+                ),
+            )
+            .await;
+            match result {
+                Err(aruna_operations::mutate_realm_placement::MutateRealmPlacementError::StorageError(
+                    aruna_core::errors::StorageError::TransactionConflict,
+                )) if attempts < 10 => attempts += 1,
+                other => break other?,
+            }
+        };
         self.config = config;
         Ok(())
     }
@@ -621,12 +639,45 @@ impl Topology {
         .await
     }
 
+    /// Drives the reconciler until `transition_id`'s record is released and
+    /// pruned everywhere: past its grace that additionally means every
+    /// departing holder's drain report has reduced.
+    pub async fn await_release(&mut self, transition_id: Ulid) -> TestResult<()> {
+        let realm_id = self.realm_id;
+        let nodes = &self.nodes;
+        wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+            "placement transition never released",
+            || async move {
+                for node in nodes {
+                    aruna_operations::process_placements::process_shard_placements(
+                        &node.context,
+                        realm_id,
+                        node.node_id(),
+                    )
+                    .await;
+                }
+                replicate_config(nodes, realm_id).await;
+                let mut pending = 0;
+                for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
+                    let config = read_realm_config(node, realm_id).await?;
+                    if config.transition(&transition_id).is_some() {
+                        pending += 1;
+                    }
+                }
+                Ok(pending)
+            },
+        )
+        .await?;
+        self.config = read_realm_config(self.node(0), self.realm_id).await?;
+        Ok(())
+    }
+
     /// Drives the reconciler until every bucket of `transition_id` has cut over
     /// on every node.
     pub async fn await_transition(&mut self, transition_id: Ulid) -> TestResult<()> {
         let realm_id = self.realm_id;
         let nodes = &self.nodes;
-        wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        let result = wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
             "placement transition never completed",
             || async move {
                 for node in nodes {
@@ -658,7 +709,51 @@ impl Topology {
                 Ok(pending)
             },
         )
-        .await?;
+        .await;
+        if result.is_err() {
+            // Timeout diagnostics: the reduced record state on node 0.
+            let config = read_realm_config(self.node(0), self.realm_id).await?;
+            if let Some(transition) = config.transition(&transition_id) {
+                let mut stuck = String::new();
+                for bucket in &transition.plan.buckets {
+                    if transition.completion(bucket.bucket).is_some() {
+                        continue;
+                    }
+                    let proofs: Vec<String> = transition
+                        .proofs_for(bucket.bucket)
+                        .map(|proof| {
+                            format!(
+                                "{}:{}",
+                                &proof.holder.to_string()[..8],
+                                transition.proof_valid(bucket.bucket, proof)
+                            )
+                        })
+                        .collect();
+                    let missing: Vec<String> = bucket
+                        .target_holders
+                        .iter()
+                        .filter(|holder| {
+                            !transition
+                                .proofs_for(bucket.bucket)
+                                .any(|proof| proof.holder == **holder)
+                        })
+                        .map(|holder| holder.to_string()[..8].to_string())
+                        .collect();
+                    stuck.push_str(&format!(
+                        " bucket {}: fenced={} proofs={proofs:?} missing={missing:?};",
+                        bucket.bucket,
+                        transition.barrier_established(bucket.bucket, &bucket.old_holders),
+                    ));
+                }
+                return Err(format!(
+                    "transition never completed: status={:?} completed={} stuck:{stuck}",
+                    transition.status,
+                    transition.completed.len(),
+                )
+                .into());
+            }
+        }
+        result?;
         self.config = read_realm_config(self.node(0), self.realm_id).await?;
         Ok(())
     }

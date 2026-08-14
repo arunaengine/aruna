@@ -29,7 +29,7 @@ const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
 const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
 
-fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
+pub(crate) fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
     [
         ADMIN_OUTBOX_PREFIX,
         DELETE_OUTBOX_PREFIX,
