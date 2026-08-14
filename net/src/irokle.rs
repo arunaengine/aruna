@@ -480,12 +480,12 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         // Seeded before any drain can observe the service: an entry left by an
         // interrupted handoff must block its bucket from the first tick on.
-        let eviction_buckets: BTreeMap<irokle_crate::EvictionKey, Option<Vec<PlacementRef>>> =
-            node.pending_evictions()
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .iter()
-                .map(|eviction| (eviction.key(), None))
-                .collect();
+        let eviction_buckets: BTreeMap<irokle_crate::EvictionKey, Option<Vec<PlacementRef>>> = node
+            .pending_evictions()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .iter()
+            .map(|eviction| (eviction.key(), None))
+            .collect();
 
         Ok(Self {
             node,
@@ -1709,7 +1709,12 @@ impl DocumentSyncService {
         }
         self.eviction_buckets.write().insert(
             key,
-            Some(documents.iter().map(|document| document.placement).collect()),
+            Some(
+                documents
+                    .iter()
+                    .map(|document| document.placement)
+                    .collect(),
+            ),
         );
         Some(PendingEviction { key, documents })
     }

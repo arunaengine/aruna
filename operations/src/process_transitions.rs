@@ -571,7 +571,8 @@ async fn ensure_strategy_activations(
     local_node_id: NodeId,
     config: &RealmConfigDocument,
 ) -> bool {
-    let (mut pending, unfrozen) = activate_newest_map(context, realm_id, local_node_id, config).await;
+    let (mut pending, unfrozen) =
+        activate_newest_map(context, realm_id, local_node_id, config).await;
     if !unfrozen {
         return pending;
     }
