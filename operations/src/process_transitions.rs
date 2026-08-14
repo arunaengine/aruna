@@ -509,10 +509,10 @@ async fn ensure_expansions(
     pending
 }
 
-/// Activates the newest map for a strategy that has none, so a strategy that
-/// becomes referenced after the realm's first map never resolves nothing.
-/// Only the strategy's rank-0 node under that map issues it; the record is an
-/// immutable value, so a concurrent duplicate coalesces.
+/// Activates the newest map for a strategy that has none, publishing the
+/// successor map first when that map predates the strategy. Only a management
+/// node issues either; the activation record is an immutable value, so a
+/// concurrent duplicate coalesces.
 async fn ensure_strategy_activations(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -531,6 +531,7 @@ async fn ensure_strategy_activations(
         return false;
     }
     let mut pending = false;
+    let mut unfrozen = false;
     for strategy in &config.strategies {
         if config.activation(&strategy.strategy_id, 0).is_some() {
             continue;
@@ -539,10 +540,11 @@ async fn ensure_strategy_activations(
             strategy_id: strategy.strategy_id,
             shard: 0,
         };
-        // A map without this strategy's selector cannot activate it; a newer
-        // map publication is what resolves that, so just stay pending.
+        // A map without this strategy's selector cannot activate it; the
+        // successor map published below is what freezes it.
         if holders_in_map(config, strategy, &placement, map).is_none() {
             pending = true;
+            unfrozen |= map.selector(&strategy.strategy_id).is_none();
             continue;
         }
         pending |= submit_mutation(
@@ -556,7 +558,50 @@ async fn ensure_strategy_activations(
         )
         .await;
     }
+    if unfrozen {
+        publish_successor_map(context, realm_id, local_node_id, config, epoch).await;
+        pending = true;
+    }
     pending
+}
+
+/// Freezes a strategy the newest map predates into its successor, so a
+/// strategy created after that map cannot stay unresolvable forever.
+///
+/// The epoch is published by one deterministic issuer and derived
+/// byte-identically from the config, so a second issuer's copy coalesces in
+/// the reducer instead of leaving the epoch conflicted and unusable. A stale
+/// caller view cannot stream epochs: admission rejects an occupied epoch.
+async fn publish_successor_map(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    config: &RealmConfigDocument,
+    epoch: u64,
+) {
+    if map_publisher(config) != Some(local_node_id.to_string().as_str()) {
+        return;
+    }
+    submit_mutation(
+        context,
+        realm_id,
+        local_node_id,
+        RealmPlacementMutation::PublishCandidateMap(config.freeze_map(epoch + 1)),
+    )
+    .await;
+}
+
+/// The realm's candidate-map issuer: the lowest-id Management node. Publishing
+/// from every Management node at once risks two divergent values at one epoch,
+/// which keeps that epoch permanently unusable. A removed issuer hands the
+/// role to the next node; an unreachable one defers publication.
+fn map_publisher(config: &RealmConfigDocument) -> Option<&str> {
+    config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, aruna_core::structs::RealmNodeKind::Management))
+        .map(|node| node.node_id.as_str())
+        .min()
 }
 
 /// The bucket's current activation epoch, read back from storage so the proof
@@ -593,5 +638,225 @@ async fn submit_mutation(
             warn!(error = %error, "Placement transition step did not apply");
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::admin_document_reducer::{
+        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
+    };
+    use aruna_core::admin_documents::{
+        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    };
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    use super::*;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn actor(realm_id: RealmId, node_id: NodeId) -> Actor {
+        Actor {
+            node_id,
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        }
+    }
+
+    fn context(root: &str) -> Arc<DriverContext> {
+        Arc::new(DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        })
+    }
+
+    fn strategy(seed: u8, name: &str) -> PlacementStrategy {
+        PlacementStrategy {
+            strategy_id: Ulid::from_bytes([seed; 16]),
+            name: name.to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 4,
+        }
+    }
+
+    /// Map epoch one freezes the first strategy only; the second is created
+    /// after it, so nothing in the realm carries its frozen selector.
+    fn late_strategy_config(realm_id: RealmId) -> (RealmConfigDocument, Ulid) {
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        for seed in [1u8, 2] {
+            document.ensure_node(node(seed), RealmNodeKind::Management);
+        }
+        document.strategies.push(strategy(5, "first"));
+        document.default_strategy_id = Some(document.strategies[0].strategy_id);
+        document.snapshot_candidate_map();
+        let late = strategy(6, "late");
+        document.strategies.push(late.clone());
+        (document, late.strategy_id)
+    }
+
+    async fn store_config(context: &DriverContext, document: &RealmConfigDocument) {
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: document.realm_id,
+        };
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: document
+                    .to_bytes(&actor(document.realm_id, node(1)))
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn load_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigDocument {
+        crate::process_placements::load_realm_config(context, realm_id)
+            .await
+            .expect("the realm config is stored")
+    }
+
+    #[tokio::test]
+    async fn late_strategy_gets_map() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let (document, late) = late_strategy_config(realm_id);
+        store_config(&context, &document).await;
+        assert!(
+            document
+                .candidate_map(1)
+                .expect("epoch one is usable")
+                .selector(&late)
+                .is_none()
+        );
+
+        let issuer = map_publisher(&document)
+            .expect("a management issuer")
+            .to_string();
+        let publisher = [node(1), node(2)]
+            .into_iter()
+            .find(|candidate| candidate.to_string() == issuer)
+            .expect("the issuer is a configured node");
+        assert!(process_placement_transitions(&context, realm_id, publisher, &document).await);
+
+        // One successor map, carrying the missing frozen selector.
+        let published = load_config(&context, realm_id).await;
+        assert_eq!(published.newest_map_epoch(), Some(2));
+        assert!(
+            published
+                .candidate_map(2)
+                .expect("the successor is usable")
+                .selector(&late)
+                .is_some()
+        );
+        assert!(published.activation(&late, 0).is_none());
+
+        // The next pass activates every bucket from that reduced map.
+        process_placement_transitions(&context, realm_id, publisher, &published).await;
+        let activated = load_config(&context, realm_id).await;
+        for shard in 0..4 {
+            assert_eq!(
+                activated
+                    .activation(&late, shard)
+                    .map(|activation| activation.candidate_map_epoch),
+                Some(2)
+            );
+        }
+
+        // Repeating the pass publishes no further epoch.
+        process_placement_transitions(&context, realm_id, publisher, &activated).await;
+        assert_eq!(
+            load_config(&context, realm_id).await.newest_map_epoch(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn one_issuer_publishes() {
+        // Every Management node reconciles, but only the deterministic issuer
+        // may publish: a rival value at one epoch makes it unusable forever.
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([62; 32]);
+        let (document, _late) = late_strategy_config(realm_id);
+        store_config(&context, &document).await;
+
+        let issuer = map_publisher(&document)
+            .expect("a management issuer")
+            .to_string();
+        let other = [node(1), node(2)]
+            .into_iter()
+            .find(|candidate| candidate.to_string() != issuer)
+            .expect("two management nodes");
+
+        assert!(process_placement_transitions(&context, realm_id, other, &document).await);
+        assert_eq!(
+            load_config(&context, realm_id).await.newest_map_epoch(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn concurrent_maps_coalesce() {
+        // Two issuers racing at one epoch must reduce to one usable value, so
+        // the published map is derived byte-identically from the config.
+        let realm_id = RealmId::from_bytes([63; 32]);
+        let (document, _late) = late_strategy_config(realm_id);
+        let map = document.freeze_map(2);
+        assert_eq!(map, document.freeze_map(2));
+
+        let publish = |state: &mut AdminDocumentReducerState, seed: u8, origin: NodeId, map| {
+            state
+                .apply(&AdminDocumentEvent {
+                    event_id: Ulid::from_bytes([seed; 16]),
+                    target: AdminDocumentTarget::RealmConfig { realm_id },
+                    origin_node_id: origin,
+                    origin_seq: 1,
+                    observed: AdminDocumentClock::default(),
+                    actor: actor(realm_id, origin),
+                    op: AdminDocumentOperation::RealmConfigCandidateMapPublished { map },
+                })
+                .expect("the publication applies");
+        };
+        let materialize = |state: &AdminDocumentReducerState| {
+            let mut materialized = document.clone();
+            overlay_realm_config_placement_reducer_materialization(&mut materialized, state, 0);
+            materialized
+        };
+
+        let mut agreed =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        publish(&mut agreed, 70, node(1), map.clone());
+        publish(&mut agreed, 71, node(2), map.clone());
+        assert_eq!(materialize(&agreed).candidate_map(2), Some(&map));
+
+        // Divergent values at one epoch are exactly what a single issuer avoids.
+        let mut divergent =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let mut rival = map.clone();
+        rival.nodes.pop();
+        publish(&mut divergent, 72, node(1), map);
+        publish(&mut divergent, 73, node(2), rival);
+        assert!(materialize(&divergent).candidate_map(2).is_none());
     }
 }
