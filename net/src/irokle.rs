@@ -88,7 +88,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
 use crate::error::{NetError, Result};
@@ -2286,7 +2286,10 @@ impl DocumentSyncService {
                     let (ack, evictions) = self
                         .node
                         .receive_sync_data_from_evicting(peer, data)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        .map_err(|error| {
+                            report_journal_full(topic_id, &error);
+                            NetError::Bootstrap(error.to_string())
+                        })?;
                     self.forward_evictions(evictions);
                     received_data = true;
                     followup.push(SyncMessage::Ack(ack));
@@ -9339,6 +9342,18 @@ fn process_batch_summary_responses(
     Ok((responded_topics, failed_topics, sync_messages))
 }
 
+/// Names the bounded-journal refusal. Past Irokle's cap on unreleased records
+/// every genesis tie-break reset is refused, which otherwise reaches operators
+/// only as an opaque admission failure.
+fn report_journal_full(topic_id: irokle_crate::TopicId, error: &irokle_crate::Error) {
+    if matches!(error, irokle_crate::Error::EvictionJournalFull) {
+        error!(
+            %topic_id,
+            "Eviction journal is full; genesis tie-break resets stay refused until the eviction consumer drains it"
+        );
+    }
+}
+
 fn forward_evictions_to(
     sink: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     evictions: Vec<TopicEviction>,
@@ -9386,6 +9401,7 @@ fn process_batch_data_responses(
                         ack
                     }
                     Err(error) => {
+                        report_journal_full(topic_id, &error);
                         warn!(
                             %peer,
                             topic_id = %topic_id,
