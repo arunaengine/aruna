@@ -984,7 +984,7 @@ async fn restart_preserves_outbox() -> TestResult<()> {
     first.wait_status("/readyz", StatusCode::OK).await;
     first.terminate().await;
 
-    inject_offline_peers(&env, 1).await?;
+    inject_offline_peers(&env, 2).await?;
 
     let mut second = env.launch();
     second.wait_status("/healthz", StatusCode::OK).await;

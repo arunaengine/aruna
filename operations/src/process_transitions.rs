@@ -571,16 +571,43 @@ async fn ensure_strategy_activations(
     local_node_id: NodeId,
     config: &RealmConfigDocument,
 ) -> bool {
+    let (mut pending, unfrozen) = activate_newest_map(context, realm_id, local_node_id, config).await;
+    if !unfrozen {
+        return pending;
+    }
+    pending = true;
+    let epoch = config.newest_map_epoch().unwrap_or_default();
+    if !publish_successor_map(context, realm_id, local_node_id, config, epoch).await {
+        return pending;
+    }
+    // The successor map is durable in the local config the moment it commits,
+    // so the activations it unblocks resolve in this pass. Deferring them to
+    // the retry interval leaves the node owing work after it reports quiet.
+    if let Some(published) = crate::process_placements::load_realm_config(context, realm_id).await {
+        activate_newest_map(context, realm_id, local_node_id, &published).await;
+    }
+    pending
+}
+
+/// Initializes activations against `config`'s newest map. Returns whether work
+/// is still outstanding and whether some strategy is missing from that map,
+/// which only a successor map can freeze.
+async fn activate_newest_map(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    config: &RealmConfigDocument,
+) -> (bool, bool) {
     let Some(epoch) = config.newest_map_epoch() else {
-        return false;
+        return (false, false);
     };
     let Some(map) = config.candidate_map(epoch) else {
-        return false;
+        return (false, false);
     };
     // The activation record is an immutable value, so concurrent management
     // issuers coalesce; a non-management issuer never lands at all.
     if !is_management(config, local_node_id) {
-        return false;
+        return (false, false);
     }
     let mut pending = false;
     let mut unfrozen = false;
@@ -593,7 +620,7 @@ async fn ensure_strategy_activations(
             shard: 0,
         };
         // A map without this strategy's selector cannot activate it; the
-        // successor map published below is what freezes it.
+        // successor map published by the caller is what freezes it.
         if holders_in_map(config, strategy, &placement, map).is_none() {
             pending = true;
             unfrozen |= map.selector(&strategy.strategy_id).is_none();
@@ -610,11 +637,7 @@ async fn ensure_strategy_activations(
         )
         .await;
     }
-    if unfrozen {
-        publish_successor_map(context, realm_id, local_node_id, config, epoch).await;
-        pending = true;
-    }
-    pending
+    (pending, unfrozen)
 }
 
 /// Freezes a strategy the newest map predates into its successor, so a
@@ -631,17 +654,17 @@ async fn publish_successor_map(
     local_node_id: NodeId,
     config: &RealmConfigDocument,
     epoch: u64,
-) {
+) -> bool {
     if map_publisher(config) != Some(local_node_id.to_string().as_str()) {
-        return;
+        return false;
     }
-    submit_mutation(
+    !submit_mutation(
         context,
         realm_id,
         local_node_id,
         RealmPlacementMutation::PublishCandidateMap(config.freeze_map(epoch + 1)),
     )
-    .await;
+    .await
 }
 
 /// The realm's candidate-map issuer: the lowest-id Management node. Publishing
@@ -860,6 +883,8 @@ mod tests {
 
     #[tokio::test]
     async fn late_strategy_gets_map() {
+        // One pass publishes the successor map and activates from it: leaving
+        // the activation to the retry interval strands the work for a restart.
         let directory = tempdir().unwrap();
         let context = context(directory.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([61; 32]);
@@ -882,7 +907,8 @@ mod tests {
             .expect("the issuer is a configured node");
         assert!(process_placement_transitions(&context, realm_id, publisher, &document).await);
 
-        // One successor map, carrying the missing frozen selector.
+        // One successor map, carrying the missing frozen selector, plus every
+        // activation it unblocks.
         let published = load_config(&context, realm_id).await;
         assert_eq!(published.newest_map_epoch(), Some(2));
         assert!(
@@ -892,22 +918,18 @@ mod tests {
                 .selector(&late)
                 .is_some()
         );
-        assert!(published.activation(&late, 0).is_none());
-
-        // The next pass activates every bucket from that reduced map.
-        process_placement_transitions(&context, realm_id, publisher, &published).await;
-        let activated = load_config(&context, realm_id).await;
         for shard in 0..4 {
             assert_eq!(
-                activated
+                published
                     .activation(&late, shard)
                     .map(|activation| activation.candidate_map_epoch),
-                Some(2)
+                Some(2),
+                "the publishing pass must activate from its own successor map"
             );
         }
 
         // Repeating the pass publishes no further epoch.
-        process_placement_transitions(&context, realm_id, publisher, &activated).await;
+        process_placement_transitions(&context, realm_id, publisher, &published).await;
         assert_eq!(
             load_config(&context, realm_id).await.newest_map_epoch(),
             Some(2)
