@@ -7789,10 +7789,28 @@ async fn validate_replicated_admin_event(
                 return reject("placement transition plan is malformed");
             }
         }
-        AdminDocumentOperation::RealmConfigTransitionBarrierReported { reported_by, .. }
-        | AdminDocumentOperation::RealmConfigTransitionStallReported { reported_by, .. } => {
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            reported_by,
+            frontier,
+            ..
+        } => {
             if *reported_by != event.origin_node_id {
                 return reject("transition report does not come from the node it names");
+            }
+            if frontier.len() > aruna_core::structs::MAX_BARRIER_FRONTIER_BYTES {
+                return reject("transition barrier frontier exceeds its size bound");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            reported_by,
+            reason,
+            ..
+        } => {
+            if *reported_by != event.origin_node_id {
+                return reject("transition report does not come from the node it names");
+            }
+            if reason.len() > aruna_core::structs::MAX_STALL_REASON_BYTES {
+                return reject("transition stall reason exceeds its size bound");
             }
         }
         AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
@@ -8012,6 +8030,85 @@ fn configured_node_kind<'a>(
         .map(|node| &node.kind)
 }
 
+/// Who a transition report claims to be, against the named plan's roles.
+enum ReportParticipation {
+    NotReport,
+    Participant,
+    UnknownPlan,
+    Foreign,
+}
+
+/// Resolves the plan a report names (stored config first, reduced state as
+/// the fallback) and checks the reporter holds the role the report claims:
+/// barriers from old holders, proofs from targets, stalls from the union.
+fn report_participation(
+    op: &AdminDocumentOperation,
+    current_config: Option<&RealmConfigDocument>,
+    previous_state: Option<&AdminDocumentReducerState>,
+) -> ReportParticipation {
+    enum Role {
+        Old,
+        Target,
+        Union,
+    }
+    let (transition_id, bucket, reporter, role) = match op {
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => (*transition_id, *bucket, *reported_by, Role::Old),
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            proof,
+            ..
+        } => (*transition_id, proof.bucket, proof.holder, Role::Target),
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => (*transition_id, *bucket, *reported_by, Role::Union),
+        _ => return ReportParticipation::NotReport,
+    };
+    let from_config = current_config.and_then(|config| {
+        config
+            .placement_transitions
+            .iter()
+            .find(|transition| transition.plan.transition_id == transition_id)
+            .map(|transition| transition.plan.clone())
+    });
+    let plan = match from_config {
+        Some(plan) => plan,
+        None => {
+            let Some(plan) = previous_state
+                .map(|state| state.materialized_transition_plans())
+                .unwrap_or_default()
+                .remove(&transition_id)
+            else {
+                return ReportParticipation::UnknownPlan;
+            };
+            plan
+        }
+    };
+    let Some(bucket_plan) = plan.bucket_plan(bucket) else {
+        return ReportParticipation::Foreign;
+    };
+    let allowed = match role {
+        Role::Old => bucket_plan.old_holders.contains(&reporter),
+        Role::Target => bucket_plan.target_holders.contains(&reporter),
+        Role::Union => {
+            bucket_plan.old_holders.contains(&reporter)
+                || bucket_plan.target_holders.contains(&reporter)
+        }
+    };
+    if allowed {
+        ReportParticipation::Participant
+    } else {
+        ReportParticipation::Foreign
+    }
+}
+
 fn validate_config_authority(
     current_config: Option<&RealmConfigDocument>,
     event: &AdminDocumentEvent,
@@ -8026,6 +8123,22 @@ fn validate_config_authority(
         return Ok(AdminEventValidation::Rejected(
             "stored realm config has the wrong realm".to_string(),
         ));
+    }
+    // Reports are gated on participation whatever the origin's kind: a plan
+    // names its finite holder sets, so nothing outside them may grow state.
+    match report_participation(&event.op, current_config, previous_state) {
+        ReportParticipation::NotReport | ReportParticipation::Participant => {}
+        ReportParticipation::UnknownPlan => {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "transition plan is not yet replicated".to_string(),
+            });
+        }
+        ReportParticipation::Foreign => {
+            return Ok(AdminEventValidation::Rejected(
+                "transition report does not come from a planned participant".to_string(),
+            ));
+        }
     }
     if matches!(
         &event.op,
@@ -9918,6 +10031,123 @@ mod tests {
             actor: actor.clone(),
             op,
         }
+    }
+
+    #[test]
+    fn outsider_reports_rejected() {
+        // A configured User node's barrier, an unrelated server's proof, and
+        // an unknown-transition stall never enter replicated state; the
+        // participant's own report is accepted.
+        let realm_id = RealmId::from_bytes([61u8; 32]);
+        let strategy_id = Ulid::from_parts(1_700, 1);
+        let transition_id = Ulid::from_parts(1_701, 1);
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        for (seed, kind) in [
+            (1u8, RealmNodeKind::Server),
+            (2, RealmNodeKind::Server),
+            (3, RealmNodeKind::User),
+            (4, RealmNodeKind::Server),
+        ] {
+            config.ensure_node(node(seed), kind);
+        }
+        config
+            .placement_transitions
+            .push(aruna_core::structs::PlacementTransition::new(
+                aruna_core::structs::TransitionPlan {
+                    transition_id,
+                    strategy_id,
+                    buckets: vec![aruna_core::structs::BucketPlan {
+                        bucket: 0,
+                        old_holders: vec![node(1)],
+                        target_holders: vec![node(2)],
+                        predecessor_epoch: 1,
+                    }],
+                    target_map_epoch: 2,
+                    limits: Default::default(),
+                    created_by: node(1),
+                    created_at_ms: 1,
+                },
+            ));
+        let barrier = |seed: u8| {
+            let actor = test_actor(seed, UserId::nil(realm_id), realm_id);
+            test_admin_event(
+                Ulid::from_parts(1_702, seed as u128),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    transition_id,
+                    bucket: 0,
+                    reported_by: node(seed),
+                    frontier: vec![seed],
+                },
+            )
+        };
+
+        let rejected = |event: &AdminDocumentEvent| {
+            matches!(
+                validate_config_authority(Some(&config), event, None),
+                Ok(AdminEventValidation::Rejected(_))
+            )
+        };
+        assert!(rejected(&barrier(3)), "a User node is never a participant");
+        assert!(rejected(&barrier(4)), "an unrelated server is rejected");
+        assert!(
+            matches!(
+                validate_config_authority(Some(&config), &barrier(1), None),
+                Ok(AdminEventValidation::Accepted)
+            ),
+            "the planned old holder's own barrier is accepted"
+        );
+
+        // A proof from a non-target is rejected before any signature check.
+        let foreign_proof = {
+            let actor = test_actor(4, UserId::nil(realm_id), realm_id);
+            let claim = aruna_core::structs::ProofClaim {
+                realm_id,
+                transition_id,
+                strategy_id,
+                bucket: 0,
+                old_activation_epoch: 1,
+                target_map_epoch: 2,
+                barrier_digest: [0; 32],
+                checkpoint_root: [0; 32],
+                holder: node(4),
+            };
+            test_admin_event(
+                Ulid::from_parts(1_703, 1),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    transition_id,
+                    strategy_id,
+                    proof: claim.sign(&iroh::SecretKey::from_bytes(&[4; 32])),
+                },
+            )
+        };
+        assert!(rejected(&foreign_proof));
+
+        // A report naming an unknown transition defers until its plan arrives.
+        let unknown = {
+            let actor = test_actor(1, UserId::nil(realm_id), realm_id);
+            test_admin_event(
+                Ulid::from_parts(1_704, 1),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                3,
+                AdminDocumentOperation::RealmConfigTransitionStallReported {
+                    transition_id: Ulid::from_parts(1_705, 1),
+                    bucket: 0,
+                    reported_by: node(1),
+                    reason: "sources unreachable".to_string(),
+                },
+            )
+        };
+        assert!(matches!(
+            validate_config_authority(Some(&config), &unknown, None),
+            Ok(AdminEventValidation::Deferred { .. })
+        ));
     }
 
     async fn apply_conflicting_user_name_and_attribute(

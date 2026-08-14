@@ -66,6 +66,8 @@ pub enum AdminDocumentReducerError {
     InvalidTransitionProof,
     #[error("placement transition report does not come from the node it names")]
     TransitionOriginMismatch,
+    #[error("placement transition report exceeds its size bound")]
+    TransitionReportOversized,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1360,6 +1362,9 @@ impl AdminDocumentReducerState {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentReducerError::TransitionOriginMismatch);
                 }
+                if frontier.len() > crate::structs::MAX_BARRIER_FRONTIER_BYTES {
+                    return Err(AdminDocumentReducerError::TransitionReportOversized);
+                }
                 self.apply_transition_report(
                     event,
                     transition_barrier_path(transition_id, *bucket, reported_by),
@@ -1412,6 +1417,9 @@ impl AdminDocumentReducerState {
                     at_risk_report,
                 },
             ) => {
+                if at_risk_report.len() > crate::structs::MAX_STALL_REASON_BYTES {
+                    return Err(AdminDocumentReducerError::TransitionReportOversized);
+                }
                 self.apply_transition_report(
                     event,
                     transition_force_path(transition_id, *bucket),
@@ -1429,6 +1437,9 @@ impl AdminDocumentReducerState {
             ) => {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                }
+                if reason.len() > crate::structs::MAX_STALL_REASON_BYTES {
+                    return Err(AdminDocumentReducerError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
                     event,
@@ -1933,8 +1944,13 @@ impl AdminDocumentReducerState {
                 TransitionPart::Plan => {}
                 TransitionPart::Aborted => transition.status = TransitionStatus::Aborted,
                 TransitionPart::Barrier(bucket, reported_by) => {
+                    // Only planned old holders fence; a foreign report never
+                    // enters the record or the digest proofs commit to.
                     if let Ok(frontier) = hex::decode(value)
-                        && transition.plan.covers(bucket)
+                        && transition
+                            .plan
+                            .bucket_plan(bucket)
+                            .is_some_and(|plan| plan.old_holders.contains(&reported_by))
                     {
                         transition.barriers.push(BucketBarrier {
                             bucket,
@@ -1968,11 +1984,18 @@ impl AdminDocumentReducerState {
                         });
                     }
                 }
-                TransitionPart::Stall(bucket, reported_by) => transition.stalls.push(StallReport {
-                    bucket,
-                    reported_by,
-                    reason: value.to_string(),
-                }),
+                TransitionPart::Stall(bucket, reported_by) => {
+                    if transition.plan.bucket_plan(bucket).is_some_and(|plan| {
+                        plan.old_holders.contains(&reported_by)
+                            || plan.target_holders.contains(&reported_by)
+                    }) {
+                        transition.stalls.push(StallReport {
+                            bucket,
+                            reported_by,
+                            reason: value.to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -7407,6 +7430,75 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
         overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
         config
+    }
+
+    #[test]
+    fn foreign_reports_dropped() {
+        // A barrier from a non-old-holder and a stall from an outsider reduce
+        // as values but never materialize; oversized reports fail at apply.
+        let plan = transition_plan(&[1, 2], &[3, 4]);
+        let mut state = realm_config_state();
+        for event in transition_events(&plan) {
+            state.apply(&event).unwrap();
+        }
+        state
+            .apply(&realm_config_event(
+                80,
+                node(3),
+                5,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    transition_id: plan.transition_id,
+                    bucket: 0,
+                    reported_by: node(3),
+                    frontier: vec![3],
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&realm_config_event(
+                81,
+                node(5),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigTransitionStallReported {
+                    transition_id: plan.transition_id,
+                    bucket: 0,
+                    reported_by: node(5),
+                    reason: "spoofed".to_string(),
+                },
+            ))
+            .unwrap();
+
+        let transitions = state.materialized_transitions();
+        let transition = transitions
+            .iter()
+            .find(|transition| transition.plan.transition_id == plan.transition_id)
+            .expect("transition materializes");
+        assert!(
+            transition
+                .barriers
+                .iter()
+                .all(|barrier| barrier.reported_by != node(3))
+        );
+        assert!(transition.stalls.is_empty());
+
+        let oversized = realm_config_event(
+            82,
+            node(1),
+            9,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                transition_id: plan.transition_id,
+                bucket: 0,
+                reported_by: node(1),
+                frontier: vec![0; crate::structs::MAX_BARRIER_FRONTIER_BYTES + 1],
+            },
+        );
+        assert!(matches!(
+            state.apply(&oversized),
+            Err(AdminDocumentReducerError::TransitionReportOversized)
+        ));
     }
 
     #[test]
