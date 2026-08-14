@@ -781,16 +781,26 @@ impl Topology {
                             continue;
                         };
                         match config.transition(&transition_id) {
-                            Some(record) => views.push(format!(
-                                "{short}:fenced={} proofs={} barriers={}",
-                                record.barrier_established(bucket.bucket, &bucket.old_holders),
-                                record.proofs_for(bucket.bucket).count(),
-                                record
+                            Some(record) => {
+                                // Name the reporters: a stuck bucket is one
+                                // node missing one peer's barrier.
+                                let fenced: Vec<String> = record
                                     .barriers
                                     .iter()
                                     .filter(|barrier| barrier.bucket == bucket.bucket)
-                                    .count(),
-                            )),
+                                    .map(|barrier| {
+                                        barrier.reported_by.to_string()[..8].to_string()
+                                    })
+                                    .collect();
+                                views.push(format!(
+                                    "{short}:fenced={} proofs={} barriers={fenced:?}",
+                                    record.barrier_established(
+                                        bucket.bucket,
+                                        &bucket.old_holders
+                                    ),
+                                    record.proofs_for(bucket.bucket).count(),
+                                ));
+                            }
                             None => views.push(format!("{short}:norecord")),
                         }
                     }
