@@ -1535,18 +1535,21 @@ impl DocumentSyncService {
             };
             let cursor_key = topic_cursor_key(topic_id);
             let mut cursor = applied_cursor_clock(
+                self.node.storage(),
+                topic_id,
+                genesis,
                 self.storage_read(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key.clone(),
                 )
                 .await?,
-                genesis,
-            );
+            )?;
             cursor.merge(&clock);
+            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
             writes.push((
                 DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                 cursor_key,
-                applied_cursor_value(genesis, &cursor)?,
+                value,
             ));
         }
         self.storage_batch_write(writes).await
@@ -2480,13 +2483,15 @@ impl DocumentSyncService {
             let genesis = topic.genesis;
             let cursor_key = topic_cursor_key(topic_id);
             let mut cursor = applied_cursor_clock(
+                self.node.storage(),
+                topic_id,
+                genesis,
                 self.storage_read(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key.clone(),
                 )
                 .await?,
-                genesis,
-            );
+            )?;
             let batch =
                 self.document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?;
             if batch.cursor == cursor {
@@ -3432,7 +3437,7 @@ impl DocumentSyncService {
                 // unresolved topic is safe to mark as applied.
                 continue;
             }
-            let value = applied_cursor_value(genesis, &cursor)?;
+            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
             if deferred_creates {
                 deferred_rejections.append(&mut rejections);
                 deferred_cursor_writes.push((
@@ -9057,35 +9062,72 @@ fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     ByteView::from(key)
 }
 
-/// An applied-ops cursor together with the genesis it was built from. A tie-break
-/// renumbers every actor sequence, so a cursor carrying another lineage must
-/// never gate the winning chain's replay.
+/// An applied-ops cursor together with the history it describes: the genesis it
+/// was built from, and the op that occupied each actor position when it was
+/// written. A genesis tie-break replaces the chain and an orphan quarantine
+/// rebuilds it in place under the same genesis, but both renumber actor
+/// sequences, so the position alone is never evidence that its op still stands.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct AppliedCursor {
     lineage: irokle_crate::OpId,
     clock: irokle_crate::ActorClock,
+    marks: BTreeMap<irokle_crate::ActorId, irokle_crate::OpId>,
 }
 
-/// Decodes a stored cursor, discarding one written under another genesis (or in
-/// an unreadable shape) so replay restarts at actor sequence one.
+/// Decodes a stored cursor, discarding one written under another genesis, one
+/// whose recorded ops no longer occupy their positions, and one in an
+/// unreadable shape. A discarded cursor restarts replay at actor sequence one.
 fn applied_cursor_clock(
-    stored: Option<Value>,
+    storage: &impl irokle_crate::storage::Storage,
+    topic_id: irokle_crate::TopicId,
     genesis: irokle_crate::OpId,
-) -> irokle_crate::ActorClock {
-    stored
+    stored: Option<Value>,
+) -> Result<irokle_crate::ActorClock> {
+    let Some(cursor) = stored
         .and_then(|value| postcard::from_bytes::<AppliedCursor>(value.as_ref()).ok())
         .filter(|cursor| cursor.lineage == genesis)
-        .map(|cursor| cursor.clock)
-        .unwrap_or_default()
+    else {
+        return Ok(irokle_crate::ActorClock::default());
+    };
+    for (actor_id, actor_seq) in cursor.clock.iter() {
+        if *actor_seq == 0 {
+            continue;
+        }
+        let current = storage
+            .actor_index(&topic_id, actor_id, *actor_seq)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        if current.is_none() || current.as_ref() != cursor.marks.get(actor_id) {
+            debug!(%topic_id, %actor_id, "Discarding a document sync cursor whose history was rebuilt");
+            return Ok(irokle_crate::ActorClock::default());
+        }
+    }
+    Ok(cursor.clock)
 }
 
+/// Encodes a cursor with the ops that currently occupy its positions. A position
+/// with no op is left unmarked, which the read side treats as untrusted.
 fn applied_cursor_value(
+    storage: &impl irokle_crate::storage::Storage,
+    topic_id: irokle_crate::TopicId,
     genesis: irokle_crate::OpId,
     clock: &irokle_crate::ActorClock,
 ) -> Result<ByteView> {
+    let mut marks = BTreeMap::new();
+    for (actor_id, actor_seq) in clock.iter() {
+        if *actor_seq == 0 {
+            continue;
+        }
+        if let Some(op_id) = storage
+            .actor_index(&topic_id, actor_id, *actor_seq)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        {
+            marks.insert(*actor_id, op_id);
+        }
+    }
     postcard::to_allocvec(&AppliedCursor {
         lineage: genesis,
         clock: clock.clone(),
+        marks,
     })
     .map(ByteView::from)
     .map_err(|error| NetError::Bootstrap(error.to_string()))
@@ -16914,6 +16956,9 @@ mod tests {
             };
         let loser_actor = irokle_crate::actor_id_for(topic_id, loser_peer);
         let stale = applied_cursor_clock(
+            loser_node.storage(),
+            topic_id,
+            genesis(loser_node),
             loser
                 .storage_read(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
@@ -16921,8 +16966,8 @@ mod tests {
                 )
                 .await
                 .expect("cursor read"),
-            genesis(loser_node),
-        );
+        )
+        .expect("cursor decodes");
         assert!(
             stale.get(&loser_actor) > 0,
             "the loser's publish must leave a cursor covering its own chain"
@@ -16990,38 +17035,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn applied_cursor_lineage() {
-        // A cursor is trusted only under the genesis it was written for; any
-        // other lineage, and any unreadable value, restarts replay at one.
-        let mut clock = irokle_crate::ActorClock::default();
-        clock.observe(irokle_crate::actor_id_for(topic(1), peer(1)), 4);
-        let encoded = applied_cursor_value(test_genesis(1), &clock).expect("cursor encodes");
+    #[tokio::test]
+    async fn applied_cursor_lineage() {
+        // A cursor is trusted only while it still describes the topic's current
+        // history: another genesis, a position rebuilt under the same genesis
+        // (an orphan quarantine), and any unreadable value all restart replay.
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([81; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(81).await,
+            storage,
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
 
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let local_actor = test_actor(81, UserId::nil(realm_id), realm_id);
+        let event = test_admin_event(
+            Ulid::from_parts(1_810, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            1,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "cursor lineage".to_string(),
+            },
+        );
+        assert!(matches!(
+            service
+                .publish_documents(
+                    vec![DocumentSyncPublish::AdminOperation {
+                        target,
+                        event: Box::new(event),
+                        placement: PlacementRef::NIL,
+                        allow_genesis: true,
+                    }],
+                    Vec::new(),
+                )
+                .await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        let node = service.node();
+        let store = node.storage();
+        let genesis = service
+            .topic_genesis(topic_id)
+            .expect("topic genesis")
+            .expect("topic exists");
+        let clock = store.actor_clock(&topic_id).expect("topic clock");
+        let encoded =
+            applied_cursor_value(store, topic_id, genesis, &clock).expect("cursor encodes");
+        let read = |value: Option<Value>, genesis| {
+            applied_cursor_clock(store, topic_id, genesis, value).expect("cursor reads")
+        };
+
+        assert_eq!(read(Some(encoded.clone().into()), genesis), clock);
         assert_eq!(
-            applied_cursor_clock(Some(encoded.clone().into()), test_genesis(1)),
-            clock
+            read(Some(encoded.clone().into()), test_genesis(2)),
+            irokle_crate::ActorClock::default(),
+            "another genesis is another history"
         );
         assert_eq!(
-            applied_cursor_clock(Some(encoded.into()), test_genesis(2)),
-            irokle_crate::ActorClock::default()
-        );
-        assert_eq!(
-            applied_cursor_clock(
+            read(
                 Some(
                     postcard::to_allocvec(&clock)
                         .expect("bare clock serializes")
                         .into()
                 ),
-                test_genesis(1)
+                genesis
             ),
             irokle_crate::ActorClock::default(),
             "a cursor without a lineage is untrusted"
         );
         assert_eq!(
-            applied_cursor_clock(None, test_genesis(1)),
-            irokle_crate::ActorClock::default()
+            read(None, genesis),
+            irokle_crate::ActorClock::default(),
+            "an absent cursor replays from one"
         );
+
+        // An orphan quarantine keeps the genesis and rebuilds the chain, so the
+        // recorded positions hold different ops than the cursor remembers.
+        let mut rebuilt: AppliedCursor =
+            postcard::from_bytes(encoded.as_ref()).expect("cursor decodes");
+        for mark in rebuilt.marks.values_mut() {
+            *mark = test_genesis(9);
+        }
+        assert_eq!(
+            read(
+                Some(
+                    postcard::to_allocvec(&rebuilt)
+                        .expect("rebuilt cursor serializes")
+                        .into()
+                ),
+                genesis
+            ),
+            irokle_crate::ActorClock::default(),
+            "a rebuilt position must not count as applied"
+        );
+
+        service.shutdown().await;
     }
 
     // Whole-document admin sync is refused by apply_upsert/apply_delete. If reconcile
