@@ -10,6 +10,7 @@
 //! finite remainder to drain.
 
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLACEMENT_WRITE_FENCE_KEYSPACE;
 use aruna_core::storage_entries::placement_fence_key;
@@ -17,6 +18,8 @@ use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
+
+const CLOSE_ATTEMPTS: usize = 4;
 
 /// Generation a write of `placement` is admitted at: the bucket's activation
 /// epoch. `None` while the bucket has no usable activation, which is bootstrap
@@ -40,9 +43,12 @@ pub fn fence_read(realm_id: &RealmId, placement: &PlacementRef) -> (String, Key)
 
 /// The highest generation the stored fence value closes.
 pub fn closed_generation(value: Option<&Value>) -> u64 {
-    value
-        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
-        .map_or(0, u64::from_be_bytes)
+    match value {
+        None => 0,
+        Some(bytes) => <[u8; 8]>::try_from(bytes.as_ref())
+            .map(u64::from_be_bytes)
+            .unwrap_or(u64::MAX),
+    }
 }
 
 /// Whether a write that resolved holders at `generation` may still commit.
@@ -124,34 +130,85 @@ pub async fn close(
     generation: u64,
 ) -> Result<(), String> {
     let (key_space, key) = fence_read(realm_id, placement);
-    let current = match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.clone(),
-            key: key.clone(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => closed_generation(value.as_ref()),
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected fence read result: {other:?}")),
-    };
-    if current >= generation {
-        return Ok(());
+    for _ in 0..CLOSE_ATTEMPTS {
+        let txn_id = match storage
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected fence transaction result: {other:?}")),
+        };
+        let current = match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: key_space.clone(),
+                key: key.clone(),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                closed_generation(value.as_ref())
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error.to_string());
+            }
+            other => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(format!("unexpected fence read result: {other:?}"));
+            }
+        };
+        if current >= generation {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        }
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.clone(),
+                key: key.clone(),
+                value: ByteView::from(generation.to_be_bytes().to_vec()),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error.to_string());
+            }
+            other => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(format!("unexpected fence write result: {other:?}"));
+            }
+        }
+        match storage
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+                if committed == txn_id =>
+            {
+                return Ok(());
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => continue,
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected fence commit result: {other:?}")),
+        }
     }
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value: ByteView::from(generation.to_be_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected fence write result: {other:?}")),
-    }
+    Err(StorageError::TransactionConflict.to_string())
 }
 
 #[cfg(test)]
@@ -177,8 +234,10 @@ mod tests {
         assert!(!admits(Some(&closed), 1));
         assert!(!admits(Some(&closed), 2));
         assert!(admits(Some(&closed), 3));
-        // A truncated value must never read as "closed at a high generation".
-        assert_eq!(closed_generation(Some(&Value::from(vec![1u8]))), 0);
+        // A malformed value must never reopen the bucket.
+        let malformed = Value::from(vec![1u8]);
+        assert_eq!(closed_generation(Some(&malformed)), u64::MAX);
+        assert!(!admits(Some(&malformed), 1));
     }
 
     #[test]
@@ -304,5 +363,13 @@ mod tests {
         assert_eq!(stored().await, 3);
         close(&storage, &realm_id, &placement, 4).await.unwrap();
         assert_eq!(stored().await, 4);
+
+        let (lower, higher) = tokio::join!(
+            close(&storage, &realm_id, &placement, 5),
+            close(&storage, &realm_id, &placement, 6),
+        );
+        lower.unwrap();
+        higher.unwrap();
+        assert_eq!(stored().await, 6);
     }
 }
