@@ -48,6 +48,9 @@ pub enum PersistentIdError {
     DocumentMissing,
     #[error("persistent id authority is unavailable: {0}")]
     Unavailable(String),
+    /// The mapping's bucket cut over to a new holder set mid-transition.
+    #[error("persistent id mapping bucket cut over; retry the transition")]
+    PlacementFenced,
 }
 
 pub fn read_mapping_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
@@ -181,9 +184,13 @@ pub async fn withdraw_persistent_id(
 /// replicates after the document is gone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MappingRoute {
+    pub realm_id: RealmId,
     pub placement: PlacementRef,
     pub peers: Vec<aruna_core::NodeId>,
     pub actor: aruna_core::NodeId,
+    /// Activation generation the mapping's bucket resolved at. `0` means the
+    /// realm has no activation yet, so no transition can be in flight.
+    pub generation: u64,
 }
 
 async fn mapping_route(
@@ -214,9 +221,11 @@ pub fn mapping_route_for(
 ) -> Option<MappingRoute> {
     let placement = mapping_placement(config, realm_id, document_id).ok()?;
     Some(MappingRoute {
+        realm_id,
         placement,
         peers: resolve_shard_holders(config, &placement),
         actor,
+        generation: crate::placement::fence::write_generation(config, &placement).unwrap_or(0),
     })
 }
 
@@ -263,6 +272,9 @@ async fn mint_in_txn(
     if mapping_in_txn(ctx, document_id, txn_id).await?.is_some() {
         return Ok(None);
     }
+    if !fence_admits(ctx, route, txn_id).await? {
+        return Err(PersistentIdError::PlacementFenced);
+    }
     let mapping =
         PersistentIdMapping::conceptual(document_id, minted_by, revision(route, minted_at_ms));
     write_transition(ctx, route, &mapping, txn_id).await?;
@@ -282,6 +294,9 @@ async fn withdraw_in_txn(
     // already gone belongs to the transaction that removed it, not here.
     if registry_missing_txn(ctx, document_id, txn_id).await? {
         return Err(PersistentIdError::DocumentMissing);
+    }
+    if !fence_admits(ctx, route, txn_id).await? {
+        return Err(PersistentIdError::PlacementFenced);
     }
     let existing = mapping_in_txn(ctx, document_id, txn_id).await?;
     let Some((mapping, writes)) =
@@ -353,7 +368,8 @@ pub fn transition_entries(
                 },
                 route.placement,
                 false,
-            );
+            )
+            .fenced_at(route.generation);
             let entry = outbox_write_entry(&record)
                 .map_err(|error| PersistentIdError::Conversion(error.into()))?;
             writes.push(entry);
@@ -407,6 +423,36 @@ async fn registry_missing_txn(
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
             "unexpected registry fence event: {other:?}"
+        ))),
+    }
+}
+
+/// Reads the mapping bucket's write fence inside the transaction, so a
+/// departing holder's close either rejects this transition or conflicts it.
+async fn fence_admits(
+    ctx: &DriverContext,
+    route: &Option<MappingRoute>,
+    txn_id: TxnId,
+) -> Result<bool, PersistentIdError> {
+    let Some(route) = route.as_ref().filter(|route| route.generation > 0) else {
+        return Ok(true);
+    };
+    let (key_space, key) = crate::placement::fence::fence_read(&route.realm_id, &route.placement);
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space,
+            key,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(
+            crate::placement::fence::admits(value.as_ref(), route.generation),
+        ),
+        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
+        other => Err(PersistentIdError::Unavailable(format!(
+            "unexpected mapping fence event: {other:?}"
         ))),
     }
 }
@@ -669,5 +715,70 @@ mod tests {
         assert_eq!(mapping.minted_at_ms, Some(1));
         assert_eq!(mapping.withdrawn_at_ms, Some(10));
         assert_eq!(read_mapping(&ctx, id).await.unwrap().unwrap(), mapping);
+    }
+
+    fn node() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
+    }
+
+    /// A realm whose buckets are activated at generation one, so a mapping
+    /// transition resolves a generation and takes the bucket's fence.
+    fn activated_config() -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+        config.seed_default_placement();
+        config.ensure_node(node(), aruna_core::structs::RealmNodeKind::Server);
+        config.snapshot_candidate_map();
+        config
+    }
+
+    fn outbox_row(writes: &[TransitionEntry]) -> aruna_core::document::DocumentSyncOutboxRecord {
+        let entry = writes
+            .iter()
+            .find(|(key_space, _, _)| {
+                key_space == aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE
+            })
+            .expect("the transition publishes an outbox row");
+        postcard::from_bytes(entry.2.as_ref()).expect("outbox row decodes")
+    }
+
+    #[tokio::test]
+    async fn fence_rejects_mint() {
+        // The departing holder closed generation one: a mapping transition that
+        // resolved the old holders must not commit its outbox row afterwards.
+        let (ctx, _dir) = context();
+        let config = activated_config();
+        use aruna_core::StructuredId;
+        let document_id = aruna_core::MetaResourceId::from_parts(
+            13,
+            aruna_core::structured_id::PlacementHandle::new(aruna_core::structs::METADATA_HANDLE)
+                .unwrap(),
+            aruna_core::structured_id::BucketId::new(3).unwrap(),
+            13,
+        )
+        .expect("the structured id builds")
+        .as_ulid();
+        let route =
+            mapping_route_for(&config, realm(), document_id, node()).expect("the route resolves");
+        assert_eq!(route.generation, 1);
+
+        let mapping =
+            PersistentIdMapping::conceptual(document_id, user(), revision(&Some(route.clone()), 1));
+        let writes = transition_entries(&Some(route.clone()), &mapping).expect("entries build");
+        assert_eq!(outbox_row(&writes).generation, 1);
+
+        let txn_id = start_transaction(&ctx).await.unwrap();
+        assert!(
+            fence_admits(&ctx, &Some(route.clone()), txn_id)
+                .await
+                .unwrap()
+        );
+        abort_transaction(&ctx, txn_id).await;
+
+        crate::placement::fence::close(&ctx.storage_handle, &realm(), &route.placement, 1)
+            .await
+            .expect("the departing holder closes the fence");
+        let txn_id = start_transaction(&ctx).await.unwrap();
+        assert!(!fence_admits(&ctx, &Some(route), txn_id).await.unwrap());
+        abort_transaction(&ctx, txn_id).await;
     }
 }
