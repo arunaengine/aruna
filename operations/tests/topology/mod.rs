@@ -788,16 +788,11 @@ impl Topology {
                                     .barriers
                                     .iter()
                                     .filter(|barrier| barrier.bucket == bucket.bucket)
-                                    .map(|barrier| {
-                                        barrier.reported_by.to_string()[..8].to_string()
-                                    })
+                                    .map(|barrier| barrier.reported_by.to_string()[..8].to_string())
                                     .collect();
                                 views.push(format!(
                                     "{short}:fenced={} proofs={} barriers={fenced:?}",
-                                    record.barrier_established(
-                                        bucket.bucket,
-                                        &bucket.old_holders
-                                    ),
+                                    record.barrier_established(bucket.bucket, &bucket.old_holders),
                                     record.proofs_for(bucket.bucket).count(),
                                 ));
                             }
