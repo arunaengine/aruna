@@ -34,11 +34,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-    DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
-    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    SYNC_QUARANTINE_USAGE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    DOCUMENT_SYNC_EVICTION_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE,
+    GROUP_OWNER_INDEX_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+    NOTIFICATION_WATCH_INTEREST_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -179,6 +180,33 @@ struct DocumentEventBatch {
     /// Ops whose transport payload never decoded into an event. They are
     /// permanent by construction: no redelivery can make the bytes valid.
     rejections: Vec<SyncRejection>,
+}
+
+/// One journalled eviction: the payloads Irokle removed with the losing chain,
+/// plus the key that releases them once their outbox rows are committed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingEviction {
+    pub key: ByteView,
+    pub documents: Vec<DocumentSyncEvictedDocument>,
+}
+
+/// Journal entries a restart replays in one pass. Far above any realistic
+/// backlog: an entry only survives an interrupted handoff.
+const EVICTION_JOURNAL_SCAN_LIMIT: usize = 1024;
+
+/// Derives one stable key per eviction so repeating the journal write, or the
+/// recovery it drives, never multiplies entries.
+fn eviction_journal_key(
+    topic_id: irokle_crate::TopicId,
+    documents: &[DocumentSyncEvictedDocument],
+) -> ByteView {
+    let mut identity = topic_id.as_bytes().to_vec();
+    for document in documents {
+        identity.extend_from_slice(&document.event_id.to_bytes());
+    }
+    let mut key = topic_id.as_bytes().to_vec();
+    key.extend_from_slice(irokle_crate::OpId::hash(&identity).as_bytes());
+    ByteView::from(key)
 }
 
 /// Placement fence outcome. The transactional read of the realm config is the
@@ -546,7 +574,7 @@ impl DocumentSyncService {
                     placement,
                 } => {
                     documents.push(DocumentSyncEvictedDocument {
-                        event_id: None,
+                        event_id: event.event_id,
                         target,
                         event: DocumentSyncOutboxEvent::AdminOperation { event },
                         placement,
@@ -568,7 +596,7 @@ impl DocumentSyncService {
                         continue;
                     }
                     documents.push(DocumentSyncEvictedDocument {
-                        event_id: Some(event_id),
+                        event_id,
                         target,
                         placement: change.placement,
                         event: DocumentSyncOutboxEvent::Upsert { bytes, change },
@@ -589,7 +617,7 @@ impl DocumentSyncService {
                         continue;
                     }
                     documents.push(DocumentSyncEvictedDocument {
-                        event_id: Some(event_id),
+                        event_id,
                         target,
                         placement: change.placement,
                         event: DocumentSyncOutboxEvent::Delete { change },
@@ -1661,17 +1689,96 @@ impl DocumentSyncService {
         }
     }
 
-    /// Decodes a genesis tie-break eviction and drops the replaced chain's
-    /// cursors. Both belong to the same reset, so the embedder cannot do one
-    /// without the other.
-    pub async fn consume_eviction(
-        &self,
-        eviction: TopicEviction,
-    ) -> Vec<DocumentSyncEvictedDocument> {
+    /// Decodes a genesis tie-break eviction, journals the recovered payload
+    /// durably, and drops the replaced chain's cursors. Irokle has already
+    /// removed the losing chain, so the journal entry is the only remaining copy
+    /// until every replacement outbox row is committed.
+    pub async fn consume_eviction(&self, eviction: TopicEviction) -> Option<PendingEviction> {
         let topic_id = eviction.topic_id;
         let documents = self.decode_eviction(eviction);
         self.reset_applied_cursor(topic_id).await;
-        documents
+        if documents.is_empty() {
+            return None;
+        }
+        let pending = PendingEviction {
+            key: eviction_journal_key(topic_id, &documents),
+            documents,
+        };
+        match postcard::to_allocvec(&pending.documents) {
+            Ok(value) => {
+                if let Err(error) = self
+                    .storage_write(
+                        DOCUMENT_SYNC_EVICTION_KEYSPACE.to_string(),
+                        pending.key.clone(),
+                        value.into(),
+                    )
+                    .await
+                {
+                    // Deliver anyway: the in-memory copy is all that is left.
+                    warn!(%topic_id, %error, "Failed to journal evicted document sync payloads");
+                }
+            }
+            Err(error) => {
+                warn!(%topic_id, %error, "Failed to encode evicted document sync payloads");
+            }
+        }
+        Some(pending)
+    }
+
+    /// Journal entries left by an interrupted eviction handoff, oldest first.
+    /// The net layer replays them before it treats recovery as complete.
+    pub async fn pending_evictions(&self) -> Result<Vec<PendingEviction>> {
+        let entries = match self
+            .storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: DOCUMENT_SYNC_EVICTION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: EVICTION_JOURNAL_SCAN_LIMIT,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(NetError::Bootstrap(error.to_string()));
+            }
+            other => {
+                return Err(NetError::Bootstrap(format!(
+                    "unexpected eviction journal scan event: {other:?}"
+                )));
+            }
+        };
+        Ok(entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                match postcard::from_bytes::<Vec<DocumentSyncEvictedDocument>>(value.as_ref()) {
+                    Ok(documents) => Some(PendingEviction { key, documents }),
+                    Err(error) => {
+                        warn!(%error, "Skipping undecodable eviction journal entry");
+                        None
+                    }
+                }
+            })
+            .collect())
+    }
+
+    /// Releases a journal entry once every replacement outbox row is durable.
+    pub async fn clear_eviction(&self, key: ByteView) -> Result<()> {
+        match self
+            .storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: DOCUMENT_SYNC_EVICTION_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+            other => Err(NetError::Bootstrap(format!(
+                "unexpected eviction journal delete event: {other:?}"
+            ))),
+        }
     }
 
     /// Drops the applied-ops cursor of a topic whose chain was replaced by a
@@ -16657,19 +16764,20 @@ mod tests {
                 .is_none(),
             "the replaced chain's applied-ops cursor must not survive its eviction"
         );
-        assert_eq!(reemitted.len(), 1);
-        let reemitted = &reemitted[0];
-        assert_eq!(&reemitted.target, &target);
+        let reemitted = reemitted.expect("the eviction journals a pending entry");
+        assert_eq!(reemitted.documents.len(), 1);
+        let document = &reemitted.documents[0];
+        assert_eq!(&document.target, &target);
         assert!(
-            !reemitted.allow_genesis,
+            !document.allow_genesis,
             "re-emission must not mint a rival genesis"
         );
-        assert!(
-            reemitted.event_id.is_none(),
-            "admin outbox re-emission uses the embedded admin event id"
+        assert_eq!(
+            document.event_id, loser_event_id,
+            "the outbox record id must be the evicted event's own id"
         );
-        assert_eq!(reemitted.placement, placement);
-        match &reemitted.event {
+        assert_eq!(document.placement, placement);
+        match &document.event {
             DocumentSyncOutboxEvent::AdminOperation { event } => {
                 assert_eq!(
                     event.event_id, loser_event_id,
@@ -16678,6 +16786,25 @@ mod tests {
             }
             other => panic!("expected an AdminOperation re-emission, got {other:?}"),
         }
+
+        // Irokle already removed the losing chain, so the payload is durable
+        // before it is handed out and stays recoverable until it is released.
+        let journalled = loser
+            .pending_evictions()
+            .await
+            .expect("eviction journal reads");
+        assert_eq!(journalled, vec![reemitted.clone()]);
+        loser
+            .clear_eviction(reemitted.key)
+            .await
+            .expect("journal entry releases");
+        assert!(
+            loser
+                .pending_evictions()
+                .await
+                .expect("eviction journal reads")
+                .is_empty()
+        );
     }
 
     // The eager cursor delete is an optimization, not the invariant. A crash or

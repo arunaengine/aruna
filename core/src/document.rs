@@ -150,9 +150,13 @@ pub enum DocumentSyncOutboxEvent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A payload recovered from a genesis tie-break, journalled until its
+/// replacement outbox row is durable. `event_id` is the evicted event's own id,
+/// so repeating the recovery rewrites one stable outbox row instead of adding a
+/// duplicate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentSyncEvictedDocument {
-    pub event_id: Option<Ulid>,
+    pub event_id: Ulid,
     pub target: DocumentSyncTarget,
     pub event: DocumentSyncOutboxEvent,
     pub placement: PlacementRef,

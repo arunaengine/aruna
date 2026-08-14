@@ -55,7 +55,7 @@ use ulid::Ulid;
 pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
-pub use document_sync::{DocumentSyncService, ShardGenesisProbe};
+pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
 pub use error::{NetError, Result};
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
@@ -65,6 +65,10 @@ const DEFAULT_INBOUND_DRAIN: Duration = Duration::from_secs(5);
 /// Grace for the same handlers once the endpoint is closed under them.
 pub const FORCED_INBOUND_DRAIN: Duration = Duration::from_secs(5);
 const NOTIFICATION_WAKE_CAPACITY: usize = 256;
+/// How often a journalled eviction whose outbox rows are not yet committed is
+/// retried. Progress also happens on handler registration and on any new
+/// eviction, so this only bounds an otherwise idle retry.
+const EVICTION_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 use connection_pool::{ConnectionPool, ConnectionPoolOptions};
 pub use streams::StreamsService;
 
@@ -368,15 +372,23 @@ pub trait InboundEventHandler: Send + Sync {
 
     /// Re-emits the documents recovered from a genesis tie-break eviction: the
     /// loser's own payloads, decoded from the reset chain, to be replayed onto
-    /// the winning genesis via durable operations outbox records.
-    async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncEvictedDocument>) {}
+    /// the winning genesis via durable operations outbox records. Returns
+    /// whether every replacement record is committed; anything else keeps the
+    /// journal entry for a later attempt.
+    async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncEvictedDocument>) -> bool {
+        false
+    }
 }
 
+/// Hands journalled evictions to the registered handler and releases only the
+/// entries whose replacement records are durable. Everything else stays pending,
+/// so a missing handler, a failed write, or a shutdown loses nothing.
 async fn flush_pending_evicted_documents(
     inbound_handler: &Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
-    pending_documents: &mut Vec<DocumentSyncEvictedDocument>,
+    document_sync: &Arc<DocumentSyncService>,
+    pending: &mut Vec<PendingEviction>,
 ) -> bool {
-    if pending_documents.is_empty() {
+    if pending.is_empty() {
         return true;
     }
 
@@ -385,9 +397,27 @@ async fn flush_pending_evicted_documents(
         return false;
     };
 
-    let documents = mem::take(pending_documents);
-    handler.handle_evicted_documents(documents).await;
-    true
+    let mut retained = Vec::new();
+    let mut flushed = true;
+    for entry in mem::take(pending) {
+        if !handler
+            .handle_evicted_documents(entry.documents.clone())
+            .await
+        {
+            flushed = false;
+            retained.push(entry);
+            continue;
+        }
+        if let Err(error) = document_sync.clear_eviction(entry.key.clone()).await {
+            // The rows are durable and their ids are stable, so a repeat is a
+            // no-op; keep the entry rather than risk losing it.
+            warn!(%error, "Failed to release a drained eviction journal entry");
+            flushed = false;
+            retained.push(entry);
+        }
+    }
+    *pending = retained;
+    flushed
 }
 
 #[derive(Clone)]
@@ -719,10 +749,11 @@ impl NetHandle {
         });
 
         // Drains genesis tie-break evictions (from irokle's own accept/resync
-        // loops and this service's bootstrap/batch-sync paths), decodes them
-        // into re-emittable documents, and hands them to the registered inbound
-        // handler for outbox re-enqueue. Decoded documents are buffered until
-        // the inbound handler is registered and drained before shutdown exits.
+        // loops and this service's bootstrap/batch-sync paths) into the durable
+        // eviction journal, then hands each entry to the registered inbound
+        // handler for outbox re-enqueue. An entry is released only once its
+        // replacement records are committed, so a missing handler, a failed
+        // write, a shutdown, or a crash all leave the payload recoverable.
         let eviction_document_sync = document_sync.clone();
         let eviction_inbound_handler = inbound_handler.clone();
         let eviction_inbound_handler_registered = inbound_handler_registered.clone();
@@ -732,51 +763,68 @@ impl NetHandle {
             let Some(mut eviction_rx) = eviction_document_sync.take_eviction_receiver() else {
                 return;
             };
-            let mut pending_documents = Vec::new();
+            let mut pending = match eviction_document_sync.pending_evictions().await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    warn!(%error, "Failed to read the eviction journal on startup");
+                    Vec::new()
+                }
+            };
+            let mut retry = tokio::time::interval(EVICTION_RETRY_INTERVAL);
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = eviction_shutdown_for_task.cancelled() => {
                         while let Ok(eviction) = eviction_rx.try_recv() {
-                            pending_documents
-                                .extend(eviction_document_sync.consume_eviction(eviction).await);
+                            pending.extend(eviction_document_sync.consume_eviction(eviction).await);
                         }
                         if !flush_pending_evicted_documents(
                             &eviction_inbound_handler,
-                            &mut pending_documents,
+                            &eviction_document_sync,
+                            &mut pending,
                         )
                         .await
                         {
+                            // Never dropped: the journal outlives this process.
                             warn!(
-                                count = pending_documents.len(),
-                                "Dropping re-emitted eviction documents during shutdown without a registered inbound handler"
+                                count = pending.len(),
+                                "Leaving evicted document sync payloads journalled for restart"
                             );
                         }
                         break;
                     },
-                    _ = eviction_inbound_handler_registered.notified(), if !pending_documents.is_empty() => {
+                    _ = eviction_inbound_handler_registered.notified(), if !pending.is_empty() => {
                         let _ = flush_pending_evicted_documents(
                             &eviction_inbound_handler,
-                            &mut pending_documents,
+                            &eviction_document_sync,
+                            &mut pending,
+                        )
+                        .await;
+                    },
+                    _ = retry.tick(), if !pending.is_empty() => {
+                        let _ = flush_pending_evicted_documents(
+                            &eviction_inbound_handler,
+                            &eviction_document_sync,
+                            &mut pending,
                         )
                         .await;
                     },
                     maybe_eviction = eviction_rx.recv() => {
                         let Some(eviction) = maybe_eviction else { break };
-                        let documents =
-                            eviction_document_sync.consume_eviction(eviction).await;
-                        if documents.is_empty() {
+                        pending.extend(eviction_document_sync.consume_eviction(eviction).await);
+                        if pending.is_empty() {
                             continue;
                         }
-                        pending_documents.extend(documents);
                         if !flush_pending_evicted_documents(
                             &eviction_inbound_handler,
-                            &mut pending_documents,
+                            &eviction_document_sync,
+                            &mut pending,
                         )
                         .await
                         {
                             warn!(
-                                count = pending_documents.len(),
-                                "Buffering re-emitted eviction documents until an inbound handler is registered"
+                                count = pending.len(),
+                                "Retrying journalled eviction payloads until their outbox rows commit"
                             );
                         }
                     }
@@ -2575,7 +2623,7 @@ mod tests {
         };
 
         DocumentSyncEvictedDocument {
-            event_id: Some(event_id),
+            event_id,
             target: DocumentSyncTarget::RealmConfig {
                 realm_id: RealmId::from_bytes([seed; 32]),
             },
@@ -2585,9 +2633,19 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct RecordingEvictedHandler {
         documents: tokio::sync::Mutex<Vec<DocumentSyncEvictedDocument>>,
+        accepts: bool,
+    }
+
+    impl RecordingEvictedHandler {
+        fn new(accepts: bool) -> Self {
+            Self {
+                documents: tokio::sync::Mutex::new(Vec::new()),
+                accepts,
+            }
+        }
     }
 
     #[async_trait]
@@ -2600,31 +2658,83 @@ mod tests {
         ) {
         }
 
-        async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) {
+        async fn handle_evicted_documents(
+            &self,
+            documents: Vec<DocumentSyncEvictedDocument>,
+        ) -> bool {
             self.documents.lock().await.extend(documents);
+            self.accepts
         }
+    }
+
+    async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
+        let dir = tempfile::tempdir().expect("eviction service tempdir");
+        let storage = aruna_storage::FjallStorage::open(
+            dir.path().join("storage").to_str().expect("utf-8 path"),
+        )
+        .expect("storage opens");
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[123u8; 32]))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![Alpn::DocumentSync.as_bytes().to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("valid bind addr"),
+            )
+            .expect("bind addr configures")
+            .bind()
+            .await
+            .expect("endpoint binds");
+        let service = DocumentSyncService::open_with_persist_policy(
+            endpoint,
+            storage,
+            dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            ::irokle::net::IrohRuntimeConfig::default(),
+            aruna_storage::FjallPersistPolicy::Buffer,
+            RealmId::from_bytes([123u8; 32]),
+        )
+        .expect("document sync service opens");
+        (dir, Arc::new(service))
     }
 
     #[tokio::test]
     async fn evicted_documents_wait_for_registered_inbound_handler() {
+        // A journal entry survives a missing handler and a handler that cannot
+        // commit; only a durable conversion releases it.
+        let (_dir, service) = eviction_test_service().await;
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
-        let expected = vec![test_evicted_document(11), test_evicted_document(12)];
-        let mut pending_documents = expected.clone();
+        let entry = PendingEviction {
+            key: byteview::ByteView::from(b"eviction-test".to_vec()),
+            documents: vec![test_evicted_document(11), test_evicted_document(12)],
+        };
+        let mut pending = vec![entry.clone()];
 
         assert!(
-            !flush_pending_evicted_documents(&inbound_handler, &mut pending_documents).await,
-            "documents must stay buffered without a handler"
+            !flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await,
+            "payloads must stay journalled without a handler"
         );
-        assert_eq!(pending_documents, expected);
+        assert_eq!(pending, vec![entry.clone()]);
 
-        let handler = Arc::new(RecordingEvictedHandler::default());
-        let registered_handler: Arc<dyn InboundEventHandler> = handler.clone();
-        *inbound_handler.write() = Some(registered_handler);
+        let failing = Arc::new(RecordingEvictedHandler::new(false));
+        *inbound_handler.write() = Some(failing.clone() as Arc<dyn InboundEventHandler>);
+        assert!(
+            !flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await,
+            "a handler that cannot commit must not release the entry"
+        );
+        assert_eq!(pending, vec![entry.clone()]);
+        assert_eq!(*failing.documents.lock().await, entry.documents);
 
-        assert!(flush_pending_evicted_documents(&inbound_handler, &mut pending_documents).await);
-        assert!(pending_documents.is_empty());
-        assert_eq!(*handler.documents.lock().await, expected);
+        let handler = Arc::new(RecordingEvictedHandler::new(true));
+        *inbound_handler.write() = Some(handler.clone() as Arc<dyn InboundEventHandler>);
+        assert!(flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await);
+        assert!(pending.is_empty());
+        assert_eq!(*handler.documents.lock().await, entry.documents);
+
+        service.shutdown().await;
     }
 
     #[test]
