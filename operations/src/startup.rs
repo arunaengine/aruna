@@ -58,6 +58,14 @@ fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
     )
 }
 
+fn sync_eligible_node(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    let node_id = node_id.to_string();
+    config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == node_id && node.kind.is_sync_eligible())
+}
+
 fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
     config
         .nodes
@@ -1066,10 +1074,14 @@ fn plan_shard_groups(
     // One designated minter for the realm-wide topics, derived from the config
     // every node materializes: the lowest sync-eligible node id, the same rank-0
     // rule the metadata graph topics use. Positive absence alone lets every
-    // observer mint the same topic at once, which forks the realm document.
-    let realm_minter = shared_peers
-        .iter()
-        .all(|peer| node_id.as_bytes() < peer.as_bytes());
+    // observer mint the same topic at once, which forks the realm document. The
+    // eligibility check is what makes the choice agree everywhere: peers resolve
+    // the minter over sync-eligible nodes only, so a node outside that set must
+    // never read itself as the lowest.
+    let realm_minter = sync_eligible_node(config, node_id)
+        && shared_peers
+            .iter()
+            .all(|peer| node_id.as_bytes() < peer.as_bytes());
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let groups = if realm_wide_target(&target) && !realm_minter {
@@ -1644,6 +1656,40 @@ mod tests {
             config.ensure_node(*node_id, RealmNodeKind::Server);
         }
         config
+    }
+
+    // Every node must resolve the same realm-wide minter. Peers resolve it over
+    // sync-eligible nodes only, so a User node that happens to hold the lowest
+    // id must not read itself as the minter and mint a rival genesis.
+    #[test]
+    fn realm_minter_agrees() {
+        let realm_id = RealmId([7; 32]);
+        let mut ids = vec![node(1), node(2), node(3)];
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let (user, minter, follower) = (ids[0], ids[1], ids[2]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.ensure_node(user, RealmNodeKind::User);
+        config.ensure_node(minter, RealmNodeKind::Server);
+        config.ensure_node(follower, RealmNodeKind::Server);
+
+        let mints_realm_topics = |node_id| {
+            plan_shard_groups(&config, node_id, realm_id, 0)
+                .into_units()
+                .iter()
+                .any(|unit| {
+                    unit.kind == RestoreKind::Shared
+                        && unit.topics.contains(
+                            &DocumentSyncTarget::RealmConfig { realm_id }
+                                .sync_topic_id(realm_id, &PlacementRef::NIL),
+                        )
+                })
+        };
+        assert!(mints_realm_topics(minter));
+        assert!(!mints_realm_topics(follower));
+        assert!(
+            !mints_realm_topics(user),
+            "a node outside the sync-eligible set is never the realm minter"
+        );
     }
 
     #[test]
