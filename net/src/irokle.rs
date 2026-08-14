@@ -1500,26 +1500,25 @@ impl DocumentSyncService {
         }
         let mut writes = Vec::with_capacity(published.len());
         for (topic_id, clock) in published {
+            // A tie-break between the publish and this write leaves the ops on a
+            // chain that no longer exists; the next reconcile replays the winner.
+            let Some(genesis) = self.topic_genesis(topic_id)? else {
+                continue;
+            };
             let cursor_key = topic_cursor_key(topic_id);
-            let mut cursor: irokle_crate::ActorClock = match self
-                .storage_read(
+            let mut cursor = applied_cursor_clock(
+                self.storage_read(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key.clone(),
                 )
-                .await?
-            {
-                Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
-                None => irokle_crate::ActorClock::default(),
-            };
-            cursor.merge(&clock);
-            let value = ByteView::from(
-                postcard::to_allocvec(&cursor)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                .await?,
+                genesis,
             );
+            cursor.merge(&clock);
             writes.push((
                 DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                 cursor_key,
-                value,
+                applied_cursor_value(genesis, &cursor)?,
             ));
         }
         self.storage_batch_write(writes).await
@@ -1633,12 +1632,27 @@ impl DocumentSyncService {
         sync_peers
     }
 
+    fn topic_genesis(&self, topic_id: irokle_crate::TopicId) -> Result<Option<irokle_crate::OpId>> {
+        Ok(self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .map(|state| state.genesis))
+    }
+
     fn next_sync_round(&self, topic_id: irokle_crate::TopicId) -> Result<u64> {
-        current_cursor(&self.fanout_cursors, topic_id)
+        let Some(genesis) = self.topic_genesis(topic_id)? else {
+            return Ok(0);
+        };
+        current_cursor(&self.fanout_cursors, topic_id, genesis)
     }
 
     fn advance_cursor(&self, topic_id: irokle_crate::TopicId, round: u64) -> Result<()> {
-        advance_cursor(&self.fanout_cursors, topic_id, round)
+        let Some(genesis) = self.topic_genesis(topic_id)? else {
+            return Ok(());
+        };
+        advance_cursor(&self.fanout_cursors, topic_id, genesis, round)
     }
 
     fn clear_cursor(&self, topic_id: irokle_crate::TopicId) {
@@ -2354,17 +2368,18 @@ impl DocumentSyncService {
             if topic.event_type_id != DocumentSyncEvent::TYPE_ID {
                 continue;
             }
+            // Lineage self-heals the cursor: an eviction callback that was lost
+            // or failed cannot make the winner's early ops look already applied.
+            let genesis = topic.genesis;
             let cursor_key = topic_cursor_key(topic_id);
-            let mut cursor: irokle_crate::ActorClock = match self
-                .storage_read(
+            let mut cursor = applied_cursor_clock(
+                self.storage_read(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key.clone(),
                 )
-                .await?
-            {
-                Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
-                None => irokle_crate::ActorClock::default(),
-            };
+                .await?,
+                genesis,
+            );
             let batch =
                 self.document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?;
             if batch.cursor == cursor {
@@ -3310,10 +3325,7 @@ impl DocumentSyncService {
                 // unresolved topic is safe to mark as applied.
                 continue;
             }
-            let value = ByteView::from(
-                postcard::to_allocvec(&cursor)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-            );
+            let value = applied_cursor_value(genesis, &cursor)?;
             if deferred_creates {
                 deferred_rejections.append(&mut rejections);
                 deferred_cursor_writes.push((
@@ -8938,43 +8950,84 @@ fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     ByteView::from(key)
 }
 
+/// An applied-ops cursor together with the genesis it was built from. A tie-break
+/// renumbers every actor sequence, so a cursor carrying another lineage must
+/// never gate the winning chain's replay.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct AppliedCursor {
+    lineage: irokle_crate::OpId,
+    clock: irokle_crate::ActorClock,
+}
+
+/// Decodes a stored cursor, discarding one written under another genesis (or in
+/// an unreadable shape) so replay restarts at actor sequence one.
+fn applied_cursor_clock(
+    stored: Option<Value>,
+    genesis: irokle_crate::OpId,
+) -> irokle_crate::ActorClock {
+    stored
+        .and_then(|value| postcard::from_bytes::<AppliedCursor>(value.as_ref()).ok())
+        .filter(|cursor| cursor.lineage == genesis)
+        .map(|cursor| cursor.clock)
+        .unwrap_or_default()
+}
+
+fn applied_cursor_value(
+    genesis: irokle_crate::OpId,
+    clock: &irokle_crate::ActorClock,
+) -> Result<ByteView> {
+    postcard::to_allocvec(&AppliedCursor {
+        lineage: genesis,
+        clock: clock.clone(),
+    })
+    .map(ByteView::from)
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
+}
+
+const FANOUT_CURSOR_LEN: usize = irokle_crate::OpId::LEN + std::mem::size_of::<u64>();
+
+fn fanout_cursor_value(genesis: irokle_crate::OpId, round: u64) -> [u8; FANOUT_CURSOR_LEN] {
+    let mut value = [0u8; FANOUT_CURSOR_LEN];
+    value[..irokle_crate::OpId::LEN].copy_from_slice(genesis.as_bytes());
+    value[irokle_crate::OpId::LEN..].copy_from_slice(&round.to_be_bytes());
+    value
+}
+
+fn fanout_cursor_round(value: &[u8], genesis: irokle_crate::OpId) -> Option<u64> {
+    let (lineage, round) = value.split_at_checked(irokle_crate::OpId::LEN)?;
+    if lineage != genesis.as_bytes() {
+        return None;
+    }
+    Some(u64::from_be_bytes(round.try_into().ok()?))
+}
+
 fn current_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
+    genesis: irokle_crate::OpId,
 ) -> Result<u64> {
-    let Some(value) = cursors
+    Ok(cursors
         .get(topic_cursor_key(topic_id))
         .map_err(|error| NetError::Bootstrap(error.to_string()))?
-    else {
-        return Ok(0);
-    };
-    if value.len() != std::mem::size_of::<u64>() {
-        return Ok(0);
-    }
-    let mut bytes = [0u8; std::mem::size_of::<u64>()];
-    bytes.copy_from_slice(value.as_ref());
-    Ok(u64::from_be_bytes(bytes))
+        .and_then(|value| fanout_cursor_round(value.as_ref(), genesis))
+        .unwrap_or_default())
 }
 
 fn advance_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
+    genesis: irokle_crate::OpId,
     round: u64,
 ) -> Result<()> {
     cursors
         .update_fetch(topic_cursor_key(topic_id), |value| {
-            let stored = value
-                .filter(|value| value.len() == std::mem::size_of::<u64>())
-                .map(|value| {
-                    let mut bytes = [0u8; std::mem::size_of::<u64>()];
-                    bytes.copy_from_slice(value.as_ref());
-                    u64::from_be_bytes(bytes)
-                })
-                .unwrap_or_default();
-            if stored == round {
-                Some(fjall::Slice::from(round.wrapping_add(1).to_be_bytes()))
-            } else {
-                value.cloned()
+            // A cursor from a replaced genesis reads as no round at all, so the
+            // first advance after a tie-break rebinds it to the new lineage.
+            match value.and_then(|value| fanout_cursor_round(value.as_ref(), genesis)) {
+                Some(stored) if stored != round => value.cloned(),
+                _ => Some(fjall::Slice::from(
+                    fanout_cursor_value(genesis, round.wrapping_add(1)).as_slice(),
+                )),
             }
         })
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -9546,8 +9599,11 @@ mod tests {
                     fjall::KeyspaceCreateOptions::default,
                 )
                 .expect("fanout cursor keyspace");
-            assert_eq!(current_cursor(&cursors, topic_id).expect("first cursor"), 0);
-            advance_cursor(&cursors, topic_id, 0).expect("advance cursor");
+            assert_eq!(
+                current_cursor(&cursors, topic_id, test_genesis(1)).expect("first cursor"),
+                0
+            );
+            advance_cursor(&cursors, topic_id, test_genesis(1), 0).expect("advance cursor");
             db.persist(fjall::PersistMode::SyncAll)
                 .expect("persist fanout cursor");
         }
@@ -9562,7 +9618,18 @@ mod tests {
             )
             .expect("reopen fanout cursor keyspace");
         assert_eq!(
-            current_cursor(&cursors, topic_id).expect("restarted cursor"),
+            current_cursor(&cursors, topic_id, test_genesis(1)).expect("restarted cursor"),
+            1
+        );
+        // A replaced genesis must restart peer selection instead of inheriting
+        // the losing chain's rotation.
+        assert_eq!(
+            current_cursor(&cursors, topic_id, test_genesis(2)).expect("replaced cursor"),
+            0
+        );
+        advance_cursor(&cursors, topic_id, test_genesis(2), 0).expect("rebind cursor");
+        assert_eq!(
+            current_cursor(&cursors, topic_id, test_genesis(2)).expect("rebound cursor"),
             1
         );
     }
@@ -9586,7 +9653,7 @@ mod tests {
                     fjall::KeyspaceCreateOptions::default,
                 )
                 .expect("fanout cursor clear keyspace");
-            advance_cursor(&cursors, topic_id, 0).expect("create fanout cursor");
+            advance_cursor(&cursors, topic_id, test_genesis(3), 0).expect("create fanout cursor");
             assert!(
                 cursors
                     .contains_key(topic_cursor_key(topic_id))
@@ -9945,6 +10012,10 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
+    fn test_genesis(seed: u8) -> irokle_crate::OpId {
+        irokle_crate::OpId::from_bytes([seed; 32])
+    }
+
     fn test_storage() -> (TempDir, StorageHandle) {
         let dir = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("temp path"))
@@ -10141,7 +10212,11 @@ mod tests {
             topic_cursor_key(topic_id),
         )
         .await?;
-        Some(postcard::from_bytes(&bytes).expect("cursor decodes"))
+        Some(
+            postcard::from_bytes::<AppliedCursor>(&bytes)
+                .expect("cursor decodes")
+                .clock,
+        )
     }
 
     fn test_actor(seed: u8, user_id: UserId, realm_id: RealmId) -> Actor {
@@ -15130,16 +15205,7 @@ mod tests {
                 irokle_crate::ActorClock::default(),
                 "metadata topic must contain its published event"
             );
-            service
-                .storage_write(
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                    topic_cursor_key(topic_id),
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes")
-                        .into(),
-                )
-                .await
-                .expect("metadata cursor resets");
+            reset_test_cursor(&service, topic_id).await;
         }
 
         let dependency = DocumentSyncDependency::PlacementStrategy {
@@ -15222,16 +15288,9 @@ mod tests {
             "expected full {dependency:?}; topics registered under {registered_dependencies:?}"
         );
         for topic_id in [registry_topic, create_topic] {
-            let cursor: irokle_crate::ActorClock = postcard::from_bytes(
-                &read_storage_value(
-                    &storage,
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                    topic_cursor_key(topic_id),
-                )
+            let cursor = read_test_cursor(&storage, topic_id)
                 .await
-                .expect("deferred cursor remains stored"),
-            )
-            .expect("cursor decodes");
+                .unwrap_or_default();
             assert_eq!(
                 cursor,
                 irokle_crate::ActorClock::default(),
@@ -15402,16 +15461,7 @@ mod tests {
             matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
             "metadata publish failed: {published:?}"
         );
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(metadata_topic),
-                postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                    .expect("clock serializes")
-                    .into(),
-            )
-            .await
-            .expect("metadata cursor resets");
+        reset_test_cursor(&service, metadata_topic).await;
 
         let deferred = service
             .reconcile_document_topics([metadata_topic])
@@ -15436,16 +15486,9 @@ mod tests {
             .await
             .is_none()
         );
-        let deferred_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
+        let deferred_cursor = read_test_cursor(&storage, metadata_topic)
             .await
-            .expect("deferred cursor remains stored"),
-        )
-        .expect("cursor decodes");
+            .unwrap_or_default();
         let metadata_clock = service
             .node()
             .storage()
@@ -15498,16 +15541,7 @@ mod tests {
             matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
             "strategy publish failed: {published:?}"
         );
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(config_topic),
-                postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                    .expect("clock serializes")
-                    .into(),
-            )
-            .await
-            .expect("config cursor resets");
+        reset_test_cursor(&service, config_topic).await;
 
         let applied = service
             .reconcile_document_topics([config_topic])
@@ -15541,16 +15575,9 @@ mod tests {
                 .expect("create acceptance decodes"),
             create
         );
-        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
+        let applied_cursor = read_test_cursor(&storage, metadata_topic)
             .await
-            .expect("applied cursor is stored"),
-        )
-        .expect("cursor decodes");
+            .unwrap_or_default();
         assert!(!applied_cursor.dominates(&metadata_clock));
         let replayed = service
             .reconcile_document_topics([metadata_topic])
@@ -15558,16 +15585,9 @@ mod tests {
             .expect("metadata update reconciles");
         assert!(replayed.targets.contains(&update_target));
         assert!(replayed.metadata_create_events.contains(&update));
-        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
+        let applied_cursor = read_test_cursor(&storage, metadata_topic)
             .await
-            .expect("replayed cursor is stored"),
-        )
-        .expect("cursor decodes");
+            .expect("replayed cursor is stored");
         assert!(applied_cursor.dominates(&metadata_clock));
         let acceptance = read_storage_value(
             &storage,
@@ -15618,16 +15638,7 @@ mod tests {
             postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
             create
         );
-        let cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
-            .await
-            .unwrap(),
-        )
-        .unwrap();
+        let cursor = read_test_cursor(&storage, metadata_topic).await.unwrap();
         assert!(
             cursor.dominates(
                 &service
@@ -16669,6 +16680,223 @@ mod tests {
         }
     }
 
+    // The eager cursor delete is an optimization, not the invariant. A crash or
+    // a failed delete leaves the replaced chain's cursor behind, so reconcile
+    // must detect the lineage change itself and replay the winner from one.
+    #[tokio::test]
+    async fn lost_eviction_replays() {
+        let (_dir_a, storage_a) = test_storage();
+        let (_dir_b, storage_b) = test_storage();
+        let doc_a = tempfile::tempdir().expect("doc a");
+        let doc_b = tempfile::tempdir().expect("doc b");
+        let realm_id = RealmId::from_bytes([79; 32]);
+        let service_a = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(79).await,
+            storage_a,
+            doc_a.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("service a opens");
+        let service_b = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(80).await,
+            storage_b.clone(),
+            doc_b.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("service b opens");
+
+        let node_a = service_a.local_node_id().expect("node a id");
+        let node_b = service_b.local_node_id().expect("node b id");
+        let user_id = UserId::local(Ulid::from_parts(79, 1), realm_id);
+        let target = DocumentSyncTarget::User { user_id };
+        let admin_target = AdminDocumentTarget::User { user_id };
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_parts(79, 7),
+            shard: 1,
+        };
+        let topic_id = target.sync_topic_id(realm_id, &placement);
+
+        service_a
+            .ensure_document_sync_topics(&[topic_id], vec![node_b])
+            .expect("service a topic genesis");
+        service_b
+            .ensure_document_sync_topics(&[topic_id], vec![node_a])
+            .expect("service b topic genesis");
+        for (service, seed, name) in [(&service_a, 1u8, "from-a"), (&service_b, 2u8, "from-b")] {
+            let event = test_admin_event(
+                Ulid::from_parts(79, seed as u128),
+                admin_target.clone(),
+                &test_actor(seed, user_id, realm_id),
+                1,
+                AdminDocumentOperation::UserNameSet {
+                    name: name.to_string(),
+                },
+            );
+            assert!(matches!(
+                service
+                    .publish_documents(
+                        vec![DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(event),
+                            placement,
+                            allow_genesis: true,
+                        }],
+                        Vec::new(),
+                    )
+                    .await,
+                DocumentSyncNetEvent::DocumentsPublished { .. }
+            ));
+        }
+
+        let node_a_handle = service_a.node();
+        let node_b_handle = service_b.node();
+        let genesis = |handle: &irokle_crate::Irokle<irokle_crate::FjallStorage>| {
+            handle
+                .storage()
+                .topic_state(&topic_id)
+                .expect("topic state")
+                .expect("topic exists")
+                .genesis
+        };
+        assert_ne!(genesis(&node_a_handle), genesis(&node_b_handle));
+        let (loser, loser_node, winner_node, loser_peer, winner_peer) =
+            if genesis(&node_a_handle) > genesis(&node_b_handle) {
+                (
+                    &service_a,
+                    &node_a_handle,
+                    &node_b_handle,
+                    node_id_to_peer_id(&node_a),
+                    node_id_to_peer_id(&node_b),
+                )
+            } else {
+                (
+                    &service_b,
+                    &node_b_handle,
+                    &node_a_handle,
+                    node_id_to_peer_id(&node_b),
+                    node_id_to_peer_id(&node_a),
+                )
+            };
+        let loser_actor = irokle_crate::actor_id_for(topic_id, loser_peer);
+        let stale = applied_cursor_clock(
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read"),
+            genesis(loser_node),
+        );
+        assert!(
+            stale.get(&loser_actor) > 0,
+            "the loser's publish must leave a cursor covering its own chain"
+        );
+
+        let winner_ops =
+            irokle_crate::oplog::topological(winner_node.storage(), &topic_id).expect("winner ops");
+        let (_ack, evictions) = loser_node
+            .receive_sync_data_from_evicting(
+                winner_peer,
+                SyncData {
+                    topic_id,
+                    ops: winner_ops,
+                },
+            )
+            .expect("loser admits the winning chain");
+        assert_eq!(evictions.len(), 1);
+        // `decode_eviction` is `consume_eviction` without the cursor delete:
+        // exactly the state a crash or a failed delete leaves behind.
+        loser.decode_eviction(evictions.into_iter().next().expect("one eviction"));
+        let winning_genesis = genesis(loser_node);
+        assert!(
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .is_some(),
+            "this test must leave the stale cursor in place"
+        );
+
+        loser
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("the winning chain reconciles");
+        let stored: AppliedCursor = postcard::from_bytes(
+            &loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .expect("reconcile rewrites the cursor"),
+        )
+        .expect("cursor decodes");
+        assert_eq!(stored.lineage, winning_genesis);
+        assert_eq!(
+            stored.clock.get(&loser_actor),
+            0,
+            "the replaced chain's sequences must not mask the loser's re-emissions"
+        );
+
+        // A reconcile that changes no lineage must not replay the topic again.
+        assert!(
+            loser
+                .reconcile_document_topics([topic_id])
+                .await
+                .expect("second reconcile")
+                .targets
+                .is_empty(),
+            "an unchanged genesis must keep its cursor instead of reapplying"
+        );
+    }
+
+    #[test]
+    fn applied_cursor_lineage() {
+        // A cursor is trusted only under the genesis it was written for; any
+        // other lineage, and any unreadable value, restarts replay at one.
+        let mut clock = irokle_crate::ActorClock::default();
+        clock.observe(irokle_crate::actor_id_for(topic(1), peer(1)), 4);
+        let encoded = applied_cursor_value(test_genesis(1), &clock).expect("cursor encodes");
+
+        assert_eq!(
+            applied_cursor_clock(Some(encoded.clone().into()), test_genesis(1)),
+            clock
+        );
+        assert_eq!(
+            applied_cursor_clock(Some(encoded.into()), test_genesis(2)),
+            irokle_crate::ActorClock::default()
+        );
+        assert_eq!(
+            applied_cursor_clock(
+                Some(
+                    postcard::to_allocvec(&clock)
+                        .expect("bare clock serializes")
+                        .into()
+                ),
+                test_genesis(1)
+            ),
+            irokle_crate::ActorClock::default(),
+            "a cursor without a lineage is untrusted"
+        );
+        assert_eq!(
+            applied_cursor_clock(None, test_genesis(1)),
+            irokle_crate::ActorClock::default()
+        );
+    }
+
     // Whole-document admin sync is refused by apply_upsert/apply_delete. If reconcile
     // `?`-propagated that refusal the applied-ops cursor would never advance, so each
     // reconcile would re-materialize the whole post-cursor history. The upsert/delete
@@ -16772,17 +17000,7 @@ mod tests {
         ));
 
         // Reset the cursor so reconcile reprocesses every op as a fresh peer would.
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         // Reconcile completes despite the hostile whole-document ops.
         let result = service
@@ -16801,15 +17019,9 @@ mod tests {
         );
 
         // The cursor advanced past the hostile ops.
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -17503,17 +17715,7 @@ mod tests {
                 service.publish_documents(documents, Vec::new()).await,
                 DocumentSyncNetEvent::DocumentsPublished { .. }
             ));
-            service
-                .storage_write(
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                    topic_cursor_key(target.sync_topic_id(realm_id, &PlacementRef::NIL)),
-                    ByteView::from(
-                        postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                            .expect("clock serializes"),
-                    ),
-                )
-                .await
-                .expect("cursor resets");
+            reset_test_cursor(&service, target.sync_topic_id(realm_id, &PlacementRef::NIL)).await;
         }
 
         service
@@ -17530,16 +17732,9 @@ mod tests {
                 .is_empty(),
             "the assignment must wait for realm configuration"
         );
-        let deferred_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(auth_topic),
-            )
+        let deferred_cursor = read_test_cursor(&storage, auth_topic)
             .await
-            .expect("deferred cursor remains stored"),
-        )
-        .expect("cursor decodes");
+            .unwrap_or_default();
         let auth_clock = service
             .node()
             .storage()
@@ -17590,16 +17785,9 @@ mod tests {
                 .contains(&admin_user_id),
             "the deferred assignment must apply after realm configuration"
         );
-        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(auth_topic),
-            )
+        let applied_cursor = read_test_cursor(&storage, auth_topic)
             .await
-            .expect("applied cursor is stored"),
-        )
-        .expect("cursor decodes");
+            .expect("applied cursor is stored");
         assert!(applied_cursor.dominates(&auth_clock));
 
         let group_id = Ulid::from_parts(1_631, 1);
@@ -17661,16 +17849,11 @@ mod tests {
                 .await,
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(group_target.sync_topic_id(realm_id, &group_placement)),
-                postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                    .expect("clock serializes")
-                    .into(),
-            )
-            .await
-            .expect("group cursor resets");
+        reset_test_cursor(
+            &service,
+            group_target.sync_topic_id(realm_id, &group_placement),
+        )
+        .await;
         service
             .reconcile_document_topics([group_target.sync_topic_id(realm_id, &group_placement)])
             .await
@@ -17840,17 +18023,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         let result = service
             .reconcile_document_topics([topic_id])
@@ -17865,15 +18038,9 @@ mod tests {
             vec![placement_entry(local_actor.node_id)]
         );
 
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -18500,17 +18667,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         let result = service
             .reconcile_document_topics([topic_id])
@@ -18536,15 +18693,9 @@ mod tests {
             .is_none()
         );
 
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -18670,17 +18821,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         let result = service
             .reconcile_document_topics([topic_id])
@@ -18706,15 +18847,9 @@ mod tests {
             .is_none()
         );
 
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -18817,17 +18952,7 @@ mod tests {
 
         // Reset the cursor so reconcile reprocesses both ops exactly as a fresh
         // peer receiving them via sync would (its cursor has not yet advanced).
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         // (a) Reconcile completes without error despite the hostile Delete.
         let result = service
@@ -18846,15 +18971,9 @@ mod tests {
         );
 
         // (b) The cursor advanced past the hostile op.
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -18923,36 +19042,14 @@ mod tests {
         .expect("usage row writes");
     }
 
-    async fn reset_cursor(service: &DocumentSyncService, topic_id: irokle_crate::TopicId) {
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
-    }
-
     async fn cursor_advanced(
         service: &DocumentSyncService,
         storage: &StorageHandle,
         topic_id: irokle_crate::TopicId,
     ) -> bool {
-        let Some(bytes) = read_storage_value(
-            storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        else {
+        let Some(cursor) = read_test_cursor(storage, topic_id).await else {
             return false;
         };
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&bytes).expect("cursor decodes");
         let topic_clock = service
             .node()
             .storage()
@@ -19110,8 +19207,8 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        reset_cursor(&service, watch_topic).await;
-        reset_cursor(&service, info_topic).await;
+        reset_test_cursor(&service, watch_topic).await;
+        reset_test_cursor(&service, info_topic).await;
         service
             .reconcile_document_topics([watch_topic, info_topic])
             .await
@@ -19204,8 +19301,8 @@ mod tests {
         );
 
         // Replay: the same evidence, no duplicate rows and no usage growth.
-        reset_cursor(&service, watch_topic).await;
-        reset_cursor(&service, info_topic).await;
+        reset_test_cursor(&service, watch_topic).await;
+        reset_test_cursor(&service, info_topic).await;
         service
             .reconcile_document_topics([watch_topic, info_topic])
             .await
@@ -19273,7 +19370,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -19466,8 +19563,8 @@ mod tests {
             "metadata publish failed: {published:?}"
         );
 
-        reset_cursor(&service, bad_topic).await;
-        reset_cursor(&service, good_topic).await;
+        reset_test_cursor(&service, bad_topic).await;
+        reset_test_cursor(&service, good_topic).await;
         let applied = service
             .reconcile_document_topics([bad_topic, good_topic])
             .await
@@ -19813,7 +19910,7 @@ mod tests {
             },
         )
         .await;
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -19871,7 +19968,7 @@ mod tests {
         assert_eq!(usage.records, 7);
 
         // Redelivery is the same evidence under the same transport identity.
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -20007,7 +20104,7 @@ mod tests {
         );
 
         for topic_id in [valid_topic, forged_topic, other_topic] {
-            reset_cursor(&service, topic_id).await;
+            reset_test_cursor(&service, topic_id).await;
         }
         let applied = service
             .reconcile_document_topics([valid_topic, forged_topic, other_topic])
@@ -20142,7 +20239,7 @@ mod tests {
             bytes: 0,
         };
         write_usage(&storage, full).await;
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -20521,15 +20618,9 @@ mod tests {
             "rejected event must not mutate document storage"
         );
 
-        let cursor_bytes = read_storage_value(
-            &receiver_storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&receiver_storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = receiver
             .node()
             .storage()
