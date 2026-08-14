@@ -1216,7 +1216,7 @@ mod tests {
     fn missing_selector_fails() {
         // A strategy added after the activated map was published must fail
         // closed rather than fall back to live selector fields.
-        let (mut config, placement) = config_and_placement();
+        let (mut config, _placement) = config_and_placement();
         config.snapshot_candidate_map();
         let late = PlacementStrategy {
             strategy_id: Ulid::from_bytes([9u8; 16]),

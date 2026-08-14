@@ -203,6 +203,7 @@ async fn ensure_held_shard_topics(
 ///
 /// Returns whether any genesis was withheld (or an adopt failed to land), so the
 /// caller schedules a placement retry instead of deferring writes forever.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure_rank0_shard_group(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,

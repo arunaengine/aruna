@@ -7560,6 +7560,7 @@ fn remove_deferred_topic(
     deferred_topics.retain(|_, topics| !topics.is_empty());
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn validate_replicated_admin_event(
     storage: &StorageHandle,
     topic_id: irokle_crate::TopicId,
