@@ -45,6 +45,16 @@ pub async fn process_placement_transitions(
     // of serialized, conflict-prone transactions (one per bucket per node).
     let mut steps: Vec<RealmPlacementMutation> = Vec::new();
     for transition in &config.placement_transitions {
+        if transition_stale(config, transition) {
+            // A plan whose incomplete buckets all have stale predecessors can
+            // never apply; abort it so the strategy's in-flight slot frees.
+            if is_management(config, local_node_id) {
+                steps.push(RealmPlacementMutation::AbortTransition(
+                    transition.plan.transition_id,
+                ));
+            }
+            continue;
+        }
         let mut in_flight = 0u32;
         for bucket in &transition.plan.buckets {
             if transition.completion(bucket.bucket).is_some() {
@@ -94,6 +104,39 @@ pub async fn process_placement_transitions(
         crate::task_incoming::drive_document_sync_outbox_drain(context.clone()).await;
     }
     pending
+}
+
+/// An active plan none of whose incomplete buckets can ever apply: every one
+/// was derived from an activation epoch the bucket has since left.
+fn transition_stale(config: &RealmConfigDocument, transition: &PlacementTransition) -> bool {
+    if !matches!(transition.status, TransitionStatus::Active) {
+        return false;
+    }
+    let mut incomplete = 0usize;
+    let mut stale = 0usize;
+    for bucket in &transition.plan.buckets {
+        if transition.completion(bucket.bucket).is_some() {
+            continue;
+        }
+        incomplete += 1;
+        if config
+            .activation(&transition.plan.strategy_id, bucket.bucket)
+            .is_some_and(|activation| activation.activation_epoch != bucket.predecessor_epoch)
+        {
+            stale += 1;
+        }
+    }
+    incomplete > 0 && stale == incomplete
+}
+
+/// Only a management node's abort passes inbound admission; everyone else
+/// keeps watching until one issues it.
+fn is_management(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    let node_id = node_id.to_string();
+    config.nodes.iter().any(|node| {
+        node.node_id == node_id
+            && matches!(node.kind, aruna_core::structs::RealmNodeKind::Management)
+    })
 }
 
 /// One bucket step this node owes: a mutation ready to batch, work still

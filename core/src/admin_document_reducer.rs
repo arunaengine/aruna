@@ -774,7 +774,13 @@ fn overlay_placement_transitions(
                 .iter()
                 .filter(|transition| transition.plan.strategy_id == strategy_id)
             {
-                if !transition.plan.covers(shard) {
+                let Some(bucket_plan) = transition.plan.bucket_plan(shard) else {
+                    continue;
+                };
+                // Predecessor gate: a plan derived from another activation
+                // epoch never applies to this bucket, in any replay order, so
+                // concurrent same-base plans cannot chain (see BucketPlan).
+                if bucket_plan.predecessor_epoch != activation.activation_epoch {
                     continue;
                 }
                 if transition.bucket_ready(shard) {
@@ -7382,6 +7388,81 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
         overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
         config
+    }
+
+    #[test]
+    fn concurrent_plans_gated() {
+        // Two complete plans derived from one activation base: only the
+        // ULID-first one advances the bucket, in either delivery order, and
+        // the other can never replay as its successor.
+        let plan_a = transition_plan(&[1, 2], &[3, 4]);
+        let mut plan_b = transition_plan(&[1, 2], &[3, 4]);
+        plan_b.transition_id = Ulid::from_bytes([32; 16]);
+        plan_b.target_map_epoch = 3;
+
+        let start_b = realm_config_event(
+            45,
+            node(1),
+            6,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTransitionStarted {
+                plan: plan_b.clone(),
+            },
+        );
+        let completion_b: Vec<AdminDocumentEvent> = (0..4)
+            .map(|index| {
+                let seed = (index + 1) as u8;
+                if index < 2 {
+                    realm_config_event(
+                        70 + index as u8,
+                        node(seed),
+                        3,
+                        AdminDocumentClock::default(),
+                        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                            transition_id: plan_b.transition_id,
+                            bucket: 0,
+                            reported_by: node(seed),
+                            frontier: vec![seed],
+                        },
+                    )
+                } else {
+                    realm_config_event(
+                        70 + index as u8,
+                        node(seed),
+                        4,
+                        AdminDocumentClock::default(),
+                        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                            transition_id: plan_b.transition_id,
+                            strategy_id: plan_b.strategy_id,
+                            proof: proof_for(&plan_b, 0, seed),
+                        },
+                    )
+                }
+            })
+            .collect();
+
+        let mut forward: Vec<AdminDocumentEvent> = transition_events(&plan_a);
+        forward.extend(completion_events(&plan_a));
+        forward.push(start_b.clone());
+        forward.extend(completion_b.clone());
+
+        let mut reversed: Vec<AdminDocumentEvent> = transition_events(&plan_a);
+        reversed.push(start_b);
+        reversed.extend(completion_b);
+        reversed.extend(completion_events(&plan_a));
+
+        for events in [forward, reversed] {
+            let mut state = realm_config_state();
+            for event in events {
+                state.apply(&event).unwrap();
+            }
+            let config = transition_config(&state);
+            let activation = config
+                .activation(&plan_a.strategy_id, 0)
+                .expect("activation");
+            assert_eq!(activation.activation_epoch, 2);
+            assert_eq!(activation.candidate_map_epoch, plan_a.target_map_epoch);
+        }
     }
 
     #[test]
