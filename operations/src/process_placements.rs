@@ -213,12 +213,17 @@ async fn ensure_held_shard_topics(
 /// might hold a genesis, and forking a second one is a permanent split-brain.
 /// A sole holder creates immediately: no peer can hold a divergent genesis.
 /// The withheld flag tells the caller to retry rather than strand the topic.
+///
+/// `may_mint` is the caller's single-minter decision. Positive absence is a
+/// snapshot, not a lock, so a caller that is not the designated minter for these
+/// topics adopts only and leaves an absent topic withheld.
 pub(crate) async fn resolve_creatable_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     local_node_id: NodeId,
     co_members: &[NodeId],
     topics: Vec<::irokle::TopicId>,
+    may_mint: bool,
 ) -> (Vec<::irokle::TopicId>, bool) {
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
     let mut missing: Vec<::irokle::TopicId> = Vec::new();
@@ -238,7 +243,11 @@ pub(crate) async fn resolve_creatable_topics(
         return (to_ensure, withheld);
     }
     if co_members.is_empty() {
-        to_ensure.extend(missing);
+        if may_mint {
+            to_ensure.extend(missing);
+        } else {
+            withheld = true;
+        }
         return (to_ensure, withheld);
     }
 
@@ -249,7 +258,7 @@ pub(crate) async fn resolve_creatable_topics(
     for topic in missing {
         if probe.known_by_co_holder.contains(&topic) {
             to_adopt.push(topic);
-        } else if probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
+        } else if may_mint && probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
             to_ensure.push(topic);
         } else {
             withheld = true;
@@ -309,8 +318,15 @@ pub(crate) async fn ensure_rank0_shard_group(
         )
         .await;
 
-    let (to_ensure, mut withheld) =
-        resolve_creatable_topics(context, net_handle, local_node_id, &co_members, topics).await;
+    let (to_ensure, mut withheld) = resolve_creatable_topics(
+        context,
+        net_handle,
+        local_node_id,
+        &co_members,
+        topics,
+        true,
+    )
+    .await;
 
     if !to_ensure.is_empty() {
         match net_handle.ensure_document_sync_topics(&to_ensure, co_members) {

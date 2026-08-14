@@ -47,6 +47,17 @@ fn shared_targets(
     ]
 }
 
+/// Whether a shared target belongs to the realm rather than to one node. A
+/// node-owned target names its node in the topic id, so only that node ever
+/// plans it; a realm-wide one is planned by every node and needs a single
+/// designated minter instead.
+fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
+    matches!(
+        target,
+        DocumentSyncTarget::RealmConfig { .. } | DocumentSyncTarget::RealmAuthorization { .. }
+    )
+}
+
 fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
     config
         .nodes
@@ -1029,6 +1040,7 @@ type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
 struct ShardPlan {
     summary: RestoreShardSummary,
     shared_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    shared_join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
     rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
     join_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
 }
@@ -1044,18 +1056,28 @@ fn plan_shard_groups(
     let mut plan = ShardPlan {
         summary: RestoreShardSummary::default(),
         shared_groups: BTreeMap::new(),
+        shared_join_groups: BTreeMap::new(),
         rank0_groups: BTreeMap::new(),
         join_groups: BTreeMap::new(),
     };
 
     let mut shared_peers = shared_topic_peers(config, node_id);
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    // One designated minter for the realm-wide topics, derived from the config
+    // every node materializes: the lowest sync-eligible node id, the same rank-0
+    // rule the metadata graph topics use. Positive absence alone lets every
+    // observer mint the same topic at once, which forks the realm document.
+    let realm_minter = shared_peers
+        .iter()
+        .all(|peer| node_id.as_bytes() < peer.as_bytes());
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        plan.shared_groups
-            .entry(shared_peers.clone())
-            .or_default()
-            .push(topic);
+        let groups = if realm_wide_target(&target) && !realm_minter {
+            &mut plan.shared_join_groups
+        } else {
+            &mut plan.shared_groups
+        };
+        groups.entry(shared_peers.clone()).or_default().push(topic);
         plan.summary.shared_topics += 1;
     }
 
@@ -1189,9 +1211,11 @@ struct RestoreUnit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestoreKind {
-    /// Fixed realm-scoped topics; their genesis is deterministic, so they are
-    /// ensured directly.
+    /// Shared topics this node may mint: its own node-owned ones, and the
+    /// realm-wide ones when it is the designated minter.
     Shared,
+    /// Realm-wide topics minted elsewhere: probe and adopt, never create.
+    SharedJoin,
     /// Rank-0: create a genesis only with positive co-holder confirmation.
     Rank0,
     /// Held at another rank: join-only.
@@ -1215,6 +1239,7 @@ fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
             RestoreKind::Shared => 0,
             RestoreKind::Rank0 => 1,
             RestoreKind::Join => 2,
+            RestoreKind::SharedJoin => 3,
         };
         hasher.update(&[kind]);
         hasher.update(&(unit.peers.len() as u64).to_be_bytes());
@@ -1268,6 +1293,15 @@ impl ShardPlan {
                 topics,
             );
         }
+        for (peers, topics) in self.shared_join_groups {
+            push(
+                RestoreKind::SharedJoin,
+                peers,
+                Vec::new(),
+                BTreeSet::new(),
+                topics,
+            );
+        }
         for ((peers, publishers, retained), topics) in self.rank0_groups {
             push(RestoreKind::Rank0, peers, publishers, retained, topics);
         }
@@ -1302,7 +1336,8 @@ async fn process_restore_unit(
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> RestoreUnitOutcome {
     match unit.kind {
-        RestoreKind::Shared => restore_shared(context, net_handle, node_id, unit).await,
+        RestoreKind::Shared => restore_shared(context, net_handle, node_id, unit, true).await,
+        RestoreKind::SharedJoin => restore_shared(context, net_handle, node_id, unit, false).await,
         RestoreKind::Rank0 => restore_rank0(context, net_handle, node_id, unit, verified).await,
         RestoreKind::Join => restore_join(context, net_handle, node_id, unit, verified).await,
     }
@@ -1313,6 +1348,7 @@ async fn restore_shared(
     net_handle: &aruna_net::NetHandle,
     node_id: NodeId,
     unit: &RestoreUnit,
+    may_mint: bool,
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
     // A peer that is unreachable, or that refuses a topic it already holds,
@@ -1324,6 +1360,7 @@ async fn restore_shared(
         node_id,
         &unit.peers,
         unit.topics.clone(),
+        may_mint,
     )
     .await;
     if withheld {
@@ -2090,6 +2127,10 @@ mod tests {
         );
 
         mesh_nodes(&local, &blocked).await;
+        // The peer runs its own restore too, as every configured node does: only
+        // the designated minter creates the realm-wide shared topics, so a peer
+        // that never restores would strand them whichever node that is.
+        restore_shard_subscriptions(&blocked.context, blocked.net.node_id(), realm_id).await;
         crate::process_placements::process_shard_placements(
             &blocked.context,
             realm_id,
