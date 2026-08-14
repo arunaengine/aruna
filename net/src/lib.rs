@@ -408,7 +408,7 @@ async fn flush_pending_evicted_documents(
             retained.push(entry);
             continue;
         }
-        if let Err(error) = document_sync.clear_eviction(entry.key.clone()).await {
+        if let Err(error) = document_sync.clear_eviction(entry.key).await {
             // The rows are durable and their ids are stable, so a repeat is a
             // no-op; keep the entry rather than risk losing it.
             warn!(%error, "Failed to release a drained eviction journal entry");
