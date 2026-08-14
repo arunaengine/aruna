@@ -31,6 +31,72 @@ const REPLICATION_FACTOR: u32 = 3;
 const SHARD_COUNT: u32 = 4;
 
 #[tokio::test]
+async fn second_join_expands() -> TestResult<()> {
+    // Two nodes join during one expansion window: the first join's transition
+    // runs while the second join only publishes a newer map, and once the
+    // first completes, the rank-0 node starts the successor automatically so
+    // the second joiner enters the activated holder sets.
+    let mut realm = Topology::spawn_sharded(
+        MANAGEMENT_NODES,
+        USER_NODES,
+        REPLICATION_FACTOR,
+        SHARD_COUNT,
+    )
+    .await?;
+    realm.seed_group().await?;
+    let everywhere = realm
+        .config
+        .strategies
+        .iter()
+        .find(|strategy| strategy.replica_count.is_none())
+        .map(|strategy| strategy.strategy_id)
+        .expect("the seeded realm binds an everywhere strategy");
+    let probe = PlacementRef {
+        strategy_id: everywhere,
+        shard: 0,
+    };
+
+    let first = realm.spawn_late_node(RealmNodeKind::Management).await?;
+    let second = realm.spawn_late_node(RealmNodeKind::Management).await?;
+
+    let started = realm.live_transitions();
+    for transition_id in &started {
+        realm.await_transition(*transition_id).await?;
+    }
+    // The successor is reconciler-driven: passes let the rank-0 node start it,
+    // and awaiting whatever is live drives it to completion.
+    for _ in 0..5 {
+        let holders = aruna_operations::placement::resolve_shard_holders(&realm.config, &probe);
+        if holders.contains(&second) && holders.contains(&first) {
+            break;
+        }
+        for index in 0..realm.nodes.len() {
+            let node = realm.node(index);
+            if node.is_sync_eligible() {
+                aruna_operations::process_placements::process_shard_placements(
+                    &node.context,
+                    realm.realm_id,
+                    node.node_id(),
+                )
+                .await;
+            }
+        }
+        realm.await_config("configs replicate", |_| true).await?;
+        for transition_id in realm.live_transitions() {
+            realm.await_transition(transition_id).await?;
+        }
+    }
+    let holders = aruna_operations::placement::resolve_shard_holders(&realm.config, &probe);
+    assert!(
+        holders.contains(&first) && holders.contains(&second),
+        "the successor expansion never activated the second joiner"
+    );
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn expansion_hands_buckets() -> TestResult<()> {
     let mut realm = Topology::spawn_sharded(
         MANAGEMENT_NODES,

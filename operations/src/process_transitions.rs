@@ -23,7 +23,9 @@ use crate::driver::{DriverContext, drive};
 use crate::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
-use crate::placement::transition::holders_in_map;
+use crate::placement::transition::{
+    TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
+};
 use crate::shard::assemble_shard_manifest;
 use crate::shard::verify::converge_with_barrier;
 
@@ -36,9 +38,13 @@ pub async fn process_placement_transitions(
     config: &RealmConfigDocument,
 ) -> bool {
     if config.placement_transitions.is_empty() {
-        return ensure_strategy_activations(context, realm_id, local_node_id, config).await;
+        let activations =
+            ensure_strategy_activations(context, realm_id, local_node_id, config).await;
+        let expansions = ensure_expansions(context, realm_id, local_node_id, config).await;
+        return activations || expansions;
     }
     let mut pending = ensure_strategy_activations(context, realm_id, local_node_id, config).await;
+    pending |= ensure_expansions(context, realm_id, local_node_id, config).await;
     let mut departed = false;
     // Steps are gathered and committed as one batch: per-bucket commits on a
     // realm-scale transition would grind the config document through hundreds
@@ -420,6 +426,80 @@ async fn submit_steps(
             true
         }
     }
+}
+
+/// Starts the successor expansion for a strategy whose activations trail the
+/// newest map once its active transition is terminal (F10): a join during an
+/// active expansion publishes the newer map, and this picks it up. Only the
+/// strategy's rank-0 node under the newest map issues the plan; everyone else
+/// reports pending so their timer keeps watching.
+async fn ensure_expansions(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    config: &RealmConfigDocument,
+) -> bool {
+    let Some(epoch) = config.newest_map_epoch() else {
+        return false;
+    };
+    let Some(map) = config.candidate_map(epoch) else {
+        return false;
+    };
+    let mut pending = false;
+    for strategy in &config.strategies {
+        if config.placement_transitions.iter().any(|transition| {
+            transition.plan.strategy_id == strategy.strategy_id && !transition.is_terminal()
+        }) {
+            continue;
+        }
+        let Ok(buckets) = expansion_buckets(config, strategy.strategy_id, epoch) else {
+            continue;
+        };
+        if buckets.is_empty() {
+            continue;
+        }
+        pending = true;
+        let placement = PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard: 0,
+        };
+        if holders_in_map(config, strategy, &placement, map)
+            .is_none_or(|holders| holders.first() != Some(&local_node_id))
+        {
+            continue;
+        }
+        let transition_id = ulid::Ulid::generate();
+        match plan_transition(
+            config,
+            TransitionRequest {
+                transition_id,
+                strategy_id: strategy.strategy_id,
+                buckets,
+                target_map_epoch: epoch,
+                // Expansion moves nothing off a holder; every bucket may run.
+                limits: aruna_core::structs::TransitionLimits {
+                    max_incomplete_buckets: u32::MAX,
+                    ..Default::default()
+                },
+                created_by: local_node_id,
+                created_at_ms: aruna_core::util::unix_timestamp_millis(),
+            },
+        ) {
+            Ok(plan) => {
+                pending |= submit_mutation(
+                    context,
+                    realm_id,
+                    local_node_id,
+                    RealmPlacementMutation::StartTransition(plan),
+                )
+                .await;
+            }
+            Err(error) => {
+                debug!(error = %error, "Successor expansion could not plan yet");
+            }
+        }
+    }
+    pending
 }
 
 /// Activates the newest map for a strategy that has none, so a strategy that

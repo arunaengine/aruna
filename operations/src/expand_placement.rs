@@ -78,20 +78,29 @@ pub async fn expand_realm_placement(
     actor: &Actor,
 ) -> Result<Vec<Ulid>, MutateRealmPlacementError> {
     let config = ensure_activated_map(context, actor).await?;
-    let (epoch, map) = next_map(&config);
-    if config
+    let (next_epoch, map) = next_map(&config);
+    // The newest epoch is the durable pending expansion target when it already
+    // freezes the current view; equality never short-circuits the transition
+    // work below, or a join during an active expansion would be dropped.
+    let reuse = config
         .newest_map_epoch()
         .and_then(|epoch| config.candidate_map(epoch))
-        .is_some_and(|newest| newest.nodes == map.nodes)
-    {
-        return Ok(Vec::new());
-    }
-    let mut config = mutate(
-        context,
-        actor,
-        RealmPlacementMutation::PublishCandidateMap(map),
-    )
-    .await?;
+        .is_some_and(|newest| {
+            newest.nodes == map.nodes
+                && newest.selectors == map.selectors
+                && newest.shard_overrides == map.shard_overrides
+        });
+    let (epoch, mut config) = if reuse {
+        (config.newest_map_epoch().unwrap_or(next_epoch), config)
+    } else {
+        let config = mutate(
+            context,
+            actor,
+            RealmPlacementMutation::PublishCandidateMap(map),
+        )
+        .await?;
+        (next_epoch, config)
+    };
 
     let strategy_ids: Vec<Ulid> = config
         .strategies

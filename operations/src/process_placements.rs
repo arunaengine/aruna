@@ -666,6 +666,17 @@ fn has_transition_work(config: &RealmConfigDocument, now_ms: u64) -> bool {
                 .any(|strategy| config.activation(&strategy.strategy_id, 0).is_none()))
         || crate::placement::next_release_ms(config, now_ms).is_some()
         || crate::placement::drain_pending(config, now_ms)
+        // A cheap over-approximation of a pending successor expansion: an
+        // activation trailing the newest map with no transition in flight.
+        || config.newest_map_epoch().is_some_and(|newest| {
+            config.placement_activations.iter().any(|activation| {
+                activation.candidate_map_epoch != newest
+                    && !config.placement_transitions.iter().any(|transition| {
+                        transition.plan.strategy_id == activation.strategy_id
+                            && !transition.is_terminal()
+                    })
+            })
+        })
 }
 
 async fn load_realm_config_outcome(
