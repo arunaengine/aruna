@@ -9322,6 +9322,7 @@ fn sync_message_topic_id(message: &SyncMessage) -> irokle_crate::TopicId {
         SyncMessage::Request(request) => request.topic_id,
         SyncMessage::Data(data) => data.topic_id,
         SyncMessage::Ack(ack) => ack.topic_id,
+        SyncMessage::Failure(failure) => failure.topic_id,
     }
 }
 

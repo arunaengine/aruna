@@ -1837,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.1"
-source = "git+https://github.com/arunaengine/craqle?branch=main#cce50b5e2c213bc14470593aa5a3a02cfc0477fd"
+source = "git+https://github.com/arunaengine/craqle?branch=fix%2Firokle-dangling-op-meta#f7c95c610f90345708e238a0575cac7612520a06"
 dependencies = [
  "blake3",
  "chrono",
@@ -3862,7 +3862,7 @@ dependencies = [
 [[package]]
 name = "irokle"
 version = "0.1.3"
-source = "git+https://github.com/arunaengine/irokle.git?branch=main#5d0e0393c3de8f6d3294bb3483165c5e31060b11"
+source = "git+https://github.com/arunaengine/irokle.git?branch=fix%2Fdangling-op-meta#de59b44b1b4f95ca126c67e1715c01e7360e95d2"
 dependencies = [
  "blake3",
  "bytes",
@@ -3882,7 +3882,7 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?branch=main#5d0e0393c3de8f6d3294bb3483165c5e31060b11"
+source = "git+https://github.com/arunaengine/irokle.git?branch=fix%2Fdangling-op-meta#de59b44b1b4f95ca126c67e1715c01e7360e95d2"
 dependencies = [
  "proc-macro2",
  "quote",
