@@ -32,8 +32,8 @@ use crate::metadata::{
 };
 use crate::structs::{
     MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PLACEMENT_EPOCH_PAD,
-    PlacementRef, User, WatchSubscription, notification_inbox_key, notification_outbox_key,
-    notification_prune_index_key, watch_subscription_key,
+    PlacementRef, RealmId, User, WatchSubscription, notification_inbox_key,
+    notification_outbox_key, notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
 
@@ -418,6 +418,17 @@ pub fn shard_manifest_key(placement: &PlacementRef, target: &DocumentSyncTarget)
     let mut bytes = Vec::with_capacity(28 + tail.as_ref().len());
     bytes.extend_from_slice(&shard_manifest_prefix(placement));
     bytes.extend_from_slice(tail.as_ref());
+    ByteView::from(bytes)
+}
+
+/// Key of a bucket's write-admission fence: `realm ‖ strategy ‖ shard`. The
+/// fence is local state: it admits this node's own writes against its own
+/// observation of the bucket's cutover.
+pub fn placement_fence_key(realm_id: &RealmId, placement: &PlacementRef) -> Key {
+    let mut bytes = Vec::with_capacity(52);
+    bytes.extend_from_slice(realm_id.as_bytes());
+    bytes.extend_from_slice(&placement.strategy_id.to_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
     ByteView::from(bytes)
 }
 

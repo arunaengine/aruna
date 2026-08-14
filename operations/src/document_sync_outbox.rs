@@ -132,6 +132,8 @@ pub fn new_outbox_record_with_id(
         peers,
         event,
         placement,
+        // Unfenced by default; a fence-admitted writer stamps its generation.
+        generation: 0,
         updated_at: unix_timestamp_secs(),
         allow_genesis,
     }

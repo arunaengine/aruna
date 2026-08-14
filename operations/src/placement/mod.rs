@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod distribution;
+pub mod fence;
 pub mod resolver;
 pub mod selector;
 pub mod transition;

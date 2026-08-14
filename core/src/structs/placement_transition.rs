@@ -361,10 +361,10 @@ impl PlacementTransition {
     ///
     /// The grace is what keeps a departing old holder in the topic while a
     /// reader mid-cutover may still need it; the drain report is what proves
-    /// its accepted writes reached the topic. A permanently dead holder keeps
-    /// the record alive until an operator removes the node from the realm,
-    /// never a clock. An aborted record that cut nothing over releases at
-    /// once - it moved nobody.
+    /// its accepted writes reached the topic. A permanently dead holder is
+    /// retained indefinitely: the plan names it, so removing the node from the
+    /// realm releases nothing either, and only its own report may. An aborted
+    /// record that cut nothing over releases at once - it moved nobody.
     pub fn released(&self, now_ms: u64) -> bool {
         self.is_terminal()
             && self

@@ -24,6 +24,7 @@ use crate::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
     is_management,
 };
+use crate::placement::fence;
 use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
@@ -88,7 +89,8 @@ pub async fn process_placement_transitions(
                         strategy_id: transition.plan.strategy_id,
                         shard: bucket.bucket,
                     };
-                    match drain_step(context, transition, &placement, local_node_id).await {
+                    match drain_step(context, realm_id, transition, &placement, local_node_id).await
+                    {
                         StepPlan::Ready(mutation) => steps.push(mutation),
                         StepPlan::Stalled(mutation) => {
                             steps.push(mutation);
@@ -176,14 +178,25 @@ fn transition_stale(config: &RealmConfigDocument, transition: &PlacementTransiti
     incomplete > 0 && stale == incomplete
 }
 
-/// Reports the bucket drained once no outbox record for its placement
-/// remains; until then the pass stays pending and keeps driving the drain.
+/// Closes the bucket's write fence, then reports it drained once no record of
+/// a closed generation remains. The close comes first and is durable: without
+/// it an empty scan says nothing about a write that resolved the bucket before
+/// the cutover and commits its row afterwards.
 async fn drain_step(
     context: &Arc<DriverContext>,
+    realm_id: RealmId,
     transition: &PlacementTransition,
     placement: &PlacementRef,
     local_node_id: NodeId,
 ) -> StepPlan {
+    let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
+        return StepPlan::Done;
+    };
+    let closed = bucket.predecessor_epoch;
+    if let Err(error) = fence::close(&context.storage_handle, &realm_id, placement, closed).await {
+        debug!(error = %error, "Transition drain could not close the write fence");
+        return StepPlan::Pending;
+    }
     for prefix in crate::document_sync_outbox::outbox_stream_prefixes() {
         let mut start_after: Option<Vec<u8>> = None;
         loop {
@@ -201,10 +214,11 @@ async fn drain_step(
                     return StepPlan::Pending;
                 }
             };
+            // An unfenced row carries generation zero and always counts.
             if batch
                 .records
                 .iter()
-                .any(|(_, record)| record.placement == *placement)
+                .any(|(_, record)| record.placement == *placement && record.generation <= closed)
             {
                 return StepPlan::Pending;
             }
@@ -814,6 +828,171 @@ mod tests {
             load_config(&context, realm_id).await.newest_map_epoch(),
             Some(1)
         );
+    }
+
+    /// Bucket zero handed from the local node to a peer, cut over and past its
+    /// grace, so the departing holder owes a drain report.
+    fn departing_config(realm_id: RealmId) -> (RealmConfigDocument, PlacementRef) {
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(node(1), RealmNodeKind::Server);
+        document.ensure_node(node(2), RealmNodeKind::Server);
+        document.strategies.push(strategy(5, "first"));
+        document.default_strategy_id = Some(document.strategies[0].strategy_id);
+        document.snapshot_candidate_map();
+        let strategy_id = document.strategies[0].strategy_id;
+        let placement = PlacementRef {
+            strategy_id,
+            shard: 0,
+        };
+        let mut transition = PlacementTransition::new(aruna_core::structs::TransitionPlan {
+            transition_id: Ulid::from_bytes([8; 16]),
+            strategy_id,
+            buckets: vec![aruna_core::structs::BucketPlan {
+                bucket: 0,
+                old_holders: vec![node(1)],
+                target_holders: vec![node(2)],
+                predecessor_epoch: 1,
+            }],
+            target_map_epoch: 1,
+            limits: aruna_core::structs::TransitionLimits {
+                max_incomplete_buckets: 1,
+                grace_ms: 0,
+            },
+            created_by: node(2),
+            created_at_ms: 1,
+        });
+        transition
+            .completed
+            .push(aruna_core::structs::BucketCompletion {
+                bucket: 0,
+                completed_at_ms: 1,
+            });
+        document.placement_transitions.push(transition);
+        (document, placement)
+    }
+
+    async fn write_outbox_row(
+        context: &DriverContext,
+        placement: PlacementRef,
+        generation: u64,
+        seed: u8,
+    ) -> Vec<u8> {
+        let change = aruna_core::document::DocumentSyncChange {
+            base: None,
+            current: aruna_core::document::DocumentSyncRevision {
+                generation,
+                event_id: Ulid::from_bytes([seed; 16]),
+                actor: node(1),
+                updated_at_ms: 1,
+            },
+            kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+            placement,
+        };
+        let record = crate::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_bytes([seed; 16]),
+            node(1),
+            DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: Ulid::from_bytes([seed; 16]),
+            },
+            vec![node(2)],
+            aruna_core::document::DocumentSyncOutboxEvent::Delete { change },
+            placement,
+            false,
+        )
+        .fenced_at(generation);
+        let (key_space, key, value) =
+            crate::document_sync_outbox::outbox_write_entry(&record).expect("the row encodes");
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key: key.clone(),
+                value,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        key.to_vec()
+    }
+
+    #[tokio::test]
+    async fn drain_fences_then_reports() {
+        // The close comes first, a predecessor-generation row blocks the
+        // report, and a successor-generation row never does.
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([64; 32]);
+        let (document, placement) = departing_config(realm_id);
+        let transition = &document.placement_transitions[0];
+        let predecessor = write_outbox_row(&context, placement, 1, 21).await;
+        write_outbox_row(&context, placement, 2, 22).await;
+
+        let blocked = drain_step(&context, realm_id, transition, &placement, node(1)).await;
+        assert!(
+            matches!(blocked, StepPlan::Pending),
+            "an undrained predecessor row blocks the report"
+        );
+        assert_eq!(closed_generation(&context, realm_id, &placement).await, 1);
+
+        crate::document_sync_outbox::delete_outbox_records(
+            &context.storage_handle,
+            vec![predecessor],
+        )
+        .await
+        .expect("the row is deleted");
+        let reported = drain_step(&context, realm_id, transition, &placement, node(1)).await;
+        assert!(
+            matches!(
+                reported,
+                StepPlan::Ready(RealmPlacementMutation::ReportDrained { bucket: 0, .. })
+            ),
+            "a successor-generation row must not block the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_holder_stays_retained() {
+        // Removing a dead holder from the realm must never stand in for its
+        // drain report: the record keeps retaining it.
+        let realm_id = RealmId::from_bytes([65; 32]);
+        let (mut document, _placement) = departing_config(realm_id);
+        document
+            .nodes
+            .retain(|entry| entry.node_id != node(1).to_string());
+        document
+            .placement_map
+            .retain(|entry| entry.node_id != node(1));
+
+        assert!(!document.placement_transitions[0].released(u64::MAX));
+        assert!(
+            crate::placement::retained_departing_holder(&document, &_placement, node(1)),
+            "a removed holder is still a retained publisher until it reports"
+        );
+    }
+
+    async fn closed_generation(
+        context: &Arc<DriverContext>,
+        realm_id: RealmId,
+        placement: &PlacementRef,
+    ) -> u64 {
+        let (key_space, key) = fence::fence_read(&realm_id, placement);
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                fence::closed_generation(value.as_ref())
+            }
+            other => panic!("unexpected fence read: {other:?}"),
+        }
     }
 
     #[test]

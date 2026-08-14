@@ -49,6 +49,10 @@ pub const SYNC_QUARANTINE_KEYSPACE: &str = "sync_quarantine";
 /// same batch as every quarantine row write and prune delete.
 pub const SYNC_QUARANTINE_USAGE_KEYSPACE: &str = "sync_quarantine_usage";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
+/// Per-bucket write-admission fence: the highest activation generation a
+/// departing holder has closed. A holder-authoritative writer reads it inside
+/// its own transaction, so a close conflicts every uncommitted predecessor write.
+pub const PLACEMENT_WRITE_FENCE_KEYSPACE: &str = "placement_write_fence";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
 pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
 pub const TASK_TIMER_KEYSPACE: &str = "task_timers";

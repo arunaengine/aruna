@@ -16,7 +16,9 @@ use aruna_core::storage_entries::{
     metadata_document_lifecycle_write_entry, metadata_event_log_key, metadata_event_log_prefix,
     raw_budget_entry, raw_budget_key,
 };
-use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument};
+use aruna_core::structs::{
+    MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
@@ -73,6 +75,9 @@ pub struct UpdateMetadataDocumentOperation {
     next_raw_budget: Option<MetadataRawOriginBudget>,
     accepted_create: Option<MetadataCreateEventRecord>,
     realm_config: Option<RealmConfigDocument>,
+    /// Buckets this update publishes onto and the activation generation each
+    /// resolved at, read as a fence inside the write transaction.
+    fenced: Vec<(PlacementRef, u64)>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -111,6 +116,8 @@ pub enum UpdateMetadataDocumentError {
     NotFinished,
     #[error("metadata raw update budget exceeded")]
     RawLimit,
+    #[error("the document's bucket cut over to a new holder set; retry the update")]
+    PlacementFenced,
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -132,6 +139,7 @@ impl UpdateMetadataDocumentOperation {
             next_raw_budget: None,
             accepted_create: None,
             realm_config: None,
+            fenced: Vec::new(),
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -235,6 +243,32 @@ impl UpdateMetadataDocumentOperation {
         })]
     }
 
+    /// The buckets this update publishes onto and the generation each resolves
+    /// at. Empty before the realm's first candidate map, where no activation
+    /// exists and no transition can be in flight.
+    fn fenced_buckets(&self, record: &MetadataRegistryRecord) -> Vec<(PlacementRef, u64)> {
+        let Some(config) = self.realm_config.as_ref() else {
+            return Vec::new();
+        };
+        [
+            record.placement,
+            crate::placement::registry_placement(config, record),
+        ]
+        .into_iter()
+        .filter_map(|placement| {
+            let generation = crate::placement::fence::write_generation(config, &placement)?;
+            Some((placement, generation))
+        })
+        .collect()
+    }
+
+    fn generation_of(&self, placement: &PlacementRef) -> u64 {
+        self.fenced
+            .iter()
+            .find(|(bucket, _)| bucket == placement)
+            .map_or(0, |(_, generation)| *generation)
+    }
+
     fn write_update_batch_effect(
         &self,
         txn_id: TxnId,
@@ -246,7 +280,8 @@ impl UpdateMetadataDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let lifecycle_outbox = create_event_outbox_record(event, self.realm_config.as_ref(), false);
+        let lifecycle_outbox = create_event_outbox_record(event, self.realm_config.as_ref(), false)
+            .fenced_at(self.generation_of(&event.record.placement));
         let outbox = (!event.record.holder_node_ids.is_empty()).then_some(&lifecycle_outbox);
         let status = new_pending_materialization_status(event, now);
         let job = new_materialization_job(event, now);
@@ -255,7 +290,10 @@ impl UpdateMetadataDocumentOperation {
         // Refresh the everywhere-bound registry row so non-holders see the new
         // revision, not just the bucket's holders.
         if let Some(registry_outbox) =
-            registry_outbox_record(event, self.realm_config.as_ref(), false)
+            registry_outbox_record(event, self.realm_config.as_ref(), false).map(|record| {
+                let generation = self.generation_of(&record.placement);
+                record.fenced_at(generation)
+            })
         {
             writes.push(
                 outbox_write_entry(&registry_outbox)
@@ -628,17 +666,24 @@ impl Operation for UpdateMetadataDocumentOperation {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
                     self.state = UpdateMetadataDocumentState::ReadRawFence;
+                    self.fenced = self.fenced_buckets(&record);
+                    let mut reads = vec![
+                        (
+                            METADATA_RAW_BUDGET_KEYSPACE.to_string(),
+                            raw_budget_key(self.config.document_id, self.config.actor.node_id),
+                        ),
+                        (
+                            METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                            metadata_create_acceptance_key(self.config.document_id),
+                        ),
+                    ];
+                    // The fence joins this transaction's read set, so a
+                    // departing holder's close conflicts an uncommitted write.
+                    reads.extend(self.fenced.iter().map(|(placement, _)| {
+                        crate::placement::fence::fence_read(&record.realm_id, placement)
+                    }));
                     smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: vec![
-                            (
-                                METADATA_RAW_BUDGET_KEYSPACE.to_string(),
-                                raw_budget_key(self.config.document_id, self.config.actor.node_id,),
-                            ),
-                            (
-                                METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                                metadata_create_acceptance_key(self.config.document_id),
-                            ),
-                        ],
+                        reads,
                         txn_id: Some(txn_id),
                     })]
                 }
@@ -648,12 +693,29 @@ impl Operation for UpdateMetadataDocumentOperation {
             },
             UpdateMetadataDocumentState::ReadRawFence => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, raw_budget), (_, accepted_create)] = values.as_slice() else {
+                    let [(_, raw_budget), (_, accepted_create), fences @ ..] = values.as_slice()
+                    else {
                         return self.unexpected_event(
                             "metadata raw sidecar read",
                             format!("batch read with {} values", values.len()),
                         );
                     };
+                    if fences.len() != self.fenced.len() {
+                        return self.unexpected_event(
+                            "one fence value per fenced bucket",
+                            format!("batch read with {} values", values.len()),
+                        );
+                    }
+                    let admitted =
+                        self.fenced
+                            .iter()
+                            .zip(fences)
+                            .all(|((_, generation), (_, value))| {
+                                crate::placement::fence::admits(value.as_ref(), *generation)
+                            });
+                    if !admitted {
+                        return self.fail(UpdateMetadataDocumentError::PlacementFenced);
+                    }
                     let Some(value) = accepted_create.clone() else {
                         return self.fail(UpdateMetadataDocumentError::RawLimit);
                     };
@@ -1213,6 +1275,156 @@ mod tests {
             |payload| matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. }),
         );
         assert_eq!(event.record.placement, fenced.placement);
+    }
+
+    /// A realm whose buckets are activated at generation one, so an update
+    /// resolves a generation and takes the bucket's fence.
+    fn activated_config(record: &mut MetadataRegistryRecord) -> Event {
+        let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 3);
+        config.ensure_node(actor().node_id, aruna_core::structs::RealmNodeKind::Server);
+        let strategy_id = Ulid::from_bytes([5u8; 16]);
+        config
+            .strategies
+            .push(aruna_core::structs::PlacementStrategy {
+                strategy_id,
+                name: "default".to_string(),
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+                shard_count: 16,
+            });
+        config.default_strategy_id = Some(strategy_id);
+        config.snapshot_candidate_map();
+        record.placement = PlacementRef {
+            strategy_id,
+            shard: 11,
+        };
+        Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*record.realm_id.as_bytes()),
+            value: Some(config.to_bytes(&actor()).unwrap().into()),
+        })
+    }
+
+    fn fenced_raw_read(
+        record: &MetadataRegistryRecord,
+        budget: Option<MetadataRawOriginBudget>,
+        closed: &[Option<u64>],
+    ) -> Event {
+        let Event::Storage(StorageEvent::BatchReadResult { mut values }) =
+            raw_read_for(record, actor().node_id, budget)
+        else {
+            unreachable!("the raw sidecar read is a batch read");
+        };
+        for generation in closed {
+            values.push((
+                ByteView::from(b"fence".to_vec()),
+                generation.map(|generation| generation.to_be_bytes().to_vec().into()),
+            ));
+        }
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    }
+
+    fn outbox_rows(effects: &[Effect]) -> Vec<aruna_core::document::DocumentSyncOutboxRecord> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => Some(writes),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(key_space, _, _)| {
+                key_space == aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE
+            })
+            .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).expect("outbox row decodes"))
+            .collect()
+    }
+
+    /// Steps an update to the fence read and answers it with `closed`.
+    fn step_to_fence(
+        operation: &mut UpdateMetadataDocumentOperation,
+        record: &MetadataRegistryRecord,
+        config: Event,
+        txn_id: Ulid,
+        closed: &[Option<u64>],
+    ) -> Effects {
+        operation.start();
+        operation.step(registry_read(record));
+        assert_start_transaction(operation.step(config).as_slice());
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let reads = operation.step(registry_read(record));
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = reads.as_slice() else {
+            panic!("the transaction batch-reads the raw sidecar and the fences");
+        };
+        assert_eq!(reads.len(), 2 + closed.len(), "one read per fenced bucket");
+        let budget = budget(
+            record,
+            1,
+            postcard::experimental::serialized_size(&create_event(record)).unwrap() as u64,
+        );
+        operation.step(fenced_raw_read(record, Some(budget), closed))
+    }
+
+    #[test]
+    fn update_takes_bucket_fence() {
+        // An admitted update stamps the generation it resolved at onto every
+        // outbox row it commits, so the drain can bound the predecessor set.
+        let actor = actor();
+        let mut record = record(&actor);
+        let realm_config = activated_config(&mut record);
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        let effects = step_to_fence(&mut operation, &record, realm_config, txn_id, &[None, None]);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { .. })]
+        ));
+        let rows = outbox_rows(operation.step(raw_events(&record)).as_slice());
+        assert!(!rows.is_empty(), "an admitted update publishes");
+        for row in rows {
+            assert_eq!(row.generation, 1, "row for {:?}", row.placement);
+        }
+    }
+
+    #[test]
+    fn closed_fence_rejects_update() {
+        // The departing holder closed generation one: the write must not commit
+        // an old-placement row after that.
+        let actor = actor();
+        let mut record = record(&actor);
+        let realm_config = activated_config(&mut record);
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        let effects = step_to_fence(
+            &mut operation,
+            &record,
+            realm_config,
+            txn_id,
+            &[Some(1), None],
+        );
+        assert!(outbox_rows(effects.as_slice()).is_empty());
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::BatchWrite { .. })))
+        );
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            UpdateMetadataDocumentError::PlacementFenced
+        );
     }
 
     #[test]

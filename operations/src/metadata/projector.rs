@@ -996,6 +996,7 @@ pub fn registry_outbox_record(
             change,
         },
         placement,
+        generation: 0,
         updated_at: event.occurred_at_ms / 1_000,
         allow_genesis,
     })
@@ -1031,6 +1032,7 @@ pub fn create_event_outbox_record(
             change,
         },
         placement,
+        generation: 0,
         updated_at: event.occurred_at_ms / 1_000,
         allow_genesis,
     }

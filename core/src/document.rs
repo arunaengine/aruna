@@ -129,11 +129,23 @@ pub struct DocumentSyncOutboxRecord {
     /// envelope change's ref, for `AdminOperation` the target's resolved ref.
     /// Does not affect the outbox FIFO key.
     pub placement: PlacementRef,
+    /// Activation generation the write was admitted at, so a departing holder
+    /// drains exactly the finite set its closed fence bounds. `0` means the
+    /// writer took no fence and the row always counts toward the drain.
+    pub generation: u64,
     pub updated_at: u64,
     /// Whether the publisher may mint this document's sync topic genesis when it
     /// is missing. Only the node that originated the document sets this; every
     /// other publisher waits (retryable) for the origin's genesis to replicate.
     pub allow_genesis: bool,
+}
+
+impl DocumentSyncOutboxRecord {
+    /// Stamps the generation the bucket's write fence admitted this row at.
+    pub fn fenced_at(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
