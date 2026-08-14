@@ -501,6 +501,44 @@ fn push_unique(nodes: &mut Vec<NodeId>, node_id: NodeId) {
     }
 }
 
+/// The earliest future instant a completed bucket's retention can end (its
+/// grace deadline). Buckets already past grace contribute nothing here: they
+/// either released or await a drain report, which the normal retry drives.
+pub fn next_release_ms(config: &RealmConfigDocument, now_ms: u64) -> Option<u64> {
+    let mut earliest: Option<u64> = None;
+    for transition in &config.placement_transitions {
+        for completion in &transition.completed {
+            if transition.departing_holders(completion.bucket).is_empty() {
+                continue;
+            }
+            let deadline = completion
+                .completed_at_ms
+                .saturating_add(transition.plan.limits.grace_ms);
+            if deadline > now_ms {
+                earliest = Some(earliest.map_or(deadline, |current| current.min(deadline)));
+            }
+        }
+    }
+    earliest
+}
+
+/// Whether any completed bucket past its grace still awaits a departing
+/// holder's drain report, so the caller keeps a normal retry armed.
+pub fn drain_pending(config: &RealmConfigDocument, now_ms: u64) -> bool {
+    config.placement_transitions.iter().any(|transition| {
+        transition.completed.iter().any(|completion| {
+            let deadline = completion
+                .completed_at_ms
+                .saturating_add(transition.plan.limits.grace_ms);
+            now_ms >= deadline
+                && transition
+                    .departing_holders(completion.bucket)
+                    .into_iter()
+                    .any(|holder| !transition.drain_reported(completion.bucket, holder))
+        })
+    })
+}
+
 /// Whether `node_id` is a cut-over old holder whose retention has not ended:
 /// its queued pre-cutover records stay deliverable until grace elapses AND its
 /// drain report reduces (never a clock alone).
@@ -1111,6 +1149,24 @@ mod tests {
             500,
         );
         assert!(still_retained.publishers.contains(&node(9)));
+    }
+
+    #[test]
+    fn release_deadline_derived() {
+        // Before the grace end the deadline is completion plus grace; past it
+        // a missing drain report demands a retry rather than a deadline.
+        let (config, _) = membership_fixture();
+        let mut undrained = config.clone();
+        undrained.placement_transitions[0].drained.clear();
+
+        assert_eq!(next_release_ms(&config, 500), Some(1_100));
+        assert!(!drain_pending(&config, 500));
+        // Bucket 7's holder drained, so past grace nothing pends.
+        assert_eq!(next_release_ms(&config, 1_100), None);
+        assert!(!drain_pending(&config, 1_100));
+        // Without the drain report the deadline passes into a pending retry.
+        assert_eq!(next_release_ms(&undrained, 1_100), None);
+        assert!(drain_pending(&undrained, 1_100));
     }
 
     #[test]

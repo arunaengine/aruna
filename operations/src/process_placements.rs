@@ -451,7 +451,7 @@ async fn reconcile_placements(
             &config,
         )
         .await;
-    } else if has_transition_work(&config)
+    } else if has_transition_work(&config, unix_timestamp_millis())
         && let Some(task_handle) = context.task_handle.as_ref()
     {
         // A pure transition target never mutates the config, so nothing else
@@ -460,6 +460,22 @@ async fn reconcile_placements(
             realm_id,
             local_node_id,
             std::time::Duration::ZERO,
+        );
+        let _ = task_handle.send_effect(effect).await;
+    }
+
+    // Release is a deadline, not an event: arm the timer for the earliest
+    // pending grace end (shorten-only, so a sooner retry is never postponed)
+    // and keep the normal retry driving post-grace drain scans.
+    let deadline_now = unix_timestamp_millis();
+    retry_needed |= crate::placement::drain_pending(&config, deadline_now);
+    if let Some(deadline) = crate::placement::next_release_ms(&config, deadline_now)
+        && let Some(task_handle) = context.task_handle.as_ref()
+    {
+        let effect = crate::sync_placement::schedule_placement_deadline(
+            realm_id,
+            local_node_id,
+            std::time::Duration::from_millis(deadline.saturating_sub(deadline_now)),
         );
         let _ = task_handle.send_effect(effect).await;
     }
@@ -638,7 +654,7 @@ async fn reconcile_placements(
 
 /// Whether the transitions engine may have local steps to run: an unsettled
 /// transition, or a strategy whose activations nobody initialized yet.
-fn has_transition_work(config: &RealmConfigDocument) -> bool {
+fn has_transition_work(config: &RealmConfigDocument, now_ms: u64) -> bool {
     config
         .placement_transitions
         .iter()
@@ -648,6 +664,8 @@ fn has_transition_work(config: &RealmConfigDocument) -> bool {
                 .strategies
                 .iter()
                 .any(|strategy| config.activation(&strategy.strategy_id, 0).is_none()))
+        || crate::placement::next_release_ms(config, now_ms).is_some()
+        || crate::placement::drain_pending(config, now_ms)
 }
 
 async fn load_realm_config_outcome(

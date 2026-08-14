@@ -115,6 +115,22 @@ pub fn schedule_placement_revalidation_effect(realm_id: RealmId, local_node_id: 
     schedule_placement_retry_after(realm_id, local_node_id, Duration::ZERO)
 }
 
+/// Arms the placement timer for a computed deadline without postponing any
+/// earlier pending retry: shorten-only semantics.
+pub fn schedule_placement_deadline(
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    after: Duration,
+) -> Effect {
+    Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::SyncPlacements {
+            realm_id,
+            node_id: local_node_id,
+        },
+        after,
+    })
+}
+
 pub fn schedule_placement_retry_after(
     realm_id: RealmId,
     local_node_id: NodeId,
