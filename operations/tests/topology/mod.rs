@@ -59,8 +59,8 @@ use aruna_operations::mutate_realm_placement::{
 };
 use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
 use aruna_operations::placement::{
-    PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, resolve_shard_holders,
-    strategy_for_target, transition_members,
+    PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
+    resolve_shard_holders, strategy_for_target,
 };
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -486,7 +486,7 @@ impl Topology {
 
     /// Desired shard-topic membership for a bucket, as the reconciler derives it.
     pub fn members(&self, placement: &PlacementRef) -> Vec<NodeId> {
-        transition_members(&self.config, placement, unix_timestamp_millis())
+        bucket_membership(&self.config, placement, unix_timestamp_millis()).members
     }
 
     /// Every transition the realm has not finished yet.

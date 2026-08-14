@@ -776,7 +776,8 @@ impl DocumentSyncService {
     pub async fn reconcile_shard_membership(
         &self,
         topics: &[irokle_crate::TopicId],
-        holders: Vec<NodeId>,
+        members: Vec<NodeId>,
+        publishers: Vec<NodeId>,
         retained: &BTreeSet<NodeId>,
         verified_topics: &BTreeSet<irokle_crate::TopicId>,
     ) -> Result<()> {
@@ -785,22 +786,24 @@ impl DocumentSyncService {
         }
 
         let _reconcile_guard = self.reconcile_lock.lock().await;
-        let holder_peers: BTreeSet<PeerId> = holders
+        let local_peer = self.node.peer_id();
+        // Membership (delivery) and publish authority are separate sets: an
+        // unactivated transition target is a member without authority. The
+        // adapter installs exactly the sets it is handed; policy stays in
+        // operations.
+        let member_peers: BTreeSet<PeerId> = members
             .into_iter()
             .map(|node_id| node_id_to_peer_id(&node_id))
+            .chain(retained.iter().map(node_id_to_peer_id))
             .collect();
-        let local_peer = self.node.peer_id();
-        if !holder_peers.contains(&local_peer) {
+        if !member_peers.contains(&local_peer) {
             return Err(NetError::Bootstrap(
-                "local node is not an authoritative shard holder".to_string(),
+                "local node is not a shard member".to_string(),
             ));
         }
-        // Canonical holders plus draining former-holders still flushing: the set
-        // that may publish onto and stay in the shard topic. Only canonical
-        // holders drive membership top-up and the local-holder guard above.
-        let member_peers: BTreeSet<PeerId> = holder_peers
-            .iter()
-            .copied()
+        let publisher_peers: BTreeSet<PeerId> = publishers
+            .into_iter()
+            .map(|node_id| node_id_to_peer_id(&node_id))
             .chain(retained.iter().map(node_id_to_peer_id))
             .collect();
 
@@ -819,7 +822,7 @@ impl DocumentSyncService {
                 .storage()
                 .topic_state(&topic_id)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let current = member_peers
+            let current = publisher_peers
                 .iter()
                 .copied()
                 .map(|peer| irokle_crate::actor_id_for(topic_id, peer))
@@ -19691,6 +19694,7 @@ mod tests {
             .reconcile_shard_membership(
                 &[shard_topic],
                 vec![local_node, current_node],
+                vec![local_node, current_node],
                 &BTreeSet::new(),
                 &BTreeSet::new(),
             )
@@ -19978,6 +19982,7 @@ mod tests {
             .reconcile_shard_membership(
                 &[topic_id],
                 vec![receiver_node],
+                vec![receiver_node],
                 &BTreeSet::new(),
                 &BTreeSet::from([topic_id]),
             )
@@ -20091,6 +20096,7 @@ mod tests {
             .reconcile_shard_membership(
                 &[topic],
                 vec![local_node, co_holder],
+                vec![local_node, co_holder],
                 &BTreeSet::new(),
                 &BTreeSet::new(),
             )
@@ -20110,6 +20116,7 @@ mod tests {
         service
             .reconcile_shard_membership(
                 &[topic],
+                vec![local_node, co_holder],
                 vec![local_node, co_holder],
                 &BTreeSet::new(),
                 &BTreeSet::from([topic]),

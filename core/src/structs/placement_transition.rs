@@ -155,6 +155,19 @@ impl TransitionPlan {
     pub fn bucket_list(&self) -> Vec<u32> {
         self.buckets.iter().map(|plan| plan.bucket).collect()
     }
+
+    /// The first `limits.max_incomplete_buckets` incomplete bucket plans in
+    /// plan order: the admitted in-flight window. Only these buckets' targets
+    /// may join, pull, and prove; completion frees the next slot.
+    pub fn admitted_buckets<'a>(
+        &'a self,
+        completed: &'a [BucketCompletion],
+    ) -> impl Iterator<Item = &'a BucketPlan> {
+        self.buckets
+            .iter()
+            .filter(move |plan| !completed.iter().any(|entry| entry.bucket == plan.bucket))
+            .take(self.limits.max_incomplete_buckets as usize)
+    }
 }
 
 /// One old holder's frozen frontier for a bucket. The bucket's barrier is the

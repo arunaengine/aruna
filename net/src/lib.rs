@@ -906,18 +906,20 @@ impl NetHandle {
             .allow_document_sync_peers(topics, peers)
     }
 
-    /// Reconciles shard-only topics to their exact current holder membership and
-    /// publisher policy. Shared topic membership and default peers are unchanged.
+    /// Reconciles shard-only topics to their exact sync membership (delivery)
+    /// and accepted publisher set (authority). Shared topic membership and
+    /// default peers are unchanged.
     pub async fn reconcile_shard_membership(
         &self,
         topics: &[::irokle::TopicId],
-        holders: Vec<NodeId>,
+        members: Vec<NodeId>,
+        publishers: Vec<NodeId>,
         retained: &std::collections::BTreeSet<NodeId>,
         verified_topics: &std::collections::BTreeSet<::irokle::TopicId>,
     ) -> Result<()> {
         self.inner
             .document_sync
-            .reconcile_shard_membership(topics, holders, retained, verified_topics)
+            .reconcile_shard_membership(topics, members, publishers, retained, verified_topics)
             .await
     }
 

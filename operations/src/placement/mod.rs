@@ -425,26 +425,76 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
 /// over, so repeated transitions bound peak membership at `|old U new|` and
 /// steady-state membership at the holders (#399). `now_ms` only ends the
 /// window; when it starts is carried in the record.
-pub fn transition_members(
+pub struct BucketMembership {
+    /// Sync membership and pull/delivery peers.
+    pub members: Vec<NodeId>,
+    /// Accepted authors: activated holders plus retained departing holders.
+    pub publishers: Vec<NodeId>,
+}
+
+/// Per-bucket membership and publish authority, derived from each bucket's
+/// own completion and status rather than the transition as a whole:
+/// an admitted incomplete bucket adds its targets as members only, a
+/// completed bucket retains departing old holders (member and publisher)
+/// through its own grace window, and an aborted incomplete bucket adds
+/// nothing beyond the activated holders.
+pub fn bucket_membership(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
     now_ms: u64,
-) -> Vec<NodeId> {
-    let mut members = resolve_shard_holders(config, placement);
+) -> BucketMembership {
+    let base = resolve_shard_holders(config, placement);
+    let mut members = base.clone();
+    let mut publishers = base;
     for transition in &config.placement_transitions {
-        if transition.plan.strategy_id != placement.strategy_id || transition.released(now_ms) {
+        if transition.plan.strategy_id != placement.strategy_id {
             continue;
         }
         let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
             continue;
         };
-        for node_id in bucket.old_holders.iter().chain(&bucket.target_holders) {
-            if !members.contains(node_id) {
-                members.push(*node_id);
+        match transition.completion(bucket.bucket) {
+            None => {
+                // Only targets inside the admitted window join, bounding the
+                // join/pull fan-out to the plan's in-flight limit.
+                if matches!(
+                    transition.status,
+                    aruna_core::structs::TransitionStatus::Active
+                ) && transition
+                    .plan
+                    .admitted_buckets(&transition.completed)
+                    .any(|admitted| admitted.bucket == bucket.bucket)
+                {
+                    for node_id in &bucket.target_holders {
+                        push_unique(&mut members, *node_id);
+                    }
+                }
+            }
+            Some(completion) => {
+                let retained_until = completion
+                    .completed_at_ms
+                    .saturating_add(transition.plan.limits.grace_ms);
+                if now_ms < retained_until {
+                    for node_id in &bucket.old_holders {
+                        if !bucket.target_holders.contains(node_id) {
+                            push_unique(&mut members, *node_id);
+                            push_unique(&mut publishers, *node_id);
+                        }
+                    }
+                }
             }
         }
     }
-    members
+    BucketMembership {
+        members,
+        publishers,
+    }
+}
+
+fn push_unique(nodes: &mut Vec<NodeId>, node_id: NodeId) {
+    if !nodes.contains(&node_id) {
+        nodes.push(node_id);
+    }
 }
 
 /// Whether `node_id` holds `placement`, and may therefore publish onto its
@@ -618,29 +668,6 @@ pub fn choose_origin_bucket(
         strategy_id: strategy.strategy_id,
         shard: held[best],
     })
-}
-
-fn resolve_shard_holders_with(
-    config: &RealmConfigDocument,
-    strategy: &PlacementStrategy,
-    placement: &PlacementRef,
-) -> Vec<NodeId> {
-    let view = build_view(config);
-    resolve_shard_holders_from_view(config, &view, strategy, placement)
-}
-
-fn resolve_shard_holders_from_view(
-    config: &RealmConfigDocument,
-    view: &PlacementView,
-    strategy: &PlacementStrategy,
-    placement: &PlacementRef,
-) -> Vec<NodeId> {
-    resolve_holders(
-        view,
-        strategy,
-        &shard_subject_bytes(placement),
-        shard_override(config, placement),
-    )
 }
 
 #[cfg(test)]
@@ -973,6 +1000,106 @@ mod tests {
                 .expect("frozen selector"),
             pinned
         );
+    }
+
+    fn membership_fixture() -> (RealmConfigDocument, Ulid) {
+        // Bucket 7 completed at t=100 (grace 1000, departing holder node 9),
+        // buckets 8 and 9 incomplete with a limit-one window.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let strategy_id = placement.strategy_id;
+        let bucket =
+            |bucket: u32, old: Vec<NodeId>, target: Vec<NodeId>| aruna_core::structs::BucketPlan {
+                bucket,
+                old_holders: old,
+                target_holders: target,
+                predecessor_epoch: 1,
+            };
+        let mut transition =
+            aruna_core::structs::PlacementTransition::new(aruna_core::structs::TransitionPlan {
+                transition_id: Ulid::from_bytes([8; 16]),
+                strategy_id,
+                buckets: vec![
+                    bucket(7, vec![node(9)], vec![node(2)]),
+                    bucket(8, Vec::new(), vec![node(8)]),
+                    bucket(9, Vec::new(), vec![node(7)]),
+                ],
+                target_map_epoch: 2,
+                limits: aruna_core::structs::TransitionLimits {
+                    max_incomplete_buckets: 1,
+                    grace_ms: 1_000,
+                },
+                created_by: node(1),
+                created_at_ms: 1,
+            });
+        transition
+            .completed
+            .push(aruna_core::structs::BucketCompletion {
+                bucket: 7,
+                completed_at_ms: 100,
+            });
+        config.placement_transitions.push(transition);
+        (config, strategy_id)
+    }
+
+    #[test]
+    fn membership_per_bucket() {
+        // Retention is the bucket's own: bucket 7 releases at its grace end
+        // while bucket 8's target stays a member without publish authority,
+        // and an abort drops incomplete targets immediately.
+        let (config, strategy_id) = membership_fixture();
+        let at = |shard: u32, now_ms: u64| {
+            bucket_membership(&config, &PlacementRef { strategy_id, shard }, now_ms)
+        };
+
+        let retained = at(7, 500);
+        assert!(retained.members.contains(&node(9)));
+        assert!(retained.publishers.contains(&node(9)));
+        let released = at(7, 1_100);
+        assert!(!released.members.contains(&node(9)));
+        assert!(!released.publishers.contains(&node(9)));
+
+        let admitted = at(8, 500);
+        assert!(admitted.members.contains(&node(8)));
+        assert!(!admitted.publishers.contains(&node(8)));
+
+        let mut aborted_config = config.clone();
+        aborted_config.placement_transitions[0].status =
+            aruna_core::structs::TransitionStatus::Aborted;
+        let aborted = bucket_membership(
+            &aborted_config,
+            &PlacementRef {
+                strategy_id,
+                shard: 8,
+            },
+            500,
+        );
+        assert!(!aborted.members.contains(&node(8)));
+        // The completed bucket's retention survives the abort.
+        let still_retained = bucket_membership(
+            &aborted_config,
+            &PlacementRef {
+                strategy_id,
+                shard: 7,
+            },
+            500,
+        );
+        assert!(still_retained.publishers.contains(&node(9)));
+    }
+
+    #[test]
+    fn window_bounds_joins() {
+        // Limit-one: only the first incomplete bucket's target is admitted.
+        let (config, strategy_id) = membership_fixture();
+        let outside = bucket_membership(
+            &config,
+            &PlacementRef {
+                strategy_id,
+                shard: 9,
+            },
+            500,
+        );
+        assert!(!outside.members.contains(&node(7)));
     }
 
     #[test]
@@ -1362,7 +1489,7 @@ mod tests {
         assert!(pruned.placement_transitions.is_empty());
         for (placement, holders) in buckets.iter().zip(&moved) {
             assert_eq!(&resolve_shard_holders(&pruned, placement), holders);
-            assert!(transition_members(&pruned, placement, u64::MAX) == *holders);
+            assert!(bucket_membership(&pruned, placement, u64::MAX).members == *holders);
         }
         assert_eq!(pruned.placement_activations, live.placement_activations);
     }

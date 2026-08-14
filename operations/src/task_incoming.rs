@@ -1124,9 +1124,9 @@ impl OperationsTaskHandler {
             invocation.outcome.merge(outcome);
         }
 
-        // Publish to the transition membership (holders plus every set an
-        // active transition still names), but keep stamped peers above as
-        // genesis sources: a target must see writes made during the window.
+        // Publish to the bucket's sync members (admitted targets and retained
+        // departing holders included), but keep stamped peers above as genesis
+        // sources: a target must see writes made during the window.
         if let Some(config) = config {
             let now_ms = aruna_core::util::unix_timestamp_millis();
             for (_, record, _) in &mut records {
@@ -1134,7 +1134,7 @@ impl OperationsTaskHandler {
                     continue;
                 }
                 let members =
-                    crate::placement::transition_members(config, &record.placement, now_ms);
+                    crate::placement::bucket_membership(config, &record.placement, now_ms).members;
                 if !members.is_empty() {
                     record.peers = members;
                 }

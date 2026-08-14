@@ -15,7 +15,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::{resolve_shard_holders, transition_members};
+use crate::placement::{bucket_membership, resolve_shard_holders};
 use crate::shard::assemble_shard_manifest;
 use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
 use crate::shard::protocol::{
@@ -151,7 +151,10 @@ async fn build_response(
     }
     // A transition target is not a holder yet and still has to verify the copy
     // it pulled against this holder, so the derived membership decides here.
-    if !transition_members(&config, &placement, unix_timestamp_millis()).contains(&peer) {
+    if !bucket_membership(&config, &placement, unix_timestamp_millis())
+        .members
+        .contains(&peer)
+    {
         return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
             "shard peer `{peer}` is not a holder for shard {}/{} in realm `{realm_id}`",
             placement.strategy_id, placement.shard

@@ -14,7 +14,7 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::{draining_former_holders, resolve_shard_holders, transition_members};
+use crate::placement::{bucket_membership, draining_former_holders, resolve_shard_holders};
 use crate::sync_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
@@ -54,7 +54,7 @@ async fn ensure_held_shard_topics(
     verified: &BTreeSet<::irokle::TopicId>,
     now_ms: u64,
 ) -> HeldTopicOutcome {
-    type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
+    type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
     let mut rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut member_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
     for strategy in &config.strategies {
@@ -64,22 +64,25 @@ async fn ensure_held_shard_topics(
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            // Members are the activated holders plus every set a transition
-            // still names for the bucket, so a target joins and an old holder
-            // stays reachable through the grace window (#399 bounds the peak at
-            // |old U new|).
-            let members = transition_members(config, &placement, now_ms);
-            if !members.contains(&local_node_id) {
+            // Per-bucket membership: admitted targets join for delivery, and
+            // retained departing holders stay through their bucket's grace
+            // (#399 bounds the peak at |old U new|); publish authority stays
+            // with activated plus retained holders only.
+            let membership = bucket_membership(config, &placement, now_ms);
+            if !membership.members.contains(&local_node_id) {
                 continue;
             }
             // Rank-0 is an activation role: a target that has not cut over yet
             // never creates a genesis (#400).
             let local_is_rank0 = holders.first() == Some(&local_node_id);
-            let mut co_holders: Vec<NodeId> = members
+            let mut co_members: Vec<NodeId> = membership
+                .members
                 .into_iter()
                 .filter(|candidate| *candidate != local_node_id)
                 .collect();
-            sort_node_ids(&mut co_holders);
+            sort_node_ids(&mut co_members);
+            let mut publishers = membership.publishers;
+            sort_node_ids(&mut publishers);
             let retained: BTreeSet<NodeId> = draining_former_holders(config, &placement)
                 .into_iter()
                 .collect();
@@ -89,24 +92,25 @@ async fn ensure_held_shard_topics(
                 &mut member_groups
             };
             groups
-                .entry((co_holders, retained))
+                .entry((co_members, publishers, retained))
                 .or_default()
                 .push(shard_topic_id(realm_id, &placement));
         }
     }
     let mut outcome = HeldTopicOutcome::default();
-    for ((co_holders, retained), topics) in rank0_groups {
+    for ((co_members, publishers, retained), topics) in rank0_groups {
         debug!(
             event = "placement.genesis.ensure",
             topics = topics.len(),
-            co_holders = co_holders.len(),
+            co_members = co_members.len(),
             "Ensuring rank-0 shard topic geneses"
         );
         outcome.withheld |= ensure_rank0_shard_group(
             context,
             net_handle,
             local_node_id,
-            co_holders,
+            co_members,
+            publishers,
             topics,
             &retained,
             verified,
@@ -121,18 +125,24 @@ async fn ensure_held_shard_topics(
     // origin is drained out of the holder set, nobody does.
     // Topics already known are topped up with the current co-holder set, which
     // is what admits a freshly added holder on the pushing side.
-    for ((co_holders, retained), topics) in member_groups {
-        if co_holders.is_empty() {
+    for ((co_members, publishers, retained), topics) in member_groups {
+        if co_members.is_empty() {
             continue;
         }
-        let mut current_holders = co_holders.clone();
-        current_holders.push(local_node_id);
-        sort_node_ids(&mut current_holders);
+        let mut current_members = co_members.clone();
+        current_members.push(local_node_id);
+        sort_node_ids(&mut current_members);
         // Install the current publisher policy before pulling any history. A
         // missing topic is expected here; the exact membership pass below is
         // repeated after a successful pull.
         let _ = net_handle
-            .reconcile_shard_membership(&topics, current_holders.clone(), &retained, verified)
+            .reconcile_shard_membership(
+                &topics,
+                current_members.clone(),
+                publishers.clone(),
+                &retained,
+                verified,
+            )
             .await;
         let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
             topics.into_iter().partition(|topic| {
@@ -144,11 +154,11 @@ async fn ensure_held_shard_topics(
             debug!(
                 event = "placement.topic.pull",
                 topics = missing.len(),
-                co_holders = co_holders.len(),
+                co_members = co_members.len(),
                 "Pulling newly held shard topics from co-holders"
             );
             let event = net_handle
-                .sync_document_topics(missing.clone(), co_holders.clone())
+                .sync_document_topics(missing.clone(), co_members.clone())
                 .await;
             crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
             for topic in missing {
@@ -168,7 +178,7 @@ async fn ensure_held_shard_topics(
             continue;
         }
         if let Err(error) = net_handle
-            .reconcile_shard_membership(&known, current_holders, &retained, verified)
+            .reconcile_shard_membership(&known, current_members, publishers, &retained, verified)
             .await
         {
             debug!(error = %error, "Could not complete held shard topic membership");
@@ -197,18 +207,25 @@ pub(crate) async fn ensure_rank0_shard_group(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     local_node_id: NodeId,
-    co_holders: Vec<NodeId>,
+    co_members: Vec<NodeId>,
+    publishers: Vec<NodeId>,
     topics: Vec<::irokle::TopicId>,
     retained: &BTreeSet<NodeId>,
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> bool {
-    let mut current_holders = co_holders.clone();
-    current_holders.push(local_node_id);
-    sort_node_ids(&mut current_holders);
+    let mut current_members = co_members.clone();
+    current_members.push(local_node_id);
+    sort_node_ids(&mut current_members);
     // This first pass installs publisher policy even when a topic still needs
     // to be adopted or created. Exact membership is retried once it exists.
     let _ = net_handle
-        .reconcile_shard_membership(&topics, current_holders.clone(), retained, verified)
+        .reconcile_shard_membership(
+            &topics,
+            current_members.clone(),
+            publishers.clone(),
+            retained,
+            verified,
+        )
         .await;
 
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
@@ -226,11 +243,11 @@ pub(crate) async fn ensure_rank0_shard_group(
 
     let mut withheld = false;
     if !missing.is_empty() {
-        if co_holders.is_empty() {
+        if co_members.is_empty() {
             to_ensure.extend(missing);
         } else {
             let probe = net_handle
-                .probe_shard_topic_geneses(missing.clone(), co_holders.clone())
+                .probe_shard_topic_geneses(missing.clone(), co_members.clone())
                 .await;
             let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
             for topic in missing {
@@ -247,7 +264,7 @@ pub(crate) async fn ensure_rank0_shard_group(
             }
             if !to_adopt.is_empty() {
                 let event = net_handle
-                    .sync_document_topics(to_adopt.clone(), co_holders.clone())
+                    .sync_document_topics(to_adopt.clone(), co_members.clone())
                     .await;
                 crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
                 // Only ensure membership on topics whose genesis actually landed;
@@ -275,10 +292,16 @@ pub(crate) async fn ensure_rank0_shard_group(
     }
 
     if !to_ensure.is_empty() {
-        match net_handle.ensure_document_sync_topics(&to_ensure, co_holders) {
+        match net_handle.ensure_document_sync_topics(&to_ensure, co_members) {
             Ok(()) => {
                 if let Err(error) = net_handle
-                    .reconcile_shard_membership(&to_ensure, current_holders, retained, verified)
+                    .reconcile_shard_membership(
+                        &to_ensure,
+                        current_members,
+                        publishers,
+                        retained,
+                        verified,
+                    )
                     .await
                 {
                     warn!(error = %error, "Failed to reconcile rank-0 shard membership");
@@ -559,10 +582,12 @@ async fn reconcile_placements(
             let retained = draining_former_holders(&config, &record.placement)
                 .into_iter()
                 .collect();
+            let bucket = bucket_membership(&config, &record.placement, unix_timestamp_millis());
             let membership = net_handle
                 .reconcile_shard_membership(
                     &[topic],
-                    transition_members(&config, &record.placement, unix_timestamp_millis()),
+                    bucket.members,
+                    bucket.publishers,
                     &retained,
                     &verified,
                 )

@@ -55,7 +55,13 @@ pub async fn process_placement_transitions(
             }
             continue;
         }
-        let mut in_flight = 0u32;
+        // One window function decides execution and membership alike: only
+        // admitted buckets run, and only their targets join topics.
+        let admitted: Vec<u32> = transition
+            .plan
+            .admitted_buckets(&transition.completed)
+            .map(|bucket| bucket.bucket)
+            .collect();
         for bucket in &transition.plan.buckets {
             if transition.completion(bucket.bucket).is_some() {
                 departed |= bucket.old_holders.contains(&local_node_id)
@@ -67,10 +73,9 @@ pub async fn process_placement_transitions(
             if !matches!(transition.status, TransitionStatus::Active) {
                 continue;
             }
-            in_flight += 1;
-            if in_flight > transition.plan.limits.max_incomplete_buckets {
+            if !admitted.contains(&bucket.bucket) {
                 pending = true;
-                break;
+                continue;
             }
             let placement = PlacementRef {
                 strategy_id: transition.plan.strategy_id,

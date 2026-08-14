@@ -885,7 +885,7 @@ pub async fn restore_shard_pass(
             ..ShardRestorePass::default()
         };
     };
-    let plan = plan_shard_groups(&config, node_id, realm_id);
+    let plan = plan_shard_groups(&config, node_id, realm_id, unix_timestamp_millis());
     let mut summary = plan.summary;
     let units = plan.into_units();
     let units_total = units.len();
@@ -1022,7 +1022,7 @@ async fn restore_batch(
     }
 }
 
-type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
+type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
 
 /// Restore work grouped by co-holder and retained peer sets, so matching shards
 /// ride one ensure and one sync instead of one round trip each.
@@ -1039,6 +1039,7 @@ fn plan_shard_groups(
     config: &RealmConfigDocument,
     node_id: NodeId,
     realm_id: RealmId,
+    now_ms: u64,
 ) -> ShardPlan {
     let mut plan = ShardPlan {
         summary: RestoreShardSummary::default(),
@@ -1065,19 +1066,26 @@ fn plan_shard_groups(
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            if !holders.contains(&node_id) {
+            // Restart is transition-aware: a target or retained departing
+            // holder stays in its bucket's membership, publishers stay the
+            // authority set.
+            let membership = crate::placement::bucket_membership(config, &placement, now_ms);
+            if !membership.members.contains(&node_id) {
                 continue;
             }
             plan.summary.held_shards += 1;
             let local_is_rank0 = holders.first() == Some(&node_id);
-            let mut co_holders: Vec<NodeId> = holders
+            let mut co_members: Vec<NodeId> = membership
+                .members
                 .into_iter()
                 .filter(|candidate| *candidate != node_id)
                 .collect();
-            co_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            if co_holders.is_empty() {
+            co_members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            if co_members.is_empty() {
                 continue;
             }
+            let mut publishers = membership.publishers;
+            publishers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             let topic = shard_topic_id(realm_id, &placement);
             let retained: BTreeSet<NodeId> = draining_former_holders(config, &placement)
                 .into_iter()
@@ -1088,7 +1096,7 @@ fn plan_shard_groups(
                 &mut plan.join_groups
             };
             groups
-                .entry((co_holders, retained))
+                .entry((co_members, publishers, retained))
                 .or_default()
                 .push(topic);
             plan.summary.shard_topics += 1;
@@ -1111,11 +1119,12 @@ pub async fn prepare_shard_policy(
     let RealmConfigLoad::Found(config) = load_realm_config(context, realm_id).await else {
         return RestoreShardSummary::default();
     };
-    let plan = plan_shard_groups(&config, node_id, realm_id);
+    let plan = plan_shard_groups(&config, node_id, realm_id, unix_timestamp_millis());
     let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
 
     let mut prepared = 0usize;
-    for ((co_holders, retained), topics) in plan.rank0_groups.iter().chain(plan.join_groups.iter())
+    for ((co_members, publishers, retained), topics) in
+        plan.rank0_groups.iter().chain(plan.join_groups.iter())
     {
         let present: Vec<::irokle::TopicId> = topics
             .iter()
@@ -1129,12 +1138,12 @@ pub async fn prepare_shard_policy(
         if present.is_empty() {
             continue;
         }
-        let mut holders = co_holders.clone();
-        holders.push(node_id);
-        holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut members = co_members.clone();
+        members.push(node_id);
+        members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         prepared += present.len();
         if let Err(error) = net_handle
-            .reconcile_shard_membership(&present, holders, retained, &verified)
+            .reconcile_shard_membership(&present, members, publishers.clone(), retained, &verified)
             .await
         {
             // Local policy is installed before this returns.
@@ -1173,6 +1182,7 @@ fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> RestoreRange
 struct RestoreUnit {
     kind: RestoreKind,
     peers: Vec<NodeId>,
+    publishers: Vec<NodeId>,
     retained: BTreeSet<NodeId>,
     topics: Vec<::irokle::TopicId>,
 }
@@ -1211,6 +1221,10 @@ fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
         for peer in &unit.peers {
             hasher.update(peer.as_bytes());
         }
+        hasher.update(&(unit.publishers.len() as u64).to_be_bytes());
+        for peer in &unit.publishers {
+            hasher.update(peer.as_bytes());
+        }
         hasher.update(&(unit.retained.len() as u64).to_be_bytes());
         for peer in &unit.retained {
             hasher.update(peer.as_bytes());
@@ -1227,7 +1241,11 @@ impl ShardPlan {
     /// Flattens the plan into a deterministic list of bounded work units.
     fn into_units(self) -> Vec<RestoreUnit> {
         let mut units = Vec::new();
-        let mut push = |kind, peers: Vec<NodeId>, retained: BTreeSet<NodeId>, topics: Vec<_>| {
+        let mut push = |kind,
+                        peers: Vec<NodeId>,
+                        publishers: Vec<NodeId>,
+                        retained: BTreeSet<NodeId>,
+                        topics: Vec<_>| {
             if peers.is_empty() || topics.is_empty() {
                 return;
             }
@@ -1235,19 +1253,26 @@ impl ShardPlan {
                 units.push(RestoreUnit {
                     kind,
                     peers: peers.clone(),
+                    publishers: publishers.clone(),
                     retained: retained.clone(),
                     topics: chunk.to_vec(),
                 });
             }
         };
         for (peers, topics) in self.shared_groups {
-            push(RestoreKind::Shared, peers, BTreeSet::new(), topics);
+            push(
+                RestoreKind::Shared,
+                peers,
+                Vec::new(),
+                BTreeSet::new(),
+                topics,
+            );
         }
-        for ((peers, retained), topics) in self.rank0_groups {
-            push(RestoreKind::Rank0, peers, retained, topics);
+        for ((peers, publishers, retained), topics) in self.rank0_groups {
+            push(RestoreKind::Rank0, peers, publishers, retained, topics);
         }
-        for ((peers, retained), topics) in self.join_groups {
-            push(RestoreKind::Join, peers, retained, topics);
+        for ((peers, publishers, retained), topics) in self.join_groups {
+            push(RestoreKind::Join, peers, publishers, retained, topics);
         }
         units
     }
@@ -1335,6 +1360,7 @@ async fn restore_rank0(
         net_handle,
         node_id,
         unit.peers.clone(),
+        unit.publishers.clone(),
         unit.topics.clone(),
         &unit.retained,
         verified,
@@ -1378,13 +1404,14 @@ async fn restore_join(
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
-    let mut current_holders = unit.peers.clone();
-    current_holders.push(node_id);
-    current_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut current_members = unit.peers.clone();
+    current_members.push(node_id);
+    current_members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     if let Err(error) = net_handle
         .reconcile_shard_membership(
             &unit.topics,
-            current_holders.clone(),
+            current_members.clone(),
+            unit.publishers.clone(),
             &unit.retained,
             verified,
         )
@@ -1417,7 +1444,13 @@ async fn restore_join(
     );
     if !present.is_empty()
         && let Err(error) = net_handle
-            .reconcile_shard_membership(&present, current_holders, &unit.retained, verified)
+            .reconcile_shard_membership(
+                &present,
+                current_members,
+                unit.publishers.clone(),
+                &unit.retained,
+                verified,
+            )
             .await
     {
         warn!(error = %error, "Failed to reconcile joined shard membership on restart");
@@ -1576,7 +1609,7 @@ mod tests {
     fn restore_units_chunk() {
         let local = node(1);
         let config = sharded_config(&[local, node(2), node(3)], 256);
-        let plan = plan_shard_groups(&config, local, RealmId([7; 32]));
+        let plan = plan_shard_groups(&config, local, RealmId([7; 32]), 0);
         let held = plan.summary.held_shards;
         let units = plan.into_units();
 
@@ -1624,6 +1657,7 @@ mod tests {
     fn cursor_rebinds_plan() {
         let topic = |seed| ::irokle::TopicId::from_bytes([seed; 32]);
         let unit = |seed| RestoreUnit {
+            publishers: Vec::new(),
             kind: RestoreKind::Shared,
             peers: vec![node(seed)],
             retained: BTreeSet::new(),
@@ -1657,13 +1691,13 @@ mod tests {
     fn cursor_rebinds_config() {
         let local = node(1);
         let mut config = sharded_config(&[local, node(2), node(3)], 16);
-        let original = plan_shard_groups(&config, local, RealmId([7; 32])).into_units();
+        let original = plan_shard_groups(&config, local, RealmId([7; 32]), 0).into_units();
         let mut cursor = ShardRestoreCursor::default();
         assert!(bind_restore_plan(&mut cursor, &original));
         cursor.next_unit = 1;
 
         config.strategies[0].shard_count = 32;
-        let changed = plan_shard_groups(&config, local, RealmId([7; 32])).into_units();
+        let changed = plan_shard_groups(&config, local, RealmId([7; 32]), 0).into_units();
         assert!(bind_restore_plan(&mut cursor, &changed));
         assert_eq!(cursor.next_unit, 0);
     }
@@ -1675,8 +1709,8 @@ mod tests {
     ) {
         let local = node(1);
         let realm_id = RealmId([7; 32]);
-        let before_units = plan_shard_groups(before, local, realm_id).into_units();
-        let after_units = plan_shard_groups(after, local, realm_id).into_units();
+        let before_units = plan_shard_groups(before, local, realm_id, 0).into_units();
+        let after_units = plan_shard_groups(after, local, realm_id, 0).into_units();
         let mut cursor = ShardRestoreCursor::default();
         assert!(bind_restore_plan(&mut cursor, &before_units));
         cursor.next_unit = 1;
@@ -2256,6 +2290,7 @@ mod tests {
         let units = vec![RestoreUnit {
             kind: RestoreKind::Shared,
             peers: vec![node(2)],
+            publishers: Vec::new(),
             retained: BTreeSet::new(),
             topics: vec![::irokle::TopicId::from_bytes([5; 32])],
         }];
