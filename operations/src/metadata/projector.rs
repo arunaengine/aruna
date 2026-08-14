@@ -106,6 +106,8 @@ pub enum MetadataProjectionError {
     MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
     #[error("deferred {deferred} metadata create event(s) stamped too far in the future")]
     ClockSkewDeferred { deferred: usize },
+    #[error("the document's bucket cut over to a new holder set; retry the projection")]
+    PlacementFenced,
     #[error("unexpected event while projecting metadata create event: {0}")]
     UnexpectedEvent(String),
 }
@@ -410,6 +412,7 @@ pub async fn project_metadata_create_events(
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
+    let mut fence = crate::placement::fence::WriteFence::default();
 
     for event in events {
         let document_id = event.record.document_id;
@@ -514,10 +517,24 @@ pub async fn project_metadata_create_events(
         let has_live_holders = realm_config.is_some_and(|config| {
             !resolve_shard_holders(config, &event.record.placement).is_empty()
         });
+        if authored_here && let Some(config) = realm_config {
+            fence.add(
+                event.record.realm_id,
+                config,
+                [
+                    event.record.placement,
+                    crate::placement::registry_placement(config, &event.record),
+                ],
+            );
+        }
+        let realm_id = event.record.realm_id;
         let outbox = if authored_here && has_live_holders {
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
-            Some(create_event_outbox_record(&event, realm_config, true))
+            Some(
+                create_event_outbox_record(&event, realm_config, true)
+                    .fenced_at(fence.generation(&realm_id, &event.record.placement)),
+            )
         } else {
             if authored_here {
                 // No live holder can accept the genesis yet; keep the marker so
@@ -529,8 +546,12 @@ pub async fn project_metadata_create_events(
         };
         // The registry row rides its own everywhere-bound topic, so it goes out
         // even when the document's own bucket has no holders to publish to.
-        let registry_outbox =
-            authored_here.then(|| registry_outbox_record(&event, realm_config, true));
+        let registry_outbox = authored_here.then(|| {
+            registry_outbox_record(&event, realm_config, true).map(|record| {
+                let generation = fence.generation(&realm_id, &record.placement);
+                record.fenced_at(generation)
+            })
+        });
         let audit = audit_record(&event);
         if needs_materialization {
             let now = aruna_core::util::unix_timestamp_millis();
@@ -605,7 +626,7 @@ pub async fn project_metadata_create_events(
             .iter()
             .map(|record| record.graph_iri.clone())
             .collect::<BTreeSet<_>>();
-        transactional_projection_write(context, writes, graph_iris).await?;
+        transactional_projection_write(context, writes, graph_iris, &fence).await?;
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
             if let Some(cache_generation) = cache_generation {
                 for record in projected_records {
@@ -682,6 +703,7 @@ async fn transactional_projection_write(
     context: &DriverContext,
     writes: Vec<(String, ByteView, ByteView)>,
     graph_iris: BTreeSet<String>,
+    fence: &crate::placement::fence::WriteFence,
 ) -> Result<(), MetadataProjectionError> {
     // Read lifecycle keys in the same transaction as registry writes so a
     // delete commit conflicts instead of allowing storage resurrection.
@@ -697,7 +719,7 @@ async fn transactional_projection_write(
             "metadata projection transaction owner missing id".to_string(),
         )
     })?;
-    let reads = graph_iris
+    let mut reads = graph_iris
         .iter()
         .map(|graph_iri| {
             (
@@ -706,6 +728,10 @@ async fn transactional_projection_write(
             )
         })
         .collect::<Vec<_>>();
+    // The fence joins this transaction's read set, so a departing holder's
+    // close conflicts the commit of a write it did not observe.
+    let lifecycle_reads = reads.len();
+    reads.extend(fence.reads());
     let expected_reads = reads.len();
     let values = match storage
         .send_storage_effect(StorageEffect::BatchRead {
@@ -730,11 +756,15 @@ async fn transactional_projection_write(
             )));
         }
     };
-    for (_, value) in values {
+    if !fence.admits(&values[lifecycle_reads..]) {
+        abort_projection_transaction(storage, &mut owner, txn_id).await;
+        return Err(MetadataProjectionError::PlacementFenced);
+    }
+    for (_, value) in &values[..lifecycle_reads] {
         let Some(value) = value else {
             continue;
         };
-        let lifecycle = match postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value) {
+        let lifecycle = match postcard::from_bytes::<MetadataGraphLifecycleRecord>(value) {
             Ok(lifecycle) => lifecycle,
             Err(error) => {
                 abort_projection_transaction(storage, &mut owner, txn_id).await;
@@ -1316,6 +1346,107 @@ mod tests {
         }
     }
 
+    /// A realm whose buckets are activated at generation one, so a projection
+    /// resolves a generation and takes the bucket's fence.
+    fn activated_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
+        let mut config = realm_config(realm_id, nodes);
+        config.snapshot_candidate_map();
+        config
+    }
+
+    async fn outbox_rows(storage: &StorageHandle) -> Vec<DocumentSyncOutboxRecord> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 64,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| postcard::from_bytes(&value).expect("outbox row decodes"))
+                .collect(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_takes_fence() {
+        // An admitted projection stamps the generation it resolved at onto
+        // every outbox row it commits.
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let mut event = create_event();
+        event.node_id = node(1);
+        let config = activated_config(event.record.realm_id, &[node(1), node(2), node(3)]);
+        let event = stamped(event, &config);
+        store_realm_config(&storage, &config).await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
+            .await
+            .expect("projection succeeds");
+        let rows = outbox_rows(&storage).await;
+        assert!(!rows.is_empty(), "an admitted projection publishes");
+        for row in rows {
+            assert_eq!(row.generation, 1, "row for {:?}", row.placement);
+        }
+    }
+
+    #[tokio::test]
+    async fn fence_rejects_create() {
+        // The departing holder closed generation one: the projection must not
+        // commit a row the drained bucket can no longer publish.
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let mut event = create_event();
+        event.node_id = node(1);
+        let config = activated_config(event.record.realm_id, &[node(1), node(2), node(3)]);
+        let event = stamped(event, &config);
+        store_realm_config(&storage, &config).await;
+        crate::placement::fence::close(
+            &storage,
+            &event.record.realm_id,
+            &event.record.placement,
+            1,
+        )
+        .await
+        .expect("the departing holder closes the fence");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let error =
+            project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
+                .await
+                .expect_err("the fenced projection is rejected");
+        assert!(
+            matches!(error, MetadataProjectionError::PlacementFenced),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            outbox_rows(&storage).await.is_empty(),
+            "a fenced projection commits nothing"
+        );
+    }
+
     #[tokio::test]
     async fn deferred_mint_retries() {
         // A locally authored create whose shard has no live holder must keep its
@@ -1406,6 +1537,7 @@ mod tests {
             aruna_core::storage_entries::metadata_registry_write_entries(&event.record)
                 .expect("registry writes serialize"),
             BTreeSet::from([event.record.graph_iri.clone()]),
+            &Default::default(),
         )
         .await;
         assert!(matches!(
