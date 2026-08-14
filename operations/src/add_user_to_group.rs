@@ -45,6 +45,9 @@ pub struct AddUserToGroupInput {
 #[derive(PartialEq)]
 pub struct AddUserToGroupOperation {
     input: AddUserToGroupInput,
+    /// Bucket the authorization rows publish onto, read inside the write
+    /// transaction.
+    fence: crate::placement::fence::WriteFence,
     state: AddUserToGroupState,
     output: Option<Result<GroupAuthorizationDocument, AddUserToGroupError>>,
 }
@@ -75,6 +78,12 @@ pub enum AddUserToGroupState {
         newly_added: bool,
     },
     DeleteStaleAdminConflicts {
+        txn_id: TxnId,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        newly_added: bool,
+    },
+    ReadBucketFence {
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
@@ -111,6 +120,8 @@ pub enum AddUserToGroupError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
+    #[error("the group's bucket cut over to a new holder set; retry the change")]
+    PlacementFenced,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unauthorized")]
@@ -137,6 +148,7 @@ impl AddUserToGroupOperation {
     pub fn new(input: AddUserToGroupInput) -> Self {
         AddUserToGroupOperation {
             input,
+            fence: Default::default(),
             state: AddUserToGroupState::Init,
             output: None,
         }
@@ -335,12 +347,19 @@ impl AddUserToGroupOperation {
         let document_target = DocumentSyncTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
-        let placement = realm_config_value
+        let realm_config = realm_config_value
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
-            .transpose()?
-            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
+            .transpose()?;
+        let placement = realm_config
+            .as_ref()
+            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
+        let realm_id = self.input.actor.realm_id;
+        if let Some(config) = realm_config.as_ref() {
+            self.fence.add(realm_id, config, [placement]);
+        }
+        let generation = self.fence.generation(&realm_id, &placement);
         for event in &admin_events {
             let record = new_outbox_record_with_id(
                 event.event_id,
@@ -352,7 +371,8 @@ impl AddUserToGroupOperation {
                 },
                 placement,
                 false,
-            );
+            )
+            .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
@@ -425,7 +445,53 @@ impl AddUserToGroupOperation {
         self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written, newly_added)
     }
 
+    /// Takes the bucket's fence inside the transaction before committing, so a
+    /// departing holder's close rejects or conflicts this write.
     fn emit_commit_transaction(
+        &mut self,
+        txn_id: TxnId,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        newly_added: bool,
+    ) -> Effects {
+        if self.fence.is_empty() {
+            return self.emit_commit(txn_id, auth_doc, admin_outbox_written, newly_added);
+        }
+        self.state = AddUserToGroupState::ReadBucketFence {
+            txn_id,
+            auth_doc,
+            admin_outbox_written,
+            newly_added,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.fence.reads(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_bucket_fence(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        newly_added: bool,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::BatchReadResult)",
+                got,
+            );
+        };
+        if !self.fence.admits(&values) {
+            return self.fail(AddUserToGroupError::PlacementFenced);
+        }
+        self.emit_commit(txn_id, auth_doc, admin_outbox_written, newly_added)
+    }
+
+    fn emit_commit(
         &mut self,
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
@@ -663,6 +729,14 @@ impl Operation for AddUserToGroupOperation {
                 admin_outbox_written,
                 newly_added,
             ),
+            AddUserToGroupState::ReadBucketFence {
+                txn_id,
+                auth_doc,
+                admin_outbox_written,
+                newly_added,
+            } => {
+                self.handle_bucket_fence(event, txn_id, auth_doc, admin_outbox_written, newly_added)
+            }
             AddUserToGroupState::CommitTransaction {
                 auth_doc,
                 admin_outbox_written,
@@ -705,6 +779,7 @@ impl Operation for AddUserToGroupOperation {
             AddUserToGroupState::ReadAuthDocAndAdminState { txn_id }
             | AddUserToGroupState::WriteAuthDocAndAdminState { txn_id, .. }
             | AddUserToGroupState::DeleteStaleAdminConflicts { txn_id, .. }
+            | AddUserToGroupState::ReadBucketFence { txn_id, .. }
             | AddUserToGroupState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }

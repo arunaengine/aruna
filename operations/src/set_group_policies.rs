@@ -43,6 +43,9 @@ pub struct SetGroupPoliciesConfig {
 pub struct SetGroupPoliciesOperation {
     config: SetGroupPoliciesConfig,
     txn_id: Option<TxnId>,
+    /// Bucket the authorization row publishes onto, read inside the write
+    /// transaction.
+    fence: crate::placement::fence::WriteFence,
     state: SetGroupPoliciesState,
     output: Option<Result<GroupAuthorizationDocument, SetGroupPoliciesError>>,
 }
@@ -57,6 +60,9 @@ enum SetGroupPoliciesState {
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
     DeleteStaleAdminConflicts {
+        document: GroupAuthorizationDocument,
+    },
+    ReadBucketFence {
         document: GroupAuthorizationDocument,
     },
     CommitTransaction {
@@ -85,6 +91,8 @@ pub enum SetGroupPoliciesError {
     InvalidPolicies { reason: String },
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("the group's bucket cut over to a new holder set; retry the change")]
+    PlacementFenced,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -100,6 +108,7 @@ impl SetGroupPoliciesOperation {
         Self {
             config,
             txn_id: None,
+            fence: Default::default(),
             state: SetGroupPoliciesState::Init,
             output: None,
         }
@@ -197,12 +206,18 @@ impl SetGroupPoliciesOperation {
             Some(&reducer_state),
         );
         let document_target = self.document_ref();
-        let placement = realm_config_value
+        let realm_config = realm_config_value
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
-            .transpose()?
-            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
+            .transpose()?;
+        let placement = realm_config
+            .as_ref()
+            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
+        let realm_id = self.config.actor.realm_id;
+        if let Some(config) = realm_config.as_ref() {
+            self.fence.add(realm_id, config, [placement]);
+        }
         let mut writes = vec![
             (
                 document_target.storage_keyspace().to_string(),
@@ -221,7 +236,8 @@ impl SetGroupPoliciesOperation {
             },
             placement,
             false,
-        );
+        )
+        .fenced_at(self.fence.generation(&realm_id, &placement));
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
@@ -237,7 +253,23 @@ impl SetGroupPoliciesOperation {
         })])
     }
 
+    /// Takes the bucket's fence inside the transaction before committing, so a
+    /// departing holder's close rejects or conflicts this write.
     fn emit_commit_transaction(&mut self, document: GroupAuthorizationDocument) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(SetGroupPoliciesError::MissingTransaction);
+        };
+        if self.fence.is_empty() {
+            return self.emit_commit(document);
+        }
+        self.state = SetGroupPoliciesState::ReadBucketFence { document };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.fence.reads(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn emit_commit(&mut self, document: GroupAuthorizationDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(SetGroupPoliciesError::MissingTransaction);
         };
@@ -333,6 +365,17 @@ impl Operation for SetGroupPoliciesOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            },
+            SetGroupPoliciesState::ReadBucketFence { document } => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    if self.fence.admits(&values) {
+                        self.emit_commit(document)
+                    } else {
+                        self.fail(SetGroupPoliciesError::PlacementFenced)
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
             },
             SetGroupPoliciesState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {

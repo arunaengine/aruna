@@ -44,6 +44,9 @@ pub struct RemoveGroupRoleConfig {
 #[derive(PartialEq)]
 pub struct RemoveGroupRoleOperation {
     input: RemoveGroupRoleConfig,
+    /// Bucket the authorization rows publish onto, read inside the write
+    /// transaction.
+    fence: crate::placement::fence::WriteFence,
     state: RemoveGroupRoleState,
     output: Option<Result<(Group, GroupAuthorizationDocument), RemoveGroupRoleError>>,
 }
@@ -83,6 +86,12 @@ pub enum RemoveGroupRoleState {
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
     },
+    ReadBucketFence {
+        txn_id: TxnId,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+    },
     CommitTransaction {
         txn_id: TxnId,
         group: Group,
@@ -107,6 +116,8 @@ pub enum RemoveGroupRoleError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
+    #[error("the group's bucket cut over to a new holder set; retry the change")]
+    PlacementFenced,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unauthorized")]
@@ -135,6 +146,7 @@ impl RemoveGroupRoleOperation {
     pub fn new(input: RemoveGroupRoleConfig) -> Self {
         RemoveGroupRoleOperation {
             input,
+            fence: Default::default(),
             state: RemoveGroupRoleState::Init,
             output: None,
         }
@@ -351,12 +363,19 @@ impl RemoveGroupRoleOperation {
         let document_target = DocumentSyncTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
-        let placement = realm_config_value
+        let realm_config = realm_config_value
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
-            .transpose()?
-            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
+            .transpose()?;
+        let placement = realm_config
+            .as_ref()
+            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
+        let realm_id = self.input.actor.realm_id;
+        if let Some(config) = realm_config.as_ref() {
+            self.fence.add(realm_id, config, [placement]);
+        }
+        let generation = self.fence.generation(&realm_id, &placement);
         for event in &admin_events {
             let record = new_outbox_record_with_id(
                 event.event_id,
@@ -368,7 +387,8 @@ impl RemoveGroupRoleOperation {
                 },
                 placement,
                 false,
-            );
+            )
+            .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
@@ -444,7 +464,53 @@ impl RemoveGroupRoleOperation {
         self.emit_commit_transaction(txn_id, group, auth_doc, admin_outbox_written)
     }
 
+    /// Takes the bucket's fence inside the transaction before committing, so a
+    /// departing holder's close rejects or conflicts this write.
     fn emit_commit_transaction(
+        &mut self,
+        txn_id: TxnId,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+    ) -> Effects {
+        if self.fence.is_empty() {
+            return self.emit_commit(txn_id, group, auth_doc, admin_outbox_written);
+        }
+        self.state = RemoveGroupRoleState::ReadBucketFence {
+            txn_id,
+            group,
+            auth_doc,
+            admin_outbox_written,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.fence.reads(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_bucket_fence(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::BatchReadResult)",
+                got,
+            );
+        };
+        if !self.fence.admits(&values) {
+            return self.fail(RemoveGroupRoleError::PlacementFenced);
+        }
+        self.emit_commit(txn_id, group, auth_doc, admin_outbox_written)
+    }
+
+    fn emit_commit(
         &mut self,
         txn_id: TxnId,
         group: Group,
@@ -607,6 +673,12 @@ impl Operation for RemoveGroupRoleOperation {
                 auth_doc,
                 admin_outbox_written,
             ),
+            RemoveGroupRoleState::ReadBucketFence {
+                txn_id,
+                group,
+                auth_doc,
+                admin_outbox_written,
+            } => self.handle_bucket_fence(event, txn_id, group, auth_doc, admin_outbox_written),
             RemoveGroupRoleState::CommitTransaction {
                 group,
                 auth_doc,
@@ -642,6 +714,7 @@ impl Operation for RemoveGroupRoleOperation {
             | RemoveGroupRoleState::GetAuthDocAndAdminState { txn_id, .. }
             | RemoveGroupRoleState::WriteGroupAuthDocAndAdminState { txn_id, .. }
             | RemoveGroupRoleState::DeleteStaleAdminConflicts { txn_id, .. }
+            | RemoveGroupRoleState::ReadBucketFence { txn_id, .. }
             | RemoveGroupRoleState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
