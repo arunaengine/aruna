@@ -737,7 +737,8 @@ impl NetHandle {
                 tokio::select! {
                     _ = eviction_shutdown_for_task.cancelled() => {
                         while let Ok(eviction) = eviction_rx.try_recv() {
-                            pending_documents.extend(eviction_document_sync.decode_eviction(eviction));
+                            pending_documents
+                                .extend(eviction_document_sync.consume_eviction(eviction).await);
                         }
                         if !flush_pending_evicted_documents(
                             &eviction_inbound_handler,
@@ -761,7 +762,8 @@ impl NetHandle {
                     },
                     maybe_eviction = eviction_rx.recv() => {
                         let Some(eviction) = maybe_eviction else { break };
-                        let documents = eviction_document_sync.decode_eviction(eviction);
+                        let documents =
+                            eviction_document_sync.consume_eviction(eviction).await;
                         if documents.is_empty() {
                             continue;
                         }

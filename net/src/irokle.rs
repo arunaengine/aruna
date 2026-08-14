@@ -1647,6 +1647,41 @@ impl DocumentSyncService {
         }
     }
 
+    /// Decodes a genesis tie-break eviction and drops the replaced chain's
+    /// cursors. Both belong to the same reset, so the embedder cannot do one
+    /// without the other.
+    pub async fn consume_eviction(
+        &self,
+        eviction: TopicEviction,
+    ) -> Vec<DocumentSyncEvictedDocument> {
+        let topic_id = eviction.topic_id;
+        let documents = self.decode_eviction(eviction);
+        self.reset_applied_cursor(topic_id).await;
+        documents
+    }
+
+    /// Drops the applied-ops cursor of a topic whose chain was replaced by a
+    /// genesis tie-break. The winning chain renumbers every actor sequence, so
+    /// a cursor from the losing chain silently skips the winner's first ops.
+    async fn reset_applied_cursor(&self, topic_id: irokle_crate::TopicId) {
+        let _reconcile_guard = self.reconcile_lock.lock().await;
+        debug!(%topic_id, "Resetting document sync applied-ops cursor after a genesis tie-break");
+        match self
+            .storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                key: topic_cursor_key(topic_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            other => {
+                warn!(%topic_id, ?other, "Failed to reset document sync applied-ops cursor");
+            }
+        }
+    }
+
     fn sync_peer_selection(
         &self,
         peers: &[NodeId],
@@ -16453,9 +16488,39 @@ mod tests {
             winner_genesis
         );
 
+        // The loser published, so its applied-ops cursor covers the chain the
+        // tie-break just replaced.
+        assert!(
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .is_some(),
+            "the publish left an applied-ops cursor to invalidate"
+        );
+
         // The evicted admin event re-emits with its original event id and
         // placement preserved, and allow_genesis cleared.
-        let reemitted = loser.decode_eviction(evictions.into_iter().next().unwrap());
+        let reemitted = loser
+            .consume_eviction(evictions.into_iter().next().unwrap())
+            .await;
+
+        // The winning chain renumbers every actor sequence from one, so a
+        // surviving cursor would skip its first ops forever.
+        assert!(
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .is_none(),
+            "the replaced chain's applied-ops cursor must not survive its eviction"
+        );
         assert_eq!(reemitted.len(), 1);
         let reemitted = &reemitted[0];
         assert_eq!(&reemitted.target, &target);
