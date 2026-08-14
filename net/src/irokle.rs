@@ -1991,7 +1991,7 @@ impl DocumentSyncService {
         let net = self.net.clone();
         let data_known = known_topics.clone();
         let eviction_tx = self.eviction_tx.clone();
-        let (failed_topics, followup) = tokio::task::spawn_blocking(move || {
+        let (mut failed_topics, followup) = tokio::task::spawn_blocking(move || {
             process_batch_data_responses(
                 &node,
                 &net,
@@ -2017,6 +2017,15 @@ impl DocumentSyncService {
             for response in responses {
                 match response {
                     SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
+                    SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
+                        failed_topics.insert(failure.topic_id);
+                        warn!(
+                            %peer,
+                            topic_id = %failure.topic_id,
+                            code = ?failure.code,
+                            "Skipping document sync batch topic: peer rejected the sync ack"
+                        );
+                    }
                     other => {
                         return Err(NetError::Bootstrap(format!(
                             "unexpected document sync batch ack response from {peer}: {other:?}"
@@ -9124,6 +9133,19 @@ fn process_batch_summary_responses(
     let mut sync_messages = Vec::new();
     for response in responses {
         match response {
+            // An explicit terminal failure still counts as a response: the peer
+            // answered for this topic, so only this topic stays dirty and the
+            // rest of the batch keeps its summaries, data and acks.
+            SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
+                responded_topics.insert(failure.topic_id);
+                failed_topics.insert(failure.topic_id);
+                warn!(
+                    %peer,
+                    topic_id = %failure.topic_id,
+                    code = ?failure.code,
+                    "Skipping document sync batch topic: peer reported a sync failure"
+                );
+            }
             SyncMessage::Fingerprint(remote) if known_topics.contains(&remote.topic_id) => {
                 responded_topics.insert(remote.topic_id);
                 if local_fingerprints.get(&remote.topic_id) != Some(&remote.fingerprint) {
@@ -9219,6 +9241,15 @@ fn process_batch_data_responses(
                 if ack.peer_id == peer && known_topics.contains(&ack.topic_id) =>
             {
                 acks.push(ack);
+            }
+            SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
+                failed_topics.insert(failure.topic_id);
+                warn!(
+                    %peer,
+                    topic_id = %failure.topic_id,
+                    code = ?failure.code,
+                    "Skipping document sync batch topic: peer reported a sync failure"
+                );
             }
             SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
             SyncMessage::Data(data) if known_topics.contains(&data.topic_id) => {
@@ -14485,6 +14516,64 @@ mod tests {
         };
         assert!(message.contains("only 1/2 peers synced"));
         assert!(message.contains("offline peer"));
+    }
+
+    fn batch_test_node(seed: u8) -> (TempDir, irokle_crate::Irokle<irokle_crate::FjallStorage>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .expect("fjall database opens");
+        let node = irokle_crate::Irokle::builder()
+            .with_iroh_secret_key(&iroh::SecretKey::from_bytes(&[seed; 32]))
+            .with_fjall_database_and_persist_mode(db, fjall::PersistMode::Buffer)
+            .expect("fjall storage")
+            .build()
+            .expect("irokle node builds");
+        (dir, node)
+    }
+
+    #[test]
+    fn batch_failure_marks_only_its_topic() {
+        // A per-topic failure frame must not abort the batch: the topics after
+        // it in the same response still get negotiated.
+        let (_dir, node) = batch_test_node(21);
+        let known_topics = BTreeSet::from([topic(1), topic(2)]);
+        let local_fingerprints = BTreeMap::from([(topic(2), [0; 32])]);
+        let responses = vec![
+            SyncMessage::Failure(irokle_crate::sync::SyncFailure {
+                topic_id: topic(1),
+                code: irokle_crate::sync::SyncFailureCode::Fingerprint,
+            }),
+            SyncMessage::Fingerprint(irokle_crate::sync::SyncFingerprint {
+                topic_id: topic(2),
+                fingerprint: [0; 32],
+            }),
+        ];
+
+        let (responded, failed, _messages) = process_batch_summary_responses(
+            &node,
+            peer(9),
+            &known_topics,
+            &local_fingerprints,
+            responses,
+        )
+        .expect("a per-topic failure must not fail the whole batch");
+
+        assert_eq!(responded, known_topics);
+        assert_eq!(failed, BTreeSet::from([topic(1)]));
+    }
+
+    #[test]
+    fn batch_failure_for_unknown_topic_errors() {
+        let (_dir, node) = batch_test_node(22);
+        let known_topics = BTreeSet::from([topic(1)]);
+        let responses = vec![SyncMessage::Failure(irokle_crate::sync::SyncFailure {
+            topic_id: topic(7),
+            code: irokle_crate::sync::SyncFailureCode::Open,
+        })];
+
+        process_batch_summary_responses(&node, peer(9), &known_topics, &BTreeMap::new(), responses)
+            .expect_err("a failure for an unrequested topic indicts the peer");
     }
 
     #[test]
