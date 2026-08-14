@@ -178,10 +178,10 @@ fn transition_stale(config: &RealmConfigDocument, transition: &PlacementTransiti
     incomplete > 0 && stale == incomplete
 }
 
-/// Closes the bucket's write fence, then reports it drained once no record of
-/// a closed generation remains. The close comes first and is durable: without
-/// it an empty scan says nothing about a write that resolved the bucket before
-/// the cutover and commits its row afterwards.
+/// Closes the bucket's write fence, then reports it drained once no journalled
+/// eviction and no record of a closed generation remains. The close comes first
+/// and is durable: without it an empty scan says nothing about a write that
+/// resolved the bucket before the cutover and commits its row afterwards.
 async fn drain_step(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -197,6 +197,48 @@ async fn drain_step(
         debug!(error = %error, "Transition drain could not close the write fence");
         return StepPlan::Pending;
     }
+    if let Some(blocker) = drain_blocker(context, placement, closed).await {
+        debug!(
+            ?blocker,
+            strategy_id = %placement.strategy_id,
+            bucket = placement.shard,
+            "Transition drain cannot report the bucket yet"
+        );
+        return StepPlan::Pending;
+    }
+    StepPlan::Ready(RealmPlacementMutation::ReportDrained {
+        transition_id: transition.plan.transition_id,
+        bucket: placement.shard,
+        reported_by: local_node_id,
+    })
+}
+
+/// Why a bucket is not drained yet. Named so the order of the checks is
+/// testable: an eviction converted between them enqueues replacement rows a
+/// finished scan has already passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainBlocker {
+    Eviction,
+    OutboxRow,
+    ScanFailed,
+}
+
+/// The first reason `placement` cannot be reported drained through `closed`.
+/// The eviction journal comes first: a scan that already passed a stream proves
+/// nothing about rows the eviction hand-off commits afterwards.
+async fn drain_blocker(
+    context: &Arc<DriverContext>,
+    placement: &PlacementRef,
+    closed: u64,
+) -> Option<DrainBlocker> {
+    // No net handle means no eviction source, so nothing can be journalled.
+    if context
+        .net_handle
+        .as_ref()
+        .is_some_and(|net_handle| net_handle.eviction_pending(placement))
+    {
+        return Some(DrainBlocker::Eviction);
+    }
     for prefix in crate::document_sync_outbox::outbox_stream_prefixes() {
         let mut start_after: Option<Vec<u8>> = None;
         loop {
@@ -211,7 +253,7 @@ async fn drain_step(
                 Ok(batch) => batch,
                 Err(error) => {
                     debug!(error = %error, "Transition drain scan failed");
-                    return StepPlan::Pending;
+                    return Some(DrainBlocker::ScanFailed);
                 }
             };
             // An unfenced row carries generation zero and always counts.
@@ -220,7 +262,7 @@ async fn drain_step(
                 .iter()
                 .any(|(_, record)| record.placement == *placement && record.generation <= closed)
             {
-                return StepPlan::Pending;
+                return Some(DrainBlocker::OutboxRow);
             }
             if !batch.has_more {
                 break;
@@ -228,18 +270,7 @@ async fn drain_step(
             start_after = batch.next_start_after;
         }
     }
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return StepPlan::Pending;
-    };
-    match net_handle.document_sync_node().pending_evictions() {
-        Ok(evictions) if evictions.is_empty() => {}
-        Ok(_) | Err(_) => return StepPlan::Pending,
-    }
-    StepPlan::Ready(RealmPlacementMutation::ReportDrained {
-        transition_id: transition.plan.transition_id,
-        bucket: placement.shard,
-        reported_by: local_node_id,
-    })
+    None
 }
 
 /// One bucket step this node owes: a mutation ready to batch, work still
@@ -587,7 +618,8 @@ async fn ensure_strategy_activations(
 }
 
 /// Freezes a strategy the newest map predates into its successor, so a
-/// strategy created after that map cannot stay unresolvable forever.
+/// strategy created after that map cannot stay unresolvable forever. Returns
+/// whether this node published one.
 ///
 /// The epoch is published by one deterministic issuer and derived
 /// byte-identically from the config, so a second issuer's copy coalesces in
@@ -670,10 +702,13 @@ mod tests {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
+    use std::path::Path;
+
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -700,6 +735,73 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         })
+    }
+
+    /// A drain consults the eviction journal through the net handle, so a
+    /// context without one never exercises that gate.
+    async fn net_context(root: &Path) -> (Arc<DriverContext>, NetHandle) {
+        let storage_handle =
+            aruna_storage::FjallStorage::open(root.join("storage").to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                document_sync_storage_path: Some(root.join("document-sync")),
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        (context, net_handle)
+    }
+
+    /// One journalled eviction whose re-emitted row would land on `placement`,
+    /// authored locally so the decoder keeps it.
+    fn local_eviction(net_handle: &NetHandle, placement: PlacementRef) -> irokle::TopicEviction {
+        let event_id = Ulid::from_bytes([44; 16]);
+        let event = aruna_core::document::DocumentSyncEvent::Delete {
+            event_id,
+            target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: event_id,
+            },
+            change: aruna_core::document::DocumentSyncChange {
+                base: None,
+                current: aruna_core::document::DocumentSyncRevision {
+                    generation: 0,
+                    event_id,
+                    actor: node(1),
+                    updated_at_ms: 1,
+                },
+                kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+                placement,
+            },
+        };
+        let topic_id = irokle::TopicId::from_bytes([44; 32]);
+        let author = net_handle.document_sync_node().peer_id();
+        irokle::TopicEviction {
+            topic_id,
+            losing_genesis: irokle::OpId::from_bytes([45; 32]),
+            winning_genesis: irokle::OpId::from_bytes([46; 32]),
+            evicted: vec![irokle::EvictedOp {
+                op_id: irokle::OpId::from_bytes([47; 32]),
+                actor_id: irokle::actor_id_for(topic_id, author),
+                author,
+                actor_seq: 2,
+                payload: irokle::TopicPayload::Event(
+                    irokle::EventEnvelope::encode_event(&event).expect("the event encodes"),
+                ),
+            }],
+        }
     }
 
     fn strategy(seed: u8, name: &str) -> PlacementStrategy {
@@ -930,7 +1032,7 @@ mod tests {
         // The close comes first, a predecessor-generation row blocks the
         // report, and a successor-generation row never does.
         let directory = tempdir().unwrap();
-        let context = context(directory.path().to_str().unwrap());
+        let (context, _net_handle) = net_context(directory.path()).await;
         let realm_id = RealmId::from_bytes([64; 32]);
         let (document, placement) = departing_config(realm_id);
         let transition = &document.placement_transitions[0];
@@ -957,6 +1059,57 @@ mod tests {
                 StepPlan::Ready(RealmPlacementMutation::ReportDrained { bucket: 0, .. })
             ),
             "a successor-generation row must not block the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_blocks_first() {
+        // The eviction hand-off commits its rows before it releases the entry,
+        // so a scan that ran first would pass a stream the hand-off then fills.
+        let directory = tempdir().unwrap();
+        let (context, net_handle) = net_context(directory.path()).await;
+        let realm_id = RealmId::from_bytes([66; 32]);
+        let (document, placement) = departing_config(realm_id);
+        store_config(&context, &document).await;
+        write_outbox_row(&context, placement, 1, 23).await;
+        net_handle
+            .consume_eviction(local_eviction(&net_handle, placement))
+            .await
+            .expect("the eviction is journalled");
+
+        assert_eq!(
+            drain_blocker(&context, &placement, 1).await,
+            Some(DrainBlocker::Eviction),
+            "the journal must be consulted before the outbox scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_scopes_bucket() {
+        // A journalled eviction for another bucket must not stall this one.
+        let directory = tempdir().unwrap();
+        let (context, net_handle) = net_context(directory.path()).await;
+        let realm_id = RealmId::from_bytes([67; 32]);
+        let (document, placement) = departing_config(realm_id);
+        store_config(&context, &document).await;
+        let transition = &document.placement_transitions[0];
+        let elsewhere = PlacementRef {
+            strategy_id: placement.strategy_id,
+            shard: 2,
+        };
+        net_handle
+            .consume_eviction(local_eviction(&net_handle, elsewhere))
+            .await
+            .expect("the eviction is journalled");
+
+        assert!(net_handle.eviction_pending(&elsewhere));
+        let reported = drain_step(&context, realm_id, transition, &placement, node(1)).await;
+        assert!(
+            matches!(
+                reported,
+                StepPlan::Ready(RealmPlacementMutation::ReportDrained { bucket: 0, .. })
+            ),
+            "an unrelated bucket's eviction must not block the report"
         );
     }
 

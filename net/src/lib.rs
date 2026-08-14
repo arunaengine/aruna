@@ -31,9 +31,9 @@ use aruna_core::keys::realm_endpoint_key;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
-    NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
-    RealmConfigDocument, RealmEndpointAnnouncement, RealmId, WatchInterestEntry,
-    WatchInterestTable, realm_endpoint_announcement_signing_bytes,
+    NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, PlacementRef,
+    ProtocolConnectionState, RealmConfigDocument, RealmEndpointAnnouncement, RealmId,
+    WatchInterestEntry, WatchInterestTable, realm_endpoint_announcement_signing_bytes,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -925,6 +925,23 @@ impl NetHandle {
 
     pub fn document_sync_node(&self) -> ::irokle::Irokle<::irokle::FjallStorage> {
         self.inner.document_sync.node()
+    }
+
+    /// Whether an unreleased eviction journal entry may still enqueue outbox
+    /// rows for `placement`. A placement drain must not report the bucket clear
+    /// while one is outstanding.
+    pub fn eviction_pending(&self, placement: &PlacementRef) -> bool {
+        self.inner.document_sync.eviction_pending(placement)
+    }
+
+    /// Takes one genesis tie-break eviction into the re-emission hand-off. The
+    /// journal entry stays registered against the buckets it targets until the
+    /// replacement outbox rows commit.
+    pub async fn consume_eviction(
+        &self,
+        eviction: ::irokle::TopicEviction,
+    ) -> Option<PendingEviction> {
+        self.inner.document_sync.consume_eviction(eviction).await
     }
 
     pub fn document_sync_database(&self) -> fjall::OptimisticTxDatabase {
@@ -2779,6 +2796,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eviction_registers_its_buckets() {
+        // The entry outlives the hand-off: it is released only once the
+        // replacement rows are durable, and it never stalls another bucket.
+        let (_dir, service) = eviction_test_service().await;
+        let placement = aruna_core::structs::PlacementRef {
+            strategy_id: ulid::Ulid::from_bytes([31; 16]),
+            shard: 1,
+        };
+        let elsewhere = aruna_core::structs::PlacementRef {
+            strategy_id: placement.strategy_id,
+            shard: 2,
+        };
+        let entry = service
+            .consume_eviction(local_eviction(&service, placement, true))
+            .await
+            .expect("a journalled eviction is pending");
+        assert_eq!(entry.documents.len(), 1);
+        assert!(service.eviction_pending(&placement));
+        assert!(!service.eviction_pending(&elsewhere));
+
+        let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
+            Arc::new(RwLock::new(None));
+        let failing = Arc::new(RecordingEvictedHandler::new(false));
+        *inbound_handler.write() = Some(failing as Arc<dyn InboundEventHandler>);
+        let mut pending = vec![entry];
+        assert!(!flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await);
+        assert!(
+            service.eviction_pending(&placement),
+            "an unconverted entry must keep blocking its bucket"
+        );
+
+        let handler = Arc::new(RecordingEvictedHandler::new(true));
+        *inbound_handler.write() = Some(handler as Arc<dyn InboundEventHandler>);
+        assert!(flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await);
+        assert!(!service.eviction_pending(&placement));
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn empty_eviction_stays_unpending() {
         // Irokle writes no record for an eviction with no payloads, so treating
         // one as pending would arm the retry timer against a phantom forever.
@@ -2790,6 +2847,7 @@ mod tests {
                 .await
                 .is_none()
         );
+        assert!(!service.eviction_pending(&placement));
 
         service.shutdown().await;
     }

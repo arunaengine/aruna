@@ -386,6 +386,10 @@ pub struct DocumentSyncService {
     // receiver once via `take_eviction_receiver` and re-emits the payloads.
     eviction_tx: tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
+    // Buckets each unreleased journal entry may still re-emit onto, so a
+    // placement drain can wait on its own bucket without rescanning the
+    // journal. `None` marks an entry recovered at open but not yet decoded.
+    eviction_buckets: Arc<RwLock<BTreeMap<irokle_crate::EvictionKey, Option<Vec<PlacementRef>>>>>,
     // Realm this service serves; shard-classed targets carry no realm id of
     // their own, so their topic derivation reads it from here.
     realm_id: RealmId,
@@ -474,6 +478,14 @@ impl DocumentSyncService {
         );
         net.start_configured_resync_loop()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        // Seeded before any drain can observe the service: an entry left by an
+        // interrupted handoff must block its bucket from the first tick on.
+        let eviction_buckets: BTreeMap<irokle_crate::EvictionKey, Option<Vec<PlacementRef>>> =
+            node.pending_evictions()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .iter()
+                .map(|eviction| (eviction.key(), None))
+                .collect();
 
         Ok(Self {
             node,
@@ -488,6 +500,7 @@ impl DocumentSyncService {
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             eviction_tx,
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
+            eviction_buckets: Arc::new(RwLock::new(eviction_buckets)),
             realm_id,
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
@@ -511,10 +524,18 @@ impl DocumentSyncService {
     /// must be re-emitted onto the winning chain. Every item sets
     /// `allow_genesis: false` so the loser replays through the normal outbox
     /// drain instead of minting a rival genesis, and original ids are preserved
-    /// where the outbox format can carry them. Control ops are skipped,
-    /// whole-document admin poison is dropped with a warning (mirroring the
-    /// reconcile skip arm), and ops not authored by the local node are rejected
-    /// since an eviction is by construction the local node's own chain.
+    /// where the outbox format can carry them.
+    ///
+    /// Irokle's journal entry is the last local copy of these payloads, so each
+    /// dropped class needs its own reason not to be re-emitted:
+    ///
+    /// * Control ops carry nothing to replay.
+    /// * A foreign-authored op is durably admitted by its author before it can
+    ///   reach any peer, and that author resolves the same tie-break against
+    ///   its own chain, so the op comes back through the author's eviction.
+    /// * A whole-document admin payload cannot exist: `announce` refuses to
+    ///   build one and `apply_upsert`/`apply_delete` refuse to apply one, so
+    ///   re-emitting would only add an outbox row no peer can ever accept.
     pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
         self.clear_cursor(eviction.topic_id);
         if let Err(error) = self.flush_database() {
@@ -1683,7 +1704,14 @@ impl DocumentSyncService {
         let journalled = !eviction.evicted.is_empty();
         let documents = self.decode_eviction(eviction);
         self.reset_applied_cursor(topic_id).await;
-        journalled.then_some(PendingEviction { key, documents })
+        if !journalled {
+            return None;
+        }
+        self.eviction_buckets.write().insert(
+            key,
+            Some(documents.iter().map(|document| document.placement).collect()),
+        );
+        Some(PendingEviction { key, documents })
     }
 
     /// Irokle journal entries left by an interrupted eviction handoff.
@@ -1703,7 +1731,19 @@ impl DocumentSyncService {
     pub async fn clear_eviction(&self, key: irokle_crate::EvictionKey) -> Result<()> {
         self.node
             .clear_eviction(&key)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.eviction_buckets.write().remove(&key);
+        Ok(())
+    }
+
+    /// Whether a journalled eviction may still write replacement outbox rows for
+    /// `placement`. An entry recovered at open blocks every bucket until the
+    /// consumer decodes the buckets it actually targets.
+    pub fn eviction_pending(&self, placement: &PlacementRef) -> bool {
+        self.eviction_buckets
+            .read()
+            .values()
+            .any(|buckets| buckets.as_ref().is_none_or(|list| list.contains(placement)))
     }
 
     /// Drops the applied-ops cursor of a topic whose chain was replaced by a
