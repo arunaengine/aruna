@@ -495,8 +495,8 @@ async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
     // Deliberately NOT meshed: neither node has a path to the other.
 
     let node = &nodes[0];
-    let topic = DocumentSyncTarget::RealmConfig { realm_id }
-        .sync_topic_id(realm_id, &PlacementRef::NIL);
+    let topic =
+        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
     let mut cursor = ShardRestoreCursor::default();
     let cancelled = tokio_util::sync::CancellationToken::new();
 
