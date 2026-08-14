@@ -25,7 +25,7 @@ use crate::mutate_realm_placement::{
 };
 use crate::placement::transition::holders_in_map;
 use crate::shard::assemble_shard_manifest;
-use crate::shard::verify::converge_shard_digest;
+use crate::shard::verify::converge_with_barrier;
 
 /// Runs every transition step the local node owns. Returns whether a step is
 /// still outstanding, so the caller re-arms the placement retry.
@@ -304,13 +304,33 @@ async fn completion_step(
             }
         }
     } else {
-        match converge_shard_digest(
+        // The proof must cover every old holder's fenced writes, so the local
+        // cursor has to dominate the join of all reported frontiers even when
+        // some holders are unreachable for pulling (F5).
+        let mut required = irokle::ActorClock::default();
+        for barrier in transition
+            .barriers
+            .iter()
+            .filter(|barrier| barrier.bucket == placement.shard)
+            .filter(|barrier| bucket.old_holders.contains(&barrier.reported_by))
+        {
+            let Ok(frontier) = postcard::from_bytes::<irokle::ActorClock>(&barrier.frontier) else {
+                debug!(
+                    reported_by = %barrier.reported_by,
+                    "Undecodable barrier frontier; leaving the bucket pending"
+                );
+                return StepPlan::Pending;
+            };
+            required.merge(&frontier);
+        }
+        match converge_with_barrier(
             context,
             &net_handle,
             local_node_id,
             realm_id,
             *placement,
             &sources,
+            Some(&required),
         )
         .await
         {
