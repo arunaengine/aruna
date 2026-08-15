@@ -28,8 +28,8 @@ use crate::placement::fence;
 use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
-use crate::shard::{assemble_shard_manifest, frontier_root};
 use crate::shard::verify::converge_with_barrier;
+use crate::shard::{assemble_shard_manifest, frontier_root};
 
 /// Runs every transition step the local node owns. Returns whether a step is
 /// still outstanding, so the caller re-arms the placement retry.
@@ -331,12 +331,9 @@ async fn completion_step(
     transition: &PlacementTransition,
     placement: &PlacementRef,
 ) -> StepPlan {
-    if transition
-        .proofs_for(placement.shard)
-        .any(|proof| {
-            proof.holder == local_node_id && transition.proof_valid(placement.shard, proof)
-        })
-    {
+    if transition.proofs_for(placement.shard).any(|proof| {
+        proof.holder == local_node_id && transition.proof_valid(placement.shard, proof)
+    }) {
         return StepPlan::Done;
     }
     let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
