@@ -626,25 +626,11 @@ impl Topology {
         wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
             "placement reconciliation never reported clean",
             || async move {
-                let mut pending = 0;
-                for node in nodes {
-                    let span = tracing::info_span!(
-                        "node_pass",
-                        node = %&node.node_id().to_string()[..8]
-                    );
-                    let outcome = tracing::Instrument::instrument(
-                        aruna_operations::process_placements::process_shard_placements(
-                            &node.context,
-                            realm_id,
-                            node.node_id(),
-                        ),
-                        span,
-                    )
-                    .await;
-                    if outcome.retry_scheduled {
-                        pending += 1;
-                    }
-                }
+                let pending = reconcile_nodes(nodes, realm_id)
+                    .await
+                    .iter()
+                    .filter(|outcome| outcome.retry_scheduled)
+                    .count();
                 Ok(pending)
             },
         )
@@ -660,21 +646,7 @@ impl Topology {
         wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
             "placement transition never released",
             || async move {
-                for node in nodes {
-                    let span = tracing::info_span!(
-                        "node_pass",
-                        node = %&node.node_id().to_string()[..8]
-                    );
-                    tracing::Instrument::instrument(
-                        aruna_operations::process_placements::process_shard_placements(
-                            &node.context,
-                            realm_id,
-                            node.node_id(),
-                        ),
-                        span,
-                    )
-                    .await;
-                }
+                reconcile_nodes(nodes, realm_id).await;
                 replicate_config(nodes, realm_id).await;
                 let mut pending = 0;
                 for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
@@ -699,21 +671,7 @@ impl Topology {
         let result = wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
             "placement transition never completed",
             || async move {
-                for node in nodes {
-                    let span = tracing::info_span!(
-                        "node_pass",
-                        node = %&node.node_id().to_string()[..8]
-                    );
-                    tracing::Instrument::instrument(
-                        aruna_operations::process_placements::process_shard_placements(
-                            &node.context,
-                            realm_id,
-                            node.node_id(),
-                        ),
-                        span,
-                    )
-                    .await;
-                }
+                reconcile_nodes(nodes, realm_id).await;
                 replicate_config(nodes, realm_id).await;
                 // Count buckets, not nodes: the wait must see progress on every
                 // cut-over, not only when the last one lands.
@@ -1293,6 +1251,30 @@ async fn seed_config_topic(
         }
     }
     Ok(())
+}
+
+/// Runs one reconcile pass on every node concurrently, as the other reconcile
+/// waits here do. A pass makes seconds-long network calls, so driving the nodes
+/// in sequence lets a single poll outlast the deadlock cap on its own.
+async fn reconcile_nodes(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+) -> Vec<aruna_operations::process_placements::PlacementReconcileOutcome> {
+    join_all(nodes.iter().map(|node| {
+        let span = tracing::info_span!(
+            "node_pass",
+            node = %&node.node_id().to_string()[..8]
+        );
+        tracing::Instrument::instrument(
+            aruna_operations::process_placements::process_shard_placements(
+                &node.context,
+                realm_id,
+                node.node_id(),
+            ),
+            span,
+        )
+    }))
+    .await
 }
 
 /// Flushes every node's document-sync outbox and pulls the realm-config topic,
