@@ -530,9 +530,6 @@ impl DocumentSyncService {
     /// dropped class needs its own reason not to be re-emitted:
     ///
     /// * Control ops carry nothing to replay.
-    /// * A foreign-authored op is durably admitted by its author before it can
-    ///   reach any peer, and that author resolves the same tie-break against
-    ///   its own chain, so the op comes back through the author's eviction.
     /// * A whole-document admin payload cannot exist: `announce` refuses to
     ///   build one and `apply_upsert`/`apply_delete` refuse to apply one, so
     ///   re-emitting would only add an outbox row no peer can ever accept.
@@ -541,17 +538,8 @@ impl DocumentSyncService {
         if let Err(error) = self.flush_database() {
             warn!(%error, topic_id = %eviction.topic_id, "Failed to persist document sync fan-out cursor reset");
         }
-        let local_peer = self.node.peer_id();
         let mut documents = Vec::new();
         for evicted in eviction.evicted {
-            if evicted.author != local_peer {
-                warn!(
-                    topic_id = %eviction.topic_id,
-                    author = %evicted.author,
-                    "Skipping evicted op not authored by the local node"
-                );
-                continue;
-            }
             let TopicPayload::Event(envelope) = evicted.payload else {
                 // Non-event control op (e.g. AddPeer/RemovePeer): nothing to re-emit.
                 continue;
@@ -1691,6 +1679,32 @@ impl DocumentSyncService {
         if let Err(error) = remove_cursor(&self.fanout_cursors, topic_id) {
             warn!(%error, %topic_id, "Failed to clear document sync fan-out cursor");
         }
+    }
+
+    /// Seal a topic before a departing holder scans its journal and outbox.
+    /// The result reports whether a journal entry still exists after sealing.
+    pub fn seal_topic(&self, topic_id: irokle_crate::TopicId) -> Result<bool> {
+        self.node
+            .seal_topic(topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.flush_database()?;
+        Ok(self
+            .node
+            .pending_evictions()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .into_iter()
+            .any(|eviction| eviction.topic_id == topic_id))
+    }
+
+    pub fn unseal_topic(&self, topic_id: irokle_crate::TopicId) -> Result<()> {
+        let removed = self
+            .node
+            .unseal_topic(topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        if removed {
+            self.flush_database()?;
+        }
+        Ok(())
     }
 
     /// Decodes an eviction Irokle already journalled with its reset and drops
@@ -16812,6 +16826,38 @@ mod tests {
             }
             other => panic!("expected an AdminOperation re-emission, got {other:?}"),
         }
+
+        let foreign_event_id = Ulid::from_parts(0xC3, 3);
+        let foreign_admin = test_admin_event(
+            foreign_event_id,
+            admin_target,
+            &test_actor(3, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "foreign".into(),
+            },
+        );
+        let foreign_payload = DocumentSyncEvent::AdminOperation {
+            target: target.clone(),
+            event: Box::new(foreign_admin),
+            placement,
+        };
+        let foreign = loser.decode_eviction(TopicEviction {
+            topic_id,
+            losing_genesis: winner_genesis,
+            winning_genesis: winner_genesis,
+            evicted: vec![irokle_crate::EvictedOp {
+                op_id: irokle_crate::OpId::from_bytes([91; 32]),
+                actor_id: irokle_crate::actor_id_for(topic_id, winner_peer),
+                author: winner_peer,
+                actor_seq: 2,
+                payload: TopicPayload::Event(
+                    EventEnvelope::encode_event(&foreign_payload).expect("event encodes"),
+                ),
+            }],
+        });
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].event_id, foreign_event_id);
 
         // Irokle already removed the losing chain, so the payload is durable
         // before it is handed out and stays recoverable until it is released.

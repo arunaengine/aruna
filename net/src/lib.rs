@@ -934,6 +934,16 @@ impl NetHandle {
         self.inner.document_sync.eviction_pending(placement)
     }
 
+    /// Seal a shard topic before a departing holder checks its eviction journal
+    /// and outbox, ordering those checks after any reset transaction.
+    pub fn seal_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<bool> {
+        self.inner.document_sync.seal_topic(topic_id)
+    }
+
+    pub fn unseal_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<()> {
+        self.inner.document_sync.unseal_topic(topic_id)
+    }
+
     /// Takes one genesis tie-break eviction into the re-emission hand-off. The
     /// journal entry stays registered against the buckets it targets until the
     /// replacement outbox rows commit.

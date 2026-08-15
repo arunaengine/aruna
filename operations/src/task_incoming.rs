@@ -1131,7 +1131,7 @@ impl OperationsTaskHandler {
         if let Some(config) = config {
             let now_ms = aruna_core::util::unix_timestamp_millis();
             for (_, record, _) in &mut records {
-                if record.peers.is_empty() || !record.target.uses_shard_topic() {
+                if !record.target.uses_shard_topic() {
                     continue;
                 }
                 let members =

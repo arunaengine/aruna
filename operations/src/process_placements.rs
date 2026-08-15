@@ -57,6 +57,7 @@ async fn ensure_held_shard_topics(
     type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
     let mut rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut member_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut outcome = HeldTopicOutcome::default();
     for strategy in &config.strategies {
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
@@ -71,6 +72,27 @@ async fn ensure_held_shard_topics(
             let membership = bucket_membership(config, &placement, now_ms);
             if !membership.members.contains(&local_node_id) {
                 continue;
+            }
+            let active_target = config.placement_transitions.iter().any(|transition| {
+                transition.plan.strategy_id == placement.strategy_id
+                    && matches!(
+                        transition.status,
+                        aruna_core::structs::TransitionStatus::Active
+                    )
+                    && transition
+                        .plan
+                        .bucket_plan(placement.shard)
+                        .is_some_and(|bucket| {
+                            transition.completion(placement.shard).is_none()
+                                && bucket.target_holders.contains(&local_node_id)
+                        })
+            });
+            if (holders.contains(&local_node_id) || active_target)
+                && let Err(error) = net_handle
+                    .unseal_sync_topic(shard_topic_id(realm_id, &placement))
+            {
+                debug!(error = %error, "Failed to unseal a current shard holder topic");
+                outcome.pull_pending = true;
             }
             // Rank-0 is an activation role: a target that has not cut over yet
             // never creates a genesis (#400).
@@ -97,7 +119,6 @@ async fn ensure_held_shard_topics(
                 .push(shard_topic_id(realm_id, &placement));
         }
     }
-    let mut outcome = HeldTopicOutcome::default();
     // Pass-scoped, so a peer that comes back is probed again next reconcile.
     let mut unreachable_peers: BTreeSet<NodeId> = BTreeSet::new();
     for ((co_members, publishers, retained), topics) in rank0_groups {
