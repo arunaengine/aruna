@@ -671,8 +671,15 @@ impl Topology {
         let result = wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
             "placement transition never completed",
             || async move {
+                let poll_started = std::time::Instant::now();
                 reconcile_nodes(nodes, realm_id).await;
+                let reconcile_ms = poll_started.elapsed().as_millis() as u64;
                 replicate_config(nodes, realm_id).await;
+                tracing::debug!(
+                    reconcile_ms,
+                    poll_ms = poll_started.elapsed().as_millis() as u64,
+                    "transition poll timing"
+                );
                 // Count buckets, not nodes: the wait must see progress on every
                 // cut-over, not only when the last one lands.
                 let mut pending = 0;
@@ -1265,14 +1272,24 @@ async fn reconcile_nodes(
             "node_pass",
             node = %&node.node_id().to_string()[..8]
         );
-        tracing::Instrument::instrument(
-            aruna_operations::process_placements::process_shard_placements(
-                &node.context,
-                realm_id,
-                node.node_id(),
-            ),
-            span,
-        )
+        async move {
+            let started = std::time::Instant::now();
+            let outcome = tracing::Instrument::instrument(
+                aruna_operations::process_placements::process_shard_placements(
+                    &node.context,
+                    realm_id,
+                    node.node_id(),
+                ),
+                span,
+            )
+            .await;
+            tracing::debug!(
+                node = %&node.node_id().to_string()[..8],
+                duration_ms = started.elapsed().as_millis() as u64,
+                "reconcile pass timing"
+            );
+            outcome
+        }
     }))
     .await
 }
@@ -1281,7 +1298,9 @@ async fn reconcile_nodes(
 /// so an admin event converges on the next poll instead of waiting out the
 /// drain timer and a gossip round.
 async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
-    for node in nodes {
+    // Concurrent for the same reason the reconcile pass is: both loops make
+    // seconds-long network calls per node, and they share one poll's budget.
+    join_all(nodes.iter().map(|node| {
         let span = tracing::info_span!(
             "node_drain",
             node = %&node.node_id().to_string()[..8]
@@ -1290,20 +1309,25 @@ async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             aruna_operations::task_incoming::drive_document_sync_outbox_drain(node.context.clone()),
             span,
         )
-        .await;
-    }
+    }))
+    .await;
     let topic =
         DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
-    for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
-        node.net
-            .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::SyncDocuments {
-                    topics: vec![topic],
-                    peers: Vec::new(),
-                },
-            )))
-            .await;
-    }
+    join_all(
+        nodes
+            .iter()
+            .filter(|node| node.is_sync_eligible())
+            .map(|node| {
+                node.net
+                    .send_effect(Effect::Net(NetEffect::DocumentSync(
+                        DocumentSyncEffect::SyncDocuments {
+                            topics: vec![topic],
+                            peers: Vec::new(),
+                        },
+                    )))
+            }),
+    )
+    .await;
 }
 
 async fn write(node: &TestNode, key_space: &str, key: Vec<u8>, value: Vec<u8>) -> TestResult<()> {
