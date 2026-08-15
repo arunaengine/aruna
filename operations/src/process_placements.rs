@@ -98,6 +98,8 @@ async fn ensure_held_shard_topics(
         }
     }
     let mut outcome = HeldTopicOutcome::default();
+    // Pass-scoped, so a peer that comes back is probed again next reconcile.
+    let mut unreachable_peers: BTreeSet<NodeId> = BTreeSet::new();
     for ((co_members, publishers, retained), topics) in rank0_groups {
         debug!(
             event = "placement.genesis.ensure",
@@ -114,6 +116,7 @@ async fn ensure_held_shard_topics(
             topics,
             &retained,
             verified,
+            &mut unreachable_peers,
         )
         .await;
     }
@@ -224,6 +227,7 @@ pub(crate) async fn resolve_creatable_topics(
     co_members: &[NodeId],
     topics: Vec<::irokle::TopicId>,
     may_mint: bool,
+    unreachable_peers: &mut BTreeSet<NodeId>,
 ) -> (Vec<::irokle::TopicId>, bool) {
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
     let mut missing: Vec<::irokle::TopicId> = Vec::new();
@@ -251,9 +255,22 @@ pub(crate) async fn resolve_creatable_topics(
         return (to_ensure, withheld);
     }
 
-    let probe = net_handle
-        .probe_shard_topic_geneses(missing.clone(), co_members.to_vec())
-        .await;
+    // A peer already unreachable in this pass is not probed again: waiting its
+    // full deadline a second time cannot change the verdict. A stale entry can
+    // only withhold, never mint, so a peer that recovers costs one more pass.
+    let (live, skipped): (Vec<NodeId>, Vec<NodeId>) = co_members
+        .iter()
+        .copied()
+        .partition(|peer| !unreachable_peers.contains(peer));
+    let mut probe = if live.is_empty() {
+        aruna_net::ShardGenesisProbe::default()
+    } else {
+        net_handle
+            .probe_shard_topic_geneses(missing.clone(), live)
+            .await
+    };
+    probe.unreachable.extend(skipped);
+    unreachable_peers.extend(probe.unreachable.iter().copied());
     let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
     for topic in missing {
         if probe.known_by_co_holder.contains(&topic) {
@@ -302,6 +319,7 @@ pub(crate) async fn ensure_rank0_shard_group(
     topics: Vec<::irokle::TopicId>,
     retained: &BTreeSet<NodeId>,
     verified: &BTreeSet<::irokle::TopicId>,
+    unreachable_peers: &mut BTreeSet<NodeId>,
 ) -> bool {
     let mut current_members = co_members.clone();
     current_members.push(local_node_id);
@@ -325,6 +343,7 @@ pub(crate) async fn ensure_rank0_shard_group(
         &co_members,
         topics,
         true,
+        unreachable_peers,
     )
     .await;
 

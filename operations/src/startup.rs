@@ -1373,6 +1373,7 @@ async fn restore_shared(
         &unit.peers,
         unit.topics.clone(),
         may_mint,
+        &mut BTreeSet::new(),
     )
     .await;
     if withheld {
@@ -1417,6 +1418,7 @@ async fn restore_rank0(
         unit.topics.clone(),
         &unit.retained,
         verified,
+        &mut BTreeSet::new(),
     )
     .await;
     let present: Vec<::irokle::TopicId> = unit
