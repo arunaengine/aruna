@@ -1318,13 +1318,12 @@ async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             .iter()
             .filter(|node| node.is_sync_eligible())
             .map(|node| {
-                node.net
-                    .send_effect(Effect::Net(NetEffect::DocumentSync(
-                        DocumentSyncEffect::SyncDocuments {
-                            topics: vec![topic],
-                            peers: Vec::new(),
-                        },
-                    )))
+                node.net.send_effect(Effect::Net(NetEffect::DocumentSync(
+                    DocumentSyncEffect::SyncDocuments {
+                        topics: vec![topic],
+                        peers: Vec::new(),
+                    },
+                )))
             }),
     )
     .await;
