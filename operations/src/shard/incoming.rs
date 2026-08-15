@@ -7,6 +7,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use byteview::ByteView;
@@ -14,7 +15,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::resolve_shard_holders;
+use crate::placement::{bucket_membership, resolve_shard_holders};
 use crate::shard::assemble_shard_manifest;
 use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
 use crate::shard::protocol::{
@@ -148,7 +149,12 @@ async fn build_response(
             placement.strategy_id, placement.shard
         )));
     }
-    if !holders.contains(&peer) {
+    // A transition target is not a holder yet and still has to verify the copy
+    // it pulled against this holder, so the derived membership decides here.
+    if !bucket_membership(&config, &placement, unix_timestamp_millis())
+        .members
+        .contains(&peer)
+    {
         return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
             "shard peer `{peer}` is not a holder for shard {}/{} in realm `{realm_id}`",
             placement.strategy_id, placement.shard

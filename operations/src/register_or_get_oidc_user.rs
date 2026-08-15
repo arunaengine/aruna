@@ -43,6 +43,8 @@ pub struct RegisterOrGetOidcUserInput {
 pub struct RegisterOrGetOidcUserOperation {
     input: RegisterOrGetOidcUserInput,
     realm_config: Option<RealmConfigDocument>,
+    /// Bucket the user's rows publish onto, read inside the write transaction.
+    fence: crate::placement::fence::WriteFence,
     state: RegisterOrGetOidcUserState,
     output: Option<Result<User, RegisterOrGetOidcUserError>>,
 }
@@ -51,12 +53,32 @@ pub struct RegisterOrGetOidcUserOperation {
 enum RegisterOrGetOidcUserState {
     Init,
     StartTransaction,
-    ReadSubjectIndex { txn_id: TxnId },
-    ReadExistingUser { txn_id: TxnId },
-    WriteUserAndDocumentRevision { txn_id: TxnId, user: User },
-    WriteSubjectIndex { txn_id: TxnId, user: User },
-    CommitTransaction { user: User, announce: bool },
-    ScheduleAdminDocumentOutboxDrain { user: User },
+    ReadSubjectIndex {
+        txn_id: TxnId,
+    },
+    ReadExistingUser {
+        txn_id: TxnId,
+    },
+    WriteUserAndDocumentRevision {
+        txn_id: TxnId,
+        user: User,
+    },
+    WriteSubjectIndex {
+        txn_id: TxnId,
+        user: User,
+    },
+    ReadBucketFence {
+        txn_id: TxnId,
+        user: User,
+        announce: bool,
+    },
+    CommitTransaction {
+        user: User,
+        announce: bool,
+    },
+    ScheduleAdminDocumentOutboxDrain {
+        user: User,
+    },
     Finish,
     Error,
 }
@@ -75,6 +97,8 @@ pub enum RegisterOrGetOidcUserError {
         expected: &'static str,
         got: String,
     },
+    #[error("the user's bucket cut over to a new holder set; retry the registration")]
+    PlacementFenced,
     #[error("registration did not finish")]
     NotFinished,
 }
@@ -84,6 +108,7 @@ impl RegisterOrGetOidcUserOperation {
         Self {
             input,
             realm_config: None,
+            fence: Default::default(),
             state: RegisterOrGetOidcUserState::Init,
             output: None,
         }
@@ -215,6 +240,11 @@ impl RegisterOrGetOidcUserOperation {
             .as_ref()
             .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
+        let realm_id = self.input.actor.realm_id;
+        if let Some(config) = self.realm_config.as_ref() {
+            self.fence.add(realm_id, config, [placement]);
+        }
+        let generation = self.fence.generation(&realm_id, &placement);
         let document_revision = initial_user_document_sync_change(&self.input.actor, placement);
         let mut reducer_state = AdminDocumentReducerState::new(admin_target);
         let admin_events = seed_user_admin_events(&mut reducer_state, &self.input, subject_id)?;
@@ -238,7 +268,8 @@ impl RegisterOrGetOidcUserOperation {
                 },
                 placement,
                 true,
-            );
+            )
+            .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
 
@@ -337,7 +368,41 @@ impl RegisterOrGetOidcUserOperation {
         Ok(self.emit_commit(txn_id, user, false))
     }
 
+    /// Takes the bucket's fence inside the transaction before committing, so a
+    /// departing holder's close rejects or conflicts this write.
     fn emit_commit(&mut self, txn_id: TxnId, user: User, announce: bool) -> Effects {
+        if self.fence.is_empty() {
+            return self.emit_commit_txn(txn_id, user, announce);
+        }
+        self.state = RegisterOrGetOidcUserState::ReadBucketFence {
+            txn_id,
+            user,
+            announce,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.fence.reads(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_bucket_fence(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+        user: User,
+        announce: bool,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
+        };
+        if !self.fence.admits(&values) {
+            return self.fail(RegisterOrGetOidcUserError::PlacementFenced);
+        }
+        self.emit_commit_txn(txn_id, user, announce)
+    }
+
+    fn emit_commit_txn(&mut self, txn_id: TxnId, user: User, announce: bool) -> Effects {
         self.state = RegisterOrGetOidcUserState::CommitTransaction { user, announce };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -408,6 +473,11 @@ impl Operation for RegisterOrGetOidcUserOperation {
             RegisterOrGetOidcUserState::ReadExistingUser { txn_id } => {
                 self.handle_read_existing_user(event, txn_id)
             }
+            RegisterOrGetOidcUserState::ReadBucketFence {
+                txn_id,
+                user,
+                announce,
+            } => self.handle_bucket_fence(event, txn_id, user, announce),
             RegisterOrGetOidcUserState::CommitTransaction { user, announce } => {
                 self.handle_commit_txn(event, user, announce)
             }
@@ -436,7 +506,8 @@ impl Operation for RegisterOrGetOidcUserOperation {
             RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id }
             | RegisterOrGetOidcUserState::ReadExistingUser { txn_id }
             | RegisterOrGetOidcUserState::WriteUserAndDocumentRevision { txn_id, .. }
-            | RegisterOrGetOidcUserState::WriteSubjectIndex { txn_id, .. } => {
+            | RegisterOrGetOidcUserState::WriteSubjectIndex { txn_id, .. }
+            | RegisterOrGetOidcUserState::ReadBucketFence { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
             _ => smallvec![],

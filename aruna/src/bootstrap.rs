@@ -457,7 +457,6 @@ mod tests {
         };
         let first_shard = aruna_core::structs::PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([4u8; 16]),
-            epoch: 0,
             shard: 7,
         };
         let second_shard = aruna_core::structs::PlacementRef {

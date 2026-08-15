@@ -61,7 +61,7 @@ use ulid::Ulid;
 
 pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
-const WAIT_CAP: Duration = Duration::from_secs(60);
+pub(crate) const WAIT_CAP: Duration = Duration::from_secs(60);
 const CONDITION_CAP: Duration = Duration::from_secs(30);
 
 #[allow(dead_code)]
@@ -785,7 +785,7 @@ async fn spawn_joiner_node_with_mode(
         config.realm_id,
     )
     .await;
-    aruna_operations::process_placements::process_shard_placements(
+    aruna_operations::process_placements::reconcile_shard_topics(
         &joiner_context,
         config.realm_id,
         config.node_id,

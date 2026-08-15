@@ -20,12 +20,14 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
-    PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
+    Actor, BindingError, BindingScope, BucketPlan, CandidatePlacementMap, CompletionProof,
+    DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord,
+    NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef, PlacementScope,
+    PlacementStrategy, RealmConfigDocument, RealmNodeKind, StrategyBinding, TransitionPlan,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -51,6 +53,40 @@ pub enum RealmPlacementMutation {
     SetOverride(PlacementOverride),
     RemoveOverride(Vec<u8>),
     AppendPlacementBinding(PlacementBinding),
+    PublishCandidateMap(CandidatePlacementMap),
+    InitializeActivations {
+        strategy_id: Ulid,
+        candidate_map_epoch: u64,
+    },
+    StartTransition(TransitionPlan),
+    ReportBarrier {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+        frontier: Vec<u8>,
+    },
+    SubmitCompletion {
+        transition_id: Ulid,
+        strategy_id: Ulid,
+        proof: CompletionProof,
+    },
+    AbortTransition(Ulid),
+    ForceFinalizeBucket {
+        transition_id: Ulid,
+        bucket: u32,
+        at_risk_report: String,
+    },
+    ReportStall {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+        reason: String,
+    },
+    ReportDrained {
+        transition_id: Ulid,
+        bucket: u32,
+        reported_by: NodeId,
+    },
 }
 
 impl RealmPlacementMutation {
@@ -98,7 +134,146 @@ impl RealmPlacementMutation {
                     binding: binding.clone(),
                 }
             }
+            Self::PublishCandidateMap(map) => {
+                AdminDocumentOperation::RealmConfigCandidateMapPublished { map: map.clone() }
+            }
+            Self::InitializeActivations {
+                strategy_id,
+                candidate_map_epoch,
+            } => AdminDocumentOperation::RealmConfigActivationsInitialized {
+                strategy_id: *strategy_id,
+                candidate_map_epoch: *candidate_map_epoch,
+            },
+            Self::StartTransition(plan) => {
+                AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() }
+            }
+            Self::ReportBarrier {
+                transition_id,
+                bucket,
+                reported_by,
+                frontier,
+            } => AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                reported_by: *reported_by,
+                frontier: frontier.clone(),
+            },
+            Self::SubmitCompletion {
+                transition_id,
+                strategy_id,
+                proof,
+            } => AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                transition_id: *transition_id,
+                strategy_id: *strategy_id,
+                proof: proof.clone(),
+            },
+            Self::AbortTransition(transition_id) => {
+                AdminDocumentOperation::RealmConfigTransitionAborted {
+                    transition_id: *transition_id,
+                }
+            }
+            Self::ForceFinalizeBucket {
+                transition_id,
+                bucket,
+                at_risk_report,
+            } => AdminDocumentOperation::RealmConfigTransitionBucketForced {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                at_risk_report: at_risk_report.clone(),
+            },
+            Self::ReportStall {
+                transition_id,
+                bucket,
+                reported_by,
+                reason,
+            } => AdminDocumentOperation::RealmConfigTransitionStallReported {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                reported_by: *reported_by,
+                reason: reason.clone(),
+            },
+            Self::ReportDrained {
+                transition_id,
+                bucket,
+                reported_by,
+            } => AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                transition_id: *transition_id,
+                bucket: *bucket,
+                reported_by: *reported_by,
+            },
         }
+    }
+
+    /// Local parity with the receiving side's admission: an authority-moving
+    /// mutation needs a current Management node, a participant may only
+    /// self-report the role the plan names it for, and a Server may append
+    /// only a binding it allocated itself.
+    fn authorize(
+        &self,
+        document: &RealmConfigDocument,
+        actor: &Actor,
+    ) -> Result<(), MutateRealmPlacementError> {
+        let kind = node_kind(document, actor.node_id);
+        let rejected = MutateRealmPlacementError::Unauthorized {
+            node_id: actor.node_id,
+        };
+        if kind.is_none() {
+            return Err(rejected);
+        }
+        let allowed = match self {
+            Self::AppendPlacementBinding(binding) => {
+                matches!(kind, Some(RealmNodeKind::Server))
+                    && binding.allocated_by == Some(actor.node_id)
+            }
+            Self::ReportBarrier {
+                transition_id,
+                bucket,
+                reported_by,
+                ..
+            } => bucket_plan(document, transition_id, *bucket).is_some_and(|plan| {
+                *reported_by == actor.node_id && plan.old_holders.contains(reported_by)
+            }),
+            Self::SubmitCompletion {
+                transition_id,
+                proof,
+                ..
+            } => bucket_plan(document, transition_id, proof.bucket).is_some_and(|plan| {
+                proof.holder == actor.node_id && plan.target_holders.contains(&proof.holder)
+            }),
+            Self::ReportStall {
+                transition_id,
+                bucket,
+                reported_by,
+                ..
+            } => bucket_plan(document, transition_id, *bucket).is_some_and(|plan| {
+                *reported_by == actor.node_id
+                    && (plan.old_holders.contains(reported_by)
+                        || plan.target_holders.contains(reported_by))
+            }),
+            Self::ReportDrained {
+                transition_id,
+                bucket,
+                reported_by,
+            } => bucket_plan(document, transition_id, *bucket).is_some_and(|plan| {
+                *reported_by == actor.node_id
+                    && plan.old_holders.contains(reported_by)
+                    && !plan.target_holders.contains(reported_by)
+            }),
+            _ => false,
+        };
+        if matches!(
+            self,
+            Self::ReportBarrier { .. }
+                | Self::SubmitCompletion { .. }
+                | Self::ReportStall { .. }
+                | Self::ReportDrained { .. }
+        ) {
+            return allowed.then_some(()).ok_or(rejected);
+        }
+        if matches!(kind, Some(RealmNodeKind::Management)) {
+            return Ok(());
+        }
+        allowed.then_some(()).ok_or(rejected)
     }
 
     fn validate(&self, document: &RealmConfigDocument) -> Result<(), MutateRealmPlacementError> {
@@ -127,6 +302,20 @@ impl RealmPlacementMutation {
             Self::UpsertStrategy(strategy) if strategy.replica_count == Some(0) => {
                 Err(MutateRealmPlacementError::InvalidInput(
                     "placement strategy replica_count must not be zero".to_string(),
+                ))
+            }
+            // Per-shard activations cannot survive a bucket-space reshape.
+            Self::UpsertStrategy(strategy)
+                if document
+                    .strategy(&strategy.strategy_id)
+                    .is_some_and(|existing| existing.shard_count != strategy.shard_count)
+                    && document
+                        .placement_activations
+                        .iter()
+                        .any(|entry| entry.strategy_id == strategy.strategy_id) =>
+            {
+                Err(MutateRealmPlacementError::InvalidInput(
+                    "shard_count cannot change while the strategy has activations".to_string(),
                 ))
             }
             Self::SetDefaultStrategy(strategy_id) => {
@@ -190,6 +379,118 @@ impl RealmPlacementMutation {
                 Some(strategy_id) => require_strategy(document, strategy_id, "override"),
                 None => Ok(()),
             },
+            Self::PublishCandidateMap(map) => {
+                if document.candidate_map(map.epoch).is_some()
+                    || document
+                        .candidate_maps
+                        .iter()
+                        .any(|known| known.epoch == map.epoch)
+                {
+                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                        "candidate map epoch {} is already published",
+                        map.epoch
+                    )));
+                }
+                Ok(())
+            }
+            Self::InitializeActivations {
+                strategy_id,
+                candidate_map_epoch,
+            } => {
+                require_strategy(document, strategy_id, "activation")?;
+                if document.candidate_map(*candidate_map_epoch).is_none() {
+                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                        "candidate map epoch {candidate_map_epoch} is missing or conflicted"
+                    )));
+                }
+                Ok(())
+            }
+            Self::StartTransition(plan) => {
+                require_strategy(document, &plan.strategy_id, "transition")?;
+                if plan.limits.max_incomplete_buckets == 0 {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "a transition must allow at least one bucket in flight".to_string(),
+                    ));
+                }
+                if let Some(existing) = document.placement_transitions.iter().find(|transition| {
+                    transition.plan.strategy_id == plan.strategy_id && !transition.is_terminal()
+                }) {
+                    return Err(MutateRealmPlacementError::TransitionInFlight {
+                        transition_id: existing.plan.transition_id,
+                    });
+                }
+                // The plan restates derived holder sets, so admission re-derives
+                // them: a plan naming sets this node disagrees with never enters.
+                if !crate::placement::transition::plan_is_derivable(document, plan) {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "transition plan does not match the resolved holder sets".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::ReportBarrier {
+                transition_id,
+                bucket,
+                ..
+            }
+            | Self::ReportStall {
+                transition_id,
+                bucket,
+                ..
+            }
+            | Self::ReportDrained {
+                transition_id,
+                bucket,
+                ..
+            } => require_transition_bucket(document, transition_id, *bucket),
+            Self::SubmitCompletion {
+                transition_id,
+                strategy_id,
+                proof,
+            } => {
+                let transition = require_transition_bucket(document, transition_id, proof.bucket)
+                    .and(document.transition(transition_id).ok_or(
+                    MutateRealmPlacementError::UnknownTransition {
+                        transition_id: *transition_id,
+                    },
+                ))?;
+                if transition.plan.strategy_id != *strategy_id
+                    || !proof.verify(document.realm_id, *transition_id, *strategy_id)
+                {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "transition completion proof does not verify".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::AbortTransition(transition_id) => document
+                .transition(transition_id)
+                .map(|_| ())
+                .ok_or(MutateRealmPlacementError::UnknownTransition {
+                    transition_id: *transition_id,
+                }),
+            Self::ForceFinalizeBucket {
+                transition_id,
+                bucket,
+                ..
+            } => {
+                let transition = require_transition_bucket(document, transition_id, *bucket).and(
+                    document.transition(transition_id).ok_or(
+                        MutateRealmPlacementError::UnknownTransition {
+                            transition_id: *transition_id,
+                        },
+                    ),
+                )?;
+                // A forced cut still needs one verified copy on a target holder,
+                // so the last verified copy is never the one cut away.
+                if transition.proofs_for(*bucket).next().is_none() {
+                    return Err(MutateRealmPlacementError::ForceWithoutProof {
+                        transition_id: *transition_id,
+                        bucket: *bucket,
+                    });
+                }
+                Ok(())
+            }
             Self::RemoveStrategy(strategy_id) => {
                 let referenced = document.default_strategy_id == Some(*strategy_id)
                     || document
@@ -217,6 +518,34 @@ impl RealmPlacementMutation {
     }
 }
 
+/// The configured kind of `node_id`, or `None` when the realm does not know it.
+pub(crate) fn node_kind(document: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeKind> {
+    let node_id = node_id.to_string();
+    document
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| node.kind.clone())
+}
+
+/// Only a management node's realm-config mutation passes inbound admission;
+/// holder rank alone is not enough, because a rank-0 Server would apply
+/// locally and then be rejected by every peer.
+pub(crate) fn is_management(document: &RealmConfigDocument, node_id: NodeId) -> bool {
+    matches!(
+        node_kind(document, node_id),
+        Some(RealmNodeKind::Management)
+    )
+}
+
+fn bucket_plan<'a>(
+    document: &'a RealmConfigDocument,
+    transition_id: &Ulid,
+    bucket: u32,
+) -> Option<&'a BucketPlan> {
+    document.transition(transition_id)?.plan.bucket_plan(bucket)
+}
+
 fn require_strategy(
     document: &RealmConfigDocument,
     strategy_id: &Ulid,
@@ -225,6 +554,25 @@ fn require_strategy(
     if document.strategy(strategy_id).is_none() {
         return Err(MutateRealmPlacementError::InvalidInput(format!(
             "{reference} references missing strategy {strategy_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_transition_bucket(
+    document: &RealmConfigDocument,
+    transition_id: &Ulid,
+    bucket: u32,
+) -> Result<(), MutateRealmPlacementError> {
+    let transition =
+        document
+            .transition(transition_id)
+            .ok_or(MutateRealmPlacementError::UnknownTransition {
+                transition_id: *transition_id,
+            })?;
+    if !transition.plan.covers(bucket) {
+        return Err(MutateRealmPlacementError::InvalidInput(format!(
+            "transition {transition_id} does not cover bucket {bucket}"
         )));
     }
     Ok(())
@@ -263,7 +611,8 @@ pub struct MutateRealmPlacementConfig {
 
 #[derive(Debug, PartialEq)]
 pub struct MutateRealmPlacementOperation {
-    config: MutateRealmPlacementConfig,
+    actor: Actor,
+    mutations: Vec<RealmPlacementMutation>,
     txn_id: Option<TxnId>,
     state: MutateRealmPlacementState,
     output: Option<Result<RealmConfigDocument, MutateRealmPlacementError>>,
@@ -319,14 +668,20 @@ pub enum MutateRealmPlacementError {
     RealmConfigNotFound,
     #[error("invalid placement mutation: {0}")]
     InvalidInput(String),
-    #[error(
-        "disjoint holder transition for strategy {strategy_id} shard {shard}: at least one current holder must remain until new holders verify"
-    )]
-    DisjointHolderTransition { strategy_id: Ulid, shard: u32 },
+    #[error("node {node_id} may not originate this placement mutation")]
+    Unauthorized { node_id: NodeId },
     #[error("placement leaves strategy {strategy_id} shard {shard} with no eligible holders")]
     EmptyShardHolders { strategy_id: Ulid, shard: u32 },
     #[error("placement strategy {strategy_id} is currently referenced")]
     StrategyReferenced { strategy_id: Ulid },
+    #[error("placement transition {transition_id} is still in flight")]
+    TransitionInFlight { transition_id: Ulid },
+    #[error("placement transition {transition_id} is unknown")]
+    UnknownTransition { transition_id: Ulid },
+    #[error(
+        "forcing transition {transition_id} bucket {bucket} needs at least one verified completion proof"
+    )]
+    ForceWithoutProof { transition_id: Ulid, bucket: u32 },
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]
@@ -341,8 +696,16 @@ pub enum MutateRealmPlacementError {
 
 impl MutateRealmPlacementOperation {
     pub fn new(config: MutateRealmPlacementConfig) -> Self {
+        Self::batch(config.actor, vec![config.mutation])
+    }
+
+    /// One transaction, one reduced event per mutation, applied in order
+    /// against the evolving document. The whole batch commits or none of it
+    /// does. `RemoveStrategy` must be driven alone.
+    pub fn batch(actor: Actor, mutations: Vec<RealmPlacementMutation>) -> Self {
         Self {
-            config,
+            actor,
+            mutations,
             txn_id: None,
             state: MutateRealmPlacementState::Init,
             output: None,
@@ -351,13 +714,13 @@ impl MutateRealmPlacementOperation {
 
     fn document_ref(&self) -> DocumentSyncTarget {
         DocumentSyncTarget::RealmConfig {
-            realm_id: self.config.actor.realm_id,
+            realm_id: self.actor.realm_id,
         }
     }
 
     fn admin_target(&self) -> AdminDocumentTarget {
         AdminDocumentTarget::RealmConfig {
-            realm_id: self.config.actor.realm_id,
+            realm_id: self.actor.realm_id,
         }
     }
 
@@ -392,8 +755,12 @@ impl MutateRealmPlacementOperation {
         let Some(document_value) = document_value else {
             return Err(MutateRealmPlacementError::RealmConfigNotFound);
         };
+        if self.mutations.is_empty() {
+            return Err(MutateRealmPlacementError::InvalidInput(
+                "empty placement mutation batch".to_string(),
+            ));
+        }
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
-        self.config.mutation.validate(&document)?;
 
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
@@ -415,10 +782,20 @@ impl MutateRealmPlacementOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        let admin_event = reducer_state
-            .apply_operation(&self.config.actor, self.config.mutation.admin_operation())?;
         let pre_document = document.clone();
-        overlay_realm_config_placement_reducer_materialization(&mut document, &reducer_state);
+        let mut admin_events = Vec::with_capacity(self.mutations.len());
+        for mutation in &self.mutations {
+            mutation.authorize(&document, &self.actor)?;
+            mutation.validate(&document)?;
+            let admin_event =
+                reducer_state.apply_operation(&self.actor, mutation.admin_operation())?;
+            overlay_realm_config_placement_reducer_materialization(
+                &mut document,
+                &reducer_state,
+                unix_timestamp_millis(),
+            );
+            admin_events.push(admin_event);
+        }
 
         if let Some((node_id, placement)) =
             crate::placement::first_draining_holder_set_change(&pre_document, &document)
@@ -427,14 +804,6 @@ impl MutateRealmPlacementOperation {
                 "placement change alters drain-time holder set for node {node_id}, strategy {} shard {}",
                 placement.strategy_id, placement.shard
             )));
-        }
-        if let Some(placement) =
-            crate::placement::first_disjoint_shard_transition(&pre_document, &document)
-        {
-            return Err(MutateRealmPlacementError::DisjointHolderTransition {
-                strategy_id: placement.strategy_id,
-                shard: placement.shard,
-            });
         }
         if let Some(placement) = crate::placement::first_empty_referenced_shard(&document) {
             return Err(MutateRealmPlacementError::EmptyShardHolders {
@@ -453,22 +822,24 @@ impl MutateRealmPlacementOperation {
             (
                 document_target.storage_keyspace().to_string(),
                 document_target.storage_key(),
-                document.to_bytes(&self.config.actor)?.into(),
+                document.to_bytes(&self.actor)?.into(),
             ),
             admin_document_reducer_state_write_entry(&reducer_state)?,
         ];
-        let record = new_outbox_record_with_id(
-            admin_event.event_id,
-            self.config.actor.node_id,
-            document_target,
-            Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(admin_event),
-            },
-            placement,
-            false,
-        );
-        writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        for admin_event in admin_events {
+            let record = new_outbox_record_with_id(
+                admin_event.event_id,
+                self.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: Box::new(admin_event),
+                },
+                placement,
+                false,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
@@ -490,11 +861,23 @@ impl MutateRealmPlacementOperation {
         let Some(document_value) = document_value else {
             return Err(MutateRealmPlacementError::RealmConfigNotFound);
         };
-        let document = RealmConfigDocument::from_bytes(&document_value)?;
-        self.config.mutation.validate(&document)?;
-        let strategy_id = match &self.config.mutation {
-            RealmPlacementMutation::RemoveStrategy(strategy_id) => *strategy_id,
-            _ => {
+        let strategy_id = match self.mutations.as_slice() {
+            [RealmPlacementMutation::RemoveStrategy(strategy_id)] => {
+                let document = RealmConfigDocument::from_bytes(&document_value)?;
+                let removal = RealmPlacementMutation::RemoveStrategy(*strategy_id);
+                removal.authorize(&document, &self.actor)?;
+                removal.validate(&document)?;
+                *strategy_id
+            }
+            mutations => {
+                if mutations
+                    .iter()
+                    .any(|mutation| matches!(mutation, RealmPlacementMutation::RemoveStrategy(_)))
+                {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "strategy removal cannot be batched".to_string(),
+                    ));
+                }
                 return self.emit_write_document_and_admin_state(
                     Some(document_value),
                     reducer_state_value,
@@ -546,7 +929,7 @@ impl MutateRealmPlacementOperation {
     }
 
     fn reference_matches(&self, record: &MetadataRegistryRecord, strategy_id: Ulid) -> bool {
-        record.realm_id == self.config.actor.realm_id
+        record.realm_id == self.actor.realm_id
             && record.placement != PlacementRef::NIL
             && record.placement.strategy_id == strategy_id
     }
@@ -771,16 +1154,16 @@ impl Operation for MutateRealmPlacementOperation {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
                     smallvec![schedule_placement_revalidation_effect(
-                        self.config.actor.realm_id,
-                        self.config.actor.node_id,
+                        self.actor.realm_id,
+                        self.actor.node_id,
                     )]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
                     self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
                     smallvec![schedule_placement_revalidation_effect(
-                        self.config.actor.realm_id,
-                        self.config.actor.node_id,
+                        self.actor.realm_id,
+                        self.actor.node_id,
                     )]
                 }
                 other => self.unexpected_event(
@@ -876,9 +1259,18 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::placement::transition::{TransitionRequest, plan_transition};
+    use aruna_core::structs::{PlacementTransition, ProofClaim, TransitionLimits};
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn node_secret(node_id: &aruna_core::NodeId) -> iroh::SecretKey {
+        (1..=8u8)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
+            .find(|secret| secret.public() == *node_id)
+            .expect("fixture node keys are seeded")
     }
 
     fn actor(realm_id: RealmId) -> Actor {
@@ -903,6 +1295,7 @@ mod tests {
     async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
         let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         document.seed_default_placement();
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
         document.placement_handle_ranges.push(HandleRange {
             range_id: Ulid::from_bytes([9; 16]),
             owner: actor.node_id,
@@ -973,7 +1366,6 @@ mod tests {
                 permission_path: "/referenced".to_string(),
                 placement: PlacementRef {
                     strategy_id,
-                    epoch: 0,
                     shard: 1,
                 },
                 holder_node_ids: vec![actor.node_id],
@@ -1251,6 +1643,31 @@ mod tests {
     }
 
     #[test]
+    fn shard_count_frozen() {
+        // A bucket-space reshape would orphan per-shard activations.
+        let realm_id = RealmId::from_bytes([15; 32]);
+        let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        document.seed_default_placement();
+        document.snapshot_candidate_map();
+        let strategy_id = document.default_strategy_id.unwrap();
+        let mut reshaped = document.strategy(&strategy_id).unwrap().clone();
+        reshaped.shard_count *= 2;
+
+        assert!(matches!(
+            RealmPlacementMutation::UpsertStrategy(reshaped).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("shard_count")
+        ));
+
+        // Selector edits without a shard_count change stay allowed.
+        let mut edited = document.strategy(&strategy_id).unwrap().clone();
+        edited.replica_count = Some(1);
+        assert_eq!(
+            RealmPlacementMutation::UpsertStrategy(edited).validate(&document),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn group_reuses_realm() {
         let realm_id = RealmId::from_bytes([14; 32]);
         let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -1412,6 +1829,8 @@ mod tests {
         for node_id in nodes {
             document.ensure_node(*node_id, RealmNodeKind::Server);
         }
+        // The issuing actor must be Management, or admission rejects it.
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
@@ -1472,27 +1891,6 @@ mod tests {
                 .validate(&document)
                 .is_ok()
         );
-    }
-
-    #[tokio::test]
-    async fn disjoint_transition_rejected() {
-        let directory = tempdir().unwrap();
-        let context = context(directory.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([21; 32]);
-        let actor = actor(realm_id);
-        // Single-replica: every shard has one holder, so draining a node moves its
-        // shards to a disjoint holder.
-        seed_placement_config(&context, &actor, &[node(1), node(2)], Some(1)).await;
-
-        assert!(matches!(
-            mutate(
-                &context,
-                &actor,
-                RealmPlacementMutation::UpsertNode(draining_entry(node(1)))
-            )
-            .await,
-            Err(MutateRealmPlacementError::DisjointHolderTransition { .. })
-        ));
     }
 
     #[tokio::test]
@@ -1680,6 +2078,366 @@ mod tests {
         assert!(matches!(
             RealmPlacementMutation::AppendPlacementBinding(foreign).validate(&document),
             Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("does not match")
+        ));
+    }
+
+    fn transition_document() -> (RealmConfigDocument, Ulid) {
+        // Four nodes, one replica: every bucket moves to a disjoint holder when
+        // the newest map adds a node, which is what a transition is for.
+        let realm_id = RealmId::from_bytes([41; 32]);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        let strategy_id = Ulid::from_bytes([42; 16]);
+        document.strategies.push(PlacementStrategy {
+            strategy_id,
+            name: "moved".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 4,
+        });
+        document.default_strategy_id = Some(strategy_id);
+        for seed in 1..=3u8 {
+            document.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        document.snapshot_candidate_map();
+        document.ensure_node(node(4), RealmNodeKind::Server);
+        document.snapshot_candidate_map();
+        (document, strategy_id)
+    }
+
+    fn transition_request(strategy_id: Ulid) -> TransitionRequest {
+        TransitionRequest {
+            transition_id: Ulid::from_bytes([43; 16]),
+            strategy_id,
+            buckets: Vec::new(),
+            target_map_epoch: 2,
+            limits: TransitionLimits::default(),
+            created_by: node(1),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn transition_plan_must_match() {
+        let (document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        assert_eq!(plan.buckets.len(), 4);
+        assert!(
+            RealmPlacementMutation::StartTransition(plan.clone())
+                .validate(&document)
+                .is_ok()
+        );
+
+        // A plan naming a holder set this node does not derive never enters.
+        let mut forged = plan.clone();
+        forged.buckets[0].target_holders = vec![node(1)];
+        assert!(matches!(
+            RealmPlacementMutation::StartTransition(forged).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("does not match the resolved holder sets")
+        ));
+
+        // One transition per strategy at a time.
+        let mut in_flight = document.clone();
+        in_flight
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        let mut successor = plan.clone();
+        successor.transition_id = Ulid::from_bytes([44; 16]);
+        assert!(matches!(
+            RealmPlacementMutation::StartTransition(successor).validate(&in_flight),
+            Err(MutateRealmPlacementError::TransitionInFlight { transition_id })
+                if transition_id == plan.transition_id
+        ));
+    }
+
+    fn issuer(realm_id: RealmId, node_id: aruna_core::NodeId) -> Actor {
+        Actor {
+            node_id,
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        }
+    }
+
+    #[test]
+    fn authority_needs_management() {
+        // Server, Local, and unknown issuers must be rejected before any
+        // reducer state is touched; Management keeps working.
+        let (mut document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        document
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        document.ensure_node(node(5), RealmNodeKind::Local);
+        document.ensure_node(node(6), RealmNodeKind::Management);
+        let realm_id = document.realm_id;
+
+        for mutation in [
+            RealmPlacementMutation::PublishCandidateMap(document.freeze_map(3)),
+            RealmPlacementMutation::InitializeActivations {
+                strategy_id,
+                candidate_map_epoch: 2,
+            },
+            RealmPlacementMutation::StartTransition(plan.clone()),
+            RealmPlacementMutation::AbortTransition(plan.transition_id),
+            RealmPlacementMutation::ForceFinalizeBucket {
+                transition_id: plan.transition_id,
+                bucket: plan.buckets[0].bucket,
+                at_risk_report: "old holders lost".to_string(),
+            },
+            RealmPlacementMutation::UpsertStrategy(strategy(Ulid::from_bytes([77; 16]))),
+            RealmPlacementMutation::RemoveNode(node(3)),
+        ] {
+            for rejected in [node(1), node(5), node(9)] {
+                assert!(
+                    matches!(
+                        mutation.authorize(&document, &issuer(realm_id, rejected)),
+                        Err(MutateRealmPlacementError::Unauthorized { node_id })
+                            if node_id == rejected
+                    ),
+                    "{rejected} must not originate an authority-moving mutation"
+                );
+            }
+            assert_eq!(
+                mutation.authorize(&document, &issuer(realm_id, node(6))),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn reports_need_planned_role() {
+        // A non-Management participant may only report the role its bucket
+        // plan names it for, and only for itself.
+        let (mut document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        let bucket = plan
+            .buckets
+            .iter()
+            .find(|bucket| bucket.old_holders != bucket.target_holders)
+            .expect("the fixture moves at least one bucket")
+            .clone();
+        document
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        let realm_id = document.realm_id;
+        let old = bucket.old_holders[0];
+        let target = bucket.target_holders[0];
+        let transition_id = plan.transition_id;
+
+        let barrier = |reported_by| RealmPlacementMutation::ReportBarrier {
+            transition_id,
+            bucket: bucket.bucket,
+            reported_by,
+            frontier: vec![1],
+        };
+        assert_eq!(
+            barrier(old).authorize(&document, &issuer(realm_id, old)),
+            Ok(())
+        );
+        assert!(
+            barrier(target)
+                .authorize(&document, &issuer(realm_id, target))
+                .is_err()
+        );
+        // Reporting on another node's behalf is never a self-report.
+        assert!(
+            barrier(old)
+                .authorize(&document, &issuer(realm_id, target))
+                .is_err()
+        );
+        document.ensure_node(node(6), RealmNodeKind::Management);
+        assert!(
+            barrier(old)
+                .authorize(&document, &issuer(realm_id, node(6)))
+                .is_err()
+        );
+
+        let claim = ProofClaim {
+            realm_id,
+            transition_id,
+            strategy_id,
+            bucket: bucket.bucket,
+            old_activation_epoch: 1,
+            target_map_epoch: 2,
+            barrier_digest: [0; 32],
+            checkpoint_root: [1; 32],
+            holder: target,
+        };
+        let completion = RealmPlacementMutation::SubmitCompletion {
+            transition_id,
+            strategy_id,
+            proof: claim.sign(&node_secret(&target)),
+        };
+        assert_eq!(
+            completion.authorize(&document, &issuer(realm_id, target)),
+            Ok(())
+        );
+        assert!(
+            completion
+                .authorize(&document, &issuer(realm_id, old))
+                .is_err()
+        );
+
+        let drained = |reported_by| RealmPlacementMutation::ReportDrained {
+            transition_id,
+            bucket: bucket.bucket,
+            reported_by,
+        };
+        assert_eq!(
+            drained(old).authorize(&document, &issuer(realm_id, old)),
+            Ok(())
+        );
+        assert!(
+            drained(target)
+                .authorize(&document, &issuer(realm_id, target))
+                .is_err()
+        );
+
+        let stall = |reported_by| RealmPlacementMutation::ReportStall {
+            transition_id,
+            bucket: bucket.bucket,
+            reported_by,
+            reason: "no source".to_string(),
+        };
+        for participant in [old, target] {
+            assert_eq!(
+                stall(participant).authorize(&document, &issuer(realm_id, participant)),
+                Ok(())
+            );
+        }
+        let outsider = (1..=9u8)
+            .map(node)
+            .find(|candidate| {
+                !bucket.old_holders.contains(candidate)
+                    && !bucket.target_holders.contains(candidate)
+                    && node_kind(&document, *candidate).is_some()
+            })
+            .expect("the fixture has an uninvolved node");
+        assert!(
+            stall(outsider)
+                .authorize(&document, &issuer(realm_id, outsider))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_writes_nothing() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([46; 32]);
+        let management = actor(realm_id);
+        let seeded = seed_placement_config(&context, &management, &[node(2)], Some(2)).await;
+
+        let result = mutate(
+            &context,
+            &issuer(realm_id, node(2)),
+            RealmPlacementMutation::PublishCandidateMap(seeded.freeze_map(1)),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MutateRealmPlacementError::Unauthorized { node_id }) if node_id == node(2)
+        ));
+        let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
+            .await
+            .expect("the realm config survives a rejected mutation");
+        assert!(stored.candidate_maps.is_empty());
+        assert!(
+            crate::document_sync_outbox::read_outbox_tails(&context.storage_handle)
+                .await
+                .expect("outbox scan")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn force_needs_one_proof() {
+        let (mut document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        let bucket = plan.buckets[0].bucket;
+        let holder = plan.buckets[0].target_holders[0];
+        document
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        let force = RealmPlacementMutation::ForceFinalizeBucket {
+            transition_id: plan.transition_id,
+            bucket,
+            at_risk_report: "old holders lost".to_string(),
+        };
+
+        assert!(matches!(
+            force.validate(&document),
+            Err(MutateRealmPlacementError::ForceWithoutProof { bucket: forced, .. })
+                if forced == bucket
+        ));
+
+        let secret = node_secret(&holder);
+        document.placement_transitions[0].proofs.push(
+            ProofClaim {
+                realm_id: document.realm_id,
+                transition_id: plan.transition_id,
+                strategy_id,
+                bucket,
+                old_activation_epoch: 1,
+                target_map_epoch: 2,
+                barrier_digest: [0; 32],
+                checkpoint_root: [1; 32],
+                holder,
+            }
+            .sign(&secret),
+        );
+        assert_eq!(force.validate(&document), Ok(()));
+    }
+
+    #[test]
+    fn completion_must_verify() {
+        let (mut document, strategy_id) = transition_document();
+        let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
+        let bucket = plan.buckets[0].bucket;
+        let holder = plan.buckets[0].target_holders[0];
+        document
+            .placement_transitions
+            .push(PlacementTransition::new(plan.clone()));
+        let claim = ProofClaim {
+            realm_id: document.realm_id,
+            transition_id: plan.transition_id,
+            strategy_id,
+            bucket,
+            old_activation_epoch: 1,
+            target_map_epoch: 2,
+            barrier_digest: [0; 32],
+            checkpoint_root: [1; 32],
+            holder,
+        };
+        let submit = |proof| RealmPlacementMutation::SubmitCompletion {
+            transition_id: plan.transition_id,
+            strategy_id,
+            proof,
+        };
+
+        assert_eq!(
+            submit(claim.sign(&node_secret(&holder))).validate(&document),
+            Ok(())
+        );
+
+        // Signed by the wrong key, and aimed at a bucket the plan does not cover.
+        let other = (1..=4u8)
+            .map(node)
+            .find(|candidate| *candidate != holder)
+            .expect("the fixture has more than one node");
+        assert!(matches!(
+            submit(claim.sign(&node_secret(&other))).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("does not verify")
+        ));
+        let mut off_plan = claim;
+        off_plan.bucket = 9;
+        assert!(matches!(
+            submit(off_plan.sign(&node_secret(&holder))).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("does not cover bucket")
         ));
     }
 }

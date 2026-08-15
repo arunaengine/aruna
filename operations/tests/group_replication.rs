@@ -140,7 +140,6 @@ fn capped_holders(config: &RealmConfigDocument, group_id: Ulid) -> Vec<NodeId> {
         config,
         &PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard: shard_for_subject(&group_id.to_bytes(), strategy.shard_count),
         },
     )

@@ -88,7 +88,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
 use crate::error::{NetError, Result};
@@ -179,6 +179,14 @@ struct DocumentEventBatch {
     /// Ops whose transport payload never decoded into an event. They are
     /// permanent by construction: no redelivery can make the bytes valid.
     rejections: Vec<SyncRejection>,
+}
+
+/// One journalled eviction: the payloads Irokle removed with the losing chain,
+/// plus the key that releases them once their outbox rows are committed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingEviction {
+    pub key: irokle_crate::EvictionKey,
+    pub documents: Vec<DocumentSyncEvictedDocument>,
 }
 
 /// Placement fence outcome. The transactional read of the realm config is the
@@ -378,6 +386,10 @@ pub struct DocumentSyncService {
     // receiver once via `take_eviction_receiver` and re-emits the payloads.
     eviction_tx: tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
+    // Buckets each unreleased journal entry may still re-emit onto, so a
+    // placement drain can wait on its own bucket without rescanning the
+    // journal. `None` marks an entry recovered at open but not yet decoded.
+    eviction_buckets: Arc<RwLock<BTreeMap<irokle_crate::EvictionKey, Option<Vec<PlacementRef>>>>>,
     // Realm this service serves; shard-classed targets carry no realm id of
     // their own, so their topic derivation reads it from here.
     realm_id: RealmId,
@@ -466,6 +478,14 @@ impl DocumentSyncService {
         );
         net.start_configured_resync_loop()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        // Seeded before any drain can observe the service: an entry left by an
+        // interrupted handoff must block its bucket from the first tick on.
+        let eviction_buckets: BTreeMap<irokle_crate::EvictionKey, Option<Vec<PlacementRef>>> = node
+            .pending_evictions()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .iter()
+            .map(|eviction| (eviction.key(), None))
+            .collect();
 
         Ok(Self {
             node,
@@ -480,6 +500,7 @@ impl DocumentSyncService {
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             eviction_tx,
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
+            eviction_buckets: Arc::new(RwLock::new(eviction_buckets)),
             realm_id,
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
@@ -503,26 +524,22 @@ impl DocumentSyncService {
     /// must be re-emitted onto the winning chain. Every item sets
     /// `allow_genesis: false` so the loser replays through the normal outbox
     /// drain instead of minting a rival genesis, and original ids are preserved
-    /// where the outbox format can carry them. Control ops are skipped,
-    /// whole-document admin poison is dropped with a warning (mirroring the
-    /// reconcile skip arm), and ops not authored by the local node are rejected
-    /// since an eviction is by construction the local node's own chain.
+    /// where the outbox format can carry them.
+    ///
+    /// Irokle's journal entry is the last local copy of these payloads, so each
+    /// dropped class needs its own reason not to be re-emitted:
+    ///
+    /// * Control ops carry nothing to replay.
+    /// * A whole-document admin payload cannot exist: `announce` refuses to
+    ///   build one and `apply_upsert`/`apply_delete` refuse to apply one, so
+    ///   re-emitting would only add an outbox row no peer can ever accept.
     pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
         self.clear_cursor(eviction.topic_id);
         if let Err(error) = self.flush_database() {
             warn!(%error, topic_id = %eviction.topic_id, "Failed to persist document sync fan-out cursor reset");
         }
-        let local_peer = self.node.peer_id();
         let mut documents = Vec::new();
         for evicted in eviction.evicted {
-            if evicted.author != local_peer {
-                warn!(
-                    topic_id = %eviction.topic_id,
-                    author = %evicted.author,
-                    "Skipping evicted op not authored by the local node"
-                );
-                continue;
-            }
             let TopicPayload::Event(envelope) = evicted.payload else {
                 // Non-event control op (e.g. AddPeer/RemovePeer): nothing to re-emit.
                 continue;
@@ -546,7 +563,7 @@ impl DocumentSyncService {
                     placement,
                 } => {
                     documents.push(DocumentSyncEvictedDocument {
-                        event_id: None,
+                        event_id: event.event_id,
                         target,
                         event: DocumentSyncOutboxEvent::AdminOperation { event },
                         placement,
@@ -568,7 +585,7 @@ impl DocumentSyncService {
                         continue;
                     }
                     documents.push(DocumentSyncEvictedDocument {
-                        event_id: Some(event_id),
+                        event_id,
                         target,
                         placement: change.placement,
                         event: DocumentSyncOutboxEvent::Upsert { bytes, change },
@@ -589,7 +606,7 @@ impl DocumentSyncService {
                         continue;
                     }
                     documents.push(DocumentSyncEvictedDocument {
-                        event_id: Some(event_id),
+                        event_id,
                         target,
                         placement: change.placement,
                         event: DocumentSyncOutboxEvent::Delete { change },
@@ -776,7 +793,8 @@ impl DocumentSyncService {
     pub async fn reconcile_shard_membership(
         &self,
         topics: &[irokle_crate::TopicId],
-        holders: Vec<NodeId>,
+        members: Vec<NodeId>,
+        publishers: Vec<NodeId>,
         retained: &BTreeSet<NodeId>,
         verified_topics: &BTreeSet<irokle_crate::TopicId>,
     ) -> Result<()> {
@@ -785,22 +803,24 @@ impl DocumentSyncService {
         }
 
         let _reconcile_guard = self.reconcile_lock.lock().await;
-        let holder_peers: BTreeSet<PeerId> = holders
+        let local_peer = self.node.peer_id();
+        // Membership (delivery) and publish authority are separate sets: an
+        // unactivated transition target is a member without authority. The
+        // adapter installs exactly the sets it is handed; policy stays in
+        // operations.
+        let member_peers: BTreeSet<PeerId> = members
             .into_iter()
             .map(|node_id| node_id_to_peer_id(&node_id))
+            .chain(retained.iter().map(node_id_to_peer_id))
             .collect();
-        let local_peer = self.node.peer_id();
-        if !holder_peers.contains(&local_peer) {
+        if !member_peers.contains(&local_peer) {
             return Err(NetError::Bootstrap(
-                "local node is not an authoritative shard holder".to_string(),
+                "local node is not a shard member".to_string(),
             ));
         }
-        // Canonical holders plus draining former-holders still flushing: the set
-        // that may publish onto and stay in the shard topic. Only canonical
-        // holders drive membership top-up and the local-holder guard above.
-        let member_peers: BTreeSet<PeerId> = holder_peers
-            .iter()
-            .copied()
+        let publisher_peers: BTreeSet<PeerId> = publishers
+            .into_iter()
+            .map(|node_id| node_id_to_peer_id(&node_id))
             .chain(retained.iter().map(node_id_to_peer_id))
             .collect();
 
@@ -819,7 +839,7 @@ impl DocumentSyncService {
                 .storage()
                 .topic_state(&topic_id)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let current = member_peers
+            let current = publisher_peers
                 .iter()
                 .copied()
                 .map(|peer| irokle_crate::actor_id_for(topic_id, peer))
@@ -1497,22 +1517,24 @@ impl DocumentSyncService {
         }
         let mut writes = Vec::with_capacity(published.len());
         for (topic_id, clock) in published {
+            // A tie-break between the publish and this write leaves the ops on a
+            // chain that no longer exists; the next reconcile replays the winner.
+            let Some(genesis) = self.topic_genesis(topic_id)? else {
+                continue;
+            };
             let cursor_key = topic_cursor_key(topic_id);
-            let mut cursor: irokle_crate::ActorClock = match self
-                .storage_read(
+            let mut cursor = applied_cursor_clock(
+                self.node.storage(),
+                topic_id,
+                genesis,
+                self.storage_read(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key.clone(),
                 )
-                .await?
-            {
-                Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
-                None => irokle_crate::ActorClock::default(),
-            };
+                .await?,
+            )?;
             cursor.merge(&clock);
-            let value = ByteView::from(
-                postcard::to_allocvec(&cursor)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-            );
+            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
             writes.push((
                 DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                 cursor_key,
@@ -1630,17 +1652,138 @@ impl DocumentSyncService {
         sync_peers
     }
 
+    fn topic_genesis(&self, topic_id: irokle_crate::TopicId) -> Result<Option<irokle_crate::OpId>> {
+        Ok(self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .map(|state| state.genesis))
+    }
+
     fn next_sync_round(&self, topic_id: irokle_crate::TopicId) -> Result<u64> {
-        current_cursor(&self.fanout_cursors, topic_id)
+        let Some(genesis) = self.topic_genesis(topic_id)? else {
+            return Ok(0);
+        };
+        current_cursor(&self.fanout_cursors, topic_id, genesis)
     }
 
     fn advance_cursor(&self, topic_id: irokle_crate::TopicId, round: u64) -> Result<()> {
-        advance_cursor(&self.fanout_cursors, topic_id, round)
+        let Some(genesis) = self.topic_genesis(topic_id)? else {
+            return Ok(());
+        };
+        advance_cursor(&self.fanout_cursors, topic_id, genesis, round)
     }
 
     fn clear_cursor(&self, topic_id: irokle_crate::TopicId) {
         if let Err(error) = remove_cursor(&self.fanout_cursors, topic_id) {
             warn!(%error, %topic_id, "Failed to clear document sync fan-out cursor");
+        }
+    }
+
+    /// Seal a topic before a departing holder scans its journal and outbox.
+    /// The result reports whether a journal entry still exists after sealing.
+    pub fn seal_topic(&self, topic_id: irokle_crate::TopicId) -> Result<bool> {
+        self.node
+            .seal_topic(topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.flush_database()?;
+        Ok(self
+            .node
+            .pending_evictions()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .into_iter()
+            .any(|eviction| eviction.topic_id == topic_id))
+    }
+
+    pub fn unseal_topic(&self, topic_id: irokle_crate::TopicId) -> Result<()> {
+        let removed = self
+            .node
+            .unseal_topic(topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        if removed {
+            self.flush_database()?;
+        }
+        Ok(())
+    }
+
+    /// Decodes an eviction Irokle already journalled with its reset and drops
+    /// the replaced chain's cursors. The journal remains until every replacement
+    /// outbox row is committed.
+    pub async fn consume_eviction(&self, eviction: TopicEviction) -> Option<PendingEviction> {
+        let topic_id = eviction.topic_id;
+        let key = eviction.key();
+        // Irokle journals nothing for an eviction with no payloads, so treating
+        // one as pending would arm the retry timer against a phantom entry.
+        let journalled = !eviction.evicted.is_empty();
+        let documents = self.decode_eviction(eviction);
+        self.reset_applied_cursor(topic_id).await;
+        if !journalled {
+            return None;
+        }
+        self.eviction_buckets.write().insert(
+            key,
+            Some(
+                documents
+                    .iter()
+                    .map(|document| document.placement)
+                    .collect(),
+            ),
+        );
+        Some(PendingEviction { key, documents })
+    }
+
+    /// Irokle journal entries left by an interrupted eviction handoff.
+    pub async fn pending_evictions(&self) -> Result<Vec<PendingEviction>> {
+        let evictions = self
+            .node
+            .pending_evictions()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let mut pending = Vec::with_capacity(evictions.len());
+        for eviction in evictions {
+            pending.extend(self.consume_eviction(eviction).await);
+        }
+        Ok(pending)
+    }
+
+    /// Releases a journal entry once every replacement outbox row is durable.
+    pub async fn clear_eviction(&self, key: irokle_crate::EvictionKey) -> Result<()> {
+        self.node
+            .clear_eviction(&key)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.eviction_buckets.write().remove(&key);
+        Ok(())
+    }
+
+    /// Whether a journalled eviction may still write replacement outbox rows for
+    /// `placement`. An entry recovered at open blocks every bucket until the
+    /// consumer decodes the buckets it actually targets.
+    pub fn eviction_pending(&self, placement: &PlacementRef) -> bool {
+        self.eviction_buckets
+            .read()
+            .values()
+            .any(|buckets| buckets.as_ref().is_none_or(|list| list.contains(placement)))
+    }
+
+    /// Drops the applied-ops cursor of a topic whose chain was replaced by a
+    /// genesis tie-break. The winning chain renumbers every actor sequence, so
+    /// a cursor from the losing chain silently skips the winner's first ops.
+    async fn reset_applied_cursor(&self, topic_id: irokle_crate::TopicId) {
+        let _reconcile_guard = self.reconcile_lock.lock().await;
+        debug!(%topic_id, "Resetting document sync applied-ops cursor after a genesis tie-break");
+        match self
+            .storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                key: topic_cursor_key(topic_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            other => {
+                warn!(%topic_id, ?other, "Failed to reset document sync applied-ops cursor");
+            }
         }
     }
 
@@ -1911,8 +2054,13 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))??;
         let r1_process = r1_process_started.elapsed();
         if responded_topics.len() != known_topics.len() {
+            let refused: Vec<String> = known_topics
+                .iter()
+                .filter(|topic| !responded_topics.contains(*topic))
+                .map(|topic| topic.to_string())
+                .collect();
             return Err(NetError::Bootstrap(format!(
-                "peer {peer} responded for {}/{} document sync batch topics",
+                "peer {peer} responded for {}/{} document sync batch topics (refused: {refused:?})",
                 responded_topics.len(),
                 known_topics.len()
             )));
@@ -1948,7 +2096,7 @@ impl DocumentSyncService {
         let net = self.net.clone();
         let data_known = known_topics.clone();
         let eviction_tx = self.eviction_tx.clone();
-        let (failed_topics, followup) = tokio::task::spawn_blocking(move || {
+        let (mut failed_topics, followup) = tokio::task::spawn_blocking(move || {
             process_batch_data_responses(
                 &node,
                 &net,
@@ -1974,6 +2122,15 @@ impl DocumentSyncService {
             for response in responses {
                 match response {
                     SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
+                    SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
+                        failed_topics.insert(failure.topic_id);
+                        warn!(
+                            %peer,
+                            topic_id = %failure.topic_id,
+                            code = ?failure.code,
+                            "Skipping document sync batch topic: peer rejected the sync ack"
+                        );
+                    }
                     other => {
                         return Err(NetError::Bootstrap(format!(
                             "unexpected document sync batch ack response from {peer}: {other:?}"
@@ -2188,7 +2345,10 @@ impl DocumentSyncService {
                     let (ack, evictions) = self
                         .node
                         .receive_sync_data_from_evicting(peer, data)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        .map_err(|error| {
+                            report_journal_full(topic_id, &error);
+                            NetError::Bootstrap(error.to_string())
+                        })?;
                     self.forward_evictions(evictions);
                     received_data = true;
                     followup.push(SyncMessage::Ack(ack));
@@ -2302,17 +2462,21 @@ impl DocumentSyncService {
             if topic.event_type_id != DocumentSyncEvent::TYPE_ID {
                 continue;
             }
+            // The cursor self-heals here: an eviction callback that was lost or
+            // failed cannot make a rebuilt chain's early ops look already
+            // applied, because every recorded position is re-checked.
+            let genesis = topic.genesis;
             let cursor_key = topic_cursor_key(topic_id);
-            let mut cursor: irokle_crate::ActorClock = match self
-                .storage_read(
+            let mut cursor = applied_cursor_clock(
+                self.node.storage(),
+                topic_id,
+                genesis,
+                self.storage_read(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key.clone(),
                 )
-                .await?
-            {
-                Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
-                None => irokle_crate::ActorClock::default(),
-            };
+                .await?,
+            )?;
             let batch =
                 self.document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?;
             if batch.cursor == cursor {
@@ -2325,12 +2489,25 @@ impl DocumentSyncService {
             let mut deferred_admin_events = Vec::new();
             let mut satisfied_admin_dependencies = BTreeSet::new();
             let mut cross_topic_dependencies = BTreeSet::new();
+            let mut config_run: Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)> = None;
+            let mut validation_cache = ConfigValidationCache::default();
             for (event, actor_id, actor_seq) in batch.events {
                 let identity = SyncQuarantineIdentity {
                     topic: topic_id,
                     actor: actor_id,
                     actor_seq,
                 };
+                // Any event outside the run must observe the run's state, so
+                // the buffer flushes before anything else applies.
+                let run_candidate = matches!(
+                    &event,
+                    DocumentSyncEvent::AdminOperation { target, event, .. }
+                        if matches!(target, DocumentSyncTarget::RealmConfig { .. })
+                            && coalescible_config_op(&event.op)
+                );
+                if !run_candidate {
+                    flush_config_run(&self.storage, &mut config_run, &mut validation_cache).await?;
+                }
                 if self
                     .shard_publishers
                     .read()
@@ -3056,6 +3233,7 @@ impl DocumentSyncService {
                             &event,
                             self.realm_id,
                             &placement,
+                            &mut validation_cache,
                         )
                         .await?
                         {
@@ -3096,12 +3274,28 @@ impl DocumentSyncService {
 
                         let dependencies =
                             satisfied_document_sync_dependencies(&target, event.as_ref());
-                        apply_admin_document_operation_to_storage(
-                            &self.storage,
-                            target.clone(),
-                            *event,
-                        )
-                        .await?;
+                        if matches!(target, DocumentSyncTarget::RealmConfig { .. })
+                            && coalescible_config_op(&event.op)
+                        {
+                            match &mut config_run {
+                                Some((run_target, events)) if *run_target == target => {
+                                    events.push(*event);
+                                }
+                                run => {
+                                    flush_config_run(&self.storage, run, &mut validation_cache)
+                                        .await?;
+                                    *run = Some((target.clone(), vec![*event]));
+                                }
+                            }
+                        } else {
+                            apply_admin_document_operation_to_storage(
+                                &self.storage,
+                                target.clone(),
+                                *event,
+                            )
+                            .await?;
+                            validation_cache.invalidate();
+                        }
                         satisfied_admin_dependencies.extend(dependencies);
                         applied_targets.push(target);
                     }
@@ -3127,6 +3321,7 @@ impl DocumentSyncService {
                     }
                 }
             }
+            flush_config_run(&self.storage, &mut config_run, &mut validation_cache).await?;
             let mut pending = deferred_admin_events;
             loop {
                 let mut progressed = false;
@@ -3140,6 +3335,7 @@ impl DocumentSyncService {
                         &event,
                         self.realm_id,
                         &placement,
+                        &mut validation_cache,
                     )
                     .await?
                     {
@@ -3152,6 +3348,7 @@ impl DocumentSyncService {
                                 event,
                             )
                             .await?;
+                            validation_cache.invalidate();
                             satisfied_admin_dependencies.extend(dependencies);
                             applied_targets.push(target);
                             progressed = true;
@@ -3225,10 +3422,7 @@ impl DocumentSyncService {
                 // unresolved topic is safe to mark as applied.
                 continue;
             }
-            let value = ByteView::from(
-                postcard::to_allocvec(&cursor)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-            );
+            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
             if deferred_creates {
                 deferred_rejections.append(&mut rejections);
                 deferred_cursor_writes.push((
@@ -4536,7 +4730,13 @@ fn overlay_realm_config_reducer_materialization(
         }
     }
 
-    overlay_realm_config_placement_reducer_materialization(config, reducer_state);
+    // The revocation clock is in seconds; the transition grace is in
+    // milliseconds, and a second of granularity is nothing against it.
+    overlay_realm_config_placement_reducer_materialization(
+        config,
+        reducer_state,
+        now.saturating_mul(1_000),
+    );
 }
 
 fn realm_config_from_reducer_materialization(
@@ -4568,6 +4768,9 @@ fn realm_config_from_reducer_materialization(
         placement_bindings: Vec::new(),
         placement_handle_ranges: Vec::new(),
         band_pools: Vec::new(),
+        candidate_maps: Vec::new(),
+        placement_activations: Vec::new(),
+        placement_transitions: Vec::new(),
         revoked_tokens: Vec::new(),
         revocation_floor: reducer_state.revocation_floor,
     };
@@ -5207,6 +5410,8 @@ fn metadata_document_delete_matches_registry(
         && delete.tombstone.document_id == document_id
 }
 
+const APPLY_CONFLICT_ATTEMPTS: usize = 64;
+
 async fn apply_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
@@ -5394,7 +5599,12 @@ async fn apply_user_admin_document_operation_to_storage(
         return storage_batch_delete_and_write_transactionally(storage, deletes, writes).await;
     }
 
-    for _ in 0..3 {
+    // A transient SSI conflict must never become stream-fatal: an aborted
+    // inbound apply leaves ops without meta and wedges the topic. Local
+    // interleavings are finite, so retry with yields; the bound stays a
+    // safety valve against a genuine livelock.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
         let txn_id = start_storage_transaction(storage).await?;
         let mut attempt_writes = writes.clone();
         let mut attempt_deletes = deletes.clone();
@@ -5480,7 +5690,7 @@ async fn apply_user_admin_document_operation_to_storage(
         }
     }
     Err(NetError::Dht(
-        "user subject claim apply conflicted three times".to_string(),
+        "user subject claim apply conflict retries exhausted".to_string(),
     ))
 }
 
@@ -5762,10 +5972,19 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
             | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
             | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+            | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
             | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, policy updates, and token revocations"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, and token revocations"
                 .to_string(),
         ));
     }
@@ -5783,7 +6002,12 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         ));
     }
 
-    for _ in 0..3 {
+    // A transient SSI conflict must never become stream-fatal: an aborted
+    // inbound apply leaves ops without meta and wedges the topic. Local
+    // interleavings are finite, so retry with yields; the bound stays a
+    // safety valve against a genuine livelock.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
         let raw_now = unix_timestamp_secs();
         let txn_id = start_storage_transaction(storage).await?;
         let previous_state = match storage_read_from_transaction(
@@ -6013,7 +6237,274 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         }
     }
     Err(NetError::Dht(
-        "realm config admin operation conflicted three times".to_string(),
+        "realm config admin operation conflict retries exhausted".to_string(),
+    ))
+}
+
+/// Realm-config ops the reducer stores as order-insensitive immutable values
+/// and whose validation no other such op can influence: a consecutive run of
+/// them may apply as one read-reduce-write cycle instead of one per event.
+fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
+    matches!(
+        op,
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+    )
+}
+
+/// Flushes a buffered run of coalescible realm-config events, if any, and
+/// drops the validation snapshot the applied events just outdated.
+async fn flush_config_run(
+    storage: &StorageHandle,
+    run: &mut Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)>,
+    validation_cache: &mut ConfigValidationCache,
+) -> Result<()> {
+    if let Some((target, events)) = run.take() {
+        apply_config_events(storage, target, events).await?;
+        validation_cache.invalidate();
+    }
+    Ok(())
+}
+
+/// Applies a run of coalescible realm-config events in one transaction. A
+/// realm-scale transition replicates hundreds of barrier and proof values;
+/// decoding and rewriting the reducer state per event is quadratic and stalls
+/// every later document behind the batch, so the run pays for state, document,
+/// materialization, and commit once.
+async fn apply_config_events(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    events: Vec<AdminDocumentEvent>,
+) -> Result<()> {
+    let DocumentSyncTarget::RealmConfig { realm_id } = document_target.clone() else {
+        return Err(NetError::Bootstrap(
+            "realm config admin operation sync only supports realm config targets".to_string(),
+        ));
+    };
+    for event in &events {
+        let AdminDocumentTarget::RealmConfig {
+            realm_id: event_realm_id,
+        } = event.target
+        else {
+            return Err(NetError::Bootstrap(
+                "admin document operation payload target is not a realm config".to_string(),
+            ));
+        };
+        if event_realm_id != realm_id {
+            return Err(NetError::Bootstrap(format!(
+                "replicated realm config admin operation target {realm_id} does not match payload realm id {event_realm_id}"
+            )));
+        }
+        if !coalescible_config_op(&event.op) {
+            return Err(NetError::Bootstrap(
+                "realm config event run only supports transition updates".to_string(),
+            ));
+        }
+        if event.origin_node_id != event.actor.node_id
+            || event.actor.realm_id != realm_id
+            || event.actor.user_id.realm_id != realm_id
+        {
+            return Err(NetError::Bootstrap(
+                "realm config event actor and origin do not match the target realm".to_string(),
+            ));
+        }
+    }
+    let Some(actor) = events.last().map(|event| event.actor.clone()) else {
+        return Ok(());
+    };
+
+    // A transient SSI conflict must never become stream-fatal: an aborted
+    // inbound apply leaves ops without meta and wedges the topic. Local
+    // interleavings are finite, so retry with yields; the bound stays a
+    // safety valve against a genuine livelock.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
+        let raw_now = unix_timestamp_secs();
+        let txn_id = start_storage_transaction(storage).await?;
+        let previous_state = match storage_read_from_transaction(
+            storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id }),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| decode_admin_document_reducer_state(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        let previous_config = match storage_read_from_transaction(
+            storage,
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => match value
+                .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+                .transpose()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            },
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+
+        let effective_now = previous_state
+            .as_ref()
+            .map_or(raw_now, |state| state.revocation_floor.max(raw_now));
+        let mut reducer_state = previous_state.clone().unwrap_or_else(|| {
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id })
+        });
+        for event in &events {
+            if let Err(error) = reducer_state.apply(event) {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        }
+        reducer_state.advance_revocation_floor(effective_now);
+        let needs_index = needs_revocation_index(
+            false,
+            previous_config.is_some(),
+            &reducer_state,
+            effective_now,
+        );
+        let mut revocation_index =
+            needs_index.then(|| reducer_state.revocation_index(effective_now));
+        if let Some(index) = revocation_index.as_mut() {
+            index.compact(&mut reducer_state);
+        }
+
+        let (config, config_changed) = match previous_config {
+            Some(mut config) => {
+                if config.realm_id != realm_id {
+                    return Err(
+                        abort_error(
+                            storage,
+                            txn_id,
+                            NetError::Bootstrap(format!(
+                                "stored realm config document id {realm_id} does not match payload realm id {}",
+                                config.realm_id
+                            )),
+                        )
+                        .await,
+                    );
+                }
+                let before = config.clone();
+                overlay_realm_config_reducer_materialization(
+                    &mut config,
+                    &reducer_state,
+                    effective_now,
+                    revocation_index.as_ref(),
+                );
+                let changed = config != before;
+                (Some(config), changed)
+            }
+            None => {
+                let config = realm_config_from_reducer_materialization(
+                    realm_id,
+                    &reducer_state,
+                    effective_now,
+                    revocation_index.as_ref(),
+                );
+                let changed = config.is_some();
+                (config, changed)
+            }
+        };
+        if previous_state
+            .as_ref()
+            .is_some_and(|previous| previous == &reducer_state)
+            && !config_changed
+        {
+            abort_txn(storage, txn_id).await?;
+            return Ok(());
+        }
+
+        let mut writes = Vec::new();
+        if config_changed && let Some(config) = config {
+            let bytes = match config.to_bytes(&actor) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.push((
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+                bytes.into(),
+            ));
+        }
+        let reducer_write = match admin_document_reducer_state_write_entry(&reducer_state) {
+            Ok(write) => write,
+            Err(error) => {
+                return Err(
+                    abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
+                );
+            }
+        };
+        writes.push(reducer_write);
+        if previous_state
+            .as_ref()
+            .is_none_or(|previous| previous.conflicts != reducer_state.conflicts)
+        {
+            let conflict_writes = match admin_document_conflict_write_entries(&reducer_state) {
+                Ok(writes) => writes,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            writes.extend(conflict_writes);
+        }
+
+        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
+            previous_state.as_ref(),
+            Some(&reducer_state),
+        );
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            stale_conflict_deletes,
+            writes,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                abort_txn(storage, txn_id).await?;
+            }
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+    }
+    Err(NetError::Dht(
+        "realm config admin operation conflict retries exhausted".to_string(),
     ))
 }
 
@@ -6688,7 +7179,6 @@ async fn derive_placement_txn(
     };
     let derived = PlacementRef {
         strategy_id: resolved.strategy_id,
-        epoch: 0,
         shard: u32::from(resolved.bucket.get()),
     };
     if resolved.document_class != DocumentClass::Metadata || !scope_matches || derived != placement
@@ -6893,18 +7383,39 @@ async fn storage_batch_delete_and_write_transactionally(
     deletes: Vec<(String, ByteView)>,
     writes: Vec<(String, ByteView, Value)>,
 ) -> Result<()> {
-    let txn_id = start_storage_transaction(storage).await?;
-
-    if let Err(error) =
-        storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
-    {
-        let _ = storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Err(error);
+    // Same conflict discipline as the realm-config applies: a transient SSI
+    // conflict must never abort inbound stream processing, or ops land
+    // without meta and the topic wedges.
+    let mut last = None;
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
+        let txn_id = start_storage_transaction(storage).await?;
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            deletes.clone(),
+            writes.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                last = Some(NetError::Dht(message));
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-
-    Ok(())
+    Err(last.unwrap_or_else(|| NetError::Dht("apply conflict retries exhausted".to_string())))
 }
 
 async fn storage_batch_delete_and_write_in_transaction(
@@ -7114,6 +7625,50 @@ enum AdminEventValidation {
     },
 }
 
+/// Per-batch snapshot of the realm-config document and reducer state that
+/// admin-event validation consults. Decoding both per event is quadratic over
+/// a transition batch; a buffered run applies nothing, so the snapshot holds
+/// until the caller applies events and invalidates it.
+#[derive(Default)]
+struct ConfigValidationCache {
+    entry: Option<(
+        RealmId,
+        Option<RealmConfigDocument>,
+        Option<AdminDocumentReducerState>,
+    )>,
+}
+
+impl ConfigValidationCache {
+    fn invalidate(&mut self) {
+        self.entry = None;
+    }
+
+    async fn load(
+        &mut self,
+        storage: &StorageHandle,
+        realm_id: RealmId,
+    ) -> Result<(
+        Option<&RealmConfigDocument>,
+        Option<&AdminDocumentReducerState>,
+    )> {
+        if self
+            .entry
+            .as_ref()
+            .is_none_or(|(cached, ..)| *cached != realm_id)
+        {
+            let config = read_admin_realm_config(storage, realm_id).await?;
+            let state =
+                read_admin_reducer_state(storage, &AdminDocumentTarget::RealmConfig { realm_id })
+                    .await?;
+            self.entry = Some((realm_id, config, state));
+        }
+        match &self.entry {
+            Some((_, config, state)) => Ok((config.as_ref(), state.as_ref())),
+            None => Ok((None, None)),
+        }
+    }
+}
+
 fn satisfied_document_sync_dependencies(
     target: &DocumentSyncTarget,
     event: &AdminDocumentEvent,
@@ -7201,6 +7756,7 @@ fn remove_deferred_topic(
     deferred_topics.retain(|_, topics| !topics.is_empty());
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn validate_replicated_admin_event(
     storage: &StorageHandle,
     topic_id: irokle_crate::TopicId,
@@ -7209,6 +7765,7 @@ async fn validate_replicated_admin_event(
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     placement: &PlacementRef,
+    config_cache: &mut ConfigValidationCache,
 ) -> Result<AdminEventValidation> {
     let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
 
@@ -7278,6 +7835,15 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
         | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
         | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+        | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+        | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+        | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+        | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+        | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+        | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
         | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
@@ -7396,7 +7962,78 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
         AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. } => {}
+        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+        | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+        | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. } => {}
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
+            let mut seen = std::collections::BTreeSet::new();
+            if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
+                return reject("candidate placement map is malformed");
+            }
+        }
+        AdminDocumentOperation::RealmConfigActivationsInitialized {
+            candidate_map_epoch,
+            ..
+        } => {
+            if *candidate_map_epoch == 0 {
+                return reject("activation names no candidate map epoch");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
+            let mut seen = std::collections::BTreeSet::new();
+            let well_formed = plan.limits.max_incomplete_buckets >= 1
+                && plan.target_map_epoch > 0
+                && !plan.buckets.is_empty()
+                && plan
+                    .buckets
+                    .iter()
+                    .all(|bucket| seen.insert(bucket.bucket) && !bucket.target_holders.is_empty());
+            if !well_formed {
+                return reject("placement transition plan is malformed");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            reported_by,
+            frontier,
+            ..
+        } => {
+            if *reported_by != event.origin_node_id {
+                return reject("transition report does not come from the node it names");
+            }
+            if frontier.len() > aruna_core::structs::MAX_BARRIER_FRONTIER_BYTES {
+                return reject("transition barrier frontier exceeds its size bound");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            reported_by,
+            reason,
+            ..
+        } => {
+            if *reported_by != event.origin_node_id {
+                return reject("transition report does not come from the node it names");
+            }
+            if reason.len() > aruna_core::structs::MAX_STALL_REASON_BYTES {
+                return reject("transition stall reason exceeds its size bound");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. } => {
+            if *reported_by != event.origin_node_id {
+                return reject("transition report does not come from the node it names");
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            strategy_id,
+            proof,
+        } => {
+            // Verified here as well as in the reducer: a forged proof must never
+            // reach storage, and the publisher binding already fixed the origin.
+            if proof.holder != event.origin_node_id
+                || !proof.verify(event.actor.realm_id, *transition_id, *strategy_id)
+            {
+                return reject("transition completion proof does not verify");
+            }
+        }
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             if let Some(label) = reserved_label(&entry.labels) {
                 return reject(&format!(
@@ -7434,23 +8071,43 @@ async fn validate_replicated_admin_event(
         }
     }
 
-    let previous_state = read_admin_reducer_state(storage, &event.target).await?;
-    let authorized = match family {
+    let previous_state = match family {
         AdminOperationFamily::RealmConfig => {
-            validate_realm_config_admin_authority(storage, event, previous_state.as_ref()).await?
+            let AdminDocumentTarget::RealmConfig {
+                realm_id: event_realm_id,
+            } = event.target
+            else {
+                return reject("admin event target is not a realm config");
+            };
+            let (current_config, cached_state) = config_cache.load(storage, event_realm_id).await?;
+            let authorized = validate_config_authority(current_config, event, cached_state)?;
+            if !matches!(authorized, AdminEventValidation::Accepted) {
+                return Ok(authorized);
+            }
+            cached_state.cloned()
         }
-        AdminOperationFamily::RealmAuthorization => {
-            validate_realm_authorization_admin_authority(storage, event, previous_state.as_ref())
-                .await?
-        }
-        AdminOperationFamily::Group => validate_group_admin_authority(storage, event).await?,
-        AdminOperationFamily::User => {
-            validate_user_admin_authority(storage, event, previous_state.as_ref()).await?
+        family => {
+            let previous_state = read_admin_reducer_state(storage, &event.target).await?;
+            let authorized = match family {
+                AdminOperationFamily::RealmAuthorization => {
+                    validate_realm_authorization_admin_authority(
+                        storage,
+                        event,
+                        previous_state.as_ref(),
+                    )
+                    .await?
+                }
+                AdminOperationFamily::Group => {
+                    validate_group_admin_authority(storage, event).await?
+                }
+                _ => validate_user_admin_authority(storage, event, previous_state.as_ref()).await?,
+            };
+            if !matches!(authorized, AdminEventValidation::Accepted) {
+                return Ok(authorized);
+            }
+            previous_state
         }
     };
-    if !matches!(authorized, AdminEventValidation::Accepted) {
-        return Ok(authorized);
-    }
 
     if previous_state
         .as_ref()
@@ -7581,8 +8238,97 @@ fn configured_node_kind<'a>(
         .map(|node| &node.kind)
 }
 
-async fn validate_realm_config_admin_authority(
-    storage: &StorageHandle,
+/// Who a transition report claims to be, against the named plan's roles.
+enum ReportParticipation {
+    NotReport,
+    Participant,
+    UnknownPlan,
+    Foreign,
+}
+
+/// Resolves the plan a report names (stored config first, reduced state as
+/// the fallback) and checks the reporter holds the role the report claims:
+/// barriers from old holders, proofs from targets, stalls from the union.
+fn report_participation(
+    op: &AdminDocumentOperation,
+    current_config: Option<&RealmConfigDocument>,
+    previous_state: Option<&AdminDocumentReducerState>,
+) -> ReportParticipation {
+    enum Role {
+        Old,
+        Target,
+        Union,
+        Departing,
+    }
+    let (transition_id, bucket, reporter, role) = match op {
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => (*transition_id, *bucket, *reported_by, Role::Old),
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            proof,
+            ..
+        } => (*transition_id, proof.bucket, proof.holder, Role::Target),
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            transition_id,
+            bucket,
+            reported_by,
+            ..
+        } => (*transition_id, *bucket, *reported_by, Role::Union),
+        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+            transition_id,
+            bucket,
+            reported_by,
+        } => (*transition_id, *bucket, *reported_by, Role::Departing),
+        _ => return ReportParticipation::NotReport,
+    };
+    let from_config = current_config.and_then(|config| {
+        config
+            .placement_transitions
+            .iter()
+            .find(|transition| transition.plan.transition_id == transition_id)
+            .map(|transition| transition.plan.clone())
+    });
+    let plan = match from_config {
+        Some(plan) => plan,
+        None => {
+            let Some(plan) = previous_state
+                .map(|state| state.materialized_transition_plans())
+                .unwrap_or_default()
+                .remove(&transition_id)
+            else {
+                return ReportParticipation::UnknownPlan;
+            };
+            plan
+        }
+    };
+    let Some(bucket_plan) = plan.bucket_plan(bucket) else {
+        return ReportParticipation::Foreign;
+    };
+    let allowed = match role {
+        Role::Old => bucket_plan.old_holders.contains(&reporter),
+        Role::Target => bucket_plan.target_holders.contains(&reporter),
+        Role::Union => {
+            bucket_plan.old_holders.contains(&reporter)
+                || bucket_plan.target_holders.contains(&reporter)
+        }
+        Role::Departing => {
+            bucket_plan.old_holders.contains(&reporter)
+                && !bucket_plan.target_holders.contains(&reporter)
+        }
+    };
+    if allowed {
+        ReportParticipation::Participant
+    } else {
+        ReportParticipation::Foreign
+    }
+}
+
+fn validate_config_authority(
+    current_config: Option<&RealmConfigDocument>,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentReducerState>,
 ) -> Result<AdminEventValidation> {
@@ -7591,20 +8337,35 @@ async fn validate_realm_config_admin_authority(
             "admin event target is not a realm config".to_string(),
         ));
     };
-    let current_config = read_admin_realm_config(storage, realm_id).await?;
-    if current_config
-        .as_ref()
-        .is_some_and(|config| config.realm_id != realm_id)
-    {
+    if current_config.is_some_and(|config| config.realm_id != realm_id) {
         return Ok(AdminEventValidation::Rejected(
             "stored realm config has the wrong realm".to_string(),
         ));
+    }
+    // Reports are gated on participation whatever the origin's kind: a plan
+    // names its finite holder sets, so nothing outside them may grow state.
+    match report_participation(&event.op, current_config, previous_state) {
+        ReportParticipation::NotReport | ReportParticipation::Participant => {}
+        ReportParticipation::UnknownPlan => {
+            // Same-topic retry only. A participant can report only after
+            // observing the plan, so a plan absent after the buffered run
+            // flushes has no causal evidence and must not park the cursor.
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "transition plan is not yet materialized".to_string(),
+            });
+        }
+        ReportParticipation::Foreign => {
+            return Ok(AdminEventValidation::Rejected(
+                "transition report does not come from a planned participant".to_string(),
+            ));
+        }
     }
     if matches!(
         &event.op,
         AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
-        if !revocation_origin_known(current_config.as_ref(), previous_state, event, realm_id) {
+        if !revocation_origin_known(current_config, previous_state, event, realm_id) {
             return Ok(AdminEventValidation::Deferred {
                 dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
                 reason: if current_config.is_some() {
@@ -7617,16 +8378,28 @@ async fn validate_realm_config_admin_authority(
         }
         return Ok(AdminEventValidation::Accepted);
     }
-    // Placement reducer state precedes full config materialization at bootstrap.
-    let mut placement_config = current_config
-        .clone()
-        .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
-    if let Some(state) = previous_state {
-        overlay_realm_config_placement_reducer_materialization(&mut placement_config, state);
-    }
+    // Placement reducer state precedes full config materialization at
+    // bootstrap. Only band and handle checks consult it, so the full-state
+    // overlay is not paid for the other, far more frequent operations.
+    let placement_config = matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+    )
+    .then(|| {
+        let mut placement_config = current_config
+            .cloned()
+            .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
+        if let Some(state) = previous_state {
+            overlay_realm_config_placement_reducer_materialization(&mut placement_config, state, 0);
+        }
+        placement_config
+    });
     // Band pools form a causal delegation tree; reject a forged or
     // non-owning issuer, and defer a child until its parent replicates.
-    if let AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } = &event.op {
+    if let (AdminDocumentOperation::RealmConfigBandPoolAssigned { pool }, Some(placement_config)) =
+        (&event.op, placement_config.as_ref())
+    {
         match admit_band_pool(&placement_config.band_pools, pool, &event.origin_node_id) {
             PoolAdmission::Reject => {
                 return Ok(AdminEventValidation::Rejected(
@@ -7642,7 +8415,11 @@ async fn validate_realm_config_admin_authority(
             PoolAdmission::Accept => {}
         }
     }
-    if let AdminDocumentOperation::RealmConfigHandleRangeGranted { range } = &event.op {
+    if let (
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+        Some(placement_config),
+    ) = (&event.op, placement_config.as_ref())
+    {
         let canonical = range.len() == HANDLE_RANGE_SIZE
             && range
                 .start
@@ -7670,7 +8447,7 @@ async fn validate_realm_config_admin_authority(
             ));
         }
     }
-    if let Some(config) = current_config.as_ref() {
+    if let Some(config) = current_config {
         let server_binding = match (
             configured_node_kind(config, &event.origin_node_id),
             &event.op,
@@ -7684,6 +8461,19 @@ async fn validate_realm_config_admin_authority(
             }
             _ => false,
         };
+        // D9: every holder acts. A barrier, proof, or stall names its own origin
+        // and moves no authority on its own, so a holder may emit it.
+        let self_report = matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported { reported_by, .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { reported_by, .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. }
+                if *reported_by == event.origin_node_id
+        ) || matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigTransitionProofSubmitted { proof, .. }
+                if proof.holder == event.origin_node_id
+        );
         if matches!(
             configured_node_kind(config, &event.origin_node_id),
             Some(RealmNodeKind::Management)
@@ -7704,6 +8494,7 @@ async fn validate_realm_config_admin_authority(
                 configured_node_kind(config, &event.origin_node_id),
                 Some(RealmNodeKind::Management)
             ) || server_binding
+                || (self_report && configured_node_kind(config, &event.origin_node_id).is_some())
             {
                 AdminEventValidation::Accepted
             } else {
@@ -8256,43 +9047,121 @@ fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     ByteView::from(key)
 }
 
+/// An applied-ops cursor together with the history it describes: the genesis it
+/// was built from, and the op that occupied each actor position when it was
+/// written. A genesis tie-break replaces the chain and an orphan quarantine
+/// rebuilds it in place under the same genesis, but both renumber actor
+/// sequences, so the position alone is never evidence that its op still stands.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct AppliedCursor {
+    lineage: irokle_crate::OpId,
+    clock: irokle_crate::ActorClock,
+    marks: BTreeMap<irokle_crate::ActorId, irokle_crate::OpId>,
+}
+
+/// Decodes a stored cursor, discarding one written under another genesis, one
+/// whose recorded ops no longer occupy their positions, and one in an
+/// unreadable shape. A discarded cursor restarts replay at actor sequence one.
+fn applied_cursor_clock(
+    storage: &impl irokle_crate::storage::Storage,
+    topic_id: irokle_crate::TopicId,
+    genesis: irokle_crate::OpId,
+    stored: Option<Value>,
+) -> Result<irokle_crate::ActorClock> {
+    let Some(cursor) = stored
+        .and_then(|value| postcard::from_bytes::<AppliedCursor>(value.as_ref()).ok())
+        .filter(|cursor| cursor.lineage == genesis)
+    else {
+        return Ok(irokle_crate::ActorClock::default());
+    };
+    for (actor_id, actor_seq) in cursor.clock.iter() {
+        if *actor_seq == 0 {
+            continue;
+        }
+        let current = storage
+            .actor_index(&topic_id, actor_id, *actor_seq)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        if current.is_none() || current.as_ref() != cursor.marks.get(actor_id) {
+            debug!(%topic_id, %actor_id, "Discarding a document sync cursor whose history was rebuilt");
+            return Ok(irokle_crate::ActorClock::default());
+        }
+    }
+    Ok(cursor.clock)
+}
+
+/// Encodes a cursor with the ops that currently occupy its positions. A position
+/// with no op is left unmarked, which the read side treats as untrusted.
+fn applied_cursor_value(
+    storage: &impl irokle_crate::storage::Storage,
+    topic_id: irokle_crate::TopicId,
+    genesis: irokle_crate::OpId,
+    clock: &irokle_crate::ActorClock,
+) -> Result<ByteView> {
+    let mut marks = BTreeMap::new();
+    for (actor_id, actor_seq) in clock.iter() {
+        if *actor_seq == 0 {
+            continue;
+        }
+        if let Some(op_id) = storage
+            .actor_index(&topic_id, actor_id, *actor_seq)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        {
+            marks.insert(*actor_id, op_id);
+        }
+    }
+    postcard::to_allocvec(&AppliedCursor {
+        lineage: genesis,
+        clock: clock.clone(),
+        marks,
+    })
+    .map(ByteView::from)
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
+}
+
+const FANOUT_CURSOR_LEN: usize = irokle_crate::OpId::LEN + std::mem::size_of::<u64>();
+
+fn fanout_cursor_value(genesis: irokle_crate::OpId, round: u64) -> [u8; FANOUT_CURSOR_LEN] {
+    let mut value = [0u8; FANOUT_CURSOR_LEN];
+    value[..irokle_crate::OpId::LEN].copy_from_slice(genesis.as_bytes());
+    value[irokle_crate::OpId::LEN..].copy_from_slice(&round.to_be_bytes());
+    value
+}
+
+fn fanout_cursor_round(value: &[u8], genesis: irokle_crate::OpId) -> Option<u64> {
+    let (lineage, round) = value.split_at_checked(irokle_crate::OpId::LEN)?;
+    if lineage != genesis.as_bytes() {
+        return None;
+    }
+    Some(u64::from_be_bytes(round.try_into().ok()?))
+}
+
 fn current_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
+    genesis: irokle_crate::OpId,
 ) -> Result<u64> {
-    let Some(value) = cursors
+    Ok(cursors
         .get(topic_cursor_key(topic_id))
         .map_err(|error| NetError::Bootstrap(error.to_string()))?
-    else {
-        return Ok(0);
-    };
-    if value.len() != std::mem::size_of::<u64>() {
-        return Ok(0);
-    }
-    let mut bytes = [0u8; std::mem::size_of::<u64>()];
-    bytes.copy_from_slice(value.as_ref());
-    Ok(u64::from_be_bytes(bytes))
+        .and_then(|value| fanout_cursor_round(value.as_ref(), genesis))
+        .unwrap_or_default())
 }
 
 fn advance_cursor(
     cursors: &fjall::OptimisticTxKeyspace,
     topic_id: irokle_crate::TopicId,
+    genesis: irokle_crate::OpId,
     round: u64,
 ) -> Result<()> {
     cursors
         .update_fetch(topic_cursor_key(topic_id), |value| {
-            let stored = value
-                .filter(|value| value.len() == std::mem::size_of::<u64>())
-                .map(|value| {
-                    let mut bytes = [0u8; std::mem::size_of::<u64>()];
-                    bytes.copy_from_slice(value.as_ref());
-                    u64::from_be_bytes(bytes)
-                })
-                .unwrap_or_default();
-            if stored == round {
-                Some(fjall::Slice::from(round.wrapping_add(1).to_be_bytes()))
-            } else {
-                value.cloned()
+            // A cursor from a replaced genesis reads as no round at all, so the
+            // first advance after a tie-break rebinds it to the new lineage.
+            match value.and_then(|value| fanout_cursor_round(value.as_ref(), genesis)) {
+                Some(stored) if stored != round => value.cloned(),
+                _ => Some(fjall::Slice::from(
+                    fanout_cursor_value(genesis, round.wrapping_add(1)).as_slice(),
+                )),
             }
         })
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -8452,6 +9321,19 @@ fn process_batch_summary_responses(
     let mut sync_messages = Vec::new();
     for response in responses {
         match response {
+            // An explicit terminal failure still counts as a response: the peer
+            // answered for this topic, so only this topic stays dirty and the
+            // rest of the batch keeps its summaries, data and acks.
+            SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
+                responded_topics.insert(failure.topic_id);
+                failed_topics.insert(failure.topic_id);
+                warn!(
+                    %peer,
+                    topic_id = %failure.topic_id,
+                    code = ?failure.code,
+                    "Skipping document sync batch topic: peer reported a sync failure"
+                );
+            }
             SyncMessage::Fingerprint(remote) if known_topics.contains(&remote.topic_id) => {
                 responded_topics.insert(remote.topic_id);
                 if local_fingerprints.get(&remote.topic_id) != Some(&remote.fingerprint) {
@@ -8519,6 +9401,18 @@ fn process_batch_summary_responses(
     Ok((responded_topics, failed_topics, sync_messages))
 }
 
+/// Names the bounded-journal refusal. Past Irokle's cap on unreleased records
+/// every genesis tie-break reset is refused, which otherwise reaches operators
+/// only as an opaque admission failure.
+fn report_journal_full(topic_id: irokle_crate::TopicId, error: &irokle_crate::Error) {
+    if matches!(error, irokle_crate::Error::EvictionJournalFull) {
+        error!(
+            %topic_id,
+            "Eviction journal is full; genesis tie-break resets stay refused until the eviction consumer drains it"
+        );
+    }
+}
+
 fn forward_evictions_to(
     sink: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     evictions: Vec<TopicEviction>,
@@ -8548,6 +9442,15 @@ fn process_batch_data_responses(
             {
                 acks.push(ack);
             }
+            SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
+                failed_topics.insert(failure.topic_id);
+                warn!(
+                    %peer,
+                    topic_id = %failure.topic_id,
+                    code = ?failure.code,
+                    "Skipping document sync batch topic: peer reported a sync failure"
+                );
+            }
             SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
             SyncMessage::Data(data) if known_topics.contains(&data.topic_id) => {
                 let topic_id = data.topic_id;
@@ -8557,6 +9460,7 @@ fn process_batch_data_responses(
                         ack
                     }
                     Err(error) => {
+                        report_journal_full(topic_id, &error);
                         warn!(
                             %peer,
                             topic_id = %topic_id,
@@ -8650,6 +9554,7 @@ fn sync_message_topic_id(message: &SyncMessage) -> irokle_crate::TopicId {
         SyncMessage::Request(request) => request.topic_id,
         SyncMessage::Data(data) => data.topic_id,
         SyncMessage::Ack(ack) => ack.topic_id,
+        SyncMessage::Failure(failure) => failure.topic_id,
     }
 }
 
@@ -8841,8 +9746,11 @@ mod tests {
                     fjall::KeyspaceCreateOptions::default,
                 )
                 .expect("fanout cursor keyspace");
-            assert_eq!(current_cursor(&cursors, topic_id).expect("first cursor"), 0);
-            advance_cursor(&cursors, topic_id, 0).expect("advance cursor");
+            assert_eq!(
+                current_cursor(&cursors, topic_id, test_genesis(1)).expect("first cursor"),
+                0
+            );
+            advance_cursor(&cursors, topic_id, test_genesis(1), 0).expect("advance cursor");
             db.persist(fjall::PersistMode::SyncAll)
                 .expect("persist fanout cursor");
         }
@@ -8857,7 +9765,18 @@ mod tests {
             )
             .expect("reopen fanout cursor keyspace");
         assert_eq!(
-            current_cursor(&cursors, topic_id).expect("restarted cursor"),
+            current_cursor(&cursors, topic_id, test_genesis(1)).expect("restarted cursor"),
+            1
+        );
+        // A replaced genesis must restart peer selection instead of inheriting
+        // the losing chain's rotation.
+        assert_eq!(
+            current_cursor(&cursors, topic_id, test_genesis(2)).expect("replaced cursor"),
+            0
+        );
+        advance_cursor(&cursors, topic_id, test_genesis(2), 0).expect("rebind cursor");
+        assert_eq!(
+            current_cursor(&cursors, topic_id, test_genesis(2)).expect("rebound cursor"),
             1
         );
     }
@@ -8881,7 +9800,7 @@ mod tests {
                     fjall::KeyspaceCreateOptions::default,
                 )
                 .expect("fanout cursor clear keyspace");
-            advance_cursor(&cursors, topic_id, 0).expect("create fanout cursor");
+            advance_cursor(&cursors, topic_id, test_genesis(3), 0).expect("create fanout cursor");
             assert!(
                 cursors
                     .contains_key(topic_cursor_key(topic_id))
@@ -9240,6 +10159,10 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
+    fn test_genesis(seed: u8) -> irokle_crate::OpId {
+        irokle_crate::OpId::from_bytes([seed; 32])
+    }
+
     fn test_storage() -> (TempDir, StorageHandle) {
         let dir = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("temp path"))
@@ -9265,7 +10188,6 @@ mod tests {
     fn restart_placement() -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_parts(99, 7),
-            epoch: 0,
             shard: 11,
         }
     }
@@ -9410,6 +10332,40 @@ mod tests {
         }
     }
 
+    /// Drops a topic's applied-ops cursor so the next reconcile replays it from
+    /// the start, whatever lineage the stored cursor carried.
+    async fn reset_test_cursor(service: &DocumentSyncService, topic_id: irokle_crate::TopicId) {
+        match service
+            .storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                key: topic_cursor_key(topic_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            other => panic!("unexpected cursor delete event: {other:?}"),
+        }
+    }
+
+    async fn read_test_cursor(
+        storage: &StorageHandle,
+        topic_id: irokle_crate::TopicId,
+    ) -> Option<irokle_crate::ActorClock> {
+        let bytes = read_storage_value(
+            storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await?;
+        Some(
+            postcard::from_bytes::<AppliedCursor>(&bytes)
+                .expect("cursor decodes")
+                .clock,
+        )
+    }
+
     fn test_actor(seed: u8, user_id: UserId, realm_id: RealmId) -> Actor {
         Actor {
             node_id: node(seed),
@@ -9443,7 +10399,6 @@ mod tests {
     fn admin_test_placement() -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_parts(9_990, 1),
-            epoch: 0,
             shard: 0,
         }
     }
@@ -9464,6 +10419,127 @@ mod tests {
             actor: actor.clone(),
             op,
         }
+    }
+
+    #[test]
+    fn outsider_reports_rejected() {
+        // A configured User node's barrier, an unrelated server's proof, and
+        // an unknown-transition stall never enter replicated state; the
+        // participant's own report is accepted.
+        let realm_id = RealmId::from_bytes([61u8; 32]);
+        let strategy_id = Ulid::from_parts(1_700, 1);
+        let transition_id = Ulid::from_parts(1_701, 1);
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        for (seed, kind) in [
+            (1u8, RealmNodeKind::Server),
+            (2, RealmNodeKind::Server),
+            (3, RealmNodeKind::User),
+            (4, RealmNodeKind::Server),
+        ] {
+            config.ensure_node(node(seed), kind);
+        }
+        config
+            .placement_transitions
+            .push(aruna_core::structs::PlacementTransition::new(
+                aruna_core::structs::TransitionPlan {
+                    transition_id,
+                    strategy_id,
+                    buckets: vec![aruna_core::structs::BucketPlan {
+                        bucket: 0,
+                        old_holders: vec![node(1)],
+                        target_holders: vec![node(2)],
+                        predecessor_epoch: 1,
+                    }],
+                    target_map_epoch: 2,
+                    limits: Default::default(),
+                    created_by: node(1),
+                    created_at_ms: 1,
+                },
+            ));
+        let barrier = |seed: u8| {
+            let actor = test_actor(seed, UserId::nil(realm_id), realm_id);
+            test_admin_event(
+                Ulid::from_parts(1_702, seed as u128),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    transition_id,
+                    bucket: 0,
+                    reported_by: node(seed),
+                    frontier: vec![seed],
+                },
+            )
+        };
+
+        let rejected = |event: &AdminDocumentEvent| {
+            matches!(
+                validate_config_authority(Some(&config), event, None),
+                Ok(AdminEventValidation::Rejected(_))
+            )
+        };
+        assert!(rejected(&barrier(3)), "a User node is never a participant");
+        assert!(rejected(&barrier(4)), "an unrelated server is rejected");
+        assert!(
+            matches!(
+                validate_config_authority(Some(&config), &barrier(1), None),
+                Ok(AdminEventValidation::Accepted)
+            ),
+            "the planned old holder's own barrier is accepted"
+        );
+
+        // A proof from a non-target is rejected before any signature check.
+        let foreign_proof = {
+            let actor = test_actor(4, UserId::nil(realm_id), realm_id);
+            let claim = aruna_core::structs::ProofClaim {
+                realm_id,
+                transition_id,
+                strategy_id,
+                bucket: 0,
+                old_activation_epoch: 1,
+                target_map_epoch: 2,
+                barrier_digest: [0; 32],
+                checkpoint_root: [0; 32],
+                holder: node(4),
+            };
+            test_admin_event(
+                Ulid::from_parts(1_703, 1),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    transition_id,
+                    strategy_id,
+                    proof: claim.sign(&iroh::SecretKey::from_bytes(&[4; 32])),
+                },
+            )
+        };
+        assert!(rejected(&foreign_proof));
+
+        // A report naming an unknown transition defers on the same topic only:
+        // a cross-topic dependency would park realm-config replay forever.
+        let unknown = {
+            let actor = test_actor(1, UserId::nil(realm_id), realm_id);
+            test_admin_event(
+                Ulid::from_parts(1_704, 1),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                3,
+                AdminDocumentOperation::RealmConfigTransitionStallReported {
+                    transition_id: Ulid::from_parts(1_705, 1),
+                    bucket: 0,
+                    reported_by: node(1),
+                    reason: "sources unreachable".to_string(),
+                },
+            )
+        };
+        assert!(matches!(
+            validate_config_authority(Some(&config), &unknown, None),
+            Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                ..
+            })
+        ));
     }
 
     async fn apply_conflicting_user_name_and_attribute(
@@ -10503,6 +11579,7 @@ mod tests {
                 &event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("validation runs"),
@@ -10531,6 +11608,7 @@ mod tests {
                 &event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("unonboarded origin validation runs"),
@@ -10564,6 +11642,7 @@ mod tests {
                 &long_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("long expiry validation runs"),
@@ -10603,6 +11682,7 @@ mod tests {
                 &user_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("onboarded user origin validation runs"),
@@ -10693,6 +11773,7 @@ mod tests {
                 &flood_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("flood validation runs"),
@@ -10720,6 +11801,7 @@ mod tests {
                 &neighbour_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("neighbour validation runs"),
@@ -12115,6 +13197,7 @@ mod tests {
             &event,
             realm_id,
             &placement,
+            &mut ConfigValidationCache::default(),
         )
         .await
         .expect("validation runs");
@@ -13692,6 +14775,64 @@ mod tests {
         assert!(message.contains("offline peer"));
     }
 
+    fn batch_test_node(seed: u8) -> (TempDir, irokle_crate::Irokle<irokle_crate::FjallStorage>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .expect("fjall database opens");
+        let node = irokle_crate::Irokle::builder()
+            .with_iroh_secret_key(&iroh::SecretKey::from_bytes(&[seed; 32]))
+            .with_fjall_database_and_persist_mode(db, fjall::PersistMode::Buffer)
+            .expect("fjall storage")
+            .build()
+            .expect("irokle node builds");
+        (dir, node)
+    }
+
+    #[test]
+    fn batch_failure_marks_only_its_topic() {
+        // A per-topic failure frame must not abort the batch: the topics after
+        // it in the same response still get negotiated.
+        let (_dir, node) = batch_test_node(21);
+        let known_topics = BTreeSet::from([topic(1), topic(2)]);
+        let local_fingerprints = BTreeMap::from([(topic(2), [0; 32])]);
+        let responses = vec![
+            SyncMessage::Failure(irokle_crate::sync::SyncFailure {
+                topic_id: topic(1),
+                code: irokle_crate::sync::SyncFailureCode::Fingerprint,
+            }),
+            SyncMessage::Fingerprint(irokle_crate::sync::SyncFingerprint {
+                topic_id: topic(2),
+                fingerprint: [0; 32],
+            }),
+        ];
+
+        let (responded, failed, _messages) = process_batch_summary_responses(
+            &node,
+            peer(9),
+            &known_topics,
+            &local_fingerprints,
+            responses,
+        )
+        .expect("a per-topic failure must not fail the whole batch");
+
+        assert_eq!(responded, known_topics);
+        assert_eq!(failed, BTreeSet::from([topic(1)]));
+    }
+
+    #[test]
+    fn batch_failure_for_unknown_topic_errors() {
+        let (_dir, node) = batch_test_node(22);
+        let known_topics = BTreeSet::from([topic(1)]);
+        let responses = vec![SyncMessage::Failure(irokle_crate::sync::SyncFailure {
+            topic_id: topic(7),
+            code: irokle_crate::sync::SyncFailureCode::Open,
+        })];
+
+        process_batch_summary_responses(&node, peer(9), &known_topics, &BTreeMap::new(), responses)
+            .expect_err("a failure for an unrequested topic indicts the peer");
+    }
+
     #[test]
     fn finish_batch_sync_fails_when_any_known_topic_failed() {
         let known_topics = BTreeSet::from([topic(3), topic(4)]);
@@ -13814,7 +14955,6 @@ mod tests {
         });
         let placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let document_id = MetaResourceId::from_parts(
@@ -13942,7 +15082,6 @@ mod tests {
         );
         record.placement = PlacementRef {
             strategy_id: Ulid::from_parts(2_103, 1),
-            epoch: 0,
             shard: 1,
         };
         let mut config = RealmConfigDocument::default_for_realm(record.realm_id, Vec::new());
@@ -14000,7 +15139,6 @@ mod tests {
         config.seed_default_placement();
         let placement = PlacementRef {
             strategy_id: config.default_strategy_id.unwrap(),
-            epoch: 0,
             shard: 4,
         };
         let document_id = MetaResourceId::from_parts(
@@ -14112,12 +15250,10 @@ mod tests {
         assert!(config.strategy(&strategy_id).is_none());
         let registry_placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let create_placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 5,
         };
         let registry_group_id = Ulid::from_parts(2_122, 1);
@@ -14216,16 +15352,7 @@ mod tests {
                 irokle_crate::ActorClock::default(),
                 "metadata topic must contain its published event"
             );
-            service
-                .storage_write(
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                    topic_cursor_key(topic_id),
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes")
-                        .into(),
-                )
-                .await
-                .expect("metadata cursor resets");
+            reset_test_cursor(&service, topic_id).await;
         }
 
         let dependency = DocumentSyncDependency::PlacementStrategy {
@@ -14308,16 +15435,9 @@ mod tests {
             "expected full {dependency:?}; topics registered under {registered_dependencies:?}"
         );
         for topic_id in [registry_topic, create_topic] {
-            let cursor: irokle_crate::ActorClock = postcard::from_bytes(
-                &read_storage_value(
-                    &storage,
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                    topic_cursor_key(topic_id),
-                )
+            let cursor = read_test_cursor(&storage, topic_id)
                 .await
-                .expect("deferred cursor remains stored"),
-            )
-            .expect("cursor decodes");
+                .unwrap_or_default();
             assert_eq!(
                 cursor,
                 irokle_crate::ActorClock::default(),
@@ -14398,7 +15518,6 @@ mod tests {
         };
         let placement = PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let group_id = Ulid::from_parts(2_112, 1);
@@ -14489,16 +15608,7 @@ mod tests {
             matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
             "metadata publish failed: {published:?}"
         );
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(metadata_topic),
-                postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                    .expect("clock serializes")
-                    .into(),
-            )
-            .await
-            .expect("metadata cursor resets");
+        reset_test_cursor(&service, metadata_topic).await;
 
         let deferred = service
             .reconcile_document_topics([metadata_topic])
@@ -14523,16 +15633,9 @@ mod tests {
             .await
             .is_none()
         );
-        let deferred_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
+        let deferred_cursor = read_test_cursor(&storage, metadata_topic)
             .await
-            .expect("deferred cursor remains stored"),
-        )
-        .expect("cursor decodes");
+            .unwrap_or_default();
         let metadata_clock = service
             .node()
             .storage()
@@ -14585,16 +15688,7 @@ mod tests {
             matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
             "strategy publish failed: {published:?}"
         );
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(config_topic),
-                postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                    .expect("clock serializes")
-                    .into(),
-            )
-            .await
-            .expect("config cursor resets");
+        reset_test_cursor(&service, config_topic).await;
 
         let applied = service
             .reconcile_document_topics([config_topic])
@@ -14628,16 +15722,9 @@ mod tests {
                 .expect("create acceptance decodes"),
             create
         );
-        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
+        let applied_cursor = read_test_cursor(&storage, metadata_topic)
             .await
-            .expect("applied cursor is stored"),
-        )
-        .expect("cursor decodes");
+            .unwrap_or_default();
         assert!(!applied_cursor.dominates(&metadata_clock));
         let replayed = service
             .reconcile_document_topics([metadata_topic])
@@ -14645,16 +15732,9 @@ mod tests {
             .expect("metadata update reconciles");
         assert!(replayed.targets.contains(&update_target));
         assert!(replayed.metadata_create_events.contains(&update));
-        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
+        let applied_cursor = read_test_cursor(&storage, metadata_topic)
             .await
-            .expect("replayed cursor is stored"),
-        )
-        .expect("cursor decodes");
+            .expect("replayed cursor is stored");
         assert!(applied_cursor.dominates(&metadata_clock));
         let acceptance = read_storage_value(
             &storage,
@@ -14705,16 +15785,7 @@ mod tests {
             postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
             create
         );
-        let cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(metadata_topic),
-            )
-            .await
-            .unwrap(),
-        )
-        .unwrap();
+        let cursor = read_test_cursor(&storage, metadata_topic).await.unwrap();
         assert!(
             cursor.dominates(
                 &service
@@ -15038,7 +16109,6 @@ mod tests {
         };
         let placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(4, 4),
-            epoch: 7,
             shard: 3,
         };
         let change = aruna_core::storage_entries::metadata_document_lifecycle_revision_change(
@@ -15166,7 +16236,6 @@ mod tests {
         mismatched.record.last_event_id = mismatched.event_id;
         mismatched.record.placement = PlacementRef {
             strategy_id: Ulid::from_parts(17, 1),
-            epoch: 1,
             shard: 1,
         };
         mismatched.payload = MetadataCreateEventPayload::ReplaceRoCrate {
@@ -15254,7 +16323,6 @@ mod tests {
         let mut local_change = metadata_lifecycle_change(&local_delete, node(8));
         local_change.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(25, 1),
-            epoch: 9,
             shard: 5,
         };
         assert!(
@@ -15537,7 +16605,6 @@ mod tests {
         let admin_target = AdminDocumentTarget::User { user_id };
         let placement = PlacementRef {
             strategy_id: Ulid::from_parts(71, 7),
-            epoch: 0,
             shard: 1,
         };
         let topic_id = target.sync_topic_id(realm_id, &placement);
@@ -15704,22 +16771,53 @@ mod tests {
             winner_genesis
         );
 
+        // The loser published, so its applied-ops cursor covers the chain the
+        // tie-break just replaced.
+        assert!(
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .is_some(),
+            "the publish left an applied-ops cursor to invalidate"
+        );
+
         // The evicted admin event re-emits with its original event id and
         // placement preserved, and allow_genesis cleared.
-        let reemitted = loser.decode_eviction(evictions.into_iter().next().unwrap());
-        assert_eq!(reemitted.len(), 1);
-        let reemitted = &reemitted[0];
-        assert_eq!(&reemitted.target, &target);
+        let reemitted = loser
+            .consume_eviction(evictions.into_iter().next().unwrap())
+            .await;
+
+        // The winning chain renumbers every actor sequence from one, so a
+        // surviving cursor would skip its first ops forever.
         assert!(
-            !reemitted.allow_genesis,
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .is_none(),
+            "the replaced chain's applied-ops cursor must not survive its eviction"
+        );
+        let reemitted = reemitted.expect("the eviction journals a pending entry");
+        assert_eq!(reemitted.documents.len(), 1);
+        let document = &reemitted.documents[0];
+        assert_eq!(&document.target, &target);
+        assert!(
+            !document.allow_genesis,
             "re-emission must not mint a rival genesis"
         );
-        assert!(
-            reemitted.event_id.is_none(),
-            "admin outbox re-emission uses the embedded admin event id"
+        assert_eq!(
+            document.event_id, loser_event_id,
+            "the outbox record id must be the evicted event's own id"
         );
-        assert_eq!(reemitted.placement, placement);
-        match &reemitted.event {
+        assert_eq!(document.placement, placement);
+        match &document.event {
             DocumentSyncOutboxEvent::AdminOperation { event } => {
                 assert_eq!(
                     event.event_id, loser_event_id,
@@ -15728,6 +16826,350 @@ mod tests {
             }
             other => panic!("expected an AdminOperation re-emission, got {other:?}"),
         }
+
+        let foreign_event_id = Ulid::from_parts(0xC3, 3);
+        let foreign_admin = test_admin_event(
+            foreign_event_id,
+            admin_target,
+            &test_actor(3, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "foreign".into(),
+            },
+        );
+        let foreign_payload = DocumentSyncEvent::AdminOperation {
+            target: target.clone(),
+            event: Box::new(foreign_admin),
+            placement,
+        };
+        let foreign = loser.decode_eviction(TopicEviction {
+            topic_id,
+            losing_genesis: winner_genesis,
+            winning_genesis: winner_genesis,
+            evicted: vec![irokle_crate::EvictedOp {
+                op_id: irokle_crate::OpId::from_bytes([91; 32]),
+                actor_id: irokle_crate::actor_id_for(topic_id, winner_peer),
+                author: winner_peer,
+                actor_seq: 2,
+                payload: TopicPayload::Event(
+                    EventEnvelope::encode_event(&foreign_payload).expect("event encodes"),
+                ),
+            }],
+        });
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].event_id, foreign_event_id);
+
+        // Irokle already removed the losing chain, so the payload is durable
+        // before it is handed out and stays recoverable until it is released.
+        let journalled = loser
+            .pending_evictions()
+            .await
+            .expect("eviction journal reads");
+        assert_eq!(journalled, vec![reemitted.clone()]);
+        loser
+            .clear_eviction(reemitted.key)
+            .await
+            .expect("journal entry releases");
+        assert!(
+            loser
+                .pending_evictions()
+                .await
+                .expect("eviction journal reads")
+                .is_empty()
+        );
+    }
+
+    // The eager cursor delete is an optimization, not the invariant. A crash or
+    // a failed delete leaves the replaced chain's cursor behind, so reconcile
+    // must detect the lineage change itself and replay the winner from one.
+    #[tokio::test]
+    async fn lost_eviction_replays() {
+        let (_dir_a, storage_a) = test_storage();
+        let (_dir_b, storage_b) = test_storage();
+        let doc_a = tempfile::tempdir().expect("doc a");
+        let doc_b = tempfile::tempdir().expect("doc b");
+        let realm_id = RealmId::from_bytes([79; 32]);
+        let service_a = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(79).await,
+            storage_a,
+            doc_a.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("service a opens");
+        let service_b = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(80).await,
+            storage_b.clone(),
+            doc_b.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("service b opens");
+
+        let node_a = service_a.local_node_id().expect("node a id");
+        let node_b = service_b.local_node_id().expect("node b id");
+        let user_id = UserId::local(Ulid::from_parts(79, 1), realm_id);
+        let target = DocumentSyncTarget::User { user_id };
+        let admin_target = AdminDocumentTarget::User { user_id };
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_parts(79, 7),
+            shard: 1,
+        };
+        let topic_id = target.sync_topic_id(realm_id, &placement);
+
+        service_a
+            .ensure_document_sync_topics(&[topic_id], vec![node_b])
+            .expect("service a topic genesis");
+        service_b
+            .ensure_document_sync_topics(&[topic_id], vec![node_a])
+            .expect("service b topic genesis");
+        for (service, seed, name) in [(&service_a, 1u8, "from-a"), (&service_b, 2u8, "from-b")] {
+            let event = test_admin_event(
+                Ulid::from_parts(79, seed as u128),
+                admin_target.clone(),
+                &test_actor(seed, user_id, realm_id),
+                1,
+                AdminDocumentOperation::UserNameSet {
+                    name: name.to_string(),
+                },
+            );
+            assert!(matches!(
+                service
+                    .publish_documents(
+                        vec![DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(event),
+                            placement,
+                            allow_genesis: true,
+                        }],
+                        Vec::new(),
+                    )
+                    .await,
+                DocumentSyncNetEvent::DocumentsPublished { .. }
+            ));
+        }
+
+        let node_a_handle = service_a.node();
+        let node_b_handle = service_b.node();
+        let genesis = |handle: &irokle_crate::Irokle<irokle_crate::FjallStorage>| {
+            handle
+                .storage()
+                .topic_state(&topic_id)
+                .expect("topic state")
+                .expect("topic exists")
+                .genesis
+        };
+        assert_ne!(genesis(&node_a_handle), genesis(&node_b_handle));
+        let (loser, loser_node, winner_node, loser_peer, winner_peer) =
+            if genesis(&node_a_handle) > genesis(&node_b_handle) {
+                (
+                    &service_a,
+                    &node_a_handle,
+                    &node_b_handle,
+                    node_id_to_peer_id(&node_a),
+                    node_id_to_peer_id(&node_b),
+                )
+            } else {
+                (
+                    &service_b,
+                    &node_b_handle,
+                    &node_a_handle,
+                    node_id_to_peer_id(&node_b),
+                    node_id_to_peer_id(&node_a),
+                )
+            };
+        let loser_actor = irokle_crate::actor_id_for(topic_id, loser_peer);
+        let stale = applied_cursor_clock(
+            loser_node.storage(),
+            topic_id,
+            genesis(loser_node),
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read"),
+        )
+        .expect("cursor decodes");
+        assert!(
+            stale.get(&loser_actor) > 0,
+            "the loser's publish must leave a cursor covering its own chain"
+        );
+
+        let winner_ops =
+            irokle_crate::oplog::topological(winner_node.storage(), &topic_id).expect("winner ops");
+        let (_ack, evictions) = loser_node
+            .receive_sync_data_from_evicting(
+                winner_peer,
+                SyncData {
+                    topic_id,
+                    ops: winner_ops,
+                },
+            )
+            .expect("loser admits the winning chain");
+        assert_eq!(evictions.len(), 1);
+        // `decode_eviction` is `consume_eviction` without the cursor delete:
+        // exactly the state a crash or a failed delete leaves behind.
+        loser.decode_eviction(evictions.into_iter().next().expect("one eviction"));
+        let winning_genesis = genesis(loser_node);
+        assert!(
+            loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .is_some(),
+            "this test must leave the stale cursor in place"
+        );
+
+        loser
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("the winning chain reconciles");
+        let stored: AppliedCursor = postcard::from_bytes(
+            &loser
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("cursor read")
+                .expect("reconcile rewrites the cursor"),
+        )
+        .expect("cursor decodes");
+        assert_eq!(stored.lineage, winning_genesis);
+        assert_eq!(
+            stored.clock.get(&loser_actor),
+            0,
+            "the replaced chain's sequences must not mask the loser's re-emissions"
+        );
+
+        // A reconcile that changes no lineage must not replay the topic again.
+        assert!(
+            loser
+                .reconcile_document_topics([topic_id])
+                .await
+                .expect("second reconcile")
+                .targets
+                .is_empty(),
+            "an unchanged genesis must keep its cursor instead of reapplying"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_cursor_lineage() {
+        // A cursor is trusted only while it still describes the topic's current
+        // history: another genesis, a position rebuilt under the same genesis
+        // (an orphan quarantine), and any unreadable value all restart replay.
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([81; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(81).await,
+            storage,
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let local_actor = test_actor(81, UserId::nil(realm_id), realm_id);
+        let event = test_admin_event(
+            Ulid::from_parts(1_810, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            1,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "cursor lineage".to_string(),
+            },
+        );
+        assert!(matches!(
+            service
+                .publish_documents(
+                    vec![DocumentSyncPublish::AdminOperation {
+                        target,
+                        event: Box::new(event),
+                        placement: PlacementRef::NIL,
+                        allow_genesis: true,
+                    }],
+                    Vec::new(),
+                )
+                .await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        let node = service.node();
+        let store = node.storage();
+        let genesis = service
+            .topic_genesis(topic_id)
+            .expect("topic genesis")
+            .expect("topic exists");
+        let clock = store.actor_clock(&topic_id).expect("topic clock");
+        let encoded =
+            applied_cursor_value(store, topic_id, genesis, &clock).expect("cursor encodes");
+        let read = |value: Option<Value>, genesis| {
+            applied_cursor_clock(store, topic_id, genesis, value).expect("cursor reads")
+        };
+
+        assert_eq!(read(Some(encoded.clone()), genesis), clock);
+        assert_eq!(
+            read(Some(encoded.clone()), test_genesis(2)),
+            irokle_crate::ActorClock::default(),
+            "another genesis is another history"
+        );
+        assert_eq!(
+            read(
+                Some(
+                    postcard::to_allocvec(&clock)
+                        .expect("bare clock serializes")
+                        .into()
+                ),
+                genesis
+            ),
+            irokle_crate::ActorClock::default(),
+            "a cursor without a lineage is untrusted"
+        );
+        assert_eq!(
+            read(None, genesis),
+            irokle_crate::ActorClock::default(),
+            "an absent cursor replays from one"
+        );
+
+        // An orphan quarantine keeps the genesis and rebuilds the chain, so the
+        // recorded positions hold different ops than the cursor remembers.
+        let mut rebuilt: AppliedCursor =
+            postcard::from_bytes(encoded.as_ref()).expect("cursor decodes");
+        for mark in rebuilt.marks.values_mut() {
+            *mark = test_genesis(9);
+        }
+        assert_eq!(
+            read(
+                Some(
+                    postcard::to_allocvec(&rebuilt)
+                        .expect("rebuilt cursor serializes")
+                        .into()
+                ),
+                genesis
+            ),
+            irokle_crate::ActorClock::default(),
+            "a rebuilt position must not count as applied"
+        );
+
+        service.shutdown().await;
     }
 
     // Whole-document admin sync is refused by apply_upsert/apply_delete. If reconcile
@@ -15755,7 +17197,6 @@ mod tests {
         let target = DocumentSyncTarget::User { user_id };
         let placement = PlacementRef {
             strategy_id: Ulid::from_parts(54, 7),
-            epoch: 0,
             shard: 1,
         };
         let topic_id = target.sync_topic_id(realm_id, &placement);
@@ -15834,17 +17275,7 @@ mod tests {
         ));
 
         // Reset the cursor so reconcile reprocesses every op as a fresh peer would.
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         // Reconcile completes despite the hostile whole-document ops.
         let result = service
@@ -15863,15 +17294,9 @@ mod tests {
         );
 
         // The cursor advanced past the hostile ops.
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -15982,6 +17407,7 @@ mod tests {
                         &event,
                         realm_id,
                         &placement,
+                        &mut ConfigValidationCache::default(),
                     )
                     .await
                     .expect("storage succeeds"),
@@ -16020,6 +17446,7 @@ mod tests {
                 &ensure,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16048,6 +17475,7 @@ mod tests {
                 &description,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16083,6 +17511,7 @@ mod tests {
                 &genesis_role,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16143,6 +17572,7 @@ mod tests {
                     &event,
                     realm_id,
                     &placement,
+                    &mut ConfigValidationCache::default(),
                 )
                 .await
                 .expect("storage succeeds"),
@@ -16213,6 +17643,7 @@ mod tests {
                 &forged_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16244,6 +17675,7 @@ mod tests {
                 &orphan_event,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16324,6 +17756,7 @@ mod tests {
                     &event,
                     realm_id,
                     &PlacementRef::NIL,
+                    &mut ConfigValidationCache::default(),
                 )
                 .await
                 .expect("storage succeeds"),
@@ -16367,6 +17800,7 @@ mod tests {
                 &waiting,
                 realm_id,
                 &PlacementRef::NIL,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16420,6 +17854,7 @@ mod tests {
                 &wrong_target,
                 realm_id,
                 &placement,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16438,7 +17873,14 @@ mod tests {
         );
         assert!(matches!(
             validate_replicated_admin_event(
-                &storage, topic_id, publisher, &target, &malformed, realm_id, &placement,
+                &storage,
+                topic_id,
+                publisher,
+                &target,
+                &malformed,
+                realm_id,
+                &placement,
+                &mut ConfigValidationCache::default(),
             )
             .await
             .expect("storage succeeds"),
@@ -16548,17 +17990,7 @@ mod tests {
                 service.publish_documents(documents, Vec::new()).await,
                 DocumentSyncNetEvent::DocumentsPublished { .. }
             ));
-            service
-                .storage_write(
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                    topic_cursor_key(target.sync_topic_id(realm_id, &PlacementRef::NIL)),
-                    ByteView::from(
-                        postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                            .expect("clock serializes"),
-                    ),
-                )
-                .await
-                .expect("cursor resets");
+            reset_test_cursor(&service, target.sync_topic_id(realm_id, &PlacementRef::NIL)).await;
         }
 
         service
@@ -16575,16 +18007,9 @@ mod tests {
                 .is_empty(),
             "the assignment must wait for realm configuration"
         );
-        let deferred_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(auth_topic),
-            )
+        let deferred_cursor = read_test_cursor(&storage, auth_topic)
             .await
-            .expect("deferred cursor remains stored"),
-        )
-        .expect("cursor decodes");
+            .unwrap_or_default();
         let auth_clock = service
             .node()
             .storage()
@@ -16635,16 +18060,9 @@ mod tests {
                 .contains(&admin_user_id),
             "the deferred assignment must apply after realm configuration"
         );
-        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                topic_cursor_key(auth_topic),
-            )
+        let applied_cursor = read_test_cursor(&storage, auth_topic)
             .await
-            .expect("applied cursor is stored"),
-        )
-        .expect("cursor decodes");
+            .expect("applied cursor is stored");
         assert!(applied_cursor.dominates(&auth_clock));
 
         let group_id = Ulid::from_parts(1_631, 1);
@@ -16706,16 +18124,11 @@ mod tests {
                 .await,
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(group_target.sync_topic_id(realm_id, &group_placement)),
-                postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                    .expect("clock serializes")
-                    .into(),
-            )
-            .await
-            .expect("group cursor resets");
+        reset_test_cursor(
+            &service,
+            group_target.sync_topic_id(realm_id, &group_placement),
+        )
+        .await;
         service
             .reconcile_document_topics([group_target.sync_topic_id(realm_id, &group_placement)])
             .await
@@ -16885,17 +18298,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         let result = service
             .reconcile_document_topics([topic_id])
@@ -16910,15 +18313,9 @@ mod tests {
             vec![placement_entry(local_actor.node_id)]
         );
 
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -16941,6 +18338,255 @@ mod tests {
             ));
         }
         assert_eq!(quarantine_usage(&storage).await.records, 4);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_report_quarantined() {
+        // An invented transition report must not park realm-config replay: it
+        // is quarantined after the same-topic retry and the valid mutation
+        // behind it still applies.
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([74; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(74).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+
+        let local_actor = test_actor(74, UserId::nil(realm_id), realm_id);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                target.clone(),
+                config
+                    .to_bytes(&local_actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let invented = test_admin_event(
+            Ulid::from_parts(1_740, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            1,
+            AdminDocumentOperation::RealmConfigTransitionStallReported {
+                transition_id: Ulid::from_parts(1_741, 1),
+                bucket: 0,
+                reported_by: local_actor.node_id,
+                reason: "invented".to_string(),
+            },
+        );
+        let mut later = test_admin_event(
+            Ulid::from_parts(1_742, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            2,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "progress after the invented report".to_string(),
+            },
+        );
+        later.observed.advance(local_actor.node_id, 1);
+
+        assert!(matches!(
+            service
+                .publish_documents(
+                    vec![
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(invented),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(later),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                    ],
+                    Vec::new(),
+                )
+                .await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        reset_test_cursor(&service, topic_id).await;
+
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("an unknown transition report never blocks reconciliation");
+
+        assert_eq!(
+            read_realm_config_doc(&storage, realm_id).await.description,
+            "progress after the invented report",
+            "a valid mutation behind an invented report must still apply"
+        );
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            read_test_cursor(&storage, topic_id)
+                .await
+                .is_some_and(|cursor| cursor.dominates(&topic_clock)),
+            "the cursor must advance past a quarantined report, not park on it"
+        );
+        let deferred: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
+            postcard::from_bytes(
+                &read_storage_value(
+                    &storage,
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                    deferred_topics_key(),
+                )
+                .await
+                .expect("deferred registry persists"),
+            )
+            .expect("deferred registry decodes");
+        assert!(
+            !deferred
+                .get(&DocumentSyncDependency::RealmConfig(realm_id))
+                .is_some_and(|topics| topics.contains(&topic_id)),
+            "a report must never register the config topic against its own realm config"
+        );
+        let records = quarantine_rows(&storage).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].reason.contains("transition plan"));
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plan_and_report_coalesce() {
+        // Plan and report share one coalesced run, so the report is unknown on
+        // the first pass and must be accepted by the post-flush retry.
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([75; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(75).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+
+        let local_actor = test_actor(75, UserId::nil(realm_id), realm_id);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
+        config.ensure_node(node(76), RealmNodeKind::Management);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                target.clone(),
+                config
+                    .to_bytes(&local_actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let transition_id = Ulid::from_parts(1_750, 1);
+        let plan = aruna_core::structs::TransitionPlan {
+            transition_id,
+            strategy_id: Ulid::from_parts(1_751, 1),
+            buckets: vec![aruna_core::structs::BucketPlan {
+                bucket: 0,
+                old_holders: vec![local_actor.node_id],
+                target_holders: vec![node(76)],
+                predecessor_epoch: 1,
+            }],
+            target_map_epoch: 2,
+            limits: Default::default(),
+            created_by: local_actor.node_id,
+            created_at_ms: 1,
+        };
+        let started = test_admin_event(
+            Ulid::from_parts(1_752, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            1,
+            AdminDocumentOperation::RealmConfigTransitionStarted { plan },
+        );
+        let mut barrier = test_admin_event(
+            Ulid::from_parts(1_753, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            2,
+            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                transition_id,
+                bucket: 0,
+                reported_by: local_actor.node_id,
+                frontier: vec![7],
+            },
+        );
+        barrier.observed.advance(local_actor.node_id, 1);
+
+        assert!(matches!(
+            service
+                .publish_documents(
+                    vec![
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(started),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                        DocumentSyncPublish::AdminOperation {
+                            target: target.clone(),
+                            event: Box::new(barrier),
+                            placement: PlacementRef::NIL,
+                            allow_genesis: true,
+                        },
+                    ],
+                    Vec::new(),
+                )
+                .await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        reset_test_cursor(&service, topic_id).await;
+
+        service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("a plan and its report reconcile in one batch");
+
+        let stored = read_realm_config_doc(&storage, realm_id).await;
+        let transition = stored
+            .transition(&transition_id)
+            .expect("the plan materialized");
+        assert!(
+            transition
+                .barriers
+                .iter()
+                .any(|reported| reported.reported_by == local_actor.node_id),
+            "the participant's barrier must survive the same-batch retry"
+        );
+        assert!(quarantine_rows(&storage).await.is_empty());
 
         service.shutdown().await;
     }
@@ -17296,17 +18942,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         let result = service
             .reconcile_document_topics([topic_id])
@@ -17332,15 +18968,9 @@ mod tests {
             .is_none()
         );
 
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -17466,17 +19096,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         let result = service
             .reconcile_document_topics([topic_id])
@@ -17502,15 +19122,9 @@ mod tests {
             .is_none()
         );
 
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -17613,17 +19227,7 @@ mod tests {
 
         // Reset the cursor so reconcile reprocesses both ops exactly as a fresh
         // peer receiving them via sync would (its cursor has not yet advanced).
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
+        reset_test_cursor(&service, topic_id).await;
 
         // (a) Reconcile completes without error despite the hostile Delete.
         let result = service
@@ -17642,15 +19246,9 @@ mod tests {
         );
 
         // (b) The cursor advanced past the hostile op.
-        let cursor_bytes = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = service
             .node()
             .storage()
@@ -17719,36 +19317,14 @@ mod tests {
         .expect("usage row writes");
     }
 
-    async fn reset_cursor(service: &DocumentSyncService, topic_id: irokle_crate::TopicId) {
-        service
-            .storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-                ByteView::from(
-                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
-                        .expect("clock serializes"),
-                ),
-            )
-            .await
-            .expect("cursor reset");
-    }
-
     async fn cursor_advanced(
         service: &DocumentSyncService,
         storage: &StorageHandle,
         topic_id: irokle_crate::TopicId,
     ) -> bool {
-        let Some(bytes) = read_storage_value(
-            storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        else {
+        let Some(cursor) = read_test_cursor(storage, topic_id).await else {
             return false;
         };
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&bytes).expect("cursor decodes");
         let topic_clock = service
             .node()
             .storage()
@@ -17906,8 +19482,8 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        reset_cursor(&service, watch_topic).await;
-        reset_cursor(&service, info_topic).await;
+        reset_test_cursor(&service, watch_topic).await;
+        reset_test_cursor(&service, info_topic).await;
         service
             .reconcile_document_topics([watch_topic, info_topic])
             .await
@@ -18000,8 +19576,8 @@ mod tests {
         );
 
         // Replay: the same evidence, no duplicate rows and no usage growth.
-        reset_cursor(&service, watch_topic).await;
-        reset_cursor(&service, info_topic).await;
+        reset_test_cursor(&service, watch_topic).await;
+        reset_test_cursor(&service, info_topic).await;
         service
             .reconcile_document_topics([watch_topic, info_topic])
             .await
@@ -18033,7 +19609,6 @@ mod tests {
 
         let placement = PlacementRef {
             strategy_id: Ulid::from_parts(7_200, 1),
-            epoch: 0,
             shard: 5,
         };
         let target = DocumentSyncTarget::PersistentIdMapping {
@@ -18070,7 +19645,7 @@ mod tests {
             DocumentSyncNetEvent::DocumentsPublished { .. }
         ));
 
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -18164,12 +19739,10 @@ mod tests {
         let group_id = Ulid::from_parts(2_152, 1);
         let mismatched = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 9,
         };
         let matching = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let bad_document = document(4, 2_153);
@@ -18265,8 +19838,8 @@ mod tests {
             "metadata publish failed: {published:?}"
         );
 
-        reset_cursor(&service, bad_topic).await;
-        reset_cursor(&service, good_topic).await;
+        reset_test_cursor(&service, bad_topic).await;
+        reset_test_cursor(&service, good_topic).await;
         let applied = service
             .reconcile_document_topics([bad_topic, good_topic])
             .await
@@ -18478,7 +20051,6 @@ mod tests {
 
         let placement = PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 4,
         };
         let document = |seed: u64| {
@@ -18613,7 +20185,7 @@ mod tests {
             },
         )
         .await;
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -18671,7 +20243,7 @@ mod tests {
         assert_eq!(usage.records, 7);
 
         // Redelivery is the same evidence under the same transport identity.
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -18750,11 +20322,7 @@ mod tests {
                 .unwrap()
                 .as_ulid()
         };
-        let placed = |shard: u32| PlacementRef {
-            strategy_id,
-            epoch: 0,
-            shard,
-        };
+        let placed = |shard: u32| PlacementRef { strategy_id, shard };
         let mapping = |document_id, actor, seed: u64| {
             PersistentIdMapping::conceptual(
                 document_id,
@@ -18811,7 +20379,7 @@ mod tests {
         );
 
         for topic_id in [valid_topic, forged_topic, other_topic] {
-            reset_cursor(&service, topic_id).await;
+            reset_test_cursor(&service, topic_id).await;
         }
         let applied = service
             .reconcile_document_topics([valid_topic, forged_topic, other_topic])
@@ -18946,7 +20514,7 @@ mod tests {
             bytes: 0,
         };
         write_usage(&storage, full).await;
-        reset_cursor(&service, topic_id).await;
+        reset_test_cursor(&service, topic_id).await;
         service
             .reconcile_document_topics([topic_id])
             .await
@@ -19001,6 +20569,7 @@ mod tests {
         service
             .reconcile_shard_membership(
                 &[shard_topic],
+                vec![local_node, current_node],
                 vec![local_node, current_node],
                 &BTreeSet::new(),
                 &BTreeSet::new(),
@@ -19289,6 +20858,7 @@ mod tests {
             .reconcile_shard_membership(
                 &[topic_id],
                 vec![receiver_node],
+                vec![receiver_node],
                 &BTreeSet::new(),
                 &BTreeSet::from([topic_id]),
             )
@@ -19323,15 +20893,9 @@ mod tests {
             "rejected event must not mutate document storage"
         );
 
-        let cursor_bytes = read_storage_value(
-            &receiver_storage,
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("cursor persisted");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let cursor = read_test_cursor(&receiver_storage, topic_id)
+            .await
+            .expect("cursor persisted");
         let topic_clock = receiver
             .node()
             .storage()
@@ -19402,6 +20966,7 @@ mod tests {
             .reconcile_shard_membership(
                 &[topic],
                 vec![local_node, co_holder],
+                vec![local_node, co_holder],
                 &BTreeSet::new(),
                 &BTreeSet::new(),
             )
@@ -19421,6 +20986,7 @@ mod tests {
         service
             .reconcile_shard_membership(
                 &[topic],
+                vec![local_node, co_holder],
                 vec![local_node, co_holder],
                 &BTreeSet::new(),
                 &BTreeSet::from([topic]),

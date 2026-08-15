@@ -50,6 +50,9 @@ pub struct AddGroupRoleConfig {
 #[derive(PartialEq)]
 pub struct AddGroupRoleOperation {
     input: AddGroupRoleConfig,
+    /// Bucket the authorization rows publish onto, read inside the write
+    /// transaction.
+    fence: crate::placement::fence::WriteFence,
     state: AddGroupRoleState,
     output: Option<Result<(Group, GroupAuthorizationDocument), AddGroupRoleError>>,
 }
@@ -85,6 +88,13 @@ pub enum AddGroupRoleState {
         new_members: Vec<UserId>,
     },
     DeleteStaleAdminConflicts {
+        txn_id: TxnId,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        new_members: Vec<UserId>,
+    },
+    ReadBucketFence {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
@@ -137,6 +147,8 @@ pub enum AddGroupRoleError {
     Unauthorized,
     #[error("No group found")]
     GroupNotFound,
+    #[error("the group's bucket cut over to a new holder set; retry the change")]
+    PlacementFenced,
     #[error("Invalid public role")]
     InvalidPublicRole,
     #[error("Invalid assigned user")]
@@ -167,6 +179,7 @@ impl AddGroupRoleOperation {
     pub fn new(input: AddGroupRoleConfig) -> Self {
         AddGroupRoleOperation {
             input,
+            fence: Default::default(),
             state: AddGroupRoleState::Init,
             output: None,
         }
@@ -415,12 +428,19 @@ impl AddGroupRoleOperation {
         let document_target = DocumentSyncTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
-        let placement = realm_config_value
+        let realm_config = realm_config_value
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
-            .transpose()?
-            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
+            .transpose()?;
+        let placement = realm_config
+            .as_ref()
+            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
+        let realm_id = self.input.actor.realm_id;
+        if let Some(config) = realm_config.as_ref() {
+            self.fence.add(realm_id, config, [placement]);
+        }
+        let generation = self.fence.generation(&realm_id, &placement);
         for event in &admin_events {
             let record = new_outbox_record_with_id(
                 event.event_id,
@@ -432,7 +452,8 @@ impl AddGroupRoleOperation {
                 },
                 placement,
                 false,
-            );
+            )
+            .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
@@ -520,7 +541,56 @@ impl AddGroupRoleOperation {
         self.emit_commit_transaction(txn_id, group, auth_doc, admin_outbox_written, new_members)
     }
 
+    /// Takes the bucket's fence inside the transaction before committing, so a
+    /// departing holder's close rejects or conflicts this write.
     fn emit_commit_transaction(
+        &mut self,
+        txn_id: TxnId,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        new_members: Vec<UserId>,
+    ) -> Effects {
+        if self.fence.is_empty() {
+            return self.emit_commit(txn_id, group, auth_doc, admin_outbox_written, new_members);
+        }
+        self.state = AddGroupRoleState::ReadBucketFence {
+            txn_id,
+            group,
+            auth_doc,
+            admin_outbox_written,
+            new_members,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.fence.reads(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_bucket_fence(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        new_members: Vec<UserId>,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::BatchReadResult)",
+                got,
+            );
+        };
+        if !self.fence.admits(&values) {
+            return self.fail(AddGroupRoleError::PlacementFenced);
+        }
+        self.emit_commit(txn_id, group, auth_doc, admin_outbox_written, new_members)
+    }
+
+    fn emit_commit(
         &mut self,
         txn_id: TxnId,
         group: Group,
@@ -801,6 +871,20 @@ impl Operation for AddGroupRoleOperation {
                 admin_outbox_written,
                 new_members,
             ),
+            AddGroupRoleState::ReadBucketFence {
+                txn_id,
+                group,
+                auth_doc,
+                admin_outbox_written,
+                new_members,
+            } => self.handle_bucket_fence(
+                event,
+                txn_id,
+                group,
+                auth_doc,
+                admin_outbox_written,
+                new_members,
+            ),
             AddGroupRoleState::CommitTransaction {
                 group,
                 auth_doc,
@@ -860,6 +944,7 @@ impl Operation for AddGroupRoleOperation {
             | AddGroupRoleState::GetAuthDocAndAdminState { txn_id, .. }
             | AddGroupRoleState::WriteGroupAuthDocAndAdminState { txn_id, .. }
             | AddGroupRoleState::DeleteStaleAdminConflicts { txn_id, .. }
+            | AddGroupRoleState::ReadBucketFence { txn_id, .. }
             | AddGroupRoleState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
@@ -1666,5 +1751,168 @@ pub mod test {
         .unwrap();
 
         assert!(read_notification_outbox(&context).await.is_empty());
+    }
+
+    /// A realm whose buckets are activated at generation one, so an add-role
+    /// resolves a generation and takes the group bucket's fence.
+    fn activated_config(actor: &Actor) -> aruna_core::structs::RealmConfigDocument {
+        let mut config =
+            aruna_core::structs::RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, aruna_core::structs::RealmNodeKind::Server);
+        config
+            .strategies
+            .push(aruna_core::structs::PlacementStrategy {
+                strategy_id: Ulid::from_bytes([5; 16]),
+                name: "default".to_string(),
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+                shard_count: 16,
+            });
+        config.default_strategy_id = Some(config.strategies[0].strategy_id);
+        config.snapshot_candidate_map();
+        config
+    }
+
+    fn role(actor: &Actor, group_id: Ulid) -> Role {
+        Role {
+            role_id: Ulid::from_bytes([6; 16]),
+            name: "viewer".to_string(),
+            permissions: HashMap::from([(
+                format!("/{}/g/{group_id}/data/**", actor.realm_id),
+                Permission::READ,
+            )]),
+            assigned_users: HashSet::new(),
+        }
+    }
+
+    /// Steps an add-role to the bucket fence read and answers it with `closed`.
+    fn step_to_fence(
+        operation: &mut AddGroupRoleOperation,
+        actor: &Actor,
+        group: &Group,
+        auth_doc: &GroupAuthorizationDocument,
+        txn_id: TxnId,
+        closed: Option<u64>,
+    ) -> aruna_core::types::Effects {
+        let config = activated_config(actor);
+        operation.start();
+        operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: group.group_id.to_bytes().into(),
+            value: Some(group.to_bytes(actor).unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    group.group_id.to_bytes().into(),
+                    Some(auth_doc.to_bytes(actor).unwrap().into()),
+                ),
+                (group.group_id.to_bytes().into(), None),
+                (
+                    actor.realm_id.as_bytes().to_vec().into(),
+                    Some(config.to_bytes(actor).unwrap().into()),
+                ),
+            ],
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: read,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("the transaction batch-reads the bucket fence, got {effects:?}");
+        };
+        assert_eq!(*read, Some(txn_id));
+        let values = reads
+            .iter()
+            .map(|(_, key)| {
+                (
+                    key.clone(),
+                    closed.map(|generation| {
+                        aruna_core::types::Value::from(generation.to_be_bytes().to_vec())
+                    }),
+                )
+            })
+            .collect();
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    }
+
+    fn fixture() -> (Actor, Group, GroupAuthorizationDocument) {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let actor = Actor {
+            node_id: node(3),
+            user_id: UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            realm_id,
+        };
+        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+            actor.user_id,
+            realm_id,
+            Ulid::from_bytes([9; 16]),
+        );
+        let group = Group {
+            display_name: "Test group".to_string(),
+            group_id: auth_doc.group_id,
+            realm_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+            owner: actor.user_id,
+        };
+        (actor, group, auth_doc)
+    }
+
+    #[test]
+    fn role_takes_fence() {
+        // An admitted role change stamps the generation it resolved at onto
+        // every admin row, so the drain can bound the predecessor set.
+        let (actor, group, auth_doc) = fixture();
+        let txn_id = TxnId::generate();
+        let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+            auth_context: auth_context(&actor),
+            actor: actor.clone(),
+            realm_id: actor.realm_id,
+            group_id: group.group_id,
+            role: role(&actor, group.group_id),
+        });
+
+        let effects = step_to_fence(&mut operation, &actor, &group, &auth_doc, txn_id, None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+    }
+
+    #[test]
+    fn fence_rejects_role() {
+        // The departing holder closed generation one: the role change must not
+        // commit a row the drained bucket can no longer publish.
+        let (actor, group, auth_doc) = fixture();
+        let txn_id = TxnId::generate();
+        let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+            auth_context: auth_context(&actor),
+            actor: actor.clone(),
+            realm_id: actor.realm_id,
+            group_id: group.group_id,
+            role: role(&actor, group.group_id),
+        });
+
+        let effects = step_to_fence(&mut operation, &actor, &group, &auth_doc, txn_id, Some(1));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Storage(StorageEffect::CommitTransaction { .. })
+            )),
+            "a fenced role change never commits, got {effects:?}"
+        );
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            AddGroupRoleError::PlacementFenced
+        );
     }
 }

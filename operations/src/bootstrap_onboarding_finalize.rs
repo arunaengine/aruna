@@ -21,19 +21,17 @@ use crate::driver::{DriverContext, drive};
 use crate::ensure_realm_config::{
     EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
 };
+use crate::expand_placement::{ensure_activated_map, expand_realm_placement};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use crate::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
     IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
-use crate::mutate_realm_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
-    RealmPlacementMutation,
-};
+use crate::mutate_realm_placement::{MutateRealmPlacementError, RealmPlacementMutation};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::notifications::watch::interest::mark_watch_interest_dirty;
-use crate::process_placements::process_shard_placements;
+use crate::process_placements::reconcile_shard_topics;
 use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
@@ -113,8 +111,13 @@ pub async fn bootstrap_onboarding_finalize(
     )
     .await?;
 
+    // The bridge must close before the joiner is registered: activations have to
+    // be pinned to a map that does not name it, or the join itself would move
+    // buckets instead of the transition below.
+    ensure_activated_map(context.as_ref(), &realm_actor(&input)).await?;
     ensure_realm_node_with_retries(&input, reserved.mode, context.as_ref()).await?;
     set_joiner_placement_entry(&input, placement_entry, context.as_ref()).await?;
+    expand_realm_placement(context.as_ref(), &realm_actor(&input)).await?;
     process_pending_placements(&input, &context).await;
 
     let ticket = drive(
@@ -287,21 +290,23 @@ fn build_joiner_placement_entry(
     })
 }
 
+fn realm_actor(input: &BootstrapOnboardingFinalizeInput) -> Actor {
+    Actor {
+        node_id: input.local_node_id,
+        user_id: UserId::nil(input.realm_id),
+        realm_id: input.realm_id,
+    }
+}
+
 async fn set_joiner_placement_entry(
     input: &BootstrapOnboardingFinalizeInput,
     entry: NodePlacementEntry,
     context: &DriverContext,
 ) -> Result<(), BootstrapOnboardingFinalizeError> {
-    drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
-            actor: Actor {
-                node_id: input.local_node_id,
-                user_id: UserId::nil(input.realm_id),
-                realm_id: input.realm_id,
-            },
-            mutation: RealmPlacementMutation::UpsertNode(entry),
-        }),
+    crate::expand_placement::mutate(
         context,
+        &realm_actor(input),
+        RealmPlacementMutation::UpsertNode(entry),
     )
     .await?;
     Ok(())
@@ -311,7 +316,10 @@ async fn process_pending_placements(
     input: &BootstrapOnboardingFinalizeInput,
     context: &Arc<DriverContext>,
 ) {
-    process_shard_placements(context, input.realm_id, input.local_node_id).await;
+    // Transition steps stay out of the bootstrap request: the expansion's
+    // mutations armed zero-delay SyncPlacements timers that run them in the
+    // background, so only topic membership is reconciled inline here.
+    reconcile_shard_topics(context, input.realm_id, input.local_node_id).await;
 }
 
 struct OnboardingSyncTopics {
@@ -843,6 +851,11 @@ mod tests {
             .find(|strategy| strategy.strategy_id == user_strategy_id)
             .unwrap()
             .replica_count = Some(1);
+        // Stand in for the expansion transition: a node registered after the
+        // realm activated its map holds nothing until one names it.
+        config.candidate_maps.clear();
+        config.placement_activations.clear();
+        config.snapshot_candidate_map();
 
         let actor = Actor {
             node_id: fixture.local_node_id,

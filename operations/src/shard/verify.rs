@@ -81,7 +81,6 @@ pub async fn verify_held_shards(
             (0..strategy.shard_count).filter_map(|shard| {
                 let placement = PlacementRef {
                     strategy_id: strategy.strategy_id,
-                    epoch: 0,
                     shard,
                 };
                 let holders = resolve_shard_holders(&config, &placement);
@@ -184,6 +183,68 @@ async fn verify_one_shard(
         return true;
     }
 
+    match converge_shard_digest(
+        context, net_handle, node_id, realm_id, placement, co_holders,
+    )
+    .await
+    {
+        Some((co_holder, digest)) => {
+            mark_verified(context, realm_id, placement, Some(co_holder), digest).await;
+            info!(
+                strategy = %placement.strategy_id,
+                shard = placement.shard,
+                co_holder = %co_holder,
+                "Verified shard against co-holder",
+            );
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reconciles the local shard copy against the first reachable co-holder and
+/// returns that co-holder with the digest both sides agree on.
+///
+/// The same machinery a joining holder verifies with, reused by the transition
+/// executor: the matched digest is the checkpoint root a completion proof
+/// commits to. `None` when no co-holder converged within the retry budget.
+pub async fn converge_shard_digest(
+    context: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    realm_id: RealmId,
+    placement: PlacementRef,
+    co_holders: &[NodeId],
+) -> Option<(NodeId, [u8; 32])> {
+    converge_with_barrier(
+        context, net_handle, node_id, realm_id, placement, co_holders, None,
+    )
+    .await
+}
+
+/// Whether the local cursor covers the required barrier join. Vacuous without
+/// a requirement; an undecodable local cursor never satisfies one.
+fn dominates_required(cursor: &[u8], required: Option<&irokle::ActorClock>) -> bool {
+    let Some(required) = required else {
+        return true;
+    };
+    postcard::from_bytes::<irokle::ActorClock>(cursor).is_ok_and(|local| local.dominates(required))
+}
+
+/// [`converge_shard_digest`] with an additionally required frontier: the local
+/// cursor must dominate `required` (the join of every old-holder barrier)
+/// before the digest counts, so a target can never prove while missing an
+/// unreachable divergent holder's writes. Every source is tried in turn.
+pub async fn converge_with_barrier(
+    context: &Arc<DriverContext>,
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    realm_id: RealmId,
+    placement: PlacementRef,
+    co_holders: &[NodeId],
+    required: Option<&irokle::ActorClock>,
+) -> Option<(NodeId, [u8; 32])> {
+    let topic = shard_topic_id(realm_id, &placement);
     for co_holder in co_holders {
         let mut remote =
             match fetch_shard_manifest(net_handle, *co_holder, realm_id, placement).await {
@@ -198,14 +259,14 @@ async fn verify_one_shard(
                 }
             };
 
-        // First reachable co-holder: reconcile against it with a bounded number
-        // of anti-entropy passes.
+        // Reconcile against this source with a bounded number of anti-entropy
+        // passes; on non-convergence continue to the next source.
         for _ in 0..SHARD_VERIFICATION_MAX_ATTEMPTS {
             let local = match assemble_shard_manifest(context, realm_id, placement).await {
                 Ok(manifest) => manifest,
                 Err(error) => {
                     warn!(error = %error, "Failed to assemble local shard manifest for verification");
-                    return false;
+                    return None;
                 }
             };
             // Never certify convergence without a local genesis: two genesis-less
@@ -215,16 +276,9 @@ async fn verify_one_shard(
                 .document_sync_topic_exists(topic)
                 .unwrap_or(false)
                 && manifests_converged(&local, &remote)
+                && dominates_required(&local.cursor, required)
             {
-                mark_verified(context, realm_id, placement, Some(*co_holder), local.digest).await;
-                info!(
-                    strategy = %placement.strategy_id,
-                    shard = placement.shard,
-                    co_holder = %co_holder,
-                    entries = local.entries.len(),
-                    "Verified shard against co-holder",
-                );
-                return true;
+                return Some((*co_holder, local.digest));
             }
             // Topic or entry digests differ: pull the co-holder's events and re-compare.
             let event = net_handle
@@ -239,11 +293,8 @@ async fn verify_one_shard(
                 }
             };
         }
-        // The first reachable co-holder did not converge within the retry
-        // budget; leave the shard unverified for the next pass.
-        return false;
     }
-    false
+    None
 }
 
 fn manifests_converged(
@@ -415,7 +466,6 @@ mod tests {
     fn placement() -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9; 16]),
-            epoch: 0,
             shard: 7,
         }
     }

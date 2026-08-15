@@ -1,13 +1,15 @@
 #[cfg(test)]
 mod distribution;
+pub mod fence;
 pub mod resolver;
 pub mod selector;
+pub mod transition;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
-    DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument,
-    shard_for_subject,
+    CandidatePlacementMap, DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy,
+    RealmConfigDocument, shard_for_subject,
 };
 use aruna_core::types::GroupId;
 use ulid::Ulid;
@@ -16,7 +18,7 @@ use crate::placement::selector::{ROLE_SHARD, rank_weighted};
 
 pub use resolver::{
     PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
-    meta_bucket_subject, resolve_holders, strategy_for_target, subject_bytes,
+    meta_bucket_subject, resolve_holders, strategy_for_target, subject_bytes, view_from_map,
 };
 
 /// Canonical rendezvous subject for a shard's holder resolution:
@@ -36,7 +38,7 @@ pub fn shard_subject_bytes(placement: &PlacementRef) -> Vec<u8> {
 /// a document subject, because one shard topic has exactly one holder set.
 /// Per-document overrides still steer strategy selection (see
 /// [`strategy_for_target`]); their pin/exclude lists are inert for holders.
-fn shard_override<'a>(
+pub(crate) fn shard_override<'a>(
     config: &'a RealmConfigDocument,
     placement: &PlacementRef,
 ) -> Option<&'a PlacementOverride> {
@@ -61,7 +63,6 @@ pub fn placement_ref_for_target(
     match strategy_for_target(config, target, context) {
         Some((strategy, _)) => PlacementRef {
             strategy_id: strategy.strategy_id,
-            epoch: 0,
             shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
         },
         None => PlacementRef::NIL,
@@ -96,7 +97,6 @@ pub(crate) fn registry_placement_for(
     };
     PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: shard_for_subject(&subject_bytes(&target), strategy.shard_count),
     }
 }
@@ -115,69 +115,78 @@ pub struct TargetPlacementPlan {
     pub placement: PlacementRef,
 }
 
+/// `Ok(None)` only when no strategy governs the target; a governed target
+/// whose bucket cannot resolve is an error the caller must retry durably,
+/// never an empty placement.
 pub fn plan_target_placement(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
     context: PlacementResolutionContext<'_>,
-) -> Option<TargetPlacementPlan> {
-    let (strategy, _override) = strategy_for_target(config, target, context)?;
+) -> Result<Option<TargetPlacementPlan>, PlacementResolveError> {
+    let Some((strategy, _override)) = strategy_for_target(config, target, context) else {
+        return Ok(None);
+    };
     let placement = PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
     };
-    let holders = resolve_shard_holders_with(config, strategy, &placement);
-    let desired_count = match strategy.replica_count {
+    let selection = frozen_selection(config, strategy, selection_epoch(config, &placement)?)?;
+    let holders = selection.resolve(&placement);
+    // The nominal replica target is the effective selector's: frozen once the
+    // bucket is pinned, live only during bootstrap.
+    let desired_count = match selection.replica_count() {
         Some(count) => count as usize,
         None => holders.len(),
     };
-    Some(TargetPlacementPlan {
+    Ok(Some(TargetPlacementPlan {
         holders,
         desired_count,
         placement,
-    })
+    }))
 }
 
-/// Full eligible-node ranking for the shard that `target` hashes into
-/// (ignoring the strategy's replica cap) so callers can top up beyond
-/// `replica_count`. Rank order is the shard's, not the individual document's.
-pub fn rank_eligible_holders(
-    config: &RealmConfigDocument,
-    target: &DocumentSyncTarget,
-    context: PlacementResolutionContext<'_>,
-) -> Vec<NodeId> {
-    let Some((strategy, _override)) = strategy_for_target(config, target, context) else {
-        return Vec::new();
-    };
-    let placement = PlacementRef {
-        strategy_id: strategy.strategy_id,
-        epoch: 0,
-        shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
-    };
-    let mut uncapped = strategy.clone();
-    uncapped.replica_count = None;
-    let view = build_view(config);
-    resolve_holders(
-        &view,
-        &uncapped,
-        &shard_subject_bytes(&placement),
-        shard_override(config, &placement),
-    )
+/// Why a bucket resolves no holder. Routing fails closed on these: they mean
+/// "not resolvable here", never "definitively absent".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PlacementResolveError {
+    #[error("placement strategy {0} is unknown")]
+    StrategyUnknown(Ulid),
+    #[error("bucket {0} has no placement activation")]
+    ActivationUnavailable(u32),
+    #[error("bucket {0} has divergent placement activations")]
+    ActivationConflicted(u32),
+    #[error("candidate map epoch {0} is missing or conflicted")]
+    CandidateMapUnavailable(u64),
 }
 
 /// Rank-ordered holders of a specific shard (capped by the strategy's
 /// `replica_count`, or all eligible for an everywhere strategy). Used by the
 /// placement reconciler and the startup restore to enumerate the co-holders of
-/// each shard the local node is responsible for. Returns `Vec::new()` when the
-/// referenced strategy is unknown.
+/// each shard the local node is responsible for. Returns `Vec::new()` for the
+/// housekeeping callers whenever [`resolve_shard_holders_checked`] fails.
 pub fn resolve_shard_holders(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
 ) -> Vec<NodeId> {
-    let Some(strategy) = config.strategy(&placement.strategy_id) else {
-        return Vec::new();
-    };
-    resolve_shard_holders_with(config, strategy, placement)
+    resolve_shard_holders_checked(config, placement).unwrap_or_default()
+}
+
+/// Holder resolution pinned to the bucket's activated candidate map: selection
+/// runs over the frozen view, so a config edit moves no holder and only a
+/// completed transition can. Routing callers use this variant and map its
+/// failures to 503, because an unresolvable bucket is not an absent document.
+pub fn resolve_shard_holders_checked(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+) -> Result<Vec<NodeId>, PlacementResolveError> {
+    let strategy =
+        config
+            .strategy(&placement.strategy_id)
+            .ok_or(PlacementResolveError::StrategyUnknown(
+                placement.strategy_id,
+            ))?;
+    let selection = frozen_selection(config, strategy, selection_epoch(config, placement)?)?;
+    Ok(selection.resolve(placement))
 }
 
 pub(crate) const MAX_READ_HOLDERS: usize = 32;
@@ -188,60 +197,162 @@ pub(crate) fn resolve_holders_limit(
     placement: &PlacementRef,
     limit: usize,
 ) -> Vec<NodeId> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let Some(strategy) = config.strategy(&placement.strategy_id) else {
-        return Vec::new();
-    };
-    let target = limit.min(u32::MAX as usize) as u32;
-    let mut bounded = strategy.clone();
-    bounded.replica_count = Some(
-        strategy
-            .replica_count
-            .map_or(target, |replicas| replicas.min(target)),
-    );
-    let view = build_view(config);
-    resolve_shard_holders_from_view(config, &view, &bounded, placement)
+    holders_limit_checked(config, placement, limit).unwrap_or_default()
 }
 
-/// First `(strategy, shard)` whose holder set is non-empty both before and after
-/// a config change yet shares no holder: a disjoint transition that would strand
-/// the shard's history and let a new holder mint a rival genesis. Interim
-/// [BR-025] guard until the staged handoff protocol (#264) lands; at least one
-/// current holder must remain until the new holders have verified.
-pub fn first_disjoint_shard_transition(
-    pre: &RealmConfigDocument,
-    post: &RealmConfigDocument,
-) -> Option<PlacementRef> {
-    let pre_view = build_view(pre);
-    let post_view = build_view(post);
-    for strategy in &post.strategies {
-        let Some(pre_strategy) = pre.strategy(&strategy.strategy_id) else {
+fn holders_limit_checked(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    limit: usize,
+) -> Result<Vec<NodeId>, PlacementResolveError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let strategy =
+        config
+            .strategy(&placement.strategy_id)
+            .ok_or(PlacementResolveError::StrategyUnknown(
+                placement.strategy_id,
+            ))?;
+    let mut selection = frozen_selection(config, strategy, selection_epoch(config, placement)?)?;
+    // The read cap bounds the frozen replica count, never the live one.
+    selection.bound_replicas(limit.min(u32::MAX as usize) as u32);
+    Ok(selection.resolve(placement))
+}
+
+/// Read fan-out for a bucket: its activated holders first, then every holder a
+/// transition still names for it, in rank order and deduped.
+///
+/// A bucket in flight has its history on the old set and, once a target has
+/// proved, on the new one; a bucket that just cut over may still be catching a
+/// reader up from an old holder. The transition record's own lifetime is that
+/// window - it is pruned only after the grace release - so no clock is read
+/// here. Writes deliberately do not union: authority is the activation alone.
+pub fn read_holder_sets(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+) -> Result<Vec<NodeId>, PlacementResolveError> {
+    let mut holders = holders_limit_checked(config, placement, MAX_READ_HOLDERS)?;
+    for transition in &config.placement_transitions {
+        if transition.plan.strategy_id != placement.strategy_id {
+            continue;
+        }
+        let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
             continue;
         };
-        for shard in 0..strategy.shard_count {
-            let placement = PlacementRef {
-                strategy_id: strategy.strategy_id,
-                epoch: 0,
-                shard,
-            };
-            let pre_holders =
-                resolve_shard_holders_from_view(pre, &pre_view, pre_strategy, &placement);
-            if pre_holders.is_empty() {
-                continue;
-            }
-            let post_holders =
-                resolve_shard_holders_from_view(post, &post_view, strategy, &placement);
-            if post_holders.is_empty() {
-                continue;
-            }
-            if !pre_holders.iter().any(|node| post_holders.contains(node)) {
-                return Some(placement);
+        for node_id in bucket.target_holders.iter().chain(&bucket.old_holders) {
+            if !holders.contains(node_id) {
+                holders.push(*node_id);
             }
         }
     }
-    None
+    holders.truncate(MAX_READ_HOLDERS);
+    Ok(holders)
+}
+
+/// Candidate map epoch a bucket selects from. `None` while the realm has
+/// published no map at all: nothing is pinned yet, so the live view is the only
+/// input there is (bootstrap, before the first `PublishCandidateMap`).
+fn selection_epoch(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+) -> Result<Option<u64>, PlacementResolveError> {
+    if config.candidate_maps.is_empty() {
+        return Ok(None);
+    }
+    match config.activation(&placement.strategy_id, placement.shard) {
+        Some(activation) => Ok(Some(activation.candidate_map_epoch)),
+        None if config.placement_activations.iter().any(|entry| {
+            entry.strategy_id == placement.strategy_id && entry.shard == placement.shard
+        }) =>
+        {
+            Err(PlacementResolveError::ActivationConflicted(placement.shard))
+        }
+        None => Err(PlacementResolveError::ActivationUnavailable(
+            placement.shard,
+        )),
+    }
+}
+
+/// The complete selection inputs a bucket resolves from: either the live
+/// config (bootstrap, before any map) or one frozen candidate map whose
+/// selector and shard overrides never see later config edits.
+pub(crate) struct FrozenSelection<'a> {
+    view: PlacementView,
+    strategy: PlacementStrategy,
+    map: Option<&'a CandidatePlacementMap>,
+    config: &'a RealmConfigDocument,
+}
+
+impl FrozenSelection<'_> {
+    pub(crate) fn resolve(&self, placement: &PlacementRef) -> Vec<NodeId> {
+        let subject = shard_subject_bytes(placement);
+        let override_ = match self.map {
+            Some(map) => map.shard_override(&subject),
+            None => shard_override(self.config, placement),
+        };
+        resolve_holders(&self.view, &self.strategy, &subject, override_)
+    }
+
+    fn bound_replicas(&mut self, limit: u32) {
+        self.strategy.replica_count = Some(
+            self.strategy
+                .replica_count
+                .map_or(limit, |replicas| replicas.min(limit)),
+        );
+    }
+
+    pub(crate) fn replica_count(&self) -> Option<u32> {
+        self.strategy.replica_count
+    }
+}
+
+/// Builds the selection inputs for `strategy` at `epoch`. A map that predates
+/// the strategy fails closed: an activated bucket must never fall back to
+/// live selector fields.
+pub(crate) fn frozen_selection<'a>(
+    config: &'a RealmConfigDocument,
+    strategy: &PlacementStrategy,
+    epoch: Option<u64>,
+) -> Result<FrozenSelection<'a>, PlacementResolveError> {
+    match epoch {
+        None => Ok(FrozenSelection {
+            view: build_view(config),
+            strategy: strategy.clone(),
+            map: None,
+            config,
+        }),
+        Some(epoch) => {
+            let map = config
+                .candidate_map(epoch)
+                .ok_or(PlacementResolveError::CandidateMapUnavailable(epoch))?;
+            map_selection(config, strategy, map)
+                .ok_or(PlacementResolveError::CandidateMapUnavailable(epoch))
+        }
+    }
+}
+
+/// Selection inputs for one explicit map; `None` when the map predates the
+/// strategy and carries no frozen selector for it.
+pub(crate) fn map_selection<'a>(
+    config: &'a RealmConfigDocument,
+    strategy: &PlacementStrategy,
+    map: &'a CandidatePlacementMap,
+) -> Option<FrozenSelection<'a>> {
+    let selector = map.selector(&strategy.strategy_id)?;
+    Some(FrozenSelection {
+        view: view_from_map(map),
+        strategy: PlacementStrategy {
+            strategy_id: strategy.strategy_id,
+            name: strategy.name.clone(),
+            replica_count: selector.replica_count,
+            distinct_locations: selector.distinct_locations,
+            affinity: selector.affinity.clone(),
+            shard_count: strategy.shard_count,
+        },
+        map: Some(map),
+        config,
+    })
 }
 
 /// First shard of a referenced strategy that resolves to zero holders while the
@@ -250,8 +361,16 @@ pub fn first_disjoint_shard_transition(
 /// all-full realms have no usable node and are not flagged (fail-early for a
 /// genuine misconfiguration, not for an empty realm).
 pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<PlacementRef> {
-    let view = build_view(config);
-    let has_capacity = view.nodes.iter().any(|node| {
+    // Checked against the newest map, which is what a future activation would
+    // pin: activated buckets are already frozen and cannot be emptied by an edit.
+    let newest_epoch = config
+        .newest_map_epoch()
+        .filter(|epoch| config.candidate_map(*epoch).is_some());
+    let capacity_view = match newest_epoch.and_then(|epoch| config.candidate_map(epoch)) {
+        Some(map) => view_from_map(map),
+        None => build_view(config),
+    };
+    let has_capacity = capacity_view.nodes.iter().any(|node| {
         node.kind.is_sync_eligible() && !node.full && !node.draining && node.weight > 0
     });
     if !has_capacity {
@@ -275,18 +394,168 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
         if !referenced {
             continue;
         }
+        // A strategy the newest map predates checks against the live view: a
+        // future map publication is what would freeze it.
+        let epoch = newest_epoch.filter(|epoch| {
+            config
+                .candidate_map(*epoch)
+                .is_some_and(|map| map.selector(&id).is_some())
+        });
+        let Ok(selection) = frozen_selection(config, strategy, epoch) else {
+            continue;
+        };
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: id,
-                epoch: 0,
                 shard,
             };
-            if resolve_shard_holders_from_view(config, &view, strategy, &placement).is_empty() {
+            if selection.resolve(&placement).is_empty() {
                 return Some(placement);
             }
         }
     }
     None
+}
+
+/// Desired shard-topic membership for a bucket: its activated holders plus
+/// every holder set a live transition still names for it.
+///
+/// A target must be a member to pull the history it has to verify, and an old
+/// holder must stay one until the record is released, or a reader mid-cutover
+/// would lose its source. That window closes `grace_ms` after the bucket cut
+/// over, so repeated transitions bound peak membership at `|old U new|` and
+/// steady-state membership at the holders (#399). `now_ms` only ends the
+/// window; when it starts is carried in the record.
+pub struct BucketMembership {
+    /// Sync membership and pull/delivery peers.
+    pub members: Vec<NodeId>,
+    /// Accepted authors: activated holders plus retained departing holders.
+    pub publishers: Vec<NodeId>,
+}
+
+/// Per-bucket membership and publish authority, derived from each bucket's
+/// own completion and status rather than the transition as a whole:
+/// an admitted incomplete bucket adds its targets as members only, a
+/// completed bucket retains departing old holders (member and publisher)
+/// through its own grace window, and an aborted incomplete bucket adds
+/// nothing beyond the activated holders.
+pub fn bucket_membership(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    now_ms: u64,
+) -> BucketMembership {
+    let base = resolve_shard_holders(config, placement);
+    let mut members = base.clone();
+    let mut publishers = base;
+    for transition in &config.placement_transitions {
+        if transition.plan.strategy_id != placement.strategy_id {
+            continue;
+        }
+        let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
+            continue;
+        };
+        match transition.completion(bucket.bucket) {
+            None => {
+                // Only targets inside the admitted window join, bounding the
+                // join/pull fan-out to the plan's in-flight limit.
+                if matches!(
+                    transition.status,
+                    aruna_core::structs::TransitionStatus::Active
+                ) && transition
+                    .plan
+                    .admitted_buckets(&transition.completed)
+                    .any(|admitted| admitted.bucket == bucket.bucket)
+                {
+                    for node_id in &bucket.target_holders {
+                        push_unique(&mut members, *node_id);
+                    }
+                }
+            }
+            Some(completion) => {
+                // Retention ends on grace AND the holder's reduced drain
+                // report, so an acknowledged pre-cutover write is never cut
+                // off by the clock alone.
+                let retained_until = completion
+                    .completed_at_ms
+                    .saturating_add(transition.plan.limits.grace_ms);
+                for node_id in &bucket.old_holders {
+                    if !bucket.target_holders.contains(node_id)
+                        && (now_ms < retained_until
+                            || !transition.drain_reported(bucket.bucket, *node_id))
+                    {
+                        push_unique(&mut members, *node_id);
+                        push_unique(&mut publishers, *node_id);
+                    }
+                }
+            }
+        }
+    }
+    BucketMembership {
+        members,
+        publishers,
+    }
+}
+
+fn push_unique(nodes: &mut Vec<NodeId>, node_id: NodeId) {
+    if !nodes.contains(&node_id) {
+        nodes.push(node_id);
+    }
+}
+
+/// The earliest future instant a completed bucket's retention can end (its
+/// grace deadline). Buckets already past grace contribute nothing here: they
+/// either released or await a drain report, which the normal retry drives.
+pub fn next_release_ms(config: &RealmConfigDocument, now_ms: u64) -> Option<u64> {
+    let mut earliest: Option<u64> = None;
+    for transition in &config.placement_transitions {
+        for completion in &transition.completed {
+            if transition.departing_holders(completion.bucket).is_empty() {
+                continue;
+            }
+            let deadline = completion
+                .completed_at_ms
+                .saturating_add(transition.plan.limits.grace_ms);
+            if deadline > now_ms {
+                earliest = Some(earliest.map_or(deadline, |current| current.min(deadline)));
+            }
+        }
+    }
+    earliest
+}
+
+/// Whether any completed bucket past its grace still awaits a departing
+/// holder's drain report, so the caller keeps a normal retry armed.
+pub fn drain_pending(config: &RealmConfigDocument, now_ms: u64) -> bool {
+    config.placement_transitions.iter().any(|transition| {
+        transition.completed.iter().any(|completion| {
+            let deadline = completion
+                .completed_at_ms
+                .saturating_add(transition.plan.limits.grace_ms);
+            now_ms >= deadline
+                && transition
+                    .departing_holders(completion.bucket)
+                    .into_iter()
+                    .any(|holder| !transition.drain_reported(completion.bucket, holder))
+        })
+    })
+}
+
+/// Whether `node_id` is a cut-over old holder whose retention has not ended:
+/// its queued pre-cutover records stay deliverable until grace elapses AND its
+/// drain report reduces (never a clock alone).
+pub fn retained_departing_holder(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    node_id: NodeId,
+) -> bool {
+    config.placement_transitions.iter().any(|transition| {
+        transition.plan.strategy_id == placement.strategy_id
+            && transition.completion(placement.shard).is_some()
+            && transition
+                .departing_holders(placement.shard)
+                .contains(&node_id)
+            && !transition.drain_reported(placement.shard, node_id)
+    })
 }
 
 /// Whether `node_id` holds `placement`, and may therefore publish onto its
@@ -372,7 +641,6 @@ pub fn first_draining_holder_set_change(
             for shard in 0..shard_count {
                 let placement = PlacementRef {
                     strategy_id: strategy.strategy_id,
-                    epoch: 0,
                     shard,
                 };
                 if is_draining_former_holder(pre, &placement, node_id)
@@ -413,17 +681,33 @@ pub fn held_buckets(
     strategy: &PlacementStrategy,
     node_id: NodeId,
 ) -> Vec<u32> {
-    let view = build_view(config);
-    (0..strategy.shard_count)
-        .filter(|shard| {
-            let placement = PlacementRef {
-                strategy_id: strategy.strategy_id,
-                epoch: 0,
-                shard: *shard,
-            };
-            resolve_shard_holders_from_view(config, &view, strategy, &placement).contains(&node_id)
-        })
-        .collect()
+    // Buckets of one strategy usually share an activated epoch, so the frozen
+    // selections are built once each rather than once per bucket.
+    let mut selections: std::collections::BTreeMap<Option<u64>, FrozenSelection<'_>> =
+        std::collections::BTreeMap::new();
+    let mut held = Vec::new();
+    for shard in 0..strategy.shard_count {
+        let placement = PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard,
+        };
+        let Ok(epoch) = selection_epoch(config, &placement) else {
+            continue;
+        };
+        let selection = match selections.entry(epoch) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let Ok(selection) = frozen_selection(config, strategy, epoch) else {
+                    continue;
+                };
+                entry.insert(selection)
+            }
+        };
+        if selection.resolve(&placement).contains(&node_id) {
+            held.push(shard);
+        }
+    }
+    held
 }
 
 /// Bucket the create-receiving node picks for `subject`: the best-ranked of the
@@ -443,41 +727,25 @@ pub fn choose_origin_bucket(
     let best = *rank_weighted(ROLE_SHARD, subject, &candidates).first()?;
     Some(PlacementRef {
         strategy_id: strategy.strategy_id,
-        epoch: 0,
         shard: held[best],
     })
-}
-
-fn resolve_shard_holders_with(
-    config: &RealmConfigDocument,
-    strategy: &PlacementStrategy,
-    placement: &PlacementRef,
-) -> Vec<NodeId> {
-    let view = build_view(config);
-    resolve_shard_holders_from_view(config, &view, strategy, placement)
-}
-
-fn resolve_shard_holders_from_view(
-    config: &RealmConfigDocument,
-    view: &PlacementView,
-    strategy: &PlacementStrategy,
-    placement: &PlacementRef,
-) -> Vec<NodeId> {
-    resolve_holders(
-        view,
-        strategy,
-        &shard_subject_bytes(placement),
-        shard_override(config, placement),
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::admin_document_reducer::{
+        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
+    };
+    use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::structs::{
-        BindingScope, MetadataRegistryRecord, RealmId, RealmNodeKind, StrategyBinding,
+        Actor, AffinityRule, BindingScope, CandidateMapNode, CandidatePlacementMap,
+        MetadataRegistryRecord, NodePlacementEntry, PlacementActivation, RealmId, RealmNodeKind,
+        StrategyBinding,
     };
     use ulid::Ulid;
+
+    use crate::placement::transition::holders_in_map;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -502,7 +770,6 @@ mod tests {
             config,
             PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard: 7,
             },
         )
@@ -717,6 +984,618 @@ mod tests {
     }
 
     #[test]
+    fn activation_pins_holders() {
+        // Once a map is activated, edits to the live placement map are inert:
+        // only a completed transition may move the bucket.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let pinned = resolve_shard_holders(&config, &placement);
+        assert_eq!(pinned.len(), 2);
+
+        for seed in 5..=8u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        config.placement_map.push(NodePlacementEntry {
+            node_id: pinned[0],
+            location: "moved".to_string(),
+            weight: 1,
+            full: true,
+            draining: false,
+            labels: std::collections::BTreeMap::new(),
+        });
+        assert_eq!(resolve_shard_holders(&config, &placement), pinned);
+
+        // Publishing a newer map is not activation either.
+        config.snapshot_candidate_map();
+        assert_eq!(resolve_shard_holders(&config, &placement), pinned);
+        assert_ne!(
+            resolve_holders(
+                &view_from_map(config.candidate_map(2).expect("newest map")),
+                strategy_of(&config),
+                &shard_subject_bytes(&placement),
+                None,
+            ),
+            pinned
+        );
+    }
+
+    #[test]
+    fn edits_stay_inert() {
+        // After activation, selector edits (replica count, affinity, distinct
+        // locations) and a shard override must not move holders: selection
+        // reads only the activated map's frozen selector inputs.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let pinned = resolve_shard_holders(&config, &placement);
+        assert_eq!(pinned.len(), 2);
+
+        let strategy_id = placement.strategy_id;
+        let strategy = config
+            .strategies
+            .iter_mut()
+            .find(|strategy| strategy.strategy_id == strategy_id)
+            .expect("strategy");
+        strategy.replica_count = Some(4);
+        strategy.distinct_locations = true;
+        strategy.affinity.push(AffinityRule {
+            matcher: aruna_core::structs::LabelMatch {
+                key: "zone".to_string(),
+                value: "a".to_string(),
+            },
+            effect: aruna_core::structs::AffinityEffect::Filter,
+        });
+        config.placement_overrides.push(PlacementOverride {
+            subject: shard_subject_bytes(&placement),
+            pinned: vec![node(4)],
+            excluded: vec![pinned[0]],
+            strategy_id: None,
+        });
+        assert_eq!(resolve_shard_holders(&config, &placement), pinned);
+
+        // A fresh snapshot freezes the edits, but only activation applies it.
+        config.snapshot_candidate_map();
+        assert_eq!(resolve_shard_holders(&config, &placement), pinned);
+        let newest = config.candidate_map(2).expect("newest map");
+        assert_ne!(
+            holders_in_map(&config, strategy_of(&config), &placement, newest)
+                .expect("frozen selector"),
+            pinned
+        );
+    }
+
+    fn membership_fixture() -> (RealmConfigDocument, Ulid) {
+        // Bucket 7 completed at t=100 (grace 1000, departing holder node 9),
+        // buckets 8 and 9 incomplete with a limit-one window.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let strategy_id = placement.strategy_id;
+        let bucket =
+            |bucket: u32, old: Vec<NodeId>, target: Vec<NodeId>| aruna_core::structs::BucketPlan {
+                bucket,
+                old_holders: old,
+                target_holders: target,
+                predecessor_epoch: 1,
+            };
+        let mut transition =
+            aruna_core::structs::PlacementTransition::new(aruna_core::structs::TransitionPlan {
+                transition_id: Ulid::from_bytes([8; 16]),
+                strategy_id,
+                buckets: vec![
+                    bucket(7, vec![node(9)], vec![node(2)]),
+                    bucket(8, Vec::new(), vec![node(8)]),
+                    bucket(9, Vec::new(), vec![node(7)]),
+                ],
+                target_map_epoch: 2,
+                limits: aruna_core::structs::TransitionLimits {
+                    max_incomplete_buckets: 1,
+                    grace_ms: 1_000,
+                },
+                created_by: node(1),
+                created_at_ms: 1,
+            });
+        transition
+            .completed
+            .push(aruna_core::structs::BucketCompletion {
+                bucket: 7,
+                completed_at_ms: 100,
+            });
+        transition.drained.push(aruna_core::structs::BucketDrain {
+            bucket: 7,
+            reported_by: node(9),
+        });
+        config.placement_transitions.push(transition);
+        (config, strategy_id)
+    }
+
+    #[test]
+    fn membership_per_bucket() {
+        // Retention is the bucket's own: bucket 7 releases at its grace end
+        // while bucket 8's target stays a member without publish authority,
+        // and an abort drops incomplete targets immediately.
+        let (config, strategy_id) = membership_fixture();
+        let at = |shard: u32, now_ms: u64| {
+            bucket_membership(&config, &PlacementRef { strategy_id, shard }, now_ms)
+        };
+
+        let retained = at(7, 500);
+        assert!(retained.members.contains(&node(9)));
+        assert!(retained.publishers.contains(&node(9)));
+        let released = at(7, 1_100);
+        assert!(!released.members.contains(&node(9)));
+        assert!(!released.publishers.contains(&node(9)));
+
+        let admitted = at(8, 500);
+        assert!(admitted.members.contains(&node(8)));
+        assert!(!admitted.publishers.contains(&node(8)));
+
+        let mut aborted_config = config.clone();
+        aborted_config.placement_transitions[0].status =
+            aruna_core::structs::TransitionStatus::Aborted;
+        let aborted = bucket_membership(
+            &aborted_config,
+            &PlacementRef {
+                strategy_id,
+                shard: 8,
+            },
+            500,
+        );
+        assert!(!aborted.members.contains(&node(8)));
+        // The completed bucket's retention survives the abort.
+        let still_retained = bucket_membership(
+            &aborted_config,
+            &PlacementRef {
+                strategy_id,
+                shard: 7,
+            },
+            500,
+        );
+        assert!(still_retained.publishers.contains(&node(9)));
+    }
+
+    #[test]
+    fn release_deadline_derived() {
+        // Before the grace end the deadline is completion plus grace; past it
+        // a missing drain report demands a retry rather than a deadline.
+        let (config, _) = membership_fixture();
+        let mut undrained = config.clone();
+        undrained.placement_transitions[0].drained.clear();
+
+        assert_eq!(next_release_ms(&config, 500), Some(1_100));
+        assert!(!drain_pending(&config, 500));
+        // Bucket 7's holder drained, so past grace nothing pends.
+        assert_eq!(next_release_ms(&config, 1_100), None);
+        assert!(!drain_pending(&config, 1_100));
+        // Without the drain report the deadline passes into a pending retry.
+        assert_eq!(next_release_ms(&undrained, 1_100), None);
+        assert!(drain_pending(&undrained, 1_100));
+    }
+
+    #[test]
+    fn window_bounds_joins() {
+        // Limit-one: only the first incomplete bucket's target is admitted.
+        let (config, strategy_id) = membership_fixture();
+        let outside = bucket_membership(
+            &config,
+            &PlacementRef {
+                strategy_id,
+                shard: 9,
+            },
+            500,
+        );
+        assert!(!outside.members.contains(&node(7)));
+    }
+
+    #[test]
+    fn planner_pins_activation() {
+        // A published-but-unactivated newer map must not move the planner:
+        // selected peers stay on the activated holder set.
+        let (mut config, _) = config_and_placement();
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::Group),
+            strategy_id: config.default_strategy_id.unwrap(),
+        }];
+        config.snapshot_candidate_map();
+        let target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_bytes([6u8; 16]),
+        };
+        let pinned = plan_target_placement(&config, &target, Default::default())
+            .expect("resolves")
+            .expect("governed");
+
+        for seed in 5..=8u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        config.snapshot_candidate_map();
+        let after = plan_target_placement(&config, &target, Default::default())
+            .expect("resolves")
+            .expect("governed");
+        assert_eq!(after.holders, pinned.holders);
+        assert_eq!(after.desired_count, pinned.desired_count);
+    }
+
+    #[test]
+    fn missing_selector_fails() {
+        // A strategy added after the activated map was published must fail
+        // closed rather than fall back to live selector fields.
+        let (mut config, _placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let late = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            name: "late".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 4,
+        };
+        config.strategies.push(late.clone());
+        config.placement_activations.push(PlacementActivation {
+            strategy_id: late.strategy_id,
+            shard: 0,
+            activation_epoch: 1,
+            candidate_map_epoch: 1,
+            transition_id: None,
+        });
+        assert_eq!(
+            resolve_shard_holders_checked(
+                &config,
+                &PlacementRef {
+                    strategy_id: late.strategy_id,
+                    shard: 0,
+                }
+            ),
+            Err(PlacementResolveError::CandidateMapUnavailable(1))
+        );
+    }
+
+    #[test]
+    fn missing_activation_fails_closed() {
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let strategy_id = placement.strategy_id;
+
+        config
+            .placement_activations
+            .retain(|activation| activation.shard != placement.shard);
+        assert_eq!(
+            resolve_shard_holders_checked(&config, &placement),
+            Err(PlacementResolveError::ActivationUnavailable(
+                placement.shard
+            ))
+        );
+        assert!(resolve_shard_holders(&config, &placement).is_empty());
+        assert!(!holds_placement(&config, &placement, node(1)));
+
+        // Two divergent activations for one bucket are a conflict, not a winner.
+        for epoch in [1, 2] {
+            config
+                .placement_activations
+                .push(aruna_core::structs::PlacementActivation {
+                    strategy_id,
+                    shard: placement.shard,
+                    activation_epoch: 1,
+                    candidate_map_epoch: epoch,
+                    transition_id: None,
+                });
+        }
+        assert_eq!(
+            resolve_shard_holders_checked(&config, &placement),
+            Err(PlacementResolveError::ActivationConflicted(placement.shard))
+        );
+
+        // An activation naming an unpublished map resolves nothing either.
+        config
+            .placement_activations
+            .retain(|activation| activation.candidate_map_epoch != 2);
+        config.candidate_maps.clear();
+        config.candidate_maps.push(CandidatePlacementMap {
+            epoch: 5,
+            nodes: Vec::new(),
+            selectors: Vec::new(),
+            shard_overrides: Vec::new(),
+        });
+        assert_eq!(
+            resolve_shard_holders_checked(&config, &placement),
+            Err(PlacementResolveError::CandidateMapUnavailable(1))
+        );
+
+        let unknown = PlacementRef {
+            strategy_id: Ulid::from_bytes([99u8; 16]),
+            shard: 0,
+        };
+        assert_eq!(
+            resolve_shard_holders_checked(&config, &unknown),
+            Err(PlacementResolveError::StrategyUnknown(unknown.strategy_id))
+        );
+    }
+
+    #[test]
+    fn empty_shard_check_uses_newest_map() {
+        // The guard validates the map a future activation would pin, not the
+        // one already activated.
+        let (mut config, _) = config_and_placement();
+        for seed in 1..=4u8 {
+            config.placement_map.push(NodePlacementEntry {
+                node_id: node(seed),
+                location: String::new(),
+                weight: aruna_core::structs::DEFAULT_NODE_WEIGHT,
+                full: false,
+                draining: false,
+                labels: std::collections::BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+            });
+        }
+        config.snapshot_candidate_map();
+        for strategy in config.strategies.iter_mut() {
+            strategy.affinity = vec![aruna_core::structs::AffinityRule {
+                matcher: aruna_core::structs::LabelMatch {
+                    key: "tier".to_string(),
+                    value: "hot".to_string(),
+                },
+                effect: aruna_core::structs::AffinityEffect::Filter,
+            }];
+        }
+        assert_eq!(first_empty_referenced_shard(&config), None);
+
+        // The frozen map still carries the matching labels, so nothing is empty
+        // until the edit is snapshotted into a new map.
+        for entry in config.placement_map.iter_mut() {
+            entry.labels.insert("tier".to_string(), "cold".to_string());
+        }
+        assert_eq!(first_empty_referenced_shard(&config), None);
+        config.snapshot_candidate_map();
+        assert!(first_empty_referenced_shard(&config).is_some());
+    }
+
+    #[test]
+    fn read_union_spans_transition() {
+        // Readers must reach both sides of a bucket in flight; writers must not.
+        let (mut config, placement) = config_and_placement();
+        config.snapshot_candidate_map();
+        let activated = resolve_shard_holders(&config, &placement);
+        assert_eq!(read_holder_sets(&config, &placement), Ok(activated.clone()));
+
+        let targets: Vec<NodeId> = (5..=6u8).map(node).collect();
+        config
+            .placement_transitions
+            .push(aruna_core::structs::PlacementTransition::new(
+                aruna_core::structs::TransitionPlan {
+                    transition_id: Ulid::from_bytes([7; 16]),
+                    strategy_id: placement.strategy_id,
+                    buckets: vec![aruna_core::structs::BucketPlan {
+                        bucket: placement.shard,
+                        old_holders: activated.clone(),
+                        target_holders: targets.clone(),
+                        predecessor_epoch: 1,
+                    }],
+                    target_map_epoch: 2,
+                    limits: Default::default(),
+                    created_by: node(1),
+                    created_at_ms: 1,
+                },
+            ));
+
+        let union = read_holder_sets(&config, &placement).expect("bucket resolves");
+        assert_eq!(union[..activated.len()], activated[..]);
+        for target in &targets {
+            assert!(union.contains(target));
+        }
+        assert_eq!(union.len(), activated.len() + targets.len());
+        // Write authority stays the activation alone.
+        assert_eq!(resolve_shard_holders(&config, &placement), activated);
+        for target in &targets {
+            assert!(!holds_placement(&config, &placement, *target));
+        }
+    }
+
+    /// Reduces a full two-bucket handoff from map one onto map two and returns
+    /// the state that replays it.
+    fn reduced_handoff(realm_id: RealmId, strategy_id: Ulid) -> AdminDocumentReducerState {
+        let mut state =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let actor = |seed: u8| Actor {
+            node_id: node(seed),
+            user_id: aruna_core::UserId::nil(realm_id),
+            realm_id,
+        };
+        let map = |epoch: u64, seeds: [u8; 2]| CandidatePlacementMap {
+            epoch,
+            nodes: seeds
+                .iter()
+                .map(|seed| CandidateMapNode {
+                    node_id: node(*seed),
+                    kind: RealmNodeKind::Server,
+                    location: "eu".to_string(),
+                    weight: 100,
+                    full: false,
+                    draining: false,
+                    labels: std::collections::BTreeMap::new(),
+                })
+                .collect(),
+            selectors: vec![aruna_core::structs::FrozenStrategySelector {
+                strategy_id,
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+            }],
+            shard_overrides: Vec::new(),
+        };
+        for operation in [
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: PlacementStrategy {
+                    strategy_id,
+                    name: "moved".to_string(),
+                    replica_count: Some(1),
+                    distinct_locations: false,
+                    affinity: Vec::new(),
+                    shard_count: 2,
+                },
+            },
+            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                map: map(1, [1, 2]),
+            },
+            AdminDocumentOperation::RealmConfigActivationsInitialized {
+                strategy_id,
+                candidate_map_epoch: 1,
+            },
+            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                map: map(2, [3, 4]),
+            },
+        ] {
+            state
+                .apply_operation(&actor(1), operation)
+                .expect("applies");
+        }
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+        let plan = crate::placement::transition::plan_transition(
+            &config,
+            crate::placement::transition::TransitionRequest {
+                transition_id: Ulid::from_bytes([7; 16]),
+                strategy_id,
+                buckets: Vec::new(),
+                target_map_epoch: 2,
+                limits: Default::default(),
+                created_by: node(1),
+                created_at_ms: 1,
+            },
+        )
+        .expect("the plan derives");
+        state
+            .apply_operation(
+                &actor(1),
+                AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() },
+            )
+            .expect("applies");
+
+        for bucket in &plan.buckets {
+            for holder in &bucket.old_holders {
+                let seed = (1..=4u8)
+                    .find(|seed| node(*seed) == *holder)
+                    .expect("known");
+                state
+                    .apply_operation(
+                        &actor(seed),
+                        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                            transition_id: plan.transition_id,
+                            bucket: bucket.bucket,
+                            reported_by: *holder,
+                            frontier: vec![seed],
+                        },
+                    )
+                    .expect("applies");
+            }
+            for holder in &bucket.old_holders {
+                if bucket.target_holders.contains(holder) {
+                    continue;
+                }
+                let seed = (1..=4u8)
+                    .find(|seed| node(*seed) == *holder)
+                    .expect("known");
+                state
+                    .apply_operation(
+                        &actor(seed),
+                        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                            transition_id: plan.transition_id,
+                            bucket: bucket.bucket,
+                            reported_by: *holder,
+                        },
+                    )
+                    .expect("applies");
+            }
+            let mut fenced = aruna_core::structs::PlacementTransition::new(plan.clone());
+            fenced.barriers = bucket
+                .old_holders
+                .iter()
+                .map(|holder| aruna_core::structs::BucketBarrier {
+                    bucket: bucket.bucket,
+                    reported_by: *holder,
+                    frontier: vec![
+                        (1..=4u8)
+                            .find(|seed| node(*seed) == *holder)
+                            .expect("known"),
+                    ],
+                })
+                .collect();
+            let digest = fenced.barrier_digest(bucket.bucket);
+            for holder in &bucket.target_holders {
+                let seed = (1..=4u8)
+                    .find(|seed| node(*seed) == *holder)
+                    .expect("known");
+                let proof = aruna_core::structs::ProofClaim {
+                    realm_id,
+                    transition_id: plan.transition_id,
+                    strategy_id,
+                    bucket: bucket.bucket,
+                    old_activation_epoch: 1,
+                    target_map_epoch: 2,
+                    barrier_digest: digest,
+                    checkpoint_root: [1; 32],
+                    holder: *holder,
+                }
+                .sign(&iroh::SecretKey::from_bytes(&[seed; 32]));
+                state
+                    .apply_operation(
+                        &actor(seed),
+                        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                            transition_id: plan.transition_id,
+                            strategy_id,
+                            proof,
+                        },
+                    )
+                    .expect("applies");
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn prune_keeps_holders() {
+        // Dropping a released record must leave every bucket exactly where the
+        // transition put it: the fold that advances activations replays the
+        // whole reduced chain, pruned records included.
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let strategy_id = Ulid::from_bytes([5u8; 16]);
+        let state = reduced_handoff(realm_id, strategy_id);
+        let materialize = |now_ms: u64| {
+            let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+            overlay_realm_config_placement_reducer_materialization(&mut config, &state, now_ms);
+            config
+        };
+        let buckets = [
+            PlacementRef {
+                strategy_id,
+                shard: 0,
+            },
+            PlacementRef {
+                strategy_id,
+                shard: 1,
+            },
+        ];
+
+        let live = materialize(0);
+        assert_eq!(live.placement_transitions.len(), 1);
+        let moved: Vec<Vec<NodeId>> = buckets
+            .iter()
+            .map(|placement| resolve_shard_holders(&live, placement))
+            .collect();
+        assert!(moved.iter().all(|holders| holders.len() == 1));
+        assert!(
+            moved
+                .iter()
+                .all(|holders| [node(3), node(4)].contains(&holders[0])),
+            "the handoff moved both buckets onto the target map"
+        );
+
+        let pruned = materialize(u64::MAX);
+        assert!(pruned.placement_transitions.is_empty());
+        for (placement, holders) in buckets.iter().zip(&moved) {
+            assert_eq!(&resolve_shard_holders(&pruned, placement), holders);
+            assert!(bucket_membership(&pruned, placement, u64::MAX).members == *holders);
+        }
+        assert_eq!(pruned.placement_activations, live.placement_activations);
+    }
+
+    #[test]
     fn holders_limit_order() {
         let mut config = RealmConfigDocument::new(RealmId::from_bytes([3u8; 32]), Vec::new(), 3);
         let strategy = PlacementStrategy {
@@ -734,7 +1613,6 @@ mod tests {
         }
         let placement = PlacementRef {
             strategy_id: config.default_strategy_id.expect("default strategy"),
-            epoch: 0,
             shard: 0,
         };
         let full = resolve_shard_holders(&config, &placement);

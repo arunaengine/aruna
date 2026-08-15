@@ -37,6 +37,10 @@ pub const ADMIN_DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const DOCUMENT_SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
 pub const TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
+/// Durable handoff for payloads recovered from a genesis tie-break. An entry
+/// survives until every replacement outbox row is committed, so a crash between
+/// the topic reset and the re-emission cannot lose an acknowledged write.
+pub const DOCUMENT_SYNC_EVICTION_KEYSPACE: &str = "document_sync_evictions";
 pub const DOCUMENT_SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const DOCUMENT_SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
 /// Durable store for permanently-invalid replicated sync events (#338).
@@ -45,6 +49,10 @@ pub const SYNC_QUARANTINE_KEYSPACE: &str = "sync_quarantine";
 /// same batch as every quarantine row write and prune delete.
 pub const SYNC_QUARANTINE_USAGE_KEYSPACE: &str = "sync_quarantine_usage";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
+/// Per-bucket write-admission fence: the highest activation generation a
+/// departing holder has closed. A holder-authoritative writer reads it inside
+/// its own transaction, so a close conflicts every uncommitted predecessor write.
+pub const PLACEMENT_WRITE_FENCE_KEYSPACE: &str = "placement_write_fence";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
 pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
 pub const TASK_TIMER_KEYSPACE: &str = "task_timers";

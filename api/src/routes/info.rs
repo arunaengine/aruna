@@ -12,6 +12,7 @@ use aruna_core::structs::{
 use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::allocate_handle::{HandleAllocationError, provision_metadata_binding};
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -23,6 +24,7 @@ use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
     drive_realm_placement_mutation,
 };
+use aruna_operations::placement::transition::transition_health;
 use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
 };
@@ -392,6 +394,18 @@ pub struct RealmPlacementConfigResponse {
     pub default_strategy_id: Option<String>,
     pub bindings: Vec<RealmPlacementBinding>,
     pub overrides: Vec<RealmPlacementOverride>,
+    pub transitions: RealmTransitionHealthResponse,
+}
+
+/// Health of the realm's in-flight placement transitions. Counts only: nothing
+/// here changes where a request routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmTransitionHealthResponse {
+    pub active: usize,
+    pub incomplete_buckets: usize,
+    pub stalled_buckets: usize,
+    /// Transitions still incomplete after a day.
+    pub overdue: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -498,7 +512,14 @@ enum RealmPlacementAction {
 
 impl RealmPlacementConfigResponse {
     fn from_document(document: &RealmConfigDocument) -> Self {
+        let health = transition_health(document, unix_timestamp_millis());
         Self {
+            transitions: RealmTransitionHealthResponse {
+                active: health.active,
+                incomplete_buckets: health.incomplete_buckets,
+                stalled_buckets: health.stalled_buckets,
+                overdue: health.overdue,
+            },
             strategies: document
                 .strategies
                 .iter()
@@ -1128,7 +1149,13 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
                         "excluded": [],
                         "strategy_id": null
                     }
-                ]
+                ],
+                "transitions": {
+                    "active": 1,
+                    "incomplete_buckets": 2,
+                    "stalled_buckets": 0,
+                    "overdue": 0
+                }
             })
         ),
         (status = 401, description = "Missing or unusable bearer token", body = crate::error::ErrorResponse),
@@ -1224,7 +1251,13 @@ pub async fn get_realm_placement(
                 "bindings": [
                     {"scope": {"kind": "realm"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
                 ],
-                "overrides": []
+                "overrides": [],
+                "transitions": {
+                    "active": 0,
+                    "incomplete_buckets": 0,
+                    "stalled_buckets": 0,
+                    "overdue": 0
+                }
             })
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
@@ -1307,13 +1340,18 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         MutateRealmPlacementError::RealmConfigNotFound => ServerError::NotFound,
         MutateRealmPlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
         error @ (MutateRealmPlacementError::AdminDocumentReducerError(_)
-        | MutateRealmPlacementError::DisjointHolderTransition { .. }
-        | MutateRealmPlacementError::EmptyShardHolders { .. }) => {
+        | MutateRealmPlacementError::EmptyShardHolders { .. }
+        | MutateRealmPlacementError::UnknownTransition { .. }
+        | MutateRealmPlacementError::ForceWithoutProof { .. }) => {
             ServerError::BadRequestReason(error.to_string())
         }
+        MutateRealmPlacementError::Unauthorized { .. } => ServerError::Forbidden,
         MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
             format!("placement strategy {strategy_id} is currently referenced"),
         ),
+        error @ MutateRealmPlacementError::TransitionInFlight { .. } => {
+            ServerError::Conflict(error.to_string())
+        }
         MutateRealmPlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
         }

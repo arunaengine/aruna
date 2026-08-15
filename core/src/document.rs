@@ -17,8 +17,8 @@ use crate::storage_entries::{
     metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
 };
 use crate::structs::{
-    PlacementRef, RealmId, node_info_storage_key, node_usage_global_key, node_usage_group_key,
-    persistent_id_key, watch_interest_node_key, watch_subscription_key,
+    PLACEMENT_EPOCH_PAD, PlacementRef, RealmId, node_info_storage_key, node_usage_global_key,
+    node_usage_group_key, persistent_id_key, watch_interest_node_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
@@ -82,7 +82,7 @@ pub enum DocumentSyncTarget {
 
 /// A shard whose sync topic the local node is an authoritative holder of and
 /// whose co-holder membership is still being topped up. Keyed by
-/// realm ‖ strategy ‖ epoch(le) ‖ shard(be); one record per shard, not per
+/// realm ‖ strategy ‖ pad ‖ shard(be); one record per shard, not per
 /// document (every document in the shard rides the same topic).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingShardPlacement {
@@ -129,11 +129,23 @@ pub struct DocumentSyncOutboxRecord {
     /// envelope change's ref, for `AdminOperation` the target's resolved ref.
     /// Does not affect the outbox FIFO key.
     pub placement: PlacementRef,
+    /// Activation generation the write was admitted at, so a departing holder
+    /// drains exactly the finite set its closed fence bounds. `0` means the
+    /// writer took no fence and the row always counts toward the drain.
+    pub generation: u64,
     pub updated_at: u64,
     /// Whether the publisher may mint this document's sync topic genesis when it
     /// is missing. Only the node that originated the document sets this; every
     /// other publisher waits (retryable) for the origin's genesis to replicate.
     pub allow_genesis: bool,
+}
+
+impl DocumentSyncOutboxRecord {
+    /// Stamps the generation the bucket's write fence admitted this row at.
+    pub fn fenced_at(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,9 +162,13 @@ pub enum DocumentSyncOutboxEvent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A payload recovered from a genesis tie-break, journalled until its
+/// replacement outbox row is durable. `event_id` is the evicted event's own id,
+/// so repeating the recovery rewrites one stable outbox row instead of adding a
+/// duplicate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentSyncEvictedDocument {
-    pub event_id: Option<Ulid>,
+    pub event_id: Ulid,
     pub target: DocumentSyncTarget,
     pub event: DocumentSyncOutboxEvent,
     pub placement: PlacementRef,
@@ -484,15 +500,15 @@ impl DocumentSyncTarget {
 }
 
 /// Sync topic a shard's records ride, derived from the realm, strategy, and
-/// shard (no config lookup at the net layer). The epoch slot is canonicalized
-/// to zero so transitions retain their epoch-0 topic identity. Mirrors the
+/// shard (no config lookup at the net layer). Holders, maps, and activations
+/// never enter it, so a full turnover keeps one topic. Mirrors the
 /// `TopicId::hash` idiom [`DocumentSyncTarget::sync_topic_id`] uses, which
 /// routes every shard-classed target here.
 pub fn shard_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
     let mut bytes = b"aruna-shard-topic-v1".to_vec();
     bytes.extend_from_slice(realm_id.as_bytes());
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
-    bytes.extend_from_slice(&0_u64.to_le_bytes());
+    bytes.extend_from_slice(&PLACEMENT_EPOCH_PAD);
     bytes.extend_from_slice(&placement.shard.to_be_bytes());
     irokle::TopicId::hash(bytes)
 }
@@ -815,7 +831,6 @@ mod tests {
         let event_id = test_ulid(5);
         let placement_a = PlacementRef {
             strategy_id: test_ulid(9),
-            epoch: 0,
             shard: 3,
         };
         let placement_b = PlacementRef {
@@ -888,7 +903,6 @@ mod tests {
         let realm_id = test_realm(2);
         let placement = PlacementRef {
             strategy_id: test_ulid(4),
-            epoch: 0,
             shard: 5,
         };
         // Fixed inputs → fixed topic id: the stage-2 cross-node canary. A change
@@ -898,13 +912,16 @@ mod tests {
             "b375275475edc34ab568776cea1fdf4053e57458816e8ed35c5925e3caa07cf4"
         );
 
-        // Realm, strategy, and shard move the topic; an epoch transition does not.
+        // A second pinned vector guards the pad slot: shard 0 of the nil
+        // strategy is the bootstrap topic every node derives before any config.
+        assert_eq!(
+            shard_topic_id(test_realm(1), &PlacementRef::NIL).to_string(),
+            "50b84e3436901b73ce31928007b79483807c50a12827539f2265e8a5d9bcc575"
+        );
+
+        // Realm, strategy, and shard are the only inputs that move the topic.
         let other_shard = PlacementRef {
             shard: 6,
-            ..placement
-        };
-        let other_epoch = PlacementRef {
-            epoch: 1,
             ..placement
         };
         let other_strategy = PlacementRef {
@@ -914,10 +931,6 @@ mod tests {
         assert_ne!(
             shard_topic_id(realm_id, &placement),
             shard_topic_id(realm_id, &other_shard)
-        );
-        assert_eq!(
-            shard_topic_id(realm_id, &placement),
-            shard_topic_id(realm_id, &other_epoch)
         );
         assert_ne!(
             shard_topic_id(realm_id, &placement),
@@ -1243,7 +1256,6 @@ mod tests {
         let document_id = test_ulid(4);
         let placement = PlacementRef {
             strategy_id: test_ulid(9),
-            epoch: 0,
             shard: 2,
         };
         let upsert_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };

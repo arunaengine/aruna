@@ -137,6 +137,39 @@ fn topic_digest_and_cursor(net_handle: &NetHandle, topic: irokle::TopicId) -> ([
     (digest, cursor)
 }
 
+/// Hashes the topic lineage and the exact operation at every required frontier
+/// position. Later writes can extend the topic, but cannot change this root.
+pub(crate) fn frontier_root(
+    net_handle: &NetHandle,
+    topic: irokle::TopicId,
+    frontier: &irokle::ActorClock,
+) -> Result<[u8; 32], String> {
+    let node = net_handle.document_sync_node();
+    let storage = node.storage();
+    let state = storage
+        .topic_state(&topic)
+        .map_err(|error| format!("failed to read shard topic state: {error}"))?
+        .ok_or_else(|| "shard topic has no genesis".to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-shard-frontier-root-v1");
+    hasher.update(state.genesis.as_bytes());
+    hasher.update(&(frontier.iter().count() as u64).to_be_bytes());
+    for (actor_id, actor_seq) in frontier.iter() {
+        let op_id = storage
+            .actor_index(&topic, actor_id, *actor_seq)
+            .map_err(|error| format!("failed to read shard frontier operation: {error}"))?
+            .ok_or_else(|| {
+                format!(
+                    "shard frontier operation missing for actor {actor_id} sequence {actor_seq}"
+                )
+            })?;
+        hasher.update(actor_id.as_bytes());
+        hasher.update(&actor_seq.to_be_bytes());
+        hasher.update(op_id.as_bytes());
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,7 +184,6 @@ mod tests {
     fn placement(shard: u32) -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9; 16]),
-            epoch: 0,
             shard,
         }
     }
@@ -270,6 +302,54 @@ mod tests {
             .fingerprint;
         assert_eq!(manifest.digest, expected_digest);
         assert!(postcard::from_bytes::<irokle::ActorClock>(&manifest.cursor).is_ok());
+    }
+
+    #[tokio::test]
+    async fn frontier_root_stable() {
+        let (_dir, context) = spawn_context().await;
+        let net = context.net_handle.as_ref().unwrap();
+        let topic = irokle::TopicId::from_bytes([8; 32]);
+        let node = net.document_sync_node();
+        let actor_id = irokle::actor_id_for(topic, node.peer_id());
+        let oplog = irokle::oplog::Oplog::with_storage(node.storage().clone());
+        oplog
+            .create_topic_genesis(
+                topic,
+                actor_id,
+                irokle::TopicGenesis {
+                    event_type_id: "frontier-test".to_string(),
+                    initial_peers: std::collections::BTreeSet::new(),
+                    replication_policy: irokle::ReplicationPolicy::all(),
+                },
+                node.signer(),
+            )
+            .unwrap();
+        oplog
+            .create_event_op(
+                topic,
+                actor_id,
+                irokle::EventEnvelope {
+                    type_id: "frontier-test".to_string(),
+                    payload: vec![1].into(),
+                },
+                node.signer(),
+            )
+            .unwrap();
+        let mut frontier = irokle::ActorClock::default();
+        frontier.observe(actor_id, 2);
+        let root = frontier_root(net, topic, &frontier).unwrap();
+        oplog
+            .create_event_op(
+                topic,
+                actor_id,
+                irokle::EventEnvelope {
+                    type_id: "frontier-test".to_string(),
+                    payload: vec![2].into(),
+                },
+                node.signer(),
+            )
+            .unwrap();
+        assert_eq!(root, frontier_root(net, topic, &frontier).unwrap());
     }
 
     #[test]

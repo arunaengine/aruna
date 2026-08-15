@@ -58,6 +58,8 @@ pub struct DeleteMetadataDocumentOperation {
     holder_peers: Vec<NodeId>,
     registry_peers: Vec<NodeId>,
     mapping_route: Option<MappingRoute>,
+    /// Buckets the tombstones publish onto, read inside the write transaction.
+    fence: crate::placement::fence::WriteFence,
     txn_id: Option<Ulid>,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
@@ -70,6 +72,7 @@ enum DeleteMetadataDocumentState {
     ReadRealmConfig,
     StartTransaction,
     ReadFence,
+    ReadBucketFence,
     WriteGraphLifecycle,
     WriteGraphPruneJob,
     WriteDocumentLifecycle,
@@ -104,6 +107,8 @@ pub enum DeleteMetadataDocumentError {
     DocumentNotFound,
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("the document's bucket cut over to a new holder set; retry the delete")]
+    PlacementFenced,
     #[error("document delete sync failed: {0}")]
     SyncDelete(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -130,6 +135,7 @@ impl DeleteMetadataDocumentOperation {
             holder_peers: Vec::new(),
             registry_peers: Vec::new(),
             mapping_route: None,
+            fence: Default::default(),
             txn_id: None,
             state: DeleteMetadataDocumentState::Init,
             output: None,
@@ -162,6 +168,22 @@ impl DeleteMetadataDocumentOperation {
             occurred_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis())
                 .unwrap_or_default(),
             details: Some("delete metadata graph".to_string()),
+        }
+    }
+
+    fn write_graph_lifecycle(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+        };
+        let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
+            return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+        };
+        match write_graph_lifecycle_effect(lifecycle_record, Some(txn_id)) {
+            Ok(effect) => {
+                self.state = DeleteMetadataDocumentState::WriteGraphLifecycle;
+                smallvec![effect]
+            }
+            Err(error) => self.fail(DeleteMetadataDocumentError::ConversionError(error)),
         }
     }
 
@@ -218,6 +240,10 @@ impl DeleteMetadataDocumentOperation {
             DocumentSyncOutboxEvent::Upsert { bytes, change },
             self.document_lifecycle_placement_ref,
             true,
+        )
+        .fenced_at(
+            self.fence
+                .generation(&record.realm_id, &self.document_lifecycle_placement_ref),
         ))
     }
 
@@ -262,6 +288,10 @@ impl DeleteMetadataDocumentOperation {
             // deleting holder originates and may mint its genesis.
             self.graph_lifecycle_placement_ref,
             true,
+        )
+        .fenced_at(
+            self.fence
+                .generation(&record.realm_id, &self.graph_lifecycle_placement_ref),
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))
@@ -300,6 +330,10 @@ impl DeleteMetadataDocumentOperation {
             DocumentSyncOutboxEvent::Delete { change },
             self.registry_placement_ref,
             true,
+        )
+        .fenced_at(
+            self.fence
+                .generation(&record.realm_id, &self.registry_placement_ref),
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))
@@ -434,6 +468,15 @@ impl Operation for DeleteMetadataDocumentOperation {
                             self.document_id,
                             self.actor.node_id,
                         );
+                        let mapping_placement =
+                            self.mapping_route.as_ref().map(|route| route.placement);
+                        self.fence.add(
+                            record.realm_id,
+                            &config,
+                            [record.placement, self.registry_placement_ref]
+                                .into_iter()
+                                .chain(mapping_placement),
+                        );
                     }
                     self.state = DeleteMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -470,20 +513,30 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
-                    let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
-                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
-                    };
-                    self.state = DeleteMetadataDocumentState::WriteGraphLifecycle;
-                    match write_graph_lifecycle_effect(lifecycle_record, Some(txn_id)) {
-                        Ok(effect) => smallvec![effect],
-                        Err(error) => {
-                            self.fail(DeleteMetadataDocumentError::ConversionError(error))
-                        }
+                    if self.fence.is_empty() {
+                        return self.write_graph_lifecycle();
                     }
+                    // The fence joins this transaction's read set, so a
+                    // departing holder's close conflicts an uncommitted delete.
+                    self.state = DeleteMetadataDocumentState::ReadBucketFence;
+                    smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: self.fence.reads(),
+                        txn_id: Some(txn_id),
+                    })]
                 }
                 Ok(None) => self.fail(DeleteMetadataDocumentError::DocumentNotFound),
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+            },
+            DeleteMetadataDocumentState::ReadBucketFence => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    if !self.fence.admits(&values) {
+                        return self.fail(DeleteMetadataDocumentError::PlacementFenced);
+                    }
+                    self.write_graph_lifecycle()
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::WriteGraphLifecycle => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
@@ -1123,6 +1176,150 @@ mod tests {
         assert_eq!(graph_change.placement, record.placement);
         assert_eq!(registry_change.placement, registry_ref);
         assert_eq!(document_outbox.peers, vec![actor.node_id]);
+    }
+
+    /// A realm whose buckets are activated at generation one, so a delete
+    /// resolves a generation and takes the bucket's fence.
+    fn activated_config(
+        record: &mut MetadataRegistryRecord,
+        actor: &aruna_core::structs::Actor,
+    ) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 3);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([1; 16]),
+            name: "default".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy.clone()];
+        config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        config.snapshot_candidate_map();
+        record.placement = crate::placement::choose_origin_bucket(
+            &config,
+            &strategy,
+            actor.node_id,
+            &record.document_id.to_bytes(),
+        )
+        .expect("origin holds a bucket");
+        config
+    }
+
+    /// Steps a delete to the bucket fence read and answers every fence with
+    /// `closed`.
+    fn step_to_fence(
+        operation: &mut DeleteMetadataDocumentOperation,
+        record: &MetadataRegistryRecord,
+        config: &RealmConfigDocument,
+        txn_id: Ulid,
+        closed: Option<u64>,
+    ) -> Effects {
+        let registry_read = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: crate::metadata::repository::metadata_registry_key(
+                    record.group_id,
+                    record.document_id,
+                ),
+                value: Some(postcard::to_allocvec(record).unwrap().into()),
+            })
+        };
+        operation.start();
+        operation.step(registry_read());
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*record.realm_id.as_bytes()),
+            value: Some(postcard::to_allocvec(config).unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(registry_read());
+        let [
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: read,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("the transaction batch-reads the bucket fences, got {effects:?}");
+        };
+        assert_eq!(*read, Some(txn_id));
+        let values = reads
+            .iter()
+            .map(|(_, key)| {
+                (
+                    key.clone(),
+                    closed.map(|generation| ByteView::from(generation.to_be_bytes().to_vec())),
+                )
+            })
+            .collect();
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    }
+
+    #[test]
+    fn delete_takes_fence() {
+        // An admitted delete stamps the generation it resolved at onto every
+        // tombstone row, so the drain can bound the predecessor set.
+        let actor = actor();
+        let mut record = record(&actor);
+        let config = activated_config(&mut record, &actor);
+        let mut operation = DeleteMetadataDocumentOperation::new(
+            actor.clone(),
+            record.group_id,
+            record.document_id,
+        );
+
+        let effects = step_to_fence(&mut operation, &record, &config, Ulid::generate(), None);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Write { .. })]
+            ),
+            "an admitted delete writes the graph lifecycle tombstone, got {effects:?}"
+        );
+        let document_outbox = operation
+            .document_lifecycle_outbox_record(&record)
+            .expect("document lifecycle outbox builds");
+        let graph_outbox = outbox_from_effects(
+            operation
+                .graph_lifecycle_outbox_effect(&record, Ulid::generate())
+                .expect("graph lifecycle outbox builds"),
+        );
+        let registry_outbox = outbox_from_effects(
+            operation
+                .registry_delete_outbox_effect(&record, Ulid::generate())
+                .expect("registry delete outbox builds"),
+        );
+        assert_eq!(document_outbox.generation, 1);
+        assert_eq!(graph_outbox.generation, 1);
+        assert_eq!(registry_outbox.generation, 1);
+    }
+
+    #[test]
+    fn fence_rejects_delete() {
+        // The departing holder closed generation one: the delete must not
+        // commit a tombstone the drained bucket can no longer publish.
+        let actor = actor();
+        let mut record = record(&actor);
+        let config = activated_config(&mut record, &actor);
+        let mut operation = DeleteMetadataDocumentOperation::new(
+            actor.clone(),
+            record.group_id,
+            record.document_id,
+        );
+
+        let effects = step_to_fence(&mut operation, &record, &config, Ulid::generate(), Some(1));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Storage(StorageEffect::Write { .. })
+                    | Effect::Storage(StorageEffect::BatchWrite { .. })
+            )),
+            "a fenced delete writes nothing, got {effects:?}"
+        );
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            DeleteMetadataDocumentError::PlacementFenced
+        );
     }
 
     #[test]

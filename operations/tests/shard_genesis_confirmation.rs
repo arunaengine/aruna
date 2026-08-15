@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::document::shard_topic_id;
+use aruna_core::document::{DocumentSyncTarget, shard_topic_id};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -19,10 +19,12 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::placement::{resolve_shard_holders, shard_subject_bytes};
 use aruna_operations::process_placements::process_shard_placements;
+use aruna_operations::startup::{ShardRestoreCursor, ShardRestorePass, restore_shard_pass};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use irokle::oplog::Oplog;
+use irokle::storage::Storage;
 use irokle::{ReplicationPolicy, TopicGenesis};
 use tempfile::TempDir;
 
@@ -298,7 +300,6 @@ fn pin_rank0_everywhere(config: &RealmConfigDocument, rank0: NodeId) -> Vec<Plac
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             overrides.push(PlacementOverride {
@@ -324,7 +325,6 @@ fn member_shard_topics(
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
@@ -341,7 +341,6 @@ fn rank0_shard_of(config: &RealmConfigDocument, rank0: NodeId, co_holder: NodeId
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
@@ -482,4 +481,141 @@ async fn shutdown_nodes(nodes: Vec<TestNode>) {
     for node in nodes {
         node.net.shutdown().await;
     }
+}
+
+// The realm-config document is a SHARED restore target (see `shared_targets`)
+// and it carries every transition barrier and proof. A peer that cannot be
+// reached might already hold its genesis, so a restart must withhold rather
+// than mint a second one: a forked realm config splits membership, makes peers
+// refuse each other's topics, and wedges transitions permanently.
+#[tokio::test]
+async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([154u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    install_realm_config(&nodes, realm_id).await?;
+    // Deliberately NOT meshed: neither node has a path to the other.
+
+    let node = &nodes[0];
+    let topic =
+        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let mut cursor = ShardRestoreCursor::default();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+
+    let pass = restore_shard_pass(
+        &node.context,
+        node.net.node_id(),
+        realm_id,
+        &mut cursor,
+        &cancelled,
+    )
+    .await;
+
+    assert!(
+        !node.net.document_sync_topic_exists(topic).unwrap_or(false),
+        "an unreachable peer must withhold the shared realm-config genesis (a fork is permanent)"
+    );
+    assert!(
+        pass.unresolved_topics.contains(&topic),
+        "withholding must leave the topic unresolved so recovery retries it"
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// Positive absence is a snapshot, not a lock: two reachable nodes starting from
+// an empty realm both see the shared realm-config topic absent everywhere, and
+// both would mint. Only the designated minter (lowest configured sync-eligible
+// node id) may create it; the other withholds, stays retryable, and adopts.
+#[tokio::test]
+async fn single_shared_minter() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([155u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    install_realm_config(&nodes, realm_id).await?;
+    mesh_nodes(&nodes).await;
+
+    let topic =
+        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let (minter, follower) =
+        if nodes[0].net.node_id().as_bytes() < nodes[1].net.node_id().as_bytes() {
+            (&nodes[0], &nodes[1])
+        } else {
+            (&nodes[1], &nodes[0])
+        };
+
+    // The follower probes first, against a minter that has not created it yet:
+    // every reached peer confirms absence, which used to authorize a rival.
+    let pass = run_restore_pass(follower, realm_id).await;
+    assert!(
+        !follower
+            .net
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false),
+        "a non-minter must never create the shared realm-config genesis"
+    );
+    assert!(
+        pass.unresolved_topics.contains(&topic),
+        "withholding must leave the topic unresolved so recovery retries it"
+    );
+
+    run_restore_pass(minter, realm_id).await;
+    let minted = topic_genesis(minter, topic).expect("the designated minter creates the genesis");
+
+    run_restore_pass(follower, realm_id).await;
+    assert_eq!(
+        topic_genesis(follower, topic),
+        Some(minted),
+        "the non-minter must adopt the minter's genesis, never a rival"
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// The same start, released together instead of ordered: the outcome must still
+// be one genesis on both nodes.
+#[tokio::test]
+async fn concurrent_shared_restore() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([156u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    install_realm_config(&nodes, realm_id).await?;
+    mesh_nodes(&nodes).await;
+
+    let topic =
+        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+    futures_util::future::join_all(nodes.iter().map(|node| run_restore_pass(node, realm_id))).await;
+
+    let minted = nodes
+        .iter()
+        .filter_map(|node| topic_genesis(node, topic))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        minted.len() <= 1,
+        "a simultaneous restore must never fork the realm-config genesis: {minted:?}"
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+async fn run_restore_pass(node: &TestNode, realm_id: RealmId) -> ShardRestorePass {
+    let mut cursor = ShardRestoreCursor::default();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    restore_shard_pass(
+        &node.context,
+        node.net.node_id(),
+        realm_id,
+        &mut cursor,
+        &cancelled,
+    )
+    .await
+}
+
+fn topic_genesis(node: &TestNode, topic: ::irokle::TopicId) -> Option<::irokle::OpId> {
+    node.net
+        .document_sync_node()
+        .storage()
+        .topic_state(&topic)
+        .expect("topic state reads")
+        .map(|state| state.genesis)
 }

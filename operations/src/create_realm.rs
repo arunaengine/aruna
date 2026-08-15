@@ -142,6 +142,10 @@ impl CreateRealmOperation {
         config_doc
             .placement_map
             .push(self.creating_node_placement_entry()?);
+        // The creator's own view is epoch one; `admin_reducer_seed_writes` hands
+        // the activations it seeds to the reducer, without which they could
+        // never advance.
+        config_doc.snapshot_candidate_map();
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -277,6 +281,21 @@ impl CreateRealmOperation {
                 entry: self.creating_node_placement_entry()?,
             },
         )?);
+        for map in &config_doc.candidate_maps {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigCandidateMapPublished { map: map.clone() },
+            )?);
+            for strategy in &config_doc.strategies {
+                config_events.push(config_state.apply_operation(
+                    &self.config.actor,
+                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                        strategy_id: strategy.strategy_id,
+                        candidate_map_epoch: map.epoch,
+                    },
+                )?);
+            }
+        }
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
@@ -785,7 +804,7 @@ mod test {
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 18);
+        assert_eq!(outbox_records.len(), 21);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -931,8 +950,72 @@ mod test {
                         },
                     },
                 ),
+                (
+                    18,
+                    AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                        map: config_doc.candidate_maps[0].clone(),
+                    },
+                ),
+                (
+                    19,
+                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                        strategy_id: seeded_strategies[0].strategy_id,
+                        candidate_map_epoch: 1,
+                    },
+                ),
+                (
+                    20,
+                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                        strategy_id: seeded_strategies[1].strategy_id,
+                        candidate_map_epoch: 1,
+                    },
+                ),
             ]
         );
+    }
+
+    // The creator's own view is activated at realm creation, through the
+    // reducer: a literal activation could never advance with a transition.
+    #[test]
+    fn seeds_activated_map() {
+        let realm_id = RealmId::from_bytes([27; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let txn_id = TxnId::generate();
+        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        operation.txn_id = Some(txn_id);
+        operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(realm_id));
+
+        let effects = operation.emit_create_config_doc().unwrap();
+        let writes = batch_writes(&effects, txn_id);
+        let config_doc = RealmConfigDocument::from_bytes(
+            write_values(writes, REALM_CONFIG_KEYSPACE)
+                .first()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let config_state = write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref()).unwrap())
+            .find(|state| state.target == (AdminDocumentTarget::RealmConfig { realm_id }))
+            .expect("the config reducer state is seeded");
+
+        let map = config_doc.candidate_map(1).expect("epoch one is published");
+        assert_eq!(map.nodes.len(), 1);
+        assert_eq!(map.nodes[0].node_id, actor.node_id);
+        for strategy in &config_doc.strategies {
+            assert_eq!(
+                config_state
+                    .materialized_activation_epochs()
+                    .get(&strategy.strategy_id),
+                Some(&1)
+            );
+            let activation = config_doc
+                .activation(&strategy.strategy_id, 0)
+                .expect("bucket zero is activated");
+            assert_eq!(activation.candidate_map_epoch, 1);
+            assert_eq!(activation.activation_epoch, 1);
+        }
     }
 
     #[test]

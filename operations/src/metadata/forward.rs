@@ -48,9 +48,7 @@ use crate::metadata::protocol::{
     PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
 };
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
-use crate::placement::{
-    MAX_READ_HOLDERS, holds_placement, resolve_holders_limit, resolve_shard_holders,
-};
+use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
@@ -341,7 +339,8 @@ pub async fn get_metadata_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_holders_limit(&config, &placement, MAX_READ_HOLDERS);
+    let holders =
+        read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
     let holder_count = holders.len();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
@@ -457,7 +456,8 @@ pub async fn export_rocrate_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_holders_limit(&config, &placement, MAX_READ_HOLDERS);
+    let holders =
+        read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
     let holder_count = holders.len();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
@@ -1793,6 +1793,7 @@ fn read_error(error: MetadataApiError) -> MetadataReadError {
         MetadataApiError::NotFound => MetadataReadError::NotFound,
         MetadataApiError::BadRequest
         | MetadataApiError::ServiceUnavailable
+        | MetadataApiError::PlacementUnavailable(_)
         | MetadataApiError::InvalidCursor(_)
         | MetadataApiError::Internal(_) => MetadataReadError::Unavailable,
     }
@@ -2245,7 +2246,6 @@ mod tests {
             config,
             PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard: 9,
             },
         )

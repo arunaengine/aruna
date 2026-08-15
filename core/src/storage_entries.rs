@@ -31,9 +31,9 @@ use crate::metadata::{
     MetadataMaterializationStatusRecord, MetadataRawOriginBudget,
 };
 use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
-    WatchSubscription, notification_inbox_key, notification_outbox_key,
-    notification_prune_index_key, watch_subscription_key,
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PLACEMENT_EPOCH_PAD,
+    PlacementRef, RealmId, User, WatchSubscription, notification_inbox_key,
+    notification_outbox_key, notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
 
@@ -408,7 +408,7 @@ pub fn document_sync_revision_write_entry(
     ))
 }
 
-/// Manifest-row key: `strategy(16) ‖ epoch(8, le) ‖ shard(4, be) ‖ per-target
+/// Manifest-row key: `strategy(16) ‖ pad(8) ‖ shard(4, be) ‖ per-target
 /// sidecar key`. The 28-byte shard prefix isolates one shard's rows on a scan;
 /// the sidecar tail (keyspace-discriminated, see
 /// [`document_sync_revision_key`]) keeps two targets sharing a storage key from
@@ -421,12 +421,23 @@ pub fn shard_manifest_key(placement: &PlacementRef, target: &DocumentSyncTarget)
     ByteView::from(bytes)
 }
 
-/// The 28-byte shard prefix (`strategy ‖ epoch ‖ shard`) a manifest assembly
+/// Key of a bucket's write-admission fence: `realm ‖ strategy ‖ shard`. The
+/// fence is local state: it admits this node's own writes against its own
+/// observation of the bucket's cutover.
+pub fn placement_fence_key(realm_id: &RealmId, placement: &PlacementRef) -> Key {
+    let mut bytes = Vec::with_capacity(52);
+    bytes.extend_from_slice(realm_id.as_bytes());
+    bytes.extend_from_slice(&placement.strategy_id.to_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
+    ByteView::from(bytes)
+}
+
+/// The 28-byte shard prefix (`strategy ‖ pad ‖ shard`) a manifest assembly
 /// scan iterates.
 pub fn shard_manifest_prefix(placement: &PlacementRef) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(28);
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
-    bytes.extend_from_slice(&placement.epoch.to_le_bytes());
+    bytes.extend_from_slice(&PLACEMENT_EPOCH_PAD);
     bytes.extend_from_slice(&placement.shard.to_be_bytes());
     bytes
 }
@@ -1095,7 +1106,6 @@ mod tests {
     fn shard_placement(shard: u32) -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9; 16]),
-            epoch: 0,
             shard,
         }
     }

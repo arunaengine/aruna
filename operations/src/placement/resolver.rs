@@ -2,29 +2,21 @@
 //! two-level rendezvous primitives in [`crate::placement::selector`].
 
 use std::collections::{BTreeMap, HashSet};
-use std::str::FromStr;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
-    AffinityEffect, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    KIND_LABEL_KEY, LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy,
-    RealmConfigDocument, RealmId, RealmNodeKind,
+    AffinityEffect, BindingScope, CandidateMapNode, CandidatePlacementMap, DocumentClass,
+    LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy, RealmConfigDocument,
+    RealmId,
 };
 use aruna_core::types::GroupId;
 
 use crate::placement::selector::{ROLE_LOCATION, ROLE_NODE, rank_weighted};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedNode {
-    pub node_id: NodeId,
-    pub kind: RealmNodeKind,
-    pub location: String,
-    pub weight: u32,
-    pub full: bool,
-    pub draining: bool,
-    pub labels: BTreeMap<String, String>,
-}
+/// The selector's node record. Identical to the serialized form a candidate
+/// map freezes, so pinning a view is a clone rather than a conversion.
+pub type ResolvedNode = CandidateMapNode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementView {
@@ -46,38 +38,17 @@ pub struct PlacementResolutionContext<'a> {
 /// class-1 placement-map entry, never the eventually-consistent `NodeInfo`, so
 /// holder sets stay a pure function of the placement map.
 pub fn build_view(config: &RealmConfigDocument) -> PlacementView {
-    let mut nodes = Vec::with_capacity(config.nodes.len());
-    for realm_node in &config.nodes {
-        let Ok(node_id) = NodeId::from_str(&realm_node.node_id) else {
-            continue;
-        };
-        let entry = config.placement_entry(node_id);
-        let location = entry
-            .map(|entry| entry.effective_location().to_string())
-            .unwrap_or_else(|| DEFAULT_LOCATION.to_string());
-        let weight = entry
-            .map(|entry| entry.weight)
-            .unwrap_or(DEFAULT_NODE_WEIGHT);
-        let full = entry.is_some_and(|entry| entry.full);
-        let draining = entry.is_some_and(|entry| entry.draining);
-
-        let mut labels = entry.map(|entry| entry.labels.clone()).unwrap_or_default();
-        labels.insert(
-            KIND_LABEL_KEY.to_string(),
-            kind_label(&realm_node.kind).to_string(),
-        );
-
-        nodes.push(ResolvedNode {
-            node_id,
-            kind: realm_node.kind.clone(),
-            location,
-            weight,
-            full,
-            draining,
-            labels,
-        });
+    PlacementView {
+        nodes: config.candidate_nodes(),
     }
-    PlacementView { nodes }
+}
+
+/// The frozen selection view of a published candidate map. Pinning resolves
+/// over this instead of the live config, so a config edit moves no holder.
+pub fn view_from_map(map: &CandidatePlacementMap) -> PlacementView {
+    PlacementView {
+        nodes: map.nodes.clone(),
+    }
 }
 
 /// Resolves holders for `subject` in rank order (downstream retry order).
@@ -354,15 +325,6 @@ fn label_matches(labels: &BTreeMap<String, String>, matcher: &LabelMatch) -> boo
         .is_some_and(|value| value == &matcher.value)
 }
 
-fn kind_label(kind: &RealmNodeKind) -> &'static str {
-    match kind {
-        RealmNodeKind::Management => "management",
-        RealmNodeKind::Server => "server",
-        RealmNodeKind::Local => "local",
-        RealmNodeKind::User => "user",
-    }
-}
-
 fn group_id_of(target: &DocumentSyncTarget) -> Option<GroupId> {
     match target {
         DocumentSyncTarget::Group { group_id }
@@ -472,7 +434,8 @@ mod tests {
     };
     use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::structs::{
-        AffinityRule, NodePlacementEntry, RealmId, RealmNode, StrategyBinding,
+        AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY, NodePlacementEntry,
+        RealmId, RealmNode, RealmNodeKind, StrategyBinding,
     };
     use aruna_core::types::UserId;
     use proptest::prelude::*;
@@ -1023,7 +986,7 @@ mod tests {
         let reducer_state =
             AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
 
-        overlay_realm_config_placement_reducer_materialization(&mut config, &reducer_state);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &reducer_state, 0);
 
         assert_eq!(config.default_strategy_id, Some(live));
         assert_eq!(config.strategy_bindings[0].strategy_id, live);

@@ -57,6 +57,8 @@ pub struct UpdateUserInput {
 pub struct UpdateUserOperation {
     input: UpdateUserInput,
     target_user_id: Option<UserId>,
+    /// Bucket the user's rows publish onto, read inside the write transaction.
+    fence: crate::placement::fence::WriteFence,
     state: UpdateUserState,
     output: Option<Result<User, UpdateUserError>>,
 }
@@ -76,6 +78,11 @@ enum UpdateUserState {
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
     DeleteStaleAdminConflicts {
+        txn_id: TxnId,
+        user: User,
+        admin_outbox_written: bool,
+    },
+    ReadBucketFence {
         txn_id: TxnId,
         user: User,
         admin_outbox_written: bool,
@@ -121,6 +128,8 @@ pub enum UpdateUserError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
+    #[error("the user's bucket cut over to a new holder set; retry the update")]
+    PlacementFenced,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -146,6 +155,7 @@ impl UpdateUserOperation {
         Self {
             input,
             target_user_id: None,
+            fence: Default::default(),
             state: UpdateUserState::Init,
             output: None,
         }
@@ -348,12 +358,19 @@ impl UpdateUserOperation {
         let document_target = DocumentSyncTarget::User {
             user_id: user.user_id,
         };
-        let placement = realm_config_value
+        let realm_config = realm_config_value
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
-            .transpose()?
-            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
+            .transpose()?;
+        let placement = realm_config
+            .as_ref()
+            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
+        let realm_id = self.input.actor.realm_id;
+        if let Some(config) = realm_config.as_ref() {
+            self.fence.add(realm_id, config, [placement]);
+        }
+        let generation = self.fence.generation(&realm_id, &placement);
         let document_revision = local_user_document_sync_change(
             previous_document_revision.as_ref(),
             &self.input.actor,
@@ -388,7 +405,8 @@ impl UpdateUserOperation {
                 },
                 placement,
                 false,
-            );
+            )
+            .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
@@ -447,12 +465,46 @@ impl UpdateUserOperation {
         self.emit_commit_transaction(txn_id, user, admin_outbox_written)
     }
 
+    /// Takes the bucket's fence inside the transaction before committing, so a
+    /// departing holder's close rejects or conflicts this write.
     fn emit_commit_transaction(
         &mut self,
         txn_id: TxnId,
         user: User,
         admin_outbox_written: bool,
     ) -> Effects {
+        if self.fence.is_empty() {
+            return self.emit_commit(txn_id, user, admin_outbox_written);
+        }
+        self.state = UpdateUserState::ReadBucketFence {
+            txn_id,
+            user,
+            admin_outbox_written,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.fence.reads(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_bucket_fence(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+        user: User,
+        admin_outbox_written: bool,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
+        };
+        if !self.fence.admits(&values) {
+            return self.fail(UpdateUserError::PlacementFenced);
+        }
+        self.emit_commit(txn_id, user, admin_outbox_written)
+    }
+
+    fn emit_commit(&mut self, txn_id: TxnId, user: User, admin_outbox_written: bool) -> Effects {
         self.state = UpdateUserState::CommitTransaction {
             txn_id,
             user,
@@ -570,6 +622,11 @@ impl Operation for UpdateUserOperation {
             } => {
                 self.handle_delete_stale_admin_conflicts(event, txn_id, user, admin_outbox_written)
             }
+            UpdateUserState::ReadBucketFence {
+                txn_id,
+                user,
+                admin_outbox_written,
+            } => self.handle_bucket_fence(event, txn_id, user, admin_outbox_written),
             UpdateUserState::CommitTransaction {
                 user,
                 admin_outbox_written,
@@ -596,6 +653,7 @@ impl Operation for UpdateUserOperation {
             UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id }
             | UpdateUserState::WriteUserAdminStateAndDocumentRevision { txn_id, .. }
             | UpdateUserState::DeleteStaleAdminConflicts { txn_id, .. }
+            | UpdateUserState::ReadBucketFence { txn_id, .. }
             | UpdateUserState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
@@ -1196,5 +1254,125 @@ mod tests {
 
         assert!(effects.is_empty());
         assert!(operation.finalize().is_err());
+    }
+
+    /// A realm whose buckets are activated at generation one, so an update
+    /// resolves a generation and takes the user bucket's fence.
+    fn activated_config(
+        realm_id: RealmId,
+        actor: &Actor,
+    ) -> aruna_core::structs::RealmConfigDocument {
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, aruna_core::structs::RealmNodeKind::Server);
+        config
+            .strategies
+            .push(aruna_core::structs::PlacementStrategy {
+                strategy_id: Ulid::from_bytes([5; 16]),
+                name: "default".to_string(),
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+                shard_count: 16,
+            });
+        config.default_strategy_id = Some(config.strategies[0].strategy_id);
+        config.snapshot_candidate_map();
+        config
+    }
+
+    /// Steps a user update to the bucket fence read and answers it with `closed`.
+    fn step_to_fence(
+        operation: &mut UpdateUserOperation,
+        realm_id: RealmId,
+        user_id: UserId,
+        txn_id: TxnId,
+        closed: Option<u64>,
+    ) -> aruna_core::types::Effects {
+        let caller = actor(realm_id, user_id);
+        let config = activated_config(realm_id, &caller);
+        let admin_target = AdminDocumentTarget::User { user_id };
+        let document_target = DocumentSyncTarget::User { user_id };
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    user_id.to_bytes().into(),
+                    Some(stored_user(user_id).to_bytes(&caller).unwrap().into()),
+                ),
+                (admin_document_reducer_state_key(&admin_target), None),
+                (document_sync_revision_key(&document_target), None),
+                (
+                    ByteView::from(*realm_id.as_bytes()),
+                    Some(config.to_bytes(&caller).unwrap().into()),
+                ),
+            ],
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: read,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("the transaction batch-reads the bucket fence, got {effects:?}");
+        };
+        assert_eq!(*read, Some(txn_id));
+        let values = reads
+            .iter()
+            .map(|(_, key)| {
+                (
+                    key.clone(),
+                    closed.map(|generation| {
+                        aruna_core::types::Value::from(generation.to_be_bytes().to_vec())
+                    }),
+                )
+            })
+            .collect();
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    }
+
+    #[test]
+    fn update_takes_fence() {
+        // An admitted user update commits only after taking the bucket's fence.
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
+
+        let effects = step_to_fence(&mut operation, realm_id, user_id, TxnId::generate(), None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+    }
+
+    #[test]
+    fn fence_rejects_user() {
+        // The departing holder closed generation one: the update must not
+        // commit a row the drained bucket can no longer publish.
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
+
+        let effects = step_to_fence(
+            &mut operation,
+            realm_id,
+            user_id,
+            TxnId::generate(),
+            Some(1),
+        );
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Storage(StorageEffect::CommitTransaction { .. })
+            )),
+            "a fenced update never commits, got {effects:?}"
+        );
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            UpdateUserError::PlacementFenced
+        );
     }
 }

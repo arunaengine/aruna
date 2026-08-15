@@ -9,11 +9,12 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
+use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::{draining_former_holders, resolve_shard_holders};
+use crate::placement::{bucket_membership, draining_former_holders, resolve_shard_holders};
 use crate::sync_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
@@ -51,27 +52,59 @@ async fn ensure_held_shard_topics(
     realm_id: RealmId,
     local_node_id: NodeId,
     verified: &BTreeSet<::irokle::TopicId>,
+    now_ms: u64,
 ) -> HeldTopicOutcome {
-    type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
+    type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
     let mut rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut member_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut outcome = HeldTopicOutcome::default();
     for strategy in &config.strategies {
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            if !holders.contains(&local_node_id) {
+            // Per-bucket membership: admitted targets join for delivery, and
+            // retained departing holders stay through their bucket's grace
+            // (#399 bounds the peak at |old U new|); publish authority stays
+            // with activated plus retained holders only.
+            let membership = bucket_membership(config, &placement, now_ms);
+            if !membership.members.contains(&local_node_id) {
                 continue;
             }
+            let active_target = config.placement_transitions.iter().any(|transition| {
+                transition.plan.strategy_id == placement.strategy_id
+                    && matches!(
+                        transition.status,
+                        aruna_core::structs::TransitionStatus::Active
+                    )
+                    && transition
+                        .plan
+                        .bucket_plan(placement.shard)
+                        .is_some_and(|bucket| {
+                            transition.completion(placement.shard).is_none()
+                                && bucket.target_holders.contains(&local_node_id)
+                        })
+            });
+            if (holders.contains(&local_node_id) || active_target)
+                && let Err(error) =
+                    net_handle.unseal_sync_topic(shard_topic_id(realm_id, &placement))
+            {
+                debug!(error = %error, "Failed to unseal a current shard holder topic");
+                outcome.pull_pending = true;
+            }
+            // Rank-0 is an activation role: a target that has not cut over yet
+            // never creates a genesis (#400).
             let local_is_rank0 = holders.first() == Some(&local_node_id);
-            let mut co_holders: Vec<NodeId> = holders
+            let mut co_members: Vec<NodeId> = membership
+                .members
                 .into_iter()
                 .filter(|candidate| *candidate != local_node_id)
                 .collect();
-            sort_node_ids(&mut co_holders);
+            sort_node_ids(&mut co_members);
+            let mut publishers = membership.publishers;
+            sort_node_ids(&mut publishers);
             let retained: BTreeSet<NodeId> = draining_former_holders(config, &placement)
                 .into_iter()
                 .collect();
@@ -81,27 +114,30 @@ async fn ensure_held_shard_topics(
                 &mut member_groups
             };
             groups
-                .entry((co_holders, retained))
+                .entry((co_members, publishers, retained))
                 .or_default()
                 .push(shard_topic_id(realm_id, &placement));
         }
     }
-    let mut outcome = HeldTopicOutcome::default();
-    for ((co_holders, retained), topics) in rank0_groups {
+    // Pass-scoped, so a peer that comes back is probed again next reconcile.
+    let mut unreachable_peers: BTreeSet<NodeId> = BTreeSet::new();
+    for ((co_members, publishers, retained), topics) in rank0_groups {
         debug!(
             event = "placement.genesis.ensure",
             topics = topics.len(),
-            co_holders = co_holders.len(),
+            co_members = co_members.len(),
             "Ensuring rank-0 shard topic geneses"
         );
         outcome.withheld |= ensure_rank0_shard_group(
             context,
             net_handle,
             local_node_id,
-            co_holders,
+            co_members,
+            publishers,
             topics,
             &retained,
             verified,
+            &mut unreachable_peers,
         )
         .await;
     }
@@ -113,18 +149,24 @@ async fn ensure_held_shard_topics(
     // origin is drained out of the holder set, nobody does.
     // Topics already known are topped up with the current co-holder set, which
     // is what admits a freshly added holder on the pushing side.
-    for ((co_holders, retained), topics) in member_groups {
-        if co_holders.is_empty() {
+    for ((co_members, publishers, retained), topics) in member_groups {
+        if co_members.is_empty() {
             continue;
         }
-        let mut current_holders = co_holders.clone();
-        current_holders.push(local_node_id);
-        sort_node_ids(&mut current_holders);
+        let mut current_members = co_members.clone();
+        current_members.push(local_node_id);
+        sort_node_ids(&mut current_members);
         // Install the current publisher policy before pulling any history. A
         // missing topic is expected here; the exact membership pass below is
         // repeated after a successful pull.
         let _ = net_handle
-            .reconcile_shard_membership(&topics, current_holders.clone(), &retained, verified)
+            .reconcile_shard_membership(
+                &topics,
+                current_members.clone(),
+                publishers.clone(),
+                &retained,
+                verified,
+            )
             .await;
         let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
             topics.into_iter().partition(|topic| {
@@ -136,11 +178,11 @@ async fn ensure_held_shard_topics(
             debug!(
                 event = "placement.topic.pull",
                 topics = missing.len(),
-                co_holders = co_holders.len(),
+                co_members = co_members.len(),
                 "Pulling newly held shard topics from co-holders"
             );
             let event = net_handle
-                .sync_document_topics(missing.clone(), co_holders.clone())
+                .sync_document_topics(missing.clone(), co_members.clone())
                 .await;
             crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
             for topic in missing {
@@ -160,7 +202,7 @@ async fn ensure_held_shard_topics(
             continue;
         }
         if let Err(error) = net_handle
-            .reconcile_shard_membership(&known, current_holders, &retained, verified)
+            .reconcile_shard_membership(&known, current_members, publishers, &retained, verified)
             .await
         {
             debug!(error = %error, "Could not complete held shard topic membership");
@@ -185,24 +227,29 @@ async fn ensure_held_shard_topics(
 ///
 /// Returns whether any genesis was withheld (or an adopt failed to land), so the
 /// caller schedules a placement retry instead of deferring writes forever.
-pub(crate) async fn ensure_rank0_shard_group(
+/// Splits `topics` into the ones this node may safely hold or create and a flag
+/// saying whether any creation was withheld.
+///
+/// A topic a co-holder already holds is adopted by anti-entropy; one every
+/// reached co-holder positively confirmed unknown is safe to create; but if any
+/// co-holder was unreachable, or a reached one refused the topic (it holds the
+/// genesis but the prober may not open it yet), creation is withheld — either
+/// might hold a genesis, and forking a second one is a permanent split-brain.
+/// A sole holder creates immediately: no peer can hold a divergent genesis.
+/// The withheld flag tells the caller to retry rather than strand the topic.
+///
+/// `may_mint` is the caller's single-minter decision. Positive absence is a
+/// snapshot, not a lock, so a caller that is not the designated minter for these
+/// topics adopts only and leaves an absent topic withheld.
+pub(crate) async fn resolve_creatable_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     local_node_id: NodeId,
-    co_holders: Vec<NodeId>,
+    co_members: &[NodeId],
     topics: Vec<::irokle::TopicId>,
-    retained: &BTreeSet<NodeId>,
-    verified: &BTreeSet<::irokle::TopicId>,
-) -> bool {
-    let mut current_holders = co_holders.clone();
-    current_holders.push(local_node_id);
-    sort_node_ids(&mut current_holders);
-    // This first pass installs publisher policy even when a topic still needs
-    // to be adopted or created. Exact membership is retried once it exists.
-    let _ = net_handle
-        .reconcile_shard_membership(&topics, current_holders.clone(), retained, verified)
-        .await;
-
+    may_mint: bool,
+    unreachable_peers: &mut BTreeSet<NodeId>,
+) -> (Vec<::irokle::TopicId>, bool) {
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
     let mut missing: Vec<::irokle::TopicId> = Vec::new();
     for topic in topics {
@@ -217,60 +264,123 @@ pub(crate) async fn ensure_rank0_shard_group(
     }
 
     let mut withheld = false;
-    if !missing.is_empty() {
-        if co_holders.is_empty() {
+    if missing.is_empty() {
+        return (to_ensure, withheld);
+    }
+    if co_members.is_empty() {
+        if may_mint {
             to_ensure.extend(missing);
         } else {
-            let probe = net_handle
-                .probe_shard_topic_geneses(missing.clone(), co_holders.clone())
-                .await;
-            let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
-            for topic in missing {
-                if probe.known_by_co_holder.contains(&topic) {
-                    to_adopt.push(topic);
-                } else if probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
-                    to_ensure.push(topic);
-                } else {
-                    // A co-holder was unreachable, or a reached one refused the
-                    // topic (holds it but the prober may not open it yet):
-                    // withhold this genesis rather than fork a second one.
-                    withheld = true;
-                }
-            }
-            if !to_adopt.is_empty() {
-                let event = net_handle
-                    .sync_document_topics(to_adopt.clone(), co_holders.clone())
-                    .await;
-                crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
-                // Only ensure membership on topics whose genesis actually landed;
-                // an adopt that failed (co-holder now unreachable) must not fall
-                // through to a fresh create — retry it on the next pass instead.
-                for topic in to_adopt {
-                    if net_handle
-                        .document_sync_topic_exists(topic)
-                        .unwrap_or(false)
-                    {
-                        to_ensure.push(topic);
-                    } else {
-                        withheld = true;
-                    }
-                }
-            }
-            if !probe.unreachable.is_empty() || !probe.unconfirmed.is_empty() {
-                warn!(
-                    unreachable = ?probe.unreachable,
-                    unconfirmed = ?probe.unconfirmed,
-                    "Withholding shard genesis creation: co-holder unreachable or topic possibly-existing"
-                );
+            withheld = true;
+        }
+        return (to_ensure, withheld);
+    }
+
+    // A peer already unreachable in this pass is not probed again: waiting its
+    // full deadline a second time cannot change the verdict. A stale entry can
+    // only withhold, never mint, so a peer that recovers costs one more pass.
+    let (live, skipped): (Vec<NodeId>, Vec<NodeId>) = co_members
+        .iter()
+        .copied()
+        .partition(|peer| !unreachable_peers.contains(peer));
+    let mut probe = if live.is_empty() {
+        aruna_net::ShardGenesisProbe::default()
+    } else {
+        net_handle
+            .probe_shard_topic_geneses(missing.clone(), live)
+            .await
+    };
+    // Skipped peers stay in `unreachable` so an all-dead set still withholds:
+    // dropping them would read as "no co-holder to consult" and mint a rival.
+    probe.unreachable.extend(skipped);
+    unreachable_peers.extend(probe.unreachable.iter().copied());
+    let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
+    for topic in missing {
+        if probe.known_by_co_holder.contains(&topic) {
+            to_adopt.push(topic);
+        } else if may_mint && probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
+            to_ensure.push(topic);
+        } else {
+            withheld = true;
+        }
+    }
+    if !to_adopt.is_empty() {
+        let event = net_handle
+            .sync_document_topics(to_adopt.clone(), co_members.to_vec())
+            .await;
+        crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+        // Only keep topics whose genesis actually landed; an adopt that failed
+        // must not fall through to a fresh create - retry it on the next pass.
+        for topic in to_adopt {
+            if net_handle
+                .document_sync_topic_exists(topic)
+                .unwrap_or(false)
+            {
+                to_ensure.push(topic);
+            } else {
+                withheld = true;
             }
         }
     }
+    if !probe.unreachable.is_empty() || !probe.unconfirmed.is_empty() {
+        warn!(
+            unreachable = ?probe.unreachable,
+            unconfirmed = ?probe.unconfirmed,
+            "Withholding genesis creation: co-holder unreachable or topic possibly-existing"
+        );
+    }
+    (to_ensure, withheld)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ensure_rank0_shard_group(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    local_node_id: NodeId,
+    co_members: Vec<NodeId>,
+    publishers: Vec<NodeId>,
+    topics: Vec<::irokle::TopicId>,
+    retained: &BTreeSet<NodeId>,
+    verified: &BTreeSet<::irokle::TopicId>,
+    unreachable_peers: &mut BTreeSet<NodeId>,
+) -> bool {
+    let mut current_members = co_members.clone();
+    current_members.push(local_node_id);
+    sort_node_ids(&mut current_members);
+    // This first pass installs publisher policy even when a topic still needs
+    // to be adopted or created. Exact membership is retried once it exists.
+    let _ = net_handle
+        .reconcile_shard_membership(
+            &topics,
+            current_members.clone(),
+            publishers.clone(),
+            retained,
+            verified,
+        )
+        .await;
+
+    let (to_ensure, mut withheld) = resolve_creatable_topics(
+        context,
+        net_handle,
+        local_node_id,
+        &co_members,
+        topics,
+        true,
+        unreachable_peers,
+    )
+    .await;
 
     if !to_ensure.is_empty() {
-        match net_handle.ensure_document_sync_topics(&to_ensure, co_holders) {
+        match net_handle.ensure_document_sync_topics(&to_ensure, co_members) {
             Ok(()) => {
                 if let Err(error) = net_handle
-                    .reconcile_shard_membership(&to_ensure, current_holders, retained, verified)
+                    .reconcile_shard_membership(
+                        &to_ensure,
+                        current_members,
+                        publishers,
+                        retained,
+                        verified,
+                    )
                     .await
                 {
                     warn!(error = %error, "Failed to reconcile rank-0 shard membership");
@@ -361,6 +471,26 @@ pub async fn process_shard_placements(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> PlacementReconcileOutcome {
+    reconcile_placements(context, realm_id, local_node_id, true).await
+}
+
+/// [`process_shard_placements`] minus transition-step execution, for request
+/// paths: every placement mutation arms a zero-delay `SyncPlacements` timer,
+/// so barriers and completion proofs run in the background instead of inline.
+pub async fn reconcile_shard_topics(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+) -> PlacementReconcileOutcome {
+    reconcile_placements(context, realm_id, local_node_id, false).await
+}
+
+async fn reconcile_placements(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    run_transitions: bool,
+) -> PlacementReconcileOutcome {
     let config = match load_realm_config_outcome(context, realm_id).await {
         RealmConfigLoadOutcome::Found(config) => config,
         RealmConfigLoadOutcome::Absent => {
@@ -388,9 +518,46 @@ pub async fn process_shard_placements(
         realm_id,
         local_node_id,
         &verified,
+        unix_timestamp_millis(),
     )
     .await;
     let mut retry_needed = held.withheld || held.pull_pending;
+    if run_transitions {
+        retry_needed |= crate::process_transitions::process_placement_transitions(
+            context,
+            realm_id,
+            local_node_id,
+            &config,
+        )
+        .await;
+    } else if has_transition_work(&config, unix_timestamp_millis())
+        && let Some(task_handle) = context.task_handle.as_ref()
+    {
+        // A pure transition target never mutates the config, so nothing else
+        // arms its timer; fire the deferred execution now.
+        let effect = crate::sync_placement::schedule_placement_retry_after(
+            realm_id,
+            local_node_id,
+            std::time::Duration::ZERO,
+        );
+        let _ = task_handle.send_effect(effect).await;
+    }
+
+    // Release is a deadline, not an event: arm the timer for the earliest
+    // pending grace end (shorten-only, so a sooner retry is never postponed)
+    // and keep the normal retry driving post-grace drain scans.
+    let deadline_now = unix_timestamp_millis();
+    retry_needed |= crate::placement::drain_pending(&config, deadline_now);
+    if let Some(deadline) = crate::placement::next_release_ms(&config, deadline_now)
+        && let Some(task_handle) = context.task_handle.as_ref()
+    {
+        let effect = crate::sync_placement::schedule_placement_deadline(
+            realm_id,
+            local_node_id,
+            std::time::Duration::from_millis(deadline.saturating_sub(deadline_now)),
+        );
+        let _ = task_handle.send_effect(effect).await;
+    }
 
     let mut start_after: Option<Key> = None;
     loop {
@@ -435,7 +602,26 @@ pub async fn process_shard_placements(
                 continue;
             }
 
-            let holders = resolve_shard_holders(&config, &record.placement);
+            // A resolution failure keeps the durable record: deleting it on a
+            // missing or conflicted activation would destroy the only retry.
+            let holders =
+                match crate::placement::resolve_shard_holders_checked(&config, &record.placement) {
+                    Ok(holders) => holders,
+                    Err(error) => {
+                        debug!(error = %error, "Keeping placement record for unresolvable bucket");
+                        let refreshed = new_placement(
+                            realm_id,
+                            record.placement,
+                            local_node_id,
+                            record.selected_peers.clone(),
+                        );
+                        if let Ok(effect) = write_placement_effect(&refreshed) {
+                            let _ = context.storage_handle.send_effect(effect).await;
+                        }
+                        retry_needed = true;
+                        continue;
+                    }
+                };
             if !holders.contains(&local_node_id) {
                 // The local node is no longer a holder of this shard. Drop the
                 // verification marker too so a later re-entry re-verifies.
@@ -491,8 +677,15 @@ pub async fn process_shard_placements(
             let retained = draining_former_holders(&config, &record.placement)
                 .into_iter()
                 .collect();
+            let bucket = bucket_membership(&config, &record.placement, unix_timestamp_millis());
             let membership = net_handle
-                .reconcile_shard_membership(&[topic], holders, &retained, &verified)
+                .reconcile_shard_membership(
+                    &[topic],
+                    bucket.members,
+                    bucket.publishers,
+                    &retained,
+                    &verified,
+                )
                 .await;
             match membership {
                 Ok(()) => {
@@ -536,6 +729,33 @@ pub async fn process_shard_placements(
         return PlacementReconcileOutcome::retry_scheduled(held.pull_pending);
     }
     PlacementReconcileOutcome::clean()
+}
+
+/// Whether the transitions engine may have local steps to run: an unsettled
+/// transition, or a strategy whose activations nobody initialized yet.
+fn has_transition_work(config: &RealmConfigDocument, now_ms: u64) -> bool {
+    config
+        .placement_transitions
+        .iter()
+        .any(|transition| !transition.is_terminal())
+        || (config.newest_map_epoch().is_some()
+            && config
+                .strategies
+                .iter()
+                .any(|strategy| config.activation(&strategy.strategy_id, 0).is_none()))
+        || crate::placement::next_release_ms(config, now_ms).is_some()
+        || crate::placement::drain_pending(config, now_ms)
+        // A cheap over-approximation of a pending successor expansion: an
+        // activation trailing the newest map with no transition in flight.
+        || config.newest_map_epoch().is_some_and(|newest| {
+            config.placement_activations.iter().any(|activation| {
+                activation.candidate_map_epoch != newest
+                    && !config.placement_transitions.iter().any(|transition| {
+                        transition.plan.strategy_id == activation.strategy_id
+                            && !transition.is_terminal()
+                    })
+            })
+        })
 }
 
 async fn load_realm_config_outcome(
@@ -627,7 +847,6 @@ mod tests {
             config,
             PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard: 3,
             },
         )

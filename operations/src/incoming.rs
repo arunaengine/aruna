@@ -19,7 +19,7 @@ use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::permission_rules::GroupPermissionRules;
-use crate::process_placements::process_shard_placements;
+use crate::process_placements::reconcile_shard_topics;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::replication::bao_read::IncomingBaoReadOperation;
 use crate::replication::incoming_version_replication::{
@@ -505,7 +505,9 @@ async fn reconcile_inbound_document_sync_topics(
         .iter()
         .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }));
     if realm_config_changed {
-        process_shard_placements(context, *net_handle.realm_id(), net_handle.node_id()).await;
+        // Transition-free: a heavy transition step here would stall document
+        // application; the reconcile arms the SyncPlacements timer instead.
+        reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
     }
     refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
     refresh_watch_interest_for_targets(context, &targets.targets).await;
@@ -888,8 +890,8 @@ impl InboundEventHandler for OperationsInboundHandler {
         .await;
     }
 
-    async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) {
-        reemit_evicted_documents(self.context.as_ref(), documents).await;
+    async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) -> bool {
+        reemit_evicted_documents(self.context.as_ref(), documents).await
     }
 }
 
@@ -909,25 +911,30 @@ fn close_bao_stream(mut stream: BiStream) {
 
 /// Re-enqueues the payloads recovered from a genesis tie-break eviction as
 /// document-sync outbox records so they replay onto the winning chain through
-/// the normal drain. Admin operations keep their original embedded event id,
-/// which is the whole safety story: appliers dedupe on it, so replaying an
-/// event that already landed on the winner chain is a no-op. Every record uses
-/// `allow_genesis: false` (the loser must not mint a rival genesis) and empty
-/// peers (resolved to the realm default set at the net layer, exactly like the
-/// mutation operations that originate admin events).
+/// the normal drain. Every record reuses the evicted event's own id, which is
+/// the whole safety story: the outbox key is derived from it and appliers dedupe
+/// on it, so repeating this conversion rewrites the same rows instead of
+/// duplicating them. Every record uses `allow_genesis: false` (the loser must
+/// not mint a rival genesis) and empty peers (resolved to the realm default set
+/// at the net layer, exactly like the mutation operations that originate admin
+/// events).
+///
+/// Returns whether every record is durable. Anything less keeps the caller's
+/// journal entry so the payload is retried instead of lost.
 async fn reemit_evicted_documents(
     context: &DriverContext,
     documents: Vec<DocumentSyncEvictedDocument>,
-) {
+) -> bool {
     let Some(net_handle) = context.net_handle.as_ref() else {
         warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot re-emit evicted documents without net handle");
-        return;
+        return false;
     };
     let node_id = net_handle.node_id();
     let mut written = 0usize;
+    let mut complete = true;
     for document in documents {
         let record = new_outbox_record_with_id(
-            document.event_id.unwrap_or_else(ulid::Ulid::generate),
+            document.event_id,
             node_id,
             document.target,
             Vec::new(),
@@ -939,6 +946,7 @@ async fn reemit_evicted_documents(
             Ok(effect) => effect,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
+                complete = false;
                 continue;
             }
         };
@@ -946,18 +954,20 @@ async fn reemit_evicted_documents(
             Event::Storage(StorageEvent::WriteResult { .. }) => written += 1,
             Event::Storage(StorageEvent::Error { error }) => {
                 warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
+                complete = false;
             }
             other => {
                 warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, event = ?other, "Unexpected event writing re-emitted eviction outbox record");
+                complete = false;
             }
         }
     }
     if written == 0 {
-        return;
+        return complete;
     }
     let Some(task_handle) = context.task_handle.as_ref() else {
         warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot schedule outbox drain for re-emitted evictions without task handle");
-        return;
+        return complete;
     };
     if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
         .send_effect(schedule_outbox_drain_effect())
@@ -969,6 +979,7 @@ async fn reemit_evicted_documents(
         count = written,
         "Re-emitted evicted documents to the sync outbox"
     );
+    complete
 }
 
 async fn project_inbound_metadata_create_events(

@@ -47,6 +47,25 @@ fn shared_targets(
     ]
 }
 
+/// Whether a shared target belongs to the realm rather than to one node. A
+/// node-owned target names its node in the topic id, so only that node ever
+/// plans it; a realm-wide one is planned by every node and needs a single
+/// designated minter instead.
+fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
+    matches!(
+        target,
+        DocumentSyncTarget::RealmConfig { .. } | DocumentSyncTarget::RealmAuthorization { .. }
+    )
+}
+
+fn sync_eligible_node(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    let node_id = node_id.to_string();
+    config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == node_id && node.kind.is_sync_eligible())
+}
+
 fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
     config
         .nodes
@@ -661,12 +680,12 @@ async fn reconcile_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let placements = crate::process_placements::process_shard_placements(
-        context,
-        config.realm_id,
-        config.node_id,
-    )
-    .await;
+    // Transition steps run on the SyncPlacements timer instead of inline:
+    // recovery must not gate presence and readiness on a cluster-wide
+    // transition draining.
+    let placements =
+        crate::process_placements::reconcile_shard_topics(context, config.realm_id, config.node_id)
+            .await;
     let outcome = match placements.status {
         crate::process_placements::PlacementReconcileStatus::Clean => {
             *pending = false;
@@ -885,7 +904,7 @@ pub async fn restore_shard_pass(
             ..ShardRestorePass::default()
         };
     };
-    let plan = plan_shard_groups(&config, node_id, realm_id);
+    let plan = plan_shard_groups(&config, node_id, realm_id, unix_timestamp_millis());
     let mut summary = plan.summary;
     let units = plan.into_units();
     let units_total = units.len();
@@ -1022,13 +1041,14 @@ async fn restore_batch(
     }
 }
 
-type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
+type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
 
 /// Restore work grouped by co-holder and retained peer sets, so matching shards
 /// ride one ensure and one sync instead of one round trip each.
 struct ShardPlan {
     summary: RestoreShardSummary,
     shared_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    shared_join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
     rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
     join_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
 }
@@ -1039,22 +1059,37 @@ fn plan_shard_groups(
     config: &RealmConfigDocument,
     node_id: NodeId,
     realm_id: RealmId,
+    now_ms: u64,
 ) -> ShardPlan {
     let mut plan = ShardPlan {
         summary: RestoreShardSummary::default(),
         shared_groups: BTreeMap::new(),
+        shared_join_groups: BTreeMap::new(),
         rank0_groups: BTreeMap::new(),
         join_groups: BTreeMap::new(),
     };
 
     let mut shared_peers = shared_topic_peers(config, node_id);
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    // One designated minter for the realm-wide topics, derived from the config
+    // every node materializes: the lowest sync-eligible node id, the same rank-0
+    // rule the metadata graph topics use. Positive absence alone lets every
+    // observer mint the same topic at once, which forks the realm document. The
+    // eligibility check is what makes the choice agree everywhere: peers resolve
+    // the minter over sync-eligible nodes only, so a node outside that set must
+    // never read itself as the lowest.
+    let realm_minter = sync_eligible_node(config, node_id)
+        && shared_peers
+            .iter()
+            .all(|peer| node_id.as_bytes() < peer.as_bytes());
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        plan.shared_groups
-            .entry(shared_peers.clone())
-            .or_default()
-            .push(topic);
+        let groups = if realm_wide_target(&target) && !realm_minter {
+            &mut plan.shared_join_groups
+        } else {
+            &mut plan.shared_groups
+        };
+        groups.entry(shared_peers.clone()).or_default().push(topic);
         plan.summary.shared_topics += 1;
     }
 
@@ -1062,23 +1097,29 @@ fn plan_shard_groups(
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
-                epoch: 0,
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            if !holders.contains(&node_id) {
+            // Restart is transition-aware: a target or retained departing
+            // holder stays in its bucket's membership, publishers stay the
+            // authority set.
+            let membership = crate::placement::bucket_membership(config, &placement, now_ms);
+            if !membership.members.contains(&node_id) {
                 continue;
             }
             plan.summary.held_shards += 1;
             let local_is_rank0 = holders.first() == Some(&node_id);
-            let mut co_holders: Vec<NodeId> = holders
+            let mut co_members: Vec<NodeId> = membership
+                .members
                 .into_iter()
                 .filter(|candidate| *candidate != node_id)
                 .collect();
-            co_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            if co_holders.is_empty() {
+            co_members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            if co_members.is_empty() {
                 continue;
             }
+            let mut publishers = membership.publishers;
+            publishers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             let topic = shard_topic_id(realm_id, &placement);
             let retained: BTreeSet<NodeId> = draining_former_holders(config, &placement)
                 .into_iter()
@@ -1089,7 +1130,7 @@ fn plan_shard_groups(
                 &mut plan.join_groups
             };
             groups
-                .entry((co_holders, retained))
+                .entry((co_members, publishers, retained))
                 .or_default()
                 .push(topic);
             plan.summary.shard_topics += 1;
@@ -1112,11 +1153,12 @@ pub async fn prepare_shard_policy(
     let RealmConfigLoad::Found(config) = load_realm_config(context, realm_id).await else {
         return RestoreShardSummary::default();
     };
-    let plan = plan_shard_groups(&config, node_id, realm_id);
+    let plan = plan_shard_groups(&config, node_id, realm_id, unix_timestamp_millis());
     let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
 
     let mut prepared = 0usize;
-    for ((co_holders, retained), topics) in plan.rank0_groups.iter().chain(plan.join_groups.iter())
+    for ((co_members, publishers, retained), topics) in
+        plan.rank0_groups.iter().chain(plan.join_groups.iter())
     {
         let present: Vec<::irokle::TopicId> = topics
             .iter()
@@ -1130,12 +1172,12 @@ pub async fn prepare_shard_policy(
         if present.is_empty() {
             continue;
         }
-        let mut holders = co_holders.clone();
-        holders.push(node_id);
-        holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut members = co_members.clone();
+        members.push(node_id);
+        members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         prepared += present.len();
         if let Err(error) = net_handle
-            .reconcile_shard_membership(&present, holders, retained, &verified)
+            .reconcile_shard_membership(&present, members, publishers.clone(), retained, &verified)
             .await
         {
             // Local policy is installed before this returns.
@@ -1174,15 +1216,18 @@ fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> RestoreRange
 struct RestoreUnit {
     kind: RestoreKind,
     peers: Vec<NodeId>,
+    publishers: Vec<NodeId>,
     retained: BTreeSet<NodeId>,
     topics: Vec<::irokle::TopicId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestoreKind {
-    /// Fixed realm-scoped topics; their genesis is deterministic, so they are
-    /// ensured directly.
+    /// Shared topics this node may mint: its own node-owned ones, and the
+    /// realm-wide ones when it is the designated minter.
     Shared,
+    /// Realm-wide topics minted elsewhere: probe and adopt, never create.
+    SharedJoin,
     /// Rank-0: create a genesis only with positive co-holder confirmation.
     Rank0,
     /// Held at another rank: join-only.
@@ -1206,10 +1251,15 @@ fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
             RestoreKind::Shared => 0,
             RestoreKind::Rank0 => 1,
             RestoreKind::Join => 2,
+            RestoreKind::SharedJoin => 3,
         };
         hasher.update(&[kind]);
         hasher.update(&(unit.peers.len() as u64).to_be_bytes());
         for peer in &unit.peers {
+            hasher.update(peer.as_bytes());
+        }
+        hasher.update(&(unit.publishers.len() as u64).to_be_bytes());
+        for peer in &unit.publishers {
             hasher.update(peer.as_bytes());
         }
         hasher.update(&(unit.retained.len() as u64).to_be_bytes());
@@ -1228,7 +1278,11 @@ impl ShardPlan {
     /// Flattens the plan into a deterministic list of bounded work units.
     fn into_units(self) -> Vec<RestoreUnit> {
         let mut units = Vec::new();
-        let mut push = |kind, peers: Vec<NodeId>, retained: BTreeSet<NodeId>, topics: Vec<_>| {
+        let mut push = |kind,
+                        peers: Vec<NodeId>,
+                        publishers: Vec<NodeId>,
+                        retained: BTreeSet<NodeId>,
+                        topics: Vec<_>| {
             if peers.is_empty() || topics.is_empty() {
                 return;
             }
@@ -1236,19 +1290,35 @@ impl ShardPlan {
                 units.push(RestoreUnit {
                     kind,
                     peers: peers.clone(),
+                    publishers: publishers.clone(),
                     retained: retained.clone(),
                     topics: chunk.to_vec(),
                 });
             }
         };
         for (peers, topics) in self.shared_groups {
-            push(RestoreKind::Shared, peers, BTreeSet::new(), topics);
+            push(
+                RestoreKind::Shared,
+                peers,
+                Vec::new(),
+                BTreeSet::new(),
+                topics,
+            );
         }
-        for ((peers, retained), topics) in self.rank0_groups {
-            push(RestoreKind::Rank0, peers, retained, topics);
+        for (peers, topics) in self.shared_join_groups {
+            push(
+                RestoreKind::SharedJoin,
+                peers,
+                Vec::new(),
+                BTreeSet::new(),
+                topics,
+            );
         }
-        for ((peers, retained), topics) in self.join_groups {
-            push(RestoreKind::Join, peers, retained, topics);
+        for ((peers, publishers, retained), topics) in self.rank0_groups {
+            push(RestoreKind::Rank0, peers, publishers, retained, topics);
+        }
+        for ((peers, publishers, retained), topics) in self.join_groups {
+            push(RestoreKind::Join, peers, publishers, retained, topics);
         }
         units
     }
@@ -1278,7 +1348,8 @@ async fn process_restore_unit(
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> RestoreUnitOutcome {
     match unit.kind {
-        RestoreKind::Shared => restore_shared(context, net_handle, node_id, unit).await,
+        RestoreKind::Shared => restore_shared(context, net_handle, node_id, unit, true).await,
+        RestoreKind::SharedJoin => restore_shared(context, net_handle, node_id, unit, false).await,
         RestoreKind::Rank0 => restore_rank0(context, net_handle, node_id, unit, verified).await,
         RestoreKind::Join => restore_join(context, net_handle, node_id, unit, verified).await,
     }
@@ -1289,35 +1360,42 @@ async fn restore_shared(
     net_handle: &aruna_net::NetHandle,
     node_id: NodeId,
     unit: &RestoreUnit,
+    may_mint: bool,
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
-    let missing: Vec<::irokle::TopicId> = unit
-        .topics
-        .iter()
-        .copied()
-        .filter(|topic| {
-            !net_handle
-                .document_sync_topic_exists(*topic)
-                .unwrap_or(false)
-        })
-        .collect();
-    if !missing.is_empty() {
-        let event = net_handle
-            .sync_document_topics(missing.clone(), unit.peers.clone())
-            .await;
-        if !apply_restored_reconcile(context, node_id, event).await {
-            outcome.fail_topics(missing);
-        }
+    // A peer that is unreachable, or that refuses a topic it already holds,
+    // might hold this genesis; minting a second one forks the realm document
+    // permanently. Withheld topics stay unresolved so recovery retries them.
+    let (to_ensure, withheld) = crate::process_placements::resolve_creatable_topics(
+        context,
+        net_handle,
+        node_id,
+        &unit.peers,
+        unit.topics.clone(),
+        may_mint,
+        &mut BTreeSet::new(),
+    )
+    .await;
+    if withheld {
+        outcome.fail_topics(
+            unit.topics
+                .iter()
+                .copied()
+                .filter(|topic| !to_ensure.contains(topic)),
+        );
     }
-    if let Err(error) = net_handle.ensure_document_sync_topics(&unit.topics, unit.peers.clone()) {
+    if to_ensure.is_empty() {
+        return outcome;
+    }
+    if let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, unit.peers.clone()) {
         warn!(error = %error, "Failed to ensure shared realm topics on restart");
-        outcome.fail_topics(unit.topics.iter().copied());
+        outcome.fail_topics(to_ensure.iter().copied());
     }
     let event = net_handle
-        .sync_document_topics(unit.topics.clone(), unit.peers.clone())
+        .sync_document_topics(to_ensure.clone(), unit.peers.clone())
         .await;
     if !apply_restored_reconcile(context, node_id, event).await {
-        outcome.fail_topics(unit.topics.iter().copied());
+        outcome.fail_topics(to_ensure);
     }
     outcome
 }
@@ -1336,9 +1414,11 @@ async fn restore_rank0(
         net_handle,
         node_id,
         unit.peers.clone(),
+        unit.publishers.clone(),
         unit.topics.clone(),
         &unit.retained,
         verified,
+        &mut BTreeSet::new(),
     )
     .await;
     let present: Vec<::irokle::TopicId> = unit
@@ -1379,13 +1459,14 @@ async fn restore_join(
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
-    let mut current_holders = unit.peers.clone();
-    current_holders.push(node_id);
-    current_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut current_members = unit.peers.clone();
+    current_members.push(node_id);
+    current_members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     if let Err(error) = net_handle
         .reconcile_shard_membership(
             &unit.topics,
-            current_holders.clone(),
+            current_members.clone(),
+            unit.publishers.clone(),
             &unit.retained,
             verified,
         )
@@ -1418,7 +1499,13 @@ async fn restore_join(
     );
     if !present.is_empty()
         && let Err(error) = net_handle
-            .reconcile_shard_membership(&present, current_holders, &unit.retained, verified)
+            .reconcile_shard_membership(
+                &present,
+                current_members,
+                unit.publishers.clone(),
+                &unit.retained,
+                verified,
+            )
             .await
     {
         warn!(error = %error, "Failed to reconcile joined shard membership on restart");
@@ -1573,11 +1660,45 @@ mod tests {
         config
     }
 
+    // Every node must resolve the same realm-wide minter. Peers resolve it over
+    // sync-eligible nodes only, so a User node that happens to hold the lowest
+    // id must not read itself as the minter and mint a rival genesis.
+    #[test]
+    fn realm_minter_agrees() {
+        let realm_id = RealmId([7; 32]);
+        let mut ids = [node(1), node(2), node(3)];
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let (user, minter, follower) = (ids[0], ids[1], ids[2]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.ensure_node(user, RealmNodeKind::User);
+        config.ensure_node(minter, RealmNodeKind::Server);
+        config.ensure_node(follower, RealmNodeKind::Server);
+
+        let mints_realm_topics = |node_id| {
+            plan_shard_groups(&config, node_id, realm_id, 0)
+                .into_units()
+                .iter()
+                .any(|unit| {
+                    unit.kind == RestoreKind::Shared
+                        && unit.topics.contains(
+                            &DocumentSyncTarget::RealmConfig { realm_id }
+                                .sync_topic_id(realm_id, &PlacementRef::NIL),
+                        )
+                })
+        };
+        assert!(mints_realm_topics(minter));
+        assert!(!mints_realm_topics(follower));
+        assert!(
+            !mints_realm_topics(user),
+            "a node outside the sync-eligible set is never the realm minter"
+        );
+    }
+
     #[test]
     fn restore_units_chunk() {
         let local = node(1);
         let config = sharded_config(&[local, node(2), node(3)], 256);
-        let plan = plan_shard_groups(&config, local, RealmId([7; 32]));
+        let plan = plan_shard_groups(&config, local, RealmId([7; 32]), 0);
         let held = plan.summary.held_shards;
         let units = plan.into_units();
 
@@ -1625,6 +1746,7 @@ mod tests {
     fn cursor_rebinds_plan() {
         let topic = |seed| ::irokle::TopicId::from_bytes([seed; 32]);
         let unit = |seed| RestoreUnit {
+            publishers: Vec::new(),
             kind: RestoreKind::Shared,
             peers: vec![node(seed)],
             retained: BTreeSet::new(),
@@ -1658,13 +1780,13 @@ mod tests {
     fn cursor_rebinds_config() {
         let local = node(1);
         let mut config = sharded_config(&[local, node(2), node(3)], 16);
-        let original = plan_shard_groups(&config, local, RealmId([7; 32])).into_units();
+        let original = plan_shard_groups(&config, local, RealmId([7; 32]), 0).into_units();
         let mut cursor = ShardRestoreCursor::default();
         assert!(bind_restore_plan(&mut cursor, &original));
         cursor.next_unit = 1;
 
         config.strategies[0].shard_count = 32;
-        let changed = plan_shard_groups(&config, local, RealmId([7; 32])).into_units();
+        let changed = plan_shard_groups(&config, local, RealmId([7; 32]), 0).into_units();
         assert!(bind_restore_plan(&mut cursor, &changed));
         assert_eq!(cursor.next_unit, 0);
     }
@@ -1676,8 +1798,8 @@ mod tests {
     ) {
         let local = node(1);
         let realm_id = RealmId([7; 32]);
-        let before_units = plan_shard_groups(before, local, realm_id).into_units();
-        let after_units = plan_shard_groups(after, local, realm_id).into_units();
+        let before_units = plan_shard_groups(before, local, realm_id, 0).into_units();
+        let after_units = plan_shard_groups(after, local, realm_id, 0).into_units();
         let mut cursor = ShardRestoreCursor::default();
         assert!(bind_restore_plan(&mut cursor, &before_units));
         cursor.next_unit = 1;
@@ -1821,7 +1943,6 @@ mod tests {
         for (shard, peer) in peers.iter().enumerate() {
             let placement = PlacementRef {
                 strategy_id,
-                epoch: 0,
                 shard: shard as u32,
             };
             config.placement_overrides.push(PlacementOverride {
@@ -2054,6 +2175,10 @@ mod tests {
         );
 
         mesh_nodes(&local, &blocked).await;
+        // The peer runs its own restore too, as every configured node does: only
+        // the designated minter creates the realm-wide shared topics, so a peer
+        // that never restores would strand them whichever node that is.
+        restore_shard_subscriptions(&blocked.context, blocked.net.node_id(), realm_id).await;
         crate::process_placements::process_shard_placements(
             &blocked.context,
             realm_id,
@@ -2258,6 +2383,7 @@ mod tests {
         let units = vec![RestoreUnit {
             kind: RestoreKind::Shared,
             peers: vec![node(2)],
+            publishers: Vec::new(),
             retained: BTreeSet::new(),
             topics: vec![::irokle::TopicId::from_bytes([5; 32])],
         }];

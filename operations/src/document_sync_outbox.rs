@@ -29,7 +29,7 @@ const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
 const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
 
-fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
+pub(crate) fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
     [
         ADMIN_OUTBOX_PREFIX,
         DELETE_OUTBOX_PREFIX,
@@ -132,6 +132,8 @@ pub fn new_outbox_record_with_id(
         peers,
         event,
         placement,
+        // Unfenced by default; a fence-admitted writer stamps its generation.
+        generation: 0,
         updated_at: unix_timestamp_secs(),
         allow_genesis,
     }
@@ -488,7 +490,6 @@ mod tests {
     fn placement(shard: u32) -> aruna_core::structs::PlacementRef {
         aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(42, 1),
-            epoch: 0,
             shard,
         }
     }

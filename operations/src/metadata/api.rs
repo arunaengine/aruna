@@ -99,6 +99,10 @@ pub enum MetadataApiError {
     NotFound,
     #[error("service unavailable")]
     ServiceUnavailable,
+    /// The bucket has no usable activation, so the request cannot be routed.
+    /// Never absence: no holder was resolved to answer it.
+    #[error("placement unavailable: {0}")]
+    PlacementUnavailable(crate::placement::PlacementResolveError),
     #[error("{0}")]
     InvalidCursor(String),
     #[error("{0}")]
@@ -745,11 +749,7 @@ fn select_path_holders(
         if tokio::time::Instant::now() >= deadline {
             return Err(MetadataApiError::ServiceUnavailable);
         }
-        let placement = PlacementRef {
-            strategy_id,
-            epoch: 0,
-            shard,
-        };
+        let placement = PlacementRef { strategy_id, shard };
         let holders =
             resolve_holders_limit(config, &placement, METADATA_DISTRIBUTED_QUERY_MAX_NODES);
         if holders.is_empty() {

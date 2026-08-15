@@ -24,10 +24,13 @@ use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use aruna_core::admin_document_reducer::AdminDocumentReducerState;
+use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::document::{DocumentSyncEffect, DocumentSyncNetEvent, DocumentSyncPublish};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -36,9 +39,10 @@ use aruna_core::structs::{
     Actor, AuthContext, DocumentClass, GroupAuthorizationDocument, HandleRange,
     MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementRef, PlacementScope,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
-    band_start,
+    TransitionLimits, band_start,
 };
 use aruna_core::structured_id::PlacementHandle;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
@@ -47,11 +51,16 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::expand_placement::expand_realm_placement;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
+use aruna_operations::mutate_realm_placement::{
+    MutateRealmPlacementConfig, RealmPlacementMutation, drive_realm_placement_mutation,
+};
+use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
 use aruna_operations::placement::{
-    PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, resolve_shard_holders,
-    strategy_for_target,
+    PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
+    resolve_shard_holders, strategy_for_target,
 };
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -117,6 +126,23 @@ impl Topology {
         users: usize,
         replication_factor: u32,
     ) -> TestResult<Self> {
+        Self::spawn_sharded(management, users, replication_factor, TOPOLOGY_SHARD_COUNT).await
+    }
+
+    /// [`Topology::spawn`] with an explicit bucket count per strategy. A
+    /// transition scenario hands every bucket over one by one, so it pays for
+    /// the realm's whole shard space; a smaller one exercises the same paths.
+    pub async fn spawn_sharded(
+        management: usize,
+        users: usize,
+        replication_factor: u32,
+        shard_count: u32,
+    ) -> TestResult<Self> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+
         assert!(
             management > replication_factor as usize,
             "non-holder fixture needs more sync-eligible nodes than the replication factor: \
@@ -125,6 +151,11 @@ impl Topology {
 
         let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        tracing::info!(
+            realm_config_topic = %DocumentSyncTarget::RealmConfig { realm_id }
+                .sync_topic_id(realm_id, &PlacementRef::NIL),
+            "spawned realm"
+        );
         let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let mut nodes = Vec::with_capacity(management + users);
@@ -152,7 +183,9 @@ impl Topology {
             )
             .await?;
         }
-        let config = install_realm_config(&nodes, realm_id, user_id, replication_factor).await?;
+        let config =
+            install_realm_config(&nodes, realm_id, user_id, replication_factor, shard_count)
+                .await?;
 
         Ok(Self {
             realm_id,
@@ -461,6 +494,424 @@ impl Topology {
             .count()
     }
 
+    /// Desired shard-topic membership for a bucket, as the reconciler derives it.
+    pub fn members(&self, placement: &PlacementRef) -> Vec<NodeId> {
+        bucket_membership(&self.config, placement, unix_timestamp_millis()).members
+    }
+
+    /// Every transition the realm has not finished yet.
+    pub fn live_transitions(&self) -> Vec<Ulid> {
+        self.config
+            .placement_transitions
+            .iter()
+            .filter(|transition| !transition.is_terminal())
+            .map(|transition| transition.plan.transition_id)
+            .collect()
+    }
+
+    /// Every activated bucket of every strategy, in resolution order.
+    pub fn holder_map(&self) -> BTreeMap<(Ulid, u32), Vec<NodeId>> {
+        let mut holders = BTreeMap::new();
+        for strategy in &self.config.strategies {
+            for shard in 0..strategy.shard_count {
+                let placement = PlacementRef {
+                    strategy_id: strategy.strategy_id,
+                    shard,
+                };
+                holders.insert(
+                    (strategy.strategy_id, shard),
+                    resolve_shard_holders(&self.config, &placement),
+                );
+            }
+        }
+        holders
+    }
+
+    /// Drives one placement mutation on a node, so control state reaches the
+    /// other nodes through the admin-op reducer path rather than a raw write.
+    pub async fn mutate(
+        &mut self,
+        node_index: usize,
+        mutation: RealmPlacementMutation,
+    ) -> TestResult<()> {
+        let node = &self.nodes[node_index];
+        let actor = self.actor(node);
+        // Inbound replication applies concurrently on the same storage, so a
+        // conflicted RMW is re-driven like the production mutation paths do.
+        let mut attempts = 0;
+        let config = loop {
+            let result = hang_cap(
+                "placement mutation",
+                drive_realm_placement_mutation(
+                    MutateRealmPlacementConfig {
+                        actor: actor.clone(),
+                        mutation: mutation.clone(),
+                    },
+                    node.context.as_ref(),
+                ),
+            )
+            .await;
+            match result {
+                Err(aruna_operations::mutate_realm_placement::MutateRealmPlacementError::StorageError(
+                    aruna_core::errors::StorageError::TransactionConflict,
+                )) if attempts < 10 => attempts += 1,
+                other => break other?,
+            }
+        };
+        self.config = config;
+        Ok(())
+    }
+
+    /// Snapshots the current view as a new candidate map on every node.
+    pub async fn publish_map(&mut self, node_index: usize) -> TestResult<u64> {
+        let mut snapshot = self.config.clone();
+        let epoch = snapshot.snapshot_candidate_map();
+        let map = snapshot
+            .candidate_map(epoch)
+            .expect("the snapshot published one map")
+            .clone();
+        self.mutate(node_index, RealmPlacementMutation::PublishCandidateMap(map))
+            .await?;
+        self.await_config("candidate map replicates", move |config| {
+            config.candidate_map(epoch).is_some()
+        })
+        .await?;
+        Ok(epoch)
+    }
+
+    /// Starts a transition of `strategy_id` onto `target_epoch` and waits for
+    /// every node to observe it - as the record, or as the cutover it already
+    /// produced, since a zero grace releases the record with the last proof.
+    pub async fn start_transition(
+        &mut self,
+        node_index: usize,
+        strategy_id: Ulid,
+        buckets: Vec<u32>,
+        target_epoch: u64,
+        limits: TransitionLimits,
+    ) -> TestResult<Ulid> {
+        let transition_id = Ulid::generate();
+        let plan = plan_transition(
+            &self.config,
+            TransitionRequest {
+                transition_id,
+                strategy_id,
+                buckets,
+                target_map_epoch: target_epoch,
+                limits,
+                created_by: self.nodes[node_index].node_id(),
+                created_at_ms: 1,
+            },
+        )?;
+        let planned = plan.bucket_list();
+        self.mutate(node_index, RealmPlacementMutation::StartTransition(plan))
+            .await?;
+        self.await_config("transition record replicates", move |config| {
+            config.transition(&transition_id).is_some()
+                || planned.iter().all(|bucket| {
+                    config
+                        .activation(&strategy_id, *bucket)
+                        .is_some_and(|activation| activation.candidate_map_epoch == target_epoch)
+                })
+        })
+        .await?;
+        Ok(transition_id)
+    }
+
+    /// Runs the placement reconciler on every node until it reports clean, so
+    /// barrier, pull, verify, and proof steps all get their turn.
+    pub async fn run_placements(&self) -> TestResult<()> {
+        let realm_id = self.realm_id;
+        let nodes = &self.nodes;
+        wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+            "placement reconciliation never reported clean",
+            || async move {
+                let pending = reconcile_nodes(nodes, realm_id)
+                    .await
+                    .iter()
+                    .filter(|outcome| outcome.retry_scheduled)
+                    .count();
+                Ok(pending)
+            },
+        )
+        .await
+    }
+
+    /// Drives the reconciler until `transition_id`'s record is released and
+    /// pruned everywhere: past its grace that additionally means every
+    /// departing holder's drain report has reduced.
+    pub async fn await_release(&mut self, transition_id: Ulid) -> TestResult<()> {
+        let realm_id = self.realm_id;
+        let nodes = &self.nodes;
+        wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+            "placement transition never released",
+            || async move {
+                reconcile_nodes(nodes, realm_id).await;
+                replicate_config(nodes, realm_id).await;
+                let mut pending = 0;
+                for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
+                    let config = read_realm_config(node, realm_id).await?;
+                    if config.transition(&transition_id).is_some() {
+                        pending += 1;
+                    }
+                }
+                Ok(pending)
+            },
+        )
+        .await?;
+        self.config = read_realm_config(self.node(0), self.realm_id).await?;
+        Ok(())
+    }
+
+    /// Drives the reconciler until every bucket of `transition_id` has cut over
+    /// on every node.
+    pub async fn await_transition(&mut self, transition_id: Ulid) -> TestResult<()> {
+        let realm_id = self.realm_id;
+        let nodes = &self.nodes;
+        let result = wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+            "placement transition never completed",
+            || async move {
+                let poll_started = std::time::Instant::now();
+                reconcile_nodes(nodes, realm_id).await;
+                let reconcile_ms = poll_started.elapsed().as_millis() as u64;
+                replicate_config(nodes, realm_id).await;
+                tracing::debug!(
+                    reconcile_ms,
+                    poll_ms = poll_started.elapsed().as_millis() as u64,
+                    "transition poll timing"
+                );
+                // Count buckets, not nodes: the wait must see progress on every
+                // cut-over, not only when the last one lands.
+                let mut pending = 0;
+                for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
+                    let config = read_realm_config(node, realm_id).await?;
+                    // A record that is gone was released after cutting every
+                    // bucket over; `start_transition` already waited for it to
+                    // replicate, so absence here is completion.
+                    if let Some(transition) = config.transition(&transition_id) {
+                        // An aborted record is terminal: its incomplete
+                        // buckets either advanced under a rival plan or will
+                        // never move; nothing further can be awaited on it.
+                        if !matches!(
+                            transition.status,
+                            aruna_core::structs::TransitionStatus::Aborted
+                        ) {
+                            pending += transition
+                                .plan
+                                .buckets
+                                .iter()
+                                .filter(|bucket| transition.completion(bucket.bucket).is_none())
+                                .count();
+                        }
+                    }
+                }
+                Ok(pending)
+            },
+        )
+        .await;
+        if result.is_err() {
+            // Timeout diagnostics: the reduced record state on node 0.
+            let config = read_realm_config(self.node(0), self.realm_id).await?;
+            if let Some(transition) = config.transition(&transition_id) {
+                let mut stuck = String::new();
+                for bucket in &transition.plan.buckets {
+                    if transition.completion(bucket.bucket).is_some() {
+                        continue;
+                    }
+                    let proofs: Vec<String> = transition
+                        .proofs_for(bucket.bucket)
+                        .map(|proof| {
+                            format!(
+                                "{}:{}",
+                                &proof.holder.to_string()[..8],
+                                transition.proof_valid(bucket.bucket, proof)
+                            )
+                        })
+                        .collect();
+                    let missing: Vec<String> = bucket
+                        .target_holders
+                        .iter()
+                        .filter(|holder| {
+                            !transition
+                                .proofs_for(bucket.bucket)
+                                .any(|proof| proof.holder == **holder)
+                        })
+                        .map(|holder| holder.to_string()[..8].to_string())
+                        .collect();
+                    let mut views: Vec<String> = Vec::new();
+                    for node in &self.nodes {
+                        let short = node.node_id().to_string()[..8].to_string();
+                        let Ok(config) = read_realm_config(node, self.realm_id).await else {
+                            views.push(format!("{short}:noconfig"));
+                            continue;
+                        };
+                        match config.transition(&transition_id) {
+                            Some(record) => {
+                                // Name the reporters: a stuck bucket is one
+                                // node missing one peer's barrier.
+                                let fenced: Vec<String> = record
+                                    .barriers
+                                    .iter()
+                                    .filter(|barrier| barrier.bucket == bucket.bucket)
+                                    .map(|barrier| barrier.reported_by.to_string()[..8].to_string())
+                                    .collect();
+                                views.push(format!(
+                                    "{short}:fenced={} proofs={} barriers={fenced:?}",
+                                    record.barrier_established(bucket.bucket, &bucket.old_holders),
+                                    record.proofs_for(bucket.bucket).count(),
+                                ));
+                            }
+                            None => views.push(format!("{short}:norecord")),
+                        }
+                    }
+                    stuck.push_str(&format!(
+                        " bucket {}: fenced={} proofs={proofs:?} missing={missing:?} topics={views:?};",
+                        bucket.bucket,
+                        transition.barrier_established(bucket.bucket, &bucket.old_holders),
+                    ));
+                }
+                return Err(format!(
+                    "transition never completed: status={:?} completed={} stuck:{stuck}",
+                    transition.status,
+                    transition.completed.len(),
+                )
+                .into());
+            }
+        }
+        result?;
+        self.config = read_realm_config(self.node(0), self.realm_id).await?;
+        Ok(())
+    }
+
+    /// Waits until every node's stored realm config satisfies `predicate`, then
+    /// refreshes the fixture's own copy from node zero.
+    pub async fn await_config<F>(&mut self, label: &str, predicate: F) -> TestResult<()>
+    where
+        F: Fn(&RealmConfigDocument) -> bool,
+    {
+        let realm_id = self.realm_id;
+        let predicate = &predicate;
+        let nodes = &self.nodes;
+        wait_for_convergence::<_, _, Box<dyn std::error::Error>>(label, || async move {
+            replicate_config(nodes, realm_id).await;
+            let mut pending = 0;
+            for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
+                if !predicate(&read_realm_config(node, realm_id).await?) {
+                    pending += 1;
+                }
+            }
+            Ok(pending)
+        })
+        .await?;
+        self.config = read_realm_config(self.node(0), self.realm_id).await?;
+        Ok(())
+    }
+
+    /// Spawns, meshes, announces, and registers one more node, then runs the
+    /// production onboarding expansion: it publishes a map naming the joiner and
+    /// starts a transition for every bucket that only grows. The joiner holds
+    /// nothing until that transition completes.
+    pub async fn spawn_late_node(&mut self, kind: RealmNodeKind) -> TestResult<NodeId> {
+        let node = spawn_node(self.realm_id, kind.clone()).await?;
+        let node_id = node.node_id();
+        for existing in &self.nodes {
+            existing.net.add_peer_addr(node.net.endpoint_addr()).await;
+            node.net.add_peer_addr(existing.net.endpoint_addr()).await;
+        }
+        hang_cap(
+            "announce late realm presence",
+            drive(
+                AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                    realm_id: self.realm_id,
+                    node_id,
+                    schedule_refresh: true,
+                }),
+                node.context.as_ref(),
+            ),
+        )
+        .await?;
+        self.nodes.push(node);
+
+        let mut config = self.config.clone();
+        config.ensure_node(node_id, kind.clone());
+        if kind.is_sync_eligible() {
+            config.placement_map.push(NodePlacementEntry {
+                node_id,
+                location: LOCATIONS[self.nodes.len() % LOCATIONS.len()].to_string(),
+                weight: NODE_WEIGHT,
+                full: false,
+                draining: false,
+                labels: BTreeMap::new(),
+            });
+        }
+        self.apply_config(config).await?;
+        // Production onboarding admits the joiner to the shared realm topics
+        // (`bootstrap_onboarding_finalize`); mirror it, or the joiner's own
+        // published events are refused by every peer and only reach the realm
+        // through incidental back-pulls of push sessions.
+        let shared_topic = DocumentSyncTarget::RealmConfig {
+            realm_id: self.realm_id,
+        }
+        .sync_topic_id(self.realm_id, &PlacementRef::NIL);
+        self.nodes[0]
+            .net
+            .ensure_document_sync_topics(&[shared_topic], vec![node_id])?;
+        self.nodes[0]
+            .net
+            .allow_document_sync_peers(&[shared_topic], vec![node_id])?;
+
+        // The joiner runs the startup hook and joins the realm-config topic, as
+        // a freshly started node does; without it no admin event reaches it.
+        let node = self.find(node_id);
+        aruna_operations::startup::restore_shard_subscriptions(
+            &node.context,
+            node_id,
+            self.realm_id,
+        )
+        .await;
+        let topic = DocumentSyncTarget::RealmConfig {
+            realm_id: self.realm_id,
+        }
+        .sync_topic_id(self.realm_id, &PlacementRef::NIL);
+        node.net
+            .send_effect(Effect::Net(NetEffect::DocumentSync(
+                DocumentSyncEffect::SyncDocuments {
+                    topics: vec![topic],
+                    peers: Vec::new(),
+                },
+            )))
+            .await;
+
+        let actor = self.actor(self.node(0));
+        let started = hang_cap(
+            "onboarding expansion",
+            expand_realm_placement(self.nodes[0].context.as_ref(), &actor),
+        )
+        .await?;
+        self.await_config("expansion transitions replicate", |config| {
+            started
+                .iter()
+                .all(|transition_id| config.transition(transition_id).is_some())
+        })
+        .await?;
+        for transition_id in &started {
+            let transition = self
+                .config
+                .transition(transition_id)
+                .expect("the started transition replicated");
+            for bucket in &transition.plan.buckets {
+                assert!(
+                    bucket
+                        .old_holders
+                        .iter()
+                        .all(|holder| bucket.target_holders.contains(holder)),
+                    "onboarding issued a transition that moves a bucket off a holder"
+                );
+            }
+        }
+        Ok(node_id)
+    }
+
     /// Reinstalls a mutated realm config on every node, as an admin change would.
     pub async fn apply_config(&mut self, config: RealmConfigDocument) -> TestResult<()> {
         for node in &self.nodes {
@@ -476,6 +927,7 @@ impl Topology {
                 config.to_bytes(&actor)?,
             )
             .await?;
+            node.net.refresh_realm_peers_from_document(&config).await?;
         }
         self.config = config;
         Ok(())
@@ -558,11 +1010,12 @@ async fn install_realm_config(
     realm_id: RealmId,
     user_id: UserId,
     replication_factor: u32,
+    shard_count: u32,
 ) -> TestResult<RealmConfigDocument> {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), replication_factor);
     config.seed_default_placement();
     for strategy in &mut config.strategies {
-        strategy.shard_count = TOPOLOGY_SHARD_COUNT;
+        strategy.shard_count = shard_count;
     }
     let mut band = 0u32;
     for (index, node) in nodes.iter().enumerate() {
@@ -602,6 +1055,10 @@ async fn install_realm_config(
         band += 1;
     }
 
+    // Freeze the assembled view as epoch 1 and activate it: holder resolution is
+    // pinned to a published map, exactly as a bootstrapped realm is.
+    config.snapshot_candidate_map();
+
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
     let trusted = HashSet::from([realm_id]);
     for node in nodes {
@@ -637,6 +1094,55 @@ async fn install_realm_config(
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
 
+    // Admin operations ride the shared realm-config topic, which needs a genesis
+    // before anything can publish onto it. The last node seeds it so node zero,
+    // which the tests mutate through, starts from an empty origin sequence.
+    seed_config_topic(nodes, realm_id, &config).await?;
+
+    // Activations must be reducer-owned to advance: a literal seed is only the
+    // bootstrap value. One explicit admin op per strategy hands ownership over,
+    // materializing the same epoch-1 activations the seed wrote.
+    let strategy_ids: Vec<Ulid> = config
+        .strategies
+        .iter()
+        .map(|strategy| strategy.strategy_id)
+        .collect();
+    for strategy_id in strategy_ids {
+        hang_cap(
+            "initialize activations",
+            drive_realm_placement_mutation(
+                MutateRealmPlacementConfig {
+                    actor: Actor {
+                        node_id: nodes[0].node_id(),
+                        user_id,
+                        realm_id,
+                    },
+                    mutation: RealmPlacementMutation::InitializeActivations {
+                        strategy_id,
+                        candidate_map_epoch: 1,
+                    },
+                },
+                nodes[0].context.as_ref(),
+            ),
+        )
+        .await?;
+    }
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "activation initialization never replicated",
+        || async {
+            replicate_config(nodes, realm_id).await;
+            let mut pending = 0;
+            for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
+                let stored = read_realm_config(node, realm_id).await?;
+                if stored.placement_activations.len() != config.placement_activations.len() {
+                    pending += 1;
+                }
+            }
+            Ok(pending)
+        },
+    )
+    .await?;
+
     // The startup hook, exactly as the binary runs it after loading the config: it
     // joins the shared realm topics and reconciles the held shard topics. Nothing
     // can be published onto a shard topic before its rank-0 holder has minted the
@@ -671,6 +1177,156 @@ async fn install_realm_config(
     )
     .await?;
     Ok(config)
+}
+
+/// Creates the realm-config sync topic and joins every node to it.
+async fn seed_config_topic(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+) -> TestResult<()> {
+    // A User-kind node seeds when the fixture has one: it never submits an admin
+    // operation, so the genesis it publishes cannot collide with a later event
+    // from the same actor log.
+    let seeder = nodes
+        .iter()
+        .find(|node| !node.is_sync_eligible())
+        .or_else(|| nodes.last())
+        .ok_or("topology has no nodes")?;
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let placement =
+        aruna_operations::placement::placement_ref_for_target(config, &target, Default::default());
+    let topic = target.sync_topic_id(realm_id, &placement);
+    let actor = Actor {
+        node_id: seeder.node_id(),
+        user_id: aruna_core::UserId::nil(realm_id),
+        realm_id,
+    };
+    let mut reducer_state =
+        AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+    let event = reducer_state.apply_operation(
+        &actor,
+        AdminDocumentOperation::RealmConfigNodePlacementSet {
+            entry: config
+                .placement_map
+                .first()
+                .ok_or("realm config has no placement entry")?
+                .clone(),
+        },
+    )?;
+    // Persist the state the seed event advanced, or the seeder's next mutation
+    // would reuse origin sequence one and fork its own actor log.
+    let (key_space, key, value) =
+        aruna_core::storage_entries::admin_document_reducer_state_write_entry(&reducer_state)?;
+    write(seeder, &key_space, key.to_vec(), value.to_vec()).await?;
+    match seeder
+        .net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentSyncEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(event),
+                    placement,
+                    allow_genesis: true,
+                }],
+                peers: Vec::new(),
+            },
+        )))
+        .await
+    {
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished { .. })) => {}
+        other => return Err(format!("unexpected config topic seed publish: {other:?}").into()),
+    }
+    for node in nodes {
+        if node.node_id() == seeder.node_id() || !node.is_sync_eligible() {
+            continue;
+        }
+        match node
+            .net
+            .send_effect(Effect::Net(NetEffect::DocumentSync(
+                DocumentSyncEffect::SyncDocuments {
+                    topics: vec![topic],
+                    peers: Vec::new(),
+                },
+            )))
+            .await
+        {
+            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+                ..
+            })) => {}
+            other => return Err(format!("unexpected config topic seed sync: {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+/// Runs one reconcile pass on every node concurrently, as the other reconcile
+/// waits here do. A pass makes seconds-long network calls, so driving the nodes
+/// in sequence lets a single poll outlast the deadlock cap on its own.
+async fn reconcile_nodes(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+) -> Vec<aruna_operations::process_placements::PlacementReconcileOutcome> {
+    join_all(nodes.iter().map(|node| {
+        let span = tracing::info_span!(
+            "node_pass",
+            node = %&node.node_id().to_string()[..8]
+        );
+        async move {
+            let started = std::time::Instant::now();
+            let outcome = tracing::Instrument::instrument(
+                aruna_operations::process_placements::process_shard_placements(
+                    &node.context,
+                    realm_id,
+                    node.node_id(),
+                ),
+                span,
+            )
+            .await;
+            tracing::debug!(
+                node = %&node.node_id().to_string()[..8],
+                duration_ms = started.elapsed().as_millis() as u64,
+                "reconcile pass timing"
+            );
+            outcome
+        }
+    }))
+    .await
+}
+
+/// Flushes every node's document-sync outbox and pulls the realm-config topic,
+/// so an admin event converges on the next poll instead of waiting out the
+/// drain timer and a gossip round.
+async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
+    // Concurrent for the same reason the reconcile pass is: both loops make
+    // seconds-long network calls per node, and they share one poll's budget.
+    join_all(nodes.iter().map(|node| {
+        let span = tracing::info_span!(
+            "node_drain",
+            node = %&node.node_id().to_string()[..8]
+        );
+        tracing::Instrument::instrument(
+            aruna_operations::task_incoming::drive_document_sync_outbox_drain(node.context.clone()),
+            span,
+        )
+    }))
+    .await;
+    let topic =
+        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+    join_all(
+        nodes
+            .iter()
+            .filter(|node| node.is_sync_eligible())
+            .map(|node| {
+                node.net.send_effect(Effect::Net(NetEffect::DocumentSync(
+                    DocumentSyncEffect::SyncDocuments {
+                        topics: vec![topic],
+                        peers: Vec::new(),
+                    },
+                )))
+            }),
+    )
+    .await;
 }
 
 async fn write(node: &TestNode, key_space: &str, key: Vec<u8>, value: Vec<u8>) -> TestResult<()> {

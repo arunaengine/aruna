@@ -47,6 +47,9 @@ pub struct CreateGroupOperation {
     group: Option<Group>,
     auth_doc: Option<GroupAuthorizationDocument>,
     realm_config: Option<RealmConfigDocument>,
+    /// Bucket the group's authorization rows publish onto, read inside the
+    /// write transaction.
+    fence: crate::placement::fence::WriteFence,
     state: CreateGroupState,
     txn_id: Option<Ulid>,
     output: Option<Result<(Group, GroupAuthorizationDocument), CreateGroupError>>,
@@ -72,6 +75,7 @@ impl CreateGroupOperation {
             group: None,
             auth_doc: None,
             realm_config: None,
+            fence: Default::default(),
             state: CreateGroupState::Init,
             txn_id: None,
             output: None,
@@ -231,6 +235,7 @@ impl CreateGroupOperation {
             .as_ref()
             .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
+        let realm_id = self.config.actor.realm_id;
         let mut writes = vec![admin_document_reducer_state_write_entry(&reducer_state)?];
         for event in admin_events {
             let record = new_outbox_record_with_id(
@@ -243,7 +248,8 @@ impl CreateGroupOperation {
                 },
                 placement,
                 true,
-            );
+            )
+            .fenced_at(self.fence.generation(&realm_id, &placement));
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
@@ -415,10 +421,47 @@ impl CreateGroupOperation {
         };
 
         self.state = CreateGroupState::CreateRoles;
+        self.resolve_fence();
         match self.emit_create_auth_doc() {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
+    }
+
+    /// The group's authorization bucket and the generation it resolves at.
+    fn resolve_fence(&mut self) {
+        let (Some(config), Some(group)) = (self.realm_config.as_ref(), self.group.as_ref()) else {
+            return;
+        };
+        let target = DocumentSyncTarget::GroupAuthorization {
+            group_id: group.group_id,
+        };
+        let placement = placement_ref_for_target(config, &target, Default::default());
+        self.fence
+            .add(self.config.actor.realm_id, config, [placement]);
+    }
+
+    fn handle_bucket_fence(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected_event(
+                CreateGroupState::ReadBucketFence,
+                "Event::Storage(StorageEvent::BatchReadResult)",
+                got,
+            );
+        };
+        if !self.fence.admits(&values) {
+            return self.fail(CreateGroupError::PlacementFenced);
+        }
+        self.commit_transaction()
+    }
+
+    fn commit_transaction(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(CreateGroupError::NoTransactionFound);
+        };
+        self.state = CreateGroupState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     #[tracing::instrument(name = "group.create.handle_auth_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
@@ -432,12 +475,19 @@ impl CreateGroupOperation {
             );
         };
 
-        self.state = CreateGroupState::CommitTransaction;
-        if let Some(txn_id) = self.txn_id {
-            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-        } else {
-            self.fail(CreateGroupError::NoTransactionFound)
+        if self.fence.is_empty() {
+            return self.commit_transaction();
         }
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(CreateGroupError::NoTransactionFound);
+        };
+        // The fence joins this transaction's read set, so a departing holder's
+        // close conflicts an uncommitted write.
+        self.state = CreateGroupState::ReadBucketFence;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.fence.reads(),
+            txn_id: Some(txn_id),
+        })]
     }
 
     #[tracing::instrument(name = "group.create.handle_commit", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
@@ -497,6 +547,7 @@ pub enum CreateGroupState {
     CreateGroup,
     WriteOwnerIndex,
     CreateRoles,
+    ReadBucketFence,
     CommitTransaction,
     ScheduleDocumentSyncOutboxDrain,
     Finish,
@@ -519,6 +570,8 @@ pub enum CreateGroupError {
     NoTransactionFound,
     #[error("No group found")]
     GroupNotFound,
+    #[error("the group's bucket cut over to a new holder set; retry the create")]
+    PlacementFenced,
     #[error("owned group limit reached ({limit})")]
     OwnedGroupLimitReached { limit: u32 },
     #[error("Creating Group did not finish")]
@@ -559,6 +612,7 @@ impl Operation for CreateGroupOperation {
             CreateGroupState::CreateGroup => self.handle_create_group(event),
             CreateGroupState::WriteOwnerIndex => self.handle_write_owner_index(event),
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
+            CreateGroupState::ReadBucketFence => self.handle_bucket_fence(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
             CreateGroupState::ScheduleDocumentSyncOutboxDrain => {
                 self.handle_schedule_document_sync_outbox_drain(event)
@@ -675,6 +729,120 @@ mod test {
         operation.auth_doc = Some(auth_doc);
         operation.state = super::CreateGroupState::CommitTransaction;
         operation
+    }
+
+    /// A realm whose buckets are activated at generation one, so a create
+    /// resolves a generation and takes the group bucket's fence.
+    fn activated_config(actor: &Actor) -> aruna_core::structs::RealmConfigDocument {
+        let mut config =
+            aruna_core::structs::RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, aruna_core::structs::RealmNodeKind::Server);
+        config
+            .strategies
+            .push(aruna_core::structs::PlacementStrategy {
+                strategy_id: Ulid::from_bytes([5; 16]),
+                name: "default".to_string(),
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+                shard_count: 16,
+            });
+        config.default_strategy_id = Some(config.strategies[0].strategy_id);
+        config.snapshot_candidate_map();
+        config
+    }
+
+    /// Steps a create to the bucket fence read and answers it with `closed`.
+    fn step_to_fence(
+        operation: &mut CreateGroupOperation,
+        actor: &Actor,
+        txn_id: TxnId,
+        closed: Option<u64>,
+    ) -> aruna_core::types::Effects {
+        let config = activated_config(actor);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(actor.realm_id.as_bytes().to_vec()),
+            value: Some(config.to_bytes(actor).unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(Vec::new()),
+        }));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(Vec::new()),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: read,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("the transaction batch-reads the bucket fence, got {effects:?}");
+        };
+        assert_eq!(*read, Some(txn_id));
+        let values = reads
+            .iter()
+            .map(|(_, key)| {
+                (
+                    key.clone(),
+                    closed.map(|generation| Value::from(generation.to_be_bytes().to_vec())),
+                )
+            })
+            .collect();
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    }
+
+    #[test]
+    fn create_takes_fence() {
+        // An admitted create stamps the generation it resolved at onto every
+        // admin row, so the drain can bound the predecessor set.
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let txn_id = TxnId::generate();
+        let mut operation = CreateGroupOperation::new(config(actor.clone()));
+
+        let effects = step_to_fence(&mut operation, &actor, txn_id, None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+        let writes = operation.admin_reducer_seed_writes().unwrap();
+        let records = write_values(&writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty(), "an admitted create publishes");
+        for record in records {
+            assert_eq!(record.generation, 1, "row for {:?}", record.placement);
+        }
+    }
+
+    #[test]
+    fn fence_rejects_create() {
+        // The departing holder closed generation one: the create must not
+        // commit a row the drained bucket can no longer publish.
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let txn_id = TxnId::generate();
+        let mut operation = CreateGroupOperation::new(config(actor.clone()));
+
+        let effects = step_to_fence(&mut operation, &actor, txn_id, Some(1));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Storage(StorageEffect::CommitTransaction { .. })
+            )),
+            "a fenced create never commits, got {effects:?}"
+        );
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            super::CreateGroupError::PlacementFenced
+        );
     }
 
     #[test]

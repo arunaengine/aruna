@@ -605,6 +605,7 @@ fn classify_deferred_record(
     // its pre-cutover ops.
     if crate::placement::holds_placement(config, &record.placement, node_id)
         || crate::placement::is_draining_former_holder(config, &record.placement, node_id)
+        || crate::placement::retained_departing_holder(config, &record.placement, node_id)
     {
         DeferOutcome::Retry
     } else {
@@ -1124,15 +1125,19 @@ impl OperationsTaskHandler {
             invocation.outcome.merge(outcome);
         }
 
-        // Publish to live holders, but keep stamped peers above as genesis sources.
+        // Publish to the bucket's sync members (admitted targets and retained
+        // departing holders included), but keep stamped peers above as genesis
+        // sources: a target must see writes made during the window.
         if let Some(config) = config {
+            let now_ms = aruna_core::util::unix_timestamp_millis();
             for (_, record, _) in &mut records {
-                if record.peers.is_empty() || !record.target.uses_shard_topic() {
+                if !record.target.uses_shard_topic() {
                     continue;
                 }
-                let holders = crate::placement::resolve_shard_holders(config, &record.placement);
-                if !holders.is_empty() {
-                    record.peers = holders;
+                let members =
+                    crate::placement::bucket_membership(config, &record.placement, now_ms).members;
+                if !members.is_empty() {
+                    record.peers = members;
                 }
             }
         }
@@ -3279,7 +3284,6 @@ mod tests {
     fn admin_placement(shard: u32) -> aruna_core::structs::PlacementRef {
         aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_bytes([50; 16]),
-            epoch: 0,
             shard,
         }
     }
@@ -3335,7 +3339,6 @@ mod tests {
         let mut value = change();
         value.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_bytes([seed; 16]),
-            epoch: 0,
             shard: 1,
         };
         value
@@ -3880,7 +3883,6 @@ mod tests {
         let mut blocked_change = change();
         blocked_change.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_bytes([48; 16]),
-            epoch: 0,
             shard: 1,
         };
         let record = crate::document_sync_outbox::new_outbox_record(
@@ -4016,7 +4018,6 @@ mod tests {
             kind: DocumentSyncChangeKind::Upsert,
             placement: aruna_core::structs::PlacementRef {
                 strategy_id: Ulid::from_parts(42, 1),
-                epoch: 0,
                 shard: 3,
             },
         };
@@ -4143,7 +4144,6 @@ mod tests {
             let mut value = change();
             value.placement = aruna_core::structs::PlacementRef {
                 strategy_id: Ulid::from_bytes([45; 16]),
-                epoch: 0,
                 shard: 1,
             };
             value
@@ -4415,7 +4415,6 @@ mod tests {
         write_realm_config(&storage, realm_id, &config, net.node_id()).await;
         let placement = aruna_core::structs::PlacementRef {
             strategy_id: config.strategies[0].strategy_id,
-            epoch: 0,
             shard: 0,
         };
         let shared_target = DocumentSyncTarget::RealmAuthorization { realm_id };
@@ -4580,7 +4579,6 @@ mod tests {
             realm_id,
             &aruna_core::structs::PlacementRef {
                 strategy_id,
-                epoch: 0,
                 shard: 0,
             },
         );
@@ -4704,7 +4702,6 @@ mod tests {
         let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
         let placement = aruna_core::structs::PlacementRef {
             strategy_id,
-            epoch: 0,
             shard: 0,
         };
         let target = DocumentSyncTarget::MetadataRegistry {

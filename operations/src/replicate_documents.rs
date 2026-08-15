@@ -167,8 +167,28 @@ impl ReplicateDocumentsOperation {
         // Placement plan for the document's bound strategy. `None` means the
         // realm has no strategy for this target (skip, like the old
         // desired_peer_count == 0 case).
-        let Some(plan) = plan_target_placement(realm_config, &document, Default::default()) else {
-            return self.emit_next_publish();
+        let plan = match plan_target_placement(realm_config, &document, Default::default()) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return self.emit_next_publish(),
+            Err(_) => {
+                // Unresolvable bucket: keep a durable pending record so the
+                // reconciler retries, and announce nothing to nonholders.
+                let placement = crate::placement::placement_ref_for_target(
+                    realm_config,
+                    &document,
+                    Default::default(),
+                );
+                self.placement_action = Some(PlacementAction::Write(new_placement(
+                    self.config.realm_id,
+                    placement,
+                    self.config.local_node_id,
+                    Vec::new(),
+                )));
+                return match self.emit_placement_update() {
+                    Ok(effects) => effects,
+                    Err(error) => self.fail(error),
+                };
+            }
         };
         let desired_count = plan.desired_count;
         let placement = plan.placement;
@@ -440,6 +460,41 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_keeps_record() {
+        // A governed target whose bucket cannot resolve writes the durable
+        // pending record with no peers and announces nothing.
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = node_usage_target(realm_id, node(5));
+        let local_node_id = node(1);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target],
+            allow_genesis: true,
+        });
+        let mut config = config_with(&[local_node_id, node(2)], Some(3));
+        // A published map without an activation makes the bucket unresolvable.
+        config.candidate_maps.push(config.freeze_map(1));
+        operation.realm_config = Some(config);
+
+        let effects = operation.emit_next_publish();
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SubOperation(_))),
+            "an unresolvable bucket must not announce"
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::Storage(_)]),
+            "expected the durable pending placement write"
+        );
+        assert_eq!(operation.state, ReplicateDocumentsState::StorePlacement);
+        assert!(operation.retry_needed);
+    }
+
+    #[test]
     fn two_remote_peers_satisfy_default_document_placement() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let target = node_usage_target(realm_id, node(4));
@@ -576,7 +631,6 @@ mod tests {
         operation.state = ReplicateDocumentsState::Publish;
         operation.placement_action = Some(PlacementAction::Delete(PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([9u8; 16]),
-            epoch: 0,
             shard: 1,
         }));
 
