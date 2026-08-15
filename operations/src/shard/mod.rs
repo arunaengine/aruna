@@ -144,7 +144,8 @@ pub(crate) fn frontier_root(
     topic: irokle::TopicId,
     frontier: &irokle::ActorClock,
 ) -> Result<[u8; 32], String> {
-    let storage = net_handle.document_sync_node().storage();
+    let node = net_handle.document_sync_node();
+    let storage = node.storage();
     let state = storage
         .topic_state(&topic)
         .map_err(|error| format!("failed to read shard topic state: {error}"))?
