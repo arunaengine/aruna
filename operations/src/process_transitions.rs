@@ -28,7 +28,7 @@ use crate::placement::fence;
 use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
-use crate::shard::assemble_shard_manifest;
+use crate::shard::{assemble_shard_manifest, frontier_root};
 use crate::shard::verify::converge_with_barrier;
 
 /// Runs every transition step the local node owns. Returns whether a step is
@@ -323,7 +323,9 @@ async fn completion_step(
 ) -> StepPlan {
     if transition
         .proofs_for(placement.shard)
-        .any(|proof| proof.holder == local_node_id)
+        .any(|proof| {
+            proof.holder == local_node_id && transition.proof_valid(placement.shard, proof)
+        })
     {
         return StepPlan::Done;
     }
@@ -358,11 +360,28 @@ async fn completion_step(
         crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
     }
 
+    let mut required = irokle::ActorClock::default();
+    for barrier in transition
+        .barriers
+        .iter()
+        .filter(|barrier| barrier.bucket == placement.shard)
+        .filter(|barrier| bucket.old_holders.contains(&barrier.reported_by))
+    {
+        let Ok(frontier) = postcard::from_bytes::<irokle::ActorClock>(&barrier.frontier) else {
+            debug!(
+                reported_by = %barrier.reported_by,
+                "Undecodable barrier frontier; leaving the bucket pending"
+            );
+            return StepPlan::Pending;
+        };
+        required.merge(&frontier);
+    }
+
     let checkpoint_root = if sources.is_empty() {
-        // No source to verify against: the bucket had no holder to lose history
-        // to, so the local (empty) manifest is the root.
-        match assemble_shard_manifest(context, realm_id, *placement).await {
-            Ok(manifest) => manifest.digest,
+        // A source-less bucket still binds its fenced frontier and topic genesis,
+        // not its moving live fingerprint.
+        match frontier_root(&net_handle, topic, &required) {
+            Ok(root) => root,
             Err(error) => {
                 debug!(error = %error, "Cannot assemble a source-less transition checkpoint");
                 return StepPlan::Pending;
@@ -372,22 +391,6 @@ async fn completion_step(
         // The proof must cover every old holder's fenced writes, so the local
         // cursor has to dominate the join of all reported frontiers even when
         // some holders are unreachable for pulling (F5).
-        let mut required = irokle::ActorClock::default();
-        for barrier in transition
-            .barriers
-            .iter()
-            .filter(|barrier| barrier.bucket == placement.shard)
-            .filter(|barrier| bucket.old_holders.contains(&barrier.reported_by))
-        {
-            let Ok(frontier) = postcard::from_bytes::<irokle::ActorClock>(&barrier.frontier) else {
-                debug!(
-                    reported_by = %barrier.reported_by,
-                    "Undecodable barrier frontier; leaving the bucket pending"
-                );
-                return StepPlan::Pending;
-            };
-            required.merge(&frontier);
-        }
         match converge_with_barrier(
             context,
             &net_handle,
@@ -399,7 +402,13 @@ async fn completion_step(
         )
         .await
         {
-            Some((_, digest)) => digest,
+            Some((_, _)) => match frontier_root(&net_handle, topic, &required) {
+                Ok(root) => root,
+                Err(error) => {
+                    debug!(error = %error, "Cannot hash the transition checkpoint frontier");
+                    return StepPlan::Pending;
+                }
+            },
             None => {
                 debug!(
                     strategy = %placement.strategy_id,
