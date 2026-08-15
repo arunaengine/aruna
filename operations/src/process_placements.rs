@@ -269,6 +269,8 @@ pub(crate) async fn resolve_creatable_topics(
             .probe_shard_topic_geneses(missing.clone(), live)
             .await
     };
+    // Skipped peers stay in `unreachable` so an all-dead set still withholds:
+    // dropping them would read as "no co-holder to consult" and mint a rival.
     probe.unreachable.extend(skipped);
     unreachable_peers.extend(probe.unreachable.iter().copied());
     let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
