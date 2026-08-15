@@ -846,6 +846,23 @@ async fn finish_outage(
             .unwrap_or(false),
         "restored peer must retain the genesis"
     );
+    // Each restored peer runs its own restore, as every configured node does:
+    // only the designated minter creates the realm-wide topics, and the live
+    // node here is never it, so a peer that never restores strands them.
+    for peer in &nodes[1..] {
+        aruna_operations::startup::restore_shard_subscriptions(
+            &peer.context,
+            peer.net.node_id(),
+            realm_id,
+        )
+        .await;
+        aruna_operations::process_placements::process_shard_placements(
+            &peer.context,
+            realm_id,
+            peer.net.node_id(),
+        )
+        .await;
+    }
 
     let expected_event = Ulid::from_parts(3, INCIDENT_METADATA_RECORDS as u128);
     wait_outbox(drainer, &nodes).await?;
