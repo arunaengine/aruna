@@ -3,6 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::PendingCleanup;
+use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
@@ -21,8 +22,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, PathRestriction, RealmId, RoCrateLimits, RoutingError,
-    RoutingSnapshot, UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
+    BucketInfo, CurrentVersionPointer, PathRestriction, PlacementPolicyError, PlacementPolicyRef,
+    RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta, VersionKey,
+    VersionSourceBinding, WriteOwner, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -52,6 +54,7 @@ pub enum PutObjectState {
     WriteBlobHead,
     WriteHashPathIndex,
     CreateBlobVersionRecord,
+    RegisterManagedCopy,
     WriteLiveReplicationObligation,
     EnforceQuota,
     QuotaRejectAbort,
@@ -100,6 +103,10 @@ pub enum PutObjectError {
     RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
     BackendFenceError(#[from] BackendFenceError),
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
+    #[error(transparent)]
+    PolicyError(#[from] PlacementPolicyError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
@@ -165,6 +172,12 @@ pub struct PutObjectOperation {
     metadata: HashMap<String, String>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
+    /// Refs sealed on the version record, reused verbatim by its registration.
+    sealed_policies: Vec<PlacementPolicyRef>,
+    /// Destination default, read inside the version transaction so an edit
+    /// observed after streaming cannot commit a stale ref set.
+    bucket_policies: Vec<PlacementPolicyRef>,
+    inherited_policies: Vec<PlacementPolicyRef>,
 }
 
 impl PutObjectOperation {
@@ -191,12 +204,31 @@ impl PutObjectOperation {
             metadata: HashMap::new(),
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
+            sealed_policies: Vec::new(),
+            bucket_policies: Vec::new(),
+            inherited_policies: Vec::new(),
         }
     }
 
     pub fn with_bucket_guard(mut self, bucket: BucketInfo) -> Self {
         self.expected_bucket = Some(bucket);
         self
+    }
+
+    /// Refs a copy or derived write carries over from its source. They are
+    /// unioned with the destination default, so a copy can only be at least as
+    /// constrained as what it was copied from.
+    pub fn with_inherited_policies(mut self, policies: Vec<PlacementPolicyRef>) -> Self {
+        self.inherited_policies = policies;
+        self
+    }
+
+    /// Union of the destination default read in this transaction and whatever
+    /// the write inherited. Both empty leaves the version ungoverned.
+    fn effective_policies(&self) -> Vec<PlacementPolicyRef> {
+        let mut policies = self.bucket_policies.clone();
+        policies.extend(self.inherited_policies.iter().copied());
+        policies
     }
 
     /// The writer's credential restrictions. They are persisted on the durable
@@ -350,16 +382,14 @@ impl PutObjectOperation {
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
-            if self.expected_bucket.is_some() {
-                self.state = PutObjectState::CheckBucket;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: self.config.request.bucket.as_bytes().into(),
-                    txn_id: self.txn_id,
-                })]
-            } else {
-                self.start_fence()
-            }
+            // Read unconditionally: the version snapshots the default this
+            // transaction observes, not one read before the bytes streamed.
+            self.state = PutObjectState::CheckBucket;
+            smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: self.config.request.bucket.as_bytes().into(),
+                txn_id: self.txn_id,
+            })]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
@@ -397,12 +427,18 @@ impl PutObjectOperation {
             Ok(current) => current,
             Err(error) => return self.emit_error(error.into()),
         };
-        if current.as_ref().map(BucketInfo::identity)
-            != self.expected_bucket.as_ref().map(BucketInfo::identity)
-            || current.is_none_or(|bucket| bucket.group_id != self.config.group_id)
+        if self.expected_bucket.is_some()
+            && (current.as_ref().map(BucketInfo::identity)
+                != self.expected_bucket.as_ref().map(BucketInfo::identity)
+                || current
+                    .as_ref()
+                    .is_none_or(|bucket| bucket.group_id != self.config.group_id))
         {
             return self.emit_error(StorageError::TransactionConflict.into());
         }
+        self.bucket_policies = current
+            .map(|bucket| bucket.placement_policies)
+            .unwrap_or_default();
         self.start_fence()
     }
 
@@ -638,11 +674,16 @@ impl PutObjectOperation {
                 self.config.version_source.clone(),
             )
             .with_metadata(self.metadata.clone());
+            let version = match version.with_policies(self.effective_policies()) {
+                Ok(version) => version,
+                Err(err) => return self.emit_error(err.into()),
+            };
             let version_key = VersionKey::new(
                 self.config.request.bucket.clone(),
                 self.config.request.key.clone(),
                 version_id,
             );
+            self.sealed_policies = version.placement_policies.clone();
             let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -655,6 +696,42 @@ impl PutObjectOperation {
     }
 
     fn handle_blob_version_record_created(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
+            self.register_managed_copy()
+        } else {
+            self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    /// Joins the version transaction, so the copy becomes serveable exactly when
+    /// the logical version does and never before.
+    fn register_managed_copy(&mut self) -> Effects {
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(PutObjectError::PutObjectFailed);
+        };
+        let Some(location) = self.get_output().cloned() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        let effect = match register_effect(
+            VersionKey::new(
+                self.config.request.bucket.clone(),
+                self.config.request.key.clone(),
+                version_id,
+            ),
+            self.config.node_id,
+            &location,
+            &self.sealed_policies,
+            version_id.timestamp_ms(),
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.state = PutObjectState::RegisterManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_copy_registered(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             self.write_live_replication_obligation()
         } else {
@@ -1147,6 +1224,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::CreateBlobVersionRecord => {
                 self.handle_blob_version_record_created(event)
             }
+            PutObjectState::RegisterManagedCopy => self.handle_copy_registered(event),
             PutObjectState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
@@ -1348,6 +1426,10 @@ mod routing_test {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        }));
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
@@ -1396,6 +1478,10 @@ mod routing_test {
         }));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
         }));
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),

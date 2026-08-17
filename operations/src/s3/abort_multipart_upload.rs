@@ -508,6 +508,7 @@ mod tests {
             status: MultipartUploadStatus::Aborting,
             checksum_hint: None,
             metadata: HashMap::new(),
+            placement_policies: Vec::new(),
         });
         operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
         operation.state = AbortMultipartUploadState::CommitMarkTransaction;

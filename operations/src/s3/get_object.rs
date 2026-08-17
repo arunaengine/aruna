@@ -1,4 +1,5 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
@@ -19,10 +20,11 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, PathRestriction, ResolvedSourceAccess, SourceMetadata, UsageDelta,
-    VersionKey, VersionSourceBinding,
+    AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BlobVersionState, CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType,
+    MultipartObjectMetadataKey, MultipartObjectSummary, PathRestriction, PlacementPolicyError,
+    PlacementPolicyRef, ResolvedSourceAccess, SourceMetadata, UsageDelta, VersionKey,
+    VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
@@ -49,6 +51,7 @@ pub enum GetObjectState {
     Init,
     StartTransaction,
     GetVersion,
+    CheckManagedCopy,
     GetBlobLocation,
     GetCurrentVersion,
     ResolveReferenceAccess,
@@ -110,6 +113,10 @@ pub enum GetObjectError {
     ResolveReferenceError(#[from] SourceConnectorResolutionError),
     #[error(transparent)]
     StagingSourceError(#[from] StagingSourceError),
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
+    #[error(transparent)]
+    PolicyError(#[from] PlacementPolicyError),
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
 }
@@ -190,6 +197,9 @@ pub struct GetObjectResult {
     pub composite_hashes: HashMap<String, Vec<u8>>,
     pub part_count: Option<usize>,
     pub resolved_range: Option<ResolvedObjectRange>,
+    /// Refs sealed on the version that was read. A copy unions them with its
+    /// destination default, so a copy is never less constrained than its source.
+    pub source_policies: Vec<PlacementPolicyRef>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -232,6 +242,10 @@ pub struct GetObjectOperation {
     composite_hashes: HashMap<String, Vec<u8>>,
     part_count: Option<usize>,
     resolved_range: Option<ResolvedObjectRange>,
+    /// Held while a governed version's local registration is verified.
+    pending_location: Option<BlobLocationKey>,
+    /// Refs of the version being read, carried to copy and advance writes.
+    source_policies: Vec<PlacementPolicyRef>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
 }
 
@@ -265,6 +279,8 @@ impl GetObjectOperation {
             composite_hashes: HashMap::new(),
             part_count: None,
             resolved_range: None,
+            pending_location: None,
+            source_policies: Vec::new(),
             output: None,
         }
     }
@@ -422,6 +438,7 @@ impl GetObjectOperation {
     ) -> Effects {
         self.resolved_version_id = Some(version_id);
         self.metadata = version.metadata.clone();
+        self.source_policies = version.placement_policies.clone();
 
         match version.state {
             BlobVersionState::Materialized {
@@ -431,7 +448,10 @@ impl GetObjectOperation {
             } => {
                 self.source_binding = source;
                 self.version_created_at = Some(version.created_at);
-                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
+                if version.placement_policies.is_empty() {
+                    return self.read_blob_location(BlobLocationKey::new(blob_hash, backend));
+                }
+                self.check_managed_copy(version_id, blob_hash, backend)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 GetObjectError::DeleteMarker
@@ -469,6 +489,44 @@ impl GetObjectOperation {
     fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = GetObjectState::GetBlobLocation;
         smallvec![blob_location_read(&key, self.txn_id)]
+    }
+
+    /// A governed version is only serveable from a registered local copy, so an
+    /// unregistered or quarantined copy fails closed before any byte moves.
+    fn check_managed_copy(
+        &mut self,
+        version_id: Ulid,
+        blob_hash: [u8; 32],
+        backend: BackendRef,
+    ) -> Effects {
+        let key = ManagedCopyKey::new(
+            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
+            backend.clone(),
+        );
+        let effect = match read_effect(&key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
+        self.state = GetObjectState::CheckManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_managed_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        if let Err(err) = check_serveable(value.as_deref()) {
+            return self.emit_error(err.into());
+        }
+        let Some(key) = self.pending_location.take() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        self.read_blob_location(key)
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
@@ -801,9 +859,16 @@ impl GetObjectOperation {
         };
 
         let new_version_id = Ulid::generate();
-        let successor = BlobVersion::reference(source_binding, observation, now, creator, now)
+        // The successor of a governed reference keeps its predecessor's refs:
+        // an automatic advance must never relax an attachment.
+        let successor = match BlobVersion::reference(source_binding, observation, now, creator, now)
             .with_metadata(self.metadata.clone())
-            .with_advance_count(successor_count);
+            .with_advance_count(successor_count)
+            .with_policies(current.placement_policies.clone())
+        {
+            Ok(successor) => successor,
+            Err(err) => return self.emit_error(err.into()),
+        };
         let version_key =
             match VersionKey::new(&self.input.bucket, &self.input.key, new_version_id).to_bytes() {
                 Ok(key) => key.into(),
@@ -1050,6 +1115,7 @@ impl GetObjectOperation {
                 composite_hashes: self.composite_hashes.clone(),
                 part_count: self.part_count,
                 resolved_range: self.resolved_range.clone(),
+                source_policies: self.source_policies.clone(),
             }));
             smallvec![]
         } else {
@@ -1113,6 +1179,7 @@ impl GetObjectOperation {
             composite_hashes: self.composite_hashes.clone(),
             part_count: self.part_count,
             resolved_range: self.resolved_range.clone(),
+            source_policies: self.source_policies.clone(),
         }));
         smallvec![]
     }
@@ -1131,6 +1198,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::Init => self.handle_init(),
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
             GetObjectState::GetVersion => self.handle_received_version(event),
+            GetObjectState::CheckManagedCopy => self.handle_managed_copy(event),
             GetObjectState::GetBlobLocation => self.handle_blob_location_read(event),
             GetObjectState::GetCurrentVersion => self.handle_received_current_version(event),
             GetObjectState::ResolveReferenceAccess => self.handle_resolved_reference_access(event),

@@ -5,8 +5,8 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
-    MultipartObjectSummary, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
-    SourceMetadata, VersionSourceBinding, VersionedObjectArn,
+    MultipartObjectSummary, PlacementPolicyRef, RealmId, ReplicationItemKind,
+    ReplicationNegotiationResult, SourceMetadata, VersionSourceBinding, VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -56,6 +56,9 @@ pub struct VersionReplicationManifest {
     /// Automatic advance count of the reference this manifest carries, so repair
     /// and snapshot replication preserve the cap instead of resetting it.
     pub reference_advance_count: Option<u16>,
+    /// Refs sealed on the replicated version. The target reconstructs the same
+    /// governed version, so replication never relaxes an attachment.
+    pub placement_policies: Vec<PlacementPolicyRef>,
 }
 
 impl VersionReplicationManifest {
@@ -66,6 +69,13 @@ impl VersionReplicationManifest {
 
     pub(crate) fn validate(&self) -> Result<(), ConversionError> {
         let mut budget = ManifestBudget::default();
+        if PlacementPolicyRef::canonical_set(&self.placement_policies)
+            .is_ok_and(|canonical| canonical == self.placement_policies)
+        {
+            budget.add(0, self.placement_policies.len())?;
+        } else {
+            return Err(ConversionError::NonCanonicalPolicyRefs);
+        }
         check_text(&mut budget, &self.bucket, MAX_REPLICATION_VALUE_BYTES)?;
         check_text(&mut budget, &self.key, MAX_REPLICATION_VALUE_BYTES)?;
         check_map(&mut budget, &self.metadata)?;
@@ -544,8 +554,8 @@ mod tests {
     use aruna_core::structs::checksum::HASH_SHA256;
     use aruna_core::structs::{
         ArunaArn, AuthContext, BackendLocation, BackendRef, MultipartChecksumType,
-        MultipartObjectPart, MultipartObjectSummary, PortableSourceDescriptor, RealmId,
-        ReplicationItemKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, PortableSourceDescriptor,
+        RealmId, ReplicationItemKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
         VersionSourceBinding,
     };
     use std::collections::HashMap;
@@ -587,6 +597,7 @@ mod tests {
             metadata: HashMap::new(),
             reference_advance: None,
             reference_advance_count: None,
+            placement_policies: Vec::new(),
         }
     }
 
@@ -766,13 +777,32 @@ mod tests {
         let (legacy, remainder) = postcard::take_from_bytes::<LegacyMessage>(payload).unwrap();
         let LegacyMessage::VersionManifest(legacy) = legacy;
 
-        // The advance count is strictly trailing, so every earlier field keeps
-        // its position on the wire.
-        assert_eq!(
-            remainder,
-            postcard::to_allocvec(&manifest.reference_advance_count).unwrap()
-        );
+        // The advance count and the policy refs are strictly trailing, so every
+        // earlier field keeps its position on the wire.
+        let mut trailing = postcard::to_allocvec(&manifest.reference_advance_count).unwrap();
+        trailing.extend(postcard::to_allocvec(&manifest.placement_policies).unwrap());
+        assert_eq!(remainder, trailing);
         assert_eq!(legacy.bucket, manifest.bucket);
+    }
+
+    #[test]
+    fn rejects_noncanonical_refs() {
+        // A governed manifest must carry the one canonical ref set or nothing.
+        let mut manifest = make_manifest();
+        manifest.placement_policies = vec![
+            PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([6u8; 16]),
+                digest: [6u8; 32],
+            },
+            PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([1u8; 16]),
+                digest: [1u8; 32],
+            },
+        ];
+
+        assert!(manifest.validate().is_err());
+        manifest.placement_policies.reverse();
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]

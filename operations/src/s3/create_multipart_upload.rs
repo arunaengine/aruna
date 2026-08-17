@@ -160,6 +160,7 @@ impl CreateMultipartUploadOperation {
             status: MultipartUploadStatus::Open,
             checksum_hint: self.input.checksum_hint.clone(),
             metadata: self.metadata.clone(),
+            placement_policies: Vec::new(),
         };
         let value = match record.to_bytes() {
             Ok(value) => value,

@@ -208,6 +208,7 @@ pub async fn copy_object(
             routing,
         })
         .with_metadata(metadata)
+        .with_inherited_policies(source.source_policies.clone())
         .with_restrictions(input.restrictions.clone()),
         context,
     )
@@ -404,6 +405,96 @@ mod test {
             panic!("missing blob version entry");
         };
         BlobVersion::from_bytes(value.expect("missing blob version").as_ref()).unwrap()
+    }
+
+    async fn seed_bucket(
+        context: &DriverContext,
+        bucket: &str,
+        group_id: GroupId,
+        user_id: UserId,
+        policies: Vec<aruna_core::structs::PlacementPolicyRef>,
+    ) {
+        let info = aruna_core::structs::BucketInfo {
+            group_id,
+            created_at: std::time::UNIX_EPOCH,
+            created_by: user_id,
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+            placement_policies: policies,
+            placement_policy_generation: 1,
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                value: info.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn copy_unions_refs() {
+        // Union tightens: the copy carries both its source's and its
+        // destination's refs.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let source_ref = aruna_core::structs::PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([1u8; 16]),
+            digest: [1u8; 32],
+        };
+        let dest_ref = aruna_core::structs::PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([2u8; 16]),
+            digest: [2u8; 32],
+        };
+        seed_bucket(&context, "source", group_id, user_id, vec![source_ref]).await;
+        seed_bucket(&context, "dest", group_id, user_id, vec![dest_ref]).await;
+        drive(
+            PutObjectOperation::new(put_config(
+                realm_id,
+                group_id,
+                node_id,
+                "source",
+                "object.txt",
+                b"payload",
+            )),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "source".to_string(),
+                source_key: "object.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "dest".to_string(),
+                dest_key: "copy.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let copied = read_dest_version(&context, "dest", "copy.txt", result.version_id).await;
+        assert_eq!(copied.placement_policies, vec![source_ref, dest_ref]);
     }
 
     #[tokio::test]

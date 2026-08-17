@@ -3,6 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::{PendingCleanup, schedule_blob_cleanup_effect};
+use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
@@ -14,7 +15,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
@@ -22,10 +23,11 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, PathRestriction, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta,
-    VersionKey, WriteOwner,
+    BucketInfo, CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
+    MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
+    MultipartUploadPartKey, MultipartUploadStatus, PathRestriction, PlacementPolicyError,
+    PlacementPolicyRef, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
+    WriteOwner,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -45,6 +47,7 @@ pub enum CompleteMultipartUploadState {
     ReadUploadParts,
     ComposeBlob,
     StartFinalizeTransaction,
+    ReadBucketDefault,
     FenceBackend,
     CheckHashLookup,
     WriteBlobLocation,
@@ -53,6 +56,7 @@ pub enum CompleteMultipartUploadState {
     WriteBlobHead,
     WriteHashPathIndex,
     WriteBlobVersionRecord,
+    RegisterManagedCopy,
     WriteObjectMetadata,
     DeleteUploadRecords,
     WriteCleanupRecords,
@@ -116,6 +120,10 @@ pub enum CompleteMultipartUploadError {
     UsageUpdateError(#[from] UsageUpdateError),
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
+    #[error(transparent)]
+    PolicyError(#[from] PlacementPolicyError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
@@ -189,6 +197,10 @@ pub struct CompleteMultipartUploadOperation {
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
+    /// Refs sealed on the version record, reused verbatim by its registration.
+    sealed_policies: Vec<PlacementPolicyRef>,
+    /// Destination default, read inside the finalize transaction.
+    bucket_policies: Vec<PlacementPolicyRef>,
 }
 
 impl CompleteMultipartUploadOperation {
@@ -220,6 +232,8 @@ impl CompleteMultipartUploadOperation {
             output: None,
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
+            sealed_policies: Vec::new(),
+            bucket_policies: Vec::new(),
         }
     }
 
@@ -733,6 +747,32 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
+        // The version snapshots the default this transaction observes, not one
+        // read while the parts were still being uploaded.
+        self.state = CompleteMultipartUploadState::ReadBucketDefault;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_default_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        match value
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => {
+                self.bucket_policies = bucket
+                    .map(|bucket| bucket.placement_policies)
+                    .unwrap_or_default();
+            }
+            Err(error) => return self.schedule_error(error.into()),
+        }
 
         let Some(location) = self.composed_location.clone() else {
             return self
@@ -997,7 +1037,16 @@ impl CompleteMultipartUploadOperation {
             None,
         )
         .with_metadata(upload_record.metadata.clone());
+        // Union with what part copies inherited: a part-wise copy of a governed
+        // source can only add refs to the composed object.
+        let mut policies = self.bucket_policies.clone();
+        policies.extend(upload_record.placement_policies.iter().copied());
+        let version = match version.with_policies(policies) {
+            Ok(version) => version,
+            Err(err) => return self.schedule_error(err.into()),
+        };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        self.sealed_policies = version.placement_policies.clone();
         let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -1008,6 +1057,37 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn handle_blob_version_record_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
+        self.register_managed_copy()
+    }
+
+    /// Joins the finalize transaction, so the composed copy becomes serveable
+    /// exactly when the logical version does and never before.
+    fn register_managed_copy(&mut self) -> Effects {
+        let (Some(version_id), Some(location)) = (self.version_id, self.final_location.clone())
+        else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        let effect = match register_effect(
+            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
+            self.input.node_id,
+            &location,
+            &self.sealed_policies,
+            version_id.timestamp_ms(),
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        self.state = CompleteMultipartUploadState::RegisterManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_copy_registered(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1543,6 +1623,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)
             }
+            CompleteMultipartUploadState::ReadBucketDefault => self.handle_default_read(event),
             CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteMultipartUploadState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             CompleteMultipartUploadState::WriteBlobLocation => {
@@ -1559,6 +1640,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::WriteBlobVersionRecord => {
                 self.handle_blob_version_record_written(event)
             }
+            CompleteMultipartUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteMultipartUploadState::WriteObjectMetadata => {
                 self.handle_object_metadata_written(event)
             }
@@ -1798,6 +1880,7 @@ mod tests {
             status: MultipartUploadStatus::Completing,
             checksum_hint: None,
             metadata: HashMap::new(),
+            placement_policies: Vec::new(),
         }
     }
 
@@ -1878,6 +1961,16 @@ mod tests {
         let txn_id = TxnId::generate();
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, CompleteMultipartUploadState::ReadBucketDefault);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        }));
         assert_eq!(op.state, CompleteMultipartUploadState::FenceBackend);
         assert!(matches!(
             effects.as_slice(),

@@ -249,6 +249,7 @@ impl IntoS3Error for UploadPartCopyError {
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."
             ),
+            UploadPartCopyError::Policy(err) => internal_error(err),
         }
     }
 }

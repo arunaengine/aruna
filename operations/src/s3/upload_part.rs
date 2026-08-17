@@ -743,6 +743,7 @@ mod test {
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
             metadata: std::collections::HashMap::new(),
+            placement_policies: Vec::new(),
         };
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {

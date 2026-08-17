@@ -1360,6 +1360,7 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
             ServerError::InternalError(error.to_string())
         }
         MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.to_string()),
+        MaterializeReferenceError::Policy(error) => ServerError::InternalError(error.to_string()),
     }
 }
 

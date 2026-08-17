@@ -613,6 +613,7 @@ mod tests {
                 status: MultipartUploadStatus::Open,
                 checksum_hint: None,
                 metadata: HashMap::new(),
+                placement_policies: Vec::new(),
             }
             .to_bytes()
             .unwrap(),

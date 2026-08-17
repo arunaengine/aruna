@@ -1,6 +1,7 @@
 use crate::errors::ConversionError;
+use crate::structs::blob::checked_refs;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
-use crate::structs::{BackendLocation, BackendRef};
+use crate::structs::{BackendLocation, BackendRef, PlacementPolicyError, PlacementPolicyRef};
 use crate::types::{GroupId, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,15 +51,36 @@ pub struct MultipartUpload {
     pub status: MultipartUploadStatus,
     pub checksum_hint: Option<MultipartUploadChecksumHint>,
     pub metadata: HashMap<String, String>,
+    /// Refs inherited from the sources parts were copied from, canonically
+    /// sorted. The completed object unions them with the destination default,
+    /// so a part-wise copy cannot drop its source's constraints.
+    pub placement_policies: Vec<PlacementPolicyRef>,
 }
 
 impl MultipartUpload {
+    /// Adds the refs a copied part brought along. Returns whether the sealed set
+    /// changed, so an unchanged upload record is not rewritten.
+    pub fn merge_policies(
+        &mut self,
+        policies: &[PlacementPolicyRef],
+    ) -> Result<bool, PlacementPolicyError> {
+        let mut merged = self.placement_policies.clone();
+        merged.extend(policies.iter().copied());
+        let merged = PlacementPolicyRef::canonical_set(&merged)?;
+        let changed = merged != self.placement_policies;
+        self.placement_policies = merged;
+        Ok(changed)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        checked_refs(&self.placement_policies)?;
         Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let upload: Self = postcard::from_bytes(bytes)?;
+        checked_refs(&upload.placement_policies)?;
+        Ok(upload)
     }
 }
 

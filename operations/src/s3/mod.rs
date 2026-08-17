@@ -1,6 +1,7 @@
 pub mod abort_multipart_upload;
 mod access_index;
 pub mod bucket_cors;
+pub mod bucket_placement;
 pub mod bucket_routing;
 pub mod complete_multipart_upload;
 pub mod copy_object;
@@ -22,6 +23,9 @@ pub mod list_objects_v2;
 pub mod list_parts;
 pub mod list_user_access;
 pub mod listing;
+pub mod policy_bulk;
+pub mod policy_coverage;
+pub mod policy_successor;
 pub mod put_bucket_replication;
 pub mod put_object;
 pub mod refresh_reference_metadata;

@@ -25,10 +25,10 @@ use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs,
     MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, Permission,
-    PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
-    SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
-    blob_object_permission_path, sync_state_key,
+    PlacementPolicyRef, PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind,
+    ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
+    RoutingError, SourceConnectorKind, SourceMetadata, StagingStrategy, SyncMode, SyncRelationship,
+    VersionKey, VersionSourceBinding, blob_object_permission_path, sync_state_key,
 };
 use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
@@ -981,6 +981,8 @@ pub struct ReplicateObjectVersionOperation {
     sync: Option<SyncTransferContext>,
     writer_auth_context: Option<AuthContext>,
     reference_advance: Option<ReferenceAdvance>,
+    /// Refs read from the stored version, carried onto the manifest unchanged.
+    version_policies: Vec<PlacementPolicyRef>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
@@ -1007,6 +1009,7 @@ impl ReplicateObjectVersionOperation {
             sync: None,
             writer_auth_context: None,
             reference_advance: None,
+            version_policies: Vec::new(),
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
@@ -1744,6 +1747,7 @@ impl ReplicateObjectVersionOperation {
             metadata,
             reference_advance: self.reference_advance,
             reference_advance_count,
+            placement_policies: self.version_policies.clone(),
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -1909,8 +1913,9 @@ impl Operation for ReplicateObjectVersionOperation {
                     state,
                     metadata,
                     published_by: _,
-                    placement_policies: _,
+                    placement_policies,
                 } = version;
+                self.version_policies = placement_policies;
 
                 match state {
                     BlobVersionState::Materialized {

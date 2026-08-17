@@ -519,6 +519,10 @@ pub struct BucketCorsRule {
     pub max_age_seconds: Option<i32>,
 }
 
+/// Group, creation time and creator: the fields a write or policy mutation is
+/// authorized against and that no bucket edit may change.
+pub type BucketIdentity = (Ulid, SystemTime, UserId);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketInfo {
     pub group_id: Ulid,
@@ -561,7 +565,7 @@ impl BucketInfo {
     /// What makes this the same bucket record: what a write authorized against
     /// must not have changed. The mutable configuration is excluded on purpose,
     /// so an admin edit cannot abort a long-running write.
-    pub fn identity(&self) -> (Ulid, SystemTime, UserId) {
+    pub fn identity(&self) -> BucketIdentity {
         (self.group_id, self.created_at, self.created_by)
     }
 }
@@ -861,7 +865,7 @@ pub enum ManagedCopyQuarantine {
 
 /// Every stored ref set passes here on encode and decode, so a conflicting,
 /// oversized or noncanonical set can never be persisted or served.
-fn checked_refs(refs: &[PlacementPolicyRef]) -> Result<(), ConversionError> {
+pub(crate) fn checked_refs(refs: &[PlacementPolicyRef]) -> Result<(), ConversionError> {
     if PlacementPolicyRef::canonical_set(refs)? != refs {
         return Err(ConversionError::NonCanonicalPolicyRefs);
     }

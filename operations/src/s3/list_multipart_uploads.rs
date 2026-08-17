@@ -424,6 +424,7 @@ mod test {
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
             metadata: Default::default(),
+            placement_policies: Vec::new(),
         }
     }
 

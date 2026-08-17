@@ -8,7 +8,10 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{AuthContext, BackendLocation, MultipartUpload, MultipartUploadStatus};
+use aruna_core::structs::{
+    AuthContext, BackendLocation, MultipartUpload, MultipartUploadStatus, PlacementPolicyError,
+    PlacementPolicyRef,
+};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;
@@ -45,6 +48,8 @@ pub enum UploadPartCopyError {
     Get(#[from] GetObjectError),
     #[error(transparent)]
     UploadPart(#[from] UploadPartError),
+    #[error(transparent)]
+    Policy(#[from] PlacementPolicyError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
 }
@@ -106,6 +111,10 @@ pub async fn upload_part_copy(
         return Err(UploadPartCopyError::PreconditionFailed);
     }
 
+    // Sealed before the bytes land: a lost merge must not let the completed
+    // object drop the refs its source carried.
+    seal_source_policies(context, input.upload_id, &source.source_policies).await?;
+
     let content_length = source
         .resolved_range
         .as_ref()
@@ -136,6 +145,86 @@ pub async fn upload_part_copy(
         source_version_id,
         source_last_modified,
     })
+}
+
+/// Merges the source's refs into the destination upload record. An ungoverned
+/// copy writes nothing, so its behavior is exactly what it was before.
+async fn seal_source_policies(
+    context: &DriverContext,
+    upload_id: Ulid,
+    policies: &[PlacementPolicyRef],
+) -> Result<(), UploadPartCopyError> {
+    if policies.is_empty() {
+        return Ok(());
+    }
+    let txn_id = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        _ => return Err(UploadPartError::InvalidOperationState.into()),
+    };
+    let result = merge_upload_policies(context, upload_id, policies, txn_id).await;
+    let closing = match result {
+        Ok(()) => StorageEffect::CommitTransaction { txn_id },
+        Err(_) => StorageEffect::AbortTransaction { txn_id },
+    };
+    let event = context.storage_handle.send_storage_effect(closing).await;
+    result?;
+    match event {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(UploadPartError::StorageError(error).into())
+        }
+        _ => Err(UploadPartError::InvalidOperationState.into()),
+    }
+}
+
+async fn merge_upload_policies(
+    context: &DriverContext,
+    upload_id: Ulid,
+    policies: &[PlacementPolicyRef],
+    txn_id: aruna_core::types::TxnId,
+) -> Result<(), UploadPartCopyError> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key: upload_id.to_bytes().to_vec().into(),
+            txn_id: Some(txn_id),
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        return Err(UploadPartError::InvalidOperationState.into());
+    };
+    let Some(value) = value else {
+        return Err(UploadPartError::NoSuchUpload.into());
+    };
+    let mut record = MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?;
+    if record.status != MultipartUploadStatus::Open {
+        return Err(UploadPartError::UploadNotOpen.into());
+    }
+    if !record.merge_policies(policies)? {
+        return Ok(());
+    }
+    let value = record.to_bytes().map_err(UploadPartError::from)?;
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key: upload_id.to_bytes().to_vec().into(),
+            value: value.into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(UploadPartError::StorageError(error).into())
+        }
+        _ => Err(UploadPartError::InvalidOperationState.into()),
+    }
 }
 
 async fn validate_destination_upload(
@@ -297,6 +386,7 @@ mod test {
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
             metadata: HashMap::new(),
+            placement_policies: Vec::new(),
         };
         let event = context
             .storage_handle
@@ -381,6 +471,98 @@ mod test {
         assert_eq!(part.part_number, 1);
         assert_eq!(part.location.blob_size, 4);
         assert_eq!(part.location.created_by, user_id);
+    }
+
+    #[tokio::test]
+    async fn copy_seals_policies() {
+        // A part copied from a governed source seals its refs on the upload, so
+        // the composed object cannot be less constrained than what it copied.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let upload_id = Ulid::generate();
+        let policy = aruna_core::structs::PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([4u8; 16]),
+            digest: [4u8; 32],
+        };
+        seed_governed_bucket(&context, group_id, user_id, vec![policy]).await;
+
+        put_source(
+            &context,
+            realm_id,
+            group_id,
+            node_id,
+            "bucket",
+            "source.txt",
+            b"0123456789",
+        )
+        .await;
+        seed_multipart_upload(&context, upload_id, "bucket", "dest.txt", group_id, user_id).await;
+
+        upload_part_copy(
+            &context,
+            UploadPartCopyInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "source.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                upload_id,
+                part_number: 1,
+                range: None,
+                user_id,
+                node_id,
+                source_auth_context: AuthContext::anonymous(realm_id),
+                conditions: CopySourceConditions::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                key: upload_id.to_bytes().to_vec().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing upload record");
+        };
+        let record =
+            MultipartUpload::from_bytes(value.expect("missing upload record").as_ref()).unwrap();
+        assert_eq!(record.placement_policies, vec![policy]);
+    }
+
+    async fn seed_governed_bucket(
+        context: &DriverContext,
+        group_id: GroupId,
+        user_id: UserId,
+        policies: Vec<aruna_core::structs::PlacementPolicyRef>,
+    ) {
+        let bucket = aruna_core::structs::BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: user_id,
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+            placement_policies: policies,
+            placement_policy_generation: 1,
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+                key: b"bucket".to_vec().into(),
+                value: bucket.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
     }
 
     #[tokio::test]

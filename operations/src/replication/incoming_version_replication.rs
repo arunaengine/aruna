@@ -92,6 +92,8 @@ enum IncomingVersionReplicationState {
 #[derive(Debug, Error, PartialEq)]
 pub enum IncomingVersionReplicationError {
     #[error(transparent)]
+    Policy(#[from] aruna_core::structs::PlacementPolicyError),
+    #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
     BackendFenceError(#[from] BackendFenceError),
@@ -545,7 +547,8 @@ impl IncomingVersionReplicationOperation {
         )
         .with_metadata(self.manifest.metadata.clone())
         .with_advance_count(advance_count)
-        .with_publisher(self.publisher_node_id))
+        .with_publisher(self.publisher_node_id)
+        .with_policies(self.manifest.placement_policies.clone())?)
     }
 
     fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionReplicationError> {
@@ -1184,18 +1187,21 @@ impl IncomingVersionReplicationOperation {
                         Ok(hash) => hash,
                         Err(err) => return self.fail(ConversionError::from(err).into()),
                     };
-                    (
-                        BlobVersion::materialized(
-                            hash,
-                            location.backend.clone(),
-                            self.manifest.created_at,
-                            self.manifest.created_by,
-                            self.manifest.source.clone(),
-                        )
-                        .with_metadata(self.manifest.metadata.clone())
-                        .with_publisher(self.publisher_node_id),
-                        Some(hash),
+                    let materialized = match BlobVersion::materialized(
+                        hash,
+                        location.backend.clone(),
+                        self.manifest.created_at,
+                        self.manifest.created_by,
+                        self.manifest.source.clone(),
                     )
+                    .with_metadata(self.manifest.metadata.clone())
+                    .with_publisher(self.publisher_node_id)
+                    .with_policies(self.manifest.placement_policies.clone())
+                    {
+                        Ok(materialized) => materialized,
+                        Err(err) => return self.fail(err.into()),
+                    };
+                    (materialized, Some(hash))
                 }
             }
             ReplicationItemKind::DeleteMarker => (
@@ -2662,6 +2668,7 @@ mod tests {
             metadata: HashMap::new(),
             reference_advance: None,
             reference_advance_count: None,
+            placement_policies: Vec::new(),
         }
     }
 
