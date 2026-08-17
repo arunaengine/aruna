@@ -2,8 +2,8 @@ use crate::credential_seal::{CredentialSealKey, SealError, SealedS3Secret, crede
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
-    BucketReplicationConfig, GroupBackendKind, PathRestriction, PlacementPolicyRef, RealmId,
-    SourceMetadata, StorageRoutingRule, VersionSourceBinding,
+    BucketReplicationConfig, GroupBackendKind, PathRestriction, PlacementPolicyError,
+    PlacementPolicyRef, RealmId, SourceMetadata, StorageRoutingRule, VersionSourceBinding,
 };
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
@@ -538,12 +538,24 @@ pub struct BucketInfo {
 }
 
 impl BucketInfo {
+    /// The only ingress that changes the bucket default ref set.
+    pub fn with_policies(
+        mut self,
+        policies: Vec<PlacementPolicyRef>,
+    ) -> Result<Self, PlacementPolicyError> {
+        self.placement_policies = PlacementPolicyRef::canonical_set(&policies)?;
+        Ok(self)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        checked_refs(&self.placement_policies)?;
         Ok(postcard::to_allocvec(&self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let info: Self = postcard::from_bytes(bytes)?;
+        checked_refs(&info.placement_policies)?;
+        Ok(info)
     }
 
     /// What makes this the same bucket record: what a write authorized against
@@ -794,15 +806,15 @@ impl ManagedCopyRecord {
         policies: Vec<PlacementPolicyRef>,
         registered_at_ms: u64,
         state: ManagedCopyState,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, PlacementPolicyError> {
+        Ok(Self {
             version,
             node_id,
             location,
-            policies: canonical_policies(policies),
+            policies: PlacementPolicyRef::canonical_set(&policies)?,
             registered_at_ms,
             state,
-        }
+        })
     }
 
     pub fn key(&self) -> ManagedCopyKey {
@@ -810,11 +822,14 @@ impl ManagedCopyRecord {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        checked_refs(&self.policies)?;
         Ok(postcard::to_allocvec(&self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let record: Self = postcard::from_bytes(bytes)?;
+        checked_refs(&record.policies)?;
+        Ok(record)
     }
 }
 
@@ -844,11 +859,13 @@ pub enum ManagedCopyQuarantine {
     PolicyViolation,
 }
 
-/// Sorted and deduplicated refs: one ref set has exactly one encoding.
-fn canonical_policies(mut policies: Vec<PlacementPolicyRef>) -> Vec<PlacementPolicyRef> {
-    policies.sort_unstable();
-    policies.dedup();
-    policies
+/// Every stored ref set passes here on encode and decode, so a conflicting,
+/// oversized or noncanonical set can never be persisted or served.
+fn checked_refs(refs: &[PlacementPolicyRef]) -> Result<(), ConversionError> {
+    if PlacementPolicyRef::canonical_set(refs)? != refs {
+        return Err(ConversionError::NonCanonicalPolicyRefs);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -899,7 +916,6 @@ pub struct BlobVersion {
     /// The authenticated node that published this version. Set for replicated
     /// versions so the record is accountable to the asserting node rather than
     /// only to the manifest's self-asserted `created_by`.
-    #[serde(default)]
     pub published_by: Option<NodeId>,
     /// Effective refs sealed when this version was minted, canonically sorted.
     /// Empty means unrestricted; a later attachment mints a successor instead.
@@ -966,10 +982,13 @@ impl BlobVersion {
         self
     }
 
-    /// Seals the effective ref set. Sorting here keeps one ref set encoding.
-    pub fn with_policies(mut self, policies: Vec<PlacementPolicyRef>) -> Self {
-        self.placement_policies = canonical_policies(policies);
-        self
+    /// Seals the effective ref set in its one canonical, bounded form.
+    pub fn with_policies(
+        mut self,
+        policies: Vec<PlacementPolicyRef>,
+    ) -> Result<Self, PlacementPolicyError> {
+        self.placement_policies = PlacementPolicyRef::canonical_set(&policies)?;
+        Ok(self)
     }
 
     pub fn with_publisher(mut self, node_id: NodeId) -> Self {
@@ -987,11 +1006,14 @@ impl BlobVersion {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        checked_refs(&self.placement_policies)?;
         Ok(postcard::to_allocvec(&self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let version: Self = postcard::from_bytes(bytes)?;
+        checked_refs(&version.placement_policies)?;
+        Ok(version)
     }
 
     pub fn blob_hash(&self) -> Option<&[u8; 32]> {
@@ -1176,8 +1198,8 @@ mod tests {
     };
     use crate::NodeId;
     use crate::structs::{
-        PlacementPolicyRef, PortableSourceDescriptor, RealmId, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, VersionSourceBinding,
+        MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef, PortableSourceDescriptor,
+        RealmId, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
     };
     use crate::types::UserId;
     use std::collections::HashMap;
@@ -1610,15 +1632,41 @@ mod tests {
     }
 
     fn sample_copy(state: ManagedCopyState) -> ManagedCopyRecord {
+        copy_with_refs(state, vec![policy_ref(3), policy_ref(2)]).unwrap()
+    }
+
+    fn copy_with_refs(
+        state: ManagedCopyState,
+        policies: Vec<PlacementPolicyRef>,
+    ) -> Result<ManagedCopyRecord, PlacementPolicyError> {
         ManagedCopyRecord::new(
             VersionKey::new("bucket", "nested/object.bin", Ulid::from_bytes([1u8; 16])),
             NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
                 .unwrap(),
             sample_location(BackendRef::node_default()),
-            vec![policy_ref(3), policy_ref(2)],
+            policies,
             1_700_000_000_000,
             state,
         )
+    }
+
+    fn sample_bucket() -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 7,
+        }
+    }
+
+    fn conflicting_refs() -> Vec<PlacementPolicyRef> {
+        let mut refs = vec![policy_ref(1), policy_ref(1)];
+        refs[1].digest = [2u8; 32];
+        refs
     }
 
     #[test]
@@ -1688,7 +1736,8 @@ mod tests {
             UserId::default(),
             None,
         )
-        .with_policies(vec![policy_ref(9), policy_ref(4), policy_ref(9)]);
+        .with_policies(vec![policy_ref(9), policy_ref(4), policy_ref(9)])
+        .unwrap();
 
         let bytes = version.to_bytes().unwrap();
         let restored = BlobVersion::from_bytes(&bytes).unwrap();
@@ -1703,24 +1752,74 @@ mod tests {
 
     #[test]
     fn bucket_defaults_roundtrip() {
-        let info = BucketInfo {
-            group_id: Ulid::from_bytes([3u8; 16]),
-            created_at: SystemTime::UNIX_EPOCH,
-            created_by: UserId::default(),
-            cors_configuration: None,
-            replication: None,
-            storage_routing: Vec::new(),
-            placement_policies: vec![policy_ref(1), policy_ref(6)],
-            placement_policy_generation: 7,
-        };
+        let info = sample_bucket()
+            .with_policies(vec![policy_ref(6), policy_ref(1)])
+            .unwrap();
 
         let bytes = info.to_bytes().unwrap();
         let restored = BucketInfo::from_bytes(&bytes).unwrap();
 
+        assert_eq!(info.placement_policies, vec![policy_ref(1), policy_ref(6)]);
         assert_eq!(info, restored);
         assert_eq!(restored.to_bytes().unwrap(), bytes);
         // A default change is configuration, never bucket identity.
         assert_eq!(info.identity(), restored.identity());
+    }
+
+    #[test]
+    fn rejects_oversized_refs() {
+        let refs = (0..=MAX_POLICY_REFS as u8)
+            .map(policy_ref)
+            .collect::<Vec<_>>();
+        let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, UserId::default());
+
+        assert_eq!(
+            version.with_policies(refs.clone()),
+            Err(PlacementPolicyError::RefCount)
+        );
+        assert_eq!(
+            sample_bucket().with_policies(refs.clone()).err(),
+            Some(PlacementPolicyError::RefCount)
+        );
+        assert_eq!(
+            copy_with_refs(ManagedCopyState::Registered, refs).err(),
+            Some(PlacementPolicyError::RefCount)
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_refs() {
+        // One policy id referenced with two digests contradicts immutability.
+        let expected = PlacementPolicyError::ConflictingRefs {
+            policy_id: Ulid::from_bytes([1u8; 16]),
+        };
+        let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, UserId::default());
+
+        assert_eq!(version.with_policies(conflicting_refs()), Err(expected));
+        assert!(sample_bucket().with_policies(conflicting_refs()).is_err());
+        assert!(copy_with_refs(ManagedCopyState::Registered, conflicting_refs()).is_err());
+    }
+
+    #[test]
+    fn rejects_decoded_refs() {
+        // Encoded elsewhere: decode must fail closed rather than repair the set.
+        let mut version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, UserId::default());
+        version.placement_policies = (0..=MAX_POLICY_REFS as u8).map(policy_ref).collect();
+        let bytes = postcard::to_allocvec(&version).unwrap();
+        assert!(BlobVersion::from_bytes(&bytes).is_err());
+        assert!(version.to_bytes().is_err());
+
+        let mut record = sample_copy(ManagedCopyState::Registered);
+        record.policies = conflicting_refs();
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        assert!(ManagedCopyRecord::from_bytes(&bytes).is_err());
+        assert!(record.to_bytes().is_err());
+
+        let mut info = sample_bucket();
+        info.placement_policies = vec![policy_ref(6), policy_ref(1)];
+        let bytes = postcard::to_allocvec(&info).unwrap();
+        assert!(BucketInfo::from_bytes(&bytes).is_err());
+        assert!(info.to_bytes().is_err());
     }
 
     #[test]

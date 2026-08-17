@@ -234,6 +234,10 @@ pub enum ConversionError {
     InvalidOperationConversion(String),
     #[error("RO-Crate conversion error: {0}")]
     RoCrateError(String),
+    #[error(transparent)]
+    PlacementPolicyError(#[from] crate::structs::PlacementPolicyError),
+    #[error("policy refs must be sorted and deduplicated")]
+    NonCanonicalPolicyRefs,
 }
 
 impl PartialEq for ConversionError {
