@@ -6,7 +6,10 @@ use std::time::Duration;
 use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
-use aruna_core::events::{DhtEntry, DhtEvent, JobControlEvent, NetEvent, StreamEvent};
+use aruna_core::events::{
+    DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
+    PolicyFetchEvent, StreamEvent,
+};
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::RealmId;
 use parking_lot::Mutex;
@@ -204,6 +207,17 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::AuditPage(audit) => {
             NetEvent::AuditPages(audit_fallback(audit.nodes, audit.request.limit))
         }
+        // Policy, job-record, and launch protocols live in the operations
+        // runner too; reaching this handler is a wiring bug, never a success.
+        NetEffect::PolicyFetch(_) => NetEvent::PolicyFetch(PolicyFetchEvent::Unavailable(
+            "policy fetch must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::JobRecord(_) => NetEvent::JobRecord(JobRecordEvent::Unavailable(
+            "job-record replication must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::LaunchOffer(_) => NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(
+            "launch offer must be dispatched by the operations runner".to_string(),
+        )),
     }
 }
 
@@ -459,6 +473,9 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Stream(_) => "stream",
         NetEffect::JobControl(_) => "job_control",
         NetEffect::AuditPage(_) => "audit_page",
+        NetEffect::PolicyFetch(_) => "policy_fetch",
+        NetEffect::JobRecord(_) => "job_record",
+        NetEffect::LaunchOffer(_) => "launch_offer",
     }
 }
 

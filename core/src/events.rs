@@ -1,10 +1,12 @@
 use crate::audit::AuditPageBatch;
+use crate::effects::JobFamilyRecord;
 use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
-    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, RealmId, ReplicationSuboperationResult,
-    ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    BackendLocation, ExecutionReceipt, GroupRoutingInputs, HiddenBlobEntry, PlacementDecision,
+    PlacementPolicy, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
+    ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::{
     document::DocumentSyncNetEvent,
@@ -189,7 +191,84 @@ pub enum NetEvent {
     Stream(StreamEvent),
     JobControl(JobControlEvent),
     AuditPages(AuditPageBatch),
+    PolicyFetch(PolicyFetchEvent),
+    JobRecord(JobRecordEvent),
+    LaunchOffer(LaunchOfferEvent),
     Error(NetError),
+}
+
+/// Reply to a [`crate::effects::PolicyFetchEffect`]. A fetched document is a
+/// candidate only; the operation verifies it against the requested ref.
+#[derive(Debug, PartialEq)]
+pub enum PolicyFetchEvent {
+    Fetched {
+        publisher: NodeId,
+        policy: Box<PlacementPolicy>,
+    },
+    /// Every reached holder answered without the document.
+    NotFound,
+    /// No holder answered, so the miss is an availability hint, never a denial.
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::JobRecordEffect`].
+#[derive(Debug, PartialEq)]
+pub enum JobRecordEvent {
+    /// One current holder durably accepted the immutable record.
+    Published {
+        holder: NodeId,
+    },
+    Rejected {
+        holder: NodeId,
+        reason: JobRecordRejection,
+    },
+    /// At most the requested page of records, oldest key first.
+    Fetched {
+        records: Vec<JobFamilyRecord>,
+        next_cursor: Option<Vec<u8>>,
+    },
+    Unavailable(String),
+}
+
+/// Why a holder refused an append-only job record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRecordRejection {
+    /// The responder does not hold that family placement; resolve holders again.
+    NotHolder,
+    /// A record with the same key and different bytes is already retained.
+    Conflict,
+    /// The publisher is not the record's only permitted author.
+    Unauthorized,
+    /// The record failed contract validation, such as budget or chain rules.
+    Invalid,
+}
+
+/// Reply to a [`crate::effects::LaunchOfferEffect`].
+#[derive(Debug, PartialEq)]
+pub enum LaunchOfferEvent {
+    Accepted(Box<ExecutionReceipt>),
+    Declined(LaunchDecline),
+    /// The target was unreachable; it may still have accepted the launch.
+    Unavailable(String),
+}
+
+/// Why an execution target refused a launch offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchDecline {
+    /// The offering scheduler is not a holder in the target's current view.
+    NotHolder,
+    /// Realm or group authorization denied the sealed submitter.
+    Unauthorized,
+    /// Placement evaluation blocked the execution subject; never `Allowed`.
+    Policy(PlacementDecision),
+    /// Exact local admission found no capacity for the sealed resources.
+    Capacity,
+    /// The target is draining or leaving and accepts no new work.
+    Draining,
+    /// That launch id is already bound to a different launch digest.
+    LaunchConflict,
+    /// The request family was cancelled before the offer arrived.
+    Cancelled,
 }
 
 /// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an

@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
+use crate::compute::ExecutionTargetId;
 use crate::document::DocumentSyncEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
@@ -9,8 +10,10 @@ use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{
-    BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, RealmId,
-    ResolvedBackend, ResolvedSourceAccess,
+    BackendLocation, ExecutionReceipt, ExecutionUpdate, GroupStorageBackend,
+    GroupStorageBackendSecret, HiddenBlobKey, JobCancelRecord, LaunchIntent, LogicalJobSpec,
+    PlacementPolicyRef, PlacementRef, RealmId, ResolvedBackend, ResolvedSourceAccess,
+    SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use crate::task::TaskEffect;
 use crate::types::UserId;
@@ -254,6 +257,82 @@ pub enum NetEffect {
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
     AuditPage(Box<AuditPageEffect>),
+    PolicyFetch(Box<PolicyFetchEffect>),
+    JobRecord(Box<JobRecordEffect>),
+    LaunchOffer(Box<LaunchOfferEffect>),
+}
+
+/// Holders one policy fetch may consult. The operation resolves them from its
+/// local placement view; a longer list would turn a cache miss into a fan-out.
+pub const MAX_POLICY_FETCH_HOLDERS: usize = 8;
+
+/// Holders one job-record publish or fetch may consult.
+pub const MAX_JOB_RECORD_HOLDERS: usize = 8;
+
+/// Job-family records one fetch may return, so a family with many executions is
+/// always read as bounded pages.
+pub const MAX_JOB_RECORD_PAGE: usize = 64;
+
+/// Fetch of one immutable placement-policy document from the holders the
+/// operation resolved. The adapter tries them in order and never routes; the
+/// operation verifies id, realm, and digest before it caches anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyFetchEffect {
+    pub realm_id: RealmId,
+    /// At most [`MAX_POLICY_FETCH_HOLDERS`], in preference order.
+    pub holders: Vec<NodeId>,
+    pub policy_ref: PlacementPolicyRef,
+    pub deadline: Duration,
+}
+
+/// Replication of the append-only job-family records: publish one immutable
+/// record to the family holders, or read a bounded page back from them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobRecordEffect {
+    Publish {
+        realm_id: RealmId,
+        /// Family placement derived from the submission id, never from an alias.
+        placement: PlacementRef,
+        /// At most [`MAX_JOB_RECORD_HOLDERS`], in preference order.
+        holders: Vec<NodeId>,
+        record: JobFamilyRecord,
+        deadline: Duration,
+    },
+    Fetch {
+        realm_id: RealmId,
+        placement: PlacementRef,
+        holders: Vec<NodeId>,
+        submission_id: SubmissionId,
+        /// `None` reads every request family under this submission.
+        request_digest: Option<[u8; 32]>,
+        /// Opaque holder cursor returned by the previous page.
+        cursor: Option<Vec<u8>>,
+        /// Capped at [`MAX_JOB_RECORD_PAGE`] by the responder.
+        limit: usize,
+    },
+}
+
+/// One immutable record of a job family. Each variant is published by exactly
+/// one authorized author and is never rewritten under the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobFamilyRecord {
+    Spec(Box<LogicalJobSpec>),
+    Claim(SubmissionClaim),
+    Budget(WitnessBudgetRecord),
+    Launch(Box<LaunchIntent>),
+    Receipt(Box<ExecutionReceipt>),
+    Update(ExecutionUpdate),
+    Cancel(JobCancelRecord),
+}
+
+/// One scheduler's launch offer to an execution target. It carries no caller
+/// token: the target fetches and verifies the sealed spec itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchOfferEffect {
+    pub realm_id: RealmId,
+    pub target: ExecutionTargetId,
+    pub launch: LaunchIntent,
+    pub deadline: Duration,
 }
 
 /// Discrete job-control request to a job's immutable owner. The adapter performs
