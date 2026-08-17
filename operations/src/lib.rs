@@ -59,6 +59,7 @@ pub mod onboarding_secret_state;
 pub mod permission_rules;
 pub mod persistent_id;
 pub mod placement;
+pub mod placement_policy;
 pub mod process_placements;
 pub mod process_transitions;
 mod queue_backoff;

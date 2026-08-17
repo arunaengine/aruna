@@ -60,14 +60,15 @@ use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
     HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
-    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdStatus, PlacementRef,
-    PlacementScope, PoolAdmission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, Role, SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,
-    SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User,
-    WatchEventMask, WatchInterestDigest, WatchSubscription, admit_band_pool,
-    build_quarantine_entries, coordinator_spans, group_owner_index_key, node_usage_key_node_id,
-    persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
-    reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
+    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdStatus,
+    PlacementPolicyDocument, PlacementRef, PlacementScope, PoolAdmission,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
+    SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
+    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User, WatchEventMask,
+    WatchInterestDigest, WatchSubscription, admit_band_pool, build_quarantine_entries,
+    coordinator_spans, group_owner_index_key, node_usage_key_node_id, persistent_id_change,
+    persistent_id_key, persistent_id_target, placement_policy_change, placement_policy_target,
+    quarantine_usage_entry, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
     watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
@@ -3080,6 +3081,114 @@ impl DocumentSyncService {
                             }
                         }
                     }
+                    DocumentSyncEvent::Upsert {
+                        event_id,
+                        target: DocumentSyncTarget::PlacementPolicy { policy_id },
+                        bytes,
+                        change,
+                    } => {
+                        let target = DocumentSyncTarget::PlacementPolicy { policy_id };
+                        let reject = |reason: String| {
+                            SyncRejection::new(
+                                identity,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target: DocumentSyncTarget::PlacementPolicy { policy_id },
+                                    bytes: bytes.clone(),
+                                    change,
+                                },
+                                reason,
+                            )
+                        };
+                        let document = match postcard::from_bytes::<PlacementPolicyDocument>(&bytes)
+                        {
+                            Ok(document) => document,
+                            Err(error) => {
+                                warn!(%topic_id, %policy_id, %error, "Rejecting undecodable placement policy document");
+                                rejections.push(reject(format!(
+                                    "undecodable placement policy document: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        if let Err(reason) =
+                            validate_policy_document(policy_id, self.realm_id, &document, &change)
+                        {
+                            warn!(%topic_id, %policy_id, %reason, "Rejecting invalid placement policy document");
+                            rejections.push(reject(format!(
+                                "invalid placement policy document: {reason}"
+                            )));
+                            continue;
+                        }
+                        // The sealed actor is the publishing node, so a document
+                        // signed by anyone else is a forgery.
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&document.actor),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                %policy_id,
+                                "Rejecting placement policy document whose actor is not its publisher"
+                            );
+                            rejections.push(reject(
+                                "placement policy actor is not its publisher".to_string(),
+                            ));
+                            continue;
+                        }
+                        match self
+                            .apply_policy_document(&document, change.placement)
+                            .await?
+                        {
+                            MetadataPlacementOutcome::Accepted(true) => {
+                                applied_targets.push(target)
+                            }
+                            MetadataPlacementOutcome::Accepted(false) => {}
+                            MetadataPlacementOutcome::Deferred(dependency) => {
+                                warn!(
+                                    %topic_id,
+                                    %policy_id,
+                                    "Deferring placement policy document until its placement configuration is available"
+                                );
+                                cross_topic_dependencies.insert(dependency);
+                            }
+                            MetadataPlacementOutcome::Rejected => {
+                                warn!(
+                                    %topic_id,
+                                    %policy_id,
+                                    "Rejecting placement policy document with a mismatched placement or reused id"
+                                );
+                                rejections.push(reject(
+                                    "placement policy document has a mismatched placement or reuses its id"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    event @ (DocumentSyncEvent::Delete {
+                        target: DocumentSyncTarget::PlacementPolicy { .. },
+                        ..
+                    }
+                    | DocumentSyncEvent::AdminOperation {
+                        target: DocumentSyncTarget::PlacementPolicy { .. },
+                        ..
+                    }) => {
+                        // A policy document is immutable, so it only ever syncs as
+                        // an upsert; anything else is refused without wedging the
+                        // topic.
+                        warn!(
+                            %topic_id,
+                            target = ?event.target(),
+                            "Skipping unsupported non-upsert placement policy event"
+                        );
+                        rejections.push(SyncRejection::new(
+                            identity,
+                            event,
+                            "unsupported non-upsert placement policy event",
+                        ));
+                        continue;
+                    }
                     event @ (DocumentSyncEvent::Delete {
                         target: DocumentSyncTarget::PersistentIdMapping { .. },
                         ..
@@ -4131,6 +4240,26 @@ impl DocumentSyncService {
                 )),
             };
         }
+        if let DocumentSyncTarget::PlacementPolicy { policy_id } = target {
+            let document: PlacementPolicyDocument = postcard::from_bytes(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            validate_policy_document(policy_id, self.realm_id, &document, &change)
+                .map_err(NetError::Bootstrap)?;
+            // The generic write below would replace a stored rule with different
+            // bytes under the same id, so a policy always goes through its merge.
+            return match self
+                .apply_policy_document(&document, change.placement)
+                .await?
+            {
+                MetadataPlacementOutcome::Accepted(_) => Ok(()),
+                MetadataPlacementOutcome::Deferred(_) => Err(NetError::Dht(
+                    "placement policy configuration is unavailable".to_string(),
+                )),
+                MetadataPlacementOutcome::Rejected => Err(NetError::Bootstrap(
+                    "placement policy has a mismatched placement or reuses its id".to_string(),
+                )),
+            };
+        }
         if let DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } = target {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -4212,6 +4341,14 @@ impl DocumentSyncService {
         placement: PlacementRef,
     ) -> Result<MetadataPlacementOutcome<bool>> {
         store_pid_mapping(&self.storage, self.realm_id, mapping, placement).await
+    }
+
+    async fn apply_policy_document(
+        &self,
+        document: &PlacementPolicyDocument,
+        placement: PlacementRef,
+    ) -> Result<MetadataPlacementOutcome<bool>> {
+        store_policy_document(&self.storage, self.realm_id, document, placement).await
     }
 
     async fn apply_delete(
@@ -5304,6 +5441,172 @@ async fn store_pid_mapping(
     Err(NetError::Dht(
         "persistent id mapping conflicted twice".to_string(),
     ))
+}
+
+/// Stores one replicated policy document. The bucket is re-derived from the
+/// policy id inside the transaction, and a known id whose definition differs is
+/// rejected rather than merged: one id resolves to exactly one rule.
+async fn store_policy_document(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    incoming: &PlacementPolicyDocument,
+    placement: PlacementRef,
+) -> Result<MetadataPlacementOutcome<bool>> {
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        match derive_policy_bucket(storage, realm_id, incoming.policy_id(), placement, txn_id).await
+        {
+            Ok(MetadataPlacementOutcome::Accepted(_)) => {}
+            Ok(outcome) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(match outcome {
+                    MetadataPlacementOutcome::Deferred(dependency) => {
+                        MetadataPlacementOutcome::Deferred(dependency)
+                    }
+                    _ => MetadataPlacementOutcome::Rejected,
+                });
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+        let merged = match policy_merge_txn(storage, incoming, txn_id).await {
+            Ok(Ok(Some(merged))) => merged,
+            Ok(Ok(None)) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Accepted(false));
+            }
+            Ok(Err(())) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Rejected);
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let target = placement_policy_target(merged.policy_id());
+        let change = placement_policy_change(&merged, placement);
+        let mut writes = vec![(
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+            Value::from(
+                merged
+                    .to_bytes()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            ),
+        )];
+        writes.push(
+            document_sync_revision_write_entry(&target, &change)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+        if let Some(entry) = shard_manifest_write_entry(&target, &change)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        {
+            writes.push(entry);
+        }
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), writes)
+            .await
+        {
+            Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "placement policy document conflicted twice".to_string(),
+    ))
+}
+
+/// The bucket a policy id must ride, derived from the realm config inside the
+/// caller's transaction and compared against the stamped placement.
+async fn derive_policy_bucket(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    policy_id: Ulid,
+    placement: PlacementRef,
+    txn_id: TxnId,
+) -> Result<MetadataPlacementOutcome<PlacementRef>> {
+    if placement == PlacementRef::NIL || placement.strategy_id.is_nil() {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let value = storage_read_from_transaction(
+        storage,
+        REALM_CONFIG_KEYSPACE.to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::RealmConfig(realm_id),
+        ));
+    };
+    let config = RealmConfigDocument::from_bytes(&value)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if config.realm_id != realm_id {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    match config.policy_placement(policy_id) {
+        Some(derived) if derived == placement => Ok(MetadataPlacementOutcome::Accepted(derived)),
+        Some(_) => Ok(MetadataPlacementOutcome::Rejected),
+        None => Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::PlacementStrategy {
+                realm_id,
+                strategy_id: placement.strategy_id,
+            },
+        )),
+    }
+}
+
+/// `Ok(Ok(None))` when the local row already absorbs the incoming one and
+/// `Ok(Err(()))` when the id is reused with a different definition.
+async fn policy_merge_txn(
+    storage: &StorageHandle,
+    incoming: &PlacementPolicyDocument,
+    txn_id: TxnId,
+) -> Result<std::result::Result<Option<PlacementPolicyDocument>, ()>> {
+    let target = placement_policy_target(incoming.policy_id());
+    let local = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(local) = local else {
+        return Ok(Ok(Some(incoming.clone())));
+    };
+    let mut local = PlacementPolicyDocument::from_bytes(&local)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    match local.merge(incoming) {
+        Ok(true) => Ok(Ok(Some(local))),
+        Ok(false) => Ok(Ok(None)),
+        Err(_) => Ok(Err(())),
+    }
 }
 
 /// `Ok(None)` when the local row already absorbs the incoming one.
@@ -9001,6 +9304,39 @@ fn validate_node_info_upsert(
 /// canonical PID for the target document, a consistent kind/status/provenance
 /// triple, and a change that is exactly the one the mapping row derives. The
 /// caller enforces the publisher identity against the signed actor.
+/// Structural gate for a replicated policy document: it must address this
+/// realm and target, carry a verifiable definition, and derive its own sync
+/// change, so a sender cannot restate a policy under someone else's revision.
+fn validate_policy_document(
+    policy_id: Ulid,
+    realm_id: RealmId,
+    document: &PlacementPolicyDocument,
+    change: &DocumentSyncChange,
+) -> std::result::Result<(), String> {
+    if document.policy_id() != policy_id {
+        return Err(format!(
+            "policy {} does not match target policy {policy_id}",
+            document.policy_id()
+        ));
+    }
+    if document.realm_id != realm_id {
+        return Err(format!(
+            "policy realm {} does not match this realm",
+            document.realm_id
+        ));
+    }
+    if let Err(error) = document.verified() {
+        return Err(format!("policy definition is invalid: {error}"));
+    }
+    if change.kind != DocumentSyncChangeKind::Upsert {
+        return Err("policy event is not an upsert".to_string());
+    }
+    if *change != placement_policy_change(document, change.placement) {
+        return Err("policy revision does not match its sync change".to_string());
+    }
+    Ok(())
+}
+
 fn validate_pid_mapping(
     document_id: Ulid,
     mapping: &PersistentIdMapping,
@@ -18849,6 +19185,65 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn binds_policy_target() {
+        use aruna_core::structs::{
+            PlacementPolicy, PlacementPolicyDocument, PlacementSelector, VerifiedPolicy,
+            placement_policy_change,
+        };
+        use aruna_core::types::UserId;
+
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let policy_id = Ulid::from_bytes([8u8; 16]);
+        let selector = |location: &str| PlacementSelector {
+            node_id: None,
+            location: Some(location.to_string()),
+            labels: Vec::new(),
+            executor_kind: None,
+        };
+        let policy = VerifiedPolicy::verify(
+            PlacementPolicy::new(
+                policy_id,
+                "residency".to_string(),
+                vec![selector("eu-west")],
+            )
+            .expect("policy is valid"),
+        )
+        .expect("policy verifies");
+        let document = PlacementPolicyDocument::new(
+            realm_id,
+            &policy,
+            UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
+            node(7),
+            Ulid::from_bytes([5u8; 16]),
+            9,
+        );
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([6u8; 16]),
+            shard: 3,
+        };
+        let change = placement_policy_change(&document, placement);
+        assert!(validate_policy_document(policy_id, realm_id, &document, &change).is_ok());
+
+        // Another target, another realm, or a restated revision is refused.
+        assert!(
+            validate_policy_document(Ulid::from_bytes([9u8; 16]), realm_id, &document, &change)
+                .is_err()
+        );
+        assert!(
+            validate_policy_document(
+                policy_id,
+                RealmId::from_bytes([3u8; 32]),
+                &document,
+                &change
+            )
+            .is_err()
+        );
+        let mut restated = change.clone();
+        restated.current.actor = node(8);
+        assert!(validate_policy_document(policy_id, realm_id, &document, &restated).is_err());
     }
 
     #[tokio::test]

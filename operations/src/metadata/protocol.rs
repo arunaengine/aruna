@@ -3,7 +3,8 @@ use std::sync::Arc;
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{
-    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, SyncRelationship,
+    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicy,
+    PlacementPolicyRef, SyncRelationship,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -224,6 +225,16 @@ pub enum MetadataTransportMessage {
     },
     ForwardedPersistentId {
         result: Result<PersistentIdOutcome, MetadataReadError>,
+    },
+    /// One immutable policy document asked of a holder the requester resolved
+    /// from the policy id. Appended last so existing variant indices stay stable.
+    ForwardPlacementPolicy {
+        policy_ref: PlacementPolicyRef,
+    },
+    /// `Ok(None)` means this holder has no such document; it never means the
+    /// policy does not exist.
+    ForwardedPlacementPolicy {
+        result: Result<Option<Box<PlacementPolicy>>, MetadataReadError>,
     },
 }
 

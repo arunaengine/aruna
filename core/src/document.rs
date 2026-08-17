@@ -10,7 +10,7 @@ use crate::keyspaces::{
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
     NODE_INFO_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
+    PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
 use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
 use crate::storage_entries::{
@@ -18,7 +18,8 @@ use crate::storage_entries::{
 };
 use crate::structs::{
     PLACEMENT_EPOCH_PAD, PlacementRef, RealmId, node_info_storage_key, node_usage_global_key,
-    node_usage_group_key, persistent_id_key, watch_interest_node_key, watch_subscription_key,
+    node_usage_group_key, persistent_id_key, placement_policy_key, watch_interest_node_key,
+    watch_subscription_key,
 };
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
@@ -77,6 +78,11 @@ pub enum DocumentSyncTarget {
     NodeInfo {
         realm_id: RealmId,
         node_id: NodeId,
+    },
+    /// One immutable placement-policy document. Placed by its policy id alone,
+    /// so a reader resolves the rule's holders from a ref without any catalog.
+    PlacementPolicy {
+        policy_id: Ulid,
     },
 }
 
@@ -360,6 +366,7 @@ impl DocumentSyncTarget {
             Self::WatchInterest { realm_id, .. } => TopicId::realm(*realm_id),
             Self::WatchSubscription { owner, .. } => TopicId::realm(owner.realm_id),
             Self::NodeInfo { realm_id, .. } => TopicId::realm(*realm_id),
+            Self::PlacementPolicy { policy_id } => TopicId::metadata(*policy_id),
         }
     }
 
@@ -378,6 +385,7 @@ impl DocumentSyncTarget {
             Self::WatchInterest { .. } => NOTIFICATION_WATCH_INTEREST_KEYSPACE,
             Self::WatchSubscription { .. } => NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
+            Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
         }
     }
 
@@ -423,6 +431,7 @@ impl DocumentSyncTarget {
                 watch_subscription_key(*owner, *watch_id)
             }
             Self::NodeInfo { node_id, .. } => ByteView::from(node_info_storage_key(*node_id)),
+            Self::PlacementPolicy { policy_id } => ByteView::from(placement_policy_key(*policy_id)),
         }
     }
 
@@ -441,6 +450,7 @@ impl DocumentSyncTarget {
                 | Self::MetadataDocumentLifecycle { .. }
                 | Self::MetadataGraphLifecycle { .. }
                 | Self::PersistentIdMapping { .. }
+                | Self::PlacementPolicy { .. }
         )
     }
 

@@ -1239,6 +1239,7 @@ mod tests {
                 predecessor: Ulid::generate(),
             }),
             reference_advance_count: Some(0),
+            placement_policies: Vec::new(),
         };
 
         assert_eq!(

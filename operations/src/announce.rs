@@ -17,7 +17,7 @@ use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::PlacementRef;
 use aruna_core::structs::RealmId;
-use aruna_core::structs::persistent_id_change;
+use aruna_core::structs::{PlacementPolicyDocument, persistent_id_change, placement_policy_change};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
 use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
@@ -351,6 +351,17 @@ impl AnnounceTopicOperation {
                     )));
                 }
                 Ok(persistent_id_change(&mapping, self.placement))
+            }
+            DocumentSyncTarget::PlacementPolicy { policy_id } => {
+                let document = PlacementPolicyDocument::from_bytes(bytes)
+                    .map_err(AnnounceTopicError::ConversionError)?;
+                if document.policy_id() != *policy_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "placement policy target {policy_id} does not match payload policy {}",
+                        document.policy_id()
+                    )));
+                }
+                Ok(placement_policy_change(&document, self.placement))
             }
             // Node usage snapshots, watch-interest digests, and node info/heartbeat
             // documents are single-writer per key and applied as plain upserts

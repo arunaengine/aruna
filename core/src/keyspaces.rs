@@ -53,6 +53,11 @@ pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 /// departing holder has closed. A holder-authoritative writer reads it inside
 /// its own transaction, so a close conflicts every uncommitted predecessor write.
 pub const PLACEMENT_WRITE_FENCE_KEYSPACE: &str = "placement_write_fence";
+/// Immutable placement-policy documents a holder stores, keyed by policy id.
+pub const PLACEMENT_POLICY_KEYSPACE: &str = "placement_policies";
+/// Node-local policy cache keyed by `(policy_id, digest)`. An id-only key could
+/// accept changed bytes under a known id, which policy immutability forbids.
+pub const PLACEMENT_POLICY_CACHE_KEYSPACE: &str = "placement_policy_cache";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
 pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
 pub const TASK_TIMER_KEYSPACE: &str = "task_timers";

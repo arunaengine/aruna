@@ -367,6 +367,11 @@ async fn dispatch_effect_until(
         Effect::Net(NetEffect::AuditPage(audit)) => {
             Box::pin(dispatch_audit_page(*audit, context, deadline)).await
         }
+        // Policy fetch resolves its holders in the operation and runs only the
+        // holder round-trips here.
+        Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
+            Box::pin(crate::placement_policy::fetch_policy(context, *fetch)).await,
+        )),
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await

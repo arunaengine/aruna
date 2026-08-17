@@ -8,8 +8,8 @@ use crate::structs::{
     CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
     DocumentClass, FrozenStrategySelector, HandleRange, HandleRangeDirectory, JobId,
     KIND_LABEL_KEY, METADATA_HANDLE, NodePlacementEntry, PlacementActivation, PlacementBinding,
-    PlacementOverride, PlacementScope, PlacementStrategy, PlacementTransition, SHARD_SUBJECT_LEN,
-    StrategyBinding, coordinator_spans,
+    PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, PlacementTransition,
+    SHARD_SUBJECT_LEN, StrategyBinding, coordinator_spans, shard_for_subject,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -527,6 +527,12 @@ impl RealmConfigDocument {
             strategy_id: everywhere_strategy.strategy_id,
         })
         .collect();
+        // Policy documents are replica-capped like ordinary data documents: a
+        // non-holder resolves their holders from the ref and fetches by id.
+        self.strategy_bindings.push(StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::PlacementPolicy),
+            strategy_id: default_strategy.strategy_id,
+        });
         // Reserve the low-band Metadata binding before grants begin. JobControl
         // bindings are per node band and appended at onboarding, never seeded.
         self.placement_bindings = vec![PlacementBinding {
@@ -651,6 +657,49 @@ impl RealmConfigDocument {
         self.strategies
             .iter()
             .find(|strategy| strategy.strategy_id == *strategy_id)
+    }
+
+    /// Strategy a class-scoped document rides: class binding, realm binding,
+    /// then the realm default. `Err(())` marks a configured ref naming no
+    /// strategy, which fails closed instead of falling through to the next one.
+    pub fn class_strategy(
+        &self,
+        class: DocumentClass,
+    ) -> Result<Option<&PlacementStrategy>, ClassStrategyError> {
+        for scope in [BindingScope::Class(class), BindingScope::Realm] {
+            if let Some(binding) = self
+                .strategy_bindings
+                .iter()
+                .find(|binding| binding.scope == scope)
+            {
+                return self.strategy(&binding.strategy_id).map(Some).ok_or(
+                    ClassStrategyError::Dangling {
+                        strategy_id: binding.strategy_id,
+                    },
+                );
+            }
+        }
+        match self.default_strategy_id {
+            Some(id) => self
+                .strategy(&id)
+                .map(Some)
+                .ok_or(ClassStrategyError::Dangling { strategy_id: id }),
+            None => Ok(None),
+        }
+    }
+
+    /// Bucket one immutable policy document rides: its policy id hashed into
+    /// the class-bound strategy's shards. It says where the rule is replicated,
+    /// never which subjects the rule allows.
+    pub fn policy_placement(&self, policy_id: Ulid) -> Option<PlacementRef> {
+        let strategy = self
+            .class_strategy(DocumentClass::PlacementPolicy)
+            .ok()?
+            .or_else(|| self.strategies.first())?;
+        Some(PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard: shard_for_subject(&policy_id.to_bytes(), strategy.shard_count),
+        })
     }
 
     /// Eligible-node view derived from the live config: one entry per node with
@@ -856,6 +905,14 @@ impl RealmConfigDocument {
         let _ = (current, actor);
         Ok(postcard::to_allocvec(self)?)
     }
+}
+
+/// A class or realm binding names a strategy the config does not define, so no
+/// class placement can be derived without inventing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ClassStrategyError {
+    #[error("strategy binding references undefined strategy {strategy_id}")]
+    Dangling { strategy_id: Ulid },
 }
 
 /// Failure of the pure `JobId -> owner` derivation.
@@ -1720,5 +1777,37 @@ mod test {
             .push(binding(10, 2, owner, range_id));
         assert!(config.binding_directory().resolve(first.handle).is_err());
         assert_eq!(config.binding_directory().conflicted(), 1);
+    }
+
+    #[test]
+    fn seeds_policy_binding() {
+        // Policy documents ride the replica-capped default, not the everywhere
+        // strategy, so a realm always has non-holders that must resolve by id.
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.seed_default_placement();
+        let bound = config
+            .class_strategy(crate::structs::DocumentClass::PlacementPolicy)
+            .expect("binding resolves")
+            .expect("a strategy is bound");
+        assert_eq!(Some(bound.strategy_id), config.default_strategy_id);
+        assert_eq!(bound.replica_count, Some(2));
+    }
+
+    #[test]
+    fn bucket_follows_id() {
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.seed_default_placement();
+        let first = config
+            .policy_placement(Ulid::from_bytes([1u8; 16]))
+            .expect("bucket resolves");
+        let repeat = config
+            .policy_placement(Ulid::from_bytes([1u8; 16]))
+            .expect("bucket resolves");
+        let other = config
+            .policy_placement(Ulid::from_bytes([2u8; 16]))
+            .expect("bucket resolves");
+        assert_eq!(first, repeat);
+        assert_eq!(Some(first.strategy_id), config.default_strategy_id);
+        assert_ne!(first, other);
     }
 }

@@ -1608,6 +1608,9 @@ impl MetadataHandle {
             forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
                 super::forward::apply_forwarded_pid(context, peer, forward).await
             }
+            MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
+                crate::placement_policy::serve_local_policy(context, peer, policy_ref).await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
@@ -1629,6 +1632,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedTokenRevocationCapacity
             | MetadataTransportMessage::ForwardedMetadataHistoryCapacity
             | MetadataTransportMessage::ForwardedPersistentId { .. }
+            | MetadataTransportMessage::ForwardedPlacementPolicy { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4352,6 +4356,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         }
         MetadataTransportMessage::ForwardPersistentId { .. } => "forward_persistent_id",
         MetadataTransportMessage::ForwardedPersistentId { .. } => "forwarded_persistent_id",
+        MetadataTransportMessage::ForwardPlacementPolicy { .. } => "forward_placement_policy",
+        MetadataTransportMessage::ForwardedPlacementPolicy { .. } => "forwarded_placement_policy",
     }
 }
 

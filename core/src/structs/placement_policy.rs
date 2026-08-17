@@ -61,6 +61,10 @@ pub enum PlacementPolicyError {
     ResolutionCount,
     #[error("policy {policy_id} is referenced with two different digests")]
     ConflictingRefs { policy_id: Ulid },
+    /// A definition change must mint a new id, so a second document under a
+    /// known id is refused instead of replacing the rule holders already serve.
+    #[error("policy {policy_id} already exists with different canonical bytes")]
+    PolicyIdReuse { policy_id: Ulid },
 }
 
 /// Typed physical residency constraint. Evaluated only after realm/group CEL
@@ -116,9 +120,8 @@ pub struct NormalizedSubject {
 }
 
 /// A validated policy in canonical form. Only this shape resolves a ref, so a
-/// malformed document can neither be matched against a subject nor mint an
-/// authoritative ref. It is deliberately not serializable: decoded bytes must
-/// pass [`VerifiedPolicy::verify`] again.
+/// malformed document neither matches a subject nor mints an authoritative ref.
+/// Deliberately not serializable: decoded bytes must pass `verify` again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedPolicy(PlacementPolicy);
 
@@ -491,9 +494,8 @@ impl PlacementSubject {
 }
 
 /// Pure placement evaluation: every ref must allow the subject, and inside one
-/// policy any selector may match. An empty ref set is unrestricted data. Every
-/// input is bounded before allocation, and an unverifiable document blocks
-/// instead of granting.
+/// policy any selector may match. An empty ref set is unrestricted data; inputs
+/// are bounded before allocation and an unverifiable document blocks, never grants.
 pub fn evaluate_placement(
     refs: &[PlacementPolicyRef],
     resolved: &BTreeMap<Ulid, PolicyResolution>,
