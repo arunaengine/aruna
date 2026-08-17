@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
+use crate::NodeId;
+use crate::structs::EffectiveResources;
+
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Pattern characters of IEEE Std 1003.1-2017 (POSIX) 12.13, the only wildcards
@@ -39,6 +42,50 @@ pub struct ExecutorCapability {
     pub kind: String,
     pub file_staging: bool,
     pub direct_s3: bool,
+}
+
+/// One advertised execution target: a controller node plus the executor kind it
+/// exposes there.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExecutionTargetId {
+    pub node_id: NodeId,
+    pub executor_kind: String,
+}
+
+/// Static ceilings of one backend. These are hard eligibility facts: a request
+/// that cannot fit is not schedulable here. `None` means unmeasured, so it never
+/// filters a backend out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceEnvelope {
+    pub max_cpu_cores: Option<u32>,
+    pub max_ram_bytes: Option<u64>,
+    pub max_disk_bytes: Option<u64>,
+    pub max_concurrent: Option<u32>,
+}
+
+impl ResourceEnvelope {
+    pub fn fits(&self, resources: &EffectiveResources) -> bool {
+        self.max_cpu_cores
+            .is_none_or(|max| resources.cpu_cores <= max)
+            && self
+                .max_ram_bytes
+                .is_none_or(|max| resources.ram_bytes <= max)
+            && self
+                .max_disk_bytes
+                .is_none_or(|max| resources.disk_bytes <= max)
+    }
+}
+
+/// Stale telemetry that may only rank targets. It carries no eligibility method
+/// on purpose: free capacity is never a hard planner fact, and exact admission
+/// happens at the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorAvailability {
+    pub free_cpu_cores: Option<u32>,
+    pub free_ram_bytes: Option<u64>,
+    pub free_disk_bytes: Option<u64>,
+    pub active_executions: u32,
+    pub observed_at_ms: u64,
 }
 
 impl ExecutorKind {
@@ -779,6 +826,81 @@ mod tests {
         assert!(output_suffix("/output/a.txt", "/out").is_none());
         assert!(output_suffix("/out", "/out").is_none());
         assert!(output_suffix("/other/a.txt", "/out").is_none());
+    }
+
+    fn resources() -> EffectiveResources {
+        EffectiveResources {
+            cpu_cores: 8,
+            ram_bytes: 1024,
+            disk_bytes: 2048,
+            max_walltime_ms: 60_000,
+            preemptible: false,
+        }
+    }
+
+    #[test]
+    fn envelope_filters_requests() {
+        // An unmeasured ceiling is unknown, never zero, so it must not filter.
+        assert!(ResourceEnvelope::default().fits(&resources()));
+        assert!(
+            ResourceEnvelope {
+                max_cpu_cores: Some(8),
+                max_ram_bytes: Some(1024),
+                max_disk_bytes: Some(2048),
+                max_concurrent: None,
+            }
+            .fits(&resources())
+        );
+        for envelope in [
+            ResourceEnvelope {
+                max_cpu_cores: Some(4),
+                ..Default::default()
+            },
+            ResourceEnvelope {
+                max_ram_bytes: Some(512),
+                ..Default::default()
+            },
+            ResourceEnvelope {
+                max_disk_bytes: Some(1024),
+                ..Default::default()
+            },
+        ] {
+            assert!(!envelope.fits(&resources()), "{envelope:?}");
+        }
+    }
+
+    #[test]
+    fn roundtrips_target_facts() {
+        let target = ExecutionTargetId {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            executor_kind: "docker".to_string(),
+        };
+        let encoded = postcard::to_allocvec(&target).unwrap();
+        assert_eq!(encoded.len(), 39);
+        assert_eq!(
+            postcard::from_bytes::<ExecutionTargetId>(&encoded).unwrap(),
+            target
+        );
+
+        let availability = ExecutorAvailability {
+            free_cpu_cores: Some(2),
+            free_ram_bytes: None,
+            free_disk_bytes: None,
+            active_executions: 1,
+            observed_at_ms: 1_700_000_000_000,
+        };
+        assert_eq!(
+            postcard::from_bytes::<ExecutorAvailability>(
+                &postcard::to_allocvec(&availability).unwrap()
+            )
+            .unwrap(),
+            availability
+        );
+        // Canonical empty encodings: every unknown field is one absent-option byte.
+        assert_eq!(
+            postcard::to_allocvec(&ResourceEnvelope::default()).unwrap(),
+            vec![0u8; 4]
+        );
     }
 
     #[test]

@@ -751,6 +751,8 @@ fn output_object(
     OutputObject {
         bucket: bucket.to_string(),
         key: key.to_string(),
+        version_id: Ulid::nil(),
+        execution_id: Ulid::nil(),
         container_path: output.container_path.clone(),
         size,
         digest: Some(digest.to_hex().to_string()),
@@ -1051,6 +1053,8 @@ pub async fn collect_outputs(
                     OutputObject {
                         bucket: bucket.to_string(),
                         key: object.head.key,
+                        version_id: Ulid::nil(),
+                        execution_id: Ulid::nil(),
                         container_path: String::new(),
                         size,
                         digest,
@@ -1159,6 +1163,8 @@ mod tests {
         OutputObject {
             bucket: "workspace".to_string(),
             key: key.to_string(),
+            version_id: Ulid::nil(),
+            execution_id: Ulid::nil(),
             container_path: key.to_string(),
             size: 0,
             digest: None,

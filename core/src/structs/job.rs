@@ -8,11 +8,12 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::compute::ExecutionTargetId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
 use crate::structs::{
     AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentIdSpec,
-    StagingStrategy,
+    PlacementRef, RealmId, StagingStrategy,
 };
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
@@ -839,6 +840,11 @@ pub fn parse_job_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), Conversi
 pub struct OutputObject {
     pub bucket: String,
     pub key: String,
+    /// Exact version this write created. Two executions writing one key keep two
+    /// retrievable versions, so the identity may never be discarded.
+    pub version_id: Ulid,
+    /// Physical execution that produced the object.
+    pub execution_id: Ulid,
     pub container_path: String,
     pub size: u64,
     /// Hex BLAKE3 digest when known.
@@ -1502,10 +1508,362 @@ pub fn parse_job_owner_index_key(key: &[u8]) -> Result<(UserId, u64, JobId), Con
     Ok((created_by, created_at_ms, job_id))
 }
 
+const SUBMISSION_KEYED_DOMAIN: &[u8] = b"aruna-submission-id-v1";
+const SUBMISSION_UNKEYED_DOMAIN: &[u8] = b"aruna-submission-nonce-v1";
+const SUBMISSION_CLAIM_DOMAIN: &[u8] = b"aruna-submission-claim-v1";
+const CANONICAL_EXECUTION_DOMAIN: &[u8] = b"aruna-canonical-execution-v1";
+
+/// Opaque replicated identity of one keyed or unkeyed submission family. Every
+/// ingress derives it identically, and the raw idempotency key never replicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SubmissionId(pub [u8; 32]);
+
+impl SubmissionId {
+    /// The caller storage key is fixed width and the idempotency key is length
+    /// prefixed, so no caller can shift bytes into another family's identity.
+    pub fn keyed(created_by: UserId, idempotency_key: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SUBMISSION_KEYED_DOMAIN);
+        hasher.update(&created_by.to_storage_key());
+        hasher.update(&(idempotency_key.len() as u64).to_be_bytes());
+        hasher.update(idempotency_key);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Unkeyed submissions never merge, so a fresh ingress nonce is the subject.
+    pub fn unkeyed(nonce: Ulid) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SUBMISSION_UNKEYED_DOMAIN);
+        hasher.update(&nonce.to_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum JobContractError {
+    #[error("retry policy must allow at least one launch")]
+    EmptyRetry,
+    #[error("launch belongs to another witness budget")]
+    BudgetMismatch,
+    #[error("launch sequence {sequence} is outside the sealed budget of {max_launches}")]
+    BudgetExhausted { sequence: u32, max_launches: u32 },
+    #[error("launch spec digest does not match the sealed source spec digest")]
+    SpecMismatch,
+}
+
+/// Per-witness launch bound sealed into the immutable spec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRetryPolicy {
+    /// Includes the initial launch and is at least one.
+    pub max_launches_per_witness: u32,
+}
+
+impl JobRetryPolicy {
+    pub fn validate(&self) -> Result<(), JobContractError> {
+        match self.max_launches_per_witness {
+            0 => Err(JobContractError::EmptyRetry),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Ceilings normalized once at submission. No field is optional, so comparing a
+/// request against a static executor envelope is total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveResources {
+    pub cpu_cores: u32,
+    pub ram_bytes: u64,
+    pub disk_bytes: u64,
+    pub max_walltime_ms: u64,
+    pub preemptible: bool,
+}
+
+/// Immutable logical admission committed with the spec. Later quota convergence
+/// never revokes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobAdmissionRecord {
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub job_id: JobId,
+    pub group_id: GroupId,
+    pub admitting_node_id: NodeId,
+    pub membership_generation: u64,
+    pub resources: EffectiveResources,
+    pub admitted_at_ms: u64,
+}
+
+/// The immutable spec of one accepted claim. `request_digest` covers the
+/// normalized caller plan only; `spec_digest` covers this whole record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalJobSpec {
+    pub submission_id: SubmissionId,
+    pub job_id: JobId,
+    pub origin_node_id: NodeId,
+    pub realm_id: RealmId,
+    pub group_id: GroupId,
+    pub created_by: UserId,
+    pub created_at_ms: u64,
+    pub payload: ExecutionSpec,
+    pub request_digest: [u8; 32],
+    pub spec_digest: [u8; 32],
+    pub resources: EffectiveResources,
+    pub retry: JobRetryPolicy,
+    pub admission: JobAdmissionRecord,
+    /// Family placement derived from `submission_id`, never from the alias bucket.
+    pub placement: PlacementRef,
+}
+
+/// Union member keyed by `(submission_id, job_id)`, so two partitioned accepts
+/// of one idempotency key contribute two claims instead of conflicting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionClaim {
+    pub submission_id: SubmissionId,
+    pub job_id: JobId,
+    pub request_digest: [u8; 32],
+    pub spec_digest: [u8; 32],
+    pub committing_node_id: NodeId,
+    pub accepted_at_ms: u64,
+}
+
+impl SubmissionClaim {
+    /// Reduction order of the union: the smallest key is the canonical alias, so
+    /// arrival order, clocks, and scheduler rank never select it.
+    pub fn order_key(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SUBMISSION_CLAIM_DOMAIN);
+        hasher.update(&self.submission_id.0);
+        hasher.update(&self.request_digest);
+        hasher.update(&self.job_id.to_bytes());
+        *hasher.finalize().as_bytes()
+    }
+}
+
+/// Lifetime launch bound one scheduler seals before it first plans a request.
+/// A later realm-config or alias change can never reset or widen it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessBudgetRecord {
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub scheduler_node_id: NodeId,
+    pub source_spec_digest: [u8; 32],
+    pub max_launches: u32,
+}
+
+impl WitnessBudgetRecord {
+    /// A launch is actionable only inside the budget its own scheduler sealed.
+    pub fn admits(&self, launch: &LaunchIntent) -> Result<(), JobContractError> {
+        if self.submission_id != launch.submission_id
+            || self.request_digest != launch.request_digest
+            || self.scheduler_node_id != launch.scheduler_node_id
+        {
+            return Err(JobContractError::BudgetMismatch);
+        }
+        if self.source_spec_digest != launch.spec_digest {
+            return Err(JobContractError::SpecMismatch);
+        }
+        if launch.scheduler_seq >= self.max_launches {
+            return Err(JobContractError::BudgetExhausted {
+                sequence: launch.scheduler_seq,
+                max_launches: self.max_launches,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One scheduler's durable decision to launch. Replaying the same `launch_id`
+/// against the same target is idempotent; another id is another execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchIntent {
+    pub launch_id: Ulid,
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub job_id: JobId,
+    pub scheduler_node_id: NodeId,
+    pub scheduler_seq: u32,
+    pub witness_placement: PlacementRef,
+    /// Audit and ranking evidence; it never proves historical holder authority.
+    pub holder_generation: u64,
+    pub target: ExecutionTargetId,
+    pub plan_digest: [u8; 32],
+    pub spec_digest: [u8; 32],
+    pub created_at_ms: u64,
+}
+
+/// The target's signed acceptance. It binds one exact launch and the subject it
+/// was accepted under, so a later placement change cannot rewrite that history
+/// or authorize unrelated new work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionReceipt {
+    pub execution_id: Ulid,
+    pub launch_id: Ulid,
+    pub launch_digest: [u8; 32],
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub job_id: JobId,
+    pub executor_node_id: NodeId,
+    pub target: ExecutionTargetId,
+    pub spec_digest: [u8; 32],
+    pub membership_generation: u64,
+    pub subject_generation: u64,
+    pub subject_digest: [u8; 32],
+    pub accepted_at_ms: u64,
+}
+
+/// State of one physical execution. Terminal here means terminal for this
+/// `ExecutionId` only, never for the logical job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhysicalExecutionState {
+    Accepted,
+    Preparing,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl PhysicalExecutionState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            PhysicalExecutionState::Succeeded
+                | PhysicalExecutionState::Failed
+                | PhysicalExecutionState::Cancelled
+        )
+    }
+
+    /// Stable machine-readable name for API payloads.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PhysicalExecutionState::Accepted => "accepted",
+            PhysicalExecutionState::Preparing => "preparing",
+            PhysicalExecutionState::Running => "running",
+            PhysicalExecutionState::Succeeded => "succeeded",
+            PhysicalExecutionState::Failed => "failed",
+            PhysicalExecutionState::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Terminal facts of one physical execution. A success is valid only when every
+/// output carries its exact VersionId.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalExecutionResult {
+    pub exit_code: Option<i32>,
+    pub outputs: Vec<OutputObject>,
+    pub message: Option<String>,
+}
+
+/// Monotonic state publication by the executor. `previous_digest` roots the
+/// chain at the receipt so a gap cannot silently skip a state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionUpdate {
+    pub execution_id: Ulid,
+    pub sequence: u64,
+    pub previous_digest: Option<[u8; 32]>,
+    pub state: PhysicalExecutionState,
+    pub observed_at_ms: u64,
+    pub result: Option<PhysicalExecutionResult>,
+}
+
+/// Replicated cancellation intent for one `(submission_id, request_digest)`
+/// family. It suppresses new launches; a partitioned executor may still finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCancelRecord {
+    pub cancel_id: Ulid,
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub job_id: JobId,
+    pub requested_by: UserId,
+    pub requested_at_ms: u64,
+}
+
+/// Content-independent success order. The smallest key in one request family is
+/// canonical, so no publisher can bias selection with a timestamp.
+pub fn canonical_execution_key(
+    submission_id: SubmissionId,
+    request_digest: [u8; 32],
+    execution_id: Ulid,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CANONICAL_EXECUTION_DOMAIN);
+    hasher.update(&submission_id.0);
+    hasher.update(&request_digest);
+    hasher.update(&execution_id.to_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Replicated logical state of one request family. There is deliberately no
+/// `Failed`: realm-wide failure may never be inferred from local exhaustion or
+/// silence, so an unsuccessful family stays `Indeterminate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogicalJobState {
+    Queued,
+    Running,
+    Indeterminate,
+    Succeeded,
+    Cancelled,
+}
+
+impl LogicalJobState {
+    /// Stable machine-readable name for API payloads.
+    pub fn name(&self) -> &'static str {
+        match self {
+            LogicalJobState::Queued => "queued",
+            LogicalJobState::Running => "running",
+            LogicalJobState::Indeterminate => "indeterminate",
+            LogicalJobState::Succeeded => "succeeded",
+            LogicalJobState::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// How one physical execution relates to the canonical success. Redundant
+/// executions stay visible instead of being erased.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionRole {
+    Canonical,
+    DuplicateSuccess,
+    Redundant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectedExecution {
+    pub execution_id: Ulid,
+    pub executor_node_id: NodeId,
+    pub state: PhysicalExecutionState,
+    pub role: ExecutionRole,
+}
+
+/// Deterministic reduction of one request family. It is derived from immutable
+/// records only: local retry tasks, reachability, and the responder's clock are
+/// never inputs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProjection {
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub canonical_job_id: JobId,
+    /// Every same-request alias in `SubmissionClaim::order_key` order.
+    pub aliases: Vec<JobId>,
+    pub state: LogicalJobState,
+    pub canonical_execution_id: Option<Ulid>,
+    pub executions: Vec<ProjectedExecution>,
+    /// Outputs of the canonical execution.
+    pub outputs: Vec<OutputObject>,
+    pub cancel_requested: bool,
+}
+
+impl JobProjection {
+    /// Revision a client compares to detect that its view changed. Responder-local
+    /// diagnostics stay outside it by construction.
+    pub fn digest(&self) -> Result<[u8; 32], ConversionError> {
+        Ok(*blake3::hash(&postcard::to_allocvec(self)?).as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
 
     fn node_id(seed: u8) -> NodeId {
         let mut seed_bytes = [0u8; 32];
@@ -1818,7 +2176,6 @@ mod tests {
 
     #[test]
     fn dedup_key_namespaces() {
-        use crate::structs::RealmId;
         let job = JobId::from_bytes([1u8; 16]);
         let user_a = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let user_b = UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32]));
@@ -1942,6 +2299,365 @@ mod tests {
         assert_eq!(decoded.workspace_bucket, record.workspace_bucket);
         assert_eq!(decoded.report_digest, None);
         assert_eq!(decoded.retention_ms, DEFAULT_JOB_RETENTION_MS);
+    }
+
+    fn submission() -> SubmissionId {
+        SubmissionId([3u8; 32])
+    }
+
+    fn target() -> ExecutionTargetId {
+        ExecutionTargetId {
+            node_id: node_id(9),
+            executor_kind: "docker".to_string(),
+        }
+    }
+
+    fn sample_output() -> OutputObject {
+        OutputObject {
+            bucket: "dest".to_string(),
+            key: "out/report.txt".to_string(),
+            version_id: Ulid::from_bytes([4u8; 16]),
+            execution_id: Ulid::from_bytes([5u8; 16]),
+            container_path: "/out/report.txt".to_string(),
+            size: 12,
+            digest: Some("aa".repeat(32)),
+        }
+    }
+
+    fn sample_resources() -> EffectiveResources {
+        EffectiveResources {
+            cpu_cores: 4,
+            ram_bytes: 8 * 1024 * 1024 * 1024,
+            disk_bytes: 32 * 1024 * 1024 * 1024,
+            max_walltime_ms: 3_600_000,
+            preemptible: false,
+        }
+    }
+
+    fn sample_admission() -> JobAdmissionRecord {
+        JobAdmissionRecord {
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            job_id: JobId::from_bytes([6u8; 16]),
+            group_id: Ulid::from_bytes([7u8; 16]),
+            admitting_node_id: node_id(1),
+            membership_generation: 4,
+            resources: sample_resources(),
+            admitted_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn sample_spec() -> LogicalJobSpec {
+        LogicalJobSpec {
+            submission_id: submission(),
+            job_id: JobId::from_bytes([6u8; 16]),
+            origin_node_id: node_id(1),
+            realm_id: RealmId([8u8; 32]),
+            group_id: Ulid::from_bytes([7u8; 16]),
+            created_by: user(8, 2),
+            created_at_ms: 1_700_000_000_000,
+            payload: ExecutionSpec {
+                group_id: Ulid::from_bytes([7u8; 16]),
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine".to_string(),
+                entrypoint: None,
+                command: vec!["true".to_string()],
+                workdir: None,
+                env: Default::default(),
+                resources: Default::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
+            },
+            request_digest: [1u8; 32],
+            spec_digest: [2u8; 32],
+            resources: sample_resources(),
+            retry: JobRetryPolicy {
+                max_launches_per_witness: 3,
+            },
+            admission: sample_admission(),
+            placement: PlacementRef {
+                strategy_id: Ulid::from_bytes([9u8; 16]),
+                shard: 5,
+            },
+        }
+    }
+
+    fn sample_claim() -> SubmissionClaim {
+        SubmissionClaim {
+            submission_id: submission(),
+            job_id: JobId::from_bytes([6u8; 16]),
+            request_digest: [1u8; 32],
+            spec_digest: [2u8; 32],
+            committing_node_id: node_id(1),
+            accepted_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn sample_budget() -> WitnessBudgetRecord {
+        WitnessBudgetRecord {
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            scheduler_node_id: node_id(1),
+            source_spec_digest: [2u8; 32],
+            max_launches: 3,
+        }
+    }
+
+    fn sample_launch() -> LaunchIntent {
+        LaunchIntent {
+            launch_id: Ulid::from_bytes([10u8; 16]),
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            job_id: JobId::from_bytes([6u8; 16]),
+            scheduler_node_id: node_id(1),
+            scheduler_seq: 0,
+            witness_placement: PlacementRef {
+                strategy_id: Ulid::from_bytes([9u8; 16]),
+                shard: 5,
+            },
+            holder_generation: 11,
+            target: target(),
+            plan_digest: [12u8; 32],
+            spec_digest: [2u8; 32],
+            created_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn sample_receipt() -> ExecutionReceipt {
+        ExecutionReceipt {
+            execution_id: Ulid::from_bytes([13u8; 16]),
+            launch_id: Ulid::from_bytes([10u8; 16]),
+            launch_digest: [14u8; 32],
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            job_id: JobId::from_bytes([6u8; 16]),
+            executor_node_id: node_id(9),
+            target: target(),
+            spec_digest: [2u8; 32],
+            membership_generation: 4,
+            subject_generation: 2,
+            subject_digest: [15u8; 32],
+            accepted_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn sample_update() -> ExecutionUpdate {
+        ExecutionUpdate {
+            execution_id: Ulid::from_bytes([13u8; 16]),
+            sequence: 3,
+            previous_digest: Some([16u8; 32]),
+            state: PhysicalExecutionState::Succeeded,
+            observed_at_ms: 1_700_000_001_000,
+            result: Some(PhysicalExecutionResult {
+                exit_code: Some(0),
+                outputs: vec![sample_output()],
+                message: None,
+            }),
+        }
+    }
+
+    fn sample_cancel() -> JobCancelRecord {
+        JobCancelRecord {
+            cancel_id: Ulid::from_bytes([17u8; 16]),
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            job_id: JobId::from_bytes([6u8; 16]),
+            requested_by: user(8, 2),
+            requested_at_ms: 1_700_000_002_000,
+        }
+    }
+
+    fn sample_projection() -> JobProjection {
+        JobProjection {
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            canonical_job_id: JobId::from_bytes([6u8; 16]),
+            aliases: vec![JobId::from_bytes([6u8; 16]), JobId::from_bytes([18u8; 16])],
+            state: LogicalJobState::Succeeded,
+            canonical_execution_id: Some(Ulid::from_bytes([13u8; 16])),
+            executions: vec![ProjectedExecution {
+                execution_id: Ulid::from_bytes([13u8; 16]),
+                executor_node_id: node_id(9),
+                state: PhysicalExecutionState::Succeeded,
+                role: ExecutionRole::Canonical,
+            }],
+            outputs: vec![sample_output()],
+            cancel_requested: false,
+        }
+    }
+
+    fn reencode<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+        postcard::from_bytes(&postcard::to_allocvec(value).unwrap()).unwrap()
+    }
+
+    fn wire_digest<T: Serialize>(value: &T) -> String {
+        let bytes = postcard::to_allocvec(value).unwrap();
+        hex::encode(blake3::hash(&bytes).as_bytes())
+    }
+
+    #[test]
+    fn roundtrips_records() {
+        assert_eq!(reencode(&sample_output()), sample_output());
+        assert_eq!(reencode(&sample_spec()), sample_spec());
+        assert_eq!(reencode(&sample_admission()), sample_admission());
+        assert_eq!(reencode(&sample_claim()), sample_claim());
+        assert_eq!(reencode(&sample_budget()), sample_budget());
+        assert_eq!(reencode(&sample_launch()), sample_launch());
+        assert_eq!(reencode(&sample_receipt()), sample_receipt());
+        assert_eq!(reencode(&sample_update()), sample_update());
+        assert_eq!(reencode(&sample_cancel()), sample_cancel());
+        assert_eq!(reencode(&sample_projection()), sample_projection());
+    }
+
+    #[test]
+    fn canonical_encodings() {
+        // Golden wire digests: a change here must be a deliberate format change.
+        let digests = [
+            wire_digest(&sample_output()),
+            wire_digest(&sample_spec()),
+            wire_digest(&sample_admission()),
+            wire_digest(&sample_claim()),
+            wire_digest(&sample_budget()),
+            wire_digest(&sample_launch()),
+            wire_digest(&sample_receipt()),
+            wire_digest(&sample_update()),
+            wire_digest(&sample_cancel()),
+            wire_digest(&sample_projection()),
+        ];
+        assert_eq!(
+            digests,
+            [
+                "b98e0af7c920302f38cd6f87c1617543d64e1f0b54ab7d8d895dc3137147c889",
+                "e8187e6ea96c933f2bb870f1b94860dedfd7f8397dcf0ec3485f5ca8190b064d",
+                "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
+                "045a9878c7942dee314a991bec25d526785ac4d1d0bf0a4d2953735562115a33",
+                "0ac17924f2f58a054126d6fb22c6a0de5e2493ab93eb5a072631f4e63003accc",
+                "f5d1d8d4278b2fac2505ff0f4b72842b081aad77208abed4a8ef9e9f8fb8d2f3",
+                "70bcabaf26ea387f46f09219e24713ed2f30a41ddc49a28505c0c61128278e19",
+                "7169d9822b6b5f5d10c475c5ddbbbfee854120e48cb51a58fcf087978d42a788",
+                "1ce897cfd6c39414bd7266e6f09b21ff823cd5468a2b0e15b40387a31e00e1e6",
+                "eb62502ff6af0d549869e048e24f2a6239a256db3a9e5012eff7cc4b82fd7d76",
+            ]
+        );
+        assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);
+    }
+
+    #[test]
+    fn derives_submission_id() {
+        let caller = user(1, 2);
+        let other = user(1, 3);
+        assert_eq!(
+            SubmissionId::keyed(caller, b"key"),
+            SubmissionId::keyed(caller, b"key")
+        );
+        assert_ne!(
+            SubmissionId::keyed(caller, b"key"),
+            SubmissionId::keyed(other, b"key")
+        );
+        // A different realm under one user ulid is a different family.
+        assert_ne!(
+            SubmissionId::keyed(caller, b"key"),
+            SubmissionId::keyed(user(9, 2), b"key")
+        );
+        // Length prefixing keeps a shifted key from colliding with a longer one.
+        assert_ne!(
+            SubmissionId::keyed(caller, b"ab"),
+            SubmissionId::keyed(caller, b"a")
+        );
+        assert_ne!(
+            SubmissionId::unkeyed(Ulid::from_bytes([1u8; 16])),
+            SubmissionId::unkeyed(Ulid::from_bytes([2u8; 16]))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_retry() {
+        assert_eq!(
+            JobRetryPolicy {
+                max_launches_per_witness: 0
+            }
+            .validate(),
+            Err(JobContractError::EmptyRetry)
+        );
+        assert!(
+            JobRetryPolicy {
+                max_launches_per_witness: 1
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn admits_sealed_launch() {
+        let budget = sample_budget();
+        assert_eq!(budget.admits(&sample_launch()), Ok(()));
+
+        let mut exhausted = sample_launch();
+        exhausted.scheduler_seq = budget.max_launches;
+        assert_eq!(
+            budget.admits(&exhausted),
+            Err(JobContractError::BudgetExhausted {
+                sequence: budget.max_launches,
+                max_launches: budget.max_launches,
+            })
+        );
+
+        let mut drifted = sample_launch();
+        drifted.spec_digest = [99u8; 32];
+        assert_eq!(budget.admits(&drifted), Err(JobContractError::SpecMismatch));
+
+        let mut foreign = sample_launch();
+        foreign.scheduler_node_id = node_id(2);
+        assert_eq!(
+            budget.admits(&foreign),
+            Err(JobContractError::BudgetMismatch)
+        );
+    }
+
+    #[test]
+    fn orders_canonical_records() {
+        // Selection must not move with a timestamp or the committing node.
+        let mut restamped = sample_claim();
+        restamped.accepted_at_ms = u64::MAX;
+        restamped.committing_node_id = node_id(3);
+        assert_eq!(restamped.order_key(), sample_claim().order_key());
+
+        let mut alias = sample_claim();
+        alias.job_id = JobId::from_bytes([2u8; 16]);
+        assert_ne!(alias.order_key(), sample_claim().order_key());
+
+        let execution = Ulid::from_bytes([13u8; 16]);
+        assert_eq!(
+            canonical_execution_key(submission(), [1u8; 32], execution),
+            canonical_execution_key(submission(), [1u8; 32], execution)
+        );
+        assert_ne!(
+            canonical_execution_key(submission(), [1u8; 32], execution),
+            canonical_execution_key(submission(), [1u8; 32], Ulid::from_bytes([14u8; 16]))
+        );
+        assert_ne!(
+            canonical_execution_key(submission(), [1u8; 32], execution),
+            canonical_execution_key(submission(), [2u8; 32], execution)
+        );
+    }
+
+    #[test]
+    fn digest_tracks_projection() {
+        let projection = sample_projection();
+        assert_eq!(
+            projection.digest().unwrap(),
+            sample_projection().digest().unwrap()
+        );
+        let mut succeeded = projection.clone();
+        succeeded.state = LogicalJobState::Cancelled;
+        assert_ne!(succeeded.digest().unwrap(), projection.digest().unwrap());
     }
 
     #[test]

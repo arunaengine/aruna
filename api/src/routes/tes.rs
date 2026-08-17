@@ -2373,6 +2373,8 @@ mod tests {
             outputs: vec![OutputObject {
                 bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),
+                version_id: Ulid::nil(),
+                execution_id: Ulid::nil(),
                 container_path: "/out/report.txt".to_string(),
                 size: 12,
                 digest: None,
