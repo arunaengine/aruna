@@ -3041,6 +3041,7 @@ pub fn binding_scope_key(scope: &BindingScope) -> String {
             DocumentClass::Metadata => "class:metadata",
             DocumentClass::MetadataRegistry => "class:metadata_registry",
             DocumentClass::JobControl => "class:job_control",
+            DocumentClass::PlacementPolicy => "class:placement_policy",
         }
         .to_string(),
         BindingScope::MetadataPathPrefix(prefix) => format!(

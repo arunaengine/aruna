@@ -462,6 +462,7 @@ pub enum RealmPlacementDocumentClass {
     Metadata,
     MetadataRegistry,
     JobControl,
+    PlacementPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -661,6 +662,7 @@ impl From<aruna_core::structs::DocumentClass> for RealmPlacementDocumentClass {
             aruna_core::structs::DocumentClass::Metadata => Self::Metadata,
             aruna_core::structs::DocumentClass::MetadataRegistry => Self::MetadataRegistry,
             aruna_core::structs::DocumentClass::JobControl => Self::JobControl,
+            aruna_core::structs::DocumentClass::PlacementPolicy => Self::PlacementPolicy,
         }
     }
 }
@@ -674,6 +676,7 @@ impl From<RealmPlacementDocumentClass> for aruna_core::structs::DocumentClass {
             RealmPlacementDocumentClass::Metadata => Self::Metadata,
             RealmPlacementDocumentClass::MetadataRegistry => Self::MetadataRegistry,
             RealmPlacementDocumentClass::JobControl => Self::JobControl,
+            RealmPlacementDocumentClass::PlacementPolicy => Self::PlacementPolicy,
         }
     }
 }
