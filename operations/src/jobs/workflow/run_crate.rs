@@ -572,8 +572,8 @@ mod tests {
             outputs: vec![OutputObject {
                 bucket: "src".to_string(),
                 key: "out.txt".to_string(),
-                version_id: Ulid::nil(),
-                execution_id: Ulid::nil(),
+                version_id: Ulid::from_bytes([11; 16]),
+                execution_id: Ulid::from_bytes([12; 16]),
                 container_path: "/work/out.txt".to_string(),
                 size: 7,
                 digest: None,

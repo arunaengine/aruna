@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -25,6 +25,7 @@ use super::DEFAULT_WALLTIME;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
 use crate::get_realm_config::GetRealmConfigOperation;
+use crate::jobs::store::reserve_output_commits;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -32,7 +33,9 @@ use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
-use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::put_object::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
@@ -470,6 +473,8 @@ pub async fn load_inputs(
     Ok(files)
 }
 
+/// Export every declared file output under one write-ahead commit reservation, so
+/// an interrupted capture replays into the same versions instead of new ones.
 pub async fn capture_outputs(
     context: &DriverContext,
     backend: &Arc<dyn ExecutorBackend>,
@@ -478,18 +483,62 @@ pub async fn capture_outputs(
     record: &JobRecord,
     node_id: NodeId,
 ) -> Result<Vec<OutputObject>, JobError> {
-    let mut outputs = Vec::with_capacity(spec.file_outputs.len());
+    let mut selections = Vec::with_capacity(spec.file_outputs.len());
     for declared in &spec.file_outputs {
-        for output in resolve_output(backend, fence, declared).await? {
-            outputs.push(
-                Box::pin(put_file_output(
-                    context, backend, fence, spec, record, node_id, &output,
-                ))
-                .await?,
-            );
-        }
+        selections.extend(resolve_output(backend, fence, declared).await?);
+    }
+    if selections.len() > MAX_OUTPUT_MANIFEST_OBJECTS {
+        return Err(JobError::permanent(format!(
+            "output manifest exceeds {MAX_OUTPUT_MANIFEST_OBJECTS} objects"
+        )));
+    }
+    let destinations: Vec<(String, String)> = selections.iter().map(destination_of).collect();
+    let control = reserve_output_commits(&context.storage_handle, record.job_id, &destinations)
+        .await
+        .map_err(|error| {
+            JobError::retryable(format!("output commit reservation failed: {error}"))
+        })?;
+    if control.attempt_epoch != fence.attempt_epoch {
+        return Err(JobError::retryable(
+            "attempt fence moved during output capture",
+        ));
+    }
+    let reserved: HashMap<(&str, &str), Ulid> = control
+        .output_commits
+        .iter()
+        .map(|commit| {
+            (
+                (commit.bucket.as_str(), commit.key.as_str()),
+                commit.version_id,
+            )
+        })
+        .collect();
+    let mut outputs = Vec::with_capacity(selections.len());
+    for (selection, (bucket, key)) in selections.iter().zip(&destinations) {
+        let Some(version_id) = reserved.get(&(bucket.as_str(), key.as_str())).copied() else {
+            return Err(JobError::retryable("output commit reservation lost"));
+        };
+        outputs.push(
+            Box::pin(put_file_output(
+                context,
+                backend,
+                fence,
+                spec,
+                record,
+                node_id,
+                selection,
+                version_id,
+                control.execution_id,
+            ))
+            .await?,
+        );
     }
     Ok(outputs)
+}
+
+fn destination_of(selection: &OutputSelection) -> (String, String) {
+    let OutputDestination::S3 { bucket, key } = &selection.destination;
+    (bucket.clone(), key.clone())
 }
 
 /// Resolve one declared output into the concrete files to upload. A wildcard
@@ -556,9 +605,9 @@ fn expand_selection(
         .collect()
 }
 
-/// Stream one declared container output into its S3 destination. When the
-/// destination already holds identical content (a retried finalize), the write
-/// is skipped after a streamed hash pass.
+/// Stream one declared container output into its S3 destination under its
+/// reserved VersionId. The write fences itself on that id, so a replayed capture
+/// resolves to the version it already created instead of writing a second one.
 #[allow(clippy::too_many_arguments)]
 async fn put_file_output(
     context: &DriverContext,
@@ -568,6 +617,8 @@ async fn put_file_output(
     record: &JobRecord,
     node_id: NodeId,
     output: &OutputSelection,
+    version_id: Ulid,
+    execution_id: Ulid,
 ) -> Result<OutputObject, JobError> {
     let OutputDestination::S3 { bucket, key } = &output.destination;
     let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
@@ -606,38 +657,6 @@ async fn put_file_output(
         )));
     }
 
-    let existing = match Box::pin(drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id: None,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    {
-        Ok(Some(result)) => result.location,
-        Ok(None)
-        | Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        ) => None,
-        Err(error) => {
-            return Err(JobError::retryable(format!(
-                "output destination lookup failed: {error}"
-            )));
-        }
-    };
-    if let Some(location) = &existing {
-        let (size, digest) = hash_output(backend, fence, &output.container_path).await?;
-        if location.blob_size == size && location.get_blake3() == Some(digest.as_bytes().as_slice())
-        {
-            return Ok(output_object(output, bucket, key, size, &digest));
-        }
-    }
-
     let realm_config = Box::pin(drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
         context,
@@ -651,28 +670,20 @@ async fn put_file_output(
         .await
         .map_err(|error| output_read_error(&error))?;
     let size = fetched.size;
-    let hasher = Arc::new(std::sync::Mutex::new(blake3::Hasher::new()));
     let stream_error = Arc::new(std::sync::Mutex::new(None));
-    let body_hasher = hasher.clone();
     let body_error = stream_error.clone();
-    let body = BackendStream::new(fetched.chunks.map(move |chunk| match chunk {
-        Ok(chunk) => {
-            if let Ok(mut hasher) = body_hasher.lock() {
-                hasher.update(&chunk);
-            }
-            Ok(chunk)
-        }
-        Err(error) => {
+    let body = BackendStream::new(fetched.chunks.map(move |chunk| {
+        chunk.map_err(|error| {
             if let Ok(mut slot) = body_error.lock() {
                 *slot = Some(error.clone());
             }
-            Err(std::io::Error::other(error))
-        }
+            std::io::Error::other(error)
+        })
     }));
     let routing = routing_snapshot(context, spec.group_id, bucket)
         .await
         .map_err(|error| routing_error("output write", error))?;
-    Box::pin(drive(
+    let result = Box::pin(drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
             group_id: spec.group_id,
@@ -688,7 +699,7 @@ async fn put_file_output(
             checksum_type: None,
             exists: false,
             version_source: None,
-            preassigned_version_id: None,
+            preassigned_version_id: Some(version_id),
             quota_ceiling,
             routing,
         }),
@@ -703,33 +714,9 @@ async fn put_file_output(
             Some(backend_error) => output_read_error(&backend_error),
             None => put_object_error("output write", error),
         },
-    )?;
-    let digest = hasher
-        .lock()
-        .map(|hasher| hasher.finalize())
-        .map_err(|_| JobError::retryable("output digest lost"))?;
-    Ok(output_object(output, bucket, key, size, &digest))
-}
-
-/// Streamed size + blake3 of one container output, for the idempotent-retry check.
-async fn hash_output(
-    backend: &Arc<dyn ExecutorBackend>,
-    fence: &FenceContext,
-    path: &str,
-) -> Result<(u64, blake3::Hash), JobError> {
-    let fetched = backend
-        .fetch_output(fence, path)
-        .await
-        .map_err(|error| output_read_error(&error))?;
-    let mut chunks = fetched.chunks;
-    let mut hasher = blake3::Hasher::new();
-    let mut size = 0u64;
-    while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|error| output_read_error(&error))?;
-        size += chunk.len() as u64;
-        hasher.update(&chunk);
-    }
-    Ok((size, hasher.finalize()))
+    )?
+    .ok_or_else(|| JobError::retryable("output write returned no version"))?;
+    Ok(output_object(output, bucket, key, &result, execution_id))
 }
 
 fn output_read_error(error: &BackendError) -> JobError {
@@ -741,21 +728,23 @@ fn output_read_error(error: &BackendError) -> JobError {
     }
 }
 
+/// Exact identity of one written output: the version this write created and the
+/// physical execution that produced it, both read back from the stored version.
 fn output_object(
     output: &OutputSelection,
     bucket: &str,
     key: &str,
-    size: u64,
-    digest: &blake3::Hash,
+    result: &PutObjectResult,
+    execution_id: Ulid,
 ) -> OutputObject {
     OutputObject {
         bucket: bucket.to_string(),
         key: key.to_string(),
-        version_id: Ulid::nil(),
-        execution_id: Ulid::nil(),
+        version_id: result.version_id,
+        execution_id,
         container_path: output.container_path.clone(),
-        size,
-        digest: Some(digest.to_hex().to_string()),
+        size: result.location.blob_size,
+        digest: result.location.get_blake3().map(hex_encode),
     }
 }
 
@@ -1012,11 +1001,13 @@ fn staged_content_matches(
 }
 
 /// Inventory the declared output prefixes in the workspace at completion. Missing
-/// prefixes contribute nothing; no declarations produce an empty manifest.
+/// prefixes contribute nothing; no declarations produce an empty manifest. Every
+/// inventoried object is stamped with its exact current version.
 pub async fn collect_outputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     bucket: &str,
+    execution_id: Ulid,
 ) -> Result<Vec<OutputObject>, JobError> {
     if spec.output_prefixes.is_empty() {
         return Ok(Vec::new());
@@ -1043,7 +1034,14 @@ pub async fn collect_outputs(
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
             let Some(result) = result else { break };
             for object in result.objects {
-                let (size, digest) = match object.location {
+                // Identity, size, and digest all come from one head, so they
+                // cannot describe two different versions of the same key.
+                let Some((version_id, location)) =
+                    Box::pin(head_version(context, bucket, &object.head.key)).await?
+                else {
+                    continue;
+                };
+                let (size, digest) = match location {
                     Some(location) => (location.blob_size, location.get_blake3().map(hex_encode)),
                     None => (0, None),
                 };
@@ -1053,8 +1051,8 @@ pub async fn collect_outputs(
                     OutputObject {
                         bucket: bucket.to_string(),
                         key: object.head.key,
-                        version_id: Ulid::nil(),
-                        execution_id: Ulid::nil(),
+                        version_id,
+                        execution_id,
                         container_path: String::new(),
                         size,
                         digest,
@@ -1068,6 +1066,42 @@ pub async fn collect_outputs(
         }
     }
     Ok(outputs)
+}
+
+/// Exact current version of one inventoried object with its stored location, or
+/// `None` when the object vanished between listing and capture.
+async fn head_version(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<(Ulid, Option<BackendLocation>)>, JobError> {
+    match Box::pin(drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: None,
+        }),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(result)) => match result.version_id {
+            Some(version_id) if !version_id.is_nil() => Ok(Some((version_id, result.location))),
+            _ => Err(JobError::permanent(format!(
+                "inventoried output {bucket}/{key} has no exact version"
+            ))),
+        },
+        Ok(None)
+        | Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        ) => Ok(None),
+        Err(error) => Err(JobError::retryable(format!(
+            "output version lookup failed: {error}"
+        ))),
+    }
 }
 
 /// Fold the exported manifest into the inventoried one under the same keyed limit
@@ -1163,8 +1197,8 @@ mod tests {
         OutputObject {
             bucket: "workspace".to_string(),
             key: key.to_string(),
-            version_id: Ulid::nil(),
-            execution_id: Ulid::nil(),
+            version_id: Ulid::generate(),
+            execution_id: Ulid::from_bytes([9; 16]),
             container_path: key.to_string(),
             size: 0,
             digest: None,
@@ -1237,7 +1271,7 @@ mod tests {
         };
 
         assert!(
-            collect_outputs(&context, &spec(Vec::new()), "workspace")
+            collect_outputs(&context, &spec(Vec::new()), "workspace", Ulid::generate())
                 .await
                 .unwrap()
                 .is_empty()

@@ -18,8 +18,8 @@ use aruna_core::compute::{
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
-    AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload,
-    OutputObject, WorkspaceMode,
+    AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobRecordError,
+    JobResultPayload, OutputObject, WorkspaceMode,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::NodeId;
@@ -30,9 +30,9 @@ use tracing::{info, warn};
 use super::JOB_HEARTBEAT_MS;
 use super::store::{
     ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
-    complete_execution, complete_job, fail_execution, mark_indeterminate, read_job_record,
-    record_attempt_intent, record_attempt_started, record_attempt_tombstone, renew_lease,
-    requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
+    complete_execution, complete_job, fail_execution, mark_indeterminate, read_attempt_control,
+    read_job_record, record_attempt_intent, record_attempt_started, record_attempt_tombstone,
+    renew_lease, requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
     transition_to_cancelling, transition_to_preparing, transition_to_ready,
 };
 use super::submit::schedule_job_drain_effect;
@@ -1055,8 +1055,20 @@ pub(crate) async fn finalize_attempt(
 
     match status.phase {
         AttemptPhase::Exited { code: 0 } => {
-            let Some(inventoried) =
-                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            let Some(execution_id) =
+                Box::pin(execution_or_park(context, job_id, token, fence)).await
+            else {
+                return;
+            };
+            let Some(inventoried) = Box::pin(collect_or_park(
+                context,
+                job_id,
+                token,
+                spec,
+                bucket,
+                execution_id,
+            ))
+            .await
             else {
                 return;
             };
@@ -1085,6 +1097,10 @@ pub(crate) async fn finalize_attempt(
                 return;
             };
             let result = execution_result_for(bucket, Some(0), outputs, logs);
+            if let Err(error) = result.check_outputs(execution_id) {
+                Box::pin(fail_bad_outputs(context, job_id, token, bucket, error)).await;
+                return;
+            }
             match Box::pin(terminal_execution(storage, job_id, token, result)).await {
                 Some(ExecutionCompleteOutcome::Completed(record)) => {
                     Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
@@ -1099,8 +1115,20 @@ pub(crate) async fn finalize_attempt(
             }
         }
         AttemptPhase::Exited { code } => {
-            let Some(outputs) =
-                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            let Some(execution_id) =
+                Box::pin(execution_or_park(context, job_id, token, fence)).await
+            else {
+                return;
+            };
+            let Some(outputs) = Box::pin(collect_or_park(
+                context,
+                job_id,
+                token,
+                spec,
+                bucket,
+                execution_id,
+            ))
+            .await
             else {
                 return;
             };
@@ -1167,7 +1195,12 @@ async fn finalize_cancel(
     let storage = &context.storage_handle;
     // Running -> Cancelling (idempotent: a re-entry may already be Cancelling).
     let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    // Stop the container first: the identity is only needed to record outputs.
     let evidence = backend.cancel(fence).await;
+    let Some(execution_id) = Box::pin(execution_or_park(context, job_id, token, fence)).await
+    else {
+        return;
+    };
     match evidence {
         Ok(CancelEvidence::Stopped(status)) => {
             let Some(logs) =
@@ -1177,8 +1210,15 @@ async fn finalize_cancel(
             };
             match status.phase {
                 AttemptPhase::Exited { code: 0 } => {
-                    let Some(inventoried) =
-                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+                    let Some(inventoried) = Box::pin(collect_or_park(
+                        context,
+                        job_id,
+                        token,
+                        spec,
+                        bucket,
+                        execution_id,
+                    ))
+                    .await
                     else {
                         return;
                     };
@@ -1202,12 +1242,23 @@ async fn finalize_cancel(
                         return;
                     };
                     let result = execution_result_for(bucket, Some(0), outputs, logs);
+                    if let Err(error) = result.check_outputs(execution_id) {
+                        Box::pin(fail_bad_outputs(context, job_id, token, bucket, error)).await;
+                        return;
+                    }
                     let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Exited { code } => {
-                    let Some(outputs) =
-                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+                    let Some(outputs) = Box::pin(collect_or_park(
+                        context,
+                        job_id,
+                        token,
+                        spec,
+                        bucket,
+                        execution_id,
+                    ))
+                    .await
                     else {
                         return;
                     };
@@ -1235,8 +1286,15 @@ async fn finalize_cancel(
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Cancelled | AttemptPhase::Submitted | AttemptPhase::Running => {
-                    let Some(outputs) =
-                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+                    let Some(outputs) = Box::pin(collect_or_park(
+                        context,
+                        job_id,
+                        token,
+                        spec,
+                        bucket,
+                        execution_id,
+                    ))
+                    .await
                     else {
                         return;
                     };
@@ -1247,8 +1305,15 @@ async fn finalize_cancel(
             }
         }
         Ok(CancelEvidence::AlreadyGone) => {
-            let Some(outputs) =
-                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            let Some(outputs) = Box::pin(collect_or_park(
+                context,
+                job_id,
+                token,
+                spec,
+                bucket,
+                execution_id,
+            ))
+            .await
             else {
                 return;
             };
@@ -1471,6 +1536,47 @@ async fn requeue_or_fail_pre_submit(
     }
 }
 
+/// Physical execution identity of the fenced attempt. Without it no output can
+/// be named exactly, so the attempt is parked instead of terminalized.
+async fn execution_or_park(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    fence: &FenceContext,
+) -> Option<ulid::Ulid> {
+    let control =
+        read_attempt_control(&context.storage_handle, job_id, fence.attempt_epoch, None).await;
+    let error = match control {
+        Ok(Some(control)) if !control.execution_id.is_nil() => return Some(control.execution_id),
+        Ok(_) => JobError::retryable("attempt control carries no execution identity"),
+        Err(error) => JobError::retryable(format!("attempt control lookup failed: {error}")),
+    };
+    Box::pin(park_attempt(context, job_id, token, error)).await;
+    None
+}
+
+/// Terminal success is refused when an output cannot be named exactly: the job
+/// fails instead of claiming a success whose outputs nobody can retrieve.
+async fn fail_bad_outputs(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    bucket: &str,
+    error: JobRecordError,
+) {
+    warn!(job_id = %job_id, error = %error, "Output identity incomplete; failing");
+    let result = execution_result_for(bucket, None, Vec::new(), LogTails::default());
+    let terminal = Box::pin(terminal_fail(
+        &context.storage_handle,
+        job_id,
+        token,
+        JobError::permanent(format!("output identity incomplete: {error}")),
+        result,
+    ))
+    .await;
+    Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
+}
+
 /// Inventory the declared outputs. A permanent inventory failure terminalizes
 /// the job so cleanup runs; a transient one parks it `Indeterminate` instead of
 /// terminalizing with a false-empty output manifest.
@@ -1480,8 +1586,9 @@ async fn collect_or_park(
     token: ulid::Ulid,
     spec: &ExecutionSpec,
     bucket: &str,
+    execution_id: ulid::Ulid,
 ) -> Option<Vec<OutputObject>> {
-    match Box::pin(collect_outputs(context, spec, bucket)).await {
+    match Box::pin(collect_outputs(context, spec, bucket, execution_id)).await {
         Ok(outputs) => Some(outputs),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed permanently; failing");

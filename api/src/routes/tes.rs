@@ -1362,7 +1362,12 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
         outputs = captured
             .iter()
             .map(|output| TesOutputFileLog {
-                url: format!("s3://{}/{}", output.bucket, output.key),
+                // Names the exact version, so the caller still retrieves this
+                // output after a later write becomes the object's latest.
+                url: format!(
+                    "s3://{}/{}?versionId={}",
+                    output.bucket, output.key, output.version_id
+                ),
                 path: if output.container_path.is_empty() {
                     output.key.clone()
                 } else {
@@ -2373,8 +2378,8 @@ mod tests {
             outputs: vec![OutputObject {
                 bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),
-                version_id: Ulid::nil(),
-                execution_id: Ulid::nil(),
+                version_id: Ulid::from_bytes([21u8; 16]),
+                execution_id: Ulid::from_bytes([22u8; 16]),
                 container_path: "/out/report.txt".to_string(),
                 size: 12,
                 digest: None,
@@ -2418,7 +2423,13 @@ mod tests {
         assert_eq!(full.logs[0].logs[0].stderr.as_deref(), Some("error"));
         assert_eq!(full.logs[0].system_logs, vec!["prior failure"]);
         assert_eq!(full.logs[0].outputs.len(), 1);
-        assert_eq!(full.logs[0].outputs[0].url, "s3://dest/out/r.txt");
+        assert_eq!(
+            full.logs[0].outputs[0].url,
+            format!(
+                "s3://dest/out/r.txt?versionId={}",
+                Ulid::from_bytes([21u8; 16])
+            )
+        );
         assert_eq!(full.logs[0].outputs[0].path, "/out/report.txt");
     }
 

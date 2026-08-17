@@ -1226,9 +1226,11 @@ pub async fn record_attempt_intent(
             };
             let control = AttemptControl {
                 attempt_epoch: epoch,
+                execution_id: Ulid::generate(),
                 controller_generation: 1,
                 bound_token: Some(token),
                 tombstone_ref: None,
+                output_commits: Vec::new(),
             };
             let old = record.clone();
             record.attempt_intent = Some(intent);
@@ -1295,6 +1297,24 @@ pub async fn read_attempt_control(
                 .map_err(|error| JobMutationError::Storage(error.to_string()))
         })
         .transpose()
+}
+
+/// Write-ahead one VersionId per output destination in the attempt-control
+/// transaction that already fences this physical execution. It commits before
+/// any output write, so a replayed capture reuses the reserved identities.
+pub async fn reserve_output_commits(
+    storage: &StorageHandle,
+    job_id: JobId,
+    destinations: &[(String, String)],
+) -> Result<AttemptControl, JobMutationError> {
+    let (_, control) = mutate_attempt_control(storage, job_id, |_, control| {
+        match control.reserve_outputs(destinations, Ulid::generate) {
+            true => Ok(JobMutation::Persist),
+            false => Ok(JobMutation::Skip),
+        }
+    })
+    .await?;
+    Ok(control)
 }
 
 async fn mutate_attempt_control<F>(
