@@ -1,5 +1,8 @@
 use crate::audit::AuditPageBatch;
-use crate::effects::JobFamilyRecord;
+use crate::effects::{
+    FetchCursor, FrameBoundsError, JobRecordFrame, MAX_JOB_RECORD_PAGE, MAX_JOB_RECORD_PAGE_BYTES,
+    encoded_len,
+};
 use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
@@ -17,6 +20,7 @@ use crate::{
     types::{Key, KeySpace, TxnId, Value},
 };
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
@@ -211,6 +215,53 @@ pub enum PolicyFetchEvent {
     Unavailable(String),
 }
 
+/// Bounded page of immutable job-family records, oldest key first. Its bounds
+/// hold for a decoded page too, so a holder cannot answer with an unbounded one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<JobRecordFrame>")]
+pub struct JobRecordPage(Vec<JobRecordFrame>);
+
+impl JobRecordPage {
+    pub fn new(records: Vec<JobRecordFrame>) -> Result<Self, FrameBoundsError> {
+        if records.len() > MAX_JOB_RECORD_PAGE {
+            return Err(FrameBoundsError::RecordCount);
+        }
+        if encoded_len(&records)? > MAX_JOB_RECORD_PAGE_BYTES {
+            return Err(FrameBoundsError::PageBytes);
+        }
+        Ok(Self(records))
+    }
+
+    /// Rejects an oversized frame before it is decoded, so a peer cannot force
+    /// the allocation of a page it is not allowed to send.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FrameBoundsError> {
+        if bytes.len() > MAX_JOB_RECORD_PAGE_BYTES {
+            return Err(FrameBoundsError::PageBytes);
+        }
+        Self::new(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameBoundsError> {
+        Ok(postcard::to_allocvec(&self.0)?)
+    }
+
+    pub fn records(&self) -> &[JobRecordFrame] {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Vec<JobRecordFrame> {
+        self.0
+    }
+}
+
+impl TryFrom<Vec<JobRecordFrame>> for JobRecordPage {
+    type Error = FrameBoundsError;
+
+    fn try_from(records: Vec<JobRecordFrame>) -> Result<Self, Self::Error> {
+        Self::new(records)
+    }
+}
+
 /// Reply to a [`crate::effects::JobRecordEffect`].
 #[derive(Debug, PartialEq)]
 pub enum JobRecordEvent {
@@ -224,8 +275,8 @@ pub enum JobRecordEvent {
     },
     /// At most the requested page of records, oldest key first.
     Fetched {
-        records: Vec<JobFamilyRecord>,
-        next_cursor: Option<Vec<u8>>,
+        records: JobRecordPage,
+        next_cursor: Option<FetchCursor>,
     },
     Unavailable(String),
 }
@@ -317,4 +368,76 @@ pub enum StreamEvent {
 pub enum NetError {
     InvalidEffect,
     ChannelClosed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::{JobFamilyRecord, MAX_JOB_RECORD_BYTES};
+    use crate::structs::{ExecutionUpdate, PhysicalExecutionResult, PhysicalExecutionState};
+
+    fn update(message: usize) -> JobFamilyRecord {
+        JobFamilyRecord::Update(ExecutionUpdate {
+            execution_id: Ulid::from_bytes([5u8; 16]),
+            sequence: 2,
+            previous_digest: None,
+            state: PhysicalExecutionState::Running,
+            observed_at_ms: 3,
+            result: Some(PhysicalExecutionResult {
+                exit_code: None,
+                outputs: Vec::new(),
+                message: Some("m".repeat(message)),
+            }),
+        })
+    }
+
+    fn frame(message: usize) -> JobRecordFrame {
+        JobRecordFrame::new(update(message)).expect("bounded record")
+    }
+
+    #[test]
+    fn rejects_wide_page() {
+        let records = vec![frame(1); MAX_JOB_RECORD_PAGE + 1];
+        assert_eq!(
+            JobRecordPage::new(records.clone()),
+            Err(FrameBoundsError::RecordCount)
+        );
+        let encoded = postcard::to_allocvec(&records).expect("records encode");
+        assert_eq!(
+            JobRecordPage::from_bytes(&encoded),
+            Err(FrameBoundsError::RecordCount)
+        );
+        assert!(postcard::from_bytes::<JobRecordPage>(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_decoded_record() {
+        // A page frame may not smuggle a record past the per-record byte bound.
+        let encoded =
+            postcard::to_allocvec(&vec![update(MAX_JOB_RECORD_BYTES)]).expect("records encode");
+        assert!(JobRecordPage::from_bytes(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_heavy_page() {
+        // A record count within the page bound still cannot exceed the byte bound.
+        let records = vec![frame(MAX_JOB_RECORD_BYTES - 64); 8];
+        assert_eq!(
+            JobRecordPage::new(records),
+            Err(FrameBoundsError::PageBytes)
+        );
+        let frame = vec![0u8; MAX_JOB_RECORD_PAGE_BYTES + 1];
+        assert_eq!(
+            JobRecordPage::from_bytes(&frame),
+            Err(FrameBoundsError::PageBytes)
+        );
+    }
+
+    #[test]
+    fn page_round_trips() {
+        let page = JobRecordPage::new(vec![frame(4), frame(8)]).expect("bounded page");
+        let bytes = page.to_bytes().expect("page encodes");
+        assert_eq!(JobRecordPage::from_bytes(&bytes), Ok(page.clone()));
+        assert_eq!(page.records().len(), 2);
+    }
 }

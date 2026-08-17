@@ -19,7 +19,9 @@ use crate::task::TaskEffect;
 use crate::types::UserId;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
@@ -273,14 +275,163 @@ pub const MAX_JOB_RECORD_HOLDERS: usize = 8;
 /// always read as bounded pages.
 pub const MAX_JOB_RECORD_PAGE: usize = 64;
 
+/// Bytes of one opaque page cursor: it carries a holder's record key only.
+pub const MAX_JOB_RECORD_CURSOR_BYTES: usize = 128;
+
+/// Encoded bytes of one immutable job-family record.
+pub const MAX_JOB_RECORD_BYTES: usize = 1024 * 1024;
+
+/// Encoded bytes of one fetched record page.
+pub const MAX_JOB_RECORD_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Why a bounded policy-fetch or job-record frame was refused. Every bound holds
+/// at construction and again at decode, because a peer supplies bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum FrameBoundsError {
+    #[error("holder list must name 1..={max} nodes")]
+    HolderCount { max: usize },
+    #[error("cursor must be at most {MAX_JOB_RECORD_CURSOR_BYTES} bytes")]
+    CursorBytes,
+    #[error("page limit must be 1..={MAX_JOB_RECORD_PAGE}")]
+    PageLimit,
+    #[error("page must carry at most {MAX_JOB_RECORD_PAGE} records")]
+    RecordCount,
+    #[error("record must encode to at most {MAX_JOB_RECORD_BYTES} bytes")]
+    RecordBytes,
+    #[error("page must encode to at most {MAX_JOB_RECORD_PAGE_BYTES} bytes")]
+    PageBytes,
+    #[error(transparent)]
+    Encoding(#[from] postcard::Error),
+}
+
+/// Postcard size of a value without materializing its encoding.
+pub(crate) fn encoded_len<T>(value: &T) -> Result<usize, FrameBoundsError>
+where
+    T: Serialize + ?Sized,
+{
+    Ok(postcard::experimental::serialized_size(value)?)
+}
+
+/// Holders resolved from the local placement view, in preference order. The
+/// bound is part of the type, so no caller can widen one request into a fan-out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderList<const MAX: usize>(Vec<NodeId>);
+
+impl<const MAX: usize> HolderList<MAX> {
+    pub fn new(holders: Vec<NodeId>) -> Result<Self, FrameBoundsError> {
+        if holders.is_empty() || holders.len() > MAX {
+            return Err(FrameBoundsError::HolderCount { max: MAX });
+        }
+        Ok(Self(holders))
+    }
+
+    pub fn as_slice(&self) -> &[NodeId] {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Vec<NodeId> {
+        self.0
+    }
+}
+
+/// Opaque page cursor a holder minted. Decoding rejects an oversized cursor, so
+/// a peer cannot return a marker the next request would have to carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<u8>")]
+pub struct FetchCursor(Vec<u8>);
+
+impl FetchCursor {
+    pub fn new(cursor: Vec<u8>) -> Result<Self, FrameBoundsError> {
+        if cursor.is_empty() || cursor.len() > MAX_JOB_RECORD_CURSOR_BYTES {
+            return Err(FrameBoundsError::CursorBytes);
+        }
+        Ok(Self(cursor))
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<u8>> for FetchCursor {
+    type Error = FrameBoundsError;
+
+    fn try_from(cursor: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::new(cursor)
+    }
+}
+
+/// Requested page size. A requester-supplied value is clamped to the documented
+/// maximum; a decoded value outside the range is a malformed frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "usize")]
+pub struct PageLimit(usize);
+
+impl PageLimit {
+    pub fn new(limit: usize) -> Self {
+        Self(limit.clamp(1, MAX_JOB_RECORD_PAGE))
+    }
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for PageLimit {
+    fn default() -> Self {
+        Self(MAX_JOB_RECORD_PAGE)
+    }
+}
+
+impl TryFrom<usize> for PageLimit {
+    type Error = FrameBoundsError;
+
+    fn try_from(limit: usize) -> Result<Self, Self::Error> {
+        if limit == 0 || limit > MAX_JOB_RECORD_PAGE {
+            return Err(FrameBoundsError::PageLimit);
+        }
+        Ok(Self(limit))
+    }
+}
+
+/// One job-family record bounded by its encoded size, so neither a publisher nor
+/// a fetched page can carry a record whose strings or vectors are unbounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "JobFamilyRecord")]
+pub struct JobRecordFrame(JobFamilyRecord);
+
+impl JobRecordFrame {
+    pub fn new(record: JobFamilyRecord) -> Result<Self, FrameBoundsError> {
+        if encoded_len(&record)? > MAX_JOB_RECORD_BYTES {
+            return Err(FrameBoundsError::RecordBytes);
+        }
+        Ok(Self(record))
+    }
+
+    pub fn record(&self) -> &JobFamilyRecord {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> JobFamilyRecord {
+        self.0
+    }
+}
+
+impl TryFrom<JobFamilyRecord> for JobRecordFrame {
+    type Error = FrameBoundsError;
+
+    fn try_from(record: JobFamilyRecord) -> Result<Self, Self::Error> {
+        Self::new(record)
+    }
+}
+
 /// Fetch of one immutable placement-policy document from the holders the
 /// operation resolved. The adapter tries them in order and never routes; the
 /// operation verifies id, realm, and digest before it caches anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFetchEffect {
     pub realm_id: RealmId,
-    /// At most [`MAX_POLICY_FETCH_HOLDERS`], in preference order.
-    pub holders: Vec<NodeId>,
+    pub holders: HolderList<MAX_POLICY_FETCH_HOLDERS>,
     pub policy_ref: PlacementPolicyRef,
     pub deadline: Duration,
 }
@@ -293,28 +444,27 @@ pub enum JobRecordEffect {
         realm_id: RealmId,
         /// Family placement derived from the submission id, never from an alias.
         placement: PlacementRef,
-        /// At most [`MAX_JOB_RECORD_HOLDERS`], in preference order.
-        holders: Vec<NodeId>,
-        record: JobFamilyRecord,
+        holders: HolderList<MAX_JOB_RECORD_HOLDERS>,
+        record: JobRecordFrame,
         deadline: Duration,
     },
     Fetch {
         realm_id: RealmId,
         placement: PlacementRef,
-        holders: Vec<NodeId>,
+        holders: HolderList<MAX_JOB_RECORD_HOLDERS>,
         submission_id: SubmissionId,
         /// `None` reads every request family under this submission.
         request_digest: Option<[u8; 32]>,
         /// Opaque holder cursor returned by the previous page.
-        cursor: Option<Vec<u8>>,
-        /// Capped at [`MAX_JOB_RECORD_PAGE`] by the responder.
-        limit: usize,
+        cursor: Option<FetchCursor>,
+        limit: PageLimit,
+        deadline: Duration,
     },
 }
 
 /// One immutable record of a job family. Each variant is published by exactly
 /// one authorized author and is never rewritten under the same key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobFamilyRecord {
     Spec(Box<LogicalJobSpec>),
     Claim(SubmissionClaim),
@@ -436,4 +586,105 @@ pub enum DhtEffect {
 pub enum StreamEffect {
     Open { node_id: NodeId, alpn: Alpn },
     Close { stream_id: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::{PhysicalExecutionResult, PhysicalExecutionState};
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn update(message: usize) -> JobFamilyRecord {
+        JobFamilyRecord::Update(ExecutionUpdate {
+            execution_id: Ulid::from_bytes([7u8; 16]),
+            sequence: 1,
+            previous_digest: None,
+            state: PhysicalExecutionState::Running,
+            observed_at_ms: 1,
+            result: Some(PhysicalExecutionResult {
+                exit_code: None,
+                outputs: Vec::new(),
+                message: Some("m".repeat(message)),
+            }),
+        })
+    }
+
+    #[test]
+    fn rejects_wide_holders() {
+        let holders: Vec<NodeId> = (0..=MAX_JOB_RECORD_HOLDERS as u8).map(node).collect();
+        assert_eq!(
+            HolderList::<MAX_JOB_RECORD_HOLDERS>::new(holders),
+            Err(FrameBoundsError::HolderCount {
+                max: MAX_JOB_RECORD_HOLDERS
+            })
+        );
+        assert_eq!(
+            HolderList::<MAX_POLICY_FETCH_HOLDERS>::new(Vec::new()),
+            Err(FrameBoundsError::HolderCount {
+                max: MAX_POLICY_FETCH_HOLDERS
+            })
+        );
+        let holders = vec![node(1), node(2)];
+        assert_eq!(
+            HolderList::<MAX_POLICY_FETCH_HOLDERS>::new(holders.clone())
+                .expect("bounded holders")
+                .as_slice(),
+            holders.as_slice()
+        );
+    }
+
+    #[test]
+    fn rejects_long_cursor() {
+        let cursor = vec![9u8; MAX_JOB_RECORD_CURSOR_BYTES + 1];
+        assert_eq!(
+            FetchCursor::new(cursor.clone()),
+            Err(FrameBoundsError::CursorBytes)
+        );
+        let encoded = postcard::to_allocvec(&cursor).expect("cursor bytes encode");
+        assert!(postcard::from_bytes::<FetchCursor>(&encoded).is_err());
+    }
+
+    #[test]
+    fn cursor_round_trips() {
+        let cursor = FetchCursor::new(vec![3u8; 32]).expect("bounded cursor");
+        let encoded = postcard::to_allocvec(&cursor).expect("cursor encodes");
+        assert_eq!(postcard::from_bytes::<FetchCursor>(&encoded), Ok(cursor));
+    }
+
+    #[test]
+    fn clamps_page_limit() {
+        assert_eq!(PageLimit::new(usize::MAX).get(), MAX_JOB_RECORD_PAGE);
+        assert_eq!(PageLimit::new(0).get(), 1);
+        assert_eq!(PageLimit::new(8).get(), 8);
+        assert_eq!(PageLimit::default().get(), MAX_JOB_RECORD_PAGE);
+    }
+
+    #[test]
+    fn rejects_decoded_limit() {
+        // A requester clamps its own limit; a peer's frame is refused instead.
+        let over = postcard::to_allocvec(&(MAX_JOB_RECORD_PAGE + 1)).expect("limit encodes");
+        assert!(postcard::from_bytes::<PageLimit>(&over).is_err());
+        let zero = postcard::to_allocvec(&0usize).expect("limit encodes");
+        assert!(postcard::from_bytes::<PageLimit>(&zero).is_err());
+        let valid = postcard::to_allocvec(&MAX_JOB_RECORD_PAGE).expect("limit encodes");
+        assert_eq!(
+            postcard::from_bytes::<PageLimit>(&valid),
+            Ok(PageLimit::new(MAX_JOB_RECORD_PAGE))
+        );
+    }
+
+    #[test]
+    fn rejects_large_record() {
+        let record = update(MAX_JOB_RECORD_BYTES);
+        assert_eq!(
+            JobRecordFrame::new(record.clone()),
+            Err(FrameBoundsError::RecordBytes)
+        );
+        let encoded = postcard::to_allocvec(&record).expect("record encodes");
+        assert!(postcard::from_bytes::<JobRecordFrame>(&encoded).is_err());
+        assert!(JobRecordFrame::new(update(16)).is_ok());
+    }
 }
