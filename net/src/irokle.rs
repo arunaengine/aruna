@@ -4763,6 +4763,7 @@ fn realm_config_from_reducer_materialization(
         placement_map: Vec::new(),
         strategies: Vec::new(),
         default_strategy_id: None,
+        job_family_strategy_id: Ulid::nil(),
         strategy_bindings: Vec::new(),
         placement_overrides: Vec::new(),
         placement_bindings: Vec::new(),

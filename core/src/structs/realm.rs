@@ -163,6 +163,9 @@ pub struct RealmConfigDocument {
     pub placement_map: Vec<NodePlacementEntry>,
     pub strategies: Vec<PlacementStrategy>,
     pub default_strategy_id: Option<Ulid>,
+    /// Strategy every node derives submission-family placement from. It and its
+    /// shard count are immutable while v1 family records are retained.
+    pub job_family_strategy_id: Ulid,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
     /// Append-only bindings materialized by the reducer overlay. Divergent
@@ -460,6 +463,7 @@ impl RealmConfigDocument {
             revocation_floor: 0,
             strategies: Vec::new(),
             default_strategy_id: None,
+            job_family_strategy_id: Ulid::nil(),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
@@ -1016,6 +1020,7 @@ mod test {
             placement_map: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
+            job_family_strategy_id: Ulid::from_bytes([3u8; 16]),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
@@ -1042,6 +1047,39 @@ mod test {
         let config = RealmConfigDocument::new(RealmId([4u8; 32]), Vec::new(), 3);
         let mut changed = config.clone();
         changed.description = "changed".to_string();
+
+        assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
+        assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
+    }
+
+    #[test]
+    fn config_bytes_canonical() {
+        // Pins the canonical wire form. Postcard is positional, so the field
+        // occupies a fixed slot that a shorter encoding cannot satisfy.
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e550001030000000000001a30323038313034304732303831303430473230383130343047320000000000000000000000";
+        let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
+        config.job_family_strategy_id = Ulid::from_bytes([2u8; 16]);
+
+        let bytes = postcard::to_allocvec(&config).unwrap();
+        assert_eq!(hex::encode(&bytes), ENCODED);
+        assert_eq!(RealmConfigDocument::from_bytes(&bytes).unwrap(), config);
+
+        // Dropping the field's length-prefixed slot must fail to decode.
+        let text = config.job_family_strategy_id.to_string();
+        let start = bytes
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .expect("field is encoded as canonical ulid text");
+        let mut without = bytes.clone();
+        without.drain(start - 1..start + text.len());
+        assert!(RealmConfigDocument::from_bytes(&without).is_err());
+    }
+
+    #[test]
+    fn digest_binds_family() {
+        let config = RealmConfigDocument::new(RealmId([12u8; 32]), Vec::new(), 3);
+        let mut changed = config.clone();
+        changed.job_family_strategy_id = Ulid::from_bytes([1u8; 16]);
 
         assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
         assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
@@ -1425,6 +1463,7 @@ mod test {
             placement_map: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
+            job_family_strategy_id: Ulid::nil(),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
