@@ -1,7 +1,7 @@
 use crate::NodeId;
 use crate::structs::{DEFAULT_LOCATION, LabelMatch, MAX_NODE_LOCATION_LEN};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -21,9 +21,15 @@ pub const MAX_LABEL_KEY_LEN: usize = 128;
 pub const MAX_LABEL_VALUE_LEN: usize = 256;
 /// Maximum executor kind length, matching the short wire kinds nodes advertise.
 pub const MAX_EXECUTOR_KIND_LEN: usize = 32;
+/// Maximum labels one advertised subject carries, above any realistic node or
+/// worker label set.
+pub const MAX_SUBJECT_LABELS: usize = 32;
 /// Maximum policy refs on one governed version or registered copy. Refs
 /// intersect, so a longer set can only be more restrictive than this bound.
 pub const MAX_POLICY_REFS: usize = 8;
+/// Raw refs one canonical set may be built from. A union of two governed sets
+/// stays acceptable, while a larger input is rejected before it is allocated.
+pub const MAX_POLICY_REF_INPUT: usize = 2 * MAX_POLICY_REFS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PlacementPolicyError {
@@ -39,12 +45,20 @@ pub enum PlacementPolicyError {
     LabelCount,
     #[error("label key must be 1..={MAX_LABEL_KEY_LEN} bytes, value at most {MAX_LABEL_VALUE_LEN}")]
     InvalidLabel,
+    #[error("subject carries at most {MAX_SUBJECT_LABELS} labels")]
+    SubjectLabelCount,
+    #[error("label key {key} is present with more than one spelling")]
+    AmbiguousLabel { key: String },
     #[error("selector location must be 1..={MAX_NODE_LOCATION_LEN} bytes")]
     InvalidLocation,
     #[error("selector executor kind must be 1..={MAX_EXECUTOR_KIND_LEN} bytes")]
     InvalidExecutorKind,
+    #[error("policy document is not in canonical form")]
+    NotCanonical,
     #[error("a governed record carries at most {MAX_POLICY_REFS} policy refs")]
     RefCount,
+    #[error("one evaluation resolves at most {MAX_POLICY_REF_INPUT} policies")]
+    ResolutionCount,
     #[error("policy {policy_id} is referenced with two different digests")]
     ConflictingRefs { policy_id: Ulid },
 }
@@ -101,11 +115,18 @@ pub struct NormalizedSubject {
     executor_kind: Option<String>,
 }
 
+/// A validated policy in canonical form. Only this shape resolves a ref, so a
+/// malformed document can neither be matched against a subject nor mint an
+/// authoritative ref. It is deliberately not serializable: decoded bytes must
+/// pass [`VerifiedPolicy::verify`] again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedPolicy(PlacementPolicy);
+
 /// Local resolution state of one referenced policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyResolution {
     /// Canonical policy bytes this node has verified and cached.
-    Known(PlacementPolicy),
+    Known(VerifiedPolicy),
     /// Holders were consulted and could not supply the document.
     Unresolved,
 }
@@ -126,8 +147,18 @@ pub enum PlacementDecision {
     DigestMismatch {
         refs: Vec<PlacementPolicyRef>,
     },
+    /// A resolved document failed validation; a malformed policy is never
+    /// reinterpreted as a grant.
+    Invalid {
+        policy_ids: Vec<Ulid>,
+    },
     Denied {
         policy_ids: Vec<Ulid>,
+    },
+    /// The refs, resolutions, or subject exceed a declared bound or are
+    /// ambiguous, so nothing was evaluated at all.
+    InvalidInput {
+        reason: PlacementPolicyError,
     },
 }
 
@@ -201,26 +232,61 @@ impl PlacementPolicy {
         bytes
     }
 
-    pub fn digest(&self) -> [u8; 32] {
+    /// Private: an authoritative ref may only be minted from a document that
+    /// passed [`VerifiedPolicy::verify`].
+    fn digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(POLICY_DIGEST_DOMAIN);
         hasher.update(&self.canonical_bytes());
         *hasher.finalize().as_bytes()
     }
 
-    pub fn policy_ref(&self) -> PlacementPolicyRef {
-        PlacementPolicyRef {
-            policy_id: self.policy_id,
-            digest: self.digest(),
-        }
-    }
-
     /// A subject satisfies the policy when any selector matches; a policy
-    /// without selectors allows nothing.
-    pub fn allows(&self, subject: &NormalizedSubject) -> bool {
+    /// without selectors allows nothing. Private for the same reason as
+    /// [`PlacementPolicy::digest`].
+    fn allows(&self, subject: &NormalizedSubject) -> bool {
         self.allowed
             .iter()
             .any(|selector| selector.matches(subject))
+    }
+}
+
+impl VerifiedPolicy {
+    /// Accepts a decoded or locally authored document only when it is valid and
+    /// already canonical, so one ref resolves to exactly one encoding.
+    pub fn verify(policy: PlacementPolicy) -> Result<Self, PlacementPolicyError> {
+        let verified = Self(policy);
+        verified.revalidate()?;
+        Ok(verified)
+    }
+
+    /// Boundary re-check for a document that arrived from a cache or a peer;
+    /// construction alone never makes a document trusted.
+    pub fn revalidate(&self) -> Result<(), PlacementPolicyError> {
+        self.0.validate()?;
+        if self.0 != self.0.canonical() {
+            return Err(PlacementPolicyError::NotCanonical);
+        }
+        Ok(())
+    }
+
+    pub fn policy(&self) -> &PlacementPolicy {
+        &self.0
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        self.0.digest()
+    }
+
+    pub fn policy_ref(&self) -> PlacementPolicyRef {
+        PlacementPolicyRef {
+            policy_id: self.0.policy_id,
+            digest: self.0.digest(),
+        }
+    }
+
+    pub fn allows(&self, subject: &NormalizedSubject) -> bool {
+        self.0.allows(subject)
     }
 }
 
@@ -316,9 +382,13 @@ impl PlacementSelector {
 }
 
 impl PlacementPolicyRef {
-    /// Sorted, deduplicated ref set stored on a governed record. Two digests
-    /// for one policy id contradict policy immutability and fail closed.
+    /// Sorted, deduplicated ref set stored on a governed record. The raw input
+    /// is bounded before it is copied, and two digests for one policy id
+    /// contradict policy immutability and fail closed.
     pub fn canonical_set(refs: &[Self]) -> Result<Vec<Self>, PlacementPolicyError> {
+        if refs.len() > MAX_POLICY_REF_INPUT {
+            return Err(PlacementPolicyError::RefCount);
+        }
         let mut canonical = refs.to_vec();
         canonical.sort_unstable();
         canonical.dedup();
@@ -337,10 +407,44 @@ impl PlacementPolicyRef {
 }
 
 impl PlacementSubject {
+    /// Bounds every advertised attribute before it is evaluated or hashed. Two
+    /// label keys that trim to one key are ambiguous rather than merged.
+    pub fn validate(&self) -> Result<(), PlacementPolicyError> {
+        if self.location.trim().len() > MAX_NODE_LOCATION_LEN {
+            return Err(PlacementPolicyError::InvalidLocation);
+        }
+        if self.labels.len() > MAX_SUBJECT_LABELS {
+            return Err(PlacementPolicyError::SubjectLabelCount);
+        }
+        let mut keys = BTreeSet::new();
+        for (key, value) in &self.labels {
+            let key = key.trim();
+            if key.is_empty()
+                || key.len() > MAX_LABEL_KEY_LEN
+                || value.trim().len() > MAX_LABEL_VALUE_LEN
+            {
+                return Err(PlacementPolicyError::InvalidLabel);
+            }
+            if !keys.insert(key) {
+                return Err(PlacementPolicyError::AmbiguousLabel {
+                    key: key.to_string(),
+                });
+            }
+        }
+        if let Some(kind) = self.executor_kind.as_deref() {
+            let kind = kind.trim();
+            if kind.is_empty() || kind.len() > MAX_EXECUTOR_KIND_LEN {
+                return Err(PlacementPolicyError::InvalidExecutorKind);
+            }
+        }
+        Ok(())
+    }
+
     /// `local_to_controller` is a transport fact rather than a residency
     /// attribute, so it is deliberately absent from the matching view.
-    pub fn normalized(&self) -> NormalizedSubject {
-        NormalizedSubject {
+    pub fn normalized(&self) -> Result<NormalizedSubject, PlacementPolicyError> {
+        self.validate()?;
+        Ok(NormalizedSubject {
             node_id: self.node_id,
             location: trimmed(Some(self.location.as_str()))
                 .unwrap_or_else(|| DEFAULT_LOCATION.to_string()),
@@ -348,19 +452,20 @@ impl PlacementSubject {
                 .labels
                 .iter()
                 .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
-                .filter(|(key, _)| !key.is_empty())
                 .collect(),
             executor_kind: trimmed(self.executor_kind.as_deref()),
-        }
+        })
     }
 
-    /// Binds the generation to the matching attributes it describes, so a
-    /// receipt's sealed digest detects a subject that changed underneath it.
-    pub fn digest(&self) -> [u8; 32] {
-        let normalized = self.normalized();
+    /// Binds the generation and the execution-site model to the matching
+    /// attributes, so a receipt's sealed digest detects a subject that changed
+    /// underneath it.
+    pub fn digest(&self) -> Result<[u8; 32], PlacementPolicyError> {
+        let normalized = self.normalized()?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(SUBJECT_DIGEST_DOMAIN);
         hasher.update(&self.generation.to_le_bytes());
+        hasher.update(&[u8::from(self.local_to_controller)]);
         hasher.update(normalized.node_id.as_bytes());
         hasher.update(&(normalized.location.len() as u64).to_le_bytes());
         hasher.update(normalized.location.as_bytes());
@@ -381,28 +486,48 @@ impl PlacementSubject {
                 hasher.update(&[0]);
             }
         }
-        *hasher.finalize().as_bytes()
+        Ok(*hasher.finalize().as_bytes())
     }
 }
 
 /// Pure placement evaluation: every ref must allow the subject, and inside one
-/// policy any selector may match. An empty ref set is unrestricted data.
+/// policy any selector may match. An empty ref set is unrestricted data. Every
+/// input is bounded before allocation, and an unverifiable document blocks
+/// instead of granting.
 pub fn evaluate_placement(
     refs: &[PlacementPolicyRef],
     resolved: &BTreeMap<Ulid, PolicyResolution>,
     subject: &PlacementSubject,
 ) -> PlacementDecision {
-    let subject = subject.normalized();
+    if resolved.len() > MAX_POLICY_REF_INPUT {
+        return PlacementDecision::InvalidInput {
+            reason: PlacementPolicyError::ResolutionCount,
+        };
+    }
+    let refs = match PlacementPolicyRef::canonical_set(refs) {
+        Ok(refs) => refs,
+        Err(reason) => return PlacementDecision::InvalidInput { reason },
+    };
+    let subject = match subject.normalized() {
+        Ok(subject) => subject,
+        Err(reason) => return PlacementDecision::InvalidInput { reason },
+    };
+    // The canonical ref set is sorted, deduplicated, and free of conflicting
+    // policy ids, so every collection below is bounded and deterministic.
     let mut required = Vec::new();
     let mut unavailable = Vec::new();
     let mut mismatched = Vec::new();
+    let mut invalid = Vec::new();
     let mut denied = Vec::new();
-    for policy_ref in refs {
+    for policy_ref in &refs {
         match resolved.get(&policy_ref.policy_id) {
             None => required.push(*policy_ref),
             Some(PolicyResolution::Unresolved) => unavailable.push(policy_ref.policy_id),
             Some(PolicyResolution::Known(policy)) => {
-                if policy.policy_id != policy_ref.policy_id || policy.digest() != policy_ref.digest
+                if policy.revalidate().is_err() {
+                    invalid.push(policy_ref.policy_id);
+                } else if policy.policy().policy_id != policy_ref.policy_id
+                    || policy.digest() != policy_ref.digest
                 {
                     mismatched.push(*policy_ref);
                 } else if !policy.allows(&subject) {
@@ -414,39 +539,26 @@ pub fn evaluate_placement(
     // Every outcome below blocks the operation; the order only decides which
     // reason is reported, and an incomplete evaluation must not be sold as a
     // definitive denial.
-    if !mismatched.is_empty() {
-        return PlacementDecision::DigestMismatch {
-            refs: sorted_refs(mismatched),
+    if !invalid.is_empty() {
+        return PlacementDecision::Invalid {
+            policy_ids: invalid,
         };
+    }
+    if !mismatched.is_empty() {
+        return PlacementDecision::DigestMismatch { refs: mismatched };
     }
     if !unavailable.is_empty() {
         return PlacementDecision::Unavailable {
-            policy_ids: sorted_ids(unavailable),
+            policy_ids: unavailable,
         };
     }
     if !required.is_empty() {
-        return PlacementDecision::Required {
-            refs: sorted_refs(required),
-        };
+        return PlacementDecision::Required { refs: required };
     }
     if !denied.is_empty() {
-        return PlacementDecision::Denied {
-            policy_ids: sorted_ids(denied),
-        };
+        return PlacementDecision::Denied { policy_ids: denied };
     }
     PlacementDecision::Allowed
-}
-
-fn sorted_refs(mut refs: Vec<PlacementPolicyRef>) -> Vec<PlacementPolicyRef> {
-    refs.sort_unstable();
-    refs.dedup();
-    refs
-}
-
-fn sorted_ids(mut ids: Vec<Ulid>) -> Vec<Ulid> {
-    ids.sort_unstable();
-    ids.dedup();
-    ids
 }
 
 fn trimmed(value: Option<&str>) -> Option<String> {
@@ -535,7 +647,36 @@ mod tests {
     fn resolved(policies: &[&PlacementPolicy]) -> BTreeMap<Ulid, PolicyResolution> {
         policies
             .iter()
-            .map(|policy| (policy.policy_id, PolicyResolution::Known((*policy).clone())))
+            .map(|policy| {
+                let verified = VerifiedPolicy::verify((*policy).clone()).expect("valid policy");
+                (policy.policy_id, PolicyResolution::Known(verified))
+            })
+            .collect()
+    }
+
+    /// A cache entry that never passed verification, as a corrupt store or a
+    /// hostile holder could supply.
+    fn forged(policy: &PlacementPolicy) -> BTreeMap<Ulid, PolicyResolution> {
+        BTreeMap::from([(
+            policy.policy_id,
+            PolicyResolution::Known(VerifiedPolicy(policy.clone())),
+        )])
+    }
+
+    /// The ref a document mints from its own bytes, valid or not.
+    fn self_ref(policy: &PlacementPolicy) -> PlacementPolicyRef {
+        PlacementPolicyRef {
+            policy_id: policy.policy_id,
+            digest: policy.digest(),
+        }
+    }
+
+    fn distinct_refs(count: usize) -> Vec<PlacementPolicyRef> {
+        (0..count)
+            .map(|index| PlacementPolicyRef {
+                policy_id: Ulid::generate(),
+                digest: [index as u8; 32],
+            })
             .collect()
     }
 
@@ -558,11 +699,11 @@ mod tests {
             ..selector()
         }]);
         assert_eq!(
-            evaluate_placement(&[allowed.policy_ref()], &resolved(&[&allowed]), &subject()),
+            evaluate_placement(&[self_ref(&allowed)], &resolved(&[&allowed]), &subject()),
             PlacementDecision::Allowed
         );
         assert_eq!(
-            evaluate_placement(&[other.policy_ref()], &resolved(&[&other]), &subject()),
+            evaluate_placement(&[self_ref(&other)], &resolved(&[&other]), &subject()),
             PlacementDecision::Denied {
                 policy_ids: vec![other.policy_id]
             }
@@ -583,17 +724,17 @@ mod tests {
         let mut unset = subject();
         unset.location = "  ".to_string();
         assert_eq!(
-            evaluate_placement(&[west.policy_ref()], &resolved(&[&west]), &subject()),
+            evaluate_placement(&[self_ref(&west)], &resolved(&[&west]), &subject()),
             PlacementDecision::Allowed
         );
         assert_eq!(
-            evaluate_placement(&[west.policy_ref()], &resolved(&[&west]), &unset),
+            evaluate_placement(&[self_ref(&west)], &resolved(&[&west]), &unset),
             PlacementDecision::Denied {
                 policy_ids: vec![west.policy_id]
             }
         );
         assert_eq!(
-            evaluate_placement(&[default.policy_ref()], &resolved(&[&default]), &unset),
+            evaluate_placement(&[self_ref(&default)], &resolved(&[&default]), &unset),
             PlacementDecision::Allowed
         );
     }
@@ -601,19 +742,19 @@ mod tests {
     #[test]
     fn labels_and_together() {
         let both = policy(vec![PlacementSelector {
-            labels: vec![label("zone", "a"), label("tier", "gold")],
+            labels: vec![label("tier", "gold"), label("zone", "a")],
             ..selector()
         }]);
         let missing = policy(vec![PlacementSelector {
-            labels: vec![label("zone", "a"), label("tier", "platinum")],
+            labels: vec![label("tier", "platinum"), label("zone", "a")],
             ..selector()
         }]);
         assert_eq!(
-            evaluate_placement(&[both.policy_ref()], &resolved(&[&both]), &subject()),
+            evaluate_placement(&[self_ref(&both)], &resolved(&[&both]), &subject()),
             PlacementDecision::Allowed
         );
         assert_eq!(
-            evaluate_placement(&[missing.policy_ref()], &resolved(&[&missing]), &subject()),
+            evaluate_placement(&[self_ref(&missing)], &resolved(&[&missing]), &subject()),
             PlacementDecision::Denied {
                 policy_ids: vec![missing.policy_id]
             }
@@ -630,11 +771,11 @@ mod tests {
         let mut unknown = subject();
         unknown.executor_kind = None;
         assert_eq!(
-            evaluate_placement(&[docker.policy_ref()], &resolved(&[&docker]), &subject()),
+            evaluate_placement(&[self_ref(&docker)], &resolved(&[&docker]), &subject()),
             PlacementDecision::Allowed
         );
         assert_eq!(
-            evaluate_placement(&[docker.policy_ref()], &resolved(&[&docker]), &unknown),
+            evaluate_placement(&[self_ref(&docker)], &resolved(&[&docker]), &unknown),
             PlacementDecision::Denied {
                 policy_ids: vec![docker.policy_id]
             }
@@ -652,20 +793,30 @@ mod tests {
             node_id: Some(node(9)),
             ..selector()
         };
-        let forward = policy(vec![first.clone(), second.clone()]);
-        let mut reverse = forward.clone();
-        reverse.allowed = vec![
-            second,
-            PlacementSelector {
-                labels: vec![label("zone", "a"), label("tier", "gold")],
-                ..first
-            },
-        ];
+        let policy_id = Ulid::generate();
+        let forward = PlacementPolicy::new(
+            policy_id,
+            "eu-only".to_string(),
+            vec![first.clone(), second.clone()],
+        )
+        .expect("valid policy");
+        let reverse = PlacementPolicy::new(
+            policy_id,
+            "eu-only".to_string(),
+            vec![
+                second,
+                PlacementSelector {
+                    labels: vec![label("zone", "a"), label("tier", "gold")],
+                    ..first
+                },
+            ],
+        )
+        .expect("valid policy");
         assert_eq!(forward.digest(), reverse.digest());
         assert_eq!(forward.canonical_bytes(), reverse.canonical_bytes());
         assert_eq!(
-            evaluate_placement(&[forward.policy_ref()], &resolved(&[&forward]), &subject()),
-            evaluate_placement(&[reverse.policy_ref()], &resolved(&[&reverse]), &subject())
+            evaluate_placement(&[self_ref(&forward)], &resolved(&[&forward]), &subject()),
+            evaluate_placement(&[self_ref(&reverse)], &resolved(&[&reverse]), &subject())
         );
     }
 
@@ -680,10 +831,8 @@ mod tests {
             ..selector()
         }]);
         let store = resolved(&[&west, &gold]);
-        let forward =
-            evaluate_placement(&[west.policy_ref(), gold.policy_ref()], &store, &subject());
-        let reverse =
-            evaluate_placement(&[gold.policy_ref(), west.policy_ref()], &store, &subject());
+        let forward = evaluate_placement(&[self_ref(&west), self_ref(&gold)], &store, &subject());
+        let reverse = evaluate_placement(&[self_ref(&gold), self_ref(&west)], &store, &subject());
         assert_eq!(forward, PlacementDecision::Allowed);
         assert_eq!(forward, reverse);
     }
@@ -700,7 +849,7 @@ mod tests {
         }]);
         let store = resolved(&[&west, &east]);
         assert_eq!(
-            evaluate_placement(&[east.policy_ref(), west.policy_ref()], &store, &subject()),
+            evaluate_placement(&[self_ref(&east), self_ref(&west)], &store, &subject()),
             PlacementDecision::Denied {
                 policy_ids: vec![east.policy_id]
             }
@@ -714,9 +863,9 @@ mod tests {
             ..selector()
         }]);
         assert_eq!(
-            evaluate_placement(&[west.policy_ref()], &BTreeMap::new(), &subject()),
+            evaluate_placement(&[self_ref(&west)], &BTreeMap::new(), &subject()),
             PlacementDecision::Required {
-                refs: vec![west.policy_ref()]
+                refs: vec![self_ref(&west)]
             }
         );
     }
@@ -729,7 +878,7 @@ mod tests {
         }]);
         let store = BTreeMap::from([(west.policy_id, PolicyResolution::Unresolved)]);
         assert_eq!(
-            evaluate_placement(&[west.policy_ref()], &store, &subject()),
+            evaluate_placement(&[self_ref(&west)], &store, &subject()),
             PlacementDecision::Unavailable {
                 policy_ids: vec![west.policy_id]
             }
@@ -755,13 +904,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_selector_denies() {
+    fn empty_selector_blocks() {
         // A constraint-free selector would otherwise allow every subject.
         let open = policy(vec![selector()]);
         assert_eq!(open.validate(), Err(PlacementPolicyError::EmptySelector));
         assert_eq!(
-            evaluate_placement(&[open.policy_ref()], &resolved(&[&open]), &subject()),
-            PlacementDecision::Denied {
+            VerifiedPolicy::verify(open.clone()),
+            Err(PlacementPolicyError::EmptySelector)
+        );
+        assert_eq!(
+            evaluate_placement(&[self_ref(&open)], &forged(&open), &subject()),
+            PlacementDecision::Invalid {
                 policy_ids: vec![open.policy_id]
             }
         );
@@ -769,7 +922,7 @@ mod tests {
             allowed: Vec::new(),
             ..open
         };
-        assert!(!none.allows(&subject().normalized()));
+        assert!(!none.allows(&subject().normalized().expect("valid subject")));
     }
 
     #[test]
@@ -839,7 +992,9 @@ mod tests {
             Err(PlacementPolicyError::InvalidLabel)
         );
 
-        assert!(PlacementPolicy::new(Ulid::generate(), "ok".to_string(), vec![valid]).is_ok());
+        let authored = PlacementPolicy::new(Ulid::generate(), " ok ".to_string(), vec![valid])
+            .expect("valid policy");
+        assert!(VerifiedPolicy::verify(authored).is_ok());
     }
 
     #[test]
@@ -911,7 +1066,28 @@ mod tests {
         };
         assert_ne!(base.digest(), advanced.digest());
         assert_ne!(base.digest(), moved.digest());
-        assert_eq!(base.normalized(), advanced.normalized());
+        assert_eq!(
+            base.normalized().expect("valid subject"),
+            advanced.normalized().expect("valid subject")
+        );
+    }
+
+    #[test]
+    fn digest_binds_locality() {
+        // A receipt must prove which execution-site model was accepted.
+        let local = subject();
+        let remote = PlacementSubject {
+            local_to_controller: false,
+            ..local.clone()
+        };
+        assert_ne!(
+            local.digest().expect("valid subject"),
+            remote.digest().expect("valid subject")
+        );
+        assert_eq!(
+            local.normalized().expect("valid subject"),
+            remote.normalized().expect("valid subject")
+        );
     }
 
     #[test]
@@ -933,16 +1109,16 @@ mod tests {
             PlacementPolicyRef::canonical_set(&[first, first]),
             Ok(vec![first])
         );
-        let oversize = (0..=MAX_POLICY_REFS)
-            .map(|index| PlacementPolicyRef {
-                policy_id: Ulid::generate(),
-                digest: [index as u8; 32],
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            PlacementPolicyRef::canonical_set(&oversize),
+            PlacementPolicyRef::canonical_set(&distinct_refs(MAX_POLICY_REFS + 1)),
             Err(PlacementPolicyError::RefCount)
         );
+        // The raw input is bounded before it is copied and deduplicated.
+        assert_eq!(
+            PlacementPolicyRef::canonical_set(&distinct_refs(MAX_POLICY_REF_INPUT + 1)),
+            Err(PlacementPolicyError::RefCount)
+        );
+        assert!(PlacementPolicyRef::canonical_set(&distinct_refs(MAX_POLICY_REFS)).is_ok());
     }
 
     #[test]
@@ -957,5 +1133,233 @@ mod tests {
         let decoded: PlacementPolicy = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, policy);
         assert_eq!(decoded.digest(), policy.digest());
+        assert!(VerifiedPolicy::verify(decoded).is_ok());
+    }
+
+    #[test]
+    fn invalid_known_blocks() {
+        // A self-consistent digest must never turn a malformed document into a
+        // grant, whichever holder cached it.
+        let valid = PlacementSelector {
+            location: Some("eu-west".to_string()),
+            ..selector()
+        };
+        let base = policy(vec![valid.clone()]);
+        let documents = vec![
+            PlacementPolicy {
+                policy_id: Ulid::nil(),
+                ..base.clone()
+            },
+            PlacementPolicy {
+                name: "n".repeat(MAX_POLICY_NAME_LEN + 1),
+                ..base.clone()
+            },
+            PlacementPolicy {
+                allowed: vec![valid.clone(); MAX_POLICY_SELECTORS + 1],
+                ..base.clone()
+            },
+            PlacementPolicy {
+                allowed: vec![PlacementSelector {
+                    labels: vec![label("zone", "a"); MAX_SELECTOR_LABELS + 1],
+                    ..valid.clone()
+                }],
+                ..base.clone()
+            },
+            PlacementPolicy {
+                allowed: vec![PlacementSelector {
+                    location: Some("l".repeat(MAX_NODE_LOCATION_LEN + 1)),
+                    ..selector()
+                }],
+                ..base.clone()
+            },
+            PlacementPolicy {
+                allowed: vec![PlacementSelector {
+                    executor_kind: Some("k".repeat(MAX_EXECUTOR_KIND_LEN + 1)),
+                    ..valid
+                }],
+                ..base.clone()
+            },
+            PlacementPolicy {
+                allowed: Vec::new(),
+                ..base
+            },
+        ];
+        for document in documents {
+            assert!(VerifiedPolicy::verify(document.clone()).is_err());
+            assert_eq!(
+                evaluate_placement(&[self_ref(&document)], &forged(&document), &subject()),
+                PlacementDecision::Invalid {
+                    policy_ids: vec![document.policy_id]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn noncanonical_document_rejected() {
+        // Untrimmed bytes hash to the canonical digest, so only the exact
+        // canonical encoding may resolve a ref.
+        let west = policy(vec![PlacementSelector {
+            location: Some("eu-west".to_string()),
+            ..selector()
+        }]);
+        let untrimmed = PlacementPolicy {
+            name: " eu-only ".to_string(),
+            ..west.clone()
+        };
+        assert_eq!(self_ref(&untrimmed), self_ref(&west));
+        assert_eq!(untrimmed.validate(), Ok(()));
+        assert_eq!(
+            VerifiedPolicy::verify(untrimmed.clone()),
+            Err(PlacementPolicyError::NotCanonical)
+        );
+        assert_eq!(
+            evaluate_placement(&[self_ref(&untrimmed)], &forged(&untrimmed), &subject()),
+            PlacementDecision::Invalid {
+                policy_ids: vec![untrimmed.policy_id]
+            }
+        );
+        assert_eq!(
+            evaluate_placement(&[self_ref(&west)], &resolved(&[&west]), &subject()),
+            PlacementDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn oversized_refs_rejected() {
+        let west = policy(vec![PlacementSelector {
+            location: Some("eu-west".to_string()),
+            ..selector()
+        }]);
+        let store = resolved(&[&west]);
+        assert_eq!(
+            evaluate_placement(&distinct_refs(MAX_POLICY_REFS + 1), &store, &subject()),
+            PlacementDecision::InvalidInput {
+                reason: PlacementPolicyError::RefCount
+            }
+        );
+        assert_eq!(
+            evaluate_placement(&distinct_refs(MAX_POLICY_REF_INPUT + 1), &store, &subject()),
+            PlacementDecision::InvalidInput {
+                reason: PlacementPolicyError::RefCount
+            }
+        );
+        let conflicting = [
+            self_ref(&west),
+            PlacementPolicyRef {
+                policy_id: west.policy_id,
+                digest: [9; 32],
+            },
+        ];
+        assert_eq!(
+            evaluate_placement(&conflicting, &store, &subject()),
+            PlacementDecision::InvalidInput {
+                reason: PlacementPolicyError::ConflictingRefs {
+                    policy_id: west.policy_id
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_resolution_rejected() {
+        // An empty ref set must not shortcut a malformed resolution map.
+        let store = (0..=MAX_POLICY_REF_INPUT)
+            .map(|_| (Ulid::generate(), PolicyResolution::Unresolved))
+            .collect();
+        assert_eq!(
+            evaluate_placement(&[], &store, &subject()),
+            PlacementDecision::InvalidInput {
+                reason: PlacementPolicyError::ResolutionCount
+            }
+        );
+    }
+
+    #[test]
+    fn subject_bounds_rejected() {
+        let cases = vec![
+            (
+                PlacementSubject {
+                    location: "l".repeat(MAX_NODE_LOCATION_LEN + 1),
+                    ..subject()
+                },
+                PlacementPolicyError::InvalidLocation,
+            ),
+            (
+                PlacementSubject {
+                    labels: (0..=MAX_SUBJECT_LABELS)
+                        .map(|index| (format!("key{index}"), "a".to_string()))
+                        .collect(),
+                    ..subject()
+                },
+                PlacementPolicyError::SubjectLabelCount,
+            ),
+            (
+                PlacementSubject {
+                    labels: BTreeMap::from([("k".repeat(MAX_LABEL_KEY_LEN + 1), "a".to_string())]),
+                    ..subject()
+                },
+                PlacementPolicyError::InvalidLabel,
+            ),
+            (
+                PlacementSubject {
+                    labels: BTreeMap::from([(
+                        "zone".to_string(),
+                        "v".repeat(MAX_LABEL_VALUE_LEN + 1),
+                    )]),
+                    ..subject()
+                },
+                PlacementPolicyError::InvalidLabel,
+            ),
+            (
+                PlacementSubject {
+                    labels: BTreeMap::from([(" ".to_string(), "a".to_string())]),
+                    ..subject()
+                },
+                PlacementPolicyError::InvalidLabel,
+            ),
+            (
+                PlacementSubject {
+                    executor_kind: Some("k".repeat(MAX_EXECUTOR_KIND_LEN + 1)),
+                    ..subject()
+                },
+                PlacementPolicyError::InvalidExecutorKind,
+            ),
+            (
+                PlacementSubject {
+                    executor_kind: Some("  ".to_string()),
+                    ..subject()
+                },
+                PlacementPolicyError::InvalidExecutorKind,
+            ),
+        ];
+        for (subject, reason) in cases {
+            assert_eq!(subject.validate(), Err(reason.clone()));
+            assert_eq!(subject.digest(), Err(reason.clone()));
+            assert_eq!(
+                evaluate_placement(&[], &BTreeMap::new(), &subject),
+                PlacementDecision::InvalidInput { reason }
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_labels_rejected() {
+        // Two spellings of one key must not silently collapse into one label.
+        let ambiguous = PlacementSubject {
+            labels: BTreeMap::from([
+                ("zone".to_string(), "a".to_string()),
+                (" zone ".to_string(), "b".to_string()),
+            ]),
+            ..subject()
+        };
+        let reason = PlacementPolicyError::AmbiguousLabel {
+            key: "zone".to_string(),
+        };
+        assert_eq!(ambiguous.validate(), Err(reason.clone()));
+        assert_eq!(
+            evaluate_placement(&[], &BTreeMap::new(), &ambiguous),
+            PlacementDecision::InvalidInput { reason }
+        );
     }
 }
