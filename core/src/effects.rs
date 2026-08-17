@@ -10,10 +10,9 @@ use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{
-    BackendLocation, ExecutionReceipt, ExecutionUpdate, GroupStorageBackend,
-    GroupStorageBackendSecret, HiddenBlobKey, JobCancelRecord, LaunchIntent, LogicalJobSpec,
-    PlacementPolicyRef, PlacementRef, RealmId, ResolvedBackend, ResolvedSourceAccess,
-    SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+    BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey,
+    JobRecordEnvelope, PlacementPolicyRef, PlacementRef, RealmId, ResolvedBackend,
+    ResolvedSourceAccess, SubmissionId,
 };
 use crate::task::TaskEffect;
 use crate::types::UserId;
@@ -394,34 +393,35 @@ impl TryFrom<usize> for PageLimit {
     }
 }
 
-/// One job-family record bounded by its encoded size, so neither a publisher nor
-/// a fetched page can carry a record whose strings or vectors are unbounded.
+/// One authenticated job-family record bounded by its encoded size, so neither a
+/// publisher nor a fetched page can carry an unbounded record. The envelope is
+/// carried verbatim: bounding a frame never rewrites what its publisher signed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "JobFamilyRecord")]
-pub struct JobRecordFrame(JobFamilyRecord);
+#[serde(try_from = "JobRecordEnvelope")]
+pub struct JobRecordFrame(JobRecordEnvelope);
 
 impl JobRecordFrame {
-    pub fn new(record: JobFamilyRecord) -> Result<Self, FrameBoundsError> {
-        if encoded_len(&record)? > MAX_JOB_RECORD_BYTES {
+    pub fn new(envelope: JobRecordEnvelope) -> Result<Self, FrameBoundsError> {
+        if encoded_len(&envelope)? > MAX_JOB_RECORD_BYTES {
             return Err(FrameBoundsError::RecordBytes);
         }
-        Ok(Self(record))
+        Ok(Self(envelope))
     }
 
-    pub fn record(&self) -> &JobFamilyRecord {
+    pub fn envelope(&self) -> &JobRecordEnvelope {
         &self.0
     }
 
-    pub fn into_inner(self) -> JobFamilyRecord {
+    pub fn into_inner(self) -> JobRecordEnvelope {
         self.0
     }
 }
 
-impl TryFrom<JobFamilyRecord> for JobRecordFrame {
+impl TryFrom<JobRecordEnvelope> for JobRecordFrame {
     type Error = FrameBoundsError;
 
-    fn try_from(record: JobFamilyRecord) -> Result<Self, Self::Error> {
-        Self::new(record)
+    fn try_from(envelope: JobRecordEnvelope) -> Result<Self, Self::Error> {
+        Self::new(envelope)
     }
 }
 
@@ -445,7 +445,7 @@ pub enum JobRecordEffect {
         /// Family placement derived from the submission id, never from an alias.
         placement: PlacementRef,
         holders: HolderList<MAX_JOB_RECORD_HOLDERS>,
-        record: JobRecordFrame,
+        record: Box<JobRecordFrame>,
         deadline: Duration,
     },
     Fetch {
@@ -462,26 +462,13 @@ pub enum JobRecordEffect {
     },
 }
 
-/// One immutable record of a job family. Each variant is published by exactly
-/// one authorized author and is never rewritten under the same key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobFamilyRecord {
-    Spec(Box<LogicalJobSpec>),
-    Claim(SubmissionClaim),
-    Budget(WitnessBudgetRecord),
-    Launch(Box<LaunchIntent>),
-    Receipt(Box<ExecutionReceipt>),
-    Update(ExecutionUpdate),
-    Cancel(JobCancelRecord),
-}
-
 /// One scheduler's launch offer to an execution target. It carries no caller
-/// token: the target fetches and verifies the sealed spec itself.
+/// token: the target verifies the signed launch and fetches the sealed spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchOfferEffect {
     pub realm_id: RealmId,
     pub target: ExecutionTargetId,
-    pub launch: LaunchIntent,
+    pub launch: Box<JobRecordEnvelope>,
     pub deadline: Duration,
 }
 
@@ -588,28 +575,47 @@ pub enum StreamEffect {
     Close { stream_id: u64 },
 }
 
+/// Test fixture shared with the event frames: one signed output record whose
+/// encoded size grows with the output count and key width.
+#[cfg(test)]
+pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvelope {
+    use crate::structs::{
+        ExecutionOutputRecord, JobFamilyRecord, JobId, OutputObject, OutputSet, SubmissionId,
+    };
+
+    let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
+    let execution_id = Ulid::from_bytes([7u8; 16]);
+    let outputs = (0..objects)
+        .map(|index| OutputObject {
+            bucket: "bucket".to_string(),
+            key: format!("{index:08}-{}", "k".repeat(key_bytes)),
+            version_id: Ulid::from_bytes([9u8; 16]),
+            execution_id,
+            container_path: "/out".to_string(),
+            size: 1,
+            digest: None,
+        })
+        .collect();
+    let record = JobFamilyRecord::Output(Box::new(ExecutionOutputRecord {
+        execution_id,
+        submission_id: SubmissionId([1u8; 32]),
+        request_digest: [2u8; 32],
+        job_id: JobId::from_bytes([5u8; 16]),
+        executor_node_id: secret.public(),
+        spec_digest: [3u8; 32],
+        receipt_digest: [4u8; 32],
+        outputs: OutputSet::canonical(outputs).expect("canonical outputs"),
+        committed_at_ms: 1,
+    }));
+    JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::{PhysicalExecutionResult, PhysicalExecutionState};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn update(message: usize) -> JobFamilyRecord {
-        JobFamilyRecord::Update(ExecutionUpdate {
-            execution_id: Ulid::from_bytes([7u8; 16]),
-            sequence: 1,
-            previous_digest: None,
-            state: PhysicalExecutionState::Running,
-            observed_at_ms: 1,
-            result: Some(PhysicalExecutionResult {
-                exit_code: None,
-                outputs: Vec::new(),
-                message: Some("m".repeat(message)),
-            }),
-        })
     }
 
     #[test]
@@ -678,13 +684,24 @@ mod tests {
 
     #[test]
     fn rejects_large_record() {
-        let record = update(MAX_JOB_RECORD_BYTES);
+        let envelope = sized_envelope(1024, 1200);
         assert_eq!(
-            JobRecordFrame::new(record.clone()),
+            JobRecordFrame::new(envelope.clone()),
             Err(FrameBoundsError::RecordBytes)
         );
-        let encoded = postcard::to_allocvec(&record).expect("record encodes");
+        let encoded = postcard::to_allocvec(&envelope).expect("record encodes");
         assert!(postcard::from_bytes::<JobRecordFrame>(&encoded).is_err());
-        assert!(JobRecordFrame::new(update(16)).is_ok());
+        assert!(JobRecordFrame::new(sized_envelope(2, 8)).is_ok());
+    }
+
+    #[test]
+    fn frame_keeps_publisher() {
+        // A frame is a size bound, never a rewrite of what the publisher signed.
+        let envelope = sized_envelope(2, 8);
+        let frame = JobRecordFrame::new(envelope.clone()).expect("bounded record");
+        let bytes = postcard::to_allocvec(&frame).expect("frame encodes");
+        let relayed: JobRecordFrame = postcard::from_bytes(&bytes).expect("frame decodes");
+        assert_eq!(relayed.envelope(), &envelope);
+        assert!(relayed.envelope().verify_signature().is_ok());
     }
 }

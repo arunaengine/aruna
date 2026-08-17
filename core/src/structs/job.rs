@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -227,7 +227,10 @@ fn validate_input_version(input: &InputSelection) -> Result<(), CompositionError
         InputMode::FloatingReference if version_id.is_some() => {
             Err(CompositionError::PinnedVersion(input.dest_key.clone()))
         }
-        _ => Ok(()),
+        InputMode::Snapshot
+        | InputMode::Mount
+        | InputMode::FloatingReference
+        | InputMode::ExactReference => Ok(()),
     }
 }
 
@@ -786,9 +789,14 @@ pub struct AttemptIntent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptControl {
     pub attempt_epoch: u64,
+    /// Physical execution this fenced attempt is, minted with the control row and
+    /// never reused by another attempt.
+    pub execution_id: Ulid,
     pub controller_generation: u64,
     pub bound_token: Option<Ulid>,
     pub tombstone_ref: Option<String>,
+    /// Write-ahead output commit identities of this physical execution.
+    pub output_commits: Vec<OutputCommitIntent>,
 }
 
 impl AttemptControl {
@@ -799,6 +807,41 @@ impl AttemptControl {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+
+    /// Reserve one VersionId per destination this execution has not committed
+    /// yet, keeping every existing reservation so a replayed capture reuses it
+    /// instead of creating a second version. Reports whether anything was added.
+    pub fn reserve_outputs<F>(&mut self, destinations: &[(String, String)], mut mint: F) -> bool
+    where
+        F: FnMut() -> Ulid,
+    {
+        let mut reserved: BTreeSet<(String, String)> = self
+            .output_commits
+            .iter()
+            .map(|commit| (commit.bucket.clone(), commit.key.clone()))
+            .collect();
+        let mut changed = false;
+        for (bucket, key) in destinations {
+            if reserved.insert((bucket.clone(), key.clone())) {
+                self.output_commits.push(OutputCommitIntent {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: mint(),
+                });
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// Write-ahead identity of one output commit, persisted before the write so a
+/// replayed capture reuses this VersionId instead of creating a second version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputCommitIntent {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Ulid,
 }
 
 pub fn attempt_control_key(job_id: JobId, attempt_epoch: u64) -> Vec<u8> {
@@ -903,6 +946,28 @@ impl JobResultPayload {
         }
     }
 
+    /// Terminal success requires every captured output to name the exact version
+    /// it created and the physical execution that produced it, so a duplicate
+    /// execution stays attributable and a replay stays idempotent.
+    pub fn check_outputs(&self, execution_id: Ulid) -> Result<(), JobRecordError> {
+        let JobResultPayload::Execution { outputs, .. } = self else {
+            return Ok(());
+        };
+        if execution_id.is_nil() {
+            return Err(JobRecordError::OutputIdentity);
+        }
+        let mut seen = BTreeSet::new();
+        for output in outputs {
+            if output.version_id.is_nil() || output.execution_id != execution_id {
+                return Err(JobRecordError::OutputIdentity);
+            }
+            if !seen.insert((&output.bucket, &output.key, output.version_id)) {
+                return Err(JobRecordError::OutputIdentity);
+            }
+        }
+        Ok(())
+    }
+
     /// Payload-specific public projection returned by the REST surface.
     pub fn to_public_json(&self) -> serde_json::Value {
         match self {
@@ -925,6 +990,8 @@ impl JobResultPayload {
                     .map(|output| serde_json::json!({
                         "bucket": output.bucket,
                         "key": output.key,
+                        "version_id": output.version_id.to_string(),
+                        "execution_id": output.execution_id.to_string(),
                         "container_path": output.container_path,
                         "size": output.size,
                         "digest": output.digest,
@@ -1522,6 +1589,27 @@ impl SubmissionId {
     }
 }
 
+/// Domain tags of the canonical record encodings. Each tag is distinct and no
+/// tag is a prefix of another, so `tag || postcard(body)` is unambiguous.
+pub const JOB_SPEC_DOMAIN: &[u8] = b"aruna-job-spec-v1";
+pub const JOB_CLAIM_DOMAIN: &[u8] = b"aruna-job-claim-v1";
+pub const JOB_BUDGET_DOMAIN: &[u8] = b"aruna-job-budget-v1";
+pub const JOB_LAUNCH_DOMAIN: &[u8] = b"aruna-job-launch-v1";
+pub const JOB_RECEIPT_DOMAIN: &[u8] = b"aruna-job-receipt-v1";
+pub const JOB_UPDATE_DOMAIN: &[u8] = b"aruna-job-update-v1";
+pub const JOB_OUTPUT_DOMAIN: &[u8] = b"aruna-job-output-v1";
+pub const JOB_CANCEL_DOMAIN: &[u8] = b"aruna-job-cancel-v1";
+pub const JOB_ENVELOPE_DOMAIN: &[u8] = b"aruna-job-envelope-v1";
+
+/// Objects one execution may publish in its immutable output record.
+pub const MAX_EXECUTION_OUTPUTS: usize = 1024;
+
+/// Bytes of the free-text diagnostic on a terminal execution update.
+pub const MAX_RESULT_MESSAGE_BYTES: usize = 4096;
+
+/// Encoded width of a [`JobRecordKey`]: family, kind, subject, sequence.
+pub const JOB_RECORD_KEY_BYTES: usize = 105;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum JobContractError {
     #[error("retry policy must allow at least one launch")]
@@ -1532,6 +1620,46 @@ pub enum JobContractError {
     BudgetExhausted { sequence: u32, max_launches: u32 },
     #[error("launch spec digest does not match the sealed source spec digest")]
     SpecMismatch,
+}
+
+/// Why a replicated job record is not authentic. An unverifiable record is never
+/// appended, projected, or relayed as authentic.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum JobRecordError {
+    #[error(transparent)]
+    Encoding(#[from] postcard::Error),
+    #[error(transparent)]
+    Contract(#[from] JobContractError),
+    #[error("publisher signature does not verify for the claimed publisher")]
+    BadSignature,
+    #[error("record realm does not match the ingesting holder's realm")]
+    RealmMismatch,
+    #[error("record does not belong to the job family being ingested")]
+    FamilyMismatch,
+    #[error("spec placement is not the family placement derived from the submission")]
+    PlacementMismatch,
+    #[error("a {0:?} record may only be published by its one permitted author")]
+    WrongPublisher(JobRecordKind),
+    #[error("record digest does not reproduce from its own canonical bytes")]
+    DigestMismatch,
+    #[error("a verified {0:?} record is required to authorize this record")]
+    MissingEvidence(JobRecordKind),
+    #[error("record contradicts the verified {0:?} record it refers to")]
+    EvidenceMismatch(JobRecordKind),
+    #[error("record's own embedded fields contradict each other")]
+    Inconsistent,
+    #[error("caller is not authorized against the sealed job spec")]
+    Unauthorized,
+    #[error("job record key must be {JOB_RECORD_KEY_BYTES} bytes naming a known kind")]
+    MalformedKey,
+    #[error("outputs must be at most {MAX_EXECUTION_OUTPUTS} canonically ordered exact objects")]
+    OutputOrder,
+    #[error("every output must name its exact version and its producing execution once")]
+    OutputIdentity,
+    #[error("result message must be at most {MAX_RESULT_MESSAGE_BYTES} bytes")]
+    MessageBytes,
+    #[error("two different updates claim sequence {sequence}")]
+    ChainConflict { sequence: u64 },
 }
 
 /// Per-witness launch bound sealed into the immutable spec.
@@ -1576,7 +1704,8 @@ pub struct JobAdmissionRecord {
 }
 
 /// The immutable spec of one accepted claim. `request_digest` covers the
-/// normalized caller plan only; `spec_digest` covers this whole record.
+/// normalized caller plan; `spec_digest` is this record's own digest, the one
+/// self-referential field: zeroed, never omitted, while its bytes are computed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalJobSpec {
     pub submission_id: SubmissionId,
@@ -1594,6 +1723,36 @@ pub struct LogicalJobSpec {
     pub admission: JobAdmissionRecord,
     /// Family placement derived from `submission_id`, never from the alias bucket.
     pub placement: PlacementRef,
+}
+
+impl LogicalJobSpec {
+    /// Fills the self-referential `spec_digest` from the record's canonical bytes.
+    pub fn seal(mut self) -> Result<Self, JobRecordError> {
+        self.spec_digest = self.digest()?;
+        Ok(self)
+    }
+
+    /// Fails when the sealed digest does not reproduce from the record itself.
+    pub fn verify_digest(&self) -> Result<(), JobRecordError> {
+        match self.spec_digest == self.digest()? {
+            true => Ok(()),
+            false => Err(JobRecordError::DigestMismatch),
+        }
+    }
+
+    /// The admission committed with the spec must describe this exact claim.
+    fn admission_binds(&self) -> Result<(), JobRecordError> {
+        let admission = &self.admission;
+        match admission.submission_id == self.submission_id
+            && admission.request_digest == self.request_digest
+            && admission.job_id == self.job_id
+            && admission.group_id == self.group_id
+            && admission.resources == self.resources
+        {
+            true => Ok(()),
+            false => Err(JobRecordError::Inconsistent),
+        }
+    }
 }
 
 /// Union member keyed by `(submission_id, job_id)`, so two partitioned accepts
@@ -1673,9 +1832,9 @@ pub struct LaunchIntent {
     pub created_at_ms: u64,
 }
 
-/// The target's signed acceptance. It binds one exact launch and the subject it
-/// was accepted under, so a later placement change cannot rewrite that history
-/// or authorize unrelated new work.
+/// The target's acceptance of one exact launch, authenticated by the executor's
+/// envelope signature. It binds the subject it was accepted under, so a later
+/// placement change cannot rewrite that history or authorize unrelated work.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
     pub execution_id: Ulid,
@@ -1728,25 +1887,136 @@ impl PhysicalExecutionState {
     }
 }
 
-/// Terminal facts of one physical execution. A success is valid only when every
-/// output carries its exact VersionId.
+/// Bounded free-text diagnostic carried by a terminal update.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ResultMessage(String);
+
+impl ResultMessage {
+    pub fn new(message: String) -> Result<Self, JobRecordError> {
+        match message.len() <= MAX_RESULT_MESSAGE_BYTES {
+            true => Ok(Self(message)),
+            false => Err(JobRecordError::MessageBytes),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ResultMessage {
+    type Error = JobRecordError;
+
+    fn try_from(message: String) -> Result<Self, Self::Error> {
+        Self::new(message)
+    }
+}
+
+/// Ordering of one output inside a canonical set.
+fn output_order(object: &OutputObject) -> (&str, &str, Ulid) {
+    (&object.bucket, &object.key, object.version_id)
+}
+
+/// The exact output objects of one execution, in one canonical order. Decoding
+/// rejects an unordered, duplicated, oversized, or identity-free set, so a peer
+/// can never reorder a signed record into different canonical bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<OutputObject>")]
+pub struct OutputSet(Vec<OutputObject>);
+
+impl OutputSet {
+    pub fn new(outputs: Vec<OutputObject>) -> Result<Self, JobRecordError> {
+        if outputs.len() > MAX_EXECUTION_OUTPUTS {
+            return Err(JobRecordError::OutputOrder);
+        }
+        if outputs
+            .iter()
+            .any(|object| object.version_id.is_nil() || object.execution_id.is_nil())
+        {
+            return Err(JobRecordError::OutputOrder);
+        }
+        if outputs
+            .windows(2)
+            .any(|pair| output_order(&pair[0]) >= output_order(&pair[1]))
+        {
+            return Err(JobRecordError::OutputOrder);
+        }
+        Ok(Self(outputs))
+    }
+
+    /// Producer-side constructor: sorts into the one canonical order first.
+    pub fn canonical(mut outputs: Vec<OutputObject>) -> Result<Self, JobRecordError> {
+        outputs.sort_by(|left, right| output_order(left).cmp(&output_order(right)));
+        Self::new(outputs)
+    }
+
+    pub fn as_slice(&self) -> &[OutputObject] {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Vec<OutputObject> {
+        self.0
+    }
+}
+
+impl TryFrom<Vec<OutputObject>> for OutputSet {
+    type Error = JobRecordError;
+
+    fn try_from(outputs: Vec<OutputObject>) -> Result<Self, Self::Error> {
+        Self::new(outputs)
+    }
+}
+
+/// Terminal facts of one physical execution. Outputs are not embedded here: a
+/// success names the digest of its separately published output record, so that
+/// record must already be durable before success can be projected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhysicalExecutionResult {
     pub exit_code: Option<i32>,
-    pub outputs: Vec<OutputObject>,
-    pub message: Option<String>,
+    pub output_digest: Option<[u8; 32]>,
+    pub message: Option<ResultMessage>,
 }
 
-/// Monotonic state publication by the executor. `previous_digest` roots the
-/// chain at the receipt so a gap cannot silently skip a state.
+/// Monotonic state publication by the fenced executor. `previous_digest` roots
+/// the chain at the receipt, so a gap cannot silently skip a state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionUpdate {
     pub execution_id: Ulid,
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub executor_node_id: NodeId,
     pub sequence: u64,
-    pub previous_digest: Option<[u8; 32]>,
+    pub previous_digest: [u8; 32],
     pub state: PhysicalExecutionState,
     pub observed_at_ms: u64,
     pub result: Option<PhysicalExecutionResult>,
+}
+
+/// The exact output set of one physical execution, published as its own
+/// immutable record. Its durability is the prerequisite for terminal success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionOutputRecord {
+    pub execution_id: Ulid,
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub job_id: JobId,
+    pub executor_node_id: NodeId,
+    pub spec_digest: [u8; 32],
+    pub receipt_digest: [u8; 32],
+    pub outputs: OutputSet,
+    pub committed_at_ms: u64,
+}
+
+/// Token-free evidence of how the publishing node authorized the caller against
+/// the sealed spec. Bearer tokens never replicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CancelAuthority {
+    /// The caller is the sealed submitter; every holder rechecks this alone.
+    Submitter,
+    /// The publishing node checked cancel permission on the sealed group when it
+    /// published the record, and its envelope signature is that statement.
+    GroupAdmin,
 }
 
 /// Replicated cancellation intent for one `(submission_id, request_digest)`
@@ -1757,7 +2027,10 @@ pub struct JobCancelRecord {
     pub submission_id: SubmissionId,
     pub request_digest: [u8; 32],
     pub job_id: JobId,
+    /// Sealed spec the caller's authorization was evaluated against.
+    pub spec_digest: [u8; 32],
     pub requested_by: UserId,
+    pub authority: CancelAuthority,
     pub requested_at_ms: u64,
 }
 
@@ -1774,6 +2047,717 @@ pub fn canonical_execution_key(
     hasher.update(&request_digest);
     hasher.update(&execution_id.to_bytes());
     *hasher.finalize().as_bytes()
+}
+
+/// Replication family every job record belongs to. Two different requests under
+/// one submission are separate families and never merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct JobFamilyId {
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+}
+
+impl JobFamilyId {
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&self.submission_id.0);
+        bytes[32..].copy_from_slice(&self.request_digest);
+        bytes
+    }
+}
+
+/// The immutable record kinds of one job family. Declaration order is the byte
+/// order of [`JobRecordKey`], so key ordering and struct ordering agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum JobRecordKind {
+    Spec,
+    Claim,
+    Budget,
+    Launch,
+    Receipt,
+    Update,
+    Output,
+    Cancel,
+}
+
+impl JobRecordKind {
+    pub fn as_byte(self) -> u8 {
+        match self {
+            JobRecordKind::Spec => 0,
+            JobRecordKind::Claim => 1,
+            JobRecordKind::Budget => 2,
+            JobRecordKind::Launch => 3,
+            JobRecordKind::Receipt => 4,
+            JobRecordKind::Update => 5,
+            JobRecordKind::Output => 6,
+            JobRecordKind::Cancel => 7,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Result<Self, JobRecordError> {
+        match byte {
+            0 => Ok(JobRecordKind::Spec),
+            1 => Ok(JobRecordKind::Claim),
+            2 => Ok(JobRecordKind::Budget),
+            3 => Ok(JobRecordKind::Launch),
+            4 => Ok(JobRecordKind::Receipt),
+            5 => Ok(JobRecordKind::Update),
+            6 => Ok(JobRecordKind::Output),
+            7 => Ok(JobRecordKind::Cancel),
+            _ => Err(JobRecordError::MalformedKey),
+        }
+    }
+}
+
+/// Stable typed key of one immutable job record. The encoded form is the storage
+/// and paging order: family prefix first, then kind, subject, and sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct JobRecordKey {
+    pub family: JobFamilyId,
+    pub kind: JobRecordKind,
+    /// Identity discriminating the record inside its kind, zero-extended.
+    pub subject: [u8; 32],
+    /// Position inside the subject; zero for every single-instance kind.
+    pub sequence: u64,
+}
+
+impl JobRecordKey {
+    pub fn to_bytes(&self) -> [u8; JOB_RECORD_KEY_BYTES] {
+        let mut bytes = [0u8; JOB_RECORD_KEY_BYTES];
+        bytes[..64].copy_from_slice(&self.family.to_bytes());
+        bytes[64] = self.kind.as_byte();
+        bytes[65..97].copy_from_slice(&self.subject);
+        bytes[97..].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, JobRecordError> {
+        if bytes.len() != JOB_RECORD_KEY_BYTES {
+            return Err(JobRecordError::MalformedKey);
+        }
+        let read = |range: std::ops::Range<usize>| -> Result<[u8; 32], JobRecordError> {
+            bytes[range]
+                .try_into()
+                .map_err(|_| JobRecordError::MalformedKey)
+        };
+        let sequence: [u8; 8] = bytes[97..]
+            .try_into()
+            .map_err(|_| JobRecordError::MalformedKey)?;
+        Ok(Self {
+            family: JobFamilyId {
+                submission_id: SubmissionId(read(0..32)?),
+                request_digest: read(32..64)?,
+            },
+            kind: JobRecordKind::from_byte(bytes[64])?,
+            subject: read(65..97)?,
+            sequence: u64::from_be_bytes(sequence),
+        })
+    }
+}
+
+/// Domain-tagged canonical encoding shared by every record kind.
+fn tagged_bytes(domain: &[u8], value: &impl Serialize) -> Result<Vec<u8>, JobRecordError> {
+    let body = postcard::to_allocvec(value)?;
+    let mut bytes = Vec::with_capacity(domain.len() + body.len());
+    bytes.extend_from_slice(domain);
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
+/// Zero-extends a 16-byte identity into a record key subject.
+fn subject_bytes(id: [u8; 16]) -> [u8; 32] {
+    let mut subject = [0u8; 32];
+    subject[..16].copy_from_slice(&id);
+    subject
+}
+
+/// Canonical identity of one immutable job record kind. The digest is
+/// `blake3(DOMAIN || postcard(canonical form))`; a record carrying its own digest
+/// zeroes that one field there and nowhere else, hashing every other as it stands.
+pub trait JobRecordBody: Serialize + Sized {
+    const DOMAIN: &'static [u8];
+    const KIND: JobRecordKind;
+
+    fn family(&self) -> JobFamilyId;
+
+    fn subject(&self) -> [u8; 32];
+
+    fn sequence(&self) -> u64 {
+        0
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, JobRecordError> {
+        tagged_bytes(Self::DOMAIN, self)
+    }
+
+    fn digest(&self) -> Result<[u8; 32], JobRecordError> {
+        Ok(*blake3::hash(&self.canonical_bytes()?).as_bytes())
+    }
+}
+
+impl JobRecordBody for LogicalJobSpec {
+    const DOMAIN: &'static [u8] = JOB_SPEC_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Spec;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.job_id.to_bytes())
+    }
+
+    /// The only self-referential field in the family is zeroed here.
+    fn canonical_bytes(&self) -> Result<Vec<u8>, JobRecordError> {
+        let mut canonical = self.clone();
+        canonical.spec_digest = [0u8; 32];
+        tagged_bytes(Self::DOMAIN, &canonical)
+    }
+}
+
+impl JobRecordBody for SubmissionClaim {
+    const DOMAIN: &'static [u8] = JOB_CLAIM_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Claim;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.job_id.to_bytes())
+    }
+}
+
+impl JobRecordBody for WitnessBudgetRecord {
+    const DOMAIN: &'static [u8] = JOB_BUDGET_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Budget;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        *self.scheduler_node_id.as_bytes()
+    }
+}
+
+impl JobRecordBody for LaunchIntent {
+    const DOMAIN: &'static [u8] = JOB_LAUNCH_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Launch;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.launch_id.to_bytes())
+    }
+}
+
+impl JobRecordBody for ExecutionReceipt {
+    const DOMAIN: &'static [u8] = JOB_RECEIPT_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Receipt;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.execution_id.to_bytes())
+    }
+}
+
+impl JobRecordBody for ExecutionUpdate {
+    const DOMAIN: &'static [u8] = JOB_UPDATE_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Update;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.execution_id.to_bytes())
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl JobRecordBody for ExecutionOutputRecord {
+    const DOMAIN: &'static [u8] = JOB_OUTPUT_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Output;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.execution_id.to_bytes())
+    }
+}
+
+impl JobRecordBody for JobCancelRecord {
+    const DOMAIN: &'static [u8] = JOB_CANCEL_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Cancel;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.cancel_id.to_bytes())
+    }
+}
+
+/// One immutable record of a job family. Every variant has exactly one permitted
+/// author and is never rewritten under the same key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobFamilyRecord {
+    Spec(Box<LogicalJobSpec>),
+    Claim(SubmissionClaim),
+    Budget(WitnessBudgetRecord),
+    Launch(Box<LaunchIntent>),
+    Receipt(Box<ExecutionReceipt>),
+    Update(Box<ExecutionUpdate>),
+    Output(Box<ExecutionOutputRecord>),
+    Cancel(JobCancelRecord),
+}
+
+impl JobFamilyRecord {
+    pub fn kind(&self) -> JobRecordKind {
+        match self {
+            JobFamilyRecord::Spec(_) => JobRecordKind::Spec,
+            JobFamilyRecord::Claim(_) => JobRecordKind::Claim,
+            JobFamilyRecord::Budget(_) => JobRecordKind::Budget,
+            JobFamilyRecord::Launch(_) => JobRecordKind::Launch,
+            JobFamilyRecord::Receipt(_) => JobRecordKind::Receipt,
+            JobFamilyRecord::Update(_) => JobRecordKind::Update,
+            JobFamilyRecord::Output(_) => JobRecordKind::Output,
+            JobFamilyRecord::Cancel(_) => JobRecordKind::Cancel,
+        }
+    }
+
+    /// Family the record binds itself to. It is part of the signed canonical
+    /// bytes, so a relay cannot move a record into another family.
+    pub fn family(&self) -> JobFamilyId {
+        match self {
+            JobFamilyRecord::Spec(spec) => spec.family(),
+            JobFamilyRecord::Claim(claim) => claim.family(),
+            JobFamilyRecord::Budget(budget) => budget.family(),
+            JobFamilyRecord::Launch(launch) => launch.family(),
+            JobFamilyRecord::Receipt(receipt) => receipt.family(),
+            JobFamilyRecord::Update(update) => update.family(),
+            JobFamilyRecord::Output(output) => output.family(),
+            JobFamilyRecord::Cancel(cancel) => cancel.family(),
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, JobRecordError> {
+        match self {
+            JobFamilyRecord::Spec(spec) => spec.canonical_bytes(),
+            JobFamilyRecord::Claim(claim) => claim.canonical_bytes(),
+            JobFamilyRecord::Budget(budget) => budget.canonical_bytes(),
+            JobFamilyRecord::Launch(launch) => launch.canonical_bytes(),
+            JobFamilyRecord::Receipt(receipt) => receipt.canonical_bytes(),
+            JobFamilyRecord::Update(update) => update.canonical_bytes(),
+            JobFamilyRecord::Output(output) => output.canonical_bytes(),
+            JobFamilyRecord::Cancel(cancel) => cancel.canonical_bytes(),
+        }
+    }
+
+    pub fn digest(&self) -> Result<[u8; 32], JobRecordError> {
+        Ok(*blake3::hash(&self.canonical_bytes()?).as_bytes())
+    }
+
+    pub fn key(&self) -> JobRecordKey {
+        let (subject, sequence) = match self {
+            JobFamilyRecord::Spec(spec) => (spec.subject(), spec.sequence()),
+            JobFamilyRecord::Claim(claim) => (claim.subject(), claim.sequence()),
+            JobFamilyRecord::Budget(budget) => (budget.subject(), budget.sequence()),
+            JobFamilyRecord::Launch(launch) => (launch.subject(), launch.sequence()),
+            JobFamilyRecord::Receipt(receipt) => (receipt.subject(), receipt.sequence()),
+            JobFamilyRecord::Update(update) => (update.subject(), update.sequence()),
+            JobFamilyRecord::Output(output) => (output.subject(), output.sequence()),
+            JobFamilyRecord::Cancel(cancel) => (cancel.subject(), cancel.sequence()),
+        };
+        JobRecordKey {
+            family: self.family(),
+            kind: self.kind(),
+            subject,
+            sequence,
+        }
+    }
+}
+
+/// Verified evidence a holder already retains. Every field comes from an earlier
+/// verified record, never from the peer that relayed the record under check.
+#[derive(Clone, Copy, Debug)]
+pub struct JobRecordContext<'a> {
+    pub realm_id: RealmId,
+    pub family: JobFamilyId,
+    /// Family placement derived from the submission id and the realm strategy.
+    pub placement: PlacementRef,
+    pub spec: Option<&'a LogicalJobSpec>,
+    pub budget: Option<&'a WitnessBudgetRecord>,
+    pub launch: Option<&'a LaunchIntent>,
+    pub receipt: Option<&'a ExecutionReceipt>,
+}
+
+impl<'a> JobRecordContext<'a> {
+    pub fn new(realm_id: RealmId, family: JobFamilyId, placement: PlacementRef) -> Self {
+        Self {
+            realm_id,
+            family,
+            placement,
+            spec: None,
+            budget: None,
+            launch: None,
+            receipt: None,
+        }
+    }
+}
+
+/// The authenticated envelope every replicated job record travels in, kept
+/// byte-identical end to end: after a relay the publisher signature is the only
+/// proof of authorship, and key, kind, family, and digest all derive from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecordEnvelope {
+    pub realm_id: RealmId,
+    pub record: JobFamilyRecord,
+    /// The node that created the record, not the holder that relayed it.
+    pub published_by: NodeId,
+    pub signature: iroh::Signature,
+}
+
+/// The tuple a publisher signs: realm plus the record's canonical digest, which
+/// already covers kind and family. A record therefore cannot be replayed into
+/// another realm, family, or kind.
+fn claim_bytes(realm_id: RealmId, record: &JobFamilyRecord) -> Result<[u8; 32], JobRecordError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(JOB_ENVELOPE_DOMAIN);
+    hasher.update(realm_id.as_bytes());
+    hasher.update(&record.digest()?);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+impl JobRecordEnvelope {
+    pub fn sign(
+        realm_id: RealmId,
+        record: JobFamilyRecord,
+        secret: &iroh::SecretKey,
+    ) -> Result<Self, JobRecordError> {
+        Self::signed_with(realm_id, record, secret.public(), |message| {
+            secret.sign(message)
+        })
+    }
+
+    /// Signs with the node's own signer, for publishers that hold a handle
+    /// rather than the key itself.
+    pub fn signed_with(
+        realm_id: RealmId,
+        record: JobFamilyRecord,
+        published_by: NodeId,
+        sign: impl FnOnce(&[u8]) -> iroh::Signature,
+    ) -> Result<Self, JobRecordError> {
+        let signature = sign(&claim_bytes(realm_id, &record)?);
+        Ok(Self {
+            realm_id,
+            record,
+            published_by,
+            signature,
+        })
+    }
+
+    pub fn key(&self) -> JobRecordKey {
+        self.record.key()
+    }
+
+    pub fn kind(&self) -> JobRecordKind {
+        self.record.kind()
+    }
+
+    pub fn family(&self) -> JobFamilyId {
+        self.record.family()
+    }
+
+    pub fn digest(&self) -> Result<[u8; 32], JobRecordError> {
+        self.record.digest()
+    }
+
+    pub fn signing_bytes(&self) -> Result<[u8; 32], JobRecordError> {
+        claim_bytes(self.realm_id, &self.record)
+    }
+
+    /// The single ingest gate: realm and family binding, publisher signature, and
+    /// the record kind's exact author rule. A holder that only relays a record
+    /// never satisfies any of the author rules.
+    pub fn verify(&self, context: &JobRecordContext<'_>) -> Result<(), JobRecordError> {
+        if self.realm_id != context.realm_id {
+            return Err(JobRecordError::RealmMismatch);
+        }
+        if self.record.family() != context.family {
+            return Err(JobRecordError::FamilyMismatch);
+        }
+        self.verify_signature()?;
+        match &self.record {
+            JobFamilyRecord::Spec(spec) => self.verify_spec(spec, context),
+            JobFamilyRecord::Claim(claim) => self.verify_claim(claim, context),
+            JobFamilyRecord::Budget(budget) => self.verify_budget(budget, context),
+            JobFamilyRecord::Launch(launch) => self.verify_launch(launch, context),
+            JobFamilyRecord::Receipt(receipt) => self.verify_receipt(receipt, context),
+            JobFamilyRecord::Update(update) => self.verify_update(update, context),
+            JobFamilyRecord::Output(output) => self.verify_output(output, context),
+            JobFamilyRecord::Cancel(cancel) => self.verify_cancel(cancel, context),
+        }
+    }
+
+    pub fn verify_signature(&self) -> Result<(), JobRecordError> {
+        self.published_by
+            .verify(&self.signing_bytes()?, &self.signature)
+            .map_err(|_| JobRecordError::BadSignature)
+    }
+
+    fn author(&self, expected: NodeId, kind: JobRecordKind) -> Result<(), JobRecordError> {
+        match self.published_by == expected {
+            true => Ok(()),
+            false => Err(JobRecordError::WrongPublisher(kind)),
+        }
+    }
+
+    /// Only the committing family holder that minted the alias publishes a spec.
+    fn verify_spec(
+        &self,
+        spec: &LogicalJobSpec,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        self.author(spec.origin_node_id, JobRecordKind::Spec)?;
+        if spec.realm_id != context.realm_id {
+            return Err(JobRecordError::RealmMismatch);
+        }
+        if spec.placement != context.placement {
+            return Err(JobRecordError::PlacementMismatch);
+        }
+        spec.verify_digest()?;
+        spec.admission_binds()?;
+        Ok(spec.retry.validate()?)
+    }
+
+    fn verify_claim(
+        &self,
+        claim: &SubmissionClaim,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        self.author(claim.committing_node_id, JobRecordKind::Claim)?;
+        let Some(spec) = context.spec else {
+            return Ok(());
+        };
+        match claim.job_id == spec.job_id
+            && claim.spec_digest == spec.spec_digest
+            && claim.committing_node_id == spec.origin_node_id
+        {
+            true => Ok(()),
+            false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec)),
+        }
+    }
+
+    fn verify_budget(
+        &self,
+        budget: &WitnessBudgetRecord,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        self.author(budget.scheduler_node_id, JobRecordKind::Budget)?;
+        if budget.max_launches == 0 {
+            return Err(JobRecordError::Contract(JobContractError::EmptyRetry));
+        }
+        let Some(spec) = context.spec else {
+            return Ok(());
+        };
+        match budget.source_spec_digest == spec.spec_digest
+            && budget.max_launches <= spec.retry.max_launches_per_witness
+        {
+            true => Ok(()),
+            false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec)),
+        }
+    }
+
+    fn verify_launch(
+        &self,
+        launch: &LaunchIntent,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        self.author(launch.scheduler_node_id, JobRecordKind::Launch)?;
+        if let Some(budget) = context.budget {
+            budget.admits(launch)?;
+        }
+        let Some(spec) = context.spec else {
+            return Ok(());
+        };
+        match launch.spec_digest == spec.spec_digest && launch.job_id == spec.job_id {
+            true => Ok(()),
+            false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec)),
+        }
+    }
+
+    fn verify_receipt(
+        &self,
+        receipt: &ExecutionReceipt,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        self.author(receipt.executor_node_id, JobRecordKind::Receipt)?;
+        if receipt.executor_node_id != receipt.target.node_id {
+            return Err(JobRecordError::Inconsistent);
+        }
+        let Some(launch) = context.launch else {
+            return Ok(());
+        };
+        match receipt.launch_id == launch.launch_id
+            && receipt.launch_digest == launch.digest()?
+            && receipt.target == launch.target
+            && receipt.spec_digest == launch.spec_digest
+        {
+            true => Ok(()),
+            false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Launch)),
+        }
+    }
+
+    fn verify_update(
+        &self,
+        update: &ExecutionUpdate,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        self.author(update.executor_node_id, JobRecordKind::Update)?;
+        let Some(receipt) = context.receipt else {
+            return Ok(());
+        };
+        match update.execution_id == receipt.execution_id
+            && update.executor_node_id == receipt.executor_node_id
+        {
+            true => Ok(()),
+            false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt)),
+        }
+    }
+
+    fn verify_output(
+        &self,
+        output: &ExecutionOutputRecord,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        self.author(output.executor_node_id, JobRecordKind::Output)?;
+        if output
+            .outputs
+            .as_slice()
+            .iter()
+            .any(|object| object.execution_id != output.execution_id)
+        {
+            return Err(JobRecordError::Inconsistent);
+        }
+        let Some(receipt) = context.receipt else {
+            return Ok(());
+        };
+        match output.execution_id == receipt.execution_id
+            && output.executor_node_id == receipt.executor_node_id
+            && output.receipt_digest == receipt.digest()?
+            && output.spec_digest == receipt.spec_digest
+        {
+            true => Ok(()),
+            false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt)),
+        }
+    }
+
+    /// Cancellation authority is defined against the sealed spec, so the spec is
+    /// required evidence and no bearer token ever replicates.
+    fn verify_cancel(
+        &self,
+        cancel: &JobCancelRecord,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        let spec = context
+            .spec
+            .ok_or(JobRecordError::MissingEvidence(JobRecordKind::Spec))?;
+        if cancel.spec_digest != spec.spec_digest || cancel.job_id != spec.job_id {
+            return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec));
+        }
+        if cancel.requested_by.realm_id != spec.realm_id {
+            return Err(JobRecordError::Unauthorized);
+        }
+        match cancel.authority {
+            CancelAuthority::Submitter => match cancel.requested_by == spec.created_by {
+                true => Ok(()),
+                false => Err(JobRecordError::Unauthorized),
+            },
+            CancelAuthority::GroupAdmin => Ok(()),
+        }
+    }
+}
+
+/// Longest receipt-rooted contiguous update chain, in sequence order. A gap, a
+/// broken link, a state after a terminal one, or a success whose exact output
+/// record is not durable truncates the projection instead of extending it.
+pub fn verify_update_chain(
+    receipt_digest: [u8; 32],
+    output_digest: Option<[u8; 32]>,
+    updates: &[ExecutionUpdate],
+) -> Result<Vec<&ExecutionUpdate>, JobRecordError> {
+    let mut ordered: Vec<&ExecutionUpdate> = updates.iter().collect();
+    ordered.sort_by_key(|update| update.sequence);
+    let mut chain: Vec<&ExecutionUpdate> = Vec::new();
+    let mut previous = receipt_digest;
+    let mut expected = 0u64;
+    for index in 0..ordered.len() {
+        let update = ordered[index];
+        if index > 0 && ordered[index - 1].sequence == update.sequence {
+            if ordered[index - 1] == update {
+                continue;
+            }
+            return Err(JobRecordError::ChainConflict {
+                sequence: update.sequence,
+            });
+        }
+        if update.sequence != expected || update.previous_digest != previous {
+            break;
+        }
+        if update.state == PhysicalExecutionState::Succeeded {
+            let claimed = update
+                .result
+                .as_ref()
+                .and_then(|result| result.output_digest);
+            if claimed.is_none() || claimed != output_digest {
+                break;
+            }
+        }
+        chain.push(update);
+        previous = update.digest()?;
+        expected += 1;
+        if update.state.is_terminal() {
+            break;
+        }
+    }
+    Ok(chain)
 }
 
 /// Replicated logical state of one request family. There is deliberately no
@@ -1831,8 +2815,8 @@ pub struct JobProjection {
     pub state: LogicalJobState,
     pub canonical_execution_id: Option<Ulid>,
     pub executions: Vec<ProjectedExecution>,
-    /// Outputs of the canonical execution.
-    pub outputs: Vec<OutputObject>,
+    /// Outputs of the canonical execution, in their one canonical order.
+    pub outputs: OutputSet,
     pub cancel_requested: bool,
 }
 
@@ -1848,10 +2832,14 @@ impl JobProjection {
 mod tests {
     use super::*;
 
-    fn node_id(seed: u8) -> NodeId {
+    fn secret(seed: u8) -> iroh::SecretKey {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&seed_bytes).public()
+        iroh::SecretKey::from_bytes(&seed_bytes)
+    }
+
+    fn node_id(seed: u8) -> NodeId {
+        secret(seed).public()
     }
 
     fn user(realm: u8, byte: u8) -> UserId {
@@ -1933,9 +2921,9 @@ mod tests {
         }
     }
 
-    // External-only states must be rejected for an in-process job.
     #[test]
     fn internal_rejects_external() {
+        // External-only states must be rejected for an in-process job.
         let external_only = [
             (JobState::Claimed, JobState::Preparing),
             (JobState::Preparing, JobState::Ready),
@@ -1954,9 +2942,9 @@ mod tests {
         }
     }
 
-    // The fenced execution graph is accepted for external attempts.
     #[test]
     fn external_graph_legal() {
+        // The fenced execution graph is accepted for external attempts.
         let legal = [
             (JobState::Claimed, JobState::Preparing),
             (JobState::Preparing, JobState::Ready),
@@ -2294,12 +3282,34 @@ mod tests {
         }
     }
 
+    fn family() -> JobFamilyId {
+        JobFamilyId {
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+        }
+    }
+
+    fn placement() -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            shard: 5,
+        }
+    }
+
+    fn context<'a>() -> JobRecordContext<'a> {
+        JobRecordContext::new(RealmId([8u8; 32]), family(), placement())
+    }
+
+    fn envelope(record: JobFamilyRecord, seed: u8) -> JobRecordEnvelope {
+        JobRecordEnvelope::sign(RealmId([8u8; 32]), record, &secret(seed)).expect("record signs")
+    }
+
     fn sample_output() -> OutputObject {
         OutputObject {
             bucket: "dest".to_string(),
             key: "out/report.txt".to_string(),
             version_id: Ulid::from_bytes([4u8; 16]),
-            execution_id: Ulid::from_bytes([5u8; 16]),
+            execution_id: Ulid::from_bytes([13u8; 16]),
             container_path: "/out/report.txt".to_string(),
             size: 12,
             digest: Some("aa".repeat(32)),
@@ -2357,17 +3367,20 @@ mod tests {
                 collision_policy: Default::default(),
             },
             request_digest: [1u8; 32],
-            spec_digest: [2u8; 32],
+            spec_digest: [0u8; 32],
             resources: sample_resources(),
             retry: JobRetryPolicy {
                 max_launches_per_witness: 3,
             },
             admission: sample_admission(),
-            placement: PlacementRef {
-                strategy_id: Ulid::from_bytes([9u8; 16]),
-                shard: 5,
-            },
+            placement: placement(),
         }
+        .seal()
+        .expect("spec seals")
+    }
+
+    fn spec_digest() -> [u8; 32] {
+        sample_spec().spec_digest
     }
 
     fn sample_claim() -> SubmissionClaim {
@@ -2375,7 +3388,7 @@ mod tests {
             submission_id: submission(),
             job_id: JobId::from_bytes([6u8; 16]),
             request_digest: [1u8; 32],
-            spec_digest: [2u8; 32],
+            spec_digest: spec_digest(),
             committing_node_id: node_id(1),
             accepted_at_ms: 1_700_000_000_000,
         }
@@ -2386,7 +3399,7 @@ mod tests {
             submission_id: submission(),
             request_digest: [1u8; 32],
             scheduler_node_id: node_id(1),
-            source_spec_digest: [2u8; 32],
+            source_spec_digest: spec_digest(),
             max_launches: 3,
         }
     }
@@ -2399,14 +3412,11 @@ mod tests {
             job_id: JobId::from_bytes([6u8; 16]),
             scheduler_node_id: node_id(1),
             scheduler_seq: 0,
-            witness_placement: PlacementRef {
-                strategy_id: Ulid::from_bytes([9u8; 16]),
-                shard: 5,
-            },
+            witness_placement: placement(),
             holder_generation: 11,
             target: target(),
             plan_digest: [12u8; 32],
-            spec_digest: [2u8; 32],
+            spec_digest: spec_digest(),
             created_at_ms: 1_700_000_000_000,
         }
     }
@@ -2415,13 +3425,13 @@ mod tests {
         ExecutionReceipt {
             execution_id: Ulid::from_bytes([13u8; 16]),
             launch_id: Ulid::from_bytes([10u8; 16]),
-            launch_digest: [14u8; 32],
+            launch_digest: sample_launch().digest().expect("launch digests"),
             submission_id: submission(),
             request_digest: [1u8; 32],
             job_id: JobId::from_bytes([6u8; 16]),
             executor_node_id: node_id(9),
             target: target(),
-            spec_digest: [2u8; 32],
+            spec_digest: spec_digest(),
             membership_generation: 4,
             subject_generation: 2,
             subject_digest: [15u8; 32],
@@ -2429,18 +3439,47 @@ mod tests {
         }
     }
 
+    fn output_record() -> ExecutionOutputRecord {
+        ExecutionOutputRecord {
+            execution_id: Ulid::from_bytes([13u8; 16]),
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            job_id: JobId::from_bytes([6u8; 16]),
+            executor_node_id: node_id(9),
+            spec_digest: spec_digest(),
+            receipt_digest: sample_receipt().digest().expect("receipt digests"),
+            outputs: OutputSet::canonical(vec![sample_output()]).expect("canonical outputs"),
+            committed_at_ms: 1_700_000_001_000,
+        }
+    }
+
     fn sample_update() -> ExecutionUpdate {
         ExecutionUpdate {
             execution_id: Ulid::from_bytes([13u8; 16]),
-            sequence: 3,
-            previous_digest: Some([16u8; 32]),
-            state: PhysicalExecutionState::Succeeded,
+            submission_id: submission(),
+            request_digest: [1u8; 32],
+            executor_node_id: node_id(9),
+            sequence: 0,
+            previous_digest: sample_receipt().digest().expect("receipt digests"),
+            state: PhysicalExecutionState::Running,
             observed_at_ms: 1_700_000_001_000,
+            result: None,
+        }
+    }
+
+    /// Terminal success naming the durable output record it depends on.
+    fn success_update() -> ExecutionUpdate {
+        ExecutionUpdate {
+            sequence: 1,
+            previous_digest: sample_update().digest().expect("update digests"),
+            state: PhysicalExecutionState::Succeeded,
+            observed_at_ms: 1_700_000_002_000,
             result: Some(PhysicalExecutionResult {
                 exit_code: Some(0),
-                outputs: vec![sample_output()],
+                output_digest: Some(output_record().digest().expect("output digests")),
                 message: None,
             }),
+            ..sample_update()
         }
     }
 
@@ -2450,7 +3489,9 @@ mod tests {
             submission_id: submission(),
             request_digest: [1u8; 32],
             job_id: JobId::from_bytes([6u8; 16]),
+            spec_digest: spec_digest(),
             requested_by: user(8, 2),
+            authority: CancelAuthority::Submitter,
             requested_at_ms: 1_700_000_002_000,
         }
     }
@@ -2469,7 +3510,7 @@ mod tests {
                 state: PhysicalExecutionState::Succeeded,
                 role: ExecutionRole::Canonical,
             }],
-            outputs: vec![sample_output()],
+            outputs: OutputSet::canonical(vec![sample_output()]).expect("canonical outputs"),
             cancel_requested: false,
         }
     }
@@ -2493,8 +3534,11 @@ mod tests {
         assert_eq!(reencode(&sample_launch()), sample_launch());
         assert_eq!(reencode(&sample_receipt()), sample_receipt());
         assert_eq!(reencode(&sample_update()), sample_update());
+        assert_eq!(reencode(&output_record()), output_record());
         assert_eq!(reencode(&sample_cancel()), sample_cancel());
         assert_eq!(reencode(&sample_projection()), sample_projection());
+        let signed = envelope(JobFamilyRecord::Cancel(sample_cancel()), 1);
+        assert_eq!(reencode(&signed), signed);
     }
 
     #[test]
@@ -2509,22 +3553,24 @@ mod tests {
             wire_digest(&sample_launch()),
             wire_digest(&sample_receipt()),
             wire_digest(&sample_update()),
+            wire_digest(&output_record()),
             wire_digest(&sample_cancel()),
             wire_digest(&sample_projection()),
         ];
         assert_eq!(
             digests,
             [
-                "b98e0af7c920302f38cd6f87c1617543d64e1f0b54ab7d8d895dc3137147c889",
-                "e8187e6ea96c933f2bb870f1b94860dedfd7f8397dcf0ec3485f5ca8190b064d",
+                "6574d19e7b5a36c99e21fbd21b129e3ca457ba55474809f7c7ac5b7dd7544c6d",
+                "551b48534d452eae653137159ca4c8f3514d763a6189e72641d87c95b7fbe65c",
                 "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
-                "045a9878c7942dee314a991bec25d526785ac4d1d0bf0a4d2953735562115a33",
-                "0ac17924f2f58a054126d6fb22c6a0de5e2493ab93eb5a072631f4e63003accc",
-                "f5d1d8d4278b2fac2505ff0f4b72842b081aad77208abed4a8ef9e9f8fb8d2f3",
-                "70bcabaf26ea387f46f09219e24713ed2f30a41ddc49a28505c0c61128278e19",
-                "7169d9822b6b5f5d10c475c5ddbbbfee854120e48cb51a58fcf087978d42a788",
-                "1ce897cfd6c39414bd7266e6f09b21ff823cd5468a2b0e15b40387a31e00e1e6",
-                "eb62502ff6af0d549869e048e24f2a6239a256db3a9e5012eff7cc4b82fd7d76",
+                "6b75f1a8a153c42e3bbf5c312091e54a624f71f16824bc11d0a43b028c5a0255",
+                "e8d31f6e84d50a99569c384eee9d85ec285b61760ac17f3eb9e800f75f992d0d",
+                "1fe5e3557fa18cf3768780374c4b6db60d1fa4f095bd6df2b9845ef46ee0d997",
+                "3b3ad4c422586915c1c969fef1cbc79d454ee8e98d5c71cb8fb3d585e9e91be4",
+                "168955b25fab893b9adeca11c3a5ae1f3b32e8ae1f96933dd44eeaffe9b1b545",
+                "228d051ff582fdc9a422197fc788a239552e10876ee5b17e0fa2085279929b6b",
+                "6e3f11e167e81b8f84fa1923fc41ebf594288041104ff55ae953f5c1576c6311",
+                "9739d83be3ed5c46b18de67ae1a0fea04ce4e05218882b2ffa675ceab4151eb9",
             ]
         );
         assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);
@@ -2628,6 +3674,460 @@ mod tests {
             canonical_execution_key(submission(), [1u8; 32], execution),
             canonical_execution_key(submission(), [2u8; 32], execution)
         );
+    }
+
+    #[test]
+    fn digest_excludes_self() {
+        // The one self-referential field is zeroed, never omitted.
+        let spec = sample_spec();
+        let mut restamped = spec.clone();
+        restamped.spec_digest = [77u8; 32];
+        assert_eq!(spec.digest().unwrap(), restamped.digest().unwrap());
+        assert_eq!(spec.verify_digest(), Ok(()));
+        assert_eq!(
+            restamped.verify_digest(),
+            Err(JobRecordError::DigestMismatch)
+        );
+        let mut moved = spec.clone();
+        moved.created_at_ms += 1;
+        assert_ne!(moved.digest().unwrap(), spec.digest().unwrap());
+    }
+
+    #[test]
+    fn domains_stay_distinct() {
+        // `tag || body` is only unambiguous while no tag prefixes another.
+        let domains = [
+            JOB_SPEC_DOMAIN,
+            JOB_CLAIM_DOMAIN,
+            JOB_BUDGET_DOMAIN,
+            JOB_LAUNCH_DOMAIN,
+            JOB_RECEIPT_DOMAIN,
+            JOB_UPDATE_DOMAIN,
+            JOB_OUTPUT_DOMAIN,
+            JOB_CANCEL_DOMAIN,
+            JOB_ENVELOPE_DOMAIN,
+        ];
+        for (index, left) in domains.iter().enumerate() {
+            for right in domains.iter().skip(index + 1) {
+                assert!(!left.starts_with(right) && !right.starts_with(left));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_forged_author() {
+        let record = JobFamilyRecord::Spec(Box::new(sample_spec()));
+        assert_eq!(envelope(record.clone(), 1).verify(&context()), Ok(()));
+        // A relay restating the record signs with its own key and is refused.
+        assert_eq!(
+            envelope(record.clone(), 2).verify(&context()),
+            Err(JobRecordError::WrongPublisher(JobRecordKind::Spec))
+        );
+        let mut restated = envelope(record, 2);
+        restated.published_by = node_id(1);
+        assert_eq!(
+            restated.verify(&context()),
+            Err(JobRecordError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_forged_fields() {
+        let mut forged = envelope(JobFamilyRecord::Claim(sample_claim()), 1);
+        let JobFamilyRecord::Claim(claim) = &mut forged.record else {
+            unreachable!("claim record")
+        };
+        claim.accepted_at_ms = 0;
+        assert_eq!(forged.verify(&context()), Err(JobRecordError::BadSignature));
+    }
+
+    #[test]
+    fn relay_keeps_publisher() {
+        // Replication is transport: the envelope crosses a holder unchanged.
+        let signed = envelope(JobFamilyRecord::Claim(sample_claim()), 1);
+        let relayed = reencode(&signed);
+        assert_eq!(relayed.published_by, node_id(1));
+        assert_eq!(relayed.verify(&context()), Ok(()));
+        assert_eq!(relayed.key(), signed.key());
+    }
+
+    #[test]
+    fn replay_is_identical() {
+        let first = envelope(JobFamilyRecord::Budget(sample_budget()), 1);
+        let second = envelope(JobFamilyRecord::Budget(sample_budget()), 1);
+        assert_eq!(first.key(), second.key());
+        assert_eq!(first.digest().unwrap(), second.digest().unwrap());
+    }
+
+    #[test]
+    fn detects_byte_conflict() {
+        let first = sample_update();
+        let mut second = sample_update();
+        second.observed_at_ms += 1;
+        assert_eq!(
+            JobFamilyRecord::Update(Box::new(first.clone())).key(),
+            JobFamilyRecord::Update(Box::new(second.clone())).key()
+        );
+        assert_ne!(first.digest().unwrap(), second.digest().unwrap());
+    }
+
+    #[test]
+    fn rejects_wrong_family() {
+        let mut foreign = sample_claim();
+        foreign.request_digest = [44u8; 32];
+        assert_eq!(
+            envelope(JobFamilyRecord::Claim(foreign), 1).verify(&context()),
+            Err(JobRecordError::FamilyMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_realm() {
+        let record = JobFamilyRecord::Claim(sample_claim());
+        let elsewhere = JobRecordEnvelope::sign(RealmId([99u8; 32]), record, &secret(1)).unwrap();
+        assert_eq!(
+            elsewhere.verify(&context()),
+            Err(JobRecordError::RealmMismatch)
+        );
+        let mut spec = sample_spec();
+        spec.realm_id = RealmId([99u8; 32]);
+        let spec = spec.seal().unwrap();
+        assert_eq!(
+            envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&context()),
+            Err(JobRecordError::RealmMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_placement() {
+        let mut spec = sample_spec();
+        spec.placement = PlacementRef::NIL;
+        let spec = spec.seal().unwrap();
+        assert_eq!(
+            envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&context()),
+            Err(JobRecordError::PlacementMismatch)
+        );
+    }
+
+    #[test]
+    fn binds_receipt_launch() {
+        let launch = sample_launch();
+        let spec = sample_spec();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            launch: Some(&launch),
+            ..context()
+        };
+        let signed = envelope(JobFamilyRecord::Receipt(Box::new(sample_receipt())), 9);
+        assert_eq!(signed.verify(&checked), Ok(()));
+
+        let mut drifted = sample_receipt();
+        drifted.launch_digest = [1u8; 32];
+        assert_eq!(
+            envelope(JobFamilyRecord::Receipt(Box::new(drifted)), 9).verify(&checked),
+            Err(JobRecordError::EvidenceMismatch(JobRecordKind::Launch))
+        );
+    }
+
+    #[test]
+    fn bounds_sealed_budget() {
+        let budget = sample_budget();
+        let spec = sample_spec();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            budget: Some(&budget),
+            ..context()
+        };
+        assert_eq!(
+            envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1).verify(&checked),
+            Ok(())
+        );
+        let mut beyond = sample_launch();
+        beyond.scheduler_seq = budget.max_launches;
+        assert_eq!(
+            envelope(JobFamilyRecord::Launch(Box::new(beyond)), 1).verify(&checked),
+            Err(JobRecordError::Contract(
+                JobContractError::BudgetExhausted {
+                    sequence: budget.max_launches,
+                    max_launches: budget.max_launches,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn cancel_needs_spec() {
+        // Cancellation authority is defined only against the sealed spec.
+        let signed = envelope(JobFamilyRecord::Cancel(sample_cancel()), 1);
+        assert_eq!(
+            signed.verify(&context()),
+            Err(JobRecordError::MissingEvidence(JobRecordKind::Spec))
+        );
+        let spec = sample_spec();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            ..context()
+        };
+        assert_eq!(signed.verify(&checked), Ok(()));
+
+        let mut stranger = sample_cancel();
+        stranger.requested_by = user(8, 5);
+        assert_eq!(
+            envelope(JobFamilyRecord::Cancel(stranger), 1).verify(&checked),
+            Err(JobRecordError::Unauthorized)
+        );
+        stranger.authority = CancelAuthority::GroupAdmin;
+        assert_eq!(
+            envelope(JobFamilyRecord::Cancel(stranger), 1).verify(&checked),
+            Ok(())
+        );
+        stranger.requested_by = user(9, 5);
+        assert_eq!(
+            envelope(JobFamilyRecord::Cancel(stranger), 1).verify(&checked),
+            Err(JobRecordError::Unauthorized)
+        );
+        let mut replayed = sample_cancel();
+        replayed.spec_digest = [1u8; 32];
+        assert_eq!(
+            envelope(JobFamilyRecord::Cancel(replayed), 1).verify(&checked),
+            Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec))
+        );
+    }
+
+    #[test]
+    fn outputs_sort_canonically() {
+        let first = sample_output();
+        let mut second = sample_output();
+        second.key = "out/a.txt".to_string();
+        let sorted = OutputSet::canonical(vec![second.clone(), first.clone()]).unwrap();
+        assert_eq!(
+            sorted,
+            OutputSet::canonical(vec![first.clone(), second.clone()]).unwrap()
+        );
+        assert_eq!(sorted.as_slice()[0], second);
+
+        // A peer may not reorder or duplicate what its publisher signed.
+        let unsorted = postcard::to_allocvec(&vec![first.clone(), second.clone()]).unwrap();
+        assert!(postcard::from_bytes::<OutputSet>(&unsorted).is_err());
+        assert_eq!(
+            OutputSet::canonical(vec![first.clone(), first.clone()]),
+            Err(JobRecordError::OutputOrder)
+        );
+        let mut anonymous = sample_output();
+        anonymous.version_id = Ulid::nil();
+        assert_eq!(
+            OutputSet::canonical(vec![anonymous]),
+            Err(JobRecordError::OutputOrder)
+        );
+        let many = (0..=MAX_EXECUTION_OUTPUTS)
+            .map(|index| OutputObject {
+                key: format!("out/{index:08}"),
+                ..sample_output()
+            })
+            .collect();
+        assert_eq!(OutputSet::canonical(many), Err(JobRecordError::OutputOrder));
+    }
+
+    fn execution_result(outputs: Vec<OutputObject>) -> JobResultPayload {
+        JobResultPayload::Execution {
+            exit_code: Some(0),
+            workspace_bucket: Some("ws".to_string()),
+            outputs,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn success_needs_identity() {
+        let execution_id = sample_output().execution_id;
+        assert!(
+            execution_result(vec![sample_output()])
+                .check_outputs(execution_id)
+                .is_ok()
+        );
+
+        let mut anonymous = sample_output();
+        anonymous.version_id = Ulid::nil();
+        assert_eq!(
+            execution_result(vec![anonymous]).check_outputs(execution_id),
+            Err(JobRecordError::OutputIdentity)
+        );
+
+        // An output produced by another execution may not ride this result.
+        let mut foreign = sample_output();
+        foreign.execution_id = Ulid::from_bytes([14u8; 16]);
+        assert_eq!(
+            execution_result(vec![foreign]).check_outputs(execution_id),
+            Err(JobRecordError::OutputIdentity)
+        );
+        assert_eq!(
+            execution_result(vec![sample_output()]).check_outputs(Ulid::nil()),
+            Err(JobRecordError::OutputIdentity)
+        );
+        assert_eq!(
+            execution_result(vec![sample_output(), sample_output()]).check_outputs(execution_id),
+            Err(JobRecordError::OutputIdentity)
+        );
+    }
+
+    #[test]
+    fn reservation_is_stable() {
+        // A replayed capture must reuse the reserved VersionId, never mint a second.
+        let mut control = AttemptControl {
+            attempt_epoch: 3,
+            execution_id: Ulid::from_bytes([13u8; 16]),
+            controller_generation: 1,
+            bound_token: None,
+            tombstone_ref: None,
+            output_commits: Vec::new(),
+        };
+        let destinations = vec![
+            ("dest".to_string(), "out/a.txt".to_string()),
+            ("dest".to_string(), "out/b.txt".to_string()),
+        ];
+        assert!(control.reserve_outputs(&destinations, Ulid::generate));
+        let reserved = control.output_commits.clone();
+        assert_eq!(reserved.len(), 2);
+        assert!(!control.reserve_outputs(&destinations, Ulid::generate));
+        assert_eq!(control.output_commits, reserved);
+
+        let grown = vec![("dest".to_string(), "out/c.txt".to_string())];
+        assert!(control.reserve_outputs(&grown, Ulid::generate));
+        assert_eq!(control.output_commits[..2], reserved[..]);
+    }
+
+    #[test]
+    fn binds_output_receipt() {
+        let receipt = sample_receipt();
+        let checked = JobRecordContext {
+            receipt: Some(&receipt),
+            ..context()
+        };
+        assert_eq!(
+            envelope(JobFamilyRecord::Output(Box::new(output_record())), 9).verify(&checked),
+            Ok(())
+        );
+        let mut foreign = output_record();
+        foreign.outputs = OutputSet::canonical(vec![OutputObject {
+            execution_id: Ulid::from_bytes([1u8; 16]),
+            ..sample_output()
+        }])
+        .unwrap();
+        assert_eq!(
+            envelope(JobFamilyRecord::Output(Box::new(foreign)), 9).verify(&checked),
+            Err(JobRecordError::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn chain_stops_gap() {
+        let root = sample_receipt().digest().unwrap();
+        let outputs = output_record().digest().unwrap();
+        let mut gapped = success_update();
+        gapped.sequence = 2;
+        let records = [gapped, sample_update()];
+        let chain = verify_update_chain(root, Some(outputs), &records).unwrap();
+        assert_eq!(chain, vec![&sample_update()]);
+
+        let mut unrooted = sample_update();
+        unrooted.previous_digest = [0u8; 32];
+        assert!(
+            verify_update_chain(root, Some(outputs), &[unrooted])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chain_stops_terminal() {
+        let root = sample_receipt().digest().unwrap();
+        let outputs = output_record().digest().unwrap();
+        let mut trailing = sample_update();
+        trailing.sequence = 2;
+        trailing.previous_digest = success_update().digest().unwrap();
+        let records = [sample_update(), success_update(), trailing];
+        let chain = verify_update_chain(root, Some(outputs), &records).unwrap();
+        assert_eq!(chain, vec![&sample_update(), &success_update()]);
+    }
+
+    #[test]
+    fn chain_requires_outputs() {
+        // A success is projected only once its exact output record is durable.
+        let root = sample_receipt().digest().unwrap();
+        let records = [sample_update(), success_update()];
+        assert_eq!(
+            verify_update_chain(root, None, &records).unwrap(),
+            vec![&sample_update()]
+        );
+        assert_eq!(
+            verify_update_chain(root, Some([3u8; 32]), &records).unwrap(),
+            vec![&sample_update()]
+        );
+        let outputs = output_record().digest().unwrap();
+        assert_eq!(
+            verify_update_chain(root, Some(outputs), &records)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn chain_rejects_conflict() {
+        let root = sample_receipt().digest().unwrap();
+        let mut rival = sample_update();
+        rival.observed_at_ms += 1;
+        assert_eq!(
+            verify_update_chain(root, None, &[sample_update(), rival]),
+            Err(JobRecordError::ChainConflict { sequence: 0 })
+        );
+        // An exact replay of one record is a no-op, not a conflict.
+        assert_eq!(
+            verify_update_chain(root, None, &[sample_update(), sample_update()])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn key_bytes_ordered() {
+        let mut keys = vec![
+            JobFamilyRecord::Cancel(sample_cancel()).key(),
+            JobFamilyRecord::Spec(Box::new(sample_spec())).key(),
+            JobFamilyRecord::Update(Box::new(success_update())).key(),
+            JobFamilyRecord::Update(Box::new(sample_update())).key(),
+            JobFamilyRecord::Receipt(Box::new(sample_receipt())).key(),
+        ];
+        keys.sort();
+        let mut encoded: Vec<[u8; JOB_RECORD_KEY_BYTES]> =
+            keys.iter().map(JobRecordKey::to_bytes).collect();
+        encoded.sort();
+        assert_eq!(
+            encoded,
+            keys.iter()
+                .map(JobRecordKey::to_bytes)
+                .collect::<Vec<[u8; JOB_RECORD_KEY_BYTES]>>()
+        );
+        for key in keys {
+            assert_eq!(JobRecordKey::from_bytes(&key.to_bytes()), Ok(key));
+        }
+        assert_eq!(
+            JobRecordKey::from_bytes(&[0u8; JOB_RECORD_KEY_BYTES - 1]),
+            Err(JobRecordError::MalformedKey)
+        );
+    }
+
+    #[test]
+    fn bounds_result_message() {
+        assert!(ResultMessage::new("m".repeat(MAX_RESULT_MESSAGE_BYTES)).is_ok());
+        assert_eq!(
+            ResultMessage::new("m".repeat(MAX_RESULT_MESSAGE_BYTES + 1)),
+            Err(JobRecordError::MessageBytes)
+        );
+        let over = postcard::to_allocvec(&"m".repeat(MAX_RESULT_MESSAGE_BYTES + 1)).unwrap();
+        assert!(postcard::from_bytes::<ResultMessage>(&over).is_err());
     }
 
     #[test]

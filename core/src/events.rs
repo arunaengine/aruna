@@ -7,7 +7,7 @@ use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceErro
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
-    BackendLocation, ExecutionReceipt, GroupRoutingInputs, HiddenBlobEntry, PlacementDecision,
+    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, JobRecordEnvelope, PlacementDecision,
     PlacementPolicy, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
     ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
@@ -262,7 +262,9 @@ impl TryFrom<Vec<JobRecordFrame>> for JobRecordPage {
     }
 }
 
-/// Reply to a [`crate::effects::JobRecordEffect`].
+/// Reply to a [`crate::effects::JobRecordEffect`]. `holder` is the authenticated
+/// peer that answered; each record keeps its own publisher inside its envelope,
+/// so relaying a record never makes the holder its author.
 #[derive(Debug, PartialEq)]
 pub enum JobRecordEvent {
     /// One current holder durably accepted the immutable record.
@@ -275,6 +277,7 @@ pub enum JobRecordEvent {
     },
     /// At most the requested page of records, oldest key first.
     Fetched {
+        holder: NodeId,
         records: JobRecordPage,
         next_cursor: Option<FetchCursor>,
     },
@@ -288,17 +291,24 @@ pub enum JobRecordRejection {
     NotHolder,
     /// A record with the same key and different bytes is already retained.
     Conflict,
-    /// The publisher is not the record's only permitted author.
+    /// The publisher signature or the kind's exact author rule failed.
     Unauthorized,
     /// The record failed contract validation, such as budget or chain rules.
     Invalid,
 }
 
-/// Reply to a [`crate::effects::LaunchOfferEffect`].
+/// Reply to a [`crate::effects::LaunchOfferEffect`]. The receipt arrives in the
+/// target's own signed envelope, so the scheduler replicates it with its author.
 #[derive(Debug, PartialEq)]
 pub enum LaunchOfferEvent {
-    Accepted(Box<ExecutionReceipt>),
-    Declined(LaunchDecline),
+    Accepted {
+        target: NodeId,
+        receipt: Box<JobRecordEnvelope>,
+    },
+    Declined {
+        target: NodeId,
+        reason: LaunchDecline,
+    },
     /// The target was unreachable; it may still have accepted the launch.
     Unavailable(String),
 }
@@ -373,31 +383,15 @@ pub enum NetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effects::{JobFamilyRecord, MAX_JOB_RECORD_BYTES};
-    use crate::structs::{ExecutionUpdate, PhysicalExecutionResult, PhysicalExecutionState};
+    use crate::effects::sized_envelope;
 
-    fn update(message: usize) -> JobFamilyRecord {
-        JobFamilyRecord::Update(ExecutionUpdate {
-            execution_id: Ulid::from_bytes([5u8; 16]),
-            sequence: 2,
-            previous_digest: None,
-            state: PhysicalExecutionState::Running,
-            observed_at_ms: 3,
-            result: Some(PhysicalExecutionResult {
-                exit_code: None,
-                outputs: Vec::new(),
-                message: Some("m".repeat(message)),
-            }),
-        })
-    }
-
-    fn frame(message: usize) -> JobRecordFrame {
-        JobRecordFrame::new(update(message)).expect("bounded record")
+    fn frame(objects: usize, key_bytes: usize) -> JobRecordFrame {
+        JobRecordFrame::new(sized_envelope(objects, key_bytes)).expect("bounded record")
     }
 
     #[test]
     fn rejects_wide_page() {
-        let records = vec![frame(1); MAX_JOB_RECORD_PAGE + 1];
+        let records = vec![frame(1, 8); MAX_JOB_RECORD_PAGE + 1];
         assert_eq!(
             JobRecordPage::new(records.clone()),
             Err(FrameBoundsError::RecordCount)
@@ -414,14 +408,14 @@ mod tests {
     fn rejects_decoded_record() {
         // A page frame may not smuggle a record past the per-record byte bound.
         let encoded =
-            postcard::to_allocvec(&vec![update(MAX_JOB_RECORD_BYTES)]).expect("records encode");
+            postcard::to_allocvec(&vec![sized_envelope(1024, 1200)]).expect("records encode");
         assert!(JobRecordPage::from_bytes(&encoded).is_err());
     }
 
     #[test]
     fn rejects_heavy_page() {
         // A record count within the page bound still cannot exceed the byte bound.
-        let records = vec![frame(MAX_JOB_RECORD_BYTES - 64); 8];
+        let records = vec![frame(1024, 800); 5];
         assert_eq!(
             JobRecordPage::new(records),
             Err(FrameBoundsError::PageBytes)
@@ -435,9 +429,21 @@ mod tests {
 
     #[test]
     fn page_round_trips() {
-        let page = JobRecordPage::new(vec![frame(4), frame(8)]).expect("bounded page");
+        let page = JobRecordPage::new(vec![frame(1, 8), frame(2, 8)]).expect("bounded page");
         let bytes = page.to_bytes().expect("page encodes");
         assert_eq!(JobRecordPage::from_bytes(&bytes), Ok(page.clone()));
         assert_eq!(page.records().len(), 2);
+    }
+
+    #[test]
+    fn page_keeps_publishers() {
+        // Paging is transport: every relayed record keeps its own publisher.
+        let envelope = sized_envelope(3, 8);
+        let page = JobRecordPage::new(vec![frame(3, 8)]).expect("bounded page");
+        let bytes = page.to_bytes().expect("page encodes");
+        let relayed = JobRecordPage::from_bytes(&bytes).expect("page decodes");
+        let first = relayed.records()[0].envelope();
+        assert_eq!(first.published_by, envelope.published_by);
+        assert!(first.verify_signature().is_ok());
     }
 }
