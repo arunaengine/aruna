@@ -38,7 +38,6 @@ use aruna_operations::jobs::drain::restore_job_queue_timer;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
-use aruna_operations::replication::migration::migrate_legacy_sync;
 #[cfg(debug_assertions)]
 use aruna_operations::startup::RecoveryState;
 use aruna_operations::startup::{
@@ -356,21 +355,6 @@ async fn prepare_startup(
     }
 
     let announcement = prepare_mode(config, driver_ctx, net_handle).await?;
-    match migrate_legacy_sync(driver_ctx.as_ref(), config.node_id, config.realm_id).await {
-        Ok(summary) if summary.failed > 0 => warn!(
-            migrated = summary.migrated,
-            skipped = summary.skipped,
-            failed = summary.failed,
-            "Legacy S3 replication migration incomplete; startup will retry"
-        ),
-        Ok(summary) if !summary.already_complete => info!(
-            migrated = summary.migrated,
-            skipped = summary.skipped,
-            "Migrated legacy S3 replication configs"
-        ),
-        Ok(_) => {}
-        Err(error) => warn!(%error, "Failed to migrate legacy S3 replication configs"),
-    }
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
     prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;

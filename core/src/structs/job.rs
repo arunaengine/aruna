@@ -1140,7 +1140,6 @@ pub struct JobRecord {
     pub attempt_intent: Option<AttemptIntent>,
     /// Durable workspace/run bucket name (`ws-{jobid}`) for execution jobs.
     pub workspace_bucket: Option<String>,
-    #[serde(default)]
     pub workspace_mode: WorkspaceMode,
     pub report_digest: Option<[u8; 32]>,
     pub retention_ms: u64,
@@ -1200,23 +1199,7 @@ impl JobRecord {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        match postcard::from_bytes(bytes) {
-            Ok(record) => Ok(record),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                let mut previous = bytes.to_vec();
-                previous.extend(postcard::to_allocvec(&Option::<[u8; 32]>::None)?);
-                previous.extend(postcard::to_allocvec(&DEFAULT_JOB_RETENTION_MS)?);
-                if let Ok(record) = postcard::from_bytes(&previous) {
-                    return Ok(record);
-                }
-                let mut legacy = bytes.to_vec();
-                legacy.extend(postcard::to_allocvec(&WorkspaceMode::default())?);
-                legacy.extend(postcard::to_allocvec(&Option::<[u8; 32]>::None)?);
-                legacy.extend(postcard::to_allocvec(&DEFAULT_JOB_RETENTION_MS)?);
-                Ok(postcard::from_bytes(&legacy)?)
-            }
-            Err(error) => Err(error.into()),
-        }
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -2283,22 +2266,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_record_defaults() {
+    fn rejects_short_record() {
+        // A predecessor-format record must fail loudly, never decode with defaults.
         let record = probe_record(JobId::from_bytes([6u8; 16]), 1_700_000_000_000);
-        let mut bytes = record.to_bytes().unwrap();
+        let bytes = record.to_bytes().unwrap();
         let retention = postcard::to_allocvec(&record.retention_ms).unwrap();
-        bytes.truncate(bytes.len() - retention.len());
         let digest = postcard::to_allocvec(&Option::<[u8; 32]>::None).unwrap();
-        bytes.truncate(bytes.len() - digest.len());
         let mode = postcard::to_allocvec(&WorkspaceMode::Kept).unwrap();
-        bytes.truncate(bytes.len() - mode.len());
 
-        let decoded = JobRecord::from_bytes(&bytes).unwrap();
-
-        assert_eq!(decoded.workspace_mode, WorkspaceMode::Kept);
-        assert_eq!(decoded.workspace_bucket, record.workspace_bucket);
-        assert_eq!(decoded.report_digest, None);
-        assert_eq!(decoded.retention_ms, DEFAULT_JOB_RETENTION_MS);
+        for trim in [
+            retention.len(),
+            retention.len() + digest.len(),
+            retention.len() + digest.len() + mode.len(),
+        ] {
+            assert!(JobRecord::from_bytes(&bytes[..bytes.len() - trim]).is_err());
+        }
     }
 
     fn submission() -> SubmissionId {
