@@ -2,8 +2,8 @@ use crate::credential_seal::{CredentialSealKey, SealError, SealedS3Secret, crede
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
-    BucketReplicationConfig, GroupBackendKind, PathRestriction, RealmId, SourceMetadata,
-    StorageRoutingRule, VersionSourceBinding,
+    BucketReplicationConfig, GroupBackendKind, PathRestriction, PlacementPolicyRef, RealmId,
+    SourceMetadata, StorageRoutingRule, VersionSourceBinding,
 };
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
@@ -529,6 +529,12 @@ pub struct BucketInfo {
     /// Bucket, prefix and exact-key write routing rules, most specific first at
     /// resolution time. Empty means the group default decides.
     pub storage_routing: Vec<StorageRoutingRule>,
+    /// Refs snapshotted onto every version minted here, canonically sorted.
+    /// Empty means unrestricted.
+    pub placement_policies: Vec<PlacementPolicyRef>,
+    /// Advances on each default change, so a write that read an older default
+    /// is detectable at commit time.
+    pub placement_policy_generation: u64,
 }
 
 impl BucketInfo {
@@ -740,6 +746,111 @@ impl VersionKey {
     }
 }
 
+/// One row per (version, backend): a node may hold the same logical version on
+/// more than one of its local backends.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedCopyKey {
+    pub version: VersionKey,
+    pub backend: BackendRef,
+}
+
+impl ManagedCopyKey {
+    pub fn new(version: VersionKey, backend: BackendRef) -> Self {
+        Self { version, backend }
+    }
+
+    /// Scans every local backend holding one logical version.
+    pub fn version_prefix(version: &VersionKey) -> Result<Vec<u8>, ConversionError> {
+        version.to_bytes()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// This node's registration of one logical version copy. Local inventory only:
+/// it never claims anything about copies held elsewhere in the realm.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedCopyRecord {
+    pub version: VersionKey,
+    pub node_id: NodeId,
+    pub location: BackendLocation,
+    /// Refs sealed with the copy, canonically sorted. Empty means unrestricted.
+    pub policies: Vec<PlacementPolicyRef>,
+    pub registered_at_ms: u64,
+    pub state: ManagedCopyState,
+}
+
+impl ManagedCopyRecord {
+    pub fn new(
+        version: VersionKey,
+        node_id: NodeId,
+        location: BackendLocation,
+        policies: Vec<PlacementPolicyRef>,
+        registered_at_ms: u64,
+        state: ManagedCopyState,
+    ) -> Self {
+        Self {
+            version,
+            node_id,
+            location,
+            policies: canonical_policies(policies),
+            registered_at_ms,
+            state,
+        }
+    }
+
+    pub fn key(&self) -> ManagedCopyKey {
+        ManagedCopyKey::new(self.version.clone(), self.location.backend.clone())
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ManagedCopyState {
+    /// Registered and compliant with every ref in `policies`.
+    Registered,
+    Quarantined(ManagedCopyQuarantine),
+    /// Last known on a node that left: neither serveable nor proven erased.
+    UnresolvedDeparted,
+}
+
+impl ManagedCopyState {
+    pub fn is_serveable(&self) -> bool {
+        match self {
+            Self::Registered => true,
+            Self::Quarantined(_) | Self::UnresolvedDeparted => false,
+        }
+    }
+}
+
+/// Why a registered copy stopped being serveable until it is re-evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ManagedCopyQuarantine {
+    Rejoin,
+    SubjectTransition,
+    PolicyViolation,
+}
+
+/// Sorted and deduplicated refs: one ref set has exactly one encoding.
+fn canonical_policies(mut policies: Vec<PlacementPolicyRef>) -> Vec<PlacementPolicyRef> {
+    policies.sort_unstable();
+    policies.dedup();
+    policies
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CurrentVersionPointer {
     pub version_id: Ulid,
@@ -790,6 +901,9 @@ pub struct BlobVersion {
     /// only to the manifest's self-asserted `created_by`.
     #[serde(default)]
     pub published_by: Option<NodeId>,
+    /// Effective refs sealed when this version was minted, canonically sorted.
+    /// Empty means unrestricted; a later attachment mints a successor instead.
+    pub placement_policies: Vec<PlacementPolicyRef>,
 }
 
 impl BlobVersion {
@@ -810,6 +924,7 @@ impl BlobVersion {
             },
             metadata: HashMap::new(),
             published_by: None,
+            placement_policies: Vec::new(),
         }
     }
 
@@ -820,6 +935,7 @@ impl BlobVersion {
             state: BlobVersionState::Deleted,
             metadata: HashMap::new(),
             published_by: None,
+            placement_policies: Vec::new(),
         }
     }
 
@@ -841,11 +957,18 @@ impl BlobVersion {
             },
             metadata: HashMap::new(),
             published_by: None,
+            placement_policies: Vec::new(),
         }
     }
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Seals the effective ref set. Sorting here keeps one ref set encoding.
+    pub fn with_policies(mut self, policies: Vec<PlacementPolicyRef>) -> Self {
+        self.placement_policies = canonical_policies(policies);
         self
     }
 
@@ -1045,14 +1168,16 @@ impl UserAccess {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketCorsConfiguration,
-        BucketCorsRule, CurrentVersionPointer, HashPathIndexKey, HiddenBlobKey,
-        blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
+        Backend, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+        BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
+        HashPathIndexKey, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
+        ManagedCopyState, VersionKey, blob_bucket_permission_path, blob_group_permission_path,
+        blob_object_permission_path,
     };
     use crate::NodeId;
     use crate::structs::{
-        PortableSourceDescriptor, RealmId, SourceConnectorKind, SourceMetadata, StagingStrategy,
-        VersionSourceBinding,
+        PlacementPolicyRef, PortableSourceDescriptor, RealmId, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionSourceBinding,
     };
     use crate::types::UserId;
     use std::collections::HashMap;
@@ -1456,6 +1581,146 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    fn policy_ref(byte: u8) -> PlacementPolicyRef {
+        PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([byte; 16]),
+            digest: [byte; 32],
+        }
+    }
+
+    fn sample_location(backend: BackendRef) -> BackendLocation {
+        BackendLocation {
+            backend,
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "storage".to_string(),
+            backend_path: "object.bin".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 7,
+            hashes: HashMap::new(),
+        }
+    }
+
+    fn sample_copy(state: ManagedCopyState) -> ManagedCopyRecord {
+        ManagedCopyRecord::new(
+            VersionKey::new("bucket", "nested/object.bin", Ulid::from_bytes([1u8; 16])),
+            NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
+                .unwrap(),
+            sample_location(BackendRef::node_default()),
+            vec![policy_ref(3), policy_ref(2)],
+            1_700_000_000_000,
+            state,
+        )
+    }
+
+    #[test]
+    fn managed_copy_roundtrip() {
+        for state in [
+            ManagedCopyState::Registered,
+            ManagedCopyState::Quarantined(ManagedCopyQuarantine::Rejoin),
+            ManagedCopyState::Quarantined(ManagedCopyQuarantine::SubjectTransition),
+            ManagedCopyState::Quarantined(ManagedCopyQuarantine::PolicyViolation),
+            ManagedCopyState::UnresolvedDeparted,
+        ] {
+            let record = sample_copy(state);
+            let bytes = record.to_bytes().unwrap();
+            let restored = ManagedCopyRecord::from_bytes(&bytes).unwrap();
+
+            assert_eq!(record, restored);
+            assert_eq!(restored.to_bytes().unwrap(), bytes);
+            assert_eq!(state.is_serveable(), state == ManagedCopyState::Registered);
+        }
+    }
+
+    #[test]
+    fn copy_refs_sorted() {
+        // Two orderings of one ref set must produce the same stored bytes.
+        let mut reversed = sample_copy(ManagedCopyState::Registered);
+        reversed.policies = vec![policy_ref(2), policy_ref(3)];
+
+        let record = sample_copy(ManagedCopyState::Registered);
+
+        assert_eq!(record.policies, vec![policy_ref(2), policy_ref(3)]);
+        assert_eq!(record.to_bytes().unwrap(), reversed.to_bytes().unwrap());
+    }
+
+    #[test]
+    fn copy_key_scans() {
+        let version = VersionKey::new("bucket", "nested/object.bin", Ulid::from_bytes([1u8; 16]));
+        let node = ManagedCopyKey::new(version.clone(), BackendRef::node_default());
+        let group = ManagedCopyKey::new(
+            version.clone(),
+            BackendRef::Group(Ulid::from_bytes([4u8; 16])),
+        );
+
+        let node_bytes = node.to_bytes().unwrap();
+        let group_bytes = group.to_bytes().unwrap();
+
+        assert_ne!(node_bytes, group_bytes);
+        assert_eq!(ManagedCopyKey::from_bytes(&node_bytes).unwrap(), node);
+        assert_eq!(ManagedCopyKey::from_bytes(&group_bytes).unwrap(), group);
+        let version_prefix = ManagedCopyKey::version_prefix(&version).unwrap();
+        assert!(node_bytes.starts_with(&version_prefix));
+        assert!(group_bytes.starts_with(&version_prefix));
+        assert!(node_bytes.starts_with(&VersionKey::bucket_prefix("bucket").unwrap()));
+        assert_eq!(sample_copy(ManagedCopyState::Registered).key(), node);
+    }
+
+    #[test]
+    fn version_policies_sorted() {
+        // A version's stored ref set must not depend on the caller's order.
+        let created_at = SystemTime::UNIX_EPOCH;
+        let plain = BlobVersion::deleted(created_at, UserId::default());
+        assert!(plain.placement_policies.is_empty());
+
+        let version = BlobVersion::materialized(
+            [1u8; 32],
+            BackendRef::node_default(),
+            created_at,
+            UserId::default(),
+            None,
+        )
+        .with_policies(vec![policy_ref(9), policy_ref(4), policy_ref(9)]);
+
+        let bytes = version.to_bytes().unwrap();
+        let restored = BlobVersion::from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            version.placement_policies,
+            vec![policy_ref(4), policy_ref(9)]
+        );
+        assert_eq!(version, restored);
+        assert_eq!(restored.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn bucket_defaults_roundtrip() {
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+            placement_policies: vec![policy_ref(1), policy_ref(6)],
+            placement_policy_generation: 7,
+        };
+
+        let bytes = info.to_bytes().unwrap();
+        let restored = BucketInfo::from_bytes(&bytes).unwrap();
+
+        assert_eq!(info, restored);
+        assert_eq!(restored.to_bytes().unwrap(), bytes);
+        // A default change is configuration, never bucket identity.
+        assert_eq!(info.identity(), restored.identity());
     }
 
     #[test]

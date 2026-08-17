@@ -1586,6 +1586,8 @@ mod test {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let edited = BucketInfo {
             storage_routing: vec![aruna_core::structs::StorageRoutingRule {
@@ -1628,6 +1630,8 @@ mod test {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let recreated = BucketInfo {
             created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),

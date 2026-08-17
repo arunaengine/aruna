@@ -553,6 +553,8 @@ mod tests {
                 exact: false,
                 target: RoutingTarget::Class("cold".to_string()),
             }],
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let event = storage_handle
             .send_storage_effect(StorageEffect::Write {

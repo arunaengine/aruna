@@ -3079,6 +3079,8 @@ mod tests {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
         let version = BlobVersion::materialized(

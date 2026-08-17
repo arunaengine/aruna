@@ -184,6 +184,8 @@ pub(crate) mod test_utils {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         drive(
             CreateBucketOperation::new(bucket.to_string(), info.clone()),

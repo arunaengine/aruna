@@ -68,6 +68,10 @@ pub const BLOB_HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
+/// Local inventory of the logical version copies this node has registered.
+/// Written and removed atomically with the operation that exposes a copy
+/// locally; it is never evidence about another node's copies.
+pub const MANAGED_COPY_KEYSPACE: &str = "managed_copies";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";

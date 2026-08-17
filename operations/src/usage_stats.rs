@@ -2074,6 +2074,8 @@ mod tests {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             &ctx,
@@ -2177,6 +2179,8 @@ mod tests {
                 cors_configuration: None,
                 replication: None,
                 storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -2499,6 +2503,8 @@ mod tests {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             &ctx,

@@ -1909,6 +1909,7 @@ impl Operation for ReplicateObjectVersionOperation {
                     state,
                     metadata,
                     published_by: _,
+                    placement_policies: _,
                 } = version;
 
                 match state {
@@ -2429,6 +2430,8 @@ mod tests {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 

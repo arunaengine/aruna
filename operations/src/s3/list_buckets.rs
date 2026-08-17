@@ -278,6 +278,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             (
@@ -289,6 +291,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             (
@@ -300,6 +304,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
         ] {
@@ -352,6 +358,8 @@ mod test {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let entry = |name: &str, group_id| {
             (
@@ -416,6 +424,8 @@ mod test {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let entry = |name: &str, group_id| {
             (
@@ -488,6 +498,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 }
                 .to_bytes()
                 .unwrap()

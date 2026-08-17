@@ -134,6 +134,8 @@ pub async fn ensure_workspace_bucket(
         cors_configuration: None,
         replication: None,
         storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
     };
     match Box::pin(drive(
         CreateBucketOperation::new(bucket.to_string(), bucket_info),

@@ -1300,6 +1300,8 @@ mod test {
             cors_configuration: None,
             replication: None,
             storage_routing: vec![rule.clone()],
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let record = GroupStorageRouting {
             group_id,
@@ -3052,6 +3054,8 @@ mod routing_tests {
             cors_configuration: None,
             replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 

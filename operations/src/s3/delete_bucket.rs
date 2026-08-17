@@ -524,6 +524,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             &driver_ctx,
@@ -579,6 +581,8 @@ mod test {
                         targets: vec![make_replication_target(&bucket)],
                     }),
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             &driver_ctx,
@@ -631,6 +635,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             &driver_ctx,
@@ -754,6 +760,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 }
                 .to_bytes()
                 .unwrap()
@@ -819,6 +827,8 @@ mod test {
                     cors_configuration: None,
                     replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 }
                 .to_bytes()
                 .unwrap()
