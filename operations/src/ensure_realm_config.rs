@@ -368,6 +368,36 @@ impl EnsureRealmConfigOperation {
                 AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
             )?);
         }
+        // A fresh document seeds its strategies locally; without the matching
+        // reducer events a later reducer-only rebuild loses them and the sealed
+        // family routing with them.
+        if fresh
+            && reducer_state.materialized_family_strategy().is_none()
+            && reducer_state
+                .materialized_realm_config_placement_strategies()
+                .is_empty()
+        {
+            for strategy in &document.strategies {
+                admin_events.push(reducer_state.apply_operation(
+                    &self.config.actor,
+                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                        strategy: strategy.clone(),
+                    },
+                )?);
+            }
+            if let Some(strategy_id) = document.default_strategy_id {
+                admin_events.push(reducer_state.apply_operation(
+                    &self.config.actor,
+                    AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+                )?);
+            }
+            admin_events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigJobFamilySet {
+                    strategy_id: document.job_family_strategy_id,
+                },
+            )?);
+        }
         overlay_realm_config_reducer_materialization(
             &mut document,
             &reducer_state,

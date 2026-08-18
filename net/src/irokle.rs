@@ -4922,7 +4922,11 @@ fn realm_config_from_reducer_materialization(
         placement_map: Vec::new(),
         strategies: Vec::new(),
         default_strategy_id: None,
-        job_family_strategy_id: Ulid::nil(),
+        // Rebuilt from the reducer, never reset: the overlay below would restore
+        // it anyway, and a hardcoded nil here would defeat family routing.
+        job_family_strategy_id: reducer_state
+            .materialized_family_strategy()
+            .unwrap_or_else(Ulid::nil),
         strategy_bindings: Vec::new(),
         placement_overrides: Vec::new(),
         placement_bindings: Vec::new(),
@@ -6290,6 +6294,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
             | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
             | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+            | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
             | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
             | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
@@ -8153,6 +8158,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
         | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
         | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+        | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
@@ -8282,6 +8288,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
         | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+        | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }

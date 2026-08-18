@@ -9,7 +9,7 @@ use crate::structs::{
     DocumentClass, FrozenStrategySelector, HandleRange, HandleRangeDirectory, JobId,
     KIND_LABEL_KEY, METADATA_HANDLE, NodePlacementEntry, PlacementActivation, PlacementBinding,
     PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, PlacementTransition,
-    SHARD_SUBJECT_LEN, StrategyBinding, coordinator_spans, shard_for_subject,
+    SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, coordinator_spans, shard_for_subject,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -514,7 +514,19 @@ impl RealmConfigDocument {
             affinity: Vec::new(),
             shard_count: DEFAULT_SHARD_COUNT,
         };
+        // Submission families route through their own strategy for the life of
+        // the realm, so ordinary default-strategy administration stays free
+        // while this identity and its shard count are fenced as immutable.
+        let job_family_strategy = PlacementStrategy {
+            strategy_id: Ulid::generate(),
+            name: "job-family".to_string(),
+            replica_count: Some(self.metadata_replication.default_replication_factor),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: DEFAULT_SHARD_COUNT,
+        };
         self.default_strategy_id = Some(default_strategy.strategy_id);
+        self.job_family_strategy_id = job_family_strategy.strategy_id;
         self.strategy_bindings = [
             DocumentClass::MetadataRegistry,
             DocumentClass::Admin,
@@ -544,7 +556,7 @@ impl RealmConfigDocument {
             allocated_by: None,
             allocated_at_ms: None,
         }];
-        self.strategies = vec![default_strategy, everywhere_strategy];
+        self.strategies = vec![default_strategy, everywhere_strategy, job_family_strategy];
     }
 
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
@@ -657,6 +669,25 @@ impl RealmConfigDocument {
         self.strategies
             .iter()
             .find(|strategy| strategy.strategy_id == *strategy_id)
+    }
+
+    /// The one submission-family placement every node derives. Ingress, holder,
+    /// target, fetch, and audit routes all resolve it here; a missing or
+    /// dangling family strategy is refused instead of defaulted.
+    pub fn family_placement(
+        &self,
+        submission_id: SubmissionId,
+    ) -> Result<PlacementRef, JobFamilyError> {
+        if self.job_family_strategy_id.is_nil() {
+            return Err(JobFamilyError::Unset);
+        }
+        let strategy = self
+            .strategy(&self.job_family_strategy_id)
+            .ok_or(JobFamilyError::Dangling(self.job_family_strategy_id))?;
+        Ok(PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard: shard_for_subject(&submission_id.0, strategy.shard_count),
+        })
     }
 
     /// Strategy a class-scoped document rides: class binding, realm binding,
@@ -915,6 +946,16 @@ pub enum ClassStrategyError {
     Dangling { strategy_id: Ulid },
 }
 
+/// Why submission-family placement cannot be derived. Both cases refuse
+/// admission; neither ever falls back to the realm default strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum JobFamilyError {
+    #[error("realm config names no job family placement strategy")]
+    Unset,
+    #[error("job family strategy {0} is not defined in this realm")]
+    Dangling(Ulid),
+}
+
 /// Failure of the pure `JobId -> owner` derivation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum JobOwnerError {
@@ -1020,9 +1061,11 @@ mod test {
         Actor, CandidatePlacementMap, DynamicDiscoveryMethod, KIND_LABEL_KEY,
         MetadataGroupReplicationOverride, MetadataPathReplicationOverride, OidcProviderConfig,
         RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, TokenRevocation, default_realm_discovery_config,
+        RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
     };
     use ulid::Ulid;
+
+    use super::JobFamilyError;
 
     #[test]
     pub fn test_realm_auth_doc_conversion() {
@@ -1130,6 +1173,60 @@ mod test {
         let mut without = bytes.clone();
         without.drain(start - 1..start + text.len());
         assert!(RealmConfigDocument::from_bytes(&without).is_err());
+    }
+
+    #[test]
+    fn seeds_family_strategy() {
+        // Fresh creation must select a real strategy, not the nil placeholder.
+        let mut config = RealmConfigDocument::new(RealmId([9u8; 32]), Vec::new(), 3);
+        assert!(config.job_family_strategy_id.is_nil());
+        config.seed_default_placement();
+
+        assert!(!config.job_family_strategy_id.is_nil());
+        assert!(config.strategy(&config.job_family_strategy_id).is_some());
+        assert_ne!(
+            Some(config.job_family_strategy_id),
+            config.default_strategy_id
+        );
+    }
+
+    #[test]
+    fn derives_family_placement() {
+        // Two independently built configs sharing the sealed strategy must
+        // derive one identical placement for the same submission.
+        let mut left = RealmConfigDocument::new(RealmId([10u8; 32]), Vec::new(), 3);
+        left.seed_default_placement();
+        let mut right = RealmConfigDocument::new(RealmId([11u8; 32]), Vec::new(), 5);
+        right.strategies = left.strategies.clone();
+        right.job_family_strategy_id = left.job_family_strategy_id;
+
+        let submission = SubmissionId([7u8; 32]);
+        let placement = left.family_placement(submission).unwrap();
+        assert_eq!(placement.strategy_id, left.job_family_strategy_id);
+        assert_eq!(Ok(placement), right.family_placement(submission));
+        assert_ne!(
+            placement.shard,
+            left.family_placement(SubmissionId([8u8; 32]))
+                .unwrap()
+                .shard
+        );
+    }
+
+    #[test]
+    fn refuses_unset_family() {
+        let mut config = RealmConfigDocument::new(RealmId([12u8; 32]), Vec::new(), 3);
+        let submission = SubmissionId([1u8; 32]);
+        assert_eq!(
+            config.family_placement(submission),
+            Err(JobFamilyError::Unset)
+        );
+
+        let dangling = Ulid::from_bytes([5u8; 16]);
+        config.job_family_strategy_id = dangling;
+        assert_eq!(
+            config.family_placement(submission),
+            Err(JobFamilyError::Dangling(dangling))
+        );
     }
 
     #[test]

@@ -266,6 +266,12 @@ pub enum AdminDocumentOperation {
         bucket: u32,
         reported_by: NodeId,
     },
+    /// Seals the realm's submission-family placement strategy at creation. The
+    /// reducer refuses a nil id and any later change, so family routing is
+    /// immutable once one node has observed it.
+    RealmConfigJobFamilySet {
+        strategy_id: Ulid,
+    },
 }
 
 #[cfg(test)]
