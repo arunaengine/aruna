@@ -199,6 +199,10 @@ pub struct RealmConfigDocument {
     pub revoked_tokens: Vec<TokenRevocation>,
     /// Highest validation/compaction time observed for the revocation set.
     pub revocation_floor: u64,
+    /// Operator knowledge the planner reads: directed transfer bandwidth and
+    /// the staleness bound of ranking telemetry.
+    #[serde(default)]
+    pub compute: crate::structs::RealmComputeConfig,
 }
 
 /// One realm-wide bearer token revocation. The expiry is the revoked token's
@@ -472,6 +476,7 @@ impl RealmConfigDocument {
             candidate_maps: Vec::new(),
             placement_activations: Vec::new(),
             placement_transitions: Vec::new(),
+            compute: crate::structs::RealmComputeConfig::default(),
         }
     }
 
@@ -1116,6 +1121,7 @@ mod test {
             request_policies: Vec::new(),
             revoked_tokens: Vec::new(),
             revocation_floor: 0,
+            compute: Default::default(),
             description: "Example Realm".to_string(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
@@ -1613,6 +1619,7 @@ mod test {
             request_policies: Vec::new(),
             revoked_tokens: Vec::new(),
             revocation_floor: 0,
+            compute: Default::default(),
             description: String::new(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
