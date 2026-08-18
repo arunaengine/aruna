@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
-use super::config::KubernetesConfig;
+use super::config::{KubernetesConfig, MAX_NODE_SELECTOR_ENTRIES};
 use super::logs::{BoundedTail, LogSink};
 use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, digest_pinned};
@@ -46,9 +46,9 @@ use super::{BackendCaps, ExecutorBackend, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, StageMarker, WORKLOAD_SA, WORKSPACE_PATH, helper_pod, job_manifest,
-    marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest,
-    needs_workspace, network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
+    HELPER_PATH, StageMarker, WORKSPACE_PATH, helper_pod, job_manifest, marker_manifest,
+    marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
+    network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -833,12 +833,19 @@ impl ExecutorBackend for KubernetesBackend {
         ExecutorKind::Kubernetes
     }
 
+    /// Workers do not run on the controller: the advertised site is the
+    /// configured worker placement, and network isolation only counts as proven
+    /// when those pods are actually pinned to it.
     fn capabilities(&self) -> BackendCaps {
+        let worker_site = self.config.worker_site();
         BackendCaps {
             file_staging: true,
             direct_s3: !self.config.s3_cidrs.is_empty(),
             s3_mount: self.config.s3_mount_driver.is_some(),
-            ..BackendCaps::default()
+            network_policy: worker_site.is_some(),
+            local_site: false,
+            worker_site,
+            limits: self.config.envelope,
         }
     }
 
@@ -864,7 +871,10 @@ impl ExecutorBackend for KubernetesBackend {
         }
         let accounts: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
-        accounts.get(WORKLOAD_SA).await.map_err(kube_error)?;
+        accounts
+            .get(&self.config.service_account)
+            .await
+            .map_err(kube_error)?;
         for (group, resource, subresource, verb) in
             required_access(self.config.s3_mount_driver.is_some())
         {
@@ -1346,6 +1356,21 @@ fn validate_config(config: &KubernetesConfig) -> Result<(), BackendError> {
         return Err(BackendError::InvalidSpec(
             "Kubernetes deadlines and ports must be nonzero".to_string(),
         ));
+    }
+    if config.service_account.trim().is_empty() {
+        return Err(BackendError::InvalidSpec(
+            "Kubernetes workload service account is required".to_string(),
+        ));
+    }
+    let bounded = |entries: &std::collections::BTreeMap<String, String>| {
+        entries.len() <= MAX_NODE_SELECTOR_ENTRIES
+            && entries.keys().all(|key| !key.trim().is_empty())
+    };
+    if !bounded(&config.node_selector) || !bounded(&config.execution_labels) {
+        return Err(BackendError::InvalidSpec(format!(
+            "Kubernetes selectors and worker labels are at most \
+             {MAX_NODE_SELECTOR_ENTRIES} named entries"
+        )));
     }
     Ok(())
 }
@@ -2145,6 +2170,7 @@ mod tests {
             s3_cidrs: Vec::new(),
             s3_port: 443,
             s3_mount_driver: None,
+            ..Default::default()
         }
     }
 
@@ -2454,6 +2480,7 @@ mod tests {
             s3_cidrs: Vec::new(),
             s3_port: 443,
             s3_mount_driver: None,
+            ..Default::default()
         };
         assert!(validate_config(&config).is_err());
     }
@@ -2538,7 +2565,7 @@ mod tests {
                         200,
                         json!({
                             "apiVersion":"v1","kind":"ServiceAccount",
-                            "metadata":{"name":WORKLOAD_SA}
+                            "metadata":{"name":crate::executor::config::DEFAULT_WORKLOAD_SA}
                         }),
                     );
                 }

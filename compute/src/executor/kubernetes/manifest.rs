@@ -12,10 +12,9 @@ use serde_json::json;
 
 use super::{EPOCH_ANNOTATION, GENERATION_ANNOTATION, ROLE_LABEL, STATE_ANNOTATION};
 use crate::executor::config::KubernetesConfig;
-use crate::executor::digest_pinned;
 use crate::executor::staging::StageLayout;
+use crate::executor::{digest_pinned, enforced_limit};
 
-pub const WORKLOAD_SA: &str = "aruna-workload";
 pub const WORKSPACE_PATH: &str = "/workspace";
 pub const MARKER_PATH: &str = "/aruna-marker/marker";
 pub const SENTINEL_PATH: &str = "/workspace/.aruna-stage";
@@ -165,7 +164,7 @@ pub fn job_manifest(
         "workingDir":spec.workdir,
         "env":env,
         "envFrom":env_from,
-        "resources":resource_limits(spec),
+        "resources":resource_limits(spec, config)?,
         "securityContext":container_security(spec.security.read_only_rootfs),
         "startupProbe":startup_probe,
         "volumeMounts":mounts
@@ -194,8 +193,9 @@ pub fn job_manifest(
                 "metadata":{"labels":labels},
                 "spec":{
                     "restartPolicy":"Never",
-                    "serviceAccountName":WORKLOAD_SA,
+                    "serviceAccountName":config.service_account,
                     "automountServiceAccountToken":false,
+                    "nodeSelector":node_selector(config),
                     "securityContext":pod_security(),
                     "initContainers":init,
                     "containers":[container],
@@ -317,8 +317,9 @@ pub fn helper_pod(
         },
         "spec":{
             "restartPolicy":"Never",
-            "serviceAccountName":WORKLOAD_SA,
+            "serviceAccountName":config.service_account,
             "automountServiceAccountToken":false,
+            "nodeSelector":node_selector(config),
             "securityContext":pod_security(),
             "containers":[{
                 "name":"helper",
@@ -563,18 +564,40 @@ fn container_security(read_only: bool) -> serde_json::Value {
     })
 }
 
-fn resource_limits(spec: &TaskSpec) -> serde_json::Value {
+/// Requests and limits of the task container. CPU and memory always carry a
+/// bound: an attempt the sealed spec and the backend both leave open would run
+/// against the whole node.
+fn resource_limits(
+    spec: &TaskSpec,
+    config: &KubernetesConfig,
+) -> Result<serde_json::Value, BackendError> {
     let mut limits = BTreeMap::new();
-    if let Some(cpu) = spec.resources.cpu_cores {
-        limits.insert("cpu", cpu.to_string());
-    }
-    if let Some(memory) = spec.resources.ram_bytes {
-        limits.insert("memory", memory.to_string());
-    }
-    if let Some(disk) = spec.resources.disk_bytes {
+    limits.insert(
+        "cpu",
+        enforced_limit(
+            spec.resources.cpu_cores.map(u64::from),
+            config.default_cpu_cores.map(u64::from),
+            "cpu",
+        )?
+        .to_string(),
+    );
+    limits.insert(
+        "memory",
+        enforced_limit(spec.resources.ram_bytes, config.default_mem_bytes, "memory")?.to_string(),
+    );
+    if let Some(disk) = spec.resources.disk_bytes.or(config.default_disk_bytes) {
         limits.insert("ephemeral-storage", disk.to_string());
     }
-    json!({"limits":limits,"requests":limits})
+    Ok(json!({"limits":limits,"requests":limits}))
+}
+
+/// The selector every task and helper pod carries, so a declared worker site is
+/// the site Kubernetes actually schedules on.
+fn node_selector(config: &KubernetesConfig) -> Option<serde_json::Value> {
+    match config.node_selector.is_empty() {
+        true => None,
+        false => Some(json!(config.node_selector)),
+    }
 }
 
 fn manifest_error(error: serde_json::Error) -> BackendError {
@@ -606,7 +629,68 @@ mod tests {
             s3_cidrs: Vec::new(),
             s3_port: 443,
             s3_mount_driver: Some("s3.csi.scality.com".to_string()),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn stamps_worker_selector() {
+        // Every pod of a declared worker site must be pinned to it, or the
+        // advertised placement would be a claim Kubernetes never honours.
+        let base = config();
+        let mut config = base.clone();
+        config.node_selector = BTreeMap::from([("zone".to_string(), "dc-b".to_string())]);
+        config.service_account = "aruna-restricted".to_string();
+        let spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        let layout = StageLayout::from_spec(&spec).unwrap();
+
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &config, &layout).unwrap())
+            .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        assert_eq!(pod["nodeSelector"]["zone"], "dc-b");
+        assert_eq!(pod["serviceAccountName"], "aruna-restricted");
+
+        let helper =
+            serde_json::to_value(helper_pod(&context(), &config, "drain").unwrap()).unwrap();
+        assert_eq!(helper["spec"]["nodeSelector"]["zone"], "dc-b");
+        assert_eq!(helper["spec"]["serviceAccountName"], "aruna-restricted");
+
+        // Without a configured selector no pod carries an empty one.
+        let plain =
+            serde_json::to_value(job_manifest(&context(), &spec, &base, &layout).unwrap()).unwrap();
+        assert!(plain["spec"]["template"]["spec"]["nodeSelector"].is_null());
+    }
+
+    #[test]
+    fn bounds_task_resources() {
+        // The sealed envelope wins, the backend default fills a gap, and an
+        // attempt neither of them bounds never becomes a manifest.
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.resources.cpu_cores = Some(4);
+        spec.resources.ram_bytes = Some(2_048);
+        spec.resources.disk_bytes = Some(4_096);
+        let layout = StageLayout::from_spec(&spec).unwrap();
+
+        let job =
+            serde_json::to_value(job_manifest(&context(), &spec, &config(), &layout).unwrap())
+                .unwrap();
+        let limits = &job["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits["cpu"], "4");
+        assert_eq!(limits["memory"], "2048");
+        assert_eq!(limits["ephemeral-storage"], "4096");
+
+        let empty = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        let job =
+            serde_json::to_value(job_manifest(&context(), &empty, &config(), &layout).unwrap())
+                .unwrap();
+        let limits = &job["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits["cpu"], "2");
+        assert_eq!(limits["memory"], (2u64 * 1024 * 1024 * 1024).to_string());
+
+        let mut unbounded = config();
+        unbounded.default_cpu_cores = None;
+        unbounded.default_mem_bytes = None;
+        assert!(job_manifest(&context(), &empty, &unbounded, &layout).is_err());
     }
 
     #[test]
