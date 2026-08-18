@@ -1,5 +1,9 @@
 # Compute executors
 
+This page describes the per-node executor backends. How a submitted job is
+admitted, planned, duplicated under a partition, versioned, audited, quota-bound
+and drained is described in [Distributed execution jobs](distributed-jobs.md).
+
 Aruna can run one compute executor per node. Set `ARUNA_COMPUTE_EXECUTOR` to
 `none`, `docker`, `apptainer`, or `kubernetes`; the default is `none`. Selecting
 an executor whose Cargo feature was not compiled is a configuration error.
