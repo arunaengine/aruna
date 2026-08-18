@@ -358,7 +358,9 @@ async fn write_node_info_document(
     storage: &StorageHandle,
     document: &NodeInfoDocument,
 ) -> Result<(), String> {
-    let value = Value::from(postcard::to_allocvec(document).map_err(|error| error.to_string())?);
+    // `to_bytes` validates, so a locally built advertisement that broke its own
+    // bounds never reaches storage or the shared realm topic.
+    let value = Value::from(document.to_bytes().map_err(|error| error.to_string())?);
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: NODE_INFO_KEYSPACE.to_string(),
