@@ -271,16 +271,16 @@ mod tests {
     fn rejects_snapshot_ahead() {
         // A snapshot may not claim a newer epoch than the advertisement that
         // carries it, otherwise it would outlive its own supersession order.
-        let mut document = document(node(1), epoch(4, 9));
-        document.demand.epoch = epoch(5, 1);
+        let mut ahead = document(node(1), epoch(4, 9));
+        ahead.demand.epoch = epoch(5, 1);
         assert_eq!(
-            document.validate(),
+            ahead.validate(),
             Err(AdvertisementError::Snapshot(SnapshotError::EpochAhead))
         );
 
-        let mut document = document(node(1), epoch(4, 9));
-        document.reservation.epoch = epoch(4, 10);
-        assert!(document.validate().is_err());
+        let mut reserved = document(node(1), epoch(4, 9));
+        reserved.reservation.epoch = epoch(4, 10);
+        assert!(reserved.validate().is_err());
     }
 
     #[test]

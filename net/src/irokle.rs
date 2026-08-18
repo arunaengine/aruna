@@ -19300,6 +19300,18 @@ mod tests {
         assert!(!node_info_supersedes(&document(7, 1), Some(&current)));
         assert!(node_info_supersedes(&document(1, 1), None));
         assert!(node_info_supersedes(&document(1, 1), Some(b"corrupt")));
+
+        // An unbounded or self-contradicting snapshot never reaches storage.
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let target = DocumentSyncTarget::NodeInfo {
+            realm_id,
+            node_id: node(7),
+        };
+        let mut ahead = document(7, 1);
+        ahead.demand.epoch.membership_generation = 8;
+        assert!(
+            validate_node_info_upsert(&target, &postcard::to_allocvec(&ahead).unwrap()).is_err()
+        );
     }
 
     /// The user every policy fixture publishes under.
