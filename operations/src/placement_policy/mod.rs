@@ -11,6 +11,7 @@ pub mod create;
 pub mod gate;
 pub mod read;
 pub mod resolve;
+pub mod resolve_set;
 pub mod subject;
 pub mod transport;
 
@@ -24,6 +25,7 @@ pub use read::{
     AuthenticPolicy, PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
+pub use resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
     sync_subject,
