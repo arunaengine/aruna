@@ -77,6 +77,8 @@ use crate::document_sync_outbox::{
 use crate::driver::{DriverContext, drive};
 use crate::group_backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
+use crate::jobs::lifecycle::outbox::{OUTBOX_RETRY_AFTER, drain_family_outbox};
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
@@ -2188,6 +2190,24 @@ impl OperationsTaskHandler {
             .await;
     }
 
+    /// Replicates locally published job-family records to the other holders.
+    /// The pass is bounded, so a large backlog re-arms instead of blocking.
+    async fn drain_job_family_outbox(&self) {
+        if drain_family_outbox(self.context.as_ref()).await {
+            self.reschedule_timer(TaskKey::DrainJobFamilyOutbox, OUTBOX_RETRY_AFTER)
+                .await;
+        }
+    }
+
+    /// Runs every witness round whose persisted deadline has elapsed.
+    async fn drain_job_witness_queue(&self) {
+        let now_ms = unix_timestamp_millis();
+        if drain_witness_deadlines(self.context.as_ref(), now_ms).await {
+            self.reschedule_timer(TaskKey::DrainJobWitnessQueue, WITNESS_RETRY_AFTER)
+                .await;
+        }
+    }
+
     async fn drain_job_queue(&self) {
         if !self.jobs_runtime.is_started() {
             return;
@@ -2689,6 +2709,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::RefreshBlobHolders => {
                 self.refresh_blob_holders().await;
+            }
+            TaskKey::DrainJobFamilyOutbox => {
+                self.drain_job_family_outbox().await;
+            }
+            TaskKey::DrainJobWitnessQueue => {
+                self.drain_job_witness_queue().await;
             }
         }
     }
