@@ -1714,6 +1714,23 @@ impl MetadataHandle {
                 })
                 .await
             }
+            MetadataTransportMessage::ForwardJobSubmission {
+                auth_token,
+                submission_id,
+                request,
+            } => {
+                Box::pin(async {
+                    crate::jobs::lifecycle::ingress::serve_submission(
+                        context,
+                        peer,
+                        auth_token,
+                        submission_id,
+                        *request,
+                    )
+                    .await
+                })
+                .await
+            }
             forward @ MetadataTransportMessage::ForwardCreatePlacementPolicy { .. } => {
                 Box::pin(async {
                     crate::placement_policy::apply_forwarded_policy(context, peer, forward).await
@@ -1746,6 +1763,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedJobRecord { .. }
             | MetadataTransportMessage::ForwardedJobRecordPage { .. }
             | MetadataTransportMessage::ForwardedLaunchOffer { .. }
+            | MetadataTransportMessage::ForwardedJobSubmission { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4483,6 +4501,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedJobRecordPage { .. } => "forwarded_job_record_page",
         MetadataTransportMessage::ForwardLaunchOffer { .. } => "forward_launch_offer",
         MetadataTransportMessage::ForwardedLaunchOffer { .. } => "forwarded_launch_offer",
+        MetadataTransportMessage::ForwardJobSubmission { .. } => "forward_job_submission",
+        MetadataTransportMessage::ForwardedJobSubmission { .. } => "forwarded_job_submission",
     }
 }
 

@@ -24,12 +24,14 @@ use super::records::RecordStoreError;
 
 pub mod admit;
 pub mod ids;
+pub mod ingress;
 pub mod outbox;
 pub mod plan;
 pub mod witness;
 
 pub use admit::{AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission};
 pub use ids::{RequestIdentity, SubmissionRequest};
+pub use ingress::{AcceptedSubmission, submit_external_job};
 
 /// Records of one submission an admission decision scans before it commits.
 pub const MAX_SUBMISSION_SCAN: usize = 512;

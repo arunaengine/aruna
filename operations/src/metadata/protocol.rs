@@ -16,6 +16,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::jobs::lifecycle::ids::SubmissionRequest;
+use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::MetadataRoCrateExportView;
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::search_buckets::BucketSearchHit;
@@ -281,6 +283,19 @@ pub enum MetadataTransportMessage {
     },
     ForwardedLaunchOffer {
         result: Result<Box<ReceiptFrame>, LaunchDecline>,
+    },
+    /// One complete external submission forwarded a single hop to an observed
+    /// family holder, with the identity the ingress preassigned. The holder
+    /// revalidates the caller and recomputes that identity before it commits,
+    /// and never forwards it again. Appended last so existing variant indices
+    /// stay stable.
+    ForwardJobSubmission {
+        auth_token: MetadataAuthToken,
+        submission_id: SubmissionId,
+        request: Box<SubmissionRequest>,
+    },
+    ForwardedJobSubmission {
+        result: Result<SubmissionAck, SubmissionRefusal>,
     },
 }
 

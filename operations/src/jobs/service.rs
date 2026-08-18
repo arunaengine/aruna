@@ -47,7 +47,7 @@ pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
 /// it never selects a remote owner.
-async fn mint_local_job(
+pub(crate) async fn mint_local_job(
     context: &DriverContext,
     realm_id: RealmId,
     owner_node_id: NodeId,
@@ -107,21 +107,17 @@ pub(crate) async fn submit_local_job(
     drive(SubmitJobOperation::new(spec, job_id), context).await
 }
 
-/// Submit a container execution job on behalf of `created_by`. The drain claims it
-/// and drives the fenced external attempt lifecycle. The idempotency key is
-/// namespaced per user, disjoint from internal obligation keys.
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_execution_job(
-    context: &DriverContext,
-    mut spec: ExecutionSpec,
-    created_by: UserId,
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
+/// Normalizes one execution request and enforces every bound that holds
+/// regardless of where the job runs: composition, the shared output bound, and
+/// the workspace rules. It is the single gate both the local and the
+/// distributed submission path pass through.
+pub(crate) fn validate_execution(
+    spec: &mut ExecutionSpec,
     workspace_mode: WorkspaceMode,
-    workspace_bucket: Option<String>,
-    retention_ms: u64,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    spec.inputs = aruna_core::structs::plan_composition(spec.inputs, spec.collision_policy)?;
+    workspace_bucket: Option<&str>,
+) -> Result<(), SubmitJobError> {
+    spec.inputs =
+        aruna_core::structs::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
     // One bound governs declaration, expansion, the local result, and the
     // immutable output record, so a valid success is always publishable.
     if spec.file_outputs.len() + spec.workspace_outputs.len() > MAX_EXECUTION_OUTPUTS {
@@ -136,9 +132,7 @@ pub async fn submit_execution_job(
             ));
         }
         WorkspaceMode::Existing
-            if workspace_bucket
-                .as_deref()
-                .is_none_or(|bucket| bucket.trim().is_empty()) =>
+            if workspace_bucket.is_none_or(|bucket| bucket.trim().is_empty()) =>
         {
             return Err(SubmitJobError::InvalidWorkspace(
                 "existing mode requires a bucket".to_string(),
@@ -173,6 +167,24 @@ pub async fn submit_execution_job(
             "mounted inputs require none workspace mode".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Submit a container execution job on behalf of `created_by`. The drain claims it
+/// and drives the fenced external attempt lifecycle. The idempotency key is
+/// namespaced per user, disjoint from internal obligation keys.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_execution_job(
+    context: &DriverContext,
+    mut spec: ExecutionSpec,
+    created_by: UserId,
+    owner_node_id: NodeId,
+    idempotency_key: Option<String>,
+    workspace_mode: WorkspaceMode,
+    workspace_bucket: Option<String>,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,

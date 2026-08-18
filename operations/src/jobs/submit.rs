@@ -85,6 +85,9 @@ pub enum SubmitJobError {
     InvalidWorkspace(String),
     #[error("a job may declare at most {limit} outputs")]
     TooManyOutputs { limit: usize },
+    /// Standing compute quota refused the new logical admission.
+    #[error("compute quota denied: {0}")]
+    QuotaDenied(String),
     #[error(transparent)]
     Composition(#[from] aruna_core::structs::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]
