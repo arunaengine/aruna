@@ -425,7 +425,7 @@ pub(crate) fn map_submit_error(
         SubmitJobError::PlacementUnavailable(_) => {
             ServerError::ServiceUnavailableReason("job_placement_unavailable".to_string())
         }
-        SubmitJobError::QuotaDenied(reason) => ServerError::Conflict(reason),
+        SubmitJobError::QuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
         SubmitJobError::AuthorityDenied => ServerError::Forbidden,
         other => ServerError::InternalError(other.to_string()),
     }

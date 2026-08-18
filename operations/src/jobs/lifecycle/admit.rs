@@ -5,6 +5,7 @@
 //! another request under the same key is a visible conflict. The candidate
 //! records are signed before this runs, so the transaction only decides.
 
+use aruna_core::compute_quota::QuotaDenied;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -45,7 +46,7 @@ pub struct AdmitSubmissionConfig {
     pub now_ms: u64,
     /// A standing-quota refusal evaluated before the transaction. It applies
     /// only to a fresh admission: a replayed claim settles before this check.
-    pub quota_refusal: Option<String>,
+    pub quota_refusal: Option<QuotaDenied>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,8 +195,8 @@ impl AdmitSubmissionOperation {
             self.outcome = Some(Err(LifecycleError::IdempotencyConflict { existing_job_id }));
             return self.cancel(txn_id);
         }
-        if let Some(reason) = self.config.quota_refusal.take() {
-            self.outcome = Some(Err(LifecycleError::QuotaDenied(reason)));
+        if let Some(denied) = self.config.quota_refusal.take() {
+            self.outcome = Some(Err(LifecycleError::QuotaDenied(denied)));
             return self.cancel(txn_id);
         }
         self.state = AdmitState::ReadCache { txn_id };

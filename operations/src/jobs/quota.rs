@@ -3,7 +3,7 @@
 use crate::driver::DriverContext;
 use crate::node_info::group_demand;
 use aruna_core::NodeId;
-use aruna_core::compute_quota::{ComputeQuota, admits};
+use aruna_core::compute_quota::{ComputeQuota, QuotaDenied, admits};
 use aruna_core::structs::{EffectiveResources, RealmConfigDocument};
 use aruna_core::types::GroupId;
 
@@ -17,7 +17,7 @@ pub async fn quota_refusal(
     local: NodeId,
     group_id: GroupId,
     resources: &EffectiveResources,
-) -> Result<Option<String>, String> {
+) -> Result<Option<QuotaDenied>, String> {
     let quota = config
         .compute
         .effective_quota(&group_id)
@@ -30,6 +30,6 @@ pub async fn quota_refusal(
         .map_err(|error| format!("quota demand view unavailable: {error}"))?;
     match admits(&view, &quota, resources) {
         Ok(()) => Ok(None),
-        Err(denied) => Ok(Some(denied.to_string())),
+        Err(denied) => Ok(Some(denied)),
     }
 }

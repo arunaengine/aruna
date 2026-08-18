@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use aruna_core::compute_quota::QuotaDenied;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::handle::Handle;
 use aruna_core::structs::{JobFamilyError, JobId, JobRecordError};
@@ -76,7 +77,7 @@ pub enum LifecycleError {
     IdempotencyConflict { existing_job_id: JobId },
     /// Standing quota refused this NEW admission; replays are never refused.
     #[error("standing compute quota refused the admission: {0}")]
-    QuotaDenied(String),
+    QuotaDenied(#[from] QuotaDenied),
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]
