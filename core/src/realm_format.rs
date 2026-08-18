@@ -56,6 +56,7 @@ pub fn verify_realm_epoch(declared: u32) -> Result<(), RealmFormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irokle::Event;
 
     #[test]
     fn tag_names_the_epoch() {

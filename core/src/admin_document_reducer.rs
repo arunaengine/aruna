@@ -101,11 +101,8 @@ pub struct AdminDocumentReducerState {
     pub applied_event_ids: BTreeSet<Ulid>,
     pub user_attributes: BTreeMap<String, AdminDocumentAttributeVersion>,
     pub conflicts: BTreeMap<String, AdminDocumentConflict>,
-    #[serde(default)]
     pub user_name: Option<AdminDocumentAttributeVersion>,
-    #[serde(default)]
     pub user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
-    #[serde(default)]
     pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
     pub revocation_floor: u64,
     pub revocation_next_expiry: Option<u64>,

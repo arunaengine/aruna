@@ -43,7 +43,6 @@ pub struct GroupAuthorizationDocument {
     pub roles: HashMap<RoleId, Role>,
     /// Deny-only CEL request policies scoped to this group, evaluated after the
     /// realm set. Either scope may deny; neither may grant.
-    #[serde(default)]
     pub policies: Vec<crate::request_policy::RequestPolicy>,
 }
 

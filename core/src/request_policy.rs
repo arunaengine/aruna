@@ -75,11 +75,9 @@ pub enum PolicyKind {
 pub struct RequestPolicy {
     pub policy_id: Ulid,
     pub name: String,
-    #[serde(default)]
     pub kind: PolicyKind,
     /// Optional applicability guard; the rule applies when it is absent or
     /// evaluates to `true`, and a guard that errors denies the request.
-    #[serde(default)]
     pub when: Option<String>,
     /// CEL expression over the request variables.
     pub expression: String,
@@ -610,6 +608,22 @@ mod tests {
             when: None,
             expression: expression.to_string(),
             enabled: true,
+        }
+    }
+
+    #[test]
+    fn rejects_partial_policy_json() {
+        // The admin-document surface writes whole policies. Tolerating a missing
+        // kind or guard would silently admit a predecessor's bytes.
+        let current = serde_json::to_string(&policy("permission == 'write'")).unwrap();
+        assert!(serde_json::from_str::<RequestPolicy>(&current).is_ok());
+
+        for missing in ["kind", "when"] {
+            let mut fields: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&current).unwrap();
+            fields.remove(missing);
+            let partial = serde_json::to_string(&fields).unwrap();
+            assert!(serde_json::from_str::<RequestPolicy>(&partial).is_err());
         }
     }
 
