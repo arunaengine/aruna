@@ -23,7 +23,7 @@ pub use diagnostics::{
     CacheCoverage, CopyViolation, DiagnosticsInput, DiagnosticsReport, PolicyDiagnosticsOperation,
 };
 pub(crate) use forward::apply_forwarded_policy;
-pub use forward::create_policy_routed;
+pub use forward::{PolicyForwardError, create_policy_routed};
 pub use gate::{
     GateContext, GatedBucket, PolicyGateConfig, PolicyGateError, PolicyGateOperation,
     PolicyGateOutcome, gate_decision, union_refs, write_gate,

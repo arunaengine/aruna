@@ -424,6 +424,12 @@ impl PolicyBulkOperation {
         for (mut candidate, (_, value)) in candidates.into_iter().zip(values) {
             self.report.observed += 1;
             let Some(value) = value else {
+                // A head pointing at a version this node no longer stores is a
+                // gap, never a covered object.
+                self.report.blocked.push(BlockedGap {
+                    key: candidate.key,
+                    reason: PolicyBlockedReason::SourceUnavailable,
+                });
                 continue;
             };
             let version = match BlobVersion::from_bytes(value.as_ref()) {

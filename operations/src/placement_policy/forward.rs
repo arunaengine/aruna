@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use aruna_core::structs::{Actor, AuthContext, PlacementPolicyDocument};
+use thiserror::Error;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
@@ -19,20 +20,30 @@ use crate::placement_policy::create::{
     CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation,
 };
 
+/// Why a routed publication did not commit. The local outcome and the delivery
+/// outcome stay distinguishable, so a reused id is never reported as an
+/// availability failure.
+#[derive(Debug, Error)]
+pub enum PolicyForwardError {
+    #[error(transparent)]
+    Create(#[from] CreatePolicyError),
+    #[error(transparent)]
+    Forward(#[from] MetadataWriteError),
+}
+
 /// Creates locally when this node holds the policy's bucket, otherwise at one of
 /// the holders the create resolved.
 pub async fn create_policy_routed(
     context: &Arc<DriverContext>,
     config: CreatePolicyConfig,
     auth_token: Option<MetadataAuthToken>,
-) -> Result<PlacementPolicyDocument, MetadataWriteError> {
+) -> Result<PlacementPolicyDocument, PolicyForwardError> {
     let policy = config.policy.clone();
     let created_at_ms = config.created_at_ms;
     let holders = match drive(CreatePolicyOperation::new(config), context.as_ref()).await {
         Ok(document) => return Ok(document),
         Err(CreatePolicyError::NotHolder { holders }) => holders,
-        Err(CreatePolicyError::Unauthorized) => return Err(MetadataWriteError::Forbidden),
-        Err(error) => return Err(MetadataWriteError::Undeliverable(error.to_string())),
+        Err(error) => return Err(error.into()),
     };
     let response = forward_to_holders(
         context,
@@ -51,7 +62,8 @@ pub async fn create_policy_routed(
         other => Err(MetadataWriteError::Undeliverable(format!(
             "holder answered a policy publication with {}",
             crate::metadata::transport_message_kind(&other)
-        ))),
+        ))
+        .into()),
     }
 }
 

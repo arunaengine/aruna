@@ -12,19 +12,19 @@ use crate::routes::metadata::forwarded_auth_token;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     Actor, AuthContext, CurrentVersionPointer, LabelMatch, PlacementPolicy,
-    PlacementPolicyDocument, PlacementPolicyRef, PlacementSelector, PolicyBlockedReason,
-    PolicyBulkStatus,
+    PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
+    PolicyBlockedReason, PolicyBulkStatus,
 };
 use aruna_operations::driver::{drive, gate_context};
 use aruna_operations::metadata::forward::MetadataWriteError;
-use aruna_operations::placement_policy::create::CreatePolicyConfig;
-use aruna_operations::placement_policy::create_policy_routed;
+use aruna_operations::placement_policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement_policy::diagnostics::{
     DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,
 };
 use aruna_operations::placement_policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
+use aruna_operations::placement_policy::{PolicyForwardError, create_policy_routed};
 use aruna_operations::s3::bucket_placement::{
     PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation,
 };
@@ -382,18 +382,26 @@ fn policy_response(document: &PlacementPolicyDocument) -> ServerResult<PolicyRes
     })
 }
 
-fn map_write_error(error: MetadataWriteError) -> ServerError {
+fn map_create_error(error: PolicyForwardError) -> ServerError {
     match error {
-        MetadataWriteError::Unauthorized => ServerError::Unauthorized,
-        MetadataWriteError::Forbidden => ServerError::Forbidden,
+        PolicyForwardError::Create(CreatePolicyError::Unauthorized) => ServerError::Forbidden,
+        PolicyForwardError::Create(CreatePolicyError::Policy(
+            PlacementPolicyError::PolicyIdReuse { .. },
+        )) => ServerError::Conflict("policy id already carries another definition".to_string()),
+        PolicyForwardError::Create(CreatePolicyError::Policy(reason)) => {
+            ServerError::BadRequestReason(reason.to_string())
+        }
+        PolicyForwardError::Forward(MetadataWriteError::Unauthorized) => ServerError::Unauthorized,
+        PolicyForwardError::Forward(MetadataWriteError::Forbidden) => ServerError::Forbidden,
         other => ServerError::ServiceUnavailableReason(other.to_string()),
     }
 }
 
 fn map_read_error(error: ReadPolicyError) -> ServerError {
     match error {
-        ReadPolicyError::NotFound { .. } | ReadPolicyError::DigestMismatch => ServerError::NotFound,
-        ReadPolicyError::RealmMismatch => ServerError::Forbidden,
+        ReadPolicyError::NotFound { .. }
+        | ReadPolicyError::DigestMismatch
+        | ReadPolicyError::RealmMismatch => ServerError::NotFound,
         ReadPolicyError::Unavailable(_) | ReadPolicyError::PlacementUnavailable => {
             ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
         }
@@ -559,7 +567,7 @@ pub async fn create_placement_policy(
         forwarded_auth_token(bearer_token)?,
     )
     .await
-    .map_err(map_write_error)?;
+    .map_err(map_create_error)?;
     Ok(Json(policy_response(&document)?))
 }
 
