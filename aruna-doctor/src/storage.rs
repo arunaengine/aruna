@@ -1,4 +1,8 @@
 use crate::error::CliError;
+use aruna_core::keyspaces::STORAGE_FORMAT_KEYSPACE;
+use aruna_core::storage_format::{
+    STORAGE_FORMAT_EPOCH, STORAGE_FORMAT_ID, STORAGE_FORMAT_KEY, StorageFormatMarker,
+};
 use blake3::Hasher;
 use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
@@ -31,6 +35,30 @@ pub struct ImportStats {
     pub keyspace_count: u64,
     pub entry_count: u64,
     pub target_path: PathBuf,
+    /// Format marker the imported rows carry. `None` means the snapshot held no
+    /// marker at all, which the caller must report rather than assume current.
+    pub format: Option<StorageFormatMarker>,
+}
+
+impl ImportStats {
+    /// Why the imported rows do not belong to this build, if they do not. The
+    /// import itself is read-only: no marker is ever written or repaired.
+    pub fn format_warning(&self) -> Option<String> {
+        match &self.format {
+            None => Some(format!(
+                "imported rows carry no format marker; this build reads `{STORAGE_FORMAT_ID}` epoch {STORAGE_FORMAT_EPOCH}"
+            )),
+            Some(marker)
+                if marker.id != STORAGE_FORMAT_ID || marker.epoch != STORAGE_FORMAT_EPOCH =>
+            {
+                Some(format!(
+                    "imported rows carry format `{}` epoch {}; this build reads `{STORAGE_FORMAT_ID}` epoch {STORAGE_FORMAT_EPOCH}",
+                    marker.id, marker.epoch
+                ))
+            }
+            Some(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -92,8 +120,30 @@ pub async fn import(snapshot_path: String, target_path: String) -> Result<(), Cl
         stats.entry_count,
         stats.target_path.display(),
     );
+    if let Some(warning) = stats.format_warning() {
+        println!("Warning: {warning}");
+    }
 
     Ok(())
+}
+
+/// Format marker the imported rows carry, read back from the target. Absent or
+/// undecodable both report `None`: the import never writes a marker.
+fn read_imported_format(
+    db: &OptimisticTxDatabase,
+) -> Result<Option<StorageFormatMarker>, SnapshotError> {
+    if !db
+        .list_keyspace_names()
+        .iter()
+        .any(|name| name.as_ref() == STORAGE_FORMAT_KEYSPACE)
+    {
+        return Ok(None);
+    }
+    let keyspace = db.keyspace(STORAGE_FORMAT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    Ok(db
+        .read_tx()
+        .get(&keyspace, STORAGE_FORMAT_KEY)?
+        .and_then(|bytes| postcard::from_bytes::<StorageFormatMarker>(&bytes).ok()))
 }
 
 pub fn snapshot_database(
@@ -274,6 +324,7 @@ pub fn import_snapshot_into_new_database(
                     keyspace_count,
                     entry_count,
                     target_path: target_db_path.to_path_buf(),
+                    format: read_imported_format(&db)?,
                 });
             }
             _ => return Err(SnapshotError::InvalidStructure("unknown record tag")),
@@ -501,7 +552,11 @@ fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotE
 
 #[cfg(test)]
 mod tests {
-    use super::{SnapshotError, import_snapshot_into_new_database, snapshot_database};
+    use super::{
+        KeyspaceCreateOptions, OptimisticTxDatabase, Path, PathBuf, PersistMode,
+        STORAGE_FORMAT_EPOCH, STORAGE_FORMAT_ID, STORAGE_FORMAT_KEY, STORAGE_FORMAT_KEYSPACE,
+        SnapshotError, StorageFormatMarker, import_snapshot_into_new_database, snapshot_database,
+    };
     use crate::test_support::env_lock;
     use aruna::config::load;
     use aruna_api::server_state::ServerState;
@@ -527,7 +582,7 @@ mod tests {
     use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_operations::task_incoming::initialize_task_incoming;
     use aruna_tasks::TaskHandle;
-    use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
+    use fjall::Readable;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -563,6 +618,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Snapshots one root holding exactly the given format marker rows.
+    fn marked_snapshot(root: &Path, marker: Option<&[u8]>) -> PathBuf {
+        let source = root.join("marked-source");
+        let snapshot_path = root.join("marked.aruna");
+        {
+            let db = OptimisticTxDatabase::builder(&source).open().unwrap();
+            let keyspace = db
+                .keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+            keyspace.insert(b"group", b"value").unwrap();
+            if let Some(bytes) = marker {
+                let format = db
+                    .keyspace(STORAGE_FORMAT_KEYSPACE, KeyspaceCreateOptions::default)
+                    .unwrap();
+                format.insert(STORAGE_FORMAT_KEY, bytes).unwrap();
+            }
+            db.persist(PersistMode::SyncAll).unwrap();
+        }
+        snapshot_database(&source, &snapshot_path).unwrap();
+        snapshot_path
+    }
+
+    #[test]
+    fn import_warns_on_foreign_epoch() {
+        // Import stays read-only: it names the mismatch and never stamps or
+        // repairs a marker in the target.
+        let temp = tempdir().unwrap();
+        let foreign = StorageFormatMarker {
+            id: STORAGE_FORMAT_ID.to_string(),
+            epoch: STORAGE_FORMAT_EPOCH + 1,
+        };
+        let snapshot_path = marked_snapshot(temp.path(), Some(&foreign.to_bytes().unwrap()));
+
+        let stats =
+            import_snapshot_into_new_database(&snapshot_path, &temp.path().join("foreign-target"))
+                .unwrap();
+
+        assert_eq!(stats.format, Some(foreign));
+        let warning = stats.format_warning().expect("a foreign epoch warns");
+        assert!(warning.contains(&(STORAGE_FORMAT_EPOCH + 1).to_string()));
+        assert!(warning.contains(&STORAGE_FORMAT_EPOCH.to_string()));
+    }
+
+    #[test]
+    fn import_warns_on_absent_epoch() {
+        let temp = tempdir().unwrap();
+        let snapshot_path = marked_snapshot(temp.path(), None);
+
+        let stats =
+            import_snapshot_into_new_database(&snapshot_path, &temp.path().join("bare-target"))
+                .unwrap();
+
+        assert_eq!(stats.format, None);
+        assert!(
+            stats
+                .format_warning()
+                .expect("an unmarked import warns")
+                .contains("no format marker")
+        );
+    }
+
+    #[test]
+    fn import_accepts_current_epoch() {
+        let temp = tempdir().unwrap();
+        let current = StorageFormatMarker::default();
+        let snapshot_path = marked_snapshot(temp.path(), Some(&current.to_bytes().unwrap()));
+
+        let stats =
+            import_snapshot_into_new_database(&snapshot_path, &temp.path().join("current-target"))
+                .unwrap();
+
+        assert_eq!(stats.format, Some(current));
+        assert_eq!(stats.format_warning(), None);
     }
 
     #[tokio::test]
