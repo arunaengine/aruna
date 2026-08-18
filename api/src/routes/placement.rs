@@ -650,7 +650,7 @@ pub struct PolicyRefQuery {
     path = "/buckets/{bucket}/placement",
     tag = "placement",
     summary = "Read a bucket's default placement policies",
-    description = "Requires a bearer token issued for this realm. This is a node-local read of the replicated bucket record: a default written on another node can be missing until it arrives here. The `generation` is the counter every default change advances, and it is what a bulk run seals and what a compare-and-set update must present. A bucket that has never been given a default returns an empty list at its current generation.",
+    description = "Requires a bearer token issued for this realm and READ on the realm configuration path, because the default names policy ids. This is a node-local read of the replicated bucket record: a default written on another node can be missing until it arrives here. The `generation` is the counter every default change advances, and it is what a bulk run seals and what a compare-and-set update must present. A bucket that has never been given a default returns an empty list at its current generation.",
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     responses(
         (status = 200, description = "The default ref set and the generation it was written at", body = BucketPlacementResponse, example = json!({
@@ -662,7 +662,7 @@ pub struct PolicyRefQuery {
             "generation": 3
         })),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -672,7 +672,15 @@ pub async fn get_bucket_placement(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
-    require_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
+    // Bucket defaults name policy ids; only realm-config readers may see them.
+    crate::auth::ensure_permission(
+        &state,
+        &auth,
+        aruna_core::structs::policy_admin_path(auth.realm_id),
+        aruna_core::structs::Permission::READ,
+    )
+    .await?;
     let info = bucket_info(&state, &bucket).await?;
     Ok(Json(BucketPlacementResponse {
         bucket,

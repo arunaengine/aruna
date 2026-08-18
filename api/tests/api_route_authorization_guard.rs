@@ -195,6 +195,43 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          record and answers 302, 404, or a 410 tombstone",
     ),
     (
+        "placement.rs",
+        "create_placement_policy",
+        "realm-admin WRITE checked inside CreatePolicyOperation; a forwarding \
+         holder re-runs the same check under the caller's token",
+    ),
+    (
+        "placement.rs",
+        "get_placement_coverage",
+        "realm-config READ checked inside PolicyCoverageOperation",
+    ),
+    (
+        "placement.rs",
+        "get_placement_diagnostics",
+        "realm-config READ checked inside PolicyDiagnosticsOperation",
+    ),
+    (
+        "placement.rs",
+        "get_placement_policy",
+        "realm-bearer read of an immutable replicated policy document every \
+         realm node can fetch to evaluate placement",
+    ),
+    (
+        "placement.rs",
+        "mint_object_placement",
+        "realm-admin WRITE checked inside PolicyMutationOperation",
+    ),
+    (
+        "placement.rs",
+        "put_bucket_placement",
+        "realm-admin WRITE checked inside PutBucketPlacementOperation",
+    ),
+    (
+        "placement.rs",
+        "run_bucket_placement",
+        "realm-admin WRITE checked inside PolicyBulkOperation",
+    ),
+    (
         "rocrate_import.rs",
         "upload_rocrate",
         "self-scoped: spools a hidden blob owned by the caller",
