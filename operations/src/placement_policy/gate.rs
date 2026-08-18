@@ -532,6 +532,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sealed_subject_must_hold() {
+        // The subject that admitted the write must still be the one advertised
+        // when the exposing transaction runs.
+        let gated = GatedBucket::observe(None).sealed_under(
+            Some(&GateContext {
+                realm_id: realm(),
+                subject: subject("eu-west"),
+                now_ms: 0,
+            }),
+            true,
+        );
+        let record =
+            aruna_core::structs::NodeSubjectRecord::seed(subject("eu-west")).expect("subject");
+        assert_eq!(gated.check_subject(Some(&record)), Ok(()));
+        assert_eq!(gated.check_subject(None), Err(PolicyGateError::Drift));
+
+        let mut advanced = record.clone();
+        advanced.subject.generation = 2;
+        assert_eq!(
+            gated.check_subject(Some(&advanced)),
+            Err(PolicyGateError::Drift)
+        );
+
+        let mut draining = record.clone();
+        draining.policy_draining = true;
+        assert_eq!(
+            gated.check_subject(Some(&draining)),
+            Err(PolicyGateError::Drift)
+        );
+    }
+
+    #[test]
+    fn ungoverned_ignores_subject() {
+        // Nothing evaluated an ungoverned write, so no subject change can
+        // invalidate it.
+        let gated = GatedBucket::observe(None).sealed_under(None, false);
+        assert_eq!(gated.check_subject(None), Ok(()));
+    }
+
     fn document(policy: &VerifiedPolicy) -> aruna_core::structs::PlacementPolicyDocument {
         crate::placement_policy::tests::signed_document(realm(), policy, 1)
     }

@@ -989,8 +989,14 @@ impl IncomingBaoReadOperation {
         {
             return self.send_refusal(BaoReadRefusal::NotFound);
         }
-        // Authorization already passed, so the refs may be disclosed; echoing
-        // one back is never authority, the source still evaluates alone.
+        self.challenge_destination(location)
+    }
+
+    /// Teaches the requester every rule it has not resolved, then evaluates the
+    /// authenticated destination independently. Authorization has already
+    /// passed here, so the refs may be disclosed; echoing one is never
+    /// authority.
+    fn challenge_destination(&mut self, location: BackendLocation) -> Effects {
         let missing: Vec<PlacementPolicyRef> = self
             .version_refs
             .iter()
@@ -1378,6 +1384,91 @@ mod tests {
                 blake3: hash,
             }
         );
+    }
+
+    /// Drives a requester read to the response frame and returns its effects.
+    fn respond(message: VersionReplicationMessage) -> BaoReadOperation {
+        let remote_node = node_from_seed(1);
+        let stream_id = Ulid::from(9u128);
+        let mut operation =
+            BaoReadOperation::new(remote_node, read_request(remote_node, [4u8; 32]));
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        operation.step(Event::Blob(BlobEvent::MessageReceived {
+            stream_id,
+            payload: message.to_bytes().unwrap(),
+        }));
+        operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+        operation
+    }
+
+    #[test]
+    fn required_teaches_refs() {
+        // The source teaches the rule instead of streaming, so the requester can
+        // resolve it and ask again.
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(3u128),
+            digest: [2u8; 32],
+        };
+        let operation = respond(VersionReplicationMessage::PlacementPolicyRequired {
+            refs: vec![policy_ref],
+        });
+        assert_eq!(
+            operation.finalize(),
+            Err(BaoReadError::PolicyRequired {
+                refs: vec![policy_ref]
+            })
+        );
+    }
+
+    #[test]
+    fn denied_never_streams() {
+        let operation = respond(VersionReplicationMessage::PlacementPolicyDenied {
+            policy_ids: vec![Ulid::from(3u128)],
+        });
+        assert_eq!(
+            operation.finalize(),
+            Err(BaoReadError::PolicyDenied {
+                policy_ids: vec![Ulid::from(3u128)]
+            })
+        );
+    }
+
+    #[test]
+    fn echoed_refs_never_grant() {
+        // The requester claims to know the rule, but the source still evaluates
+        // the destination itself and refuses it.
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(3u128),
+            digest: [2u8; 32],
+        };
+        let mut request = read_request(local_node, [4u8; 32]);
+        request.known_refs = vec![policy_ref];
+        request.destination = None;
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            request,
+        );
+        operation.version_refs = vec![policy_ref];
+        operation.request.known_refs = vec![policy_ref];
+
+        // No destination subject means nothing governed may be served, even
+        // though every ref was echoed back.
+        let (location, _) = location_value([4u8; 32]);
+        let effects = operation.challenge_destination(location);
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected a policy frame")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::PlacementPolicyDenied { .. }
+        ));
     }
 
     #[test]

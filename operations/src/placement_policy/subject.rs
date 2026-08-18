@@ -507,7 +507,7 @@ mod tests {
     use super::{SubjectScanConfig, SubjectScanMode, SubjectScanOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+    use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         BackendLocation, BackendRef, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
@@ -688,6 +688,76 @@ mod tests {
                 .state,
             ManagedCopyState::UnresolvedDeparted
         );
+    }
+
+    #[test]
+    fn departure_stops_admission() {
+        // Departure blocks new admission even when the subject is unchanged, so
+        // no governed byte lands here while the inventory is being resolved.
+        let mut operation = operation(SubjectScanMode::Depart, "eu-west");
+        operation.start();
+        let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
+        let effects = operation.step(stored(&record));
+
+        let leaving = written(&effects).expect("the record is rewritten first");
+        assert!(leaving.serving_blocked && leaving.policy_draining);
+    }
+
+    #[test]
+    fn scan_touches_no_jobs() {
+        // A receipted execution must survive a transition: the scan only ever
+        // writes the subject row and managed-copy rows.
+        let mut operation = operation(
+            SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
+            "us-east",
+        );
+        let mut effects: Vec<Effect> = operation.start().into_iter().collect();
+        let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
+        effects.extend(operation.step(stored(&record)));
+        effects.extend(operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        })));
+        effects.extend(operation.step(page(vec![copy(ManagedCopyState::Registered, Vec::new())])));
+
+        for effect in effects {
+            let Effect::Storage(
+                StorageEffect::Write { key_space, .. } | StorageEffect::Iter { key_space, .. },
+            ) = effect
+            else {
+                continue;
+            };
+            assert!(
+                key_space == MANAGED_COPY_KEYSPACE || key_space == NODE_SUBJECT_KEYSPACE,
+                "the scan touched {key_space}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_reseals_generation() {
+        // A restored copy names the subject that just admitted it, so a row
+        // sealed under the old generation can never pass for the new one.
+        let mut operation = operation(
+            SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin),
+            "eu-west",
+        );
+        operation.start();
+        let mut record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
+        record.subject.generation = 4;
+        record.serving_blocked = true;
+        operation.step(stored(&record));
+
+        let stale = copy(
+            ManagedCopyState::Quarantined(ManagedCopyQuarantine::Rejoin),
+            Vec::new(),
+        );
+        let effects = operation.step(page(vec![stale]));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected one copy transition");
+        };
+        let restored = ManagedCopyRecord::from_bytes(value.as_ref()).expect("record decodes");
+        assert_eq!(restored.state, ManagedCopyState::Registered);
+        assert_eq!(restored.subject_generation, 4);
     }
 
     #[test]

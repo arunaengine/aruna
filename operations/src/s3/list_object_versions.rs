@@ -1380,3 +1380,108 @@ mod test {
         );
     }
 }
+
+/// A listing must keep working for a governed head this node cannot answer
+/// for; it simply stops describing bytes it may not serve.
+#[cfg(test)]
+mod serve_tests {
+    use super::served_copy;
+    use crate::blob::managed_copy::register_entry;
+    use aruna_core::structs::{
+        BackendLocation, BackendRef, ManagedCopyKey, NodeSubjectRecord, PlacementPolicyRef,
+        PlacementSubject, VersionKey,
+    };
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::UNIX_EPOCH;
+    use ulid::Ulid;
+
+    fn node() -> aruna_core::types::NodeId {
+        iroh::SecretKey::from_bytes(&[9u8; 32]).public()
+    }
+
+    fn policy_ref() -> PlacementPolicyRef {
+        PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([1u8; 16]),
+            digest: [2u8; 32],
+        }
+    }
+
+    fn version() -> VersionKey {
+        VersionKey::new("bucket", "object.txt", Ulid::from_bytes([4u8; 16]))
+    }
+
+    fn location() -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "aruna".to_string(),
+            backend_path: "objects/one".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: Default::default(),
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 3,
+            hashes: HashMap::new(),
+        }
+    }
+
+    fn subject(blocked: bool) -> NodeSubjectRecord {
+        let mut record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node(),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .expect("subject is valid");
+        record.serving_blocked = blocked;
+        record
+    }
+
+    fn registration() -> Vec<u8> {
+        let (_, _, value) = register_entry(version(), node(), &location(), &[policy_ref()], 1, 7)
+            .expect("registration builds");
+        value.as_ref().to_vec()
+    }
+
+    #[test]
+    fn describes_registered_copy() {
+        let key = ManagedCopyKey::new(version(), BackendRef::node_default());
+        assert!(served_copy(
+            Some(&registration()),
+            &key,
+            &[policy_ref()],
+            Some(&subject(false))
+        ));
+    }
+
+    #[test]
+    fn hides_unanswerable_copy() {
+        // Missing registration, a blocked node and an absent subject all hide
+        // the location without failing the listing.
+        let key = ManagedCopyKey::new(version(), BackendRef::node_default());
+        assert!(!served_copy(
+            None,
+            &key,
+            &[policy_ref()],
+            Some(&subject(false))
+        ));
+        assert!(!served_copy(
+            Some(&registration()),
+            &key,
+            &[policy_ref()],
+            Some(&subject(true))
+        ));
+        assert!(!served_copy(
+            Some(&registration()),
+            &key,
+            &[policy_ref()],
+            None
+        ));
+    }
+}

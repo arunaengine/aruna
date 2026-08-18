@@ -3679,6 +3679,72 @@ mod gate_test {
         ));
     }
 
+    /// The realm view and the policy row a cache miss reads next.
+    fn opened(policy_row: Option<Value>) -> Event {
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm(), Vec::new(), 2);
+        config.seed_default_placement();
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
+        }
+        let (config_value, auth_value) = crate::placement_policy::tests::realm_view(
+            &config,
+            crate::placement_policy::tests::admin_user(realm()),
+        );
+        let key = ByteView::from(Vec::new());
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (key.clone(), policy_row),
+                (key.clone(), Some(config_value)),
+                (key, Some(auth_value)),
+            ],
+        })
+    }
+
+    #[test]
+    fn digest_mismatch_blocks() {
+        // The obtained document holds another definition under the same id, so
+        // the write refuses instead of falling back to allow.
+        let requested = policy("eu-west");
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(vec![requested.policy_ref()], 1))));
+        operation.step(read(None));
+        let substituted =
+            crate::placement_policy::fixtures::signed_document(realm(), &policy("us-east"), 9);
+        let effects = operation.step(opened(Some(ByteView::from(
+            substituted.to_bytes().expect("document encodes"),
+        ))));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Invalid))
+        ));
+    }
+
+    #[test]
+    fn inherited_ref_gates() {
+        // Staging, imports and job outputs carry their source's refs into an
+        // otherwise ungoverned destination; a sender may never drop one.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        operation.start();
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(!materializes(&effects));
+
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        let effects = operation.step(read(Some(ByteView::from(cached))));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
+        ));
+    }
+
     fn location() -> aruna_core::structs::BackendLocation {
         aruna_core::structs::BackendLocation {
             backend: aruna_core::structs::BackendRef::node_default(),

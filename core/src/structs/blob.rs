@@ -1345,6 +1345,31 @@ mod tests {
     }
 
     #[test]
+    fn markers_share_the_order() {
+        // A delete marker, a reference advance and an ordinary write are all
+        // just pointers: every permutation converges on the same head and no
+        // VersionId is dropped from the candidate set.
+        let write = pointer(6, 1);
+        let marker = pointer(7, 2);
+        let advance = pointer(7, 8);
+        let candidates = [write.clone(), marker.clone(), advance.clone()];
+        for rotation in 0..candidates.len() {
+            let mut permuted: Vec<CurrentVersionPointer> = candidates.to_vec();
+            permuted.rotate_left(rotation);
+            assert_eq!(
+                CurrentVersionPointer::select_head(permuted.iter()),
+                Some(&advance)
+            );
+            // Losing versions stay retrievable: reduction selects, never prunes.
+            for candidate in &candidates {
+                assert!(permuted.contains(candidate));
+            }
+        }
+        assert!(marker.contends(&advance));
+        assert!(!write.contends(&marker));
+    }
+
+    #[test]
     fn duplicate_delivery_holds() {
         // An identical pointer may be rewritten, so a replayed message is
         // idempotent instead of being refused.

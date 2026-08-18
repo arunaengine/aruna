@@ -3029,3 +3029,251 @@ mod tests {
         assert_eq!(operation.txn_id, None);
     }
 }
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::placement_policy::PolicyCacheEntry;
+    use aruna_core::structs::{
+        BackendRef, MultipartUploadChecksumHint, PlacementPolicy, PlacementSelector,
+        PlacementSubject, VerifiedPolicy,
+    };
+    use aruna_core::types::Value;
+    use std::collections::BTreeMap;
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    fn node() -> aruna_core::types::NodeId {
+        iroh::SecretKey::from_bytes(&[9u8; 32]).public()
+    }
+
+    fn policy(location: &str) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn gate(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: PlacementSubject {
+                node_id: node(),
+                generation: 1,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+            now_ms: 1_000,
+        }
+    }
+
+    fn input() -> CompleteMultipartUploadInput {
+        let realm_id = realm();
+        CompleteMultipartUploadInput {
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            upload_id: Ulid::generate(),
+            realm_id,
+            node_id: node(),
+            completed_parts: vec![],
+            expected_checksums: vec![],
+            checksum_algorithm: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
+            object_size: Some(10),
+            created_by: UserId::local(Ulid::generate(), realm_id),
+            quota_ceiling: Some(30),
+        }
+    }
+
+    fn upload(input: &CompleteMultipartUploadInput) -> MultipartUpload {
+        MultipartUpload {
+            upload_id: input.upload_id,
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            bucket: input.bucket.clone(),
+            key: input.key.clone(),
+            group_id: Ulid::generate(),
+            created_by: input.created_by,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None::<MultipartUploadChecksumHint>,
+            metadata: HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
+        }
+    }
+
+    fn bucket(refs: Vec<PlacementPolicyRef>, generation: u64) -> Value {
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+            placement_policies: refs,
+            placement_policy_generation: generation,
+        };
+        info.to_bytes().expect("bucket encodes").into()
+    }
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value,
+        })
+    }
+
+    /// `location` of `None` leaves the node without a subject, which fails
+    /// every governed completion closed.
+    fn at_gate(location: Option<&str>) -> CompleteMultipartUploadOperation {
+        let input = input();
+        let record = upload(&input);
+        let mut operation = CompleteMultipartUploadOperation::new(input);
+        if let Some(location) = location {
+            operation = operation.with_gate(gate(location));
+        }
+        operation.upload_record = Some(record);
+        operation.state = CompleteMultipartUploadState::ReadGateBucket;
+        operation
+    }
+
+    fn composes(effects: &Effects) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Compose { .. })))
+    }
+
+    #[test]
+    fn denies_before_compose() {
+        // The rule admits another location, so no part may be composed at all.
+        let rule = policy("us-east");
+        let mut operation = at_gate(Some("eu-west"));
+        let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        assert!(!composes(&effects));
+
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        let effects = operation.step(read(Some(cached.into())));
+
+        assert!(!composes(&effects));
+        assert_eq!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGateError(
+                PolicyGateError::Denied {
+                    policy_ids: vec![rule.policy().policy_id]
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn no_policy_blocks_compose() {
+        // A rule that cannot be obtained blocks; it is never read as a grant.
+        let rule = policy("eu-west");
+        let mut operation = at_gate(Some("eu-west"));
+        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        let hint = PolicyCacheEntry::unavailable(1_000)
+            .to_bytes()
+            .expect("entry encodes");
+        let effects = operation.step(read(Some(hint.into())));
+
+        assert!(!composes(&effects));
+        assert!(matches!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGateError(
+                PolicyGateError::Unavailable { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn missing_subject_blocks_compose() {
+        let mut operation = at_gate(None);
+        let effects = operation.step(read(Some(bucket(
+            vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([1u8; 16]),
+                digest: [4u8; 32],
+            }],
+            1,
+        ))));
+
+        assert!(!composes(&effects));
+        assert_eq!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGateError(
+                PolicyGateError::NoSubject
+            ))
+        );
+    }
+
+    #[test]
+    fn ungoverned_composes() {
+        // An object with no refs reaches the compose with no policy round trip.
+        let mut operation = at_gate(Some("eu-west"));
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(composes(&effects));
+    }
+
+    #[test]
+    fn drift_aborts_finalize() {
+        // The default changed while the parts composed, so the object must not
+        // commit refs nothing evaluated.
+        let mut operation = at_gate(Some("eu-west"));
+        operation.step(read(Some(bucket(Vec::new(), 0))));
+        operation.composed_location = Some(composed());
+        operation.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+        operation.state = CompleteMultipartUploadState::ReadBucketDefault;
+
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    Vec::new().into(),
+                    Some(bucket(vec![policy("us-east").policy_ref()], 1)),
+                ),
+                (Vec::new().into(), None),
+            ],
+        }));
+
+        assert_eq!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGateError(
+                PolicyGateError::Drift
+            ))
+        );
+    }
+
+    fn composed() -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "aruna".to_string(),
+            backend_path: "objects/one".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::from([("blake3".to_string(), vec![6u8; 32])]),
+        }
+    }
+}
