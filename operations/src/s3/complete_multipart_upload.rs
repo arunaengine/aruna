@@ -2002,6 +2002,7 @@ mod tests {
             checksum_hint: None,
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
+            subject_generation: 0,
         }
     }
 
@@ -2085,12 +2086,14 @@ mod tests {
         assert_eq!(op.state, CompleteMultipartUploadState::ReadBucketDefault);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
+            [Effect::Storage(StorageEffect::BatchRead { .. })]
         ));
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: None,
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"bucket".to_vec().into(), None),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
         assert_eq!(op.state, CompleteMultipartUploadState::FenceBackend);
         assert!(matches!(

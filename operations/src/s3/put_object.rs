@@ -3607,7 +3607,67 @@ mod gate_test {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([7u8; 16]),
         }));
-        let effects = operation.step(read(Some(bucket(vec![policy("us-east").policy_ref()], 1))));
+        let effects = operation.step(drift_read(
+            Some(bucket(vec![policy("us-east").policy_ref()], 1)),
+            None,
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Storage(StorageEffect::AbortTransaction { .. })
+        )));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Drift))
+        ));
+    }
+
+    /// The exposing transaction re-reads the bucket and the local subject in
+    /// one batch; both must still be what the gate decided on.
+    fn drift_read(bucket: Option<Value>, subject: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (ByteView::from(Vec::new()), bucket),
+                (ByteView::from(Vec::new()), subject),
+            ],
+        })
+    }
+
+    fn subject_row(generation: u64, blocked: bool) -> Value {
+        let mut record = aruna_core::structs::NodeSubjectRecord::seed(
+            crate::placement_policy::fixtures::subject(node(9), "eu-west"),
+        )
+        .expect("subject is valid");
+        record.subject.generation = generation;
+        record.serving_blocked = blocked;
+        record.policy_draining = blocked;
+        ByteView::from(record.to_bytes().expect("record encodes"))
+    }
+
+    #[test]
+    fn subject_advance_aborts() {
+        // The subject that admitted the write moved on while the bytes
+        // streamed, so the copy would commit refs nothing evaluated.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(read(Some(ByteView::from(cached))));
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
+            location: location(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7u8; 16]),
+        }));
+
+        let effects = operation.step(drift_read(
+            Some(bucket(vec![rule.policy_ref()], 1)),
+            Some(subject_row(2, false)),
+        ));
 
         assert!(effects.iter().any(|effect| matches!(
             effect,

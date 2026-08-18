@@ -509,6 +509,7 @@ mod tests {
             checksum_hint: None,
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
+            subject_generation: 0,
         });
         operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
         operation.state = AbortMultipartUploadState::CommitMarkTransaction;

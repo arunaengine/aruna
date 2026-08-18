@@ -389,6 +389,14 @@ mod tests {
         }
     }
 
+    /// A bucket with no default refs, so the gate is skipped entirely.
+    fn ungoverned_bucket() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        })
+    }
+
     fn snapshot() -> RoutingSnapshot {
         RoutingSnapshot::new(
             Ulid::generate(),
@@ -411,6 +419,7 @@ mod tests {
         let snapshot = snapshot().with_bucket_rules(vec![rule("archive")]);
         let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
         operation.start();
+        operation.step(ungoverned_bucket());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -430,6 +439,7 @@ mod tests {
         let snapshot = snapshot().with_bucket_rules(vec![rule("glacier")]);
         let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
         operation.start();
+        operation.step(ungoverned_bucket());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -453,6 +463,7 @@ mod tests {
         });
         let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
         operation.start();
+        operation.step(ungoverned_bucket());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));

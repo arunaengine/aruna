@@ -3083,6 +3083,14 @@ mod tests {
         }
     }
 
+    /// The apply transaction's drift re-check answered with an absent bucket
+    /// and an absent subject, which an ungoverned replica passes.
+    fn no_drift() -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(vec![0u8; 4].into(), None), (vec![1u8; 4].into(), None)],
+        })
+    }
+
     fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
         let txn_id = Ulid::generate();
         op.state = IncomingVersionReplicationState::StartTransaction;
@@ -3090,6 +3098,12 @@ mod tests {
         op.destination_group_id = Some(Ulid::generate());
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CheckDrift);
+        // The apply transaction re-reads the destination default and the local
+        // subject before it exposes anything.
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(vec![0u8; 4].into(), None), (vec![1u8; 4].into(), None)],
+        }));
         assert_eq!(op.state, IncomingVersionReplicationState::VerifyReplaced);
         assert!(matches!(
             effects.as_slice(),
@@ -3719,9 +3733,10 @@ mod tests {
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
         op.destination_group_id = Some(Ulid::generate());
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
         }));
+        let effects = op.step(no_drift());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -4155,7 +4170,8 @@ mod tests {
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = op.step(no_drift());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]

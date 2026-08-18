@@ -425,6 +425,7 @@ mod test {
             checksum_hint: None,
             metadata: Default::default(),
             placement_policies: Vec::new(),
+            subject_generation: 0,
         }
     }
 

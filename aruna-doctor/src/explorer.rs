@@ -2004,6 +2004,7 @@ mod tests {
             checksum_hint: None,
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
+            subject_generation: 0,
         };
 
         let decoded = decode_entry(

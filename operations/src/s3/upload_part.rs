@@ -776,11 +776,17 @@ mod test {
             checksum_hint: None,
             metadata: std::collections::HashMap::new(),
             placement_policies: Vec::new(),
+            subject_generation: 0,
         };
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            value: Some(record.to_bytes().unwrap().into()),
-            key: upload_id.to_bytes().to_vec().into(),
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    upload_id.to_bytes().to_vec().into(),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
+                (NODE_SUBJECT_KEY.to_vec().into(), None),
+            ],
         }));
 
         let [Effect::Blob(BlobEffect::WritePart { resolved, .. })] = effects.as_slice() else {
