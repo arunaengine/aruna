@@ -415,7 +415,7 @@ async fn record_decline(
 
 /// Whether a launch by this node is suppressed: a success, a cancellation, or
 /// any execution that is not terminally failed already answers this request.
-fn suppressed(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
+pub(crate) fn suppressed(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
     let Ok(Some(projection)) = reduce_family(family, records) else {
         return false;
     };

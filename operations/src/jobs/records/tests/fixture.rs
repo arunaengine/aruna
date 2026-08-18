@@ -13,6 +13,15 @@ use aruna_core::structs::{
 use aruna_core::types::UserId;
 use ulid::Ulid;
 
+use aruna_core::document::DocumentSyncTarget;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::structs::Actor;
+use aruna_storage::{FjallStorage, StorageHandle};
+use tempfile::TempDir;
+
+use crate::driver::DriverContext;
 use crate::jobs::records::verify::FamilyView;
 
 pub const REALM: RealmId = RealmId([3u8; 32]);
@@ -318,4 +327,47 @@ pub fn payload() -> ExecutionSpec {
         output_prefixes: Vec::new(),
         collision_policy: CollisionPolicy::default(),
     }
+}
+
+fn actor(node_id: NodeId) -> Actor {
+    Actor {
+        node_id,
+        user_id: user(),
+        realm_id: REALM,
+    }
+}
+
+/// One storage-backed context holding this realm config, so operations that
+/// resolve the family view run against real rows.
+pub async fn context(config: &RealmConfigDocument, publisher: NodeId) -> (TempDir, DriverContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let storage: StorageHandle =
+        FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+    let target = DocumentSyncTarget::RealmConfig { realm_id: REALM };
+    let event = storage
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            value: config
+                .to_bytes(&actor(publisher))
+                .expect("config encodes")
+                .into(),
+            txn_id: None,
+        }))
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    (
+        dir,
+        DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        },
+    )
 }

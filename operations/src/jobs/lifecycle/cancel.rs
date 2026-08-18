@@ -10,7 +10,7 @@ use aruna_core::effects::JobRecordFrame;
 use aruna_core::jobs::JobRequest;
 use aruna_core::structs::{
     AuthContext, CancelAuthority, JobCancelRecord, JobFamilyRecord, JobId, JobRecordEnvelope,
-    LogicalJobSpec, Permission, PhysicalExecutionState, blob_group_permission_path,
+    LogicalJobSpec, Permission, blob_group_permission_path,
 };
 use aruna_core::util::unix_timestamp_millis;
 use tracing::{debug, warn};
@@ -169,17 +169,4 @@ async fn stop_execution(
     if let Err(error) = send_job_request(context, executor, request).await {
         warn!(peer = %executor, error = %error, "Cancel delivery to an executor failed");
     }
-}
-
-/// Whether the family already carries a cancellation, so a launch round can
-/// suppress itself without reducing the whole projection again.
-pub fn cancelled(records: &[JobRecordEnvelope]) -> bool {
-    records
-        .iter()
-        .any(|envelope| matches!(&envelope.record, JobFamilyRecord::Cancel(_)))
-}
-
-/// Whether one projected execution is still worth cancelling.
-pub fn active(state: PhysicalExecutionState) -> bool {
-    !state.is_terminal()
 }

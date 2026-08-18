@@ -79,4 +79,4 @@ pub enum RecordStoreError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

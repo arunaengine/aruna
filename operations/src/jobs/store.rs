@@ -2772,7 +2772,6 @@ mod tests {
                 total: Some(2),
                 unit: "items".to_string(),
             },
-            None,
             4_000,
         )
         .await

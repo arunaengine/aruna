@@ -1,5 +1,5 @@
 mod adapter;
 mod admission;
-mod fixture;
+pub(crate) mod fixture;
 mod reduction;
 mod store;

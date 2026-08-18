@@ -76,3 +76,6 @@ pub enum LifecycleError {
         got: String,
     },
 }
+
+#[cfg(test)]
+mod tests;

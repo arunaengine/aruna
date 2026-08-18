@@ -10,7 +10,6 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AuthContext, InputSelection, InputSource, JobError, JobRecord, VersionedObjectArn,
 };
-use aruna_core::types::NodeId;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -92,7 +91,7 @@ pub async fn stage_remote_input(
 
 /// A denied or policy-blocked read fails this attempt permanently; anything
 /// else may still succeed from another holder later.
-fn stage_error(bucket: &str, key: &str, error: Option<BaoReadError>) -> JobError {
+pub(crate) fn stage_error(bucket: &str, key: &str, error: Option<BaoReadError>) -> JobError {
     let message = match &error {
         Some(error) => format!("staging {bucket}/{key} failed: {error}"),
         None => format!("staging {bucket}/{key} found no usable holder"),
@@ -103,21 +102,4 @@ fn stage_error(bucket: &str, key: &str, error: Option<BaoReadError>) -> JobError
         }
         _ => JobError::retryable(message),
     }
-}
-
-/// Holders of one input's bytes, for callers that only need the node list.
-pub async fn input_holders(
-    context: &DriverContext,
-    blake3: [u8; 32],
-) -> Result<Vec<NodeId>, JobError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| JobError::permanent("holder lookup needs a net handle"))?;
-    drive(
-        GetBlobHoldersOperation::new(blake3, *net.realm_id(), net.node_id()),
-        context,
-    )
-    .await
-    .map_err(|error| JobError::retryable(format!("input holder lookup failed: {error}")))
 }

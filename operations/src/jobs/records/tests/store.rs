@@ -1,15 +1,9 @@
 //! The append, projection, and audit operations against real storage.
 
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, JobRecordFrame, PageLimit, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::effects::{JobRecordFrame, PageLimit};
 use aruna_core::structs::{
     JobFamilyRecord, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
-    RealmConfigDocument,
 };
-use aruna_storage::{FjallStorage, StorageHandle};
-use tempfile::TempDir;
 
 use super::fixture::{Family, REALM};
 use crate::driver::{DriverContext, drive};
@@ -18,49 +12,7 @@ use crate::jobs::records::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOper
 use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 
-fn actor(node_id: aruna_core::NodeId) -> aruna_core::structs::Actor {
-    aruna_core::structs::Actor {
-        node_id,
-        user_id: super::fixture::user(),
-        realm_id: REALM,
-    }
-}
-
-async fn fixture(
-    config: &RealmConfigDocument,
-    family_holder: aruna_core::NodeId,
-) -> (TempDir, DriverContext) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let storage: StorageHandle =
-        FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
-    let target = DocumentSyncTarget::RealmConfig { realm_id: REALM };
-    let event = storage
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            value: config
-                .to_bytes(&actor(family_holder))
-                .expect("config encodes")
-                .into(),
-            txn_id: None,
-        }))
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
-    (
-        dir,
-        DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        },
-    )
-}
+use super::fixture::context as fixture;
 
 async fn append(
     context: &DriverContext,
