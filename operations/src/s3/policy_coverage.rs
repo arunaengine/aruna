@@ -8,19 +8,23 @@
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey,
-    ManagedCopyRecord, PlacementPolicyRef, VersionKey,
+    AuthContext, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
+    ManagedCopyKey, ManagedCopyRecord, Permission, PlacementPolicyRef, VersionKey,
+    policy_admin_path,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
+
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 /// Upper bound on one page, so a scan can never walk a whole bucket at once.
 pub const COVERAGE_PAGE_LIMIT: usize = 256;
@@ -109,6 +113,7 @@ pub struct CoverageInput {
     pub scope: CoverageScope,
     pub start_after: Option<Key>,
     pub limit: usize,
+    pub auth_context: AuthContext,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -119,6 +124,8 @@ pub enum CoverageError {
     Storage(#[from] StorageError),
     #[error("The specified bucket does not exist.")]
     NoSuchBucket,
+    #[error("caller may not administer the realm configuration")]
+    Unauthorized,
     #[error("unexpected event during the coverage scan")]
     InvalidEvent,
 }
@@ -126,6 +133,7 @@ pub enum CoverageError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ScanState {
     Init,
+    Authorize,
     StartTransaction,
     ReadBucket,
     ScanPage,
@@ -507,10 +515,18 @@ impl Operation for PolicyCoverageOperation {
     type Error = CoverageError;
 
     fn start(&mut self) -> Effects {
-        self.state = ScanState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
+        self.state = ScanState::Authorize;
+        let auth_config = CheckPermissionsConfig {
+            auth_context: self.input.auth_context.clone(),
+            path: policy_admin_path(self.input.auth_context.realm_id),
+            required_permission: Permission::READ,
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(auth_config),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -519,6 +535,25 @@ impl Operation for PolicyCoverageOperation {
         }
         match self.state {
             ScanState::Init => self.start(),
+            ScanState::Authorize => {
+                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
+                else {
+                    return self.fail(CoverageError::InvalidEvent);
+                };
+                match allowed {
+                    Ok(true) => {
+                        self.state = ScanState::StartTransaction;
+                        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                            read: true
+                        })]
+                    }
+                    Ok(false) => self.fail(CoverageError::Unauthorized),
+                    Err(error) => {
+                        warn!(error = %error, "Coverage authorization check failed");
+                        self.fail(CoverageError::Unauthorized)
+                    }
+                }
+            }
             ScanState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self.fail(CoverageError::InvalidEvent);
@@ -581,19 +616,27 @@ impl Operation for PolicyCoverageOperation {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
     }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            CoverageError::Unauthorized | CoverageError::NoSuchBucket
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachmentGap, CopyState, CoverageInput, CoverageLimit, CoverageReport, CoverageScope,
-        PolicyCoverageOperation,
+        AttachmentGap, CopyState, CoverageError, CoverageInput, CoverageLimit, CoverageReport,
+        CoverageScope, PolicyCoverageOperation,
     };
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-        ManagedCopyRecord, ManagedCopyState, PlacementPolicyRef, RealmId, VersionKey,
+        AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, ManagedCopyRecord, ManagedCopyState, PlacementPolicyRef, RealmId,
+        VersionKey,
     };
     use aruna_core::types::{Key, NodeId, UserId};
     use std::collections::HashMap;
@@ -675,6 +718,17 @@ mod tests {
             scope,
             start_after: None,
             limit: 16,
+            auth_context: AuthContext {
+                user_id: user_id(),
+                realm_id: RealmId::from_bytes([1u8; 32]),
+                path_restrictions: None,
+            },
+        })
+    }
+
+    fn authorized(allowed: bool) -> Event {
+        Event::SubOperation(SubOperationEvent::AuthorizationResult {
+            allowed: Ok(allowed),
         })
     }
 
@@ -722,6 +776,7 @@ mod tests {
         let version_id = Ulid::from_bytes([9u8; 16]);
         let mut operation = operation(CoverageScope::CurrentHeads);
         operation.start();
+        operation.step(authorized(true));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),
         }));
@@ -809,6 +864,7 @@ mod tests {
         let version_id = Ulid::from_bytes([9u8; 16]);
         let mut operation = operation(CoverageScope::Historical);
         operation.start();
+        operation.step(authorized(true));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),
         }));
@@ -842,9 +898,21 @@ mod tests {
     }
 
     #[test]
+    fn denies_non_admin() {
+        // Coverage names policy refs, so it is an administrative read.
+        let mut operation = operation(CoverageScope::CurrentHeads);
+        operation.start();
+        let effects = operation.step(authorized(false));
+
+        assert!(effects.is_empty(), "no transaction is opened");
+        assert_eq!(operation.finalize(), Err(CoverageError::Unauthorized));
+    }
+
+    #[test]
     fn historical_flags_predecessor() {
         let mut operation = operation(CoverageScope::Historical);
         operation.start();
+        operation.step(authorized(true));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),
         }));
