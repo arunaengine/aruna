@@ -9642,13 +9642,18 @@ async fn read_inbound_sync_messages(
     Ok((messages, topics.into_iter().collect()))
 }
 
-/// Refuses an inbound sync stream whose opener declares another realm wire
-/// format. Every legitimate opener names the topic's event type, so an absent
-/// declaration is refused too: there is no fallback and no downgrade.
+/// Refuses an inbound sync stream that declares another realm wire format.
+/// A genesis puller has no topic state yet and may open without a declaration,
+/// but a declared mismatch and a summary without one are refused: a peer that
+/// claims topic state always knows its format, and there is no downgrade.
 fn admit_realm_format(messages: &[SyncMessage]) -> std::result::Result<(), RealmFormatError> {
     for message in messages {
         match message {
-            SyncMessage::Open(open) => verify_realm_format(open.event_type_id.as_deref())?,
+            SyncMessage::Open(open) => {
+                if open.event_type_id.is_some() {
+                    verify_realm_format(open.event_type_id.as_deref())?;
+                }
+            }
             SyncMessage::Summary(summary) => verify_realm_format(summary.event_type_id.as_deref())?,
             _ => {}
         }
@@ -10541,8 +10546,9 @@ mod tests {
 
     #[test]
     fn admits_matching_format() {
-        // A same-format opener is admitted; another epoch and an undeclared
-        // format are both refused before any document reaches the reducer.
+        // A same-format or stateless (genesis-pull) opener is admitted; a
+        // declared other epoch is refused before any document is applied, and
+        // a summary, which always names its topic state, may not stay silent.
         let topic = irokle_crate::TopicId::hash(b"format-fence");
         let open = |event_type_id: Option<&str>| {
             SyncMessage::Open(irokle_crate::sync::SyncOpen {
@@ -10563,8 +10569,18 @@ mod tests {
                 declared: "aruna.document.v2".to_string()
             })
         );
+        assert_eq!(admit_realm_format(&[open(None)]), Ok(()));
+
+        let summary = SyncMessage::Summary(irokle_crate::sync::SyncSummary {
+            topic_id: topic,
+            event_type_id: None,
+            fingerprint: [0u8; 32],
+            heads: Default::default(),
+            actor_clock: Default::default(),
+            actor_tips: Default::default(),
+        });
         assert_eq!(
-            admit_realm_format(&[open(None)]),
+            admit_realm_format(&[summary]),
             Err(RealmFormatError::Absent)
         );
     }
