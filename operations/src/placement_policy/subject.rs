@@ -452,7 +452,8 @@ async fn read_realm_config(
         .transpose()?)
 }
 
-async fn read_local_subject(
+/// The subject record this node advertises, if it ever advertised one.
+pub async fn read_local_subject(
     context: &DriverContext,
 ) -> Result<Option<NodeSubjectRecord>, SubjectScanError> {
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = context

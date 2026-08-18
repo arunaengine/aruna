@@ -180,6 +180,7 @@ async fn reserve_and_run(
         subject_digest: round.capability.subject_digest,
         accepted_at_ms: now,
     };
+    let sealed_subject = (receipt.subject_generation, receipt.subject_digest);
     let Some(net) = context.net_handle.as_ref() else {
         return Err(LaunchDecline::Draining);
     };
@@ -201,6 +202,8 @@ async fn reserve_and_run(
             job_id: round.spec.job_id,
             execution_id,
             resources: round.spec.resources,
+            subject_generation: sealed_subject.0,
+            subject_digest: sealed_subject.1,
             now_ms: now,
         }),
         context.as_ref(),

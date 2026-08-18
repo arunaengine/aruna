@@ -41,6 +41,7 @@ use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::reservation::job_reservation;
 use crate::jobs::lifecycle::updates::{publish_progress, publish_terminal};
+use crate::placement_policy::subject::read_local_subject;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
@@ -98,7 +99,7 @@ pub async fn run_execution_job(
         return;
     };
 
-    let backend = match resolve_backend(&context, &spec) {
+    let backend = match resolve_backend(&context, &spec, job_id).await {
         Ok(backend) => backend,
         Err(error) => {
             Box::pin(fail_and_crate(&context, job_id, token, &record, error)).await;
@@ -338,9 +339,15 @@ pub async fn run_execution_job(
 }
 
 /// Resolve the backend for a spec, or a permanent error when none is eligible.
-pub fn resolve_backend(
+///
+/// A receipted execution is fenced to the exact execution site its receipt
+/// sealed: subject drift refuses the start instead of running accepted work
+/// somewhere nobody authorized. A local job without a receipt keeps the
+/// unfenced selection.
+pub async fn resolve_backend(
     context: &DriverContext,
     spec: &ExecutionSpec,
+    job_id: JobId,
 ) -> Result<Arc<dyn ExecutorBackend>, JobError> {
     let Some(registry) = context.compute_handle.as_ref() else {
         return Err(JobError::permanent("no compute backend configured"));
@@ -349,10 +356,51 @@ pub fn resolve_backend(
         .executor_constraint
         .as_deref()
         .map(ExecutorKind::from_wire);
-    registry
+    let selected = registry
         .select(constraint.as_ref())
         .cloned()
-        .ok_or_else(|| JobError::permanent("no eligible executor for job"))
+        .ok_or_else(|| JobError::permanent("no eligible executor for job"))?;
+    let Some(sealed) = sealed_site(context, job_id).await else {
+        return Ok(selected);
+    };
+    let Some(subject) = read_local_subject(context)
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.subject)
+    else {
+        return Err(JobError::retryable(
+            "receipted execution cannot start without a local placement subject",
+        ));
+    };
+    match registry.fenced(&selected.kind(), &subject, sealed.0, &sealed.1) {
+        Ok(backend) => Ok(backend.clone()),
+        Err(BackendError::Fenced) => {
+            warn!(
+                job_id = %job_id,
+                sealed_generation = sealed.0,
+                current_generation = subject.generation,
+                "Receipted execution refused: the execution site drifted from its receipt"
+            );
+            Err(JobError::retryable(format!(
+                "execution site drifted from its receipt: sealed subject generation {}, current {}",
+                sealed.0, subject.generation
+            )))
+        }
+        Err(error) => Err(JobError::permanent(format!(
+            "no eligible executor for job: {error}"
+        ))),
+    }
+}
+
+/// Subject generation and digest one receipted execution was accepted under.
+/// `None` for a local job that never reserved capacity: the unfenced path.
+async fn sealed_site(context: &DriverContext, job_id: JobId) -> Option<(u64, [u8; 32])> {
+    let reservation = job_reservation(context, job_id).await?;
+    match reservation.subject_generation {
+        0 => None,
+        generation => Some((generation, reservation.subject_digest)),
+    }
 }
 
 async fn prepare_workspace(
@@ -2661,5 +2709,142 @@ mod tests {
         );
 
         assert_eq!(spec.security.network, NetworkAccess::Open);
+    }
+
+    /// Writes the receipted reservation and the node subject a fenced start
+    /// compares against.
+    async fn seal_site(storage: &StorageHandle, job_id: JobId, generation: u64, digest: [u8; 32]) {
+        use aruna_core::compute_quota::JobReservationRecord;
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+        use aruna_core::structs::{NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject};
+
+        let reservation = JobReservationRecord {
+            execution_id: Ulid::from_bytes([0xA1; 16]),
+            job_id,
+            resources: aruna_core::structs::EffectiveResources {
+                cpu_cores: 1,
+                ram_bytes: 1,
+                disk_bytes: 0,
+                max_walltime_ms: 1_000,
+                preemptible: false,
+            },
+            created_at_ms: 1,
+            subject_generation: generation,
+            subject_digest: digest,
+        };
+        let _ = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: JOB_RESERVATION_KEYSPACE.to_string(),
+                key: reservation.execution_id.to_bytes().as_slice().into(),
+                value: postcard::to_allocvec(&reservation).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node_id(7),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .unwrap();
+        let _ = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+                key: NODE_SUBJECT_KEY.to_vec().into(),
+                value: record.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
+        let mut registry = aruna_compute::ExecutorRegistry::new();
+        registry.register(StubBackend::new(StubReconcile::NotFound));
+        Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: Some(Arc::new(registry)),
+        })
+    }
+
+    #[tokio::test]
+    async fn unreceipted_start_unfenced() {
+        // A local job never reserved capacity, so no receipt fences its start.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+
+        assert!(
+            resolve_backend(&ctx, &execution_spec(), job_id())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn drifted_site_refuses() {
+        // The receipt sealed one execution site; a node advertising another one
+        // must refuse to start the accepted work, retryably.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+        let job_id = job_id();
+        seal_site(&storage, job_id, 99, [7u8; 32]).await;
+
+        let Err(error) = resolve_backend(&ctx, &execution_spec(), job_id).await else {
+            panic!("a drifted subject must refuse the start");
+        };
+        assert_eq!(error.kind, JobErrorKind::Retryable);
+        assert!(error.message.contains("drifted"));
+    }
+
+    #[tokio::test]
+    async fn sealed_site_starts() {
+        // The exact sealed generation and digest still admit the start.
+        use aruna_compute::ExecutorRegistry;
+        use aruna_core::compute::ExecutorCapability;
+        use aruna_core::structs::{NodeSubjectRecord, PlacementSubject};
+
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+        let job_id = job_id();
+        let subject = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node_id(7),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .unwrap()
+        .subject;
+        let registry =
+            ExecutorRegistry::new().with_backend(StubBackend::new(StubReconcile::NotFound));
+        let capability: ExecutorCapability = registry
+            .capabilities(&subject, false)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        seal_site(
+            &storage,
+            job_id,
+            capability.subject.generation,
+            capability.subject_digest,
+        )
+        .await;
+
+        assert!(
+            resolve_backend(&ctx, &execution_spec(), job_id)
+                .await
+                .is_ok()
+        );
     }
 }

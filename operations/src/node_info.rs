@@ -1292,6 +1292,8 @@ mod tests {
                 preemptible: false,
             },
             created_at_ms: 5,
+            subject_generation: 1,
+            subject_digest: [0u8; 32],
         };
         write_row(
             ctx,

@@ -94,6 +94,8 @@ async fn reserve(
             job_id: receipt.job_id,
             execution_id: receipt.execution_id,
             resources: resources(),
+            subject_generation: receipt.subject_generation,
+            subject_digest: receipt.subject_digest,
             now_ms: 4_000,
         }),
         ctx,
@@ -110,6 +112,8 @@ fn holds_static_ceilings() {
         job_id: aruna_core::structs::JobId::from_bytes([2u8; 16]),
         resources: resources(),
         created_at_ms: 1,
+        subject_generation: 1,
+        subject_digest: [0u8; 32],
     }];
     assert!(fits(&held, &resources(), &envelope(2)));
     assert!(!fits(&held, &resources(), &envelope(1)));

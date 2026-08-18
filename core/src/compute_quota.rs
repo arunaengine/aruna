@@ -143,6 +143,10 @@ pub struct JobReservationRecord {
     pub job_id: JobId,
     pub resources: EffectiveResources,
     pub created_at_ms: u64,
+    /// Execution site the receipt sealed. The local attempt refuses to start
+    /// when this node no longer advertises exactly this subject.
+    pub subject_generation: u64,
+    pub subject_digest: [u8; 32],
 }
 
 /// What a departing node could not resolve before leaving. Recorded durably so

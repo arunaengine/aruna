@@ -120,6 +120,10 @@ pub struct ReserveExecutionConfig {
     pub job_id: JobId,
     pub execution_id: Ulid,
     pub resources: EffectiveResources,
+    /// Execution site the receipt sealed, kept so the local attempt can fence
+    /// itself against a subject this node no longer advertises.
+    pub subject_generation: u64,
+    pub subject_digest: [u8; 32],
     pub now_ms: u64,
 }
 
@@ -267,6 +271,8 @@ impl ReserveExecutionOperation {
                         job_id: self.config.job_id,
                         resources: self.config.resources,
                         created_at_ms: self.config.now_ms,
+                        subject_generation: self.config.subject_generation,
+                        subject_digest: self.config.subject_digest,
                     })?
                     .as_slice(),
                 ),
