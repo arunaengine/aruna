@@ -43,6 +43,9 @@ pub struct AdmitSubmissionConfig {
     pub request_digest: [u8; 32],
     pub candidate: Box<AdmissionCandidate>,
     pub now_ms: u64,
+    /// A standing-quota refusal evaluated before the transaction. It applies
+    /// only to a fresh admission: a replayed claim settles before this check.
+    pub quota_refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +192,10 @@ impl AdmitSubmissionOperation {
         }
         if let Some(existing_job_id) = self.conflicting() {
             self.outcome = Some(Err(LifecycleError::IdempotencyConflict { existing_job_id }));
+            return self.cancel(txn_id);
+        }
+        if let Some(reason) = self.config.quota_refusal.take() {
+            self.outcome = Some(Err(LifecycleError::QuotaDenied(reason)));
             return self.cancel(txn_id);
         }
         self.state = AdmitState::ReadCache { txn_id };

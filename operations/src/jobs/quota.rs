@@ -1,21 +1,35 @@
-//! The logical admission quota seam.
+//! The logical admission quota seam, wired to the replicated demand view.
 
-use aruna_core::structs::EffectiveResources;
+use crate::driver::DriverContext;
+use crate::node_info::group_demand;
+use aruna_core::NodeId;
+use aruna_core::compute_quota::{ComputeQuota, admits};
+use aruna_core::structs::{EffectiveResources, RealmConfigDocument};
 use aruna_core::types::GroupId;
-use thiserror::Error;
 
-/// Why standing quota refused a new logical admission.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
-#[error("group {group_id} is over its standing compute quota: {reason}")]
-pub struct QuotaDenied {
-    pub group_id: GroupId,
-    pub reason: String,
-}
-
-/// Standing-quota decision taken before one submission is logically admitted.
-/// The quota round wires the replicated demand evaluator into this seam; until
-/// then admission is allowed and an observed overshoot cancels nothing.
-pub fn quota_gate(group_id: GroupId, resources: &EffectiveResources) -> Result<(), QuotaDenied> {
-    let _ = (group_id, resources);
-    Ok(())
+/// Standing-quota decision before one submission is logically admitted.
+/// `Ok(Some(reason))` is a denial the admission applies only to a FRESH claim;
+/// `Err` means the quota or demand view is unavailable and admission fails
+/// closed. An overshoot observed after convergence cancels nothing.
+pub async fn quota_refusal(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    group_id: GroupId,
+    resources: &EffectiveResources,
+) -> Result<Option<String>, String> {
+    let quota = config
+        .compute
+        .effective_quota(&group_id)
+        .map_err(|error| format!("compute quota unavailable: {error}"))?;
+    if quota == ComputeQuota::default() {
+        return Ok(None);
+    }
+    let (view, _truncated) = group_demand(context, config.realm_id, local, &group_id)
+        .await
+        .map_err(|error| format!("quota demand view unavailable: {error}"))?;
+    match admits(&view, &quota, resources) {
+        Ok(()) => Ok(None),
+        Err(denied) => Ok(Some(denied.to_string())),
+    }
 }

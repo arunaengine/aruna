@@ -2524,6 +2524,7 @@ mod tests {
         let response = create_task(
             State(state.clone()),
             Extension(None),
+            Extension(None),
             basic_headers(&access, TES_SECRET),
             Json(task),
         )
@@ -2570,6 +2571,7 @@ mod tests {
 
         let response = create_task(
             State(state.clone()),
+            Extension(None),
             Extension(None),
             basic_headers(&access, TES_SECRET),
             Json(sample_task(group)),

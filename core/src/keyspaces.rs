@@ -171,9 +171,6 @@ pub const JOB_WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
 /// Bounded explain record of the plan a witness sealed before it launched.
 pub const JOB_PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
 pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
-/// Exact local capacity reserved per ExecutionId before work starts, released
-/// on that execution's terminal fact. Duplicate executions reserve separately.
-pub const JOB_RESERVATION_KEYSPACE: &str = "job_reservations";
 /// The single row recording what this node could not resolve when it departed.
 pub const COMPUTE_DEPARTURE_KEYSPACE: &str = "compute_departure";
 pub const ROCRATE_JOB_STATE_KEYSPACE: &str = "rocrate_job_state";

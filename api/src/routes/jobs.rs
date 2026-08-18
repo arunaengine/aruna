@@ -2148,6 +2148,7 @@ mod tests {
             let result = submit_job(
                 State(state.clone()),
                 Extension(auth_for(user(2))),
+                Extension(None),
                 Json(request),
             )
             .await;

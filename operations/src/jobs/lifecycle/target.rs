@@ -71,9 +71,7 @@ pub async fn admit_launch(
         return Some(Err(LaunchDecline::Unauthorized));
     }
     let family = envelope.family();
-    let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
-        return None;
-    };
+    let view = FamilyView::resolve(&config, realm_id, family)?;
     if !view.holds(intent.scheduler_node_id) {
         return Some(Err(LaunchDecline::NotHolder));
     }
@@ -82,9 +80,7 @@ pub async fn admit_launch(
         fetch_family(context, &config, realm_id, family).await;
         records = load_family(context.as_ref(), family).await;
     }
-    let Some(spec) = spec_of(&records, &intent) else {
-        return None;
-    };
+    let spec = spec_of(&records, &intent)?;
     // The launch itself becomes a retained record before it can be receipted.
     if !append_record(context, realm_id, local, launch.envelope().clone()).await {
         return None;
@@ -292,12 +288,9 @@ pub(crate) fn existing_receipt(
 }
 
 fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
-    records.iter().any(
-        |envelope| match (&envelope.record, envelope.family() == family) {
-            (JobFamilyRecord::Cancel(_), true) => true,
-            _ => false,
-        },
-    )
+    records.iter().any(|envelope| {
+        matches!(&envelope.record, JobFamilyRecord::Cancel(_)) && envelope.family() == family
+    })
 }
 
 /// This node's own advertisement for the offered executor kind.

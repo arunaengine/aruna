@@ -74,6 +74,9 @@ pub enum LifecycleError {
     /// The same idempotency key is already bound to a different request.
     #[error("idempotency key already bound to job {existing_job_id}")]
     IdempotencyConflict { existing_job_id: JobId },
+    /// Standing quota refused this NEW admission; replays are never refused.
+    #[error("standing compute quota refused the admission: {0}")]
+    QuotaDenied(String),
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]

@@ -45,6 +45,7 @@ async fn admit(
             request_digest: family.request_digest,
             candidate: Box::new(candidate(family, spec, claim)),
             now_ms: 3_000,
+            quota_refusal: None,
         }),
         context,
     )

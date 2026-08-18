@@ -20,7 +20,7 @@ use aruna_core::structs::{
     RecordVerdict,
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
-use serde::{Deserialize, Serialize};
+
 use smallvec::smallvec;
 use tracing::debug;
 use ulid::Ulid;
@@ -36,15 +36,9 @@ use crate::jobs::store::iter_prefix_page;
 /// executions than this without its backend ceiling stopping it first.
 pub const MAX_RESERVATION_SCAN: usize = 512;
 
-/// Capacity held for one physical execution. Written with the receipt and
-/// released when that execution reaches a terminal state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionReservation {
-    pub execution_id: Ulid,
-    pub job_id: JobId,
-    pub resources: EffectiveResources,
-    pub created_at_ms: u64,
-}
+/// Capacity held for one physical execution: the shared core contract, written
+/// with the receipt and released at that execution's terminal state.
+pub use aruna_core::compute_quota::JobReservationRecord as ExecutionReservation;
 
 pub fn reservation_key(execution_id: Ulid) -> Key {
     Key::from(execution_id.to_bytes().as_slice())

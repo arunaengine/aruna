@@ -27,7 +27,6 @@ use super::ids::{
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::quota::quota_gate;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::submit::SubmitJobError;
@@ -102,8 +101,6 @@ pub async fn submit_external_job(
         retention_ms,
     };
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
-    quota_gate(request.spec.group_id, &effective_resources(&request.spec))
-        .map_err(|denied| SubmitJobError::QuotaDenied(denied.to_string()))?;
     let (config, local) = local_view(context).await?;
     let view = family_view(&config, &identity)?;
     if view.holds(local) {
@@ -206,6 +203,15 @@ async fn admit_here(
         JobFamilyRecord::Spec(Box::new(spec)),
     )?;
     let claim_frame = sign_frame(context, config.realm_id, JobFamilyRecord::Claim(claim))?;
+    let quota_refusal = crate::jobs::quota::quota_refusal(
+        context,
+        config,
+        local,
+        request.spec.group_id,
+        &effective_resources(&request.spec),
+    )
+    .await
+    .map_err(SubmitJobError::PlacementUnavailable)?;
     let admitted = drive(
         AdmitSubmissionOperation::new(AdmitSubmissionConfig {
             realm_id: config.realm_id,
@@ -218,6 +224,7 @@ async fn admit_here(
                 claim: claim_frame,
             }),
             now_ms,
+            quota_refusal,
         }),
         context,
     )
@@ -251,6 +258,7 @@ fn admission_error(error: LifecycleError) -> SubmitJobError {
         LifecycleError::IdempotencyConflict { existing_job_id } => {
             SubmitJobError::JobPlanConflict { existing_job_id }
         }
+        LifecycleError::QuotaDenied(reason) => SubmitJobError::QuotaDenied(reason),
         error => SubmitJobError::PlacementUnavailable(error.to_string()),
     }
 }
