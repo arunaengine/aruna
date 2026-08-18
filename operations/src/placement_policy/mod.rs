@@ -43,6 +43,7 @@ pub(crate) mod fixtures {
     use std::collections::BTreeMap;
 
     use super::cache::{PolicyCacheEntry, cache_key};
+    pub(crate) use super::tests::signed_document;
     use crate::driver::DriverContext;
 
     pub fn subject(node_id: NodeId, location: &str) -> PlacementSubject {
@@ -73,7 +74,7 @@ pub(crate) mod fixtures {
             })
             .await;
         for policy in policies {
-            let entry = PolicyCacheEntry::verified(realm_id, policy, 0);
+            let entry = PolicyCacheEntry::verified(&signed_document(realm_id, policy, 9), 0);
             let _ = context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {

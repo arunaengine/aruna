@@ -3513,7 +3513,8 @@ mod gate_test {
         assert!(!materializes(&operation.start()));
         let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
         assert!(!materializes(&effects));
-        let cached = PolicyCacheEntry::verified(realm(), &rule, 10)
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         let effects = operation.step(read(Some(ByteView::from(cached))));
