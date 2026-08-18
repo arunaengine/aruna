@@ -68,6 +68,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "realm-wide counters intentionally open to every realm member",
     ),
     (
+        "job_audit.rs",
+        "get_job_audit",
+        "self-scoped: family_report and family_audit answer NotFound unless the \
+         caller is the sealed submitter of the request",
+    ),
+    (
         "jobs.rs",
         "cancel_job",
         "self-scoped: read_owned_job requires the caller to be the creator",

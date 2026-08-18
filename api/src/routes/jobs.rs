@@ -10,7 +10,7 @@ use aruna_core::structs::{
     JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, Permission,
     WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
 };
-use aruna_operations::jobs::lifecycle::submit_external_job;
+use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
     cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
@@ -160,10 +160,85 @@ pub struct SubmitExecutionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitJobResponse {
+    /// The alias this responder bound the request to. Stable for the caller.
     pub job_id: String,
     pub created: bool,
-    pub owner_node_url: String,
+    /// The replicated identity of the request itself, hex encoded. Two aliases
+    /// of one request always share it.
+    pub submission_id: String,
+    /// The alias the responder currently reduces as canonical. It may change
+    /// once a partitioned lower claim is learned; `job_id` never does.
+    pub canonical_job_id: String,
+    /// Logical admission state; a submission is never reported as started.
+    pub state: String,
+    /// Preferred route, not an owner: any node that reduced the family answers.
+    pub origin_node_url: String,
     pub status_url: String,
+}
+
+/// One object exactly one execution wrote, named by its own VersionId.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobOutputResponse {
+    pub bucket: String,
+    pub key: String,
+    /// The exact version this execution created; the object's latest version
+    /// may be a later, unrelated write.
+    pub version_id: String,
+    pub execution_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub container_path: String,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+/// The plan this responder sealed when it planned the request itself. Absent
+/// when another node planned it; node identities are never disclosed here.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobPlacementResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_kind: Option<String>,
+    pub estimated_transfer_bytes: u64,
+    pub estimated_transfer_ms: u64,
+    pub alternatives: u32,
+    pub rejected: u32,
+    /// Rejections the bound dropped, so truncation never reads as agreement.
+    pub omitted: u32,
+    pub sealed_at_ms: u64,
+}
+
+/// The replicated family behind one external job, as this responder reduces it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobFamilyResponse {
+    pub submission_id: String,
+    pub request_digest: String,
+    pub canonical_job_id: String,
+    pub aliases: Vec<String>,
+    pub alias_count: u32,
+    /// Other request families of the same submission: idempotency conflicts a
+    /// partition may have accepted elsewhere.
+    pub conflict_count: u32,
+    pub logical_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_execution_id: Option<String>,
+    pub executions: u32,
+    pub duplicate_successes: u32,
+    pub outputs: Vec<JobOutputResponse>,
+    pub revision: u64,
+    pub projection_digest: String,
+    /// Always true: the family is replicated, so this is one node's view.
+    pub eventually_consistent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responder_node_id: Option<String>,
+    /// The family holds more records than one projection may reduce.
+    pub partial: bool,
+    /// Responder-local diagnostic, outside the projection digest: every known
+    /// execution is terminal without success and no retry is armed here. It is
+    /// never a realm-wide failure.
+    pub locally_exhausted: bool,
+    pub cancel_requested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<JobPlacementResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -264,6 +339,10 @@ pub struct JobStatusResponse {
     pub workspace_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_crate: Option<serde_json::Value>,
+    /// Present only for a distributed external job, whose truth is the
+    /// replicated family rather than this node's own row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<JobFamilyResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -306,6 +385,62 @@ fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
         workspace_bucket: job.workspace_bucket.clone(),
         workspace_mode: job.workspace_mode.name().to_string(),
         run_crate: None,
+        family: None,
+    }
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(crate) fn output_response(output: &aruna_core::structs::OutputObject) -> JobOutputResponse {
+    JobOutputResponse {
+        bucket: output.bucket.clone(),
+        key: output.key.clone(),
+        version_id: output.version_id.to_string(),
+        execution_id: output.execution_id.to_string(),
+        container_path: output.container_path.clone(),
+        size: output.size,
+        digest: output.digest.clone(),
+    }
+}
+
+/// Projects the reduced family onto the response. Node identities of other
+/// nodes are never disclosed here: only the responder names itself.
+pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
+    JobFamilyResponse {
+        submission_id: hex32(&report.submission_id.0),
+        request_digest: hex32(&report.request_digest),
+        canonical_job_id: report.canonical_job_id.to_string(),
+        aliases: report.aliases.iter().map(JobId::to_string).collect(),
+        alias_count: report.aliases.len() as u32,
+        conflict_count: report.conflicts,
+        logical_state: report.state.name().to_string(),
+        canonical_execution_id: report
+            .canonical_execution_id
+            .map(|execution| execution.to_string()),
+        executions: report.executions,
+        duplicate_successes: report.duplicate_successes,
+        outputs: report.outputs.iter().map(output_response).collect(),
+        revision: report.revision,
+        projection_digest: hex32(&report.digest),
+        eventually_consistent: true,
+        responder_node_id: report.responder.map(|node| node.to_string()),
+        partial: report.partial,
+        locally_exhausted: report.locally_exhausted,
+        cancel_requested: report.cancel_requested,
+        placement: report.plan.as_ref().map(|plan| JobPlacementResponse {
+            executor_kind: plan
+                .target
+                .as_ref()
+                .map(|target| target.executor_kind.clone()),
+            estimated_transfer_bytes: plan.estimated_transfer_bytes,
+            estimated_transfer_ms: plan.estimated_transfer_ms,
+            alternatives: plan.alternatives,
+            rejected: plan.rejected,
+            omitted: plan.omitted,
+            sealed_at_ms: plan.sealed_at_ms,
+        }),
     }
 }
 
@@ -373,7 +508,7 @@ fn encode_report_cursor(
         .transpose()
 }
 
-fn parse_job_id(raw: &str) -> ServerResult<JobId> {
+pub(crate) fn parse_job_id(raw: &str) -> ServerResult<JobId> {
     JobId::from_str(raw).map_err(|_| ServerError::NotFound)
 }
 
@@ -622,7 +757,7 @@ pub async fn list_jobs(
     path = "/jobs/",
     tag = "jobs",
     summary = "Submit a container execution job",
-    description = "Requires a realm bearer token with WRITE on the target group's data; a path-restricted (delegated) token is refused. Submission is asynchronous: a 2xx means the job is durably accepted and queued for the node that owns it, never that it started, finished or produced outputs. The job is anchored to that owning node for its whole life, and the response carries the node's base URL plus the status URL to poll. `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200 with the job that already exists and `created` false, while the same key with a different plan is a 409 conflict. Set `workspace.mode` to `existing` to run in a bucket that already exists, which additionally requires WRITE on that bucket and that it belongs to the same group; omitting `workspace` keeps a per-job workspace bucket. Rejected with 400: an empty image, `cpu_cores` of 0, a `ram_bytes` of 0 or above 2^63-1, more than 512 inputs, more than 1024 outputs, more than 32 output prefixes, an empty `dest_key`, a container path that is not absolute and traversal-free, or two inputs or outputs sharing a `dest_key` or container path. A 503 is retryable: the caller may submit again.",
+    description = "Requires a realm bearer token with WRITE on the target group's data; a path-restricted (delegated) token is refused. Submission is asynchronous: a 2xx means the request is durably admitted into its replicated submission family and queued, never that it started, finished or produced outputs. The job is not anchored to one node: any node that reduced the family answers for it, and `origin_node_url` is a preferred route rather than an owner. The response carries the opaque `submission_id` of the request itself and the alias this responder currently reduces as canonical; `job_id` stays the caller's stable handle even when a later merge moves the canonical alias. Execution is at-least-once: a partition may admit and run duplicates, whose outputs stay retrievable and auditable while one canonical success supplies the result. `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200 with the job that already exists and `created` false, while the same key with a different plan is a 409 conflict. Set `workspace.mode` to `existing` to run in a bucket that already exists, which additionally requires WRITE on that bucket and that it belongs to the same group; omitting `workspace` keeps a per-job workspace bucket. Rejected with 400: an empty image, `cpu_cores` of 0, a `ram_bytes` of 0 or above 2^63-1, more than 512 inputs, more than 1024 outputs, more than 32 output prefixes, an empty `dest_key`, a container path that is not absolute and traversal-free, or two inputs or outputs sharing a `dest_key` or container path. A 503 is retryable: the caller may submit again.",
     request_body(
         content = SubmitExecutionRequest,
         description = "Container image, command and the inputs and outputs to stage around it",
@@ -653,26 +788,32 @@ pub async fn list_jobs(
             example = json!({
                 "job_id": "01JJRSTVWXYZ0123456789ABCD",
                 "created": true,
-                "owner_node_url": "https://node.example.test/api/v1",
+                "submission_id": "6b1f8c9d0e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+                "canonical_job_id": "01JJRSTVWXYZ0123456789ABCD",
+                "state": "queued",
+                "origin_node_url": "https://node.example.test/api/v1",
                 "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
             })
         ),
         (
             status = 200,
-            description = "The idempotency key already names a job with this exact plan; nothing new was queued",
+            description = "The idempotency key already names a request with this exact plan; nothing new was admitted",
             body = SubmitJobResponse,
             example = json!({
                 "job_id": "01JJRSTVWXYZ0123456789ABCD",
                 "created": false,
-                "owner_node_url": "https://node.example.test/api/v1",
+                "submission_id": "6b1f8c9d0e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+                "canonical_job_id": "01JJRSTVWXYZ0123456789ABCD",
+                "state": "queued",
+                "origin_node_url": "https://node.example.test/api/v1",
                 "status_url": "https://node.example.test/api/v1/jobs/01JJRSTVWXYZ0123456789ABCD"
             })
         ),
         (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, or a workspace request that names no usable bucket", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is already bound to a job with a different plan", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is already bound to a request with a different plan, or the group's standing compute quota refuses this new admission; a quota refusal carries the exact scope, dimension and numbers in `quota`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, or the caller lacks WRITE on the group or on the named existing workspace bucket", body = ErrorResponse),
-        (status = 503, description = "No node could be selected to own the job, or the id clock is unhealthy; retryable, the caller may submit again with the same idempotency key", body = ErrorResponse)
+        (status = 503, description = "No family holder could admit the request, or the id clock is unhealthy; retryable, the caller may submit again with the same idempotency key", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -777,12 +918,17 @@ pub async fn submit_job(
         StatusCode::OK
     };
     let urls = job_urls(&state, result.job_id).await?;
+    // The accepting holder's canonical binding is the alias it answered with;
+    // a later merge may move it, which the status surface then reports.
     Ok((
         status,
         Json(SubmitJobResponse {
             job_id: result.job_id.to_string(),
             created: result.created,
-            owner_node_url: urls.owner_node_url,
+            submission_id: hex32(&result.submission_id.0),
+            canonical_job_id: result.job_id.to_string(),
+            state: "queued".to_string(),
+            origin_node_url: urls.owner_node_url,
             status_url: urls.status_url,
         }),
     ))
@@ -793,7 +939,7 @@ pub async fn submit_job(
     path = "/jobs/{job_id}",
     tag = "jobs",
     summary = "Read one job's status",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Reads are self-scoped: only the job's own submitter may read it, and a job belonging to somebody else answers 404 rather than 403, so the surface never confirms that an id exists. The one exception is a persistent-id minting job the caller joined, which stays readable while the caller holds WRITE on the document it mints for. The read is answered by the node that owns the job, derived from the id itself: when that is another node the request is forwarded under the caller's own bearer token, so a malformed token is 400 and an owner that cannot be reached is a retryable 503. `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or `cancelled`. `run_crate` appears only for jobs that owe a run crate and reports that side obligation, not the job itself.",
+    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Reads are self-scoped: only the job's own submitter may read it, and a job belonging to somebody else answers 404 rather than 403, so the surface never confirms that an id exists. A distributed execution job carries a `family` block reduced from the replicated records: it names the request's `submission_id`, the currently canonical alias, the canonical execution and its exact output VersionIds, how many physical executions and duplicate successes are known, the projection `revision` and digest to detect that the view changed, and the responder that answered. `family.partial` means this responder could not reduce every record, and `family.locally_exhausted` is a responder-local diagnostic (outside the projection digest) meaning every known execution ended without success and no retry is armed here; it is never a realm-wide failure, which this feature deliberately cannot converge on. Node identities of other nodes are never disclosed; only the responder names itself. The one exception is a persistent-id minting job the caller joined, which stays readable while the caller holds WRITE on the document it mints for. The read is answered by the node that owns the job, derived from the id itself: when that is another node the request is forwarded under the caller's own bearer token, so a malformed token is 400 and an owner that cannot be reached is a retryable 503. `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or `cancelled`. `run_crate` appears only for jobs that owe a run crate and reports that side obligation, not the job itself.",
     params(("job_id" = String, Path, description = "Job identifier as returned by submission: a 26-character ULID-shaped id. An unparseable id is 404")),
     responses(
         (
@@ -827,7 +973,44 @@ pub async fn submit_job(
                 },
                 "workspace_bucket": "ws-01jjrstvwxyz0123456789abcd",
                 "workspace_mode": "kept",
-                "run_crate": {"status": "written", "resource": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#run/01JJRSTVWXYZ0123456789ABCD"}
+                "run_crate": {"status": "written", "resource": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE#run/01JJRSTVWXYZ0123456789ABCD"},
+                "family": {
+                    "submission_id": "6b1f8c9d0e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+                    "request_digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+                    "canonical_job_id": "01JJRSTVWXYZ0123456789ABCD",
+                    "aliases": ["01JJRSTVWXYZ0123456789ABCD"],
+                    "alias_count": 1,
+                    "conflict_count": 0,
+                    "logical_state": "succeeded",
+                    "canonical_execution_id": "01JJRSEXEC0123456789ABCDEF",
+                    "executions": 2,
+                    "duplicate_successes": 1,
+                    "outputs": [{
+                        "bucket": "ws-01jjrstvwxyz0123456789abcd",
+                        "key": "reports/reads_fastqc.html",
+                        "version_id": "01JJRSVERSION0123456789ABC",
+                        "execution_id": "01JJRSEXEC0123456789ABCDEF",
+                        "container_path": "/outputs/reads_fastqc.html",
+                        "size": 20480,
+                        "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8"
+                    }],
+                    "revision": 7,
+                    "projection_digest": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f",
+                    "eventually_consistent": true,
+                    "responder_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                    "partial": false,
+                    "locally_exhausted": false,
+                    "cancel_requested": false,
+                    "placement": {
+                        "executor_kind": "docker",
+                        "estimated_transfer_bytes": 4194304,
+                        "estimated_transfer_ms": 340,
+                        "alternatives": 2,
+                        "rejected": 1,
+                        "omitted": 0,
+                        "sealed_at_ms": 1755500000000u64
+                    }
+                }
             })
         ),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
@@ -846,6 +1029,14 @@ pub async fn get_job(
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
+    // A distributed external job is answered from the replicated family; every
+    // other job keeps the owner-routed view.
+    if let Some(report) = family_report(&state.get_ctx(), &auth, job_id).await {
+        let report = report.map_err(map_job_route)?;
+        let mut response = job_view_response(&report.job);
+        response.family = Some(family_response(&report));
+        return Ok((StatusCode::OK, Json(response)));
+    }
     let routed = read_job_routed(&state.get_ctx(), &auth, job_id, forwarded_job_auth(bearer)?)
         .await
         .map_err(map_job_route)?;

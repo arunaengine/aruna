@@ -15,6 +15,7 @@ pub mod drs;
 pub mod group_backends;
 pub mod groups;
 pub mod info;
+pub mod job_audit;
 pub mod jobs;
 pub mod metadata;
 pub mod notifications;
@@ -51,6 +52,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(credentials::router())
         .merge(groups::router())
         .merge(jobs::router())
+        .merge(job_audit::router())
         .merge(metadata::router())
         .merge(oai::router())
         .merge(pid::router())
@@ -173,6 +175,7 @@ mod tests {
         ("GET", "/jobs/"),
         ("GET", "/jobs/{job_id}"),
         ("GET", "/jobs/{job_id}/artifacts/rocrate"),
+        ("GET", "/jobs/{job_id}/audit"),
         ("GET", "/jobs/{job_id}/report"),
         ("GET", "/metadata"),
         ("GET", "/metadata/references"),
