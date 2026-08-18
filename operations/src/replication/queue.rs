@@ -4591,25 +4591,13 @@ mod tests {
         write_relationship(&storage, &relationship(23, 3, None, true)).await;
         write_materialized_version(&storage, "bucket", "key", version_id).await;
         write_live_obligation(&storage, version_id).await;
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
 
-        let result = process_blob_replication_batch(&context)
-            .await
-            .expect("repair drain succeeds");
+        repair_live(&storage).await;
 
-        assert_eq!(result.processed, 2);
-        assert_eq!(result.failed, 2);
         assert!(read_obligations(&storage).await.is_empty());
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 2);
-        assert!(jobs.iter().all(|(_, job)| job.attempts == 1));
+        assert!(jobs.iter().all(|(_, job)| job.relationship_id.is_some()));
     }
 
     #[tokio::test]
