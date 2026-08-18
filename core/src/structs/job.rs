@@ -1705,7 +1705,9 @@ pub enum JobRecordError {
     NotHolder(JobRecordKind),
     #[error("record digest does not reproduce from its own canonical bytes")]
     DigestMismatch,
-    #[error("a verified {0:?} record is required to authorize this record")]
+    /// Local proof gate only: a replicated record whose predecessor is absent
+    /// yields the [`RecordVerdict::MissingEvidence`] verdict instead.
+    #[error("a verified {0:?} record is required to prove this result")]
     MissingEvidence(JobRecordKind),
     #[error("record contradicts the verified {0:?} record it refers to")]
     EvidenceMismatch(JobRecordKind),
