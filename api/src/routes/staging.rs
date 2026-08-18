@@ -1349,6 +1349,9 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
             ServerError::InternalError(error.to_string())
         }
         MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.to_string()),
+        // A node revalidating its inventory admits nothing governed; the client
+        // learns only that this node is busy, never which rule applies.
+        MaterializeSnapshotError::Gate(_) => ServerError::ServiceUnavailable,
     }
 }
 
