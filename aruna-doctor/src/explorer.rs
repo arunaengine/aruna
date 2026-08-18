@@ -10,24 +10,29 @@ use aruna_core::keyspaces::{
     BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
-    GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+    GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE,
+    MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    ONBOARDING_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
-    USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
+    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, STORAGE_FORMAT_KEYSPACE,
+    SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::storage_format::{STORAGE_FORMAT_KEY, StorageFormatMarker};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
-    HeadContenderKey, ManagedCopyKey, ManagedCopyRecord, MultipartObjectMetadataKey,
-    MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
-    MultipartUploadPartKey, NodeSubjectRecord, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmId, UserAccess, VersionKey,
+    HeadContenderKey, JobRecordEnvelope, ManagedCopyKey, ManagedCopyRecord,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+    MultipartUploadPart, MultipartUploadPartKey, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
+    POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PlacementPolicyDocument, PolicyBulkIntent,
+    PolicyBulkIntentKey, PolicyBulkRun, PolicyMutationRecord, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
+use aruna_operations::placement_policy::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -77,6 +82,8 @@ struct UnresolvedLocation {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct KeyspacesOutput {
+    /// Read only: the doctor reports the stored epoch and never writes one.
+    format_epoch: Option<u32>,
     database_path: String,
     keyspaces: Vec<KeyspaceEntry>,
     missing_keyspaces: Vec<KeyspaceEntry>,
@@ -167,6 +174,12 @@ enum DecodedField {
     MultipartUploadPartKey { value: MultipartUploadPartKey },
     #[serde(rename = "multipart_object_metadata_key")]
     MultipartObjectMetadataKey { value: MultipartObjectMetadataKey },
+    #[serde(rename = "attempt_key")]
+    AttemptKey { job_id: String, attempt_epoch: u64 },
+    #[serde(rename = "policy_cache_key")]
+    PolicyCacheKey { policy_id: String, digest: String },
+    #[serde(rename = "policy_bulk_intent_key")]
+    PolicyBulkIntentKey { operation_id: String, key: String },
     #[serde(rename = "raw")]
     Raw { hex: String },
 }
@@ -207,6 +220,28 @@ enum DecodedValue {
     },
     NodeSubjectRecord {
         data: NodeSubjectRecord,
+    },
+    StorageFormatMarker {
+        data: StorageFormatMarker,
+    },
+    HeadContenderMarker,
+    JobOutputRecord {
+        data: JsonJobRecordEnvelope,
+    },
+    PlacementPolicyDocument {
+        data: JsonPlacementPolicyDocument,
+    },
+    PolicyCacheEntry {
+        data: JsonPolicyCacheEntry,
+    },
+    PolicyMutationRecord {
+        data: PolicyMutationRecord,
+    },
+    PolicyBulkRun {
+        data: PolicyBulkRun,
+    },
+    PolicyBulkIntent {
+        data: PolicyBulkIntent,
     },
     MultipartUpload {
         data: MultipartUpload,
@@ -488,6 +523,79 @@ impl Serialize for JsonUserAccess {
         state.serialize_field("path_restrictions", &self.0.path_restrictions)?;
         state.serialize_field("issued_by", &self.0.issued_by)?;
         state.serialize_field("revoked_at", &self.0.revoked_at)?;
+        state.end()
+    }
+}
+
+/// Signed output record projection: identity, authorship and integrity only.
+/// The record body stays out of the CLI so job payloads never reach a console.
+#[derive(Debug, PartialEq)]
+struct JsonJobRecordEnvelope(JobRecordEnvelope);
+
+impl Serialize for JsonJobRecordEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JobRecordEnvelope", 5)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("published_by", &self.0.published_by.to_string())?;
+        state.serialize_field("kind", &format!("{:?}", self.0.kind()))?;
+        state.serialize_field("digest", &self.0.digest().map(hex::encode).ok())?;
+        state.serialize_field("signature", &hex::encode(self.0.signature.to_bytes()))?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct JsonPlacementPolicyDocument(PlacementPolicyDocument);
+
+impl Serialize for JsonPlacementPolicyDocument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PlacementPolicyDocument", 6)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("policy_id", &self.0.policy.policy_id.to_string())?;
+        state.serialize_field("name", &self.0.policy.name)?;
+        state.serialize_field("allowed", &self.0.policy.allowed)?;
+        state.serialize_field("publisher", &self.0.publication.publisher.to_string())?;
+        state.serialize_field("created_at_ms", &self.0.publication.created_at_ms)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct JsonPolicyCacheEntry(PolicyCacheEntry);
+
+impl Serialize for JsonPolicyCacheEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PolicyCacheEntry", 4)?;
+        match &self.0 {
+            PolicyCacheEntry::Verified {
+                document,
+                stored_at_ms,
+            } => {
+                state.serialize_field("kind", "verified")?;
+                state.serialize_field("stored_at_ms", stored_at_ms)?;
+                state.serialize_field("expires_at_ms", &None::<u64>)?;
+                state
+                    .serialize_field("document", &JsonPlacementPolicyDocument(document.clone()))?;
+            }
+            PolicyCacheEntry::Unavailable {
+                stored_at_ms,
+                expires_at_ms,
+            } => {
+                state.serialize_field("kind", "unavailable")?;
+                state.serialize_field("stored_at_ms", stored_at_ms)?;
+                state.serialize_field("expires_at_ms", &Some(*expires_at_ms))?;
+                state.serialize_field("document", &None::<JsonPlacementPolicyDocument>)?;
+            }
+        }
         state.end()
     }
 }
@@ -962,6 +1070,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     missing_keyspaces.sort_by(|left, right| left.name.cmp(&right.name));
 
     Ok(KeyspacesOutput {
+        format_epoch: read_format_epoch(&db)?,
         database_path: database_path.to_string(),
         keyspaces: keyspaces
             .into_iter()
@@ -973,7 +1082,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 36] {
+fn defined_keyspaces() -> [&'static str; 43] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -993,6 +1102,7 @@ fn defined_keyspaces() -> [&'static str; 36] {
         GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
         DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        JOB_OUTPUT_RECORD_KEYSPACE,
         MANAGED_COPY_KEYSPACE,
         METADATA_AUDIT_KEYSPACE,
         METADATA_DOCUMENT_INDEX_KEYSPACE,
@@ -1001,6 +1111,11 @@ fn defined_keyspaces() -> [&'static str; 36] {
         NODE_STATE_KEYSPACE,
         NODE_SUBJECT_KEYSPACE,
         ONBOARDING_KEYSPACE,
+        PLACEMENT_POLICY_CACHE_KEYSPACE,
+        PLACEMENT_POLICY_KEYSPACE,
+        POLICY_BULK_INTENT_KEYSPACE,
+        POLICY_BULK_RUN_KEYSPACE,
+        POLICY_MUTATION_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
@@ -1008,10 +1123,28 @@ fn defined_keyspaces() -> [&'static str; 36] {
         S3_MULTIPART_UPLOAD_PART_KEYSPACE,
         SOURCE_CONNECTOR_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_SECRET_KEYSPACE,
+        STORAGE_FORMAT_KEYSPACE,
         SYNC_PLACEMENT_KEYSPACE,
         USER_ACCESS_KEYSPACE,
         USER_ACCESS_OWNER_KEYSPACE,
     ]
+}
+
+/// Reports the stored format epoch of one root. A root the running build would
+/// refuse still has to be inspectable, so a foreign marker reports `None`.
+fn read_format_epoch(db: &OptimisticTxDatabase) -> Result<Option<u32>, ExplorerError> {
+    if !db
+        .list_keyspace_names()
+        .iter()
+        .any(|name| name.as_ref() == STORAGE_FORMAT_KEYSPACE)
+    {
+        return Ok(None);
+    }
+    let keyspace = db.keyspace(STORAGE_FORMAT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let stored = db.read_tx().get(&keyspace, STORAGE_FORMAT_KEY)?;
+    Ok(stored
+        .and_then(|bytes| postcard::from_bytes::<StorageFormatMarker>(&bytes).ok())
+        .map(|marker| marker.epoch))
 }
 
 fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutput, ExplorerError> {
@@ -1241,7 +1374,20 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | API_STATE_KEYSPACE
         | DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
+        | NODE_SUBJECT_KEYSPACE
+        | STORAGE_FORMAT_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
+        PLACEMENT_POLICY_KEYSPACE | POLICY_MUTATION_KEYSPACE | POLICY_BULK_RUN_KEYSPACE => {
+            decode_policy_id_key(keyspace_name, key)
+        }
+        PLACEMENT_POLICY_CACHE_KEYSPACE => decode_policy_cache_key(key),
+        POLICY_BULK_INTENT_KEYSPACE => PolicyBulkIntentKey::from_bytes(key)
+            .map(|value| DecodedField::PolicyBulkIntentKey {
+                operation_id: value.operation_id.to_string(),
+                key: value.key,
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        JOB_OUTPUT_RECORD_KEYSPACE => decode_attempt_key(key),
         SYNC_PLACEMENT_KEYSPACE => raw_field(key),
         S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
         S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartUploadPartKey::from_bytes(key)
@@ -1313,6 +1459,46 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         NODE_SUBJECT_KEYSPACE => decode_value_with(value, NodeSubjectRecord::from_bytes, |data| {
             DecodedValue::NodeSubjectRecord { data }
         }),
+        STORAGE_FORMAT_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<StorageFormatMarker>(bytes),
+            |data| DecodedValue::StorageFormatMarker { data },
+        ),
+        BLOB_HEAD_CONTENDER_KEYSPACE => decode_contender_value(value),
+        JOB_OUTPUT_RECORD_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
+            |data| DecodedValue::JobOutputRecord {
+                data: JsonJobRecordEnvelope(data),
+            },
+        ),
+        PLACEMENT_POLICY_KEYSPACE => {
+            decode_value_with(value, PlacementPolicyDocument::from_bytes, |data| {
+                DecodedValue::PlacementPolicyDocument {
+                    data: JsonPlacementPolicyDocument(data),
+                }
+            })
+        }
+        PLACEMENT_POLICY_CACHE_KEYSPACE => {
+            decode_value_with(value, PolicyCacheEntry::from_bytes, |data| {
+                DecodedValue::PolicyCacheEntry {
+                    data: JsonPolicyCacheEntry(data),
+                }
+            })
+        }
+        POLICY_MUTATION_KEYSPACE => {
+            decode_value_with(value, PolicyMutationRecord::from_bytes, |data| {
+                DecodedValue::PolicyMutationRecord { data }
+            })
+        }
+        POLICY_BULK_RUN_KEYSPACE => decode_value_with(value, PolicyBulkRun::from_bytes, |data| {
+            DecodedValue::PolicyBulkRun { data }
+        }),
+        POLICY_BULK_INTENT_KEYSPACE => {
+            decode_value_with(value, PolicyBulkIntent::from_bytes, |data| {
+                DecodedValue::PolicyBulkIntent { data }
+            })
+        }
         S3_MULTIPART_UPLOAD_KEYSPACE => {
             decode_value_with(value, MultipartUpload::from_bytes, |data| {
                 DecodedValue::MultipartUpload { data }
@@ -1362,6 +1548,60 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             DecodedValue::DhtEntries { data }
         }),
         _ => raw_value(value, None),
+    }
+}
+
+/// Contender rows are key-only evidence; an empty value is the record itself.
+fn decode_contender_value(value: &[u8]) -> DecodedValue {
+    if value.is_empty() {
+        return DecodedValue::HeadContenderMarker;
+    }
+    raw_value(
+        value,
+        Some("head contender rows carry no value".to_string()),
+    )
+}
+
+/// Policy, mutation and bulk-run rows are all keyed by a postcard-encoded id;
+/// the placement-policy document keyspace stores the raw ulid bytes instead.
+fn decode_policy_id_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
+    if keyspace_name == PLACEMENT_POLICY_KEYSPACE {
+        return decode_ulid_key(key);
+    }
+    postcard::from_bytes::<Ulid>(key)
+        .map(|value| DecodedField::Ulid {
+            value: value.to_string(),
+        })
+        .unwrap_or_else(|_| raw_field(key))
+}
+
+fn decode_policy_cache_key(key: &[u8]) -> DecodedField {
+    let Some((policy_id, digest)) = key.split_at_checked(16) else {
+        return raw_field(key);
+    };
+    let Ok(policy_id) = <[u8; 16]>::try_from(policy_id) else {
+        return raw_field(key);
+    };
+    if digest.len() != 32 {
+        return raw_field(key);
+    }
+    DecodedField::PolicyCacheKey {
+        policy_id: Ulid::from_bytes(policy_id).to_string(),
+        digest: hex::encode(digest),
+    }
+}
+
+/// Attempt-scoped rows are keyed by `job id || attempt epoch` in big-endian.
+fn decode_attempt_key(key: &[u8]) -> DecodedField {
+    let Some((job_id, epoch)) = key.split_at_checked(key.len().saturating_sub(8)) else {
+        return raw_field(key);
+    };
+    let (Ok(job_id), Ok(epoch)) = (<[u8; 16]>::try_from(job_id), <[u8; 8]>::try_from(epoch)) else {
+        return raw_field(key);
+    };
+    DecodedField::AttemptKey {
+        job_id: Ulid::from_bytes(job_id).to_string(),
+        attempt_epoch: u64::from_be_bytes(epoch),
     }
 }
 
@@ -1499,8 +1739,8 @@ mod tests {
         CRAQLE_BATCH_LOG_ENCODING_TAG, CRAQLE_DOT_ENCODING_TAG, CRAQLE_GRAPH_META_PREFIX,
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
-        CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        location_scan, raw_field,
+        CraqleStoredQuadOp, DecodedField, DecodedValue, JsonPlacementPolicyDocument,
+        JsonPolicyCacheEntry, decode_entry, list_entries, list_keyspaces, location_scan, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1511,22 +1751,33 @@ mod tests {
         AUTH_KEYSPACE, BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE,
         BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         BUCKET_STATS_DB, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
-        GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, MANAGED_COPY_KEYSPACE,
-        METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-        METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-        S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-        SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+        GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE,
+        MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
+        NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE,
+        PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+        S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
+        SOURCE_CONNECTOR_SECRET_KEYSPACE, STORAGE_FORMAT_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
         USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_core::storage_format::{
+        STORAGE_FORMAT_EPOCH, STORAGE_FORMAT_KEY, StorageFormatMarker,
+    };
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        Group, HashPathIndexKey, MultipartChecksumType, MultipartObjectMetadataKey,
-        MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
-        MultipartUploadPartKey, MultipartUploadStatus, RealmConfigDocument, RealmId,
+        CurrentVersionPointer, Group, HashPathIndexKey, HeadContenderKey, MultipartChecksumType,
+        MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+        MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus,
+        POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+        PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, PolicyBulkIntent,
+        PolicyBulkRun, PolicyBulkStatus, PolicyIntentOutcome, PolicyMutationParams,
+        PolicyMutationRecord, PolicyPublication, PolicyRefMode, RealmConfigDocument, RealmId,
+        placement_policy_key,
     };
     use aruna_net::dht::storage::StoredEntry;
+    use aruna_operations::placement_policy::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -1681,6 +1932,7 @@ mod tests {
             DHT_KEYSPACE.to_string(),
             HASH_PATHS_INDEX_KEYSPACE.to_string(),
             DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
             MANAGED_COPY_KEYSPACE.to_string(),
             METADATA_AUDIT_KEYSPACE.to_string(),
             METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
@@ -1689,6 +1941,11 @@ mod tests {
             NODE_STATE_KEYSPACE.to_string(),
             NODE_SUBJECT_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
+            PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+            PLACEMENT_POLICY_KEYSPACE.to_string(),
+            POLICY_BULK_INTENT_KEYSPACE.to_string(),
+            POLICY_BULK_RUN_KEYSPACE.to_string(),
+            POLICY_MUTATION_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
@@ -1696,6 +1953,7 @@ mod tests {
             S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
             SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
             SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+            STORAGE_FORMAT_KEYSPACE.to_string(),
             SYNC_PLACEMENT_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
             USER_ACCESS_OWNER_KEYSPACE.to_string(),
@@ -1732,6 +1990,288 @@ mod tests {
             DecodedValue::BucketInfo { data } => assert_eq!(data, info),
             other => panic!("expected bucket info, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_format_marker() {
+        let marker = StorageFormatMarker::default();
+
+        let decoded = decode_entry(
+            STORAGE_FORMAT_KEYSPACE,
+            STORAGE_FORMAT_KEY,
+            &marker.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: "epoch".to_string()
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::StorageFormatMarker { data: marker }
+        );
+    }
+
+    #[test]
+    fn reports_format_epoch() {
+        // The doctor reads the epoch of any root; it never writes or repairs one.
+        let temp = tempdir().unwrap();
+        {
+            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
+            let keyspace = db
+                .keyspace(STORAGE_FORMAT_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+            keyspace
+                .insert(
+                    STORAGE_FORMAT_KEY,
+                    StorageFormatMarker::default().to_bytes().unwrap(),
+                )
+                .unwrap();
+        }
+
+        let output = list_keyspaces(temp.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(output.format_epoch, Some(STORAGE_FORMAT_EPOCH));
+    }
+
+    #[test]
+    fn reports_absent_epoch() {
+        let temp = tempdir().unwrap();
+        {
+            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
+            db.keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+        }
+
+        assert_eq!(
+            list_keyspaces(temp.path().to_str().unwrap())
+                .unwrap()
+                .format_epoch,
+            None
+        );
+    }
+
+    #[test]
+    fn decodes_contender_row() {
+        // Contender evidence lives entirely in the key; the row carries no value.
+        let key = HeadContenderKey::new("bucket", "a.tar", 4, Ulid::from_bytes([6_u8; 16]));
+
+        let decoded = decode_entry(BLOB_HEAD_CONTENDER_KEYSPACE, &key.to_bytes().unwrap(), b"");
+
+        assert_eq!(decoded.key, DecodedField::HeadContenderKey { value: key });
+        assert_eq!(decoded.value, DecodedValue::HeadContenderMarker);
+    }
+
+    #[test]
+    fn decodes_output_key() {
+        // Output records share the attempt-control key, so the epoch has to
+        // survive decoding for a stuck attempt to be found at all.
+        let job_id = Ulid::from_bytes([3_u8; 16]);
+        let mut key = job_id.to_bytes().to_vec();
+        key.extend_from_slice(&7_u64.to_be_bytes());
+
+        let decoded = decode_entry(JOB_OUTPUT_RECORD_KEYSPACE, &key, b"not-an-envelope");
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::AttemptKey {
+                job_id: job_id.to_string(),
+                attempt_epoch: 7,
+            }
+        );
+        assert!(matches!(
+            decoded.value,
+            DecodedValue::Raw {
+                decode_error: Some(_),
+                ..
+            }
+        ));
+    }
+
+    fn policy_document(policy_id: Ulid, realm_id: RealmId) -> PlacementPolicyDocument {
+        let secret = iroh::SecretKey::from_bytes(&[11_u8; 32]);
+        PlacementPolicyDocument {
+            realm_id,
+            policy: PlacementPolicy {
+                policy_id,
+                name: "eu-only".to_string(),
+                allowed: Vec::new(),
+            },
+            publication: PolicyPublication {
+                publisher: secret.public(),
+                created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                created_at_ms: 42,
+                event_id: Ulid::from_bytes([12_u8; 16]),
+                config_digest: [13_u8; 32],
+                signature: secret.sign(b"publication"),
+            },
+        }
+    }
+
+    #[test]
+    fn decodes_policy_document() {
+        let realm_id = RealmId::from_bytes([10_u8; 32]);
+        let policy_id = Ulid::from_bytes([14_u8; 16]);
+        let document = policy_document(policy_id, realm_id);
+
+        let decoded = decode_entry(
+            PLACEMENT_POLICY_KEYSPACE,
+            &placement_policy_key(policy_id),
+            &document.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: policy_id.to_string()
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PlacementPolicyDocument {
+                data: JsonPlacementPolicyDocument(document)
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_policy_cache() {
+        let policy_id = Ulid::from_bytes([15_u8; 16]);
+        let policy_ref = PlacementPolicyRef {
+            policy_id,
+            digest: [16_u8; 32],
+        };
+        let entry = PolicyCacheEntry::Unavailable {
+            stored_at_ms: 5,
+            expires_at_ms: 15,
+        };
+        let mut key = policy_id.to_bytes().to_vec();
+        key.extend_from_slice(&policy_ref.digest);
+
+        let decoded = decode_entry(
+            PLACEMENT_POLICY_CACHE_KEYSPACE,
+            &key,
+            &entry.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::PolicyCacheKey {
+                policy_id: policy_id.to_string(),
+                digest: hex::encode([16_u8; 32]),
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PolicyCacheEntry {
+                data: JsonPolicyCacheEntry(entry)
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_policy_mutation() {
+        let realm_id = RealmId::from_bytes([17_u8; 32]);
+        let mutation_id = Ulid::from_bytes([18_u8; 16]);
+        let record = PolicyMutationRecord {
+            mutation_id,
+            params: PolicyMutationParams {
+                bucket: "bucket".to_string(),
+                key: "a.tar".to_string(),
+                expected_head: CurrentVersionPointer::new(Ulid::from_bytes([19_u8; 16])),
+                bucket_identity: (
+                    Ulid::from_bytes([20_u8; 16]),
+                    std::time::SystemTime::UNIX_EPOCH,
+                    aruna_core::UserId::local(Ulid::generate(), realm_id),
+                ),
+                target_refs: Vec::new(),
+                mode: PolicyRefMode::Union,
+            },
+            successor_version_id: Ulid::from_bytes([21_u8; 16]),
+            sealed_refs: Vec::new(),
+            materialized: true,
+        };
+
+        let decoded = decode_entry(
+            POLICY_MUTATION_KEYSPACE,
+            &PolicyMutationRecord::key(mutation_id).unwrap(),
+            &record.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: mutation_id.to_string()
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PolicyMutationRecord { data: record }
+        );
+    }
+
+    #[test]
+    fn decodes_bulk_run() {
+        let realm_id = RealmId::from_bytes([22_u8; 32]);
+        let operation_id = Ulid::from_bytes([23_u8; 16]);
+        let run = PolicyBulkRun {
+            operation_id,
+            bucket: "bucket".to_string(),
+            bucket_identity: (
+                Ulid::from_bytes([24_u8; 16]),
+                std::time::SystemTime::UNIX_EPOCH,
+                aruna_core::UserId::local(Ulid::generate(), realm_id),
+            ),
+            generation: 3,
+            target_refs: Vec::new(),
+            status: PolicyBulkStatus::Active,
+        };
+
+        let decoded = decode_entry(
+            POLICY_BULK_RUN_KEYSPACE,
+            &PolicyBulkRun::key(operation_id).unwrap(),
+            &run.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: operation_id.to_string()
+            }
+        );
+        assert_eq!(decoded.value, DecodedValue::PolicyBulkRun { data: run });
+    }
+
+    #[test]
+    fn decodes_bulk_intent() {
+        let operation_id = Ulid::from_bytes([25_u8; 16]);
+        let intent = PolicyBulkIntent {
+            operation_id,
+            key: "a.tar".to_string(),
+            observed_head: CurrentVersionPointer::new(Ulid::from_bytes([26_u8; 16])),
+            successor_version_id: Ulid::from_bytes([27_u8; 16]),
+            outcome: PolicyIntentOutcome::Planned,
+        };
+
+        let decoded = decode_entry(
+            POLICY_BULK_INTENT_KEYSPACE,
+            &intent.key().to_bytes().unwrap(),
+            &intent.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::PolicyBulkIntentKey {
+                operation_id: operation_id.to_string(),
+                key: "a.tar".to_string(),
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PolicyBulkIntent { data: intent }
+        );
     }
 
     #[test]

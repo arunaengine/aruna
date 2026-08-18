@@ -178,3 +178,7 @@ pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";
 pub const CRAQLE_QUADS_KEYSPACE: &str = "quads";
 pub const CRAQLE_GRAPHS_KEYSPACE: &str = "graphs";
 pub const CRAQLE_LOG_KEYSPACE: &str = "log";
+
+/// Single-row identity of the on-disk format an Aruna-owned database root
+/// carries. Read and enforced before any record is decoded.
+pub const STORAGE_FORMAT_KEYSPACE: &str = "storage_format";

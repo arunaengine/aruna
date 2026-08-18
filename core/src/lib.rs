@@ -26,6 +26,7 @@ pub mod request_policy;
 pub mod scheduling;
 pub mod shutdown;
 pub mod storage_entries;
+pub mod storage_format;
 pub mod stream;
 pub mod structs;
 pub mod structured_id;

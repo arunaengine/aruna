@@ -453,6 +453,8 @@ impl DocumentSyncService {
             .manual_journal_persist(true)
             .open()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        aruna_storage::ensure_format(&db, &storage_path.to_string_lossy())
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let fanout_cursors = db
             .keyspace(
                 DOCUMENT_SYNC_FANOUT_KEYSPACE,

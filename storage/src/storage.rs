@@ -1371,6 +1371,7 @@ impl FjallStorage {
         let db = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
             .open()?;
+        crate::format::ensure_format(&db, path)?;
 
         let (sender, receivers) = StorageHandle::new();
         let mut storage = Self::new(Store::new(db), policy, &sender, read_threads, bulk_threads);
