@@ -985,6 +985,7 @@ async fn build_docker(
     let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
+        envelope: compute_envelope()?,
         ..aruna_compute::DockerConfig::default()
     };
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
@@ -1027,6 +1028,8 @@ async fn build_apptainer(
             cgroup_root,
             stop_grace: env_duration("ARUNA_COMPUTE_STOP_GRACE", 10)?,
             pull_deadline: env_duration("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE", 300)?,
+            envelope: compute_envelope()?,
+            ..aruna_compute::ApptainerConfig::default()
         },
     )
     .map_err(|error| error.to_string())?;
@@ -1076,6 +1079,14 @@ async fn build_kubernetes(
             s3_cidrs,
             s3_port,
             s3_mount_driver,
+            service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
+                .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
+            execution_location: dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
+                .unwrap_or_default(),
+            execution_labels: env_labels("ARUNA_COMPUTE_K8S_EXECUTION_LABELS")?,
+            node_selector: env_labels("ARUNA_COMPUTE_K8S_NODE_SELECTOR")?,
+            envelope: compute_envelope()?,
+            ..aruna_compute::KubernetesConfig::default()
         },
     )
     .await
@@ -1125,6 +1136,52 @@ fn parse_s3_cidrs(value: &str) -> Result<Vec<String>, String> {
                 return Err(format!("invalid Kubernetes S3 CIDR `{cidr}`"));
             }
             Ok(cidr.to_string())
+        })
+        .collect()
+}
+
+/// Static ceilings this node offers for execution. They hard-filter placement
+/// and are the basis of the advertised ranking availability, so an unset
+/// dimension stays unmeasured instead of becoming a false capacity claim.
+#[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
+fn compute_envelope() -> Result<aruna_core::compute::ResourceEnvelope, String> {
+    Ok(aruna_core::compute::ResourceEnvelope {
+        max_cpu_cores: env_number::<u32>("ARUNA_COMPUTE_MAX_CPU_CORES")?,
+        max_ram_bytes: env_number::<u64>("ARUNA_COMPUTE_MAX_RAM_BYTES")?,
+        max_disk_bytes: env_number::<u64>("ARUNA_COMPUTE_MAX_DISK_BYTES")?,
+        max_concurrent: env_number::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT")?,
+    })
+}
+
+#[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
+fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+    dotenvy::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .trim()
+                .parse::<T>()
+                .map_err(|_| format!("{name} must be a positive integer"))
+        })
+        .transpose()
+}
+
+/// Parses a bounded `key=value,key2=value2` label or selector list.
+#[cfg(feature = "kubernetes")]
+fn env_labels(name: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Ok(value) = dotenvy::var(name) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .filter(|(key, _)| !key.trim().is_empty())
+                .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+                .ok_or_else(|| format!("{name} entries must be key=value"))
         })
         .collect()
 }
