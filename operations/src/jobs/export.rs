@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
-use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -13,8 +13,9 @@ use aruna_core::structs::{
     ArtifactRef, ArunaArn, ArunaArnType, BackendLocation, BlobVersion, BucketInfo,
     ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
     ExportRoCrateResult, ExportRoCrateSpec, HashPathIndexKey, JobError, JobId, JobResultPayload,
-    Permission, RealmId, ReasonCode, RoCrateCheckpointRefs, VersionKey, VersionedObjectArn,
-    W3idDataIdentifier, blob_object_permission_path, ensure_confined_relative_path,
+    ManagedCopyKey, Permission, RealmId, ReasonCode, RoCrateCheckpointRefs, VersionKey,
+    VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
+    ensure_confined_relative_path,
 };
 use aruna_core::types::{GroupId, Key, NodeId, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -38,6 +39,9 @@ use super::rocrate_jsonld::{
 };
 use super::store::{put_job_entry, put_rocrate_checkpoint};
 use crate::blob::hidden::delete_hidden;
+use crate::blob::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
 use crate::blob::resolve_blob_permission_paths::{
     MAX_HASH_ALIASES, ResolveBlobPermissionPathsOperation,
 };
@@ -51,7 +55,7 @@ use crate::metadata::api::{
 };
 use crate::metadata::forward::export_rocrate_routed;
 use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
-use crate::replication::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
@@ -1509,16 +1513,17 @@ async fn open_local_txn(
     {
         return Ok(CandidateOpen::Status(OpenStatus::Missing));
     }
-    let Some(version) = candidate.resolved_version else {
+    let Some(version_id) = candidate.resolved_version else {
         return Ok(CandidateOpen::Status(OpenStatus::Missing));
     };
-    let version_key = VersionKey::new(bucket.to_string(), key.to_string(), version)
+    let version_key = VersionKey::new(bucket.to_string(), key.to_string(), version_id);
+    let version_bytes = version_key
         .to_bytes()
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
     let Some(version_value) = storage_value(
         driver,
         BLOB_VERSIONS_KEYSPACE,
-        version_key.into(),
+        version_bytes.into(),
         Some(txn_id),
     )
     .await?
@@ -1552,6 +1557,11 @@ async fn open_local_txn(
     }
     let evaluator = load_policy_txn(driver, spec, group_id, txn_id).await?;
     if !check_read_txn(driver, spec, permission_path, &evaluator, txn_id).await? {
+        return Ok(CandidateOpen::Status(OpenStatus::Denied));
+    }
+    // A local governed read is a serve like any other: authorization first,
+    // then this node's own registration and subject.
+    if !serveable_locally(driver, &version, version_key, location, txn_id).await? {
         return Ok(CandidateOpen::Status(OpenStatus::Denied));
     }
     let Some(blob_handle) = driver.blob_handle.as_ref() else {
@@ -1589,6 +1599,48 @@ async fn open_local_txn(
     }
 }
 
+/// Whether this node may still serve its own copy of a governed version. An
+/// ungoverned version has no refs and never consults the inventory.
+async fn serveable_locally(
+    driver: &DriverContext,
+    version: &BlobVersion,
+    version_key: VersionKey,
+    location: &BackendLocation,
+    txn_id: TxnId,
+) -> Result<bool, ExportFailure> {
+    if version.placement_policies.is_empty() {
+        return Ok(true);
+    }
+    let key = ManagedCopyKey::new(version_key, location.backend.clone());
+    let effect = match serve_reads(&key, Some(txn_id)) {
+        Ok(Effect::Storage(effect)) => effect,
+        _ => {
+            return Err(ExportFailure::Retryable(
+                "serve reads unavailable".to_string(),
+            ));
+        }
+    };
+    let Event::Storage(StorageEvent::BatchReadResult { values }) =
+        driver.storage_handle.send_storage_effect(effect).await
+    else {
+        return Ok(false);
+    };
+    let Ok((copy, subject)) = split_serve_reads(values) else {
+        return Ok(false);
+    };
+    Ok(validate_registration(
+        copy.as_deref(),
+        &CopyRequest {
+            key: &key,
+            node_id: Some(subject.subject.node_id),
+            blake3: location.get_blake3().and_then(|hash| hash.try_into().ok()),
+            refs: &version.placement_policies,
+            subject_generation: Some(subject.subject.generation),
+        },
+    )
+    .is_ok())
+}
+
 async fn open_remote(
     driver: &DriverContext,
     spec: &ExportRoCrateSpec,
@@ -1597,20 +1649,20 @@ async fn open_remote(
     expected_blake3: Option<[u8; 32]>,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
-    match drive(
-        BaoReadOperation::new(
-            node_id,
-            BaoReadRequest {
-                auth_context: spec.auth_context.clone(),
-                realm_id: spec.auth_context.realm_id,
-                target,
-                expected_blake3,
-                metadata_only,
-                destination: None,
-                known_refs: Vec::new(),
-            },
-        ),
+    // The challenge loop fills in this node's advertised subject and the refs
+    // it learns, so a governed copy can be staged instead of dead-ending.
+    match managed_read(
         driver,
+        node_id,
+        BaoReadRequest {
+            auth_context: spec.auth_context.clone(),
+            realm_id: spec.auth_context.realm_id,
+            target,
+            expected_blake3,
+            metadata_only,
+            destination: None,
+            known_refs: Vec::new(),
+        },
     )
     .await
     {
@@ -1632,6 +1684,14 @@ async fn open_remote(
         Err(BaoReadError::Blob(BlobError::IntegrityCheckFailed(_))) => {
             Ok(CandidateOpen::Status(OpenStatus::Corrupt))
         }
+        // Non-disclosing: a refused destination looks exactly like a refused
+        // authorization, and neither names a policy.
+        Err(
+            BaoReadError::PolicyDenied { .. }
+            | BaoReadError::PolicyRequired { .. }
+            | BaoReadError::Gate(_)
+            | BaoReadError::NoDestination,
+        ) => Ok(CandidateOpen::Status(OpenStatus::Denied)),
         Err(
             BaoReadError::Blob(BlobError::ReadError(_))
             | BaoReadError::Blob(BlobError::OperatorCreationFailed(_))

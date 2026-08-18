@@ -25,8 +25,9 @@ use ulid::Ulid;
 use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
+use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
 use crate::placement_policy::{
-    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, union_refs, write_gate,
 };
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
@@ -67,6 +68,12 @@ pub enum BaoReadError {
     PolicyRequired { refs: Vec<PlacementPolicyRef> },
     #[error("placement policy denies this destination")]
     PolicyDenied { policy_ids: Vec<Ulid> },
+    #[error(transparent)]
+    Gate(#[from] PolicyGateError),
+    /// This node advertises no subject, or stopped admitting while in
+    /// transition, so nothing governed may land here.
+    #[error("this node is not a legal destination for governed data")]
+    NoDestination,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,6 +291,54 @@ impl Operation for BaoReadOperation {
             }
         }
     }
+}
+
+/// One teach-then-retry round. The source only ever teaches the refs it needs,
+/// so a second `Required` for the same set is a protocol dead end, not a loop.
+const CHALLENGE_ATTEMPTS: usize = 2;
+
+/// A governed remote read with the plan's destination challenge (5.6/10).
+///
+/// The request carries this node's advertised subject, so the source can
+/// evaluate it independently. On `PlacementPolicyRequired` the refs are
+/// resolved through the ordinary policy resolver, which verifies publication
+/// authority and caches the result, then evaluated locally; the read is retried
+/// only when the local subject complies. Echoed refs are never authority.
+pub async fn managed_read(
+    context: &DriverContext,
+    node_id: NodeId,
+    request: BaoReadRequest,
+) -> Result<BaoReadOutput, BaoReadError> {
+    let mut request = request;
+    let destination = match gate_context(context, request.realm_id, now_ms()).await {
+        Ok(destination) => destination,
+        Err(GateContextError::AdmissionStopped) => {
+            return Err(PolicyGateError::AdmissionStopped.into());
+        }
+        Err(GateContextError::Routing(_)) => return Err(BaoReadError::NoDestination),
+    };
+    request.destination = destination.as_ref().map(|gate| gate.subject.clone());
+    let mut taught: Vec<PlacementPolicyRef> = Vec::new();
+    for _ in 0..CHALLENGE_ATTEMPTS {
+        let refs = match drive(BaoReadOperation::new(node_id, request.clone()), context).await {
+            Err(BaoReadError::PolicyRequired { refs }) => refs,
+            other => return other,
+        };
+        let refs = PlacementPolicyRef::canonical_set(&refs).map_err(ConversionError::from)?;
+        if refs.is_empty() || refs == taught {
+            return Err(BaoReadError::PolicyRequired { refs });
+        }
+        // The refs are only a hint: this node decides on its own resolution,
+        // which also caches the verified publication for every later read.
+        let Some(gate) = write_gate(destination.as_ref(), &refs)? else {
+            return Err(BaoReadError::NoDestination);
+        };
+        let outcome = drive(gate, context).await.map_err(PolicyGateError::from)?;
+        gate_decision(outcome.decision)?;
+        request.known_refs = union_refs(&request.known_refs, &refs)?;
+        taught = refs;
+    }
+    Err(BaoReadError::PolicyRequired { refs: taught })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
