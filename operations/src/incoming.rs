@@ -843,8 +843,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                                     .trigger(self.context.clone(), touched_topics);
                             }
                             Err(err) if err.is_admission_rejection() => {
-                                // Refused before any payload read, so no partial local
-                                // state exists; dropping avoids an all-topic reconcile.
+                                // Refused before any document was applied, so no partial
+                                // local state exists; dropping avoids an all-topic reconcile.
                                 debug!(peer = %node_id, error = ?err, "Dropped inbound document sync stream at admission");
                             }
                             Err(err) => {
