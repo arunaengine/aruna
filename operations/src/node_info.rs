@@ -3,17 +3,24 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
+use aruna_core::compute_quota::{
+    ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot, DemandFamily,
+    DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES, MAX_DEMAND_GROUPS,
+    MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
+};
 use aruna_core::document::{DocumentSyncChange, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
-    NODE_SUBJECT_KEYSPACE,
+    COMPUTE_DEPARTURE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
+    JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
 };
 use aruna_core::storage_entries::document_sync_revision_key;
 use aruna_core::structs::{
-    AdvertisementEpoch, BackendCatalog, NODE_SUBJECT_KEY, NodeInfoDocument, NodeSubjectRecord,
+    AdvertisementEpoch, BackendCatalog, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+    JobRecordKind, LogicalJobState, NODE_SUBJECT_KEY, NodeInfoDocument, NodeSubjectRecord,
     NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
     STORAGE_CLASS_LABEL_PREFIX, node_info_storage_key,
 };
@@ -27,9 +34,14 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
+use crate::jobs::records::keys::kind_prefix;
+use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
 use crate::placement::{build_view, held_buckets};
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+
+/// Rows one snapshot scan reads per page.
+const SNAPSHOT_PAGE_SIZE: usize = 128;
 
 /// Interval between node-info heartbeat republishes. Peers treat a node's
 /// `heartbeat_at_ms` staleness against this cadence when scoring liveness.
@@ -55,9 +67,11 @@ pub async fn seed_node_info_document(
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
     let stored = read_node_info_document(&ctx.storage_handle, node_id).await?;
+    let epoch = next_epoch(ctx, realm_id, stored.as_ref(), now).await?;
+    let reservation = reservation_snapshot(ctx, epoch).await?;
     let document = NodeInfoDocument {
         node_id,
-        executors: advertised_executors(ctx).await?,
+        executors: advertised_executors(ctx, &reservation.reserved, now).await?,
         labels: node_labels(ctx, &config, node_id)?,
         urls,
         utilization: NodeUtilization {
@@ -67,9 +81,11 @@ pub async fn seed_node_info_document(
             heartbeat_at_ms: now,
         },
         updated_at_ms: now,
-        epoch: next_epoch(ctx, realm_id, stored.as_ref(), now).await?,
+        epoch,
         compute_draining: stored.as_ref().is_some_and(|old| old.compute_draining),
         leaving: stored.as_ref().is_some_and(|old| old.leaving),
+        demand: demand_snapshot(ctx, epoch).await?,
+        reservation,
     };
     write_node_info_document(&ctx.storage_handle, &document).await
 }
@@ -91,16 +107,181 @@ pub async fn publish_node_info(
 /// This node's advertised execution targets: every enabled backend at the
 /// current placement subject. A node without a subject holds and executes
 /// nothing governed, so it advertises no target at all.
-async fn advertised_executors(ctx: &DriverContext) -> Result<Vec<ExecutorCapability>, String> {
+///
+/// Availability is derived from each backend's static ceilings minus what this
+/// node has actually reserved. It ranks targets and never authorizes: exact
+/// admission stays the target-side reservation.
+async fn advertised_executors(
+    ctx: &DriverContext,
+    reserved: &ResourceTotals,
+    now_ms: u64,
+) -> Result<Vec<ExecutorCapability>, String> {
     let Some(registry) = ctx.compute_handle.as_ref() else {
         return Ok(Vec::new());
     };
     let Some(record) = read_subject_record(&ctx.storage_handle).await? else {
         return Ok(Vec::new());
     };
-    registry
+    let mut capabilities = registry
         .capabilities(&record.subject, record.policy_draining)
-        .map_err(|error| format!("failed to build executor advertisements: {error}"))
+        .map_err(|error| format!("failed to build executor advertisements: {error}"))?;
+    for capability in &mut capabilities {
+        capability.availability = Some(availability(&capability.limits, reserved, now_ms));
+    }
+    Ok(capabilities)
+}
+
+/// Exact local capacity currently reserved, summed over the durable per-
+/// execution reservation rows. Duplicate executions are counted separately.
+async fn reservation_snapshot(
+    ctx: &DriverContext,
+    epoch: AdvertisementEpoch,
+) -> Result<ComputeReservationSnapshot, String> {
+    let mut reserved = ResourceTotals::default();
+    for record in read_reservations(ctx).await? {
+        reserved.add(&record.resources);
+    }
+    Ok(ComputeReservationSnapshot { epoch, reserved })
+}
+
+async fn read_reservations(ctx: &DriverContext) -> Result<Vec<JobReservationRecord>, String> {
+    let mut records = Vec::new();
+    let mut start: Option<Key> = None;
+    loop {
+        let (page, next) = iter_page(ctx, JOB_RESERVATION_KEYSPACE, None, start).await?;
+        for (_, value) in &page {
+            match postcard::from_bytes::<JobReservationRecord>(value.as_ref()) {
+                Ok(record) => records.push(record),
+                Err(error) => warn!(%error, "skipping undecodable execution reservation"),
+            }
+        }
+        match next {
+            Some(cursor) => start = Some(cursor),
+            None => return Ok(records),
+        }
+    }
+}
+
+/// Bounded logical admission demand this node observes: every request family it
+/// holds records for that is admitted and not terminal, with the group and
+/// resources its immutable spec sealed. Replicas deduplicate by family, so a
+/// family several holders observe still counts once.
+async fn demand_snapshot(
+    ctx: &DriverContext,
+    epoch: AdvertisementEpoch,
+) -> Result<ComputeDemandSnapshot, String> {
+    let mut groups: BTreeMap<aruna_core::types::GroupId, Vec<DemandFamily>> = BTreeMap::new();
+    let mut families = 0usize;
+    let mut truncated = false;
+    let mut start: Option<Key> = None;
+    loop {
+        let (page, next) = iter_page(ctx, JOB_FAMILY_PROJECTION_KEYSPACE, None, start).await?;
+        for (_, value) in &page {
+            let Some(family) = nonterminal_family(value) else {
+                continue;
+            };
+            if families >= MAX_DEMAND_FAMILIES {
+                truncated = true;
+                break;
+            }
+            let Some(spec) = read_family_spec(ctx, &family).await? else {
+                continue;
+            };
+            let entry = groups.entry(spec.0).or_default();
+            entry.push(DemandFamily {
+                submission_id: family.submission_id,
+                request_digest: family.request_digest,
+                resources: spec.1,
+            });
+            families += 1;
+        }
+        match next {
+            Some(cursor) if !truncated => start = Some(cursor),
+            _ => break,
+        }
+    }
+    truncated |= groups.len() > MAX_DEMAND_GROUPS;
+    let groups = groups
+        .into_iter()
+        .take(MAX_DEMAND_GROUPS)
+        .map(|(group_id, mut families)| {
+            families.sort_unstable_by_key(|family| (family.submission_id.0, family.request_digest));
+            DemandGroup {
+                group_id,
+                families,
+                truncated,
+            }
+        })
+        .collect();
+    Ok(ComputeDemandSnapshot { epoch, groups })
+}
+
+/// The family of one projection row that still holds logical demand. Succeeded
+/// and cancelled families released theirs; `Indeterminate` has not.
+fn nonterminal_family(value: &Value) -> Option<JobFamilyId> {
+    let projection = from_bytes::<ProjectionCache>(value.as_ref())
+        .ok()?
+        .projection?;
+    match projection.state {
+        LogicalJobState::Queued | LogicalJobState::Running | LogicalJobState::Indeterminate => {
+            Some(JobFamilyId {
+                submission_id: projection.submission_id,
+                request_digest: projection.request_digest,
+            })
+        }
+        LogicalJobState::Succeeded | LogicalJobState::Cancelled => None,
+    }
+}
+
+/// The group and sealed ceilings of one family, read from its immutable spec.
+async fn read_family_spec(
+    ctx: &DriverContext,
+    family: &JobFamilyId,
+) -> Result<
+    Option<(
+        aruna_core::types::GroupId,
+        aruna_core::structs::EffectiveResources,
+    )>,
+    String,
+> {
+    let prefix = kind_prefix(family, JobRecordKind::Spec);
+    let (page, _) = iter_page(ctx, JOB_FAMILY_RECORD_KEYSPACE, Some(prefix), None).await?;
+    for (_, value) in &page {
+        if let Ok(envelope) = from_bytes::<JobRecordEnvelope>(value.as_ref())
+            && let JobFamilyRecord::Spec(spec) = &envelope.record
+        {
+            return Ok(Some((spec.group_id, spec.resources)));
+        }
+    }
+    Ok(None)
+}
+
+async fn iter_page(
+    ctx: &DriverContext,
+    key_space: &str,
+    prefix: Option<Key>,
+    start: Option<Key>,
+) -> Result<(Vec<(Key, Value)>, Option<Key>), String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix,
+            start: start.map(IterStart::After),
+            limit: SNAPSHOT_PAGE_SIZE,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => {
+            let next = (values.len() >= SNAPSHOT_PAGE_SIZE)
+                .then(|| values.last().map(|(key, _)| key.clone()))
+                .flatten();
+            Ok((values, next))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("{key_space} iteration failed: {other:?}")),
+    }
 }
 
 async fn read_subject_record(storage: &StorageHandle) -> Result<Option<NodeSubjectRecord>, String> {
@@ -174,8 +355,10 @@ pub async fn refresh_node_info_heartbeat(
     };
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
-    document.executors = advertised_executors(ctx).await?;
     document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
+    document.reservation = reservation_snapshot(ctx, document.epoch).await?;
+    document.demand = demand_snapshot(ctx, document.epoch).await?;
+    document.executors = advertised_executors(ctx, &document.reservation.reserved, now).await?;
     document.labels = node_labels(ctx, &config, node_id)?;
     document.utilization.storage_bytes_used = local_storage_bytes(ctx).await?;
     document.utilization.documents_held = held_documents(ctx, node_id, &config).await;
@@ -184,6 +367,105 @@ pub async fn refresh_node_info_heartbeat(
     document.updated_at_ms = now;
     write_node_info_document(&ctx.storage_handle, &document).await?;
     replicate_node_info(ctx, node_id, realm_id).await
+}
+
+/// The single durable departure-report row of this node.
+const DEPARTURE_KEY: &[u8] = b"departure";
+
+/// Applies an observed departure, or a return, to this node's compute plane.
+///
+/// Departing stops new offers and admissions immediately, publishes the final
+/// snapshots, and records every still-reserved execution as unresolved. It
+/// waits for nothing: membership removal is never blocked, and a reserved
+/// execution is never declared terminal. Returning clears the flags so the
+/// rejoined node advertises again under its new membership generation.
+/// `Ok(false)` means the state already matched, so nothing was republished.
+pub async fn set_departure_state(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    realm_id: RealmId,
+    departing: bool,
+) -> Result<bool, String> {
+    let Some(mut document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+        return Ok(false);
+    };
+    if document.leaving == departing && document.compute_draining == departing {
+        return Ok(false);
+    }
+    let now = unix_timestamp_millis();
+    document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
+    document.leaving = departing;
+    document.compute_draining = departing;
+    document.reservation = reservation_snapshot(ctx, document.epoch).await?;
+    document.demand = demand_snapshot(ctx, document.epoch).await?;
+    document.updated_at_ms = now;
+    if departing {
+        write_departure_report(ctx, document.epoch.membership_generation, now).await?;
+    }
+    write_node_info_document(&ctx.storage_handle, &document).await?;
+    replicate_node_info(ctx, node_id, realm_id).await?;
+    Ok(true)
+}
+
+/// Records the executions this node still holds capacity for. Their
+/// reservations stay in place: a departing node may neither erase them nor
+/// claim they ended.
+async fn write_departure_report(
+    ctx: &DriverContext,
+    membership_generation: u64,
+    now_ms: u64,
+) -> Result<(), String> {
+    let mut unresolved: Vec<Ulid> = read_reservations(ctx)
+        .await?
+        .into_iter()
+        .map(|record| record.execution_id)
+        .collect();
+    unresolved.sort_unstable();
+    let truncated = unresolved.len() > MAX_UNRESOLVED_EXECUTIONS;
+    unresolved.truncate(MAX_UNRESOLVED_EXECUTIONS);
+    let report = ComputeDepartureReport {
+        departed_at_ms: now_ms,
+        membership_generation,
+        unresolved,
+        truncated,
+    };
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(DEPARTURE_KEY.to_vec()),
+            value: Value::from(postcard::to_allocvec(&report).map_err(|error| error.to_string())?),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("departure report write failed: {other:?}")),
+    }
+}
+
+/// The durable departure report, if this node ever departed.
+pub async fn read_departure_report(
+    storage: &StorageHandle,
+) -> Result<Option<ComputeDepartureReport>, String> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(DEPARTURE_KEY.to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| {
+                postcard::from_bytes::<ComputeDepartureReport>(bytes.as_ref())
+                    .map_err(|error| error.to_string())
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("departure report read failed: {other:?}")),
+    }
 }
 
 async fn load_realm_config(
@@ -831,6 +1113,311 @@ mod tests {
 
         let count = count_held_documents(&ctx, local, &config).await.unwrap();
         assert_eq!(count, 3);
+    }
+
+    fn family(seed: u8) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: aruna_core::structs::SubmissionId([seed; 32]),
+            request_digest: [seed; 32],
+        }
+    }
+
+    fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRecordEnvelope {
+        let resources = aruna_core::structs::EffectiveResources {
+            cpu_cores: 2,
+            ram_bytes: 1_024,
+            disk_bytes: 2_048,
+            max_walltime_ms: 60_000,
+            preemptible: false,
+        };
+        let job_id = aruna_core::structs::JobId::from_bytes([9u8; 16]);
+        let origin = node(1);
+        let spec = aruna_core::structs::LogicalJobSpec {
+            submission_id: family.submission_id,
+            job_id,
+            origin_node_id: origin,
+            realm_id,
+            group_id,
+            created_by: aruna_core::types::UserId::nil(realm_id),
+            created_at_ms: 1_000,
+            payload: aruna_core::structs::ExecutionSpec {
+                group_id,
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: Default::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
+            },
+            request_digest: family.request_digest,
+            spec_digest: [0u8; 32],
+            resources,
+            retry: aruna_core::structs::JobRetryPolicy {
+                max_launches_per_witness: 2,
+            },
+            admission: aruna_core::structs::JobAdmissionRecord {
+                submission_id: family.submission_id,
+                request_digest: family.request_digest,
+                job_id,
+                group_id,
+                admitting_node_id: origin,
+                membership_generation: 1,
+                resources,
+                admitted_at_ms: 1_000,
+            },
+            placement: PlacementRef::NIL,
+        }
+        .seal()
+        .expect("spec seals");
+        JobRecordEnvelope::sign(
+            realm_id,
+            JobFamilyRecord::Spec(Box::new(spec)),
+            &iroh::SecretKey::from_bytes(&[1u8; 32]),
+        )
+        .expect("record signs")
+    }
+
+    async fn write_family(
+        ctx: &DriverContext,
+        realm_id: RealmId,
+        family: JobFamilyId,
+        group_id: Ulid,
+        state: LogicalJobState,
+    ) {
+        let cache = ProjectionCache {
+            revision: 1,
+            stale: false,
+            projection: Some(aruna_core::structs::JobProjection {
+                submission_id: family.submission_id,
+                request_digest: family.request_digest,
+                canonical_job_id: aruna_core::structs::JobId::from_bytes([9u8; 16]),
+                aliases: Vec::new(),
+                state,
+                canonical_execution_id: None,
+                executions: Vec::new(),
+                outputs: aruna_core::structs::OutputSet::new(Vec::new()).expect("empty outputs"),
+                cancel_requested: false,
+            }),
+        };
+        write_row(
+            ctx,
+            JOB_FAMILY_PROJECTION_KEYSPACE,
+            Key::from(family.to_bytes().as_slice()),
+            postcard::to_allocvec(&cache).unwrap(),
+        )
+        .await;
+        let record = spec_record(realm_id, family, group_id);
+        let mut key = kind_prefix(&family, JobRecordKind::Spec).to_vec();
+        key.extend_from_slice(&[0u8; 40]);
+        write_row(
+            ctx,
+            JOB_FAMILY_RECORD_KEYSPACE,
+            Key::from(key.as_slice()),
+            postcard::to_allocvec(&record).unwrap(),
+        )
+        .await;
+    }
+
+    async fn write_reservation(ctx: &DriverContext, execution_id: Ulid, cpu: u32) {
+        let record = JobReservationRecord {
+            execution_id,
+            job_id: aruna_core::structs::JobId::from_bytes([9u8; 16]),
+            resources: aruna_core::structs::EffectiveResources {
+                cpu_cores: cpu,
+                ram_bytes: 512,
+                disk_bytes: 0,
+                max_walltime_ms: 1_000,
+                preemptible: false,
+            },
+            created_at_ms: 5,
+        };
+        write_row(
+            ctx,
+            JOB_RESERVATION_KEYSPACE,
+            Key::from(execution_id.to_bytes().as_slice()),
+            postcard::to_allocvec(&record).unwrap(),
+        )
+        .await;
+    }
+
+    async fn write_row(ctx: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
+        let event = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn publishes_separate_snapshots() {
+        // Logical demand and physical reservation are different controls: a
+        // terminal family leaves demand while its node still reserves capacity.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
+        write_family(
+            &ctx,
+            realm_id,
+            family(2),
+            group_id,
+            LogicalJobState::Indeterminate,
+        )
+        .await;
+        write_family(
+            &ctx,
+            realm_id,
+            family(3),
+            group_id,
+            LogicalJobState::Succeeded,
+        )
+        .await;
+        write_reservation(&ctx, Ulid::from_bytes([7u8; 16]), 4).await;
+
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .expect("document");
+        let group = stored.demand.group(&group_id).expect("group demand");
+        assert_eq!(group.families.len(), 2);
+        assert!(!group.truncated);
+        assert_eq!(stored.demand.epoch, stored.epoch);
+        // Reservations are exact and local; they never enter logical demand.
+        assert_eq!(stored.reservation.reserved.count, 1);
+        assert_eq!(stored.reservation.reserved.cpu_cores, 4);
+        assert_eq!(stored.reservation.reserved.ram_bytes, 512);
+        assert!(stored.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn departure_stops_offers() {
+        // Departure revokes future eligibility and reports what it could not
+        // resolve, without deleting a reservation or blocking removal.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([10u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        let execution_id = Ulid::from_bytes([7u8; 16]);
+        write_reservation(&ctx, execution_id, 2).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+        let before = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            set_departure_state(&ctx, local, realm_id, true)
+                .await
+                .unwrap()
+        );
+
+        let after = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.leaving && after.compute_draining);
+        assert!(!after.offers_compute(true));
+        assert!(after.supersedes(&before));
+        assert_eq!(after.reservation.reserved.count, 1);
+
+        let report = read_departure_report(&ctx.storage_handle)
+            .await
+            .unwrap()
+            .expect("departure report");
+        assert_eq!(report.unresolved, vec![execution_id]);
+        assert!(!report.truncated);
+        // The reservation itself survives: departing proves nothing about it.
+        assert_eq!(read_reservations(&ctx).await.unwrap().len(), 1);
+        // A repeated observation republishes nothing.
+        assert!(
+            !set_departure_state(&ctx, local, realm_id, true)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejoin_clears_departure() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([11u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+        set_departure_state(&ctx, local, realm_id, true)
+            .await
+            .unwrap();
+        let departed = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            set_departure_state(&ctx, local, realm_id, false)
+                .await
+                .unwrap()
+        );
+
+        let rejoined = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!rejoined.leaving && !rejoined.compute_draining);
+        assert!(rejoined.offers_compute(true));
+        assert!(rejoined.supersedes(&departed));
     }
 
     #[tokio::test]
