@@ -453,7 +453,6 @@ pub async fn blob_locations(
         return Err(ServerError::NotFound);
     };
     let blake3 = local.blake3;
-    let bucket_info = local.bucket;
     let delete_marker = local.delete_marker;
 
     let here = (local_node, query.bucket.clone(), query.path.clone());
@@ -492,11 +491,6 @@ pub async fn blob_locations(
             );
             limits.push(LocationScanLimit::RelationshipScanFailed);
         }
-    }
-    for (node_id, bucket) in configured_targets(bucket_info.as_ref(), local_node, delete_marker) {
-        let destination = (node_id, bucket, query.path.clone());
-        expected.insert(destination.clone());
-        capped |= !add_candidate(&mut candidates, destination);
     }
     let queued = match drive(
         QueuedReplicaNodesOperation::new(
@@ -683,24 +677,6 @@ async fn holder_nodes(
     .await
 }
 
-/// Legacy bucket replication targets that will receive this version. A target
-/// declining delete markers never gets a job for one, so reporting it would
-/// promise a copy that is not coming.
-fn configured_targets(
-    bucket: Option<&BucketInfo>,
-    local_node: NodeId,
-    delete_marker: bool,
-) -> Vec<(NodeId, String)> {
-    bucket
-        .iter()
-        .flat_map(|bucket| bucket.replication.iter())
-        .flat_map(|config| config.targets.iter())
-        .filter(|target| target.node_id != local_node)
-        .filter(|target| !delete_marker || target.replicate_delete_markers)
-        .map(|target| (target.node_id, target.bucket.clone()))
-        .collect()
-}
-
 /// Adds one destination unless the request is already at its cap, which counts
 /// destinations rather than nodes because each one is a separate question.
 /// `false` means the destination was dropped, which the answer has to admit.
@@ -718,8 +694,8 @@ fn add_candidate(candidates: &mut BTreeSet<Destination>, destination: Destinatio
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobCopyState, BlobCopyStorage, BlobLocationsQuery, blob_locations, configured_targets,
-        copy_response, pending_copy,
+        BlobCopyState, BlobCopyStorage, BlobLocationsQuery, blob_locations, copy_response,
+        pending_copy,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -730,9 +706,8 @@ mod tests {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
-        Actor, AuthContext, BucketInfo, BucketReplicationConfig, BucketReplicationTarget,
-        GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId,
+        Actor, AuthContext, BucketInfo, GroupAuthorizationDocument, NodeCapabilities,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::location_summary::LocationSummaryError;
@@ -748,47 +723,6 @@ mod tests {
 
     fn node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[3u8; 32]).public()
-    }
-
-    fn peer_id() -> aruna_core::NodeId {
-        iroh::SecretKey::from_bytes(&[4u8; 32]).public()
-    }
-
-    fn configured(markers: bool) -> BucketInfo {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        BucketInfo {
-            group_id: Ulid::from_bytes([2u8; 16]),
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::types::UserId::nil(realm_id),
-            cors_configuration: None,
-            replication: Some(BucketReplicationConfig {
-                targets: vec![BucketReplicationTarget {
-                    node_id: peer_id(),
-                    realm_id,
-                    bucket: "mirror".to_string(),
-                    arn: String::new(),
-                    replicate_delete_markers: markers,
-                }],
-            }),
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-        }
-    }
-
-    #[test]
-    fn skips_declined_markers() {
-        // A legacy target that declines delete markers gets no job for one, so
-        // reporting it as pending would promise a copy that never arrives.
-        assert!(configured_targets(Some(&configured(false)), node_id(), true).is_empty());
-        assert_eq!(
-            configured_targets(Some(&configured(true)), node_id(), true),
-            vec![(peer_id(), "mirror".to_string())]
-        );
-        assert_eq!(
-            configured_targets(Some(&configured(false)), node_id(), false),
-            vec![(peer_id(), "mirror".to_string())]
-        );
     }
 
     #[test]
