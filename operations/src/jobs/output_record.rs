@@ -3,7 +3,6 @@ use aruna_core::structs::{
     AttemptControl, ExecutionOutputRecord, JobError, JobFamilyRecord, JobId, JobRecord,
     JobRecordEnvelope, OutputObject, OutputSet, SubmissionId,
 };
-use ulid::Ulid;
 
 use super::store::{persist_output_record, read_output_record};
 use crate::driver::DriverContext;
@@ -26,7 +25,7 @@ pub async fn seal_outputs(
         .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
     let outputs = OutputSet::canonical(outputs.to_vec())
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
-    if let Some(digest) = sealed_digest(context, control, &outputs).await? {
+    if let Some(digest) = sealed_digest(context, record.job_id, control, &outputs).await? {
         return Ok(digest);
     }
     let output = ExecutionOutputRecord {
@@ -51,7 +50,7 @@ pub async fn seal_outputs(
     .map_err(|error| JobError::permanent(format!("output record signing failed: {error}")))?;
     let frame = JobRecordFrame::new(envelope)
         .map_err(|error| JobError::permanent(format!("output record is unpublishable: {error}")))?;
-    publish_output_record(context, record.job_id, control.execution_id, frame).await
+    publish_output_record(context, record.job_id, control, frame).await
 }
 
 /// Digest of the record this execution already sealed for the same exact output
@@ -59,13 +58,14 @@ pub async fn seal_outputs(
 /// differs only by its commit timestamp.
 async fn sealed_digest(
     context: &DriverContext,
+    job_id: JobId,
     control: &AttemptControl,
     outputs: &OutputSet,
 ) -> Result<Option<[u8; 32]>, JobError> {
     let Some(digest) = control.output_record else {
         return Ok(None);
     };
-    let envelope = read_output_record(&context.storage_handle, control.execution_id)
+    let envelope = read_output_record(&context.storage_handle, job_id, control.attempt_epoch)
         .await
         .map_err(|error| JobError::retryable(format!("output record read failed: {error}")))?;
     let Some(envelope) = envelope else {
@@ -84,7 +84,7 @@ async fn sealed_digest(
 async fn publish_output_record(
     context: &DriverContext,
     job_id: JobId,
-    execution_id: Ulid,
+    control: &AttemptControl,
     frame: JobRecordFrame,
 ) -> Result<[u8; 32], JobError> {
     let digest = frame
@@ -93,7 +93,7 @@ async fn publish_output_record(
         .map_err(|error| JobError::permanent(format!("output record digest failed: {error}")))?;
     let bytes = postcard::to_allocvec(frame.envelope())
         .map_err(|error| JobError::permanent(format!("output record encoding failed: {error}")))?;
-    persist_output_record(&context.storage_handle, job_id, execution_id, digest, bytes)
+    persist_output_record(&context.storage_handle, job_id, control, digest, bytes)
         .await
         .map_err(|error| JobError::retryable(format!("output record write failed: {error}")))?;
     Ok(digest)
@@ -107,6 +107,7 @@ mod tests {
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
+    use ulid::Ulid;
 
     use super::super::store::{insert_job, read_attempt_control, reserve_output_commits};
     use super::*;
@@ -236,10 +237,14 @@ mod tests {
         .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = read_output_record(&context.storage_handle, control.execution_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let envelope = read_output_record(
+            &context.storage_handle,
+            record.job_id,
+            control.attempt_epoch,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(envelope.digest().unwrap(), digest);
         assert!(envelope.verify_signature().is_ok());
         let JobFamilyRecord::Output(sealed) = &envelope.record else {

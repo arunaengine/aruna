@@ -194,10 +194,15 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             job_dedup_index_key(record.created_by, dedup_key),
         ));
     }
-    // Epochs are handed out from 1; every used epoch left a control row.
+    // Epochs are handed out from 1; every used epoch left a control row and, on
+    // a terminal success, the output record sealed under the same key.
     for epoch in 1..record.next_attempt_epoch {
         deletes.push((
             JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
+            ByteView::from(attempt_control_key(record.job_id, epoch)),
+        ));
+        deletes.push((
+            JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
             ByteView::from(attempt_control_key(record.job_id, epoch)),
         ));
     }
@@ -1079,15 +1084,17 @@ where
     .await
 }
 
-/// The signed output record this execution already sealed, if any.
+/// The signed output record the attempt already sealed, if any. It shares the
+/// attempt-control key, so pruning the job removes both.
 pub async fn read_output_record(
     storage: &StorageHandle,
-    execution_id: Ulid,
+    job_id: JobId,
+    attempt_epoch: u64,
 ) -> Result<Option<JobRecordEnvelope>, JobMutationError> {
     let value = read_raw(
         storage,
         JOB_OUTPUT_RECORD_KEYSPACE,
-        ByteView::from(execution_id.to_bytes().to_vec()),
+        ByteView::from(attempt_control_key(job_id, attempt_epoch)),
         None,
     )
     .await
@@ -1106,20 +1113,20 @@ pub async fn read_output_record(
 pub async fn persist_output_record(
     storage: &StorageHandle,
     job_id: JobId,
-    execution_id: Ulid,
+    control: &AttemptControl,
     digest: [u8; 32],
     envelope: Vec<u8>,
 ) -> Result<(), JobMutationError> {
     let write = vec![(
         JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
-        ByteView::from(execution_id.to_bytes().to_vec()),
+        ByteView::from(attempt_control_key(job_id, control.attempt_epoch)),
         ByteView::from(envelope),
     )];
-    mutate_control_with(storage, job_id, write, |_, control| {
-        if control.execution_id != execution_id {
+    mutate_control_with(storage, job_id, write, |_, stored| {
+        if stored.execution_id != control.execution_id {
             return Err(JobMutationError::EpochMismatch);
         }
-        control.output_record = Some(digest);
+        stored.output_record = Some(digest);
         Ok(JobMutation::Persist)
     })
     .await?;
@@ -3244,7 +3251,7 @@ mod tests {
     }
 
     /// Fence an attempt so the success path has a control row to read.
-    async fn fence_attempt(storage: &StorageHandle, job_id: JobId, token: Ulid) -> Ulid {
+    async fn fence_attempt(storage: &StorageHandle, job_id: JobId, token: Ulid) -> AttemptControl {
         record_attempt_intent(
             storage,
             job_id,
@@ -3261,7 +3268,6 @@ mod tests {
         .await
         .unwrap()
         .control
-        .execution_id
     }
 
     #[tokio::test]
@@ -3993,9 +3999,9 @@ mod tests {
         .await
         .unwrap();
 
-        let execution_id = fence_attempt(&storage, job_id, token).await;
+        let control = fence_attempt(&storage, job_id, token).await;
         let digest = [8u8; 32];
-        persist_output_record(&storage, job_id, execution_id, digest, vec![1, 2, 3])
+        persist_output_record(&storage, job_id, &control, digest, vec![1, 2, 3])
             .await
             .unwrap();
 
@@ -4044,7 +4050,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let execution_id = fence_attempt(&storage, job_id, token).await;
+        let control = fence_attempt(&storage, job_id, token).await;
 
         let unproven = complete_execution(
             &storage,
@@ -4060,7 +4066,7 @@ mod tests {
             Err(JobMutationError::OutputsUnproven(_))
         ));
 
-        persist_output_record(&storage, job_id, execution_id, [8u8; 32], vec![9])
+        persist_output_record(&storage, job_id, &control, [8u8; 32], vec![9])
             .await
             .unwrap();
         let mismatched = complete_execution(
