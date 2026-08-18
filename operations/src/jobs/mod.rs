@@ -11,6 +11,7 @@ pub mod persistent_id;
 pub(crate) mod protocol;
 pub mod prune;
 pub mod reconcile;
+pub mod records;
 mod rocrate_jsonld;
 mod route;
 pub mod runtime;

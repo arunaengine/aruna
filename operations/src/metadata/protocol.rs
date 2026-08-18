@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
+use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
+use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{
     MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicy,
-    PlacementPolicyDocument, PlacementPolicyRef, SyncRelationship,
+    PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId, SyncRelationship,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -248,6 +250,45 @@ pub enum MetadataTransportMessage {
     ForwardedPlacementPolicyCreated {
         document: Box<PlacementPolicyDocument>,
     },
+    /// One immutable job-family record offered to a holder of the family
+    /// placement. The frame is bounded at decode and the envelope keeps its own
+    /// publisher, so the authenticated peer is only the relay. Appended last so
+    /// existing variant indices stay stable.
+    ForwardJobRecord {
+        placement: PlacementRef,
+        record: Box<JobRecordFrame>,
+    },
+    /// `Ok` means the holder durably accepted or already had the record.
+    ForwardedJobRecord {
+        result: Result<(), JobRecordRejection>,
+    },
+    /// A bounded page of one submission's immutable records read from a holder.
+    ForwardJobRecordPage {
+        placement: PlacementRef,
+        submission_id: SubmissionId,
+        /// `None` reads every request family of the submission.
+        request_digest: Option<[u8; 32]>,
+        cursor: Option<FetchCursor>,
+        limit: PageLimit,
+    },
+    ForwardedJobRecordPage {
+        result: Result<JobRecordPageReply, JobRecordRejection>,
+    },
+    /// One scheduler's launch offer to an execution target. It carries no
+    /// caller token: the target verifies the signed launch itself.
+    ForwardLaunchOffer {
+        launch: Box<LaunchFrame>,
+    },
+    ForwardedLaunchOffer {
+        result: Result<Box<ReceiptFrame>, LaunchDecline>,
+    },
+}
+
+/// One page of immutable records plus the cursor of the next one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecordPageReply {
+    pub page: JobRecordPage,
+    pub next: Option<FetchCursor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

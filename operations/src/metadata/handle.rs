@@ -1611,6 +1611,13 @@ impl MetadataHandle {
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
                 crate::placement_policy::serve_local_policy(context, peer, policy_ref).await
             }
+            record @ (MetadataTransportMessage::ForwardJobRecord { .. }
+            | MetadataTransportMessage::ForwardJobRecordPage { .. }) => {
+                crate::jobs::records::serve_job_record(context, peer, record).await
+            }
+            MetadataTransportMessage::ForwardLaunchOffer { launch } => {
+                crate::jobs::records::serve_launch_offer(context, peer, *launch).await
+            }
             forward @ MetadataTransportMessage::ForwardCreatePlacementPolicy { .. } => {
                 crate::placement_policy::apply_forwarded_policy(context, peer, forward).await
             }
@@ -1637,6 +1644,9 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedPersistentId { .. }
             | MetadataTransportMessage::ForwardedPlacementPolicy { .. }
             | MetadataTransportMessage::ForwardedPlacementPolicyCreated { .. }
+            | MetadataTransportMessage::ForwardedJobRecord { .. }
+            | MetadataTransportMessage::ForwardedJobRecordPage { .. }
+            | MetadataTransportMessage::ForwardedLaunchOffer { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4368,6 +4378,12 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedPlacementPolicyCreated { .. } => {
             "forwarded_placement_policy_created"
         }
+        MetadataTransportMessage::ForwardJobRecord { .. } => "forward_job_record",
+        MetadataTransportMessage::ForwardedJobRecord { .. } => "forwarded_job_record",
+        MetadataTransportMessage::ForwardJobRecordPage { .. } => "forward_job_record_page",
+        MetadataTransportMessage::ForwardedJobRecordPage { .. } => "forwarded_job_record_page",
+        MetadataTransportMessage::ForwardLaunchOffer { .. } => "forward_launch_offer",
+        MetadataTransportMessage::ForwardedLaunchOffer { .. } => "forwarded_launch_offer",
     }
 }
 

@@ -433,6 +433,14 @@ async fn dispatch_effect_until(
         Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
             crate::placement_policy::sign_publication(context, *claim),
         )),
+        // Job-record replication and launch offers resolve their holders in the
+        // operation and run only the holder round-trips here.
+        Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(
+            Box::pin(crate::jobs::records::dispatch_record(context, *record)).await,
+        )),
+        Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
+            Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
+        )),
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await
