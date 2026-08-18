@@ -99,10 +99,16 @@ pub async fn run_execution_job(
         return;
     };
 
+    // A fenced refusal is retryable: the job returns to the queue instead of
+    // failing, because the site may still come back or another target may take
+    // it.
     let backend = match resolve_backend(&context, &spec, job_id).await {
         Ok(backend) => backend,
         Err(error) => {
-            Box::pin(fail_and_crate(&context, job_id, token, &record, error)).await;
+            Box::pin(requeue_or_fail_pre_submit(
+                &context, job_id, token, &record, error, false,
+            ))
+            .await;
             return;
         }
     };
@@ -2802,6 +2808,34 @@ mod tests {
         };
         assert_eq!(error.kind, JobErrorKind::Retryable);
         assert!(error.message.contains("drifted"));
+    }
+
+    #[tokio::test]
+    async fn drift_requeues_attempt() {
+        // A fenced refusal must return the job to the queue, not terminalize it:
+        // the site may return, or another target may take the work.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+        let (record, token, _) = ready_with_intent(&storage).await;
+        seal_site(&storage, record.job_id, 99, [7u8; 32]).await;
+        let Err(error) = resolve_backend(&ctx, &execution_spec(), record.job_id).await else {
+            panic!("a drifted subject must refuse the start");
+        };
+
+        requeue_or_fail_pre_submit(&ctx, record.job_id, token, &record, error, false).await;
+
+        let stored = read_job_record(&storage, record.job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Queued);
+        assert!(
+            stored
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("drifted"))
+        );
     }
 
     #[tokio::test]
