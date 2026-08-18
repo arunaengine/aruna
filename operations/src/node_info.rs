@@ -3,14 +3,19 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::{DocumentSyncChange, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE};
+use aruna_core::keyspaces::{
+    DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE,
+};
+use aruna_core::storage_entries::document_sync_revision_key;
 use aruna_core::structs::{
-    BackendCatalog, NodeInfoDocument, NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument,
-    RealmId, STORAGE_CLASS_LABEL_PREFIX, node_info_storage_key,
+    AdvertisementEpoch, BackendCatalog, NODE_SUBJECT_KEY, NodeInfoDocument, NodeSubjectRecord,
+    NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
+    STORAGE_CLASS_LABEL_PREFIX, node_info_storage_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -46,13 +51,13 @@ pub async fn seed_node_info_document(
     node_id: NodeId,
     realm_id: RealmId,
     urls: NodeUrls,
-    executors: Vec<ExecutorCapability>,
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
+    let stored = read_node_info_document(&ctx.storage_handle, node_id).await?;
     let document = NodeInfoDocument {
         node_id,
-        executors,
+        executors: advertised_executors(ctx).await?,
         labels: node_labels(ctx, &config, node_id)?,
         urls,
         utilization: NodeUtilization {
@@ -62,6 +67,9 @@ pub async fn seed_node_info_document(
             heartbeat_at_ms: now,
         },
         updated_at_ms: now,
+        epoch: next_epoch(ctx, realm_id, stored.as_ref(), now).await?,
+        compute_draining: stored.as_ref().is_some_and(|old| old.compute_draining),
+        leaving: stored.as_ref().is_some_and(|old| old.leaving),
     };
     write_node_info_document(&ctx.storage_handle, &document).await
 }
@@ -75,10 +83,81 @@ pub async fn publish_node_info(
     node_id: NodeId,
     realm_id: RealmId,
     urls: NodeUrls,
-    executors: Vec<ExecutorCapability>,
 ) -> Result<(), String> {
-    seed_node_info_document(ctx, node_id, realm_id, urls, executors).await?;
+    seed_node_info_document(ctx, node_id, realm_id, urls).await?;
     replicate_node_info(ctx, node_id, realm_id).await
+}
+
+/// This node's advertised execution targets: every enabled backend at the
+/// current placement subject. A node without a subject holds and executes
+/// nothing governed, so it advertises no target at all.
+async fn advertised_executors(ctx: &DriverContext) -> Result<Vec<ExecutorCapability>, String> {
+    let Some(registry) = ctx.compute_handle.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(record) = read_subject_record(&ctx.storage_handle).await? else {
+        return Ok(Vec::new());
+    };
+    registry
+        .capabilities(&record.subject, record.policy_draining)
+        .map_err(|error| format!("failed to build executor advertisements: {error}"))
+}
+
+async fn read_subject_record(storage: &StorageHandle) -> Result<Option<NodeSubjectRecord>, String> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: Key::from(NODE_SUBJECT_KEY.to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| {
+                NodeSubjectRecord::from_bytes(bytes.as_ref()).map_err(|error| error.to_string())
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("node subject read failed: {other:?}")),
+    }
+}
+
+/// Supersession tuple of the next advertisement: the observed realm-config
+/// revision plus a local counter. A rejoin observes a newer membership
+/// generation, so a restarted counter still supersedes the older epoch.
+async fn next_epoch(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    stored: Option<&NodeInfoDocument>,
+    now_ms: u64,
+) -> Result<AdvertisementEpoch, String> {
+    Ok(AdvertisementEpoch {
+        membership_generation: membership_generation(ctx, realm_id).await?,
+        publisher_generation: stored
+            .map(|document| document.epoch.publisher_generation.saturating_add(1))
+            .unwrap_or(1),
+        observed_at_ms: now_ms,
+    })
+}
+
+async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result<u64, String> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+            key: document_sync_revision_key(&target),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+            .and_then(|bytes| postcard::from_bytes::<DocumentSyncChange>(bytes.as_ref()).ok())
+            .map(|change| change.current.generation)
+            .unwrap_or_default()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("realm config revision read failed: {other:?}")),
+    }
 }
 
 /// Heartbeat: refreshes the persisted node-info document's placement-view
@@ -95,6 +174,8 @@ pub async fn refresh_node_info_heartbeat(
     };
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
+    document.executors = advertised_executors(ctx).await?;
+    document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
     document.labels = node_labels(ctx, &config, node_id)?;
     document.utilization.storage_bytes_used = local_storage_bytes(ctx).await?;
     document.utilization.documents_held = held_documents(ctx, node_id, &config).await;
@@ -474,7 +555,6 @@ mod tests {
                 api: None,
                 s3: Some("s3.example".to_string()),
             },
-            Vec::new(),
         )
         .await
         .unwrap();
@@ -521,7 +601,6 @@ mod tests {
                 api: None,
                 s3: Some("s3.example".to_string()),
             },
-            Vec::new(),
         )
         .await
         .unwrap();
@@ -580,11 +659,6 @@ mod tests {
                 api: None,
                 s3: None,
             },
-            vec![ExecutorCapability {
-                kind: "docker".to_string(),
-                file_staging: true,
-                direct_s3: true,
-            }],
         )
         .await
         .unwrap();
@@ -611,7 +685,11 @@ mod tests {
         assert_eq!(second.labels, expected_labels);
         assert_eq!(second.labels.get("zone").unwrap(), "b");
         assert!(!second.labels.contains_key("stale"));
-        assert_eq!(second.executors.len(), 1);
+        // A node without a compute plane advertises no execution target, and
+        // every republish supersedes its own predecessor.
+        assert!(second.executors.is_empty());
+        assert!(second.epoch.publisher_generation > first.epoch.publisher_generation);
+        assert!(second.supersedes(&first));
         assert!(second.updated_at_ms >= first.updated_at_ms);
         assert!(second.utilization.heartbeat_at_ms >= first.utilization.heartbeat_at_ms);
 
@@ -769,7 +847,6 @@ mod tests {
                 api: None,
                 s3: None,
             },
-            Vec::new(),
         )
         .await
         .unwrap();

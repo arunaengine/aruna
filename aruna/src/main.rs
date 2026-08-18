@@ -1180,10 +1180,6 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
             api: config.api_public_url.clone(),
             s3: config.s3_public_url.clone(),
         },
-        ctx.compute_handle
-            .as_ref()
-            .map(|registry| registry.capabilities())
-            .unwrap_or_default(),
     )
     .await
 }
