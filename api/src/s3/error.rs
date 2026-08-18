@@ -1,7 +1,9 @@
 use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::RoutingError;
+use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::RoutingInputsError;
+use aruna_operations::placement_policy::PolicyGateError;
 use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
 use aruna_operations::s3::bucket_cors::{
     DeleteBucketCorsError, GetBucketCorsError, PutBucketCorsError,
@@ -56,6 +58,56 @@ fn reference_exhausted_error() -> S3Error {
     );
     error.set_status_code(http::StatusCode::CONFLICT);
     error
+}
+
+/// A placement-policy refusal. The response never names a policy, a ref, or a
+/// node: a public caller must not learn the residency rule from a refusal.
+fn placement_denied_error(action: &str) -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("PlacementPolicyDenied".into()),
+        format!("{action} is not permitted for this object on this node."),
+    );
+    error.set_status_code(http::StatusCode::FORBIDDEN);
+    error
+}
+
+/// A governed copy this node cannot currently answer for. Retryable and equally
+/// non-disclosing: an unregistered, quarantined and blocked copy look alike.
+fn placement_unavailable_error() -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("PlacementUnavailable".into()),
+        "The requested object is not currently available from this node.".to_string(),
+    );
+    error.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+    error
+}
+
+/// One stable mapping for every managed-copy outcome, so a caller cannot tell
+/// an absent registration from a quarantined or blocked one.
+fn managed_copy_error(error: &ManagedCopyError) -> S3Error {
+    match error {
+        ManagedCopyError::Unregistered
+        | ManagedCopyError::NotServeable(_)
+        | ManagedCopyError::Mismatched
+        | ManagedCopyError::NoSubject
+        | ManagedCopyError::ServingBlocked => placement_unavailable_error(),
+        other => internal_error(other),
+    }
+}
+
+/// A denial and an unresolved rule map apart only by retryability; neither
+/// discloses which policy decided.
+fn policy_gate_error(error: &PolicyGateError, action: &str) -> S3Error {
+    match error {
+        PolicyGateError::Denied { .. } | PolicyGateError::NoSubject => {
+            placement_denied_error(action)
+        }
+        PolicyGateError::Unavailable { .. }
+        | PolicyGateError::Required { .. }
+        | PolicyGateError::Drift
+        | PolicyGateError::Read(_) => placement_unavailable_error(),
+        PolicyGateError::Invalid | PolicyGateError::Policy(_) => placement_denied_error(action),
+    }
 }
 
 /// A named backend that has reached its operator quota. Refusing loudly beats
@@ -208,6 +260,8 @@ impl IntoS3Error for PutObjectError {
             }
             PutObjectError::IncompleteBody => incomplete_body_error(),
             PutObjectError::WriteFailed(message) => write_failed_error(&message, "PutObject"),
+            PutObjectError::PolicyGate(ref error) => policy_gate_error(error, "PutObject"),
+            PutObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             err => internal_error(err),
         }
     }
@@ -302,6 +356,10 @@ impl IntoS3Error for CompleteMultipartUploadError {
             CompleteMultipartUploadError::QuotaExceeded { limit, usage } => {
                 quota_exceeded_error(limit, usage)
             }
+            CompleteMultipartUploadError::PolicyGate(ref error) => {
+                policy_gate_error(error, "CompleteMultipartUpload")
+            }
+            CompleteMultipartUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
             err => internal_error(err),
         }
     }
@@ -321,6 +379,7 @@ impl IntoS3Error for AbortMultipartUploadError {
 impl IntoS3Error for GetObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            GetObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             GetObjectError::NoSuchVersion => no_such_version_error(),
             GetObjectError::HistoricalReferenceUnavailable => {
                 s3_error!(
@@ -381,6 +440,7 @@ impl IntoS3Error for CopyObjectError {
 impl IntoS3Error for HeadObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            HeadObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             HeadObjectError::NoSuchVersion => no_such_version_error(),
             HeadObjectError::DeleteMarker => delete_marker_error(),
             HeadObjectError::NoSuchKey => no_such_key_error(),
@@ -411,6 +471,7 @@ impl IntoS3Error for HeadObjectError {
 impl IntoS3Error for GetObjectAttributesError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            GetObjectAttributesError::ManagedCopyError(ref error) => managed_copy_error(error),
             GetObjectAttributesError::NoSuchVersion => no_such_version_error(),
             GetObjectAttributesError::DeleteMarker => delete_marker_error(),
             GetObjectAttributesError::NoSuchKey => no_such_key_error(),

@@ -10,9 +10,10 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
     CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
     SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
     USER_ACCESS_OWNER_KEYSPACE,
@@ -21,9 +22,10 @@ use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-    MultipartUploadPart, MultipartUploadPartKey, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmId, UserAccess, VersionKey,
+    ManagedCopyKey, ManagedCopyRecord, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    NodeSubjectRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
+    VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
@@ -157,6 +159,8 @@ enum DecodedField {
     BlobLocationKey { blake3: String, backend: String },
     #[serde(rename = "version_key")]
     VersionKey { value: VersionKey },
+    #[serde(rename = "managed_copy_key")]
+    ManagedCopyKey { value: ManagedCopyKey },
     #[serde(rename = "multipart_upload_part_key")]
     MultipartUploadPartKey { value: MultipartUploadPartKey },
     #[serde(rename = "multipart_object_metadata_key")]
@@ -195,6 +199,12 @@ enum DecodedValue {
     },
     BlobVersion {
         data: BlobVersion,
+    },
+    ManagedCopyRecord {
+        data: ManagedCopyRecord,
+    },
+    NodeSubjectRecord {
+        data: NodeSubjectRecord,
     },
     MultipartUpload {
         data: MultipartUpload,
@@ -961,7 +971,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 33] {
+fn defined_keyspaces() -> [&'static str; 35] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -980,11 +990,13 @@ fn defined_keyspaces() -> [&'static str; 33] {
         GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
         DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        MANAGED_COPY_KEYSPACE,
         METADATA_AUDIT_KEYSPACE,
         METADATA_DOCUMENT_INDEX_KEYSPACE,
         METADATA_HOLDERS_KEYSPACE,
         METADATA_INDEX_KEYSPACE,
         NODE_STATE_KEYSPACE,
+        NODE_SUBJECT_KEYSPACE,
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
@@ -1245,6 +1257,9 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         BLOB_VERSIONS_KEYSPACE => VersionKey::from_bytes(key)
             .map(|value| DecodedField::VersionKey { value })
             .unwrap_or_else(|_| raw_field(key)),
+        MANAGED_COPY_KEYSPACE => ManagedCopyKey::from_bytes(key)
+            .map(|value| DecodedField::ManagedCopyKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
         BLOB_LOCATIONS_KEYSPACE => BlobLocationKey::from_bytes(key)
             .map(|value| DecodedField::BlobLocationKey {
                 blake3: hex::encode(value.blake3_hash),
@@ -1285,6 +1300,12 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         ),
         BLOB_VERSIONS_KEYSPACE => decode_value_with(value, BlobVersion::from_bytes, |data| {
             DecodedValue::BlobVersion { data }
+        }),
+        MANAGED_COPY_KEYSPACE => decode_value_with(value, ManagedCopyRecord::from_bytes, |data| {
+            DecodedValue::ManagedCopyRecord { data }
+        }),
+        NODE_SUBJECT_KEYSPACE => decode_value_with(value, NodeSubjectRecord::from_bytes, |data| {
+            DecodedValue::NodeSubjectRecord { data }
         }),
         S3_MULTIPART_UPLOAD_KEYSPACE => {
             decode_value_with(value, MultipartUpload::from_bytes, |data| {
