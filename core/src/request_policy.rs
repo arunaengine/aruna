@@ -613,18 +613,23 @@ mod tests {
 
     #[test]
     fn rejects_partial_policy_json() {
-        // The admin-document surface writes whole policies. Tolerating a missing
-        // kind or guard would silently admit a predecessor's bytes.
+        // A missing kind is predecessor tolerance and must refuse; a missing
+        // `when` is a valid current value (serde fills an Option with None).
         let current = serde_json::to_string(&policy("permission == 'write'")).unwrap();
         assert!(serde_json::from_str::<RequestPolicy>(&current).is_ok());
 
-        for missing in ["kind", "when"] {
-            let mut fields: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&current).unwrap();
-            fields.remove(missing);
-            let partial = serde_json::to_string(&fields).unwrap();
-            assert!(serde_json::from_str::<RequestPolicy>(&partial).is_err());
-        }
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&current).unwrap();
+        fields.remove("kind");
+        let partial = serde_json::to_string(&fields).unwrap();
+        assert!(serde_json::from_str::<RequestPolicy>(&partial).is_err());
+
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&current).unwrap();
+        fields.remove("when");
+        let absent_guard = serde_json::to_string(&fields).unwrap();
+        let decoded = serde_json::from_str::<RequestPolicy>(&absent_guard).unwrap();
+        assert_eq!(decoded.when, None);
     }
 
     fn request(path: &str, permission: &str, user: &str) -> PolicyRequest {
