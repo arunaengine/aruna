@@ -16,7 +16,7 @@ use aruna_core::structs::{
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::node_info::{
-    group_demand, read_departure_report, read_node_info_documents, read_operator_drain,
+    departure_report, group_demand, read_node_info_documents, read_operator_drain,
     set_operator_drain,
 };
 use aruna_operations::set_realm_compute::{
@@ -488,7 +488,7 @@ pub async fn get_compute_snapshots(
         }
         None => None,
     };
-    let departure = read_departure_report(&context.storage_handle)
+    let departure = departure_report(&context)
         .await
         .map_err(ServerError::InternalError)?
         .map(|report| DepartureBody {
@@ -582,6 +582,28 @@ mod tests {
         let parsed = compute_config(config_body(&stored)).expect("body parses");
 
         assert_eq!(parsed, stored);
+    }
+
+    #[test]
+    fn conflict_is_retryable() {
+        // A concurrent realm-configuration update must read as a retryable
+        // conflict, not as a rejected configuration.
+        use aruna_core::errors::StorageError;
+
+        let conflict = map_compute_error(SetRealmComputeError::StorageError(
+            StorageError::TransactionConflict,
+        ));
+        assert!(matches!(conflict, ServerError::Conflict(_)));
+        assert!(matches!(
+            map_compute_error(SetRealmComputeError::RealmConfigNotFound),
+            ServerError::NotFound
+        ));
+        assert!(matches!(
+            map_compute_error(SetRealmComputeError::InvalidCompute {
+                reason: "zero bandwidth".to_string()
+            }),
+            ServerError::BadRequestReason(_)
+        ));
     }
 
     #[test]

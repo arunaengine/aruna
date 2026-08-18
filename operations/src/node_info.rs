@@ -582,6 +582,13 @@ async fn write_departure_report(
     }
 }
 
+/// The durable departure report of this node, read through its context.
+pub async fn departure_report(
+    ctx: &DriverContext,
+) -> Result<Option<ComputeDepartureReport>, String> {
+    read_departure_report(&ctx.storage_handle).await
+}
+
 /// The durable departure report, if this node ever departed.
 pub async fn read_departure_report(
     storage: &StorageHandle,

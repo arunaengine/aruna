@@ -9,9 +9,10 @@
 
 use std::sync::Arc;
 
-use aruna_core::effects::{FetchCursor, MAX_JOB_RECORD_PAGE, PageLimit};
 use aruna_core::structs::{AuthContext, JobFamilyRecord, JobId, JobRecordEnvelope};
-use aruna_operations::jobs::lifecycle::{AuditRange, family_audit, family_report};
+use aruna_operations::jobs::lifecycle::{
+    AuditPaging, AuditRange, MAX_AUDIT_PAGE, family_audit, family_report,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -118,24 +119,16 @@ fn parse_range(scope: Option<&str>) -> ServerResult<(AuditRange, &'static str)> 
     }
 }
 
-fn parse_cursor(cursor: Option<&str>) -> ServerResult<Option<FetchCursor>> {
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
+/// Both bounds are the record store's own, validated before any read starts.
+fn parse_paging(query: &AuditQuery) -> ServerResult<AuditPaging> {
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| URL_SAFE_NO_PAD.decode(cursor))
+        .transpose()
         .map_err(|_| ServerError::BadRequest)?;
-    FetchCursor::new(bytes)
-        .map(Some)
-        .map_err(|_| ServerError::BadRequest)
-}
-
-fn parse_limit(limit: Option<usize>) -> ServerResult<PageLimit> {
-    match limit {
-        None => Ok(PageLimit::default()),
-        Some(limit) if limit > 0 && limit <= MAX_JOB_RECORD_PAGE => Ok(PageLimit::new(limit)),
-        Some(_) => Err(ServerError::BadRequest),
-    }
+    AuditPaging::new(cursor, query.limit)
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))
 }
 
 /// Projects one record. Publishers, executors, schedulers and signatures are
@@ -305,15 +298,14 @@ pub async fn get_job_audit(
     let auth: AuthContext = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
     let (range, scope) = parse_range(query.scope.as_deref())?;
-    let cursor = parse_cursor(query.cursor.as_deref())?;
-    let limit = parse_limit(query.limit)?;
+    let paging = parse_paging(&query)?;
     let context = state.get_ctx();
 
     let report = family_report(&context, &auth, job_id)
         .await
         .ok_or(ServerError::NotFound)?
         .map_err(map_job_route)?;
-    let page = family_audit(&context, &auth, job_id, range, cursor, limit)
+    let page = family_audit(&context, &auth, job_id, range, paging)
         .await
         .ok_or(ServerError::NotFound)?
         .map_err(map_job_route)?;
@@ -360,16 +352,23 @@ pub async fn get_job_audit(
 mod tests {
     use super::*;
 
+    fn query(cursor: Option<&str>, limit: Option<usize>) -> AuditQuery {
+        AuditQuery {
+            scope: None,
+            cursor: cursor.map(str::to_string),
+            limit,
+        }
+    }
+
     #[test]
     fn rejects_bad_paging() {
         // A cursor must be a bounded record key and a limit must fit the page.
-        assert!(parse_cursor(Some("not base64 !")).is_err());
-        assert!(parse_cursor(Some(&URL_SAFE_NO_PAD.encode([1u8; 200]))).is_err());
-        assert!(parse_cursor(Some(&URL_SAFE_NO_PAD.encode([1u8; 32]))).is_ok());
-        assert!(parse_cursor(None).unwrap().is_none());
-        assert!(parse_limit(Some(0)).is_err());
-        assert!(parse_limit(Some(MAX_JOB_RECORD_PAGE + 1)).is_err());
-        assert_eq!(parse_limit(None).unwrap().get(), MAX_JOB_RECORD_PAGE);
+        assert!(parse_paging(&query(Some("not base64 !"), None)).is_err());
+        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 200])), None)).is_err());
+        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 32])), None)).is_ok());
+        assert!(parse_paging(&query(None, Some(0))).is_err());
+        assert!(parse_paging(&query(None, Some(MAX_AUDIT_PAGE + 1))).is_err());
+        assert!(parse_paging(&query(None, None)).is_ok());
         assert!(parse_range(Some("everything")).is_err());
         assert_eq!(parse_range(None).unwrap().1, "family");
         assert_eq!(parse_range(Some("submission")).unwrap().1, "submission");

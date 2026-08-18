@@ -1,7 +1,7 @@
 //! What the external surfaces read back from one family, including the
 //! responder-local diagnostics that stay outside the projection digest.
 
-use aruna_core::effects::{JobRecordFrame, PageLimit};
+use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::{
     AuthContext, JobRecordEnvelope, LogicalJobState, PhysicalExecutionState,
 };
@@ -9,7 +9,7 @@ use aruna_core::types::UserId;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::report::{AuditRange, family_audit, family_report};
+use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, family_audit, family_report};
 use crate::jobs::records::tests::fixture::{Family, REALM, context, user};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 
@@ -122,8 +122,7 @@ async fn audit_pages_records() {
         &auth(),
         family.job_id,
         AuditRange::Family,
-        None,
-        PageLimit::new(3),
+        AuditPaging::new(None, Some(3)).expect("paging is valid"),
     )
     .await
     .expect("alias names a family")
@@ -136,8 +135,7 @@ async fn audit_pages_records() {
         &auth(),
         family.job_id,
         AuditRange::Family,
-        Some(cursor),
-        PageLimit::new(64),
+        AuditPaging::new(Some(cursor.as_slice().to_vec()), None).expect("paging is valid"),
     )
     .await
     .expect("alias names a family")
@@ -156,8 +154,7 @@ async fn audit_pages_records() {
             &stranger,
             family.job_id,
             AuditRange::Family,
-            None,
-            PageLimit::default(),
+            AuditPaging::new(None, None).expect("paging is valid"),
         )
         .await,
         Some(Err(crate::jobs::JobRouteError::NotFound))

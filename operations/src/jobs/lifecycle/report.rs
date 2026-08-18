@@ -224,6 +224,43 @@ async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<P
     })
 }
 
+/// Records one audit page may return. The transport clamps to this before it
+/// reaches the record store, so a caller cannot ask for an unbounded page.
+pub const MAX_AUDIT_PAGE: usize = aruna_core::effects::MAX_JOB_RECORD_PAGE;
+
+/// Why one audit request could not be paged. Both are caller mistakes, so they
+/// map to a bad request rather than to an availability answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PagingError {
+    #[error("cursor is not a record key of this log")]
+    Cursor,
+    #[error("page limit must be 1..={MAX_AUDIT_PAGE}")]
+    Limit,
+}
+
+/// Validated paging of one audit request, built before any effect exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditPaging {
+    cursor: Option<FetchCursor>,
+    limit: PageLimit,
+}
+
+impl AuditPaging {
+    /// `cursor` is the opaque marker of a previous page and `limit` defaults to
+    /// the maximum page. Anything out of bounds is refused, never clamped.
+    pub fn new(cursor: Option<Vec<u8>>, limit: Option<usize>) -> Result<Self, PagingError> {
+        let cursor = cursor
+            .map(FetchCursor::new)
+            .transpose()
+            .map_err(|_| PagingError::Cursor)?;
+        let limit = match limit {
+            None => PageLimit::default(),
+            Some(limit) => PageLimit::try_from(limit).map_err(|_| PagingError::Limit)?,
+        };
+        Ok(Self { cursor, limit })
+    }
+}
+
 /// Which records of one family an audit page covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuditRange {
@@ -241,8 +278,7 @@ pub async fn family_audit(
     auth: &AuthContext,
     job_id: JobId,
     range: AuditRange,
-    cursor: Option<FetchCursor>,
-    limit: PageLimit,
+    paging: AuditPaging,
 ) -> Option<Result<AuditPage, JobRouteError>> {
     let (projected, spec) = family_projection(context, job_id).await?;
     if spec.created_by != auth.user_id {
@@ -256,8 +292,8 @@ pub async fn family_audit(
         drive(
             FamilyAuditOperation::new(FamilyAuditConfig {
                 scope,
-                cursor,
-                limit,
+                cursor: paging.cursor,
+                limit: paging.limit,
             }),
             context,
         )

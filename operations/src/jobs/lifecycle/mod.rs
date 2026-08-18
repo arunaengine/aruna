@@ -47,7 +47,10 @@ pub mod witness;
 pub use admit::{AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission};
 pub use ids::{RequestIdentity, SubmissionRequest};
 pub use ingress::{AcceptedSubmission, submit_external_job};
-pub use report::{AuditRange, FamilyReport, PlanEstimate, family_audit, family_report};
+pub use report::{
+    AuditPaging, AuditRange, FamilyReport, MAX_AUDIT_PAGE, PagingError, PlanEstimate, family_audit,
+    family_report,
+};
 
 /// Records of one submission an admission decision scans before it commits.
 pub const MAX_SUBMISSION_SCAN: usize = 512;
