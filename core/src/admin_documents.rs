@@ -288,7 +288,7 @@ mod tests {
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
         PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, QuotaConfig,
-        RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
+        RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
     use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId, UserId};
