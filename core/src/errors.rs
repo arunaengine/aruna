@@ -236,6 +236,8 @@ pub enum ConversionError {
     RoCrateError(String),
     #[error(transparent)]
     PlacementPolicyError(#[from] crate::structs::PlacementPolicyError),
+    #[error(transparent)]
+    AdvertisementError(#[from] crate::compute::AdvertisementError),
     #[error("policy refs must be sorted and deduplicated")]
     NonCanonicalPolicyRefs,
     /// A monotonic head generation must never wrap: a wrapped pointer would

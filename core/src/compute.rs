@@ -14,9 +14,14 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use crate::NodeId;
-use crate::structs::EffectiveResources;
+use crate::structs::{
+    EffectiveResources, MAX_EXECUTOR_KIND_LEN, PlacementPolicyError, PlacementSubject,
+};
 
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Maximum executor backends one node advertises.
+pub const MAX_ADVERTISED_EXECUTORS: usize = 8;
 
 /// Pattern characters of IEEE Std 1003.1-2017 (POSIX) 12.13, the only wildcards
 /// TES 1.1 allows in `tesOutput.path`.
@@ -37,11 +42,122 @@ pub enum ExecutorKind {
     Ext(String),
 }
 
+/// Why one advertised backend or node advertisement is not trustworthy.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum AdvertisementError {
+    #[error("a node advertises at most {MAX_ADVERTISED_EXECUTORS} executors")]
+    ExecutorCount,
+    #[error("executor kind must be 1..={MAX_EXECUTOR_KIND_LEN} bytes")]
+    InvalidKind,
+    #[error("executor kind {kind} is advertised twice")]
+    DuplicateKind { kind: String },
+    #[error("advertised subject belongs to node {node_id} instead of the publisher")]
+    ForeignSubject { node_id: NodeId },
+    #[error("advertised subject does not name executor kind {kind}")]
+    SubjectKind { kind: String },
+    #[error("subject generation zero is never a published subject")]
+    ZeroGeneration,
+    #[error("advertised subject digest does not match the advertised subject")]
+    SubjectDrift,
+    #[error("a node advertises a bounded label set")]
+    LabelCount,
+    #[error("advertised label key or value exceeds its bound")]
+    InvalidLabel,
+    #[error("advertised url exceeds its bound")]
+    InvalidUrl,
+    #[error(transparent)]
+    Subject(#[from] PlacementPolicyError),
+}
+
+/// One backend a node offers as an execution target, with the execution-site
+/// facts a remote planner needs. Static fields hard-filter; `availability` is
+/// stale telemetry that may only rank.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorCapability {
     pub kind: String,
     pub file_staging: bool,
     pub direct_s3: bool,
+    pub s3_mount: bool,
+    /// The backend proves worker placement and enforces network isolation,
+    /// which protected data requires before open networking is allowed.
+    pub network_policy: bool,
+    /// Execution site this backend runs on, carrying its own generation.
+    pub subject: PlacementSubject,
+    /// Digest of `subject`; a mismatch is drift and never eligible.
+    pub subject_digest: [u8; 32],
+    /// The site is resolving a subject transition and takes no protected work.
+    pub policy_draining: bool,
+    pub limits: ResourceEnvelope,
+    pub availability: Option<ExecutorAvailability>,
+    /// Operator ranking preference; higher ranks earlier and grants nothing.
+    pub compute_priority: u32,
+}
+
+impl ExecutorCapability {
+    /// Advertisement of one backend at `subject`. The subject's executor kind is
+    /// pinned to `kind` and its digest sealed, so later drift is detectable.
+    pub fn new(kind: String, subject: PlacementSubject) -> Result<Self, PlacementPolicyError> {
+        let subject = PlacementSubject {
+            executor_kind: Some(kind.clone()),
+            ..subject
+        };
+        let subject_digest = subject.digest()?;
+        Ok(Self {
+            kind,
+            file_staging: false,
+            direct_s3: false,
+            s3_mount: false,
+            network_policy: false,
+            subject,
+            subject_digest,
+            policy_draining: false,
+            limits: ResourceEnvelope::default(),
+            availability: None,
+            compute_priority: 0,
+        })
+    }
+
+    pub fn target(&self, node_id: NodeId) -> ExecutionTargetId {
+        ExecutionTargetId {
+            node_id,
+            executor_kind: self.kind.clone(),
+        }
+    }
+
+    /// Bounds and self-consistency of one advertised backend against the node
+    /// that published it.
+    pub fn validate(&self, node_id: NodeId) -> Result<(), AdvertisementError> {
+        let kind = self.kind.trim();
+        if kind.is_empty() || kind.len() > MAX_EXECUTOR_KIND_LEN {
+            return Err(AdvertisementError::InvalidKind);
+        }
+        if self.subject.node_id != node_id {
+            return Err(AdvertisementError::ForeignSubject {
+                node_id: self.subject.node_id,
+            });
+        }
+        if self.subject.executor_kind.as_deref().map(str::trim) != Some(kind) {
+            return Err(AdvertisementError::SubjectKind {
+                kind: self.kind.clone(),
+            });
+        }
+        if self.subject.generation == 0 {
+            return Err(AdvertisementError::ZeroGeneration);
+        }
+        if self.subject.digest()? != self.subject_digest {
+            return Err(AdvertisementError::SubjectDrift);
+        }
+        Ok(())
+    }
+
+    /// Whether the backend can stage inputs the requested way.
+    pub fn supports(&self, staging: StagingMode) -> bool {
+        match staging {
+            StagingMode::Files => self.file_staging,
+            StagingMode::DirectS3 => self.direct_s3,
+            StagingMode::S3Mount => self.s3_mount,
+        }
+    }
 }
 
 /// One advertised execution target: a controller node plus the executor kind it
@@ -64,9 +180,13 @@ pub struct ResourceEnvelope {
 }
 
 impl ResourceEnvelope {
+    /// A zero concurrency ceiling admits no execution at all, so it filters like
+    /// any other static ceiling.
     pub fn fits(&self, resources: &EffectiveResources) -> bool {
-        self.max_cpu_cores
-            .is_none_or(|max| resources.cpu_cores <= max)
+        self.max_concurrent.is_none_or(|max| max > 0)
+            && self
+                .max_cpu_cores
+                .is_none_or(|max| resources.cpu_cores <= max)
             && self
                 .max_ram_bytes
                 .is_none_or(|max| resources.ram_bytes <= max)
@@ -900,6 +1020,47 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&ResourceEnvelope::default()).unwrap(),
             vec![0u8; 4]
+        );
+    }
+
+    fn subject(node_id: NodeId) -> PlacementSubject {
+        PlacementSubject {
+            node_id,
+            generation: 2,
+            location: "eu-west".to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        }
+    }
+
+    #[test]
+    fn capability_pins_kind() {
+        // The advertised subject must name the backend it describes, otherwise a
+        // policy that selects an executor kind would evaluate the wrong site.
+        let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        let capability = ExecutorCapability::new("docker".to_string(), subject(node_id))
+            .expect("subject is valid");
+
+        assert_eq!(capability.subject.executor_kind.as_deref(), Some("docker"));
+        assert_eq!(capability.target(node_id).executor_kind, "docker");
+        assert!(capability.validate(node_id).is_ok());
+        assert!(!capability.supports(StagingMode::Files));
+
+        let mut foreign = capability.clone();
+        foreign.kind = "apptainer".to_string();
+        assert!(foreign.validate(node_id).is_err());
+    }
+
+    #[test]
+    fn zero_concurrency_filters() {
+        // A backend that admits no concurrent execution can never fit a request.
+        assert!(
+            !ResourceEnvelope {
+                max_concurrent: Some(0),
+                ..Default::default()
+            }
+            .fits(&resources())
         );
     }
 

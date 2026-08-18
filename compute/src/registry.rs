@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::compute::{ExecutorCapability, ExecutorKind};
+use aruna_core::structs::{PlacementPolicyError, PlacementSubject};
 
 use crate::executor::ExecutorBackend;
 
@@ -74,16 +75,32 @@ impl ExecutorRegistry {
         self.backends.keys().cloned().collect()
     }
 
-    pub fn capabilities(&self) -> Vec<ExecutorCapability> {
+    /// Advertisement of every enabled backend at this node's execution site.
+    /// `subject` is the node's current placement subject; each backend pins its
+    /// own executor kind and site locality into its copy.
+    pub fn capabilities(
+        &self,
+        subject: &PlacementSubject,
+        policy_draining: bool,
+    ) -> Result<Vec<ExecutorCapability>, PlacementPolicyError> {
         self.backends
             .values()
             .map(|backend| {
-                let capabilities = backend.capabilities();
-                ExecutorCapability {
-                    kind: backend.kind().as_wire(),
-                    file_staging: capabilities.file_staging,
-                    direct_s3: capabilities.direct_s3,
-                }
+                let caps = backend.capabilities();
+                let mut capability = ExecutorCapability::new(
+                    backend.kind().as_wire(),
+                    PlacementSubject {
+                        local_to_controller: caps.local_site,
+                        ..subject.clone()
+                    },
+                )?;
+                capability.file_staging = caps.file_staging;
+                capability.direct_s3 = caps.direct_s3;
+                capability.s3_mount = caps.s3_mount;
+                capability.network_policy = caps.network_policy;
+                capability.limits = caps.limits;
+                capability.policy_draining = policy_draining;
+                Ok(capability)
             })
             .collect()
     }
@@ -116,7 +133,8 @@ mod tests {
         fn capabilities(&self) -> BackendCaps {
             BackendCaps {
                 file_staging: true,
-                direct_s3: false,
+                local_site: true,
+                ..BackendCaps::default()
             }
         }
         fn run_identity(&self) -> UserSpec {
@@ -197,6 +215,17 @@ mod tests {
         }
     }
 
+    fn subject() -> PlacementSubject {
+        PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            generation: 4,
+            location: "eu-west".to_string(),
+            labels: std::collections::BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: false,
+        }
+    }
+
     #[test]
     fn select_by_kind() {
         let registry =
@@ -208,13 +237,25 @@ mod tests {
         // A constraint the node cannot satisfy selects nothing.
         assert!(registry.select(Some(&ExecutorKind::Slurm)).is_none());
         assert_eq!(registry.kinds().len(), 1);
-        assert_eq!(
-            registry.capabilities(),
-            [ExecutorCapability {
-                kind: "docker".to_string(),
-                file_staging: true,
-                direct_s3: false,
-            }]
-        );
+    }
+
+    #[test]
+    fn advertises_backend_site() {
+        // Each backend advertises its own kind, site locality, and sealed digest.
+        let registry =
+            ExecutorRegistry::new().with_backend(Arc::new(StubBackend(ExecutorKind::Docker)));
+        let subject = subject();
+        let capabilities = registry
+            .capabilities(&subject, true)
+            .expect("subject is valid");
+
+        assert_eq!(capabilities.len(), 1);
+        let capability = &capabilities[0];
+        assert_eq!(capability.kind, "docker");
+        assert!(capability.file_staging && !capability.direct_s3);
+        assert!(capability.policy_draining);
+        assert!(capability.subject.local_to_controller);
+        assert_eq!(capability.subject.generation, subject.generation);
+        assert!(capability.validate(subject.node_id).is_ok());
     }
 }

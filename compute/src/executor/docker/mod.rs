@@ -1097,6 +1097,8 @@ impl ExecutorBackend for DockerBackend {
         BackendCaps {
             file_staging: true,
             direct_s3: true,
+            local_site: true,
+            ..BackendCaps::default()
         }
     }
 

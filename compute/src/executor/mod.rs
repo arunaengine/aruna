@@ -1,6 +1,7 @@
 use aruna_core::compute::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
-    ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec,
+    ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
+    UserSpec,
 };
 use async_trait::async_trait;
 use tokio::time::{Duration, sleep};
@@ -25,6 +26,15 @@ use logs::LogSink;
 pub struct BackendCaps {
     pub file_staging: bool,
     pub direct_s3: bool,
+    pub s3_mount: bool,
+    /// The backend proves where workers run and enforces their network
+    /// isolation, which protected data requires before open networking.
+    pub network_policy: bool,
+    /// The workload runs on the controller host, so it inherits the
+    /// controller's execution subject.
+    pub local_site: bool,
+    /// Static ceilings; `None` is unmeasured and never filters.
+    pub limits: ResourceEnvelope,
 }
 
 #[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]

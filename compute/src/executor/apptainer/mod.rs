@@ -263,6 +263,8 @@ impl ExecutorBackend for ApptainerBackend {
         BackendCaps {
             file_staging: true,
             direct_s3: true,
+            local_site: true,
+            ..BackendCaps::default()
         }
     }
 

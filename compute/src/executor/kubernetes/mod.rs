@@ -837,6 +837,8 @@ impl ExecutorBackend for KubernetesBackend {
         BackendCaps {
             file_staging: true,
             direct_s3: !self.config.s3_cidrs.is_empty(),
+            s3_mount: self.config.s3_mount_driver.is_some(),
+            ..BackendCaps::default()
         }
     }
 
