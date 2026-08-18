@@ -82,6 +82,7 @@ pub mod s3;
 pub mod search_groups;
 pub mod search_users;
 pub mod set_group_policies;
+pub mod set_realm_compute;
 pub mod set_realm_policies;
 pub mod set_realm_quota;
 pub mod shard;

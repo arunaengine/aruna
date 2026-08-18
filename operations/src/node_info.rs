@@ -82,7 +82,8 @@ pub async fn seed_node_info_document(
         },
         updated_at_ms: now,
         epoch,
-        compute_draining: stored.as_ref().is_some_and(|old| old.compute_draining),
+        compute_draining: stored.as_ref().is_some_and(|old| old.compute_draining)
+            || read_operator_drain(ctx).await?,
         leaving: stored.as_ref().is_some_and(|old| old.leaving),
         demand: demand_snapshot(ctx, epoch).await?,
         reservation,
@@ -419,6 +420,9 @@ pub async fn group_demand(
 
 /// The single durable departure-report row of this node.
 const DEPARTURE_KEY: &[u8] = b"departure";
+/// The operator's own compute drain, kept apart from an observed departure so
+/// returning to placement can never silently undrain a node an operator drained.
+const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
 
 /// Applies an observed departure, or a return, to this node's compute plane.
 ///
@@ -437,13 +441,16 @@ pub async fn set_departure_state(
     let Some(mut document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(false);
     };
-    if document.leaving == departing && document.compute_draining == departing {
+    // An operator drain outlives a placement observation: returning to the
+    // placement map must not undrain a node somebody drained deliberately.
+    let draining = departing || read_operator_drain(ctx).await?;
+    if document.leaving == departing && document.compute_draining == draining {
         return Ok(false);
     }
     let now = unix_timestamp_millis();
     document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
     document.leaving = departing;
-    document.compute_draining = departing;
+    document.compute_draining = draining;
     document.reservation = reservation_snapshot(ctx, document.epoch).await?;
     document.demand = demand_snapshot(ctx, document.epoch).await?;
     document.updated_at_ms = now;
@@ -453,6 +460,75 @@ pub async fn set_departure_state(
     write_node_info_document(&ctx.storage_handle, &document).await?;
     replicate_node_info(ctx, node_id, realm_id).await?;
     Ok(true)
+}
+
+/// Sets or clears the operator's own compute drain and republishes the
+/// advertisement. A drained node plans no new execution here; work that already
+/// holds a receipt is never cancelled by it, and departure state is untouched.
+/// `Ok(false)` means the state already matched, so nothing was republished.
+pub async fn set_operator_drain(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    realm_id: RealmId,
+    draining: bool,
+) -> Result<bool, String> {
+    if read_operator_drain(ctx).await? == draining {
+        return Ok(false);
+    }
+    write_operator_drain(ctx, draining).await?;
+    let Some(mut document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+        return Ok(true);
+    };
+    let now = unix_timestamp_millis();
+    document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
+    // A departing node stays draining whatever the operator flag says.
+    document.compute_draining = draining || document.leaving;
+    document.reservation = reservation_snapshot(ctx, document.epoch).await?;
+    document.demand = demand_snapshot(ctx, document.epoch).await?;
+    document.updated_at_ms = now;
+    write_node_info_document(&ctx.storage_handle, &document).await?;
+    replicate_node_info(ctx, node_id, realm_id).await?;
+    Ok(true)
+}
+
+/// Whether an operator currently drains this node's compute plane.
+pub async fn read_operator_drain(ctx: &DriverContext) -> Result<bool, String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(OPERATOR_DRAIN_KEY.to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("operator drain read failed: {other:?}")),
+    }
+}
+
+async fn write_operator_drain(ctx: &DriverContext, draining: bool) -> Result<(), String> {
+    let key = Key::from(OPERATOR_DRAIN_KEY.to_vec());
+    let effect = match draining {
+        true => StorageEffect::Write {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key,
+            value: Value::from(vec![1u8]),
+            txn_id: None,
+        },
+        false => StorageEffect::Delete {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        },
+    };
+    match ctx.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. })
+        | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("operator drain write failed: {other:?}")),
+    }
 }
 
 /// Records the executions this node still holds capacity for. Their
@@ -1613,6 +1689,64 @@ mod tests {
         assert!(!rejoined.leaving && !rejoined.compute_draining);
         assert!(rejoined.offers_compute(true));
         assert!(rejoined.supersedes(&departed));
+    }
+
+    #[tokio::test]
+    async fn drain_survives_placement() {
+        // An operator drain must outlive a return-to-placement observation:
+        // otherwise the very next placement sync silently undrains the node.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            set_operator_drain(&ctx, local, realm_id, true)
+                .await
+                .unwrap()
+        );
+        let drained = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(drained.compute_draining && !drained.leaving);
+
+        // A departure and its return leave the operator drain in place.
+        set_departure_state(&ctx, local, realm_id, true)
+            .await
+            .unwrap();
+        set_departure_state(&ctx, local, realm_id, false)
+            .await
+            .unwrap();
+        let observed = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!observed.leaving);
+        assert!(observed.compute_draining, "the operator drain must survive");
+
+        assert!(
+            set_operator_drain(&ctx, local, realm_id, false)
+                .await
+                .unwrap()
+        );
+        let released = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!released.compute_draining);
     }
 
     #[tokio::test]

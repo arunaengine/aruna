@@ -9,11 +9,11 @@ use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_DESCRIPTION_PATH,
-    REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
-    REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH, RevocationIndex, USER_NAME_PATH,
-    decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
-    group_role_user_assignment_from_path, group_role_user_assignment_path,
+    GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_COMPUTE_PATH,
+    REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
+    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH,
+    RevocationIndex, USER_NAME_PATH, decode_admin_document_reducer_state, group_role_id_from_path,
+    group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
     overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
     realm_config_node_path, realm_config_oidc_provider_id_from_path, realm_role_path,
     realm_role_user_assignment_from_path, realm_role_user_assignment_path, user_attribute_path,
@@ -4875,6 +4875,14 @@ fn overlay_realm_config_reducer_materialization(
         config.request_policies = request_policies;
     }
 
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_COMPUTE_PATH)
+        && let Some(compute) = reducer_state.materialized_realm_compute()
+    {
+        config.compute = compute;
+    }
+
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
     // Without an index, the existing set remains fail-closed until each entry's expiry.
     if let Some(revocation_index) = revocation_index {
@@ -8206,6 +8214,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
         | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
         | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+        | AdminDocumentOperation::RealmConfigComputeSet { .. }
         | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
@@ -8324,6 +8333,13 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
+        AdminDocumentOperation::RealmConfigComputeSet { compute } => {
+            // A malformed link or quota set would make every planner estimate
+            // meaningless, so it is refused before it reaches storage.
+            if compute.validate().is_err() {
+                return reject("realm compute configuration is malformed");
+            }
+        }
         AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
         | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
         | AdminDocumentOperation::RealmConfigTransitionAborted { .. }

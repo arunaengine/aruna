@@ -9,6 +9,7 @@ use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
 pub mod audit;
 pub mod blobs;
+pub mod compute;
 pub mod connectors;
 pub mod credentials;
 pub mod drs;
@@ -48,6 +49,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage_routing::router())
         .merge(sync::router())
         .merge(sync_quarantine::router())
+        .merge(compute::router())
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())
@@ -130,6 +132,8 @@ mod tests {
         ("DELETE", "/notifications/watches/{id}"),
         ("DELETE", "/pid/{document_id}"),
         ("DELETE", "/users/credentials/{access_key_id}"),
+        ("GET", "/admin/compute/config"),
+        ("GET", "/admin/compute/snapshots"),
         ("GET", "/admin/onboarding/secrets"),
         ("GET", "/admin/placement-diagnostics"),
         ("GET", "/admin/placement-policies/{policy_id}"),
@@ -209,6 +213,7 @@ mod tests {
         ("PATCH", "/info/realm/placement"),
         ("PATCH", "/users/info"),
         ("PATCH", "/users/{id}"),
+        ("POST", "/admin/compute/drain"),
         ("POST", "/admin/onboarding/secrets"),
         ("POST", "/admin/placement-policies"),
         ("POST", "/admin/placement-quarantine"),
@@ -260,6 +265,7 @@ mod tests {
         ("POST", "/users/register"),
         ("POST", "/users/resolve"),
         ("POST", "/users/tokens/revoke"),
+        ("PUT", "/admin/compute/config"),
         ("PUT", "/buckets/{bucket}/placement"),
         ("PUT", "/buckets/{bucket}/storage-routing"),
         ("PUT", "/groups/{group_id}/connectors/{connector_id}"),

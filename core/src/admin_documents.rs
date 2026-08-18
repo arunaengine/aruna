@@ -7,8 +7,8 @@ use crate::NodeId;
 use crate::structs::{
     Actor, BandPool, BindingScope, CandidatePlacementMap, CompletionProof, HandleRange,
     MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind, Role, StrategyBinding, TransitionPlan,
+    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmComputeConfig,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding, TransitionPlan,
 };
 use crate::types::{GroupId, RoleId, UserId};
 
@@ -272,6 +272,12 @@ pub enum AdminDocumentOperation {
     RealmConfigJobFamilySet {
         strategy_id: Ulid,
     },
+    /// Replaces the realm's compute configuration wholesale: the directed
+    /// location links the planner estimates transfers with, and the standing
+    /// group compute quotas new admissions are decided against.
+    RealmConfigComputeSet {
+        compute: RealmComputeConfig,
+    },
 }
 
 #[cfg(test)]
@@ -414,6 +420,9 @@ mod tests {
             },
             AdminDocumentOperation::RealmConfigQuotaSet {
                 quota: QuotaConfig::default(),
+            },
+            AdminDocumentOperation::RealmConfigComputeSet {
+                compute: RealmComputeConfig::default(),
             },
             AdminDocumentOperation::RealmConfigNodePlacementSet {
                 entry: placement_entry(node(1)),
