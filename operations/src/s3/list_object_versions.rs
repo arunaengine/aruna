@@ -1,11 +1,15 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, SourceMetadata, VersionKey,
+    CurrentVersionPointer, ManagedCopyKey, NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyRef,
+    SourceMetadata, VersionKey,
 };
 use aruna_core::types::{Effects, Key, Value};
 use aruna_core::util::prefix_upper_bound;
@@ -15,7 +19,30 @@ use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::blob::managed_copy::{CopyRequest, validate_registration};
 use crate::s3::listing::common_prefix_of;
+
+/// Whether this node still holds a serveable registration for one governed
+/// copy. A listing never fails on the answer; it only stops describing bytes.
+pub(crate) fn served_copy(
+    registration: Option<&[u8]>,
+    key: &ManagedCopyKey,
+    refs: &[PlacementPolicyRef],
+    subject: Option<&NodeSubjectRecord>,
+) -> bool {
+    subject.is_some_and(|record| !record.serving_blocked)
+        && validate_registration(
+            registration,
+            &CopyRequest {
+                key,
+                node_id: None,
+                blake3: None,
+                refs,
+                subject_generation: subject.map(|record| record.subject.generation),
+            },
+        )
+        .is_ok()
+}
 
 // A single key may accumulate more versions than one scan page holds. The
 // storage layer only iterates forward (oldest -> newest), so the version prefix
@@ -97,6 +124,9 @@ enum PendingItem {
         version_id: Ulid,
         is_latest: bool,
         created_at: SystemTime,
+        /// Registration this node must hold before the governed location may be
+        /// described. `None` leaves an ungoverned version unchanged.
+        governed: Option<(ManagedCopyKey, Vec<PlacementPolicyRef>)>,
     },
 }
 
@@ -497,13 +527,31 @@ impl ListObjectVersionsOperation {
                 } => {
                     location_reads.push((
                         BLOB_LOCATIONS_KEYSPACE.to_string(),
-                        BlobLocationKey::new(blob_hash, backend).to_bytes().into(),
+                        BlobLocationKey::new(blob_hash, backend.clone())
+                            .to_bytes()
+                            .into(),
                     ));
+                    let governed = match version.placement_policies.is_empty() {
+                        true => None,
+                        false => {
+                            let copy_key = ManagedCopyKey::new(
+                                VersionKey::new(self.input.bucket.clone(), key.clone(), version_id),
+                                backend,
+                            );
+                            let bytes = match copy_key.to_bytes() {
+                                Ok(bytes) => bytes,
+                                Err(error) => return self.emit_error(error.into()),
+                            };
+                            location_reads.push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
+                            Some((copy_key, version.placement_policies.clone()))
+                        }
+                    };
                     pending.push(PendingItem::AwaitingLocation {
                         key: key.clone(),
                         version_id,
                         is_latest,
                         created_at: version.created_at,
+                        governed,
                     });
                 }
             }
@@ -512,6 +560,17 @@ impl ListObjectVersionsOperation {
         self.current_pending = pending;
         if location_reads.is_empty() {
             return self.finish_current_key(Vec::new());
+        }
+        // The subject leads the batch so hydration can decide every governed
+        // entry as it walks the answers in order.
+        if self.pending_subject() {
+            location_reads.insert(
+                0,
+                (
+                    NODE_SUBJECT_KEYSPACE.to_string(),
+                    aruna_core::types::Key::from(NODE_SUBJECT_KEY.to_vec()),
+                ),
+            );
         }
 
         self.state = ListObjectVersionsState::ReadBlobLocations;
@@ -533,11 +592,32 @@ impl ListObjectVersionsOperation {
         self.finish_current_key(values)
     }
 
+    /// Whether this page carries a governed entry, so the batch leads with the
+    /// local subject row.
+    fn pending_subject(&self) -> bool {
+        self.current_pending.iter().any(|item| {
+            matches!(
+                item,
+                PendingItem::AwaitingLocation {
+                    governed: Some(_),
+                    ..
+                }
+            )
+        })
+    }
+
     fn finish_current_key(
         &mut self,
         locations: Vec<(aruna_core::types::Key, Option<Value>)>,
     ) -> Effects {
         let mut locations = locations.into_iter();
+        let subject = match self.pending_subject() {
+            true => locations
+                .next()
+                .and_then(|(_, value)| value)
+                .and_then(|value| NodeSubjectRecord::from_bytes(value.as_ref()).ok()),
+            false => None,
+        };
         for item in std::mem::take(&mut self.current_pending) {
             let entry = match item {
                 PendingItem::Ready(entry) => entry,
@@ -546,9 +626,20 @@ impl ListObjectVersionsOperation {
                     version_id,
                     is_latest,
                     created_at,
+                    governed,
                 } => {
                     let Some((_key, value)) = locations.next() else {
                         return self.emit_error(ListObjectVersionsError::ListObjectVersionsFailed);
+                    };
+                    let registration = match governed.as_ref() {
+                        Some(_) => match locations.next() {
+                            Some((_, value)) => value,
+                            None => {
+                                return self
+                                    .emit_error(ListObjectVersionsError::ListObjectVersionsFailed);
+                            }
+                        },
+                        None => None,
                     };
                     // A materialized version without a stored location is a data
                     // inconsistency; skip it rather than emitting a partial entry.
@@ -559,11 +650,16 @@ impl ListObjectVersionsOperation {
                         Ok(location) => location,
                         Err(err) => return self.emit_error(err.into()),
                     };
+                    // A governed head this node cannot answer for is still
+                    // listed, but without describing bytes it may not serve.
+                    let described = governed.is_none_or(|(copy_key, refs)| {
+                        served_copy(registration.as_deref(), &copy_key, &refs, subject.as_ref())
+                    });
                     ListObjectVersionsItem::Version {
                         key,
                         version_id,
                         is_latest,
-                        location: Some(location),
+                        location: described.then_some(location),
                         source_metadata: None,
                         created_at,
                     }

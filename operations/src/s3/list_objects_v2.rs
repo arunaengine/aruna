@@ -1,12 +1,17 @@
+use crate::s3::list_object_versions::served_copy;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, SourceConnectorKind, SourceMetadata, VersionKey,
+    CurrentVersionPointer, ManagedCopyKey, NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyRef,
+    SourceConnectorKind, SourceMetadata, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::util::prefix_upper_bound;
@@ -99,6 +104,9 @@ enum ResolvedEntry {
     AwaitingLocation {
         head: BlobHeadKey,
         version_created_at: std::time::SystemTime,
+        /// Registration this node must hold before the governed location may be
+        /// described. `None` leaves an ungoverned head unchanged.
+        governed: Option<(ManagedCopyKey, Vec<PlacementPolicyRef>)>,
     },
 }
 
@@ -326,12 +334,37 @@ impl ListObjectsV2Operation {
             return self.finish_hydration(Vec::new());
         }
 
-        let reads = std::mem::take(&mut self.location_reads);
+        let mut reads = std::mem::take(&mut self.location_reads);
+        // The subject leads the batch so hydration can decide every governed
+        // entry as it walks the answers in order.
+        if self.pending_subject() {
+            reads.insert(
+                0,
+                (
+                    NODE_SUBJECT_KEYSPACE.to_string(),
+                    Key::from(NODE_SUBJECT_KEY.to_vec()),
+                ),
+            );
+        }
         self.state = ListObjectsV2State::ReadBlobLocations;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: self.txn_id,
         })]
+    }
+
+    /// Whether this page carries a governed entry, so the batch leads with the
+    /// local subject row.
+    fn pending_subject(&self) -> bool {
+        self.resolved.iter().any(|entry| {
+            matches!(
+                entry,
+                ResolvedEntry::AwaitingLocation {
+                    governed: Some(_),
+                    ..
+                }
+            )
+        })
     }
 
     fn commit(&mut self) -> Effects {
@@ -439,7 +472,7 @@ impl ListObjectsV2Operation {
         }
 
         let max_keys = self.max_keys();
-        for ((head, _version_id, key_bytes), (_key, value)) in candidates.into_iter().zip(values) {
+        for ((head, version_id, key_bytes), (_key, value)) in candidates.into_iter().zip(values) {
             let version = match value {
                 Some(value) => match BlobVersion::from_bytes(value.as_ref()) {
                     Ok(version) => Some(version),
@@ -534,11 +567,30 @@ impl ListObjectsV2Operation {
                         } => {
                             self.location_reads.push((
                                 BLOB_LOCATIONS_KEYSPACE.to_string(),
-                                BlobLocationKey::new(blob_hash, backend).to_bytes().into(),
+                                BlobLocationKey::new(blob_hash, backend.clone())
+                                    .to_bytes()
+                                    .into(),
                             ));
+                            let governed = match version.placement_policies.is_empty() {
+                                true => None,
+                                false => {
+                                    let copy_key = ManagedCopyKey::new(
+                                        VersionKey::new(&head.bucket, &head.key, version_id),
+                                        backend,
+                                    );
+                                    let bytes = match copy_key.to_bytes() {
+                                        Ok(bytes) => bytes,
+                                        Err(error) => return self.emit_error(error.into()),
+                                    };
+                                    self.location_reads
+                                        .push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
+                                    Some((copy_key, version.placement_policies.clone()))
+                                }
+                            };
                             self.resolved.push(ResolvedEntry::AwaitingLocation {
                                 head,
                                 version_created_at: version.created_at,
+                                governed,
                             });
                         }
                     }
@@ -565,29 +617,37 @@ impl ListObjectsV2Operation {
             });
         };
 
-        let awaiting = self
-            .resolved
-            .iter()
-            .filter(|entry| matches!(entry, ResolvedEntry::AwaitingLocation { .. }))
-            .count();
-        if values.len() != awaiting {
-            return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
-        }
-
         self.finish_hydration(values)
     }
 
     fn finish_hydration(&mut self, locations: Vec<(Key, Option<Value>)>) -> Effects {
         let mut locations = locations.into_iter();
+        let subject = match self.pending_subject() {
+            true => locations
+                .next()
+                .and_then(|(_, value)| value)
+                .and_then(|value| NodeSubjectRecord::from_bytes(value.as_ref()).ok()),
+            false => None,
+        };
         for entry in std::mem::take(&mut self.resolved) {
             match entry {
                 ResolvedEntry::Object(object) => self.objects.push(object),
                 ResolvedEntry::AwaitingLocation {
                     head,
                     version_created_at,
+                    governed,
                 } => {
                     let Some((_key, value)) = locations.next() else {
                         return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+                    };
+                    let registration = match governed.as_ref() {
+                        Some(_) => match locations.next() {
+                            Some((_, value)) => value,
+                            None => {
+                                return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+                            }
+                        },
+                        None => None,
                     };
                     // Objects without a stored backend location stay hidden.
                     let Some(value) = value else {
@@ -597,9 +657,14 @@ impl ListObjectsV2Operation {
                         Ok(location) => location,
                         Err(err) => return self.emit_error(err.into()),
                     };
+                    // A governed head this node cannot answer for is still
+                    // listed, but without describing bytes it may not serve.
+                    let described = governed.is_none_or(|(copy_key, refs)| {
+                        served_copy(registration.as_deref(), &copy_key, &refs, subject.as_ref())
+                    });
                     self.objects.push(ListObjectsV2Object {
                         head,
-                        location: Some(location),
+                        location: described.then_some(location),
                         source_metadata: None,
                         referenced: false,
                         kind: None,
