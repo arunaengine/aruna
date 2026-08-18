@@ -4,7 +4,9 @@
 //! bandwidth between placement locations, the bandwidth to assume for an
 //! unconfigured link, and how long an availability sample stays meaningful.
 
+use crate::compute_quota::ComputeQuota;
 use crate::structs::MAX_NODE_LOCATION_LEN;
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -21,6 +23,8 @@ pub const DEFAULT_AVAILABILITY_STALE_MS: u64 = 300_000;
 /// wait before any witness launches while higher ranks are down, so an operator
 /// tunes the leaderless failover latency here instead of in a hidden constant.
 pub const DEFAULT_WITNESS_BASE_DELAY_MS: u64 = 30_000;
+/// Groups one realm gives an explicit compute quota.
+pub const MAX_GROUP_COMPUTE_QUOTAS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ComputeConfigError {
@@ -34,6 +38,10 @@ pub enum ComputeConfigError {
     DuplicateLink { from: String, to: String },
     #[error("witness base delay must be greater than zero")]
     ZeroWitnessDelay,
+    #[error("a realm configures at most {MAX_GROUP_COMPUTE_QUOTAS} group compute quotas")]
+    QuotaCount,
+    #[error("group {group_id} has two compute quotas")]
+    DuplicateQuota { group_id: GroupId },
 }
 
 /// One directed transfer estimate between two placement locations. Direction
@@ -45,6 +53,14 @@ pub struct LocationLink {
     pub bandwidth_bytes_per_sec: u64,
 }
 
+/// One group's standing compute quota. An entry replaces the realm default
+/// wholesale, so an explicitly unlimited group is an entry of all-`None`.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct GroupComputeQuota {
+    pub group_id: GroupId,
+    pub quota: ComputeQuota,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct RealmComputeConfig {
     pub links: Vec<LocationLink>,
@@ -54,6 +70,9 @@ pub struct RealmComputeConfig {
     pub availability_stale_after_ms: u64,
     /// Per-rank fallback delay of the leaderless witness schedule.
     pub witness_base_delay_ms: u64,
+    /// Applies to every group without its own entry.
+    pub default_group_quota: ComputeQuota,
+    pub group_quotas: Vec<GroupComputeQuota>,
 }
 
 impl Default for RealmComputeConfig {
@@ -63,6 +82,8 @@ impl Default for RealmComputeConfig {
             pessimistic_bandwidth_bytes_per_sec: DEFAULT_PESSIMISTIC_BANDWIDTH,
             availability_stale_after_ms: DEFAULT_AVAILABILITY_STALE_MS,
             witness_base_delay_ms: DEFAULT_WITNESS_BASE_DELAY_MS,
+            default_group_quota: ComputeQuota::default(),
+            group_quotas: Vec::new(),
         }
     }
 }
@@ -99,6 +120,33 @@ impl RealmComputeConfig {
                 return Err(ComputeConfigError::DuplicateLink {
                     from: link.from.clone(),
                     to: link.to.clone(),
+                });
+            }
+        }
+        self.validate_quotas()
+    }
+
+    /// The standing quota of one group. Fails closed on an unbounded or
+    /// ambiguous quota section instead of resolving it to the realm default.
+    pub fn effective_quota(&self, group_id: &GroupId) -> Result<ComputeQuota, ComputeConfigError> {
+        self.validate_quotas()?;
+        Ok(self
+            .group_quotas
+            .iter()
+            .find(|entry| &entry.group_id == group_id)
+            .map(|entry| entry.quota)
+            .unwrap_or(self.default_group_quota))
+    }
+
+    fn validate_quotas(&self) -> Result<(), ComputeConfigError> {
+        if self.group_quotas.len() > MAX_GROUP_COMPUTE_QUOTAS {
+            return Err(ComputeConfigError::QuotaCount);
+        }
+        let mut seen = BTreeSet::new();
+        for entry in &self.group_quotas {
+            if !seen.insert(entry.group_id) {
+                return Err(ComputeConfigError::DuplicateQuota {
+                    group_id: entry.group_id,
                 });
             }
         }
@@ -158,5 +206,70 @@ mod tests {
             .validate(),
             Err(ComputeConfigError::ZeroWitnessDelay)
         );
+    }
+
+    fn quota(max_jobs: u32) -> ComputeQuota {
+        ComputeQuota {
+            max_jobs: Some(max_jobs),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn override_replaces_default() {
+        // An entry replaces the realm default wholesale, including an entry
+        // that makes one group explicitly unlimited.
+        let group = GroupId::from_bytes([1; 16]);
+        let unlimited = GroupId::from_bytes([2; 16]);
+        let config = RealmComputeConfig {
+            default_group_quota: quota(4),
+            group_quotas: vec![
+                GroupComputeQuota {
+                    group_id: group,
+                    quota: quota(9),
+                },
+                GroupComputeQuota {
+                    group_id: unlimited,
+                    quota: ComputeQuota::default(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(config.effective_quota(&group), Ok(quota(9)));
+        assert_eq!(
+            config.effective_quota(&GroupId::from_bytes([3; 16])),
+            Ok(quota(4))
+        );
+        assert_eq!(
+            config.effective_quota(&unlimited),
+            Ok(ComputeQuota::default())
+        );
+    }
+
+    #[test]
+    fn duplicate_quota_fails_closed() {
+        // An ambiguous quota section must not silently resolve to one of its
+        // entries or to the realm default.
+        let group = GroupId::from_bytes([1; 16]);
+        let config = RealmComputeConfig {
+            group_quotas: vec![
+                GroupComputeQuota {
+                    group_id: group,
+                    quota: quota(1),
+                },
+                GroupComputeQuota {
+                    group_id: group,
+                    quota: quota(99),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.effective_quota(&GroupId::from_bytes([7; 16])),
+            Err(ComputeConfigError::DuplicateQuota { group_id: group })
+        );
+        assert!(config.validate().is_err());
     }
 }
