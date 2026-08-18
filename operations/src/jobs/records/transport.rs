@@ -113,7 +113,8 @@ async fn publish_record(
             }
             MetadataTransportMessage::ForwardedJobRecord {
                 result: Err(JobRecordRejection::NotHolder),
-            } => continue,
+            }
+            | MetadataTransportMessage::ForwardedWriteUnavailable => continue,
             MetadataTransportMessage::ForwardedJobRecord {
                 result: Err(reason),
             } => {
@@ -174,6 +175,7 @@ async fn fetch_records(
             } => {
                 warn!(peer = %holder, reason = ?reason, "Job record holder refused the fetch");
             }
+            MetadataTransportMessage::ForwardedWriteUnavailable => continue,
             other => warn!(
                 peer = %holder,
                 reply = transport_message_kind(&other),
@@ -222,8 +224,12 @@ pub async fn serve_job_record(
 ) -> MetadataTransportMessage {
     match message {
         MetadataTransportMessage::ForwardJobRecord { placement, record } => {
-            MetadataTransportMessage::ForwardedJobRecord {
-                result: accept_record(context, peer, placement, *record).await,
+            match accept_record(context, peer, placement, *record).await {
+                Ok(()) => MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) },
+                Err(ServeError::Refused(reason)) => MetadataTransportMessage::ForwardedJobRecord {
+                    result: Err(reason),
+                },
+                Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
             }
         }
         MetadataTransportMessage::ForwardJobRecordPage {
@@ -232,25 +238,37 @@ pub async fn serve_job_record(
             request_digest,
             cursor,
             limit,
-        } => MetadataTransportMessage::ForwardedJobRecordPage {
-            result: serve_page(
-                context,
-                peer,
-                PageRequest {
-                    placement,
-                    submission_id,
-                    request_digest,
-                    cursor,
-                    limit,
-                },
-            )
-            .await,
-        },
+        } => {
+            let request = PageRequest {
+                placement,
+                submission_id,
+                request_digest,
+                cursor,
+                limit,
+            };
+            match serve_page(context, peer, request).await {
+                Ok(reply) => MetadataTransportMessage::ForwardedJobRecordPage { result: Ok(reply) },
+                Err(ServeError::Refused(reason)) => {
+                    MetadataTransportMessage::ForwardedJobRecordPage {
+                        result: Err(reason),
+                    }
+                }
+                Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
+            }
+        }
         other => MetadataTransportMessage::Reject(format!(
             "unexpected job record request {}",
             transport_message_kind(&other)
         )),
     }
+}
+
+/// A refusal this node stands behind, or a local failure that says nothing
+/// about the record. A transient local failure must never be answered as a
+/// definitive refusal: the publisher would stop retrying a valid record.
+enum ServeError {
+    Refused(JobRecordRejection),
+    Unavailable,
 }
 
 /// This node's authority to answer for one family placement: it must hold the
@@ -265,24 +283,21 @@ async fn holder_view(
     context: &Arc<DriverContext>,
     peer: NodeId,
     placement: PlacementRef,
-) -> Result<ServeAuthority, JobRecordRejection> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(JobRecordRejection::NotHolder)?;
+) -> Result<ServeAuthority, ServeError> {
+    let net_handle = context.net_handle.as_ref().ok_or(ServeError::Unavailable)?;
     let realm_id = *net_handle.realm_id();
     let config = load_realm_config(context.as_ref(), realm_id)
         .await
-        .ok_or(JobRecordRejection::NotHolder)?;
+        .ok_or(ServeError::Unavailable)?;
     let eligible = config
         .sync_eligible_node_ids()
         .is_ok_and(|nodes| nodes.contains(&peer));
     if !eligible {
-        return Err(JobRecordRejection::Unauthorized);
+        return Err(ServeError::Refused(JobRecordRejection::Unauthorized));
     }
     let local = net_handle.node_id();
     if !holds_placement(&config, &placement, local) {
-        return Err(JobRecordRejection::NotHolder);
+        return Err(ServeError::Refused(JobRecordRejection::NotHolder));
     }
     Ok(ServeAuthority {
         config,
@@ -296,16 +311,16 @@ async fn accept_record(
     peer: NodeId,
     placement: PlacementRef,
     record: JobRecordFrame,
-) -> Result<(), JobRecordRejection> {
+) -> Result<(), ServeError> {
     let authority = holder_view(context, peer, placement).await?;
     let family = record.envelope().family();
     // The family placement is derived here, never taken from the requester.
     let derived = authority
         .config
         .family_placement(family.submission_id)
-        .map_err(|_| JobRecordRejection::NotHolder)?;
+        .map_err(|_| ServeError::Refused(JobRecordRejection::NotHolder))?;
     if derived != placement {
-        return Err(JobRecordRejection::Invalid);
+        return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
@@ -321,22 +336,24 @@ async fn accept_record(
     .await
     .map_err(|error| {
         warn!(error = %error, "Job record append failed");
-        JobRecordRejection::Invalid
+        ServeError::Unavailable
     })?;
     match outcome.admission {
+        // A pending record is durable here and is admitted as soon as its
+        // evidence arrives, so the publisher has nothing left to retry.
         Admission::Authentic
         | Admission::Local
         | Admission::Duplicate
         | Admission::Pending(PendingNeed::Evidence(_) | PendingNeed::LocalView) => Ok(()),
-        Admission::Conflict => Err(JobRecordRejection::Conflict),
-        Admission::PendingFull => Err(JobRecordRejection::Invalid),
-        Admission::Rejected(JobRecordError::BadSignature)
-        | Admission::Rejected(JobRecordError::WrongPublisher(_))
-        | Admission::Rejected(JobRecordError::NotHolder(_))
-        | Admission::Rejected(JobRecordError::Unauthorized) => {
-            Err(JobRecordRejection::Unauthorized)
-        }
-        Admission::Rejected(_) => Err(JobRecordRejection::Invalid),
+        Admission::Conflict => Err(ServeError::Refused(JobRecordRejection::Conflict)),
+        Admission::PendingFull => Err(ServeError::Unavailable),
+        Admission::Rejected(
+            JobRecordError::BadSignature
+            | JobRecordError::WrongPublisher(_)
+            | JobRecordError::NotHolder(_)
+            | JobRecordError::Unauthorized,
+        ) => Err(ServeError::Refused(JobRecordRejection::Unauthorized)),
+        Admission::Rejected(_) => Err(ServeError::Refused(JobRecordRejection::Invalid)),
     }
 }
 
@@ -344,7 +361,7 @@ async fn serve_page(
     context: &Arc<DriverContext>,
     peer: NodeId,
     request: PageRequest,
-) -> Result<JobRecordPageReply, JobRecordRejection> {
+) -> Result<JobRecordPageReply, ServeError> {
     holder_view(context, peer, request.placement).await?;
     let scope = match request.request_digest {
         Some(request_digest) => AuditScope::Family(JobFamilyId {
@@ -364,7 +381,7 @@ async fn serve_page(
     .await
     .map_err(|error| {
         warn!(error = %error, "Job record page read failed");
-        JobRecordRejection::Invalid
+        ServeError::Unavailable
     })?;
     let frames: Vec<JobRecordFrame> = audit
         .records
@@ -373,7 +390,7 @@ async fn serve_page(
         .collect();
     let page = JobRecordPage::new(frames).map_err(|error| {
         warn!(error = %error, "Job record page exceeds its bound");
-        JobRecordRejection::Invalid
+        ServeError::Unavailable
     })?;
     Ok(JobRecordPageReply {
         page,

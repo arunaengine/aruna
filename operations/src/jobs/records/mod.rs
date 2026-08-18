@@ -29,10 +29,12 @@ pub mod rows;
 pub mod transport;
 pub mod verify;
 
+pub use admit::Admission;
 pub use append::{AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 pub use audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 pub use project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily};
 pub use transport::{dispatch_offer, dispatch_record, serve_job_record, serve_launch_offer};
+pub use verify::FamilyView;
 
 /// Evidence-bearing records one bounded family scan loads before an append.
 pub const MAX_FAMILY_EVIDENCE: usize = 256;
