@@ -162,7 +162,7 @@ pub async fn materialize_reference(
             }
         }
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
-        let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id);
+        let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)?;
 
         for effect in build_head_transition_effects(
             &HeadAliasContext::new(

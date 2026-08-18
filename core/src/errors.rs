@@ -238,6 +238,10 @@ pub enum ConversionError {
     PlacementPolicyError(#[from] crate::structs::PlacementPolicyError),
     #[error("policy refs must be sorted and deduplicated")]
     NonCanonicalPolicyRefs,
+    /// A monotonic head generation must never wrap: a wrapped pointer would
+    /// compare equal to an older one and silently win the convergent order.
+    #[error("object head generation is exhausted")]
+    HeadGenerationExhausted,
 }
 
 impl PartialEq for ConversionError {

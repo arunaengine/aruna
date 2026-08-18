@@ -371,7 +371,7 @@ impl SuccessorMint {
         writes.push((
             BLOB_HEAD_KEYSPACE.to_string(),
             self.plan.context.head_key().to_bytes()?.into(),
-            CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)
+            CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)?
                 .to_bytes()?
                 .into(),
         ));

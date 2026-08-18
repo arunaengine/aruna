@@ -1,6 +1,7 @@
 use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read,
-    build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
+    build_head_transition_effects, head_contender_effects, write_blob_location_effect,
+    write_blob_version_effect,
 };
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
@@ -67,6 +68,7 @@ enum IncomingVersionReplicationState {
     VerifyExistingBlob,
     WriteBlobLocation,
     ReadObjectLookup,
+    WriteHeadContenders,
     ReadCurrentVersion,
     ApplyHeadTransition,
     WriteBlobVersion,
@@ -314,6 +316,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::VerifyExistingBlob => "VerifyExistingBlob",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
+            IncomingVersionReplicationState::WriteHeadContenders => "WriteHeadContenders",
             IncomingVersionReplicationState::ReadCurrentVersion => "ReadCurrentVersion",
             IncomingVersionReplicationState::ApplyHeadTransition => "ApplyHeadTransition",
             IncomingVersionReplicationState::WriteBlobVersion => "WriteBlobVersion",
@@ -1095,10 +1098,12 @@ impl IncomingVersionReplicationOperation {
             if incoming_generation != advance.generation {
                 return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
             }
+            let advanced = CurrentVersionPointer::new_with_generation(
+                self.manifest.version_id,
+                advance.generation,
+            );
             if self.advance_version_exists
-                && ((pointer.generation == advance.generation
-                    && pointer.version_id == self.manifest.version_id)
-                    || pointer.generation > advance.generation)
+                && (advanced == pointer || pointer.generation > advance.generation)
             {
                 self.existing_current_pointer = Some(pointer);
                 self.object_delta = 0;
@@ -1106,52 +1111,65 @@ impl IncomingVersionReplicationOperation {
                 self.pending_new_current_hash = None;
                 return self.write_live_obligation();
             }
+            // Lineage validation stands, and the accepted head order still has
+            // the final word: an advance may never regress the observed head.
             if pointer.generation != previous_generation
                 || pointer.version_id != advance.predecessor
+                || !advanced.supersedes(Some(&pointer))
             {
                 return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
             }
 
             self.existing_current_pointer = Some(pointer.clone());
-            self.pending_new_pointer = Some(CurrentVersionPointer::new_with_generation(
-                self.manifest.version_id,
-                advance.generation,
-            ));
+            self.pending_new_pointer = Some(advanced);
             self.pending_new_current_hash = None;
             return self.read_current(pointer.version_id);
         }
-        let should_write = match existing_pointer.as_ref() {
-            Some(pointer)
-                if (incoming_generation, self.manifest.version_id)
-                    > (pointer.generation, pointer.version_id) =>
-            {
-                true
-            }
-            Some(pointer)
-                if (incoming_generation, self.manifest.version_id)
-                    == (pointer.generation, pointer.version_id) =>
-            {
-                true
-            }
-            Some(_) => false,
-            None => true,
-        };
-
-        self.existing_current_pointer = existing_pointer.clone();
-
-        if !should_write {
-            self.pending_new_pointer = None;
-            self.pending_new_current_hash = None;
-            return self.write_version();
-        }
-
-        self.pending_new_pointer = Some(CurrentVersionPointer::new_with_generation(
+        let candidate = CurrentVersionPointer::new_with_generation(
             self.manifest.version_id,
             incoming_generation,
-        ));
-        self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
+        );
+        let should_write = candidate.supersedes(existing_pointer.as_ref());
 
-        match existing_pointer {
+        self.existing_current_pointer = existing_pointer.clone();
+        if should_write {
+            self.pending_new_pointer = Some(candidate.clone());
+            self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
+        } else {
+            self.pending_new_pointer = None;
+            self.pending_new_current_hash = None;
+        }
+        self.record_contenders(&candidate, existing_pointer.as_ref())
+    }
+
+    /// A losing candidate is still audit evidence, so both claimants of the
+    /// generation are recorded before the head transition continues.
+    fn record_contenders(
+        &mut self,
+        candidate: &CurrentVersionPointer,
+        existing: Option<&CurrentVersionPointer>,
+    ) -> Effects {
+        let context = match self.alias_context() {
+            Ok(context) => context,
+            Err(err) => return self.fail(err),
+        };
+        match head_contender_effects(&context, candidate, existing, self.txn_id) {
+            Ok(effects) if effects.is_empty() => self.resume_head_transition(),
+            Ok(effects) => {
+                self.state = IncomingVersionReplicationState::WriteHeadContenders;
+                effects
+            }
+            Err(err) => self.fail(err.into()),
+        }
+    }
+
+    /// Continues exactly where `write_object_lookup_after_compare` left off; the
+    /// stored pointers carry the decision, so no continuation state is needed.
+    fn resume_head_transition(&mut self) -> Effects {
+        if self.pending_new_pointer.is_none() {
+            return self.write_version();
+        }
+        match self.existing_current_pointer.clone() {
             Some(pointer) => self.read_current(pointer.version_id),
             None => self.apply_liveness(false),
         }
@@ -2226,14 +2244,10 @@ impl Operation for IncomingVersionReplicationOperation {
                     .as_ref()
                     .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
                 let incoming_generation = self.manifest.current_version_generation;
-                let pointer_will_update = match (incoming_generation, existing_pointer.as_ref()) {
-                    (Some(incoming_generation), Some(pointer)) => {
-                        (incoming_generation, self.manifest.version_id)
-                            >= (pointer.generation, pointer.version_id)
-                    }
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
+                let pointer_will_update = incoming_generation.is_some_and(|generation| {
+                    CurrentVersionPointer::new_with_generation(self.manifest.version_id, generation)
+                        .supersedes(existing_pointer.as_ref())
+                });
                 debug!(
                     bucket = %self.manifest.bucket,
                     key = %self.manifest.key,
@@ -2246,6 +2260,16 @@ impl Operation for IncomingVersionReplicationOperation {
                     "Compared destination current version pointer"
                 );
                 self.write_object_lookup_after_compare(value.as_deref())
+            }
+            IncomingVersionReplicationState::WriteHeadContenders => {
+                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                        received: event,
+                    });
+                };
+                self.resume_head_transition()
             }
             IncomingVersionReplicationState::ReadCurrentVersion => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {

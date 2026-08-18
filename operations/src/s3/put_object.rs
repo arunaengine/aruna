@@ -597,7 +597,10 @@ impl PutObjectOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
-        let pointer = CurrentVersionPointer::next_for(existing, version_id);
+        let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => pointer,
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
         let effect = match write_blob_head_effect(&self.alias_context(), pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),

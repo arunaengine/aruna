@@ -1,11 +1,12 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
-    HashPathIndexKey, RealmId, VersionKey,
+    HashPathIndexKey, HeadContenderKey, RealmId, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, TxnId};
 use byteview::ByteView;
@@ -199,6 +200,57 @@ pub fn iter_hash_page(
     Ok(Effect::Storage(StorageEffect::Iter {
         key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
         prefix: Some(HashPathIndexKey::hash_prefix(blake3_hash)?.into()),
+        start: start_after.map(IterStart::After),
+        limit,
+        txn_id,
+    }))
+}
+
+/// Records both claimants of one head generation. Emitted before the head
+/// write that observed them, so a lost race is auditable even though only the
+/// convergent order decides which VersionId the head names.
+pub fn head_contender_effects(
+    context: &HeadAliasContext,
+    candidate: &CurrentVersionPointer,
+    existing: Option<&CurrentVersionPointer>,
+    txn_id: Option<TxnId>,
+) -> Result<Effects, ConversionError> {
+    let Some(existing) = existing.filter(|existing| candidate.contends(existing)) else {
+        return Ok(smallvec![]);
+    };
+    let mut writes = Vec::with_capacity(2);
+    for version_id in [existing.version_id, candidate.version_id] {
+        let key = HeadContenderKey::new(
+            context.bucket.clone(),
+            context.key.clone(),
+            candidate.generation,
+            version_id,
+        );
+        writes.push((
+            BLOB_HEAD_CONTENDER_KEYSPACE.to_string(),
+            key.to_bytes()?.into(),
+            ByteView::from(Vec::<u8>::new()),
+        ));
+    }
+    Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+        writes,
+        txn_id,
+    })])
+}
+
+/// Bounded scan of the claimants observed for one object generation.
+pub fn head_contender_scan(
+    context: &HeadAliasContext,
+    generation: u64,
+    start_after: Option<Key>,
+    limit: usize,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::Iter {
+        key_space: BLOB_HEAD_CONTENDER_KEYSPACE.to_string(),
+        prefix: Some(
+            HeadContenderKey::generation_prefix(&context.bucket, &context.key, generation)?.into(),
+        ),
         start: start_after.map(IterStart::After),
         limit,
         txn_id,

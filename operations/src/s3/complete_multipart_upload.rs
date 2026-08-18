@@ -934,7 +934,10 @@ impl CompleteMultipartUploadOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
-        let pointer = CurrentVersionPointer::next_for(existing, version_id);
+        let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => pointer,
+            Err(err) => return self.schedule_error(err.into()),
+        };
         let alias_context = match self.alias_context() {
             Ok(context) => context,
             Err(err) => return self.schedule_error(err),

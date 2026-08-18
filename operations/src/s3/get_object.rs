@@ -882,7 +882,10 @@ impl GetObjectOperation {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
-        let next_pointer = CurrentVersionPointer::next_for(Some(&pointer), new_version_id);
+        let next_pointer = match CurrentVersionPointer::next_for(Some(&pointer), new_version_id) {
+            Ok(next_pointer) => next_pointer,
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
         let head_value = match next_pointer.to_bytes() {
             Ok(value) => value.into(),
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),

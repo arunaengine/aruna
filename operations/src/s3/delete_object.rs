@@ -455,8 +455,6 @@ impl DeleteObjectOperation {
             .map(|metadata| (metadata.version_id, metadata.materialized_hash))
         {
             Some((version_id, new_hash)) => {
-                self.pending_new_pointer =
-                    Some(CurrentVersionPointer::next_for(existing, version_id));
                 self.pending_new_current_hash = new_hash;
                 self.write_current_lookup(version_id, existing)
             }
@@ -473,7 +471,10 @@ impl DeleteObjectOperation {
         version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
     ) -> Effects {
-        self.pending_new_pointer = Some(CurrentVersionPointer::next_for(existing, version_id));
+        match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => self.pending_new_pointer = Some(pointer),
+            Err(err) => return self.emit_error(err.into()),
+        }
         self.prepare_head_transition(HeadTransitionContinuation::DeleteTargetVersion)
     }
 
@@ -758,7 +759,10 @@ impl DeleteObjectOperation {
         version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
     ) -> Effects {
-        self.pending_new_pointer = Some(CurrentVersionPointer::next_for(existing, version_id));
+        match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => self.pending_new_pointer = Some(pointer),
+            Err(err) => return self.emit_error(err.into()),
+        }
         self.prepare_head_transition(HeadTransitionContinuation::WriteDeletedVersion)
     }
 
