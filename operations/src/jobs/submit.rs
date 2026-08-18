@@ -83,6 +83,8 @@ pub enum SubmitJobError {
     JobPlanConflict { existing_job_id: JobId },
     #[error("invalid workspace: {0}")]
     InvalidWorkspace(String),
+    #[error("a job may declare at most {limit} outputs")]
+    TooManyOutputs { limit: usize },
     #[error(transparent)]
     Composition(#[from] aruna_core::structs::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]

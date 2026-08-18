@@ -5,9 +5,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
-    JobResultPayload, JobState, MintPersistentIdSpec, Permission, RealmId, RunCrateStatus,
-    StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key, shard_for_subject,
-    user_dedup_key,
+    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, Permission, RealmId,
+    RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key,
+    shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -122,6 +122,13 @@ pub async fn submit_execution_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     spec.inputs = aruna_core::structs::plan_composition(spec.inputs, spec.collision_policy)?;
+    // One bound governs declaration, expansion, the local result, and the
+    // immutable output record, so a valid success is always publishable.
+    if spec.file_outputs.len() + spec.workspace_outputs.len() > MAX_EXECUTION_OUTPUTS {
+        return Err(SubmitJobError::TooManyOutputs {
+            limit: MAX_EXECUTION_OUTPUTS,
+        });
+    }
     match workspace_mode {
         WorkspaceMode::None if workspace_bucket.is_some() => {
             return Err(SubmitJobError::InvalidWorkspace(

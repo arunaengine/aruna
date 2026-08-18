@@ -7,8 +7,8 @@ use aruna_core::compute::normalize_container_path;
 use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
     ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
-    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, Permission, WorkspaceMode,
-    WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
+    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, Permission,
+    WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
@@ -146,6 +146,9 @@ pub struct SubmitExecutionRequest {
     #[serde(default)]
     pub outputs: Vec<ExecutionOutputRequest>,
     #[serde(default)]
+    /// Workspace prefixes to inventory at completion. Only objects this
+    /// execution itself wrote under a prefix are reported: a version another
+    /// writer produced is never attributed to this job.
     pub output_prefixes: Vec<String>,
     #[serde(default)]
     pub collision_policy: CollisionPolicyRequest,
@@ -409,6 +412,9 @@ pub(crate) fn map_submit_error(
             ServerError::Conflict(format!("active RO-Crate job limit of {limit} reached"))
         }
         SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
+        SubmitJobError::TooManyOutputs { limit } => {
+            ServerError::BadRequestMessage(format!("a job may declare at most {limit} outputs"))
+        }
         SubmitJobError::Composition(CompositionError::KeyConflict(key)) => {
             ServerError::Conflict(format!("composition key conflict on {key}"))
         }
@@ -614,7 +620,7 @@ pub async fn list_jobs(
     path = "/jobs/",
     tag = "jobs",
     summary = "Submit a container execution job",
-    description = "Requires a realm bearer token with WRITE on the target group's data; a path-restricted (delegated) token is refused. Submission is asynchronous: a 2xx means the job is durably accepted and queued for the node that owns it, never that it started, finished or produced outputs. The job is anchored to that owning node for its whole life, and the response carries the node's base URL plus the status URL to poll. `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200 with the job that already exists and `created` false, while the same key with a different plan is a 409 conflict. Set `workspace.mode` to `existing` to run in a bucket that already exists, which additionally requires WRITE on that bucket and that it belongs to the same group; omitting `workspace` keeps a per-job workspace bucket. Rejected with 400: an empty image, `cpu_cores` of 0, a `ram_bytes` of 0 or above 2^63-1, more than 512 inputs or outputs, more than 32 output prefixes, an empty `dest_key`, a container path that is not absolute and traversal-free, or two inputs or outputs sharing a `dest_key` or container path. A 503 is retryable: the caller may submit again.",
+    description = "Requires a realm bearer token with WRITE on the target group's data; a path-restricted (delegated) token is refused. Submission is asynchronous: a 2xx means the job is durably accepted and queued for the node that owns it, never that it started, finished or produced outputs. The job is anchored to that owning node for its whole life, and the response carries the node's base URL plus the status URL to poll. `idempotency_key` is scoped to the caller: replaying the same key with the same plan answers 200 with the job that already exists and `created` false, while the same key with a different plan is a 409 conflict. Set `workspace.mode` to `existing` to run in a bucket that already exists, which additionally requires WRITE on that bucket and that it belongs to the same group; omitting `workspace` keeps a per-job workspace bucket. Rejected with 400: an empty image, `cpu_cores` of 0, a `ram_bytes` of 0 or above 2^63-1, more than 512 inputs, more than 1024 outputs, more than 32 output prefixes, an empty `dest_key`, a container path that is not absolute and traversal-free, or two inputs or outputs sharing a `dest_key` or container path. A 503 is retryable: the caller may submit again.",
     request_body(
         content = SubmitExecutionRequest,
         description = "Container image, command and the inputs and outputs to stage around it",
@@ -699,7 +705,7 @@ pub async fn submit_job(
         validate_existing_workspace(&state, &auth, group_id, bucket).await?;
     }
 
-    if request.inputs.len() > MAX_INPUTS || request.outputs.len() > MAX_INPUTS {
+    if request.inputs.len() > MAX_INPUTS || request.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(ServerError::BadRequest);
     }
     // Destination-key overlaps are the composition's collision policy to resolve.
