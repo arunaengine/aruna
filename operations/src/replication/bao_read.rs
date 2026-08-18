@@ -307,9 +307,8 @@ const CHALLENGE_ATTEMPTS: usize = 2;
 pub async fn managed_read(
     context: &DriverContext,
     node_id: NodeId,
-    request: BaoReadRequest,
+    mut request: BaoReadRequest,
 ) -> Result<BaoReadOutput, BaoReadError> {
-    let mut request = request;
     let destination = match gate_context(context, request.realm_id, now_ms()).await {
         Ok(destination) => destination,
         Err(GateContextError::AdmissionStopped) => {
