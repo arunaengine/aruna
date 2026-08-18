@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod onboarding;
 pub mod operation;
 pub mod permission_path;
+pub mod realm_format;
 pub mod request_policy;
 pub mod scheduling;
 pub mod shutdown;

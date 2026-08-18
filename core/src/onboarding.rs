@@ -1,6 +1,7 @@
 use crate::NodeId;
 use crate::auth::credential_hash;
 use crate::document::DocumentSyncTarget;
+use crate::realm_format::{REALM_FORMAT_EPOCH, RealmFormatError, verify_realm_epoch};
 use crate::structs::RealmId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -111,6 +112,9 @@ pub struct OnboardingSyncTicketPayload {
     pub node_id: String,
     pub expires_at: u64,
     pub documents: Vec<DocumentSyncTarget>,
+    /// Realm wire epoch the issuing realm runs. A joiner refuses another epoch
+    /// before it fetches or applies one onboarding document.
+    pub format_epoch: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +143,8 @@ pub enum OnboardingSecretError {
     InvalidSecret,
     #[error("invalid onboarding signature")]
     InvalidSignature,
+    #[error(transparent)]
+    RealmFormat(#[from] RealmFormatError),
     #[error(transparent)]
     Base64(#[from] base64::DecodeError),
     #[error(transparent)]
@@ -180,6 +186,7 @@ impl OnboardingSyncTicket {
             node_id: node_id.to_string(),
             expires_at,
             documents,
+            format_epoch: REALM_FORMAT_EPOCH,
         };
         let payload_bytes = postcard::to_allocvec(&payload)?;
         let signature = signing_key.sign(&payload_bytes).to_string();
@@ -202,6 +209,9 @@ impl OnboardingSyncTicket {
         expected_document: &DocumentSyncTarget,
         now: u64,
     ) -> Result<(), OnboardingSecretError> {
+        // Format first: a realm of another epoch may not enroll this node, and
+        // the reason must be the epoch rather than a later structural failure.
+        verify_realm_epoch(self.payload.format_epoch)?;
         if self.payload.node_id != expected_node_id.to_string() {
             return Err(OnboardingSecretError::InvalidSecret);
         }
@@ -253,7 +263,8 @@ pub fn bootstrap_issuer_proof_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket, credential_hash,
+        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretError,
+        OnboardingSyncTicket, REALM_FORMAT_EPOCH, RealmFormatError, credential_hash,
     };
     use crate::document::DocumentSyncTarget;
     use crate::structs::RealmId;
@@ -310,5 +321,35 @@ mod tests {
         let encoded = ticket.encode().unwrap();
         let decoded = OnboardingSyncTicket::decode(&encoded).unwrap();
         decoded.verify(node_id, &document, 0).unwrap();
+    }
+
+    #[test]
+    fn refuses_foreign_format_ticket() {
+        // A seed of another realm format must be refused before the joiner
+        // fetches or applies any onboarding document.
+        let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let node_signing_key = SigningKey::from_bytes(&[4u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes()).public();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let document = DocumentSyncTarget::RealmAuthorization { realm_id };
+
+        let mut ticket = OnboardingSyncTicket::issue(
+            &realm_signing_key,
+            &realm_id,
+            node_id,
+            u64::MAX,
+            vec![document.clone()],
+        )
+        .unwrap();
+        ticket.payload.format_epoch = REALM_FORMAT_EPOCH - 1;
+
+        assert_eq!(
+            ticket.verify(node_id, &document, 0),
+            Err(OnboardingSecretError::RealmFormat(
+                RealmFormatError::Epoch {
+                    declared: REALM_FORMAT_EPOCH - 1
+                }
+            ))
+        );
     }
 }

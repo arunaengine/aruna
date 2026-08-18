@@ -531,7 +531,9 @@ fn metadata_graph_lifecycle_topic_id(graph_iri: &str) -> Ulid {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
-#[irokle(type_id = "aruna.document.v2")]
+// Keep in step with `realm_format::REALM_FORMAT_TAG`: the derive needs a
+// literal, and `tag_names_the_epoch` fails if the two ever drift.
+#[irokle(type_id = "aruna.document.v3")]
 pub enum DocumentSyncEvent {
     Upsert {
         event_id: Ulid,
@@ -905,7 +907,10 @@ mod tests {
 
     #[test]
     fn document_sync_event_type_id_is_stable() {
-        assert_eq!(DocumentSyncEvent::TYPE_ID, "aruna.document.v2");
+        assert_eq!(
+            DocumentSyncEvent::TYPE_ID,
+            crate::realm_format::REALM_FORMAT_TAG
+        );
     }
 
     #[test]

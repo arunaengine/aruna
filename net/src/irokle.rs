@@ -45,6 +45,7 @@ use aruna_core::metadata::{
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::permission_path::compile_permission_matcher;
+use aruna_core::realm_format::{RealmFormatError, verify_realm_format};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
@@ -1017,6 +1018,16 @@ impl DocumentSyncService {
         .await
         .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT))??;
         let read_elapsed = stream_started.elapsed();
+        // Format fence: the peer's own declaration decides admission before a
+        // single replicated document reaches the reducer.
+        if let Err(error) = admit_realm_format(&messages) {
+            warn!(
+                peer = %node_id_to_peer_id(&peer),
+                error = %error,
+                "Refused an inbound document sync stream from another realm format"
+            );
+            return Err(NetError::RealmFormat(error));
+        }
         let message_count = messages.len();
         let handle_started = Instant::now();
         let net = self.net.clone();
@@ -9615,6 +9626,20 @@ async fn read_inbound_sync_messages(
     Ok((messages, topics.into_iter().collect()))
 }
 
+/// Refuses an inbound sync stream whose opener declares another realm wire
+/// format. Every legitimate opener names the topic's event type, so an absent
+/// declaration is refused too: there is no fallback and no downgrade.
+fn admit_realm_format(messages: &[SyncMessage]) -> std::result::Result<(), RealmFormatError> {
+    for message in messages {
+        match message {
+            SyncMessage::Open(open) => verify_realm_format(open.event_type_id.as_deref())?,
+            SyncMessage::Summary(summary) => verify_realm_format(summary.event_type_id.as_deref())?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn read_next_inbound_sync_frame(
     recv: &mut iroh::endpoint::RecvStream,
     bytes_read: &mut usize,
@@ -10477,6 +10502,36 @@ mod tests {
             .expect("peer added");
         let permit = service.admit_inbound(stranger);
         assert!(permit.is_ok());
+    }
+
+    #[test]
+    fn admits_matching_format() {
+        // A same-format opener is admitted; another epoch and an undeclared
+        // format are both refused before any document reaches the reducer.
+        let topic = irokle_crate::TopicId::hash(b"format-fence".to_vec());
+        let open = |event_type_id: Option<&str>| {
+            SyncMessage::Open(irokle_crate::sync::SyncOpen {
+                protocol: String::from_utf8_lossy(irokle_crate::net::IROKLE_SYNC_ALPN).into_owned(),
+                topic_id: topic,
+                peer_id: peer(7),
+                event_type_id: event_type_id.map(str::to_string),
+            })
+        };
+
+        assert_eq!(
+            admit_realm_format(&[open(Some(DocumentSyncEvent::TYPE_ID))]),
+            Ok(())
+        );
+        assert_eq!(
+            admit_realm_format(&[open(Some("aruna.document.v2"))]),
+            Err(RealmFormatError::Mismatch {
+                declared: "aruna.document.v2".to_string()
+            })
+        );
+        assert_eq!(
+            admit_realm_format(&[open(None)]),
+            Err(RealmFormatError::Absent)
+        );
     }
 
     #[test]
