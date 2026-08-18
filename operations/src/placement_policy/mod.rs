@@ -35,7 +35,7 @@ pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
 pub use resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
-    sync_subject,
+    observe_placement, sync_subject,
 };
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 

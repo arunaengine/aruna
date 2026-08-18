@@ -282,11 +282,18 @@ impl SubjectScanOperation {
         };
         match stored.advance(self.config.observed.clone()) {
             Ok(Some(advanced)) => self.write_record(advanced, ScanState::WriteRecord),
+            Ok(None) if matches!(self.config.mode, SubjectScanMode::Depart) => {
+                // Departure stops new admission even when the subject itself is
+                // unchanged, then records the inventory unresolved.
+                let mut leaving = stored;
+                leaving.serving_blocked = true;
+                leaving.policy_draining = true;
+                self.write_record(leaving, ScanState::WriteRecord)
+            }
             Ok(None) => {
                 self.record = Some(stored.clone());
                 self.result.generation = stored.subject.generation;
-                match stored.serving_blocked || matches!(self.config.mode, SubjectScanMode::Depart)
-                {
+                match stored.serving_blocked {
                     true => self.scan_page(),
                     // Nothing changed and nothing is blocked: no copy can have
                     // become non-compliant, so the scan costs nothing.
@@ -368,6 +375,87 @@ impl Operation for SubjectScanOperation {
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
+}
+
+/// Reacts to an observed placement change for this node.
+///
+/// A node the realm still places revalidates its inventory under the observed
+/// subject. A node marked draining, or one the realm no longer places at all,
+/// departs: it stops admitting governed data immediately and records every
+/// local copy unresolved. Departure is best effort and never blocks the change
+/// that caused it.
+pub async fn observe_placement(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    now_ms: u64,
+) -> Result<Option<SubjectScanResult>, SubjectScanError> {
+    let Some(config) = read_realm_config(context, realm_id).await? else {
+        return Ok(None);
+    };
+    let (observed, mode) = match config.placement_entry(node_id) {
+        Some(entry) if !entry.draining => (
+            storage_subject(entry, 1),
+            SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
+        ),
+        Some(entry) => (storage_subject(entry, 1), SubjectScanMode::Depart),
+        // The realm no longer places this node: an ungraceful removal it only
+        // learns about through config sync.
+        None => match read_local_subject(context).await? {
+            Some(record) => (record.subject, SubjectScanMode::Depart),
+            None => return Ok(None),
+        },
+    };
+    drive(
+        SubjectScanOperation::new(SubjectScanConfig {
+            realm_id,
+            observed,
+            mode,
+            now_ms,
+        }),
+        context,
+    )
+    .await
+    .map(Some)
+}
+
+async fn read_realm_config(
+    context: &DriverContext,
+    realm_id: RealmId,
+) -> Result<Option<RealmConfigDocument>, SubjectScanError> {
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        return Err(SubjectScanError::InvalidEvent("ReadRealmConfig"));
+    };
+    Ok(value
+        .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
+        .transpose()?)
+}
+
+async fn read_local_subject(
+    context: &DriverContext,
+) -> Result<Option<NodeSubjectRecord>, SubjectScanError> {
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: Key::from(NODE_SUBJECT_KEY.to_vec()),
+            txn_id: None,
+        })
+        .await
+    else {
+        return Err(SubjectScanError::InvalidEvent("ReadLocalSubject"));
+    };
+    Ok(value
+        .map(|value| NodeSubjectRecord::from_bytes(value.as_ref()))
+        .transpose()?)
 }
 
 /// Reconciles the local subject with the realm's placement map and revalidates

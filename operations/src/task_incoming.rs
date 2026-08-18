@@ -114,6 +114,7 @@ use crate::notifications::watch::interest::{
     WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
     refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
+use crate::placement_policy::observe_placement;
 use crate::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::queue_backoff::{queue_retry_after_ms, retry_after_ms};
 use crate::replication::queue::{
@@ -2613,6 +2614,15 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
                 let key = TaskKey::SyncPlacements { realm_id, node_id };
+                // The same observation that reconciles shards reconciles this
+                // node's placement subject: a moved, draining or removed node
+                // stops admitting governed data and revalidates its inventory.
+                if let Err(error) =
+                    observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
+                        .await
+                {
+                    warn!(error = %error, "Placement subject reconcile failed");
+                }
                 let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
                 match outcome.status {
                     PlacementReconcileStatus::Clean => self.reset_backoff(&key),
