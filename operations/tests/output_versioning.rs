@@ -169,6 +169,7 @@ async fn seed_execution(harness: &Harness) -> (JobId, AttemptControl) {
             pinned_image: "alpine@sha256:digest".to_string(),
             attempt_epoch: 0,
         },
+        None,
         unix_timestamp_millis(),
     )
     .await

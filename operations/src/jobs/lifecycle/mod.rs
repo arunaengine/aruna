@@ -23,12 +23,15 @@ use thiserror::Error;
 use super::records::RecordStoreError;
 
 pub mod admit;
+pub mod cancel;
 pub mod ids;
 pub mod ingress;
 pub mod outbox;
 pub mod plan;
 pub mod reservation;
+pub mod routing;
 pub mod target;
+pub mod updates;
 pub mod witness;
 
 pub use admit::{AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission};

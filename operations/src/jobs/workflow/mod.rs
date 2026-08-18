@@ -19,7 +19,7 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord,
-    JobRecordError, JobResultPayload, OutputObject, WorkspaceMode,
+    JobRecordError, JobResultPayload, OutputObject, PhysicalExecutionState, WorkspaceMode,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::NodeId;
@@ -39,6 +39,8 @@ use super::store::{
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
+use crate::jobs::lifecycle::reservation::job_reservation;
+use crate::jobs::lifecycle::updates::{publish_progress, publish_terminal};
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
@@ -112,6 +114,7 @@ pub async fn run_execution_job(
         warn!(job_id = %job_id, "Lost claim before preparing; aborting");
         return;
     }
+    publish_progress(&context, job_id, PhysicalExecutionState::Preparing).await;
 
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(
@@ -175,6 +178,11 @@ pub async fn run_execution_job(
             backend.run_identity(),
         );
 
+        // A receipted execution already has its identity: the fenced attempt
+        // binds that exact ExecutionId so its outputs chain to the receipt.
+        let receipted = job_reservation(&context, job_id)
+            .await
+            .map(|reservation| reservation.execution_id);
         // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
         let intent = AttemptIntent {
             attempt_no,
@@ -188,6 +196,7 @@ pub async fn run_execution_job(
             job_id,
             token,
             intent,
+            receipted,
             unix_timestamp_millis(),
         ))
         .await
@@ -260,6 +269,7 @@ pub async fn run_execution_job(
             Ok(record) => record,
             Err(_) => return None,
         };
+        publish_progress(&context, job_id, PhysicalExecutionState::Running).await;
         if running.cancel_requested {
             Box::pin(finalize_cancel(
                 &context, job_id, token, &backend, &fence, &spec, &bucket,
@@ -1481,6 +1491,9 @@ async fn cleanup_and_crate(context: &DriverContext, job_id: JobId, record: Optio
     // Only act on a terminal record WE wrote (a lost race returns None).
     let Some(record) = record else { return };
     log_compute_summary(&record);
+    // A receipted execution publishes its terminal state and frees its exact
+    // reservation here; a purely local job publishes nothing.
+    Box::pin(publish_terminal(context, &record)).await;
     finalize_followups(context, job_id).await;
 }
 
@@ -2104,7 +2117,7 @@ mod tests {
                     .to_string(),
             attempt_epoch: 0,
         };
-        let record = record_attempt_intent(storage, job_id, token, intent, 5)
+        let record = record_attempt_intent(storage, job_id, token, intent, None, 5)
             .await
             .unwrap();
         (record.record, token, attempt)

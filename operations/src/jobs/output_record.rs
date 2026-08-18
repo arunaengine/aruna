@@ -6,6 +6,7 @@ use aruna_core::structs::{
 };
 use tracing::{debug, warn};
 
+use super::lifecycle::updates::chain_for;
 use super::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError};
 use super::store::{persist_output_record, read_output_record};
 use crate::driver::{DriverContext, drive};
@@ -30,6 +31,11 @@ pub async fn seal_outputs(
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
     // A replay re-appends the record it already sealed: the append is
     // idempotent and a family view that was unavailable before may resolve now.
+    // A receipted execution binds the real chain: the replicated identity, the
+    // sealed spec digest, and the target's own receipt. Without a receipt this
+    // is a purely local execution and the documented local stand-ins apply.
+    let chain = chain_for(context, record.job_id, control.execution_id).await;
+    let receipted = chain.is_some();
     if let Some(sealed) = sealed_record(context, record.job_id, control, &outputs, net.node_id())
         .await?
         .map(JobRecordFrame::new)
@@ -39,19 +45,25 @@ pub async fn seal_outputs(
         let digest = sealed.envelope().digest().map_err(|error| {
             JobError::permanent(format!("output record digest failed: {error}"))
         })?;
-        append_output_record(context, record.job_id, control, sealed).await?;
+        append_output_record(context, record.job_id, control, sealed, receipted).await?;
         return Ok(digest);
     }
     let output = ExecutionOutputRecord {
         execution_id: control.execution_id,
-        // Until the family rounds derive a replicated identity, the submission
-        // and its sealed digests are the durable local equivalents.
-        submission_id: SubmissionId::unkeyed(record.job_id.as_ulid()),
-        request_digest,
+        submission_id: chain
+            .map(|chain| chain.family.submission_id)
+            .unwrap_or_else(|| SubmissionId::unkeyed(record.job_id.as_ulid())),
+        request_digest: chain
+            .map(|chain| chain.family.request_digest)
+            .unwrap_or(request_digest),
         job_id: record.job_id,
         executor_node_id: net.node_id(),
-        spec_digest: request_digest,
-        receipt_digest: control.fence_digest(record.job_id),
+        spec_digest: chain
+            .map(|chain| chain.spec_digest)
+            .unwrap_or(request_digest),
+        receipt_digest: chain
+            .map(|chain| chain.receipt_digest)
+            .unwrap_or_else(|| control.fence_digest(record.job_id)),
         outputs,
         committed_at_ms: aruna_core::util::unix_timestamp_millis(),
     };
@@ -64,7 +76,7 @@ pub async fn seal_outputs(
     .map_err(|error| JobError::permanent(format!("output record signing failed: {error}")))?;
     let frame = JobRecordFrame::new(envelope)
         .map_err(|error| JobError::permanent(format!("output record is unpublishable: {error}")))?;
-    publish_output_record(context, record.job_id, control, frame).await
+    publish_output_record(context, record.job_id, control, frame, receipted).await
 }
 
 /// The record this execution already sealed for the same exact output set. A
@@ -116,6 +128,7 @@ async fn publish_output_record(
     job_id: JobId,
     control: &AttemptControl,
     frame: JobRecordFrame,
+    receipted: bool,
 ) -> Result<[u8; 32], JobError> {
     let digest = frame
         .envelope()
@@ -126,7 +139,7 @@ async fn publish_output_record(
     persist_output_record(&context.storage_handle, job_id, control, digest, bytes)
         .await
         .map_err(|error| JobError::retryable(format!("output record write failed: {error}")))?;
-    append_output_record(context, job_id, control, frame).await?;
+    append_output_record(context, job_id, control, frame, receipted).await?;
     Ok(digest)
 }
 
@@ -138,6 +151,7 @@ async fn append_output_record(
     job_id: JobId,
     control: &AttemptControl,
     frame: JobRecordFrame,
+    receipted: bool,
 ) -> Result<(), JobError> {
     let Some(net) = context.net_handle.as_ref() else {
         return Err(JobError::permanent("output record needs a net handle"));
@@ -149,7 +163,9 @@ async fn append_output_record(
     let config = AppendRecordConfig {
         realm_id: envelope.realm_id,
         local_node_id: net.node_id(),
-        local: Some(LocalExecution {
+        // A receipted record must verify against the replicated chain; the
+        // local fence is evidence only while no receipt exists.
+        local: (!receipted).then(|| LocalExecution {
             node_id: net.node_id(),
             execution_id: control.execution_id,
             fence_digest: control.fence_digest(job_id),
@@ -292,6 +308,7 @@ mod tests {
                 pinned_image: "alpine@sha256:0".to_string(),
                 attempt_epoch: 0,
             },
+            None,
             2_000,
         )
         .await

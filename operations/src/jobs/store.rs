@@ -1374,11 +1374,14 @@ pub struct AttemptCommit {
     pub control: AttemptControl,
 }
 
+/// `execution_id` binds the fenced attempt to the physical execution a target
+/// already receipted; `None` mints a fresh one for a purely local attempt.
 pub async fn record_attempt_intent(
     storage: &StorageHandle,
     job_id: JobId,
     token: Ulid,
     draft: AttemptIntent,
+    execution_id: Option<Ulid>,
     now_ms: u64,
 ) -> Result<AttemptCommit, JobMutationError> {
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
@@ -1420,7 +1423,7 @@ pub async fn record_attempt_intent(
             };
             let control = AttemptControl {
                 attempt_epoch: epoch,
-                execution_id: Ulid::generate(),
+                execution_id: execution_id.unwrap_or_else(Ulid::generate),
                 controller_generation: 1,
                 bound_token: Some(token),
                 tombstone_ref: None,
@@ -2531,6 +2534,7 @@ mod tests {
                         .to_string(),
                 attempt_epoch: 0,
             },
+            None,
             1_000,
         )
         .await
@@ -2768,6 +2772,7 @@ mod tests {
                 total: Some(2),
                 unit: "items".to_string(),
             },
+            None,
             4_000,
         )
         .await
@@ -3265,6 +3270,7 @@ mod tests {
                 pinned_image: "alpine@sha256:0".to_string(),
                 attempt_epoch: 0,
             },
+            None,
             2_000,
         )
         .await
@@ -3853,7 +3859,7 @@ mod tests {
                     .to_string(),
             attempt_epoch: 0,
         };
-        let committed = record_attempt_intent(&storage, job_id, token, intent, 6_000)
+        let committed = record_attempt_intent(&storage, job_id, token, intent, None, 6_000)
             .await
             .unwrap();
 
@@ -3885,7 +3891,7 @@ mod tests {
                     .to_string(),
             attempt_epoch: 0,
         };
-        let error = record_attempt_intent(&storage, job_id, token, intent, 6_000)
+        let error = record_attempt_intent(&storage, job_id, token, intent, None, 6_000)
             .await
             .unwrap_err();
 
@@ -3909,7 +3915,7 @@ mod tests {
                     .to_string(),
             attempt_epoch: 0,
         };
-        let committed = record_attempt_intent(&storage, job_id, token, intent, 4_000)
+        let committed = record_attempt_intent(&storage, job_id, token, intent, None, 4_000)
             .await
             .unwrap();
         set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
