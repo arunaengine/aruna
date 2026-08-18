@@ -4,19 +4,19 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     JOB_ACTIVE_USER_KEYSPACE, JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ATTEMPT_CONTROL_KEYSPACE,
-    JOB_DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
-    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE,
-    STAGING_JOB_STATE_KEYSPACE,
+    JOB_DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE,
+    JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
+    ROCRATE_JOB_STATE_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobExecutionClass,
-    JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, JobTransitionError,
-    RunCrateStatus, UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
-    crate_job_id, encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key,
-    job_entry_prefix, job_lease_index_key, job_owner_cursor, job_owner_index_key,
-    job_owner_index_prefix, job_prune_index_key, job_record_key, job_run_crate_key,
-    parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key,
-    run_crate_dedup_key, validate_transition, workspace_credential_id,
+    JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope, JobRecordError, JobResultPayload,
+    JobState, JobTransitionError, RunCrateStatus, UserAccess, attempt_control_key,
+    cleanup_dedup_key, cleanup_job_id, crate_job_id, encode_job_dedup_value, job_active_key,
+    job_due_index_key, job_entry_key, job_entry_prefix, job_lease_index_key, job_owner_cursor,
+    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
+    job_run_crate_key, parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key,
+    rocrate_plan_key, run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -63,6 +63,8 @@ pub enum JobMutationError {
     EpochMismatch,
     #[error(transparent)]
     IllegalTransition(#[from] JobTransitionError),
+    #[error("execution outputs are not proven durable: {0}")]
+    OutputsUnproven(#[from] JobRecordError),
     #[error("{0}")]
     Storage(String),
 }
@@ -252,16 +254,73 @@ fn guard_token(record: &JobRecord, token: Ulid) -> Result<(), JobMutationError> 
 pub async fn mutate_job<F>(
     storage: &StorageHandle,
     job_id: JobId,
-    mut mutate: F,
+    mutate: F,
 ) -> Result<JobRecord, JobMutationError>
 where
     F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+{
+    let mut mutate = mutate;
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        match Box::pin(mutate_in_txn(storage, txn_id, job_id, &mut mutate, None)).await {
+            Ok(record) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(record),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+                }
+                CommitResult::Conflict => {
+                    return Err(JobMutationError::Storage(
+                        "job mutation exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "job mutation exhausted conflict retries".to_string(),
+    ))
+}
+
+/// Re-checks a mutated record against the attempt control read in the same
+/// transaction. Only supplied when an invariant needs it, so ordinary mutations
+/// pay no extra read.
+type JobGuard<'a> =
+    &'a mut (dyn FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send);
+
+/// Same transaction as [`mutate_job`], with `guard` re-checking the mutated
+/// record against the attempt control read inside that transaction. A guard
+/// rejection aborts before any write, so its invariant is atomic with the state
+/// change it protects.
+pub async fn mutate_job_guarded<F, G>(
+    storage: &StorageHandle,
+    job_id: JobId,
+    mut mutate: F,
+    mut guard: G,
+) -> Result<JobRecord, JobMutationError>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send,
 {
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
-        match Box::pin(mutate_in_txn(storage, txn_id, job_id, &mut mutate)).await {
+        match Box::pin(mutate_in_txn(
+            storage,
+            txn_id,
+            job_id,
+            &mut mutate,
+            Some(&mut guard),
+        ))
+        .await
+        {
             Ok(record) => match commit_txn(storage, txn_id).await {
                 CommitResult::Committed => return Ok(record),
                 CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
@@ -448,6 +507,7 @@ async fn mutate_in_txn<F>(
     txn_id: TxnId,
     job_id: JobId,
     mutate: &mut F,
+    guard: Option<JobGuard<'_>>,
 ) -> Result<JobRecord, JobMutationError>
 where
     F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
@@ -462,6 +522,16 @@ where
     match mutate(&mut record)? {
         JobMutation::Skip => Ok(old),
         JobMutation::Persist => {
+            if let Some(guard) = guard {
+                let control = match record.attempt_intent.as_ref() {
+                    Some(intent) => {
+                        read_attempt_control(storage, job_id, intent.attempt_epoch, Some(txn_id))
+                            .await?
+                    }
+                    None => None,
+                };
+                guard(&record, control.as_ref())?;
+            }
             if old.state != record.state {
                 validate_transition(old.execution_class, old.state, record.state)?;
             }
@@ -918,21 +988,21 @@ pub async fn complete_execution(
     now_ms: u64,
 ) -> Result<ExecutionCompleteOutcome, JobMutationError> {
     let mut completed = false;
-    let record = mutate_job(storage, job_id, |record| {
-        completed = false;
-        guard_token(record, token)?;
-        if record.cancel_requested {
-            return Ok(JobMutation::Skip);
-        }
-        record.state = JobState::Succeeded;
-        record.finished_at_ms = Some(now_ms);
-        record.updated_at_ms = now_ms;
-        record.progress = final_progress.clone();
-        record.result = Some(result.clone());
-        record.claim = None;
-        completed = true;
-        Ok(JobMutation::Persist)
-    })
+    let record = commit_success(
+        storage,
+        job_id,
+        token,
+        result,
+        final_progress,
+        now_ms,
+        |record| match record.cancel_requested {
+            true => JobMutation::Skip,
+            false => {
+                completed = true;
+                JobMutation::Persist
+            }
+        },
+    )
     .await?;
 
     Ok(if completed {
@@ -940,6 +1010,120 @@ pub async fn complete_execution(
     } else {
         ExecutionCompleteOutcome::CancelRequested(record)
     })
+}
+
+/// Complete an execution that finished successfully after cancellation was
+/// requested. It carries the same durable-output invariant as an ordinary
+/// success, because it publishes the same terminal result.
+pub async fn complete_cancelled(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    result: JobResultPayload,
+    final_progress: JobProgress,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    commit_success(
+        storage,
+        job_id,
+        token,
+        result,
+        final_progress,
+        now_ms,
+        |_| JobMutation::Persist,
+    )
+    .await
+}
+
+/// The storage-level success invariant: `Succeeded` commits in the same
+/// transaction that reads the attempt control, and only when every output binds
+/// the active ExecutionId, names a reserved version, and the execution's exact
+/// immutable output record is already durable under the named digest.
+async fn commit_success<G>(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    result: JobResultPayload,
+    final_progress: JobProgress,
+    now_ms: u64,
+    mut gate: G,
+) -> Result<JobRecord, JobMutationError>
+where
+    G: FnMut(&JobRecord) -> JobMutation,
+{
+    let proof = result.clone();
+    mutate_job_guarded(
+        storage,
+        job_id,
+        |record| {
+            guard_token(record, token)?;
+            if matches!(gate(record), JobMutation::Skip) {
+                return Ok(JobMutation::Skip);
+            }
+            record.state = JobState::Succeeded;
+            record.finished_at_ms = Some(now_ms);
+            record.updated_at_ms = now_ms;
+            record.progress = final_progress.clone();
+            record.result = Some(result.clone());
+            record.claim = None;
+            Ok(JobMutation::Persist)
+        },
+        |record, control| match record.state {
+            JobState::Succeeded => {
+                let control = control.ok_or(JobMutationError::MissingControl)?;
+                Ok(proof.proves_outputs(control)?)
+            }
+            _ => Ok(()),
+        },
+    )
+    .await
+}
+
+/// The signed output record this execution already sealed, if any.
+pub async fn read_output_record(
+    storage: &StorageHandle,
+    execution_id: Ulid,
+) -> Result<Option<JobRecordEnvelope>, JobMutationError> {
+    let value = read_raw(
+        storage,
+        JOB_OUTPUT_RECORD_KEYSPACE,
+        ByteView::from(execution_id.to_bytes().to_vec()),
+        None,
+    )
+    .await
+    .map_err(JobMutationError::Storage)?;
+    value
+        .map(|bytes| {
+            postcard::from_bytes(bytes.as_ref())
+                .map_err(|error| JobMutationError::Storage(error.to_string()))
+        })
+        .transpose()
+}
+
+/// Make this execution's signed output record durable and name its digest on
+/// the attempt control in one transaction, so terminal success can never
+/// observe the digest without the record it names.
+pub async fn persist_output_record(
+    storage: &StorageHandle,
+    job_id: JobId,
+    execution_id: Ulid,
+    digest: [u8; 32],
+    envelope: Vec<u8>,
+) -> Result<(), JobMutationError> {
+    let write = vec![(
+        JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
+        ByteView::from(execution_id.to_bytes().to_vec()),
+        ByteView::from(envelope),
+    )];
+    mutate_control_with(storage, job_id, write, |_, control| {
+        if control.execution_id != execution_id {
+            return Err(JobMutationError::EpochMismatch);
+        }
+        control.output_record = Some(digest);
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+    Ok(())
 }
 
 pub async fn fail_job(
@@ -1002,6 +1186,7 @@ fn fail_capped(record: &mut JobRecord, now_ms: u64) {
         outputs: Vec::new(),
         stdout: String::new(),
         stderr: String::new(),
+        output_digest: None,
     };
     record.result = Some(result);
 }
@@ -1231,6 +1416,7 @@ pub async fn record_attempt_intent(
                 bound_token: Some(token),
                 tombstone_ref: None,
                 output_commits: Vec::new(),
+                output_record: None,
             };
             let old = record.clone();
             record.attempt_intent = Some(intent);
@@ -1320,6 +1506,20 @@ pub async fn reserve_output_commits(
 async fn mutate_attempt_control<F>(
     storage: &StorageHandle,
     job_id: JobId,
+    mutate: F,
+) -> Result<(JobRecord, AttemptControl), JobMutationError>
+where
+    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError>,
+{
+    mutate_control_with(storage, job_id, Vec::new(), mutate).await
+}
+
+/// Same transaction as [`mutate_attempt_control`], plus writes that must land
+/// atomically with the control row.
+async fn mutate_control_with<F>(
+    storage: &StorageHandle,
+    job_id: JobId,
+    extra: JobWrites,
     mut mutate: F,
 ) -> Result<(JobRecord, AttemptControl), JobMutationError>
 where
@@ -1365,6 +1565,7 @@ where
                         .map_err(|error| JobMutationError::Storage(error.to_string()))?,
                 ),
             ));
+            writes.extend(extra.iter().cloned());
             batch_write(storage, writes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
@@ -3030,7 +3231,37 @@ mod tests {
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         }
+    }
+
+    fn named_result(digest: [u8; 32]) -> JobResultPayload {
+        let mut result = execution_result();
+        if let JobResultPayload::Execution { output_digest, .. } = &mut result {
+            *output_digest = Some(digest);
+        }
+        result
+    }
+
+    /// Fence an attempt so the success path has a control row to read.
+    async fn fence_attempt(storage: &StorageHandle, job_id: JobId, token: Ulid) -> Ulid {
+        record_attempt_intent(
+            storage,
+            job_id,
+            token,
+            AttemptIntent {
+                attempt_no: 1,
+                external_name: "aruna-test-a1".to_string(),
+                executor_kind: "docker".to_string(),
+                pinned_image: "alpine@sha256:0".to_string(),
+                attempt_epoch: 0,
+            },
+            2_000,
+        )
+        .await
+        .unwrap()
+        .control
+        .execution_id
     }
 
     #[tokio::test]
@@ -3320,6 +3551,7 @@ mod tests {
                 outputs: Vec::new(),
                 stdout: String::new(),
                 stderr: String::new(),
+                output_digest: None,
             },
             JobProgress::new("phases"),
             6_000,
@@ -3721,6 +3953,7 @@ mod tests {
         )
         .await
         .unwrap();
+        fence_attempt(&storage, job_id, token).await;
         set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
 
         let ExecutionCompleteOutcome::CancelRequested(stored) = complete_execution(
@@ -3760,11 +3993,17 @@ mod tests {
         .await
         .unwrap();
 
+        let execution_id = fence_attempt(&storage, job_id, token).await;
+        let digest = [8u8; 32];
+        persist_output_record(&storage, job_id, execution_id, digest, vec![1, 2, 3])
+            .await
+            .unwrap();
+
         let ExecutionCompleteOutcome::Completed(completed) = complete_execution(
             &storage,
             job_id,
             token,
-            execution_result(),
+            named_result(digest),
             JobProgress::new("phases"),
             6_000,
         )
@@ -3790,6 +4029,60 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn success_needs_record() {
+        // Without a durable output record naming the same digest, the storage
+        // mutation itself refuses to publish Succeeded.
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA7; 16]);
+        let token = Ulid::generate();
+        insert_job(
+            &storage,
+            &execution_record(job_id, token, JobState::Running),
+        )
+        .await
+        .unwrap();
+        let execution_id = fence_attempt(&storage, job_id, token).await;
+
+        let unproven = complete_execution(
+            &storage,
+            job_id,
+            token,
+            execution_result(),
+            JobProgress::new("phases"),
+            6_000,
+        )
+        .await;
+        assert!(matches!(
+            unproven,
+            Err(JobMutationError::OutputsUnproven(_))
+        ));
+
+        persist_output_record(&storage, job_id, execution_id, [8u8; 32], vec![9])
+            .await
+            .unwrap();
+        let mismatched = complete_execution(
+            &storage,
+            job_id,
+            token,
+            named_result([1u8; 32]),
+            JobProgress::new("phases"),
+            6_100,
+        )
+        .await;
+        assert!(matches!(
+            mismatched,
+            Err(JobMutationError::OutputsUnproven(_))
+        ));
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Running);
+        assert!(stored.result.is_none());
     }
 
     // A live renewed external lease is a plain sweep Skip, never routed to reconcile.

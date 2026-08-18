@@ -133,6 +133,8 @@ pub const JOB_ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const JOB_RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+/// Signed immutable output records, keyed by ExecutionId.
+pub const JOB_OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
 pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
 pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 pub const ROCRATE_JOB_STATE_KEYSPACE: &str = "rocrate_job_state";

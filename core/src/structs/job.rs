@@ -775,6 +775,8 @@ impl JobPayload {
     }
 }
 
+const ATTEMPT_FENCE_DOMAIN: &[u8] = b"aruna-attempt-fence-v1";
+
 /// Deterministic external identity of one attempt, recorded write-ahead before any
 /// external submit so a lost attempt can be adopted by name on reconcile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -797,9 +799,24 @@ pub struct AttemptControl {
     pub tombstone_ref: Option<String>,
     /// Write-ahead output commit identities of this physical execution.
     pub output_commits: Vec<OutputCommitIntent>,
+    /// Digest of this execution's durable signed [`ExecutionOutputRecord`].
+    /// Terminal success reads it in its own transaction, so an execution can
+    /// never succeed before its exact output set is durable.
+    pub output_record: Option<[u8; 32]>,
 }
 
 impl AttemptControl {
+    /// Local fence this execution's output record binds itself to until the
+    /// family rounds publish a real [`ExecutionReceipt`] to bind instead.
+    pub fn fence_digest(&self, job_id: JobId) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ATTEMPT_FENCE_DOMAIN);
+        hasher.update(&job_id.to_bytes());
+        hasher.update(&self.attempt_epoch.to_be_bytes());
+        hasher.update(&self.execution_id.to_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -908,6 +925,9 @@ pub enum JobResultPayload {
         outputs: Vec<OutputObject>,
         stdout: String,
         stderr: String,
+        /// Digest of the durable signed output record. Present exactly on a
+        /// terminal success, which cannot commit without it.
+        output_digest: Option<[u8; 32]>,
     },
     RunCrate {
         resource: String,
@@ -968,6 +988,45 @@ impl JobResultPayload {
         Ok(())
     }
 
+    /// The storage-level success invariant: every output names a version this
+    /// execution reserved before writing, and the exact immutable output record
+    /// is already durable under the digest the result names.
+    pub fn proves_outputs(&self, control: &AttemptControl) -> Result<(), JobRecordError> {
+        let JobResultPayload::Execution {
+            outputs,
+            output_digest,
+            ..
+        } = self
+        else {
+            return Err(JobRecordError::OutputIdentity);
+        };
+        self.check_outputs(control.execution_id)?;
+        let reserved: BTreeSet<(&str, &str, Ulid)> = control
+            .output_commits
+            .iter()
+            .map(|commit| {
+                (
+                    commit.bucket.as_str(),
+                    commit.key.as_str(),
+                    commit.version_id,
+                )
+            })
+            .collect();
+        if outputs.iter().any(|output| {
+            !reserved.contains(&(
+                output.bucket.as_str(),
+                output.key.as_str(),
+                output.version_id,
+            ))
+        }) {
+            return Err(JobRecordError::OutputIdentity);
+        }
+        match control.output_record.is_some() && *output_digest == control.output_record {
+            true => Ok(()),
+            false => Err(JobRecordError::MissingEvidence(JobRecordKind::Output)),
+        }
+    }
+
     /// Payload-specific public projection returned by the REST surface.
     pub fn to_public_json(&self) -> serde_json::Value {
         match self {
@@ -980,11 +1039,13 @@ impl JobResultPayload {
                 outputs,
                 stdout,
                 stderr,
+                output_digest,
             } => serde_json::json!({
                 "exit_code": exit_code,
                 "workspace_bucket": workspace_bucket,
                 "stdout": stdout,
                 "stderr": stderr,
+                "output_record": output_digest.map(hex::encode),
                 "outputs": outputs
                     .iter()
                     .map(|output| serde_json::json!({
@@ -3935,6 +3996,7 @@ mod tests {
             outputs,
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         }
     }
 
@@ -3971,17 +4033,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reservation_is_stable() {
-        // A replayed capture must reuse the reserved VersionId, never mint a second.
-        let mut control = AttemptControl {
+    fn sample_control() -> AttemptControl {
+        AttemptControl {
             attempt_epoch: 3,
             execution_id: Ulid::from_bytes([13u8; 16]),
             controller_generation: 1,
             bound_token: None,
             tombstone_ref: None,
             output_commits: Vec::new(),
-        };
+            output_record: None,
+        }
+    }
+
+    #[test]
+    fn success_needs_record() {
+        // Success must observe a durable output record and a reserved version
+        // for every object, so an unproven result can never commit.
+        let mut control = sample_control();
+        let output = sample_output();
+        let mut result = execution_result(vec![output.clone()]);
+
+        assert_eq!(
+            result.proves_outputs(&control),
+            Err(JobRecordError::OutputIdentity)
+        );
+
+        control.output_commits.push(OutputCommitIntent {
+            bucket: output.bucket.clone(),
+            key: output.key.clone(),
+            version_id: output.version_id,
+        });
+        assert_eq!(
+            result.proves_outputs(&control),
+            Err(JobRecordError::MissingEvidence(JobRecordKind::Output))
+        );
+
+        let digest = [7u8; 32];
+        control.output_record = Some(digest);
+        assert_eq!(
+            result.proves_outputs(&control),
+            Err(JobRecordError::MissingEvidence(JobRecordKind::Output))
+        );
+
+        if let JobResultPayload::Execution { output_digest, .. } = &mut result {
+            *output_digest = Some(digest);
+        }
+        assert_eq!(result.proves_outputs(&control), Ok(()));
+    }
+
+    #[test]
+    fn success_rejects_foreign() {
+        // A version another writer produced under the same key is not this
+        // execution's output, even when the key was reserved.
+        let mut control = sample_control();
+        let output = sample_output();
+        control.output_commits.push(OutputCommitIntent {
+            bucket: output.bucket.clone(),
+            key: output.key.clone(),
+            version_id: Ulid::from_bytes([9u8; 16]),
+        });
+        control.output_record = Some([7u8; 32]);
+        let mut result = execution_result(vec![output]);
+        if let JobResultPayload::Execution { output_digest, .. } = &mut result {
+            *output_digest = Some([7u8; 32]);
+        }
+
+        assert_eq!(
+            result.proves_outputs(&control),
+            Err(JobRecordError::OutputIdentity)
+        );
+    }
+
+    #[test]
+    fn empty_success_needs_record() {
+        // Even an empty output set is a claim: it needs its durable record.
+        let mut control = sample_control();
+        let mut result = execution_result(Vec::new());
+        assert_eq!(
+            result.proves_outputs(&control),
+            Err(JobRecordError::MissingEvidence(JobRecordKind::Output))
+        );
+        control.output_record = Some([3u8; 32]);
+        if let JobResultPayload::Execution { output_digest, .. } = &mut result {
+            *output_digest = Some([3u8; 32]);
+        }
+        assert_eq!(result.proves_outputs(&control), Ok(()));
+    }
+
+    #[test]
+    fn reservation_is_stable() {
+        // A replayed capture must reuse the reserved VersionId, never mint a second.
+        let mut control = sample_control();
         let destinations = vec![
             ("dest".to_string(), "out/a.txt".to_string()),
             ("dest".to_string(), "out/b.txt".to_string()),

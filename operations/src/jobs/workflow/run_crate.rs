@@ -580,6 +580,7 @@ mod tests {
             }],
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         });
         (record, spec)
     }

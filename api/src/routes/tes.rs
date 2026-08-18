@@ -10,8 +10,8 @@ use aruna_core::compute::{
 };
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState, OutputDestination, OutputSelection,
-    blob_group_permission_path,
+    JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
+    OutputSelection, blob_group_permission_path,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
@@ -463,7 +463,7 @@ pub async fn service_info(
     path = "/ga4gh/tes/v1/tasks",
     tag = "tes",
     summary = "Create a TES task",
-    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 512 outputs; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id.",
+    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound the immutable output record carries; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id.",
     request_body(
         content = TesTask,
         description = "Task definition: one executor, s3:// inputs and outputs, and optional resources and tags",
@@ -948,7 +948,7 @@ fn map_task_to_spec(
         }
         inputs.push(input);
     }
-    if task.outputs.len() > MAX_TASK_IO {
+    if task.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(TesError::bad_request("too many task outputs"));
     }
     let mut file_outputs: Vec<OutputSelection> = Vec::with_capacity(task.outputs.len());
@@ -1894,6 +1894,7 @@ mod tests {
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         });
         let terminal = build_task_log(&record, "");
         assert_eq!(terminal.logs.len(), 1);
@@ -1951,7 +1952,7 @@ mod tests {
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
 
         let mut task = sample_task(group);
-        task.outputs = vec![task.outputs[0].clone(); MAX_TASK_IO + 1];
+        task.outputs = vec![task.outputs[0].clone(); MAX_EXECUTION_OUTPUTS + 1];
         let error = map_task_to_spec(&task, None, true).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
@@ -2336,6 +2337,7 @@ mod tests {
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         });
         assert_eq!(tes_state(&record), TesState::ExecutorError);
         if let Some(JobResultPayload::Execution { exit_code, .. }) = &mut record.result {
@@ -2386,6 +2388,7 @@ mod tests {
             }],
             stdout: "hello".to_string(),
             stderr: "error".to_string(),
+            output_digest: None,
         });
 
         let minimal = project_task(&record, TesView::Minimal, "http://x");

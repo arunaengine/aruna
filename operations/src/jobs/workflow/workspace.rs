@@ -10,11 +10,11 @@ use aruna_core::compute::{
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec, InputMode,
-    InputSelection, InputSource, JobError, JobRecord, OutputDestination, OutputObject,
-    OutputSelection, PathRestriction, Permission, UserAccess, WorkspaceMode,
-    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
-    ensure_confined_relative_path, workspace_credential_id,
+    AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
+    InputMode, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
+    OutputDestination, OutputObject, OutputSelection, PathRestriction, Permission, UserAccess,
+    WorkspaceMode, blob_bucket_permission_path, blob_group_permission_path,
+    blob_object_permission_path, ensure_confined_relative_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -39,7 +39,6 @@ use crate::s3::put_object::{
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
-const MAX_OUTPUT_MANIFEST_OBJECTS: usize = 10_000;
 
 /// Minted workspace S3 credential handed to the container.
 pub struct WorkspaceCredential {
@@ -487,9 +486,9 @@ pub async fn capture_outputs(
     for declared in &spec.file_outputs {
         selections.extend(resolve_output(backend, fence, declared).await?);
     }
-    if selections.len() > MAX_OUTPUT_MANIFEST_OBJECTS {
+    if selections.len() > MAX_EXECUTION_OUTPUTS {
         return Err(JobError::permanent(format!(
-            "output manifest exceeds {MAX_OUTPUT_MANIFEST_OBJECTS} objects"
+            "output manifest exceeds {MAX_EXECUTION_OUTPUTS} objects"
         )));
     }
     let destinations: Vec<(String, String)> = selections.iter().map(destination_of).collect();
@@ -1000,20 +999,22 @@ fn staged_content_matches(
         )
 }
 
-/// Inventory the declared output prefixes in the workspace at completion. Missing
-/// prefixes contribute nothing; no declarations produce an empty manifest. Every
-/// inventoried object is stamped with its exact current version.
+/// Attribute this execution's outputs under the declared prefixes. A listed key
+/// counts only when this execution durably reserved its VersionId before
+/// writing: the current head may belong to a duplicate execution or to an
+/// unrelated later write, and stamping it here would forge provenance.
 pub async fn collect_outputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     bucket: &str,
-    execution_id: Ulid,
+    control: &AttemptControl,
 ) -> Result<Vec<OutputObject>, JobError> {
     if spec.output_prefixes.is_empty() {
         return Ok(Vec::new());
     }
     let mut outputs = Vec::new();
     let mut keys = HashSet::new();
+    let mut foreign = 0usize;
     for prefix in &spec.output_prefixes {
         let mut continuation = None;
         loop {
@@ -1034,13 +1035,18 @@ pub async fn collect_outputs(
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
             let Some(result) = result else { break };
             for object in result.objects {
-                // Identity, size, and digest all come from one head, so they
-                // cannot describe two different versions of the same key.
-                let Some((version_id, location)) =
-                    Box::pin(head_version(context, bucket, &object.head.key)).await?
-                else {
+                let key = object.head.key;
+                let Some(version_id) = reserved_version(control, bucket, &key) else {
+                    foreign += 1;
                     continue;
                 };
+                let location = Box::pin(head_version(context, bucket, &key, version_id))
+                    .await?
+                    .ok_or_else(|| {
+                        JobError::permanent(format!(
+                            "reserved output {bucket}/{key} version {version_id} is absent"
+                        ))
+                    })?;
                 let (size, digest) = match location {
                     Some(location) => (location.blob_size, location.get_blake3().map(hex_encode)),
                     None => (0, None),
@@ -1050,9 +1056,9 @@ pub async fn collect_outputs(
                     &mut keys,
                     OutputObject {
                         bucket: bucket.to_string(),
-                        key: object.head.key,
+                        key,
                         version_id,
-                        execution_id,
+                        execution_id: control.execution_id,
                         container_path: String::new(),
                         size,
                         digest,
@@ -1065,21 +1071,42 @@ pub async fn collect_outputs(
             }
         }
     }
+    if foreign > 0 {
+        tracing::debug!(
+            bucket = %bucket,
+            execution_id = %control.execution_id,
+            foreign,
+            "Skipped prefix objects this execution did not write"
+        );
+    }
     Ok(outputs)
 }
 
-/// Exact current version of one inventoried object with its stored location, or
-/// `None` when the object vanished between listing and capture.
+/// Version this execution reserved for `bucket`/`key` before writing, or `None`
+/// when the object under that key was produced by another writer. This is the
+/// only thing that attributes a workspace object to an execution.
+fn reserved_version(control: &AttemptControl, bucket: &str, key: &str) -> Option<Ulid> {
+    control
+        .output_commits
+        .iter()
+        .find(|commit| commit.bucket == bucket && commit.key == key)
+        .map(|commit| commit.version_id)
+}
+
+/// Stored location of one reserved output version, or `None` when that exact
+/// version does not exist. The head is read by VersionId, never by current
+/// head, so a concurrent write cannot substitute its own bytes here.
 async fn head_version(
     context: &DriverContext,
     bucket: &str,
     key: &str,
-) -> Result<Option<(Ulid, Option<BackendLocation>)>, JobError> {
+    version_id: Ulid,
+) -> Result<Option<Option<BackendLocation>>, JobError> {
     match Box::pin(drive(
         HeadObjectOperation::new(HeadObjectInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            version_id: None,
+            version_id: Some(version_id),
         }),
         context,
     ))
@@ -1087,9 +1114,9 @@ async fn head_version(
     .and_then(|result| result.transpose())
     {
         Ok(Some(result)) => match result.version_id {
-            Some(version_id) if !version_id.is_nil() => Ok(Some((version_id, result.location))),
+            Some(found) if found == version_id => Ok(Some(result.location)),
             _ => Err(JobError::permanent(format!(
-                "inventoried output {bucket}/{key} has no exact version"
+                "output {bucket}/{key} does not carry reserved version {version_id}"
             ))),
         },
         Ok(None)
@@ -1136,9 +1163,9 @@ fn insert_output(
     if !keys.insert((output.bucket.clone(), output.key.clone())) {
         return Ok(());
     }
-    if outputs.len() >= MAX_OUTPUT_MANIFEST_OBJECTS {
+    if outputs.len() >= MAX_EXECUTION_OUTPUTS {
         return Err(JobError::permanent(format!(
-            "output manifest exceeds {MAX_OUTPUT_MANIFEST_OBJECTS} objects"
+            "output manifest exceeds {MAX_EXECUTION_OUTPUTS} objects"
         )));
     }
     outputs.push(output);
@@ -1162,7 +1189,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, JobErrorKind, JobId, JobPayload,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        OutputCommitIntent, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -1271,11 +1298,70 @@ mod tests {
         };
 
         assert!(
-            collect_outputs(&context, &spec(Vec::new()), "workspace", Ulid::generate())
-                .await
-                .unwrap()
-                .is_empty()
+            collect_outputs(
+                &context,
+                &spec(Vec::new()),
+                "workspace",
+                &control(Vec::new())
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
+    }
+
+    fn control(output_commits: Vec<OutputCommitIntent>) -> AttemptControl {
+        AttemptControl {
+            attempt_epoch: 1,
+            execution_id: Ulid::from_bytes([9; 16]),
+            controller_generation: 1,
+            bound_token: None,
+            tombstone_ref: None,
+            output_commits,
+            output_record: None,
+        }
+    }
+
+    #[test]
+    fn attributes_reserved_only() {
+        // A duplicate execution's head under the same key, an unrelated later
+        // write, and another bucket all stay unattributed.
+        let version = Ulid::from_bytes([5; 16]);
+        let reserved = control(vec![OutputCommitIntent {
+            bucket: "workspace".to_string(),
+            key: "reports/a.txt".to_string(),
+            version_id: version,
+        }]);
+
+        assert_eq!(
+            reserved_version(&reserved, "workspace", "reports/a.txt"),
+            Some(version)
+        );
+        assert_eq!(
+            reserved_version(&reserved, "workspace", "reports/b.txt"),
+            None
+        );
+        assert_eq!(reserved_version(&reserved, "other", "reports/a.txt"), None);
+        assert_eq!(
+            reserved_version(&control(Vec::new()), "workspace", "reports/a.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicates_keep_versions() {
+        // Two executions writing one key reserve two versions, so neither can
+        // be attributed to the other.
+        let destinations = vec![("workspace".to_string(), "reports/a.txt".to_string())];
+        let mut first = control(Vec::new());
+        let mut second = control(Vec::new());
+        second.execution_id = Ulid::from_bytes([10; 16]);
+        first.reserve_outputs(&destinations, Ulid::generate);
+        second.reserve_outputs(&destinations, Ulid::generate);
+
+        let left = reserved_version(&first, "workspace", "reports/a.txt").unwrap();
+        let right = reserved_version(&second, "workspace", "reports/a.txt").unwrap();
+        assert_ne!(left, right);
     }
 
     struct CredentialFixture {
@@ -1600,13 +1686,13 @@ mod tests {
 
     #[test]
     fn merge_enforces_limit() {
-        let inventoried: Vec<_> = (0..MAX_OUTPUT_MANIFEST_OBJECTS)
+        let inventoried: Vec<_> = (0..MAX_EXECUTION_OUTPUTS)
             .map(|index| output(&index.to_string()))
             .collect();
 
         // A duplicate is absorbed, so a full inventory still merges.
         let merged = merge_outputs(inventoried.clone(), vec![output("0")]).unwrap();
-        assert_eq!(merged.len(), MAX_OUTPUT_MANIFEST_OBJECTS);
+        assert_eq!(merged.len(), MAX_EXECUTION_OUTPUTS);
 
         let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
@@ -1686,12 +1772,12 @@ mod tests {
     fn output_limit_errors() {
         let mut outputs = Vec::new();
         let mut keys = HashSet::new();
-        for index in 0..MAX_OUTPUT_MANIFEST_OBJECTS {
+        for index in 0..MAX_EXECUTION_OUTPUTS {
             insert_output(&mut outputs, &mut keys, output(&index.to_string())).unwrap();
         }
         insert_output(&mut outputs, &mut keys, output("0")).unwrap();
         let error = insert_output(&mut outputs, &mut keys, output("overflow")).unwrap_err();
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
-        assert_eq!(outputs.len(), MAX_OUTPUT_MANIFEST_OBJECTS);
+        assert_eq!(outputs.len(), MAX_EXECUTION_OUTPUTS);
     }
 }

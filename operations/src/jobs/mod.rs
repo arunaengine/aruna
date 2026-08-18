@@ -6,6 +6,7 @@ pub mod export;
 pub mod harvest;
 pub mod import;
 pub mod metadata_class;
+pub mod output_record;
 pub mod persistent_id;
 pub(crate) mod protocol;
 pub mod prune;
