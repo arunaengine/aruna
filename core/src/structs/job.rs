@@ -1701,6 +1701,8 @@ pub enum JobRecordError {
     PlacementMismatch,
     #[error("a {0:?} record may only be published by its one permitted author")]
     WrongPublisher(JobRecordKind),
+    #[error("a {0:?} record requires a publisher the local view still holds authority for")]
+    NotHolder(JobRecordKind),
     #[error("record digest does not reproduce from its own canonical bytes")]
     DigestMismatch,
     #[error("a verified {0:?} record is required to authorize this record")]
@@ -2475,32 +2477,91 @@ impl JobFamilyRecord {
     }
 }
 
-/// Verified evidence a holder already retains. Every field comes from an earlier
-/// verified record, never from the peer that relayed the record under check.
+/// The verifying node's authenticated local view of who may author records of
+/// this family: its current realm membership and the unconflicted holders of the
+/// family placement. A valid realm key proves identity, never holder authority.
+///
+/// A node whose local placement view is missing or conflicted must defer
+/// verification rather than present an empty view: an empty view grants nothing,
+/// so every holder-authored record would be refused instead of retried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HolderView<'a> {
+    /// Sync-eligible nodes of the verifier's current replicated realm config.
+    pub members: &'a [NodeId],
+    /// Current holders of the family placement, resolved over its activated map.
+    pub holders: &'a [NodeId],
+}
+
+impl HolderView<'_> {
+    /// Both are required: an activated candidate map may still rank a node that
+    /// has since left the realm.
+    fn grants(&self, node: NodeId) -> bool {
+        self.holders.contains(&node) && self.members.contains(&node)
+    }
+}
+
+/// A node's evidence about its own locally fenced execution, presented while no
+/// replicated launch chain exists. It authorizes that node's own output record
+/// and nothing else, and every field is a documented stand-in for the record the
+/// distributed rounds publish instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalExecution {
+    /// The verifying node itself; a caller never fills this in for a peer.
+    pub node_id: NodeId,
+    pub execution_id: Ulid,
+    /// Local attempt fence digest standing in for the receipt digest.
+    pub fence_digest: [u8; 32],
+    /// Local plan digest standing in for the sealed spec digest.
+    pub spec_digest: [u8; 32],
+}
+
+/// Verified evidence a holder already retains, plus the local view authority is
+/// judged against. Every field comes from the verifier's own state, never from
+/// the peer that relayed the record under check.
 #[derive(Clone, Copy, Debug)]
 pub struct JobRecordContext<'a> {
     pub realm_id: RealmId,
     pub family: JobFamilyId,
     /// Family placement derived from the submission id and the realm strategy.
     pub placement: PlacementRef,
+    pub view: HolderView<'a>,
     pub spec: Option<&'a LogicalJobSpec>,
     pub budget: Option<&'a WitnessBudgetRecord>,
     pub launch: Option<&'a LaunchIntent>,
     pub receipt: Option<&'a ExecutionReceipt>,
+    pub local: Option<&'a LocalExecution>,
 }
 
 impl<'a> JobRecordContext<'a> {
+    /// Fail-closed: the view starts empty, so a caller that forgets to resolve
+    /// holders proves no authority instead of accepting every publisher.
     pub fn new(realm_id: RealmId, family: JobFamilyId, placement: PlacementRef) -> Self {
         Self {
             realm_id,
             family,
             placement,
+            view: HolderView::default(),
             spec: None,
             budget: None,
             launch: None,
             receipt: None,
+            local: None,
         }
     }
+}
+
+/// Outcome of verifying one record against the local view. Only `Authentic` may
+/// be appended, projected, and relayed as replicated authority; `MissingEvidence`
+/// belongs in the bounded pending path until its predecessor is verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordVerdict {
+    Authentic,
+    /// Proven only against this node's own fenced execution: no replicated
+    /// launch chain backs it, so it stays local and never relays as authority.
+    LocalEvidence,
+    /// The named predecessor is not verified locally yet. The record is neither
+    /// authentic nor forged, so it is retained pending, never projected.
+    MissingEvidence(JobRecordKind),
 }
 
 /// The authenticated envelope every replicated job record travels in, kept
@@ -2574,10 +2635,10 @@ impl JobRecordEnvelope {
         claim_bytes(self.realm_id, &self.record)
     }
 
-    /// The single ingest gate: realm and family binding, publisher signature, and
-    /// the record kind's exact author rule. A holder that only relays a record
-    /// never satisfies any of the author rules.
-    pub fn verify(&self, context: &JobRecordContext<'_>) -> Result<(), JobRecordError> {
+    /// The single ingest gate: realm and family binding, publisher signature, the
+    /// record kind's exact author rule, and the authority the local view grants
+    /// that author. A holder that only relays a record satisfies no author rule.
+    pub fn verify(&self, context: &JobRecordContext<'_>) -> Result<RecordVerdict, JobRecordError> {
         if self.realm_id != context.realm_id {
             return Err(JobRecordError::RealmMismatch);
         }
@@ -2610,13 +2671,27 @@ impl JobRecordEnvelope {
         }
     }
 
+    /// Holder-authored kinds require a publisher the accepting node's own view
+    /// still ranks as a family holder. Identity alone authorizes nothing.
+    fn holder(
+        &self,
+        kind: JobRecordKind,
+        context: &JobRecordContext<'_>,
+    ) -> Result<(), JobRecordError> {
+        match context.view.grants(self.published_by) {
+            true => Ok(()),
+            false => Err(JobRecordError::NotHolder(kind)),
+        }
+    }
+
     /// Only the committing family holder that minted the alias publishes a spec.
     fn verify_spec(
         &self,
         spec: &LogicalJobSpec,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
+    ) -> Result<RecordVerdict, JobRecordError> {
         self.author(spec.origin_node_id, JobRecordKind::Spec)?;
+        self.holder(JobRecordKind::Spec, context)?;
         if spec.realm_id != context.realm_id {
             return Err(JobRecordError::RealmMismatch);
         }
@@ -2625,23 +2700,25 @@ impl JobRecordEnvelope {
         }
         spec.verify_digest()?;
         spec.admission_binds()?;
-        Ok(spec.retry.validate()?)
+        spec.retry.validate()?;
+        Ok(RecordVerdict::Authentic)
     }
 
     fn verify_claim(
         &self,
         claim: &SubmissionClaim,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
+    ) -> Result<RecordVerdict, JobRecordError> {
         self.author(claim.committing_node_id, JobRecordKind::Claim)?;
+        self.holder(JobRecordKind::Claim, context)?;
         let Some(spec) = context.spec else {
-            return Ok(());
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Spec));
         };
         match claim.job_id == spec.job_id
             && claim.spec_digest == spec.spec_digest
             && claim.committing_node_id == spec.origin_node_id
         {
-            true => Ok(()),
+            true => Ok(RecordVerdict::Authentic),
             false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec)),
         }
     }
@@ -2650,36 +2727,48 @@ impl JobRecordEnvelope {
         &self,
         budget: &WitnessBudgetRecord,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
+    ) -> Result<RecordVerdict, JobRecordError> {
         self.author(budget.scheduler_node_id, JobRecordKind::Budget)?;
+        self.holder(JobRecordKind::Budget, context)?;
         if budget.max_launches == 0 {
             return Err(JobRecordError::Contract(JobContractError::EmptyRetry));
         }
         let Some(spec) = context.spec else {
-            return Ok(());
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Spec));
         };
         match budget.source_spec_digest == spec.spec_digest
             && budget.max_launches <= spec.retry.max_launches_per_witness
         {
-            true => Ok(()),
+            true => Ok(RecordVerdict::Authentic),
             false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec)),
         }
     }
 
+    /// An unreceipted launch is actionable only while its scheduler is a current
+    /// holder here. Once the target signed its exact receipt, that receipt is the
+    /// historical authority and a later placement change cannot revoke it.
     fn verify_launch(
         &self,
         launch: &LaunchIntent,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
+    ) -> Result<RecordVerdict, JobRecordError> {
         self.author(launch.scheduler_node_id, JobRecordKind::Launch)?;
-        if let Some(budget) = context.budget {
-            budget.admits(launch)?;
+        let digest = launch.digest()?;
+        let receipted = context.receipt.is_some_and(|receipt| {
+            receipt.launch_id == launch.launch_id && receipt.launch_digest == digest
+        });
+        if !receipted {
+            self.holder(JobRecordKind::Launch, context)?;
         }
         let Some(spec) = context.spec else {
-            return Ok(());
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Spec));
         };
+        let Some(budget) = context.budget else {
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Budget));
+        };
+        budget.admits(launch)?;
         match launch.spec_digest == spec.spec_digest && launch.job_id == spec.job_id {
-            true => Ok(()),
+            true => Ok(RecordVerdict::Authentic),
             false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec)),
         }
     }
@@ -2688,20 +2777,21 @@ impl JobRecordEnvelope {
         &self,
         receipt: &ExecutionReceipt,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
+    ) -> Result<RecordVerdict, JobRecordError> {
         self.author(receipt.executor_node_id, JobRecordKind::Receipt)?;
         if receipt.executor_node_id != receipt.target.node_id {
             return Err(JobRecordError::Inconsistent);
         }
         let Some(launch) = context.launch else {
-            return Ok(());
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Launch));
         };
         match receipt.launch_id == launch.launch_id
             && receipt.launch_digest == launch.digest()?
             && receipt.target == launch.target
+            && receipt.job_id == launch.job_id
             && receipt.spec_digest == launch.spec_digest
         {
-            true => Ok(()),
+            true => Ok(RecordVerdict::Authentic),
             false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Launch)),
         }
     }
@@ -2710,15 +2800,19 @@ impl JobRecordEnvelope {
         &self,
         update: &ExecutionUpdate,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
+    ) -> Result<RecordVerdict, JobRecordError> {
         self.author(update.executor_node_id, JobRecordKind::Update)?;
         let Some(receipt) = context.receipt else {
-            return Ok(());
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Receipt));
         };
+        // Sequence zero roots the chain at the receipt, which seals the target's
+        // membership and subject generations; later links chain by digest.
+        let rooted = update.sequence > 0 || update.previous_digest == receipt.digest()?;
         match update.execution_id == receipt.execution_id
             && update.executor_node_id == receipt.executor_node_id
+            && rooted
         {
-            true => Ok(()),
+            true => Ok(RecordVerdict::Authentic),
             false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt)),
         }
     }
@@ -2727,7 +2821,7 @@ impl JobRecordEnvelope {
         &self,
         output: &ExecutionOutputRecord,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
+    ) -> Result<RecordVerdict, JobRecordError> {
         self.author(output.executor_node_id, JobRecordKind::Output)?;
         if output
             .outputs
@@ -2738,40 +2832,66 @@ impl JobRecordEnvelope {
             return Err(JobRecordError::Inconsistent);
         }
         let Some(receipt) = context.receipt else {
-            return Ok(());
+            return Ok(self.local_output(output, context));
         };
         match output.execution_id == receipt.execution_id
             && output.executor_node_id == receipt.executor_node_id
+            && output.job_id == receipt.job_id
             && output.receipt_digest == receipt.digest()?
             && output.spec_digest == receipt.spec_digest
         {
-            true => Ok(()),
+            true => Ok(RecordVerdict::Authentic),
             false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt)),
         }
     }
 
+    /// Until the launch and receipt rounds exist, a node's own fenced attempt is
+    /// the only evidence behind its output record. It proves nothing about any
+    /// other publisher, so anything else stays pending on its receipt.
+    fn local_output(
+        &self,
+        output: &ExecutionOutputRecord,
+        context: &JobRecordContext<'_>,
+    ) -> RecordVerdict {
+        match context.local {
+            Some(local)
+                if local.node_id == output.executor_node_id
+                    && local.execution_id == output.execution_id
+                    && local.fence_digest == output.receipt_digest
+                    && local.spec_digest == output.spec_digest =>
+            {
+                RecordVerdict::LocalEvidence
+            }
+            _ => RecordVerdict::MissingEvidence(JobRecordKind::Receipt),
+        }
+    }
+
     /// Cancellation authority is defined against the sealed spec, so the spec is
-    /// required evidence and no bearer token ever replicates.
+    /// required evidence, the publisher is the family holder that checked the
+    /// caller's permission, and no bearer token ever replicates.
     fn verify_cancel(
         &self,
         cancel: &JobCancelRecord,
         context: &JobRecordContext<'_>,
-    ) -> Result<(), JobRecordError> {
-        let spec = context
-            .spec
-            .ok_or(JobRecordError::MissingEvidence(JobRecordKind::Spec))?;
+    ) -> Result<RecordVerdict, JobRecordError> {
+        self.holder(JobRecordKind::Cancel, context)?;
+        let Some(spec) = context.spec else {
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Spec));
+        };
         if cancel.spec_digest != spec.spec_digest || cancel.job_id != spec.job_id {
             return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec));
         }
-        if cancel.requested_by.realm_id != spec.realm_id {
+        if cancel.requested_by.is_nil() || cancel.requested_by.realm_id != spec.realm_id {
             return Err(JobRecordError::Unauthorized);
         }
         match cancel.authority {
             CancelAuthority::Submitter => match cancel.requested_by == spec.created_by {
-                true => Ok(()),
+                true => Ok(RecordVerdict::Authentic),
                 false => Err(JobRecordError::Unauthorized),
             },
-            CancelAuthority::GroupAdmin => Ok(()),
+            // The publishing holder's signature is its statement that it checked
+            // group cancel permission; the payload field alone grants nothing.
+            CancelAuthority::GroupAdmin => Ok(RecordVerdict::Authentic),
         }
     }
 }
@@ -3357,8 +3477,38 @@ mod tests {
         }
     }
 
-    fn context<'a>() -> JobRecordContext<'a> {
-        JobRecordContext::new(RealmId([8u8; 32]), family(), placement())
+    /// Owns what a borrowed [`HolderView`] points at: node 1 holds the family,
+    /// node 2 is a member that never held it, node 9 is the execution target.
+    struct LocalView {
+        members: Vec<NodeId>,
+        holders: Vec<NodeId>,
+    }
+
+    impl LocalView {
+        fn new() -> Self {
+            Self {
+                members: vec![node_id(1), node_id(2), node_id(9)],
+                holders: vec![node_id(1)],
+            }
+        }
+
+        /// The view after the family moved off its former holder.
+        fn moved() -> Self {
+            Self {
+                holders: vec![node_id(2)],
+                ..Self::new()
+            }
+        }
+
+        fn context(&self) -> JobRecordContext<'_> {
+            JobRecordContext {
+                view: HolderView {
+                    members: &self.members,
+                    holders: &self.holders,
+                },
+                ..JobRecordContext::new(RealmId([8u8; 32]), family(), placement())
+            }
+        }
     }
 
     fn envelope(record: JobFamilyRecord, seed: u8) -> JobRecordEnvelope {
@@ -3777,38 +3927,52 @@ mod tests {
 
     #[test]
     fn rejects_forged_author() {
+        let view = LocalView::new();
         let record = JobFamilyRecord::Spec(Box::new(sample_spec()));
-        assert_eq!(envelope(record.clone(), 1).verify(&context()), Ok(()));
+        assert_eq!(
+            envelope(record.clone(), 1).verify(&view.context()),
+            Ok(RecordVerdict::Authentic)
+        );
         // A relay restating the record signs with its own key and is refused.
         assert_eq!(
-            envelope(record.clone(), 2).verify(&context()),
+            envelope(record.clone(), 2).verify(&view.context()),
             Err(JobRecordError::WrongPublisher(JobRecordKind::Spec))
         );
         let mut restated = envelope(record, 2);
         restated.published_by = node_id(1);
         assert_eq!(
-            restated.verify(&context()),
+            restated.verify(&view.context()),
             Err(JobRecordError::BadSignature)
         );
     }
 
     #[test]
     fn rejects_forged_fields() {
+        let view = LocalView::new();
         let mut forged = envelope(JobFamilyRecord::Claim(sample_claim()), 1);
         let JobFamilyRecord::Claim(claim) = &mut forged.record else {
             unreachable!("claim record")
         };
         claim.accepted_at_ms = 0;
-        assert_eq!(forged.verify(&context()), Err(JobRecordError::BadSignature));
+        assert_eq!(
+            forged.verify(&view.context()),
+            Err(JobRecordError::BadSignature)
+        );
     }
 
     #[test]
     fn relay_keeps_publisher() {
         // Replication is transport: the envelope crosses a holder unchanged.
+        let view = LocalView::new();
+        let spec = sample_spec();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            ..view.context()
+        };
         let signed = envelope(JobFamilyRecord::Claim(sample_claim()), 1);
         let relayed = reencode(&signed);
         assert_eq!(relayed.published_by, node_id(1));
-        assert_eq!(relayed.verify(&context()), Ok(()));
+        assert_eq!(relayed.verify(&checked), Ok(RecordVerdict::Authentic));
         assert_eq!(relayed.key(), signed.key());
     }
 
@@ -3834,53 +3998,57 @@ mod tests {
 
     #[test]
     fn rejects_wrong_family() {
+        let view = LocalView::new();
         let mut foreign = sample_claim();
         foreign.request_digest = [44u8; 32];
         assert_eq!(
-            envelope(JobFamilyRecord::Claim(foreign), 1).verify(&context()),
+            envelope(JobFamilyRecord::Claim(foreign), 1).verify(&view.context()),
             Err(JobRecordError::FamilyMismatch)
         );
     }
 
     #[test]
     fn rejects_wrong_realm() {
+        let view = LocalView::new();
         let record = JobFamilyRecord::Claim(sample_claim());
         let elsewhere = JobRecordEnvelope::sign(RealmId([99u8; 32]), record, &secret(1)).unwrap();
         assert_eq!(
-            elsewhere.verify(&context()),
+            elsewhere.verify(&view.context()),
             Err(JobRecordError::RealmMismatch)
         );
         let mut spec = sample_spec();
         spec.realm_id = RealmId([99u8; 32]);
         let spec = spec.seal().unwrap();
         assert_eq!(
-            envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&context()),
+            envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&view.context()),
             Err(JobRecordError::RealmMismatch)
         );
     }
 
     #[test]
     fn rejects_foreign_placement() {
+        let view = LocalView::new();
         let mut spec = sample_spec();
         spec.placement = PlacementRef::NIL;
         let spec = spec.seal().unwrap();
         assert_eq!(
-            envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&context()),
+            envelope(JobFamilyRecord::Spec(Box::new(spec)), 1).verify(&view.context()),
             Err(JobRecordError::PlacementMismatch)
         );
     }
 
     #[test]
     fn binds_receipt_launch() {
+        let view = LocalView::new();
         let launch = sample_launch();
         let spec = sample_spec();
         let checked = JobRecordContext {
             spec: Some(&spec),
             launch: Some(&launch),
-            ..context()
+            ..view.context()
         };
         let signed = envelope(JobFamilyRecord::Receipt(Box::new(sample_receipt())), 9);
-        assert_eq!(signed.verify(&checked), Ok(()));
+        assert_eq!(signed.verify(&checked), Ok(RecordVerdict::Authentic));
 
         let mut drifted = sample_receipt();
         drifted.launch_digest = [1u8; 32];
@@ -3892,16 +4060,17 @@ mod tests {
 
     #[test]
     fn bounds_sealed_budget() {
+        let view = LocalView::new();
         let budget = sample_budget();
         let spec = sample_spec();
         let checked = JobRecordContext {
             spec: Some(&spec),
             budget: Some(&budget),
-            ..context()
+            ..view.context()
         };
         assert_eq!(
             envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1).verify(&checked),
-            Ok(())
+            Ok(RecordVerdict::Authentic)
         );
         let mut beyond = sample_launch();
         beyond.scheduler_seq = budget.max_launches;
@@ -3919,17 +4088,18 @@ mod tests {
     #[test]
     fn cancel_needs_spec() {
         // Cancellation authority is defined only against the sealed spec.
+        let view = LocalView::new();
         let signed = envelope(JobFamilyRecord::Cancel(sample_cancel()), 1);
         assert_eq!(
-            signed.verify(&context()),
-            Err(JobRecordError::MissingEvidence(JobRecordKind::Spec))
+            signed.verify(&view.context()),
+            Ok(RecordVerdict::MissingEvidence(JobRecordKind::Spec))
         );
         let spec = sample_spec();
         let checked = JobRecordContext {
             spec: Some(&spec),
-            ..context()
+            ..view.context()
         };
-        assert_eq!(signed.verify(&checked), Ok(()));
+        assert_eq!(signed.verify(&checked), Ok(RecordVerdict::Authentic));
 
         let mut stranger = sample_cancel();
         stranger.requested_by = user(8, 5);
@@ -3940,7 +4110,7 @@ mod tests {
         stranger.authority = CancelAuthority::GroupAdmin;
         assert_eq!(
             envelope(JobFamilyRecord::Cancel(stranger), 1).verify(&checked),
-            Ok(())
+            Ok(RecordVerdict::Authentic)
         );
         stranger.requested_by = user(9, 5);
         assert_eq!(
@@ -3952,6 +4122,377 @@ mod tests {
         assert_eq!(
             envelope(JobFamilyRecord::Cancel(replayed), 1).verify(&checked),
             Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec))
+        );
+    }
+
+    /// Every kind whose author must be a current family holder, signed by the
+    /// node its own payload names as author.
+    fn holder_records() -> Vec<(JobRecordKind, JobRecordEnvelope)> {
+        vec![
+            (
+                JobRecordKind::Spec,
+                envelope(JobFamilyRecord::Spec(Box::new(sample_spec())), 1),
+            ),
+            (
+                JobRecordKind::Claim,
+                envelope(JobFamilyRecord::Claim(sample_claim()), 1),
+            ),
+            (
+                JobRecordKind::Budget,
+                envelope(JobFamilyRecord::Budget(sample_budget()), 1),
+            ),
+            (
+                JobRecordKind::Launch,
+                envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1),
+            ),
+            (
+                JobRecordKind::Cancel,
+                envelope(JobFamilyRecord::Cancel(sample_cancel()), 1),
+            ),
+        ]
+    }
+
+    #[test]
+    fn rejects_non_holder() {
+        // A valid realm key proves identity; only the local view grants authority.
+        let view = LocalView::new();
+        let spec = sample_spec();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            ..view.context()
+        };
+        for (kind, signed) in holder_records() {
+            assert_eq!(signed.verify(&checked).map(|_| kind), Ok(kind));
+        }
+
+        // Node 2 is a realm member that never held this family.
+        let stranger = LocalView {
+            holders: vec![node_id(2)],
+            ..LocalView::new()
+        };
+        let outsider = JobRecordContext {
+            spec: Some(&spec),
+            ..stranger.context()
+        };
+        for (kind, signed) in holder_records() {
+            assert_eq!(
+                signed.verify(&outsider),
+                Err(JobRecordError::NotHolder(kind))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_former_holder() {
+        // A node the map still ranks but the realm no longer lists holds nothing.
+        let departed = LocalView {
+            members: vec![node_id(2), node_id(9)],
+            holders: vec![node_id(1)],
+        };
+        let spec = sample_spec();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            ..departed.context()
+        };
+        for (kind, signed) in holder_records() {
+            assert_eq!(
+                signed.verify(&checked),
+                Err(JobRecordError::NotHolder(kind))
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_receipted_launch() {
+        // The target's signed receipt is historical authority: the launch stays
+        // valid after the family moved off the scheduler that published it.
+        let moved = LocalView::moved();
+        let spec = sample_spec();
+        let budget = sample_budget();
+        let receipt = sample_receipt();
+        let signed = envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1);
+        let unreceipted = JobRecordContext {
+            spec: Some(&spec),
+            budget: Some(&budget),
+            ..moved.context()
+        };
+        assert_eq!(
+            signed.verify(&unreceipted),
+            Err(JobRecordError::NotHolder(JobRecordKind::Launch))
+        );
+        let checked = JobRecordContext {
+            receipt: Some(&receipt),
+            ..unreceipted
+        };
+        assert_eq!(signed.verify(&checked), Ok(RecordVerdict::Authentic));
+
+        // A receipt for another launch is not that authority.
+        let mut other = sample_receipt();
+        other.launch_id = Ulid::from_bytes([20u8; 16]);
+        assert_eq!(
+            signed.verify(&JobRecordContext {
+                receipt: Some(&other),
+                ..unreceipted
+            }),
+            Err(JobRecordError::NotHolder(JobRecordKind::Launch))
+        );
+    }
+
+    #[test]
+    fn holds_missing_evidence() {
+        // A dependent record arriving before its predecessor is pending, never
+        // authentic and never an error that would drop it.
+        let view = LocalView::new();
+        let bare = view.context();
+        let cases = [
+            (
+                envelope(JobFamilyRecord::Claim(sample_claim()), 1),
+                JobRecordKind::Spec,
+            ),
+            (
+                envelope(JobFamilyRecord::Budget(sample_budget()), 1),
+                JobRecordKind::Spec,
+            ),
+            (
+                envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1),
+                JobRecordKind::Spec,
+            ),
+            (
+                envelope(JobFamilyRecord::Receipt(Box::new(sample_receipt())), 9),
+                JobRecordKind::Launch,
+            ),
+            (
+                envelope(JobFamilyRecord::Update(Box::new(sample_update())), 9),
+                JobRecordKind::Receipt,
+            ),
+            (
+                envelope(JobFamilyRecord::Output(Box::new(output_record())), 9),
+                JobRecordKind::Receipt,
+            ),
+            (
+                envelope(JobFamilyRecord::Cancel(sample_cancel()), 1),
+                JobRecordKind::Spec,
+            ),
+        ];
+        for (signed, missing) in cases {
+            assert_eq!(
+                signed.verify(&bare),
+                Ok(RecordVerdict::MissingEvidence(missing)),
+                "{:?}",
+                signed.kind()
+            );
+        }
+        // The launch's own budget is required even once the spec is verified.
+        let spec = sample_spec();
+        assert_eq!(
+            envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1).verify(
+                &JobRecordContext {
+                    spec: Some(&spec),
+                    ..bare
+                }
+            ),
+            Ok(RecordVerdict::MissingEvidence(JobRecordKind::Budget))
+        );
+    }
+
+    #[test]
+    fn verdicts_ignore_order() {
+        // Every arrival order of the same valid records ends in the same verdict:
+        // absent evidence is pending, complete evidence is authentic.
+        let view = LocalView::new();
+        let spec = sample_spec();
+        let budget = sample_budget();
+        let launch = sample_launch();
+        let receipt = sample_receipt();
+        let signed = [
+            envelope(JobFamilyRecord::Claim(sample_claim()), 1),
+            envelope(JobFamilyRecord::Launch(Box::new(launch.clone())), 1),
+            envelope(JobFamilyRecord::Receipt(Box::new(receipt.clone())), 9),
+            envelope(JobFamilyRecord::Update(Box::new(sample_update())), 9),
+            envelope(JobFamilyRecord::Output(Box::new(output_record())), 9),
+        ];
+        for mask in 0..16u8 {
+            let context = JobRecordContext {
+                spec: (mask & 1 != 0).then_some(&spec),
+                budget: (mask & 2 != 0).then_some(&budget),
+                launch: (mask & 4 != 0).then_some(&launch),
+                receipt: (mask & 8 != 0).then_some(&receipt),
+                ..view.context()
+            };
+            for record in &signed {
+                let verdict = record.verify(&context).expect("valid records never error");
+                let complete = match record.kind() {
+                    JobRecordKind::Claim => mask & 1 != 0,
+                    JobRecordKind::Launch => mask & 3 == 3,
+                    JobRecordKind::Receipt => mask & 4 != 0,
+                    JobRecordKind::Update | JobRecordKind::Output => mask & 8 != 0,
+                    kind => unreachable!("{kind:?} is not part of this set"),
+                };
+                assert_eq!(
+                    verdict == RecordVerdict::Authentic,
+                    complete,
+                    "{:?} at mask {mask}",
+                    record.kind()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_target() {
+        // Only the node the scheduler named as target may receipt that launch.
+        let view = LocalView::new();
+        let spec = sample_spec();
+        let launch = sample_launch();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            launch: Some(&launch),
+            ..view.context()
+        };
+        let mut elsewhere = sample_receipt();
+        elsewhere.executor_node_id = node_id(2);
+        elsewhere.target = ExecutionTargetId {
+            node_id: node_id(2),
+            executor_kind: "docker".to_string(),
+        };
+        assert_eq!(
+            envelope(JobFamilyRecord::Receipt(Box::new(elsewhere.clone())), 2).verify(&checked),
+            Err(JobRecordError::EvidenceMismatch(JobRecordKind::Launch))
+        );
+        // A receipt naming another node as its own target contradicts itself.
+        let mut mismatched = sample_receipt();
+        mismatched.executor_node_id = node_id(2);
+        assert_eq!(
+            envelope(JobFamilyRecord::Receipt(Box::new(mismatched)), 2).verify(&checked),
+            Err(JobRecordError::Inconsistent)
+        );
+        assert_eq!(
+            envelope(JobFamilyRecord::Receipt(Box::new(elsewhere)), 9).verify(&checked),
+            Err(JobRecordError::WrongPublisher(JobRecordKind::Receipt))
+        );
+    }
+
+    #[test]
+    fn roots_update_chain() {
+        let view = LocalView::new();
+        let receipt = sample_receipt();
+        let checked = JobRecordContext {
+            receipt: Some(&receipt),
+            ..view.context()
+        };
+        assert_eq!(
+            envelope(JobFamilyRecord::Update(Box::new(sample_update())), 9).verify(&checked),
+            Ok(RecordVerdict::Authentic)
+        );
+        // The first update must root at the exact receipt it claims to follow.
+        let mut unrooted = sample_update();
+        unrooted.previous_digest = [5u8; 32];
+        assert_eq!(
+            envelope(JobFamilyRecord::Update(Box::new(unrooted)), 9).verify(&checked),
+            Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt))
+        );
+        let mut foreign = sample_update();
+        foreign.executor_node_id = node_id(2);
+        assert_eq!(
+            envelope(JobFamilyRecord::Update(Box::new(foreign)), 2).verify(&checked),
+            Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt))
+        );
+    }
+
+    #[test]
+    fn accepts_local_output() {
+        // A node's own fenced attempt validates its own output record while no
+        // launch chain exists; the same record from anyone else stays pending.
+        let view = LocalView::new();
+        let local = LocalExecution {
+            node_id: node_id(9),
+            execution_id: output_record().execution_id,
+            fence_digest: output_record().receipt_digest,
+            spec_digest: output_record().spec_digest,
+        };
+        let signed = envelope(JobFamilyRecord::Output(Box::new(output_record())), 9);
+        assert_eq!(
+            signed.verify(&JobRecordContext {
+                local: Some(&local),
+                ..view.context()
+            }),
+            Ok(RecordVerdict::LocalEvidence)
+        );
+        let other = LocalExecution {
+            execution_id: Ulid::from_bytes([21u8; 16]),
+            ..local
+        };
+        assert_eq!(
+            signed.verify(&JobRecordContext {
+                local: Some(&other),
+                ..view.context()
+            }),
+            Ok(RecordVerdict::MissingEvidence(JobRecordKind::Receipt))
+        );
+        // A published receipt outranks the local stand-in.
+        let receipt = sample_receipt();
+        assert_eq!(
+            signed.verify(&JobRecordContext {
+                local: Some(&local),
+                receipt: Some(&receipt),
+                ..view.context()
+            }),
+            Ok(RecordVerdict::Authentic)
+        );
+    }
+
+    #[test]
+    fn rejects_forged_cancel() {
+        // Selecting GroupAdmin or naming a submitter cannot create authority.
+        let view = LocalView::new();
+        let spec = sample_spec();
+        let checked = JobRecordContext {
+            spec: Some(&spec),
+            ..view.context()
+        };
+        let mut forged = sample_cancel();
+        forged.authority = CancelAuthority::GroupAdmin;
+        forged.requested_by = user(8, 9);
+        assert_eq!(
+            envelope(JobFamilyRecord::Cancel(forged), 2).verify(&checked),
+            Err(JobRecordError::NotHolder(JobRecordKind::Cancel))
+        );
+        let mut anonymous = sample_cancel();
+        anonymous.requested_by = UserId::new(Ulid::nil(), RealmId([8u8; 32]));
+        anonymous.authority = CancelAuthority::GroupAdmin;
+        assert_eq!(
+            envelope(JobFamilyRecord::Cancel(anonymous), 1).verify(&checked),
+            Err(JobRecordError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn rejects_family_replay() {
+        // One authentic record replayed into another realm or family is refused
+        // even when every local view would otherwise grant its publisher.
+        let view = LocalView::new();
+        let spec = sample_spec();
+        let signed = envelope(JobFamilyRecord::Claim(sample_claim()), 1);
+        let elsewhere = JobRecordContext {
+            spec: Some(&spec),
+            family: JobFamilyId {
+                submission_id: SubmissionId([7u8; 32]),
+                request_digest: [1u8; 32],
+            },
+            ..view.context()
+        };
+        assert_eq!(
+            signed.verify(&elsewhere),
+            Err(JobRecordError::FamilyMismatch)
+        );
+        let other_realm = JobRecordContext {
+            spec: Some(&spec),
+            realm_id: RealmId([99u8; 32]),
+            ..view.context()
+        };
+        assert_eq!(
+            signed.verify(&other_realm),
+            Err(JobRecordError::RealmMismatch)
         );
     }
 
@@ -4141,14 +4682,15 @@ mod tests {
 
     #[test]
     fn binds_output_receipt() {
+        let view = LocalView::new();
         let receipt = sample_receipt();
         let checked = JobRecordContext {
             receipt: Some(&receipt),
-            ..context()
+            ..view.context()
         };
         assert_eq!(
             envelope(JobFamilyRecord::Output(Box::new(output_record())), 9).verify(&checked),
-            Ok(())
+            Ok(RecordVerdict::Authentic)
         );
         let mut foreign = output_record();
         foreign.outputs = OutputSet::canonical(vec![OutputObject {
