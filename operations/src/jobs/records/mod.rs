@@ -79,3 +79,6 @@ pub enum RecordStoreError {
         got: String,
     },
 }
+
+#[cfg(test)]
+mod tests;

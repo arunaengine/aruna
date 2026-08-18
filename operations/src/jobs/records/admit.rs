@@ -155,6 +155,7 @@ fn cascade(
     plan: &mut AppendPlan,
 ) {
     let mut open: Vec<&(JobRecordKey, PendingRecord)> = retained.iter().collect();
+    let mut still: BTreeMap<JobRecordKey, PendingRecord> = BTreeMap::new();
     for _ in 0..retained.len() {
         let mut settled: Vec<JobRecordKey> = Vec::new();
         for (key, row) in open.iter() {
@@ -203,13 +204,16 @@ fn cascade(
                     plan.cleared.push(*key);
                     settled.push(*key);
                 }
+                // A record that stays pending keeps its row, with one more
+                // attempt spent, so an unresolvable one cannot be retried
+                // forever.
                 Admission::Pending(need) => {
                     let attempts = row.attempts.saturating_add(1);
                     if attempts >= MAX_PENDING_ATTEMPTS {
                         plan.cleared.push(*key);
                         settled.push(*key);
-                    } else if need != row.need {
-                        plan.pending.push((
+                    } else {
+                        still.insert(
                             *key,
                             PendingRecord {
                                 envelope: row.envelope.clone(),
@@ -217,16 +221,21 @@ fn cascade(
                                 first_seen_ms: row.first_seen_ms,
                                 attempts,
                             },
-                        ));
+                        );
                     }
                 }
             }
         }
         if settled.is_empty() {
-            return;
+            break;
         }
         open.retain(|(key, _)| !settled.contains(key));
     }
+    plan.pending.extend(
+        still
+            .into_iter()
+            .filter(|(key, _)| !plan.cleared.contains(key) && !visible.contains_key(key)),
+    );
 }
 
 /// The single ingest gate for one record: idempotent replay, retained conflict,

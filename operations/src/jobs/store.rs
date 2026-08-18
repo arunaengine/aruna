@@ -29,8 +29,8 @@ use ulid::Ulid;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS};
 use crate::queue_backoff::queue_retry_after_ms;
 
-type JobWrites = Vec<(KeySpace, Key, Value)>;
-type JobDeletes = Vec<(KeySpace, Key)>;
+pub(super) type JobWrites = Vec<(KeySpace, Key, Value)>;
+pub(super) type JobDeletes = Vec<(KeySpace, Key)>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactTombstone {
@@ -209,7 +209,9 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
     deletes
 }
 
-fn index_deltas(
+/// Row plus index changes of one job-state transition. Every writer of a job
+/// row goes through this, so the schedule and active-user indexes never drift.
+pub(super) fn index_deltas(
     old: &JobRecord,
     new: &JobRecord,
 ) -> Result<(JobWrites, JobDeletes), ConversionError> {

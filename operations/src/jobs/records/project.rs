@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     JobFamilyId, JobId, JobProjection, JobRecord, JobRecordEnvelope, JobRecordKey, JobState,
-    LogicalJobState, job_record_key,
+    LogicalJobState, job_record_key, validate_transition,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -21,6 +21,7 @@ use super::keys::{alias_family, alias_prefix, family_prefix, record_key};
 use super::reduce::reduce_family;
 use super::rows::{ProjectionCache, from_bytes, to_bytes};
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
+use crate::jobs::store::{JobDeletes, JobWrites, index_deltas};
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;
@@ -64,6 +65,7 @@ pub struct ProjectFamilyOperation {
     cursor: Option<JobRecordKey>,
     truncated: bool,
     projection: Option<JobProjection>,
+    bridged: JobDeletes,
     state: ProjectState,
     outcome: Option<Result<ProjectedFamily, RecordStoreError>>,
 }
@@ -77,6 +79,7 @@ enum ProjectState {
     Page { txn_id: TxnId },
     ReadJobs { txn_id: TxnId },
     Write { txn_id: TxnId },
+    Clear { txn_id: TxnId },
     Commit { txn_id: TxnId },
     Finish,
     Error,
@@ -95,6 +98,7 @@ impl ProjectFamilyOperation {
             cursor: None,
             truncated: false,
             projection: None,
+            bridged: Vec::new(),
             state: ProjectState::Init,
             outcome: None,
         }
@@ -161,7 +165,7 @@ impl ProjectFamilyOperation {
             .map(|job_id| (JOB_KEYSPACE.to_string(), job_record_key(*job_id)))
             .collect();
         if reads.is_empty() {
-            return self.write(txn_id, Vec::new());
+            return self.write(txn_id, Vec::new(), Vec::new());
         }
         self.state = ProjectState::ReadJobs { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -171,20 +175,23 @@ impl ProjectFamilyOperation {
     }
 
     /// Bridges the reduced state into the mutable job rows this node keeps as a
-    /// local cache. A row that already settled terminally is left untouched.
-    fn bridge(&self, values: Vec<(Key, Option<Value>)>) -> Vec<(String, Key, Value)> {
+    /// local cache. A row that already settled terminally, or whose local state
+    /// machine forbids the transition, is left untouched, and the schedule
+    /// indexes move with the row through the shared job-store deltas.
+    fn bridge(&self, values: Vec<(Key, Option<Value>)>) -> (JobWrites, JobDeletes) {
+        let mut writes: JobWrites = Vec::new();
+        let mut deletes: JobDeletes = Vec::new();
         let Some(projection) = self.projection.as_ref() else {
-            return Vec::new();
+            return (writes, deletes);
         };
         let Some(state) = bridged_state(projection.state) else {
-            return Vec::new();
+            return (writes, deletes);
         };
-        let mut writes = Vec::new();
-        for (key, value) in values {
+        for (_, value) in values {
             let Some(value) = value else {
                 continue;
             };
-            let Ok(mut record) = JobRecord::from_bytes(&value) else {
+            let Ok(record) = JobRecord::from_bytes(&value) else {
                 continue;
             };
             if record.state.is_terminal()
@@ -192,18 +199,28 @@ impl ProjectFamilyOperation {
             {
                 continue;
             }
-            record.state = state;
-            record.cancel_requested |= projection.cancel_requested;
-            record.updated_at_ms = self.config.now_ms;
-            let Ok(bytes) = record.to_bytes() else {
+            if record.state != state
+                && validate_transition(record.execution_class, record.state, state).is_err()
+            {
+                continue;
+            }
+            let mut bridged = record.clone();
+            bridged.state = state;
+            bridged.cancel_requested |= projection.cancel_requested;
+            bridged.updated_at_ms = self.config.now_ms;
+            if state.is_terminal() && bridged.finished_at_ms.is_none() {
+                bridged.finished_at_ms = Some(self.config.now_ms);
+            }
+            let Ok((row_writes, row_deletes)) = index_deltas(&record, &bridged) else {
                 continue;
             };
-            writes.push((JOB_KEYSPACE.to_string(), key, Value::from(bytes.as_slice())));
+            writes.extend(row_writes);
+            deletes.extend(row_deletes);
         }
-        writes
+        (writes, deletes)
     }
 
-    fn write(&mut self, txn_id: TxnId, mut writes: Vec<(String, Key, Value)>) -> Effects {
+    fn write(&mut self, txn_id: TxnId, mut writes: JobWrites, deletes: JobDeletes) -> Effects {
         let Some(family) = self.family else {
             return self.fail(RecordStoreError::UnknownAlias);
         };
@@ -226,11 +243,31 @@ impl ProjectFamilyOperation {
             Value::from(bytes.as_slice()),
         ));
         self.cache = Some(cache);
+        self.bridged = deletes;
         self.state = ProjectState::Write { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
         })]
+    }
+
+    /// Index rows the bridged job states left behind, cleared in the same
+    /// transaction as the row and cache writes.
+    fn clear(&mut self, txn_id: TxnId) -> Effects {
+        let deletes = std::mem::take(&mut self.bridged);
+        if deletes.is_empty() {
+            return self.commit(txn_id);
+        }
+        self.state = ProjectState::Clear { txn_id };
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn commit(&mut self, txn_id: TxnId) -> Effects {
+        self.state = ProjectState::Commit { txn_id };
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn settle(&mut self, cached: bool) -> Effects {
@@ -275,6 +312,7 @@ impl ProjectFamilyOperation {
             ProjectState::Page { txn_id }
             | ProjectState::ReadJobs { txn_id }
             | ProjectState::Write { txn_id }
+            | ProjectState::Clear { txn_id }
             | ProjectState::Commit { txn_id } => Some(txn_id),
             _ => None,
         }
@@ -357,19 +395,21 @@ impl Operation for ProjectFamilyOperation {
             },
             ProjectState::ReadJobs { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let writes = self.bridge(values);
-                    self.write(txn_id, writes)
+                    let (writes, deletes) = self.bridge(values);
+                    self.write(txn_id, writes, deletes)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("job row read", format!("{other:?}")),
             },
             ProjectState::Write { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    self.state = ProjectState::Commit { txn_id };
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                }
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.clear(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("projection write", format!("{other:?}")),
+            },
+            ProjectState::Clear { txn_id } => match event {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.commit(txn_id),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected("index clear", format!("{other:?}")),
             },
             ProjectState::Commit { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.settle(false),
