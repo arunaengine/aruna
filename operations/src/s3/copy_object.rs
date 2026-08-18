@@ -443,7 +443,6 @@ mod test {
             created_at: std::time::UNIX_EPOCH,
             created_by: user_id,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: policies,
             placement_policy_generation: 1,

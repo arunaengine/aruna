@@ -475,29 +475,13 @@ mod test {
         SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
     };
     use aruna_core::structs::{
-        ArunaArn, BlobVersion, BucketReplicationConfig, BucketReplicationTarget,
-        CurrentVersionPointer, RealmId, SyncMode, SyncState, SyncStatusSnapshot,
-        sync_relationship_key,
+        ArunaArn, BlobVersion, CurrentVersionPointer, RealmId, SyncMode, SyncState,
+        SyncStatusSnapshot, sync_relationship_key,
     };
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn make_replication_target(bucket: &str) -> BucketReplicationTarget {
-        let node_id = iroh::SecretKey::generate().public();
-        BucketReplicationTarget {
-            node_id,
-            realm_id: RealmId::from_bytes([9u8; 32]),
-            bucket: bucket.to_string(),
-            arn: format!(
-                "arn:aruna:{}:{}:s3/{bucket}",
-                RealmId::from_bytes([9u8; 32]),
-                node_id
-            ),
-            replicate_delete_markers: true,
-        }
-    }
 
     #[tokio::test]
     async fn test_delete_bucket() {
@@ -522,7 +506,6 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
-                    replication: None,
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
@@ -577,9 +560,6 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
                     cors_configuration: None,
-                    replication: Some(BucketReplicationConfig {
-                        targets: vec![make_replication_target(&bucket)],
-                    }),
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
@@ -633,7 +613,6 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
-                    replication: None,
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
@@ -758,7 +737,6 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
-                    replication: None,
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
@@ -825,7 +803,6 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
-                    replication: None,
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,

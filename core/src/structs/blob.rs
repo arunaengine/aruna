@@ -2,8 +2,8 @@ use crate::credential_seal::{CredentialSealKey, SealError, SealedS3Secret, crede
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
-    BucketReplicationConfig, GroupBackendKind, PathRestriction, PlacementPolicyError,
-    PlacementPolicyRef, RealmId, SourceMetadata, StorageRoutingRule, VersionSourceBinding,
+    GroupBackendKind, PathRestriction, PlacementPolicyError, PlacementPolicyRef, RealmId,
+    SourceMetadata, StorageRoutingRule, VersionSourceBinding,
 };
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
@@ -529,7 +529,6 @@ pub struct BucketInfo {
     pub created_at: SystemTime,
     pub created_by: UserId,
     pub cors_configuration: Option<BucketCorsConfiguration>,
-    pub replication: Option<BucketReplicationConfig>,
     /// Bucket, prefix and exact-key write routing rules, most specific first at
     /// resolution time. Empty means the group default decides.
     pub storage_routing: Vec<StorageRoutingRule>,
@@ -1857,7 +1856,6 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::default(),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 7,

@@ -1307,7 +1307,6 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::nil(test_realm()),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,

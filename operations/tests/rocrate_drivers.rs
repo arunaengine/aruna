@@ -1392,7 +1392,6 @@ async fn create_bucket(
                 created_at: SystemTime::now(),
                 created_by: actor.user_id,
                 cors_configuration: None,
-                replication: None,
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,

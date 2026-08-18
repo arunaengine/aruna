@@ -23,9 +23,6 @@ use aruna_operations::s3::list_multipart_uploads::ListMultipartUploadsError;
 use aruna_operations::s3::list_object_versions::ListObjectVersionsError;
 use aruna_operations::s3::list_objects_v2::ListObjectsV2Error;
 use aruna_operations::s3::list_parts::ListPartsError;
-use aruna_operations::s3::put_bucket_replication::{
-    DeleteBucketReplicationError, GetBucketReplicationError, PutBucketReplicationError,
-};
 use aruna_operations::s3::put_object::PutObjectError;
 use aruna_operations::s3::upload_part::UploadPartError;
 use aruna_operations::s3::upload_part_copy::UploadPartCopyError;
@@ -177,13 +174,6 @@ fn bucket_not_empty_error() -> S3Error {
     s3_error!(
         BucketNotEmpty,
         "The bucket you tried to delete is not empty."
-    )
-}
-
-fn replication_configuration_not_found_error() -> S3Error {
-    s3_error!(
-        ReplicationConfigurationNotFoundError,
-        "Replication configuration not found"
     )
 }
 
@@ -520,15 +510,6 @@ impl IntoS3Error for DeleteBucketError {
     }
 }
 
-impl IntoS3Error for PutBucketReplicationError {
-    fn into_s3_error(self) -> S3Error {
-        match self {
-            PutBucketReplicationError::NoSuchBucket => bucket_not_found_error(),
-            err => internal_error(err),
-        }
-    }
-}
-
 impl IntoS3Error for PutBucketCorsError {
     fn into_s3_error(self) -> S3Error {
         match self {
@@ -554,21 +535,6 @@ impl IntoS3Error for DeleteBucketCorsError {
             DeleteBucketCorsError::NotFound => bucket_not_found_error(),
             err => internal_error(err),
         }
-    }
-}
-
-impl IntoS3Error for GetBucketReplicationError {
-    fn into_s3_error(self) -> S3Error {
-        match self {
-            GetBucketReplicationError::NotFound => replication_configuration_not_found_error(),
-            err => internal_error(err),
-        }
-    }
-}
-
-impl IntoS3Error for DeleteBucketReplicationError {
-    fn into_s3_error(self) -> S3Error {
-        internal_error(self)
     }
 }
 

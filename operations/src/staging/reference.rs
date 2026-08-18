@@ -751,7 +751,6 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,

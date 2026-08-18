@@ -417,7 +417,6 @@ mod tests {
             created_at: UNIX_EPOCH,
             created_by: UserId::nil(realm_id()),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: policies,
             placement_policy_generation: 3,

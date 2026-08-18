@@ -2107,7 +2107,6 @@ mod tests {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: user_with_source_read,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,

@@ -2027,7 +2027,6 @@ mod tests {
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,

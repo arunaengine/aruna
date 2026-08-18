@@ -3122,7 +3122,6 @@ mod gate_tests {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
             placement_policies: refs,
             placement_policy_generation: generation,

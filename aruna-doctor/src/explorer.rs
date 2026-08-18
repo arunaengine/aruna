@@ -1522,10 +1522,9 @@ mod tests {
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        BucketReplicationConfig, BucketReplicationTarget, Group, HashPathIndexKey,
-        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-        MultipartUploadStatus, RealmConfigDocument, RealmId,
+        Group, HashPathIndexKey, MultipartChecksumType, MultipartObjectMetadataKey,
+        MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
+        MultipartUploadPartKey, MultipartUploadStatus, RealmConfigDocument, RealmId,
     };
     use aruna_net::dht::storage::StoredEntry;
     use chrono::{DateTime, Utc};
@@ -1706,28 +1705,16 @@ mod tests {
     }
 
     #[test]
-    fn decodes_bucket_replication() {
-        // The replication config decodes as part of the bucket record.
+    fn decodes_bucket_record() {
         let realm_id = RealmId::from_bytes([4_u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
-        let config = BucketReplicationConfig {
-            targets: vec![BucketReplicationTarget {
-                node_id,
-                realm_id,
-                bucket: "replica-bucket".to_string(),
-                arn: format!("arn:aruna:{realm_id}:{node_id}:s3/replica-bucket"),
-                replicate_delete_markers: true,
-            }],
-        };
         let info = BucketInfo {
             group_id: Ulid::generate(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
             cors_configuration: None,
-            replication: Some(config.clone()),
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
-            placement_policy_generation: 0,
+            placement_policy_generation: 7,
         };
 
         let decoded = decode_entry(
@@ -1742,7 +1729,7 @@ mod tests {
             }
         );
         match decoded.value {
-            DecodedValue::BucketInfo { data } => assert_eq!(data.replication, Some(config)),
+            DecodedValue::BucketInfo { data } => assert_eq!(data, info),
             other => panic!("expected bucket info, got {other:?}"),
         }
     }

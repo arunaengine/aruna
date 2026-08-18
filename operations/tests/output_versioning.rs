@@ -97,7 +97,6 @@ async fn create_bucket(harness: &Harness) {
                 created_at: std::time::SystemTime::now(),
                 created_by: harness.created_by,
                 cors_configuration: None,
-                replication: None,
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,

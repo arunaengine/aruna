@@ -368,7 +368,6 @@ async fn seed_holder(
         created_at: SystemTime::UNIX_EPOCH,
         created_by: owner,
         cors_configuration: None,
-        replication: None,
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,

@@ -27,7 +27,6 @@ pub mod policy_bulk;
 pub mod policy_coverage;
 pub mod policy_mutation;
 pub mod policy_successor;
-pub mod put_bucket_replication;
 pub mod put_object;
 pub mod refresh_reference_metadata;
 pub mod revoke_user_access;
