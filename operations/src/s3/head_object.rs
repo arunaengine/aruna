@@ -1,5 +1,7 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
-use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
+use crate::blob::managed_copy::{
+    CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
+};
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
@@ -15,7 +17,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, SourceConnectorKind, SourceMetadata, VersionKey, VersionSourceBinding,
+    MultipartObjectSummary, PlacementPolicyRef, SourceConnectorKind, SourceMetadata, VersionKey,
+    VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -113,6 +116,9 @@ pub struct HeadObjectOperation {
     reference_source: Option<VersionSourceBinding>,
     /// Held while a governed version's local registration is verified.
     pending_location: Option<BlobLocationKey>,
+    pending_copy: Option<ManagedCopyKey>,
+    /// Refs of the version being served, compared against its registration.
+    source_policies: Vec<PlacementPolicyRef>,
     output: Option<Result<HeadObjectResult, HeadObjectError>>,
 }
 
@@ -133,6 +139,8 @@ impl HeadObjectOperation {
             part_count: None,
             reference_source: None,
             pending_location: None,
+            pending_copy: None,
+            source_policies: Vec::new(),
             output: None,
         }
     }
@@ -273,6 +281,7 @@ impl HeadObjectOperation {
                 self.source_metadata = None;
                 self.last_refresh = None;
                 self.version_created_at = Some(version.created_at);
+                self.source_policies = version.placement_policies.clone();
                 if version.placement_policies.is_empty() {
                     return self.read_blob_location(BlobLocationKey::new(blob_hash, backend));
                 }
@@ -328,29 +337,43 @@ impl HeadObjectOperation {
             VersionKey::new(&self.input.bucket, &self.input.key, version_id),
             backend.clone(),
         );
-        let effect = match read_effect(&key, self.txn_id) {
+        let effect = match serve_reads(&key, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(err.into()),
         };
+        self.pending_copy = Some(key);
         self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
         self.state = HeadObjectState::CheckManagedCopy;
         smallvec![effect]
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
             });
         };
-        if let Err(err) = check_serveable(value.as_deref()) {
-            return self.emit_error(err.into());
-        }
-        let Some(key) = self.pending_location.take() else {
+        let (copy, _) = match split_serve_reads(values) {
+            Ok(split) => split,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let (Some(copy_key), Some(key)) = (self.pending_copy.take(), self.pending_location.take())
+        else {
             return self.emit_error(HeadObjectError::HeadObjectFailed);
         };
+        if let Err(err) = validate_registration(
+            copy.as_deref(),
+            &CopyRequest {
+                key: &copy_key,
+                node_id: None,
+                blake3: Some(key.blake3_hash),
+                refs: &self.source_policies,
+            },
+        ) {
+            return self.emit_error(err.into());
+        }
         self.read_blob_location(key)
     }
 

@@ -4,9 +4,10 @@ use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
-    MultipartObjectSummary, PlacementPolicyRef, RealmId, ReplicationItemKind,
-    ReplicationNegotiationResult, SourceMetadata, VersionSourceBinding, VersionedObjectArn,
+    ArunaArn, AuthContext, BackendLocation, MAX_POLICY_REF_INPUT, MultipartChecksumType,
+    MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, PlacementSubject, RealmId,
+    ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata, VersionSourceBinding,
+    VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -222,6 +223,30 @@ pub struct BaoReadRequest {
     pub target: BaoReadTarget,
     pub expected_blake3: Option<[u8; 32]>,
     pub metadata_only: bool,
+    /// Where the bytes would land. Absent means the caller is not asking for a
+    /// managed copy, so the source refuses anything governed.
+    pub destination: Option<PlacementSubject>,
+    /// Refs the requester has already resolved. Echoing one is never authority:
+    /// the source evaluates the destination independently.
+    pub known_refs: Vec<PlacementPolicyRef>,
+}
+
+impl BaoReadRequest {
+    /// Bounds the destination facts before they are evaluated or stored.
+    pub fn validate(&self) -> Result<(), ConversionError> {
+        if self.known_refs.len() > MAX_POLICY_REF_INPUT {
+            return Err(ConversionError::PlacementPolicyError(
+                aruna_core::structs::PlacementPolicyError::RefCount,
+            ));
+        }
+        if PlacementPolicyRef::canonical_set(&self.known_refs)? != self.known_refs {
+            return Err(ConversionError::NonCanonicalPolicyRefs);
+        }
+        if let Some(destination) = self.destination.as_ref() {
+            destination.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -433,6 +458,15 @@ pub enum VersionReplicationMessage {
         manifest: VersionReplicationManifest,
         advance: ReferenceAdvance,
     },
+    /// The requester has not resolved every rule this copy carries. Sent only
+    /// after authorization, so object existence and policy ids stay private.
+    PlacementPolicyRequired {
+        refs: Vec<PlacementPolicyRef>,
+    },
+    /// The source evaluated the authenticated destination and refused it.
+    PlacementPolicyDenied {
+        policy_ids: Vec<Ulid>,
+    },
 }
 
 /// Read-only question a node asks a peer: do you hold this version, and on
@@ -510,6 +544,25 @@ impl VersionReplicationMessage {
             Self::ReferenceAdvance { manifest, advance } => {
                 manifest.reference_advance = Some(*advance);
                 Some(manifest)
+            }
+            // A hostile peer must not decode into an unbounded ref set.
+            Self::BaoReadRequest(request) => {
+                request.validate()?;
+                None
+            }
+            Self::PlacementPolicyRequired { refs } => {
+                if PlacementPolicyRef::canonical_set(refs)? != *refs {
+                    return Err(ConversionError::NonCanonicalPolicyRefs);
+                }
+                None
+            }
+            Self::PlacementPolicyDenied { policy_ids } => {
+                if policy_ids.len() > MAX_POLICY_REF_INPUT {
+                    return Err(ConversionError::PlacementPolicyError(
+                        aruna_core::structs::PlacementPolicyError::RefCount,
+                    ));
+                }
+                None
             }
             _ => None,
         };
@@ -675,6 +728,8 @@ mod tests {
             target: BaoReadTarget::Blake3([8u8; 32]),
             expected_blake3: Some([8u8; 32]),
             metadata_only: false,
+            destination: None,
+            known_refs: Vec::new(),
         });
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,

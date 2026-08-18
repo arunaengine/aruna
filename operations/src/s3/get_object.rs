@@ -1,5 +1,7 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
-use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
+use crate::blob::managed_copy::{
+    CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
+};
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
@@ -244,6 +246,7 @@ pub struct GetObjectOperation {
     resolved_range: Option<ResolvedObjectRange>,
     /// Held while a governed version's local registration is verified.
     pending_location: Option<BlobLocationKey>,
+    pending_copy: Option<ManagedCopyKey>,
     /// Refs of the version being read, carried to copy and advance writes.
     source_policies: Vec<PlacementPolicyRef>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
@@ -280,6 +283,7 @@ impl GetObjectOperation {
             part_count: None,
             resolved_range: None,
             pending_location: None,
+            pending_copy: None,
             source_policies: Vec::new(),
             output: None,
         }
@@ -503,29 +507,43 @@ impl GetObjectOperation {
             VersionKey::new(&self.input.bucket, &self.input.key, version_id),
             backend.clone(),
         );
-        let effect = match read_effect(&key, self.txn_id) {
+        let effect = match serve_reads(&key, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(err.into()),
         };
+        self.pending_copy = Some(key);
         self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
         self.state = GetObjectState::CheckManagedCopy;
         smallvec![effect]
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
             });
         };
-        if let Err(err) = check_serveable(value.as_deref()) {
-            return self.emit_error(err.into());
-        }
-        let Some(key) = self.pending_location.take() else {
+        let (copy, _) = match split_serve_reads(values) {
+            Ok(split) => split,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let (Some(copy_key), Some(key)) = (self.pending_copy.take(), self.pending_location.take())
+        else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
+        if let Err(err) = validate_registration(
+            copy.as_deref(),
+            &CopyRequest {
+                key: &copy_key,
+                node_id: Some(self.input.node_id),
+                blake3: Some(key.blake3_hash),
+                refs: &self.source_policies,
+            },
+        ) {
+            return self.emit_error(err.into());
+        }
         self.read_blob_location(key)
     }
 

@@ -1,4 +1,7 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::managed_copy::{
+    CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -10,8 +13,8 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, SourceMetadata, VersionKey,
+    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, MultipartObjectMetadataKey,
+    MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, SourceMetadata, VersionKey,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -26,6 +29,7 @@ pub enum GetObjectAttributesState {
     StartTransaction,
     GetVersion,
     GetCurrentVersion,
+    CheckManagedCopy,
     GetBlobLocation,
     ReadMultipartSummary,
     ReadMultipartParts,
@@ -54,6 +58,8 @@ pub enum GetObjectAttributesError {
     NoSuchVersion,
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
     #[error("GetObjectAttributes failed")]
     GetObjectAttributesFailed,
 }
@@ -87,6 +93,10 @@ pub struct GetObjectAttributesOperation {
     source_metadata: Option<SourceMetadata>,
     version_created_at: Option<std::time::SystemTime>,
     resolved_version_id: Option<Ulid>,
+    pending_copy: Option<ManagedCopyKey>,
+    pending_location: Option<BlobLocationKey>,
+    /// Refs of the version being described, compared against its registration.
+    source_policies: Vec<PlacementPolicyRef>,
     summary: Option<MultipartObjectSummary>,
     parts: Vec<MultipartObjectPart>,
     output: Option<Result<GetObjectAttributesResult, GetObjectAttributesError>>,
@@ -102,6 +112,9 @@ impl GetObjectAttributesOperation {
             source_metadata: None,
             version_created_at: None,
             resolved_version_id: None,
+            pending_copy: None,
+            pending_location: None,
+            source_policies: Vec::new(),
             summary: None,
             parts: Vec::new(),
             output: None,
@@ -234,7 +247,13 @@ impl GetObjectAttributesOperation {
             } => {
                 self.source_metadata = None;
                 self.version_created_at = Some(version.created_at);
-                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
+                // Size and checksums are governed metadata: a copy this node may
+                // not serve must not answer for them either.
+                self.source_policies = version.placement_policies.clone();
+                if self.source_policies.is_empty() {
+                    return self.read_blob_location(BlobLocationKey::new(blob_hash, backend));
+                }
+                self.check_managed_copy(version_id, blob_hash, backend)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 GetObjectAttributesError::DeleteMarker
@@ -255,6 +274,56 @@ impl GetObjectAttributesOperation {
     fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = GetObjectAttributesState::GetBlobLocation;
         smallvec![blob_location_read(&key, self.txn_id)]
+    }
+
+    fn check_managed_copy(
+        &mut self,
+        version_id: Ulid,
+        blob_hash: [u8; 32],
+        backend: aruna_core::structs::BackendRef,
+    ) -> Effects {
+        let key = ManagedCopyKey::new(
+            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
+            backend.clone(),
+        );
+        let effect = match serve_reads(&key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.pending_copy = Some(key);
+        self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
+        self.state = GetObjectAttributesState::CheckManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_managed_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let (copy, _) = match split_serve_reads(values) {
+            Ok(split) => split,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let (Some(copy_key), Some(key)) = (self.pending_copy.take(), self.pending_location.take())
+        else {
+            return self.emit_error(GetObjectAttributesError::GetObjectAttributesFailed);
+        };
+        if let Err(err) = validate_registration(
+            copy.as_deref(),
+            &CopyRequest {
+                key: &copy_key,
+                node_id: None,
+                blake3: Some(key.blake3_hash),
+                refs: &self.source_policies,
+            },
+        ) {
+            return self.emit_error(err.into());
+        }
+        self.read_blob_location(key)
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
@@ -423,6 +492,7 @@ impl Operation for GetObjectAttributesOperation {
             GetObjectAttributesState::GetCurrentVersion => {
                 self.handle_received_current_version(event)
             }
+            GetObjectAttributesState::CheckManagedCopy => self.handle_managed_copy(event),
             GetObjectAttributesState::GetBlobLocation => self.handle_blob_location_read(event),
             GetObjectAttributesState::ReadMultipartSummary => {
                 self.handle_multipart_summary_read(event)

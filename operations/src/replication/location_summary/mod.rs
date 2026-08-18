@@ -17,6 +17,8 @@ pub use remote::RemoteLocationSummaryOperation;
 #[derive(Debug, Error, PartialEq)]
 pub enum LocationSummaryError {
     #[error(transparent)]
+    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Blob(#[from] BlobError),

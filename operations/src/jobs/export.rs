@@ -1606,6 +1606,8 @@ async fn open_remote(
                 target,
                 expected_blake3,
                 metadata_only,
+                destination: None,
+                known_refs: Vec::new(),
             },
         ),
         driver,

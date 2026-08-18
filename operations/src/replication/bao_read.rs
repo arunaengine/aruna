@@ -12,8 +12,8 @@ use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFuncti
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-    HashPathIndexKey, Permission, RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn,
-    blob_object_permission_path,
+    HashPathIndexKey, ManagedCopyKey, Permission, PlacementPolicyRef, RealmConfigDocument, RealmId,
+    VersionKey, VersionedObjectArn, blob_object_permission_path,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use bytes::Bytes;
@@ -21,6 +21,13 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::blob::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
+use crate::placement_policy::{
+    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+};
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::blob::blob_keyspace_helper::blob_location_read;
@@ -53,6 +60,13 @@ pub enum BaoReadError {
     Unexpected { state: &'static str, event: String },
     #[error("bao read did not finish")]
     NotFinished,
+    #[error(transparent)]
+    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    /// The requester must resolve these rules and ask again.
+    #[error("the destination has not resolved every required placement policy")]
+    PolicyRequired { refs: Vec<PlacementPolicyRef> },
+    #[error("placement policy denies this destination")]
+    PolicyDenied { policy_ids: Vec<Ulid> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +209,14 @@ impl Operation for BaoReadOperation {
                     Ok(VersionReplicationMessage::BaoReadRefused(reason)) => {
                         self.fail(BaoReadError::Refused(reason))
                     }
+                    // The source teaches the rule before bytes: the caller
+                    // resolves it, caches it, and retries only when compliant.
+                    Ok(VersionReplicationMessage::PlacementPolicyRequired { refs }) => {
+                        self.fail(BaoReadError::PolicyRequired { refs })
+                    }
+                    Ok(VersionReplicationMessage::PlacementPolicyDenied { policy_ids }) => {
+                        self.fail(BaoReadError::PolicyDenied { policy_ids })
+                    }
                     Ok(_) => self.fail(BaoReadError::Unexpected {
                         state: self.state_name(),
                         event: "unexpected bao read response".to_string(),
@@ -282,6 +304,8 @@ enum IncomingBaoReadState {
     CheckPermission,
     ReadHashVersion,
     ReadLocation,
+    CheckManagedCopy,
+    PolicyChallenge,
     SendAccepted,
     ServeRead,
     CloseMetadata,
@@ -324,6 +348,13 @@ pub struct IncomingBaoReadOperation {
     policy_group: Option<GroupId>,
     policy_next: Option<PolicyNext>,
     policy_current: bool,
+    /// The version this serve resolved and the refs it carries. A governed copy
+    /// answers the destination challenge before a single byte is offered.
+    version_key: Option<VersionKey>,
+    version_refs: Vec<PlacementPolicyRef>,
+    pending_location: Option<BackendLocation>,
+    gate: Option<PolicyGateOperation>,
+    now_ms: u64,
 }
 
 impl IncomingBaoReadOperation {
@@ -358,7 +389,19 @@ impl IncomingBaoReadOperation {
             policy_group: None,
             policy_next: None,
             policy_current: false,
+            version_key: None,
+            version_refs: Vec::new(),
+            pending_location: None,
+            gate: None,
+            now_ms: 0,
         }
+    }
+
+    /// Cache freshness for the challenge; the operation stays sans-I/O by
+    /// taking the clock as configuration.
+    pub fn with_now(mut self, now_ms: u64) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     pub fn with_policy_paths(mut self, paths: HashSet<String>) -> Self {
@@ -689,6 +732,8 @@ impl IncomingBaoReadOperation {
             IncomingBaoReadState::CheckPermission => "check_permission",
             IncomingBaoReadState::ReadHashVersion => "read_hash_version",
             IncomingBaoReadState::ReadLocation => "read_location",
+            IncomingBaoReadState::CheckManagedCopy => "check_managed_copy",
+            IncomingBaoReadState::PolicyChallenge => "policy_challenge",
             IncomingBaoReadState::SendAccepted => "send_accepted",
             IncomingBaoReadState::ServeRead => "serve_read",
             IncomingBaoReadState::CloseMetadata => "close_metadata",
@@ -762,6 +807,10 @@ impl IncomingBaoReadOperation {
         }
         self.blob_hash = Some(blob_hash);
         self.location_key = version.location_key();
+        self.version_refs = version.placement_policies.clone();
+        self.version_key = self
+            .exact_target()
+            .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.read_location()
     }
 
@@ -808,6 +857,10 @@ impl IncomingBaoReadOperation {
         }
         self.blob_hash = Some(hash);
         self.location_key = version.location_key();
+        self.version_refs = version.placement_policies.clone();
+        self.version_key = self.candidate.as_ref().map(|candidate| {
+            VersionKey::new(&candidate.bucket, &candidate.key, candidate.version_id)
+        });
         self.read_location()
     }
 
@@ -832,7 +885,125 @@ impl IncomingBaoReadOperation {
         if location.get_blake3() != Some(blake3.as_slice()) {
             return self.send_refusal(BaoReadRefusal::HashMismatch);
         }
-        self.send_accepted(location)
+        if self.version_refs.is_empty() {
+            return self.send_accepted(location);
+        }
+        self.check_managed_copy(location)
+    }
+
+    /// A governed copy is only offered from a registration this node can still
+    /// serve, and only to a destination it evaluated itself.
+    fn check_managed_copy(&mut self, location: BackendLocation) -> Effects {
+        let Some(version) = self.version_key.clone() else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let key = ManagedCopyKey::new(version, location.backend.clone());
+        let effect = match serve_reads(&key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.pending_location = Some(location);
+        self.state = IncomingBaoReadState::CheckManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_managed_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected(event);
+        };
+        let Some((copy, _)) = split_serve_reads(values).ok() else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let (Some(location), Some(version)) =
+            (self.pending_location.clone(), self.version_key.clone())
+        else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let key = ManagedCopyKey::new(version, location.backend.clone());
+        if validate_registration(
+            copy.as_deref(),
+            &CopyRequest {
+                key: &key,
+                node_id: Some(self.local_node),
+                blake3: self.blob_hash,
+                refs: &self.version_refs,
+            },
+        )
+        .is_err()
+        {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        }
+        // Authorization already passed, so the refs may be disclosed; echoing
+        // one back is never authority, the source still evaluates alone.
+        let missing: Vec<PlacementPolicyRef> = self
+            .version_refs
+            .iter()
+            .filter(|policy_ref| !self.request.known_refs.contains(policy_ref))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return self.send_required(missing);
+        }
+        let Some(destination) = self.request.destination.clone() else {
+            return self.send_denied(Vec::new());
+        };
+        let context = GateContext {
+            realm_id: self.local_realm,
+            subject: destination,
+            now_ms: self.now_ms,
+        };
+        match write_gate(Some(&context), &self.version_refs) {
+            Ok(None) => self.send_accepted(location),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = IncomingBaoReadState::PolicyChallenge;
+                match complete {
+                    true => self.finish_challenge(),
+                    false => effects,
+                }
+            }
+            Err(_) => self.send_denied(Vec::new()),
+        }
+    }
+
+    fn finish_challenge(&mut self) -> Effects {
+        let (Some(gate), Some(location)) = (self.gate.take(), self.pending_location.clone()) else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let decision = gate
+            .finalize()
+            .map_err(PolicyGateError::from)
+            .and_then(|outcome| gate_decision(outcome.decision));
+        match decision {
+            Ok(()) => self.send_accepted(location),
+            Err(PolicyGateError::Denied { policy_ids })
+            | Err(PolicyGateError::Unavailable { policy_ids }) => self.send_denied(policy_ids),
+            Err(PolicyGateError::Required { refs }) => self.send_required(refs),
+            Err(_) => self.send_denied(Vec::new()),
+        }
+    }
+
+    fn send_required(&mut self, refs: Vec<PlacementPolicyRef>) -> Effects {
+        self.send_policy(VersionReplicationMessage::PlacementPolicyRequired { refs })
+    }
+
+    fn send_denied(&mut self, policy_ids: Vec<Ulid>) -> Effects {
+        self.send_policy(VersionReplicationMessage::PlacementPolicyDenied { policy_ids })
+    }
+
+    fn send_policy(&mut self, message: VersionReplicationMessage) -> Effects {
+        let payload = match message.to_bytes() {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.refusal = Some(BaoReadRefusal::ReadDenied);
+        self.state = IncomingBaoReadState::SendRefusal;
+        smallvec![Effect::Blob(BlobEffect::SendMessage {
+            stream_id: self.stream_id,
+            payload,
+        })]
     }
 }
 
@@ -880,6 +1051,17 @@ impl Operation for IncomingBaoReadOperation {
             IncomingBaoReadState::CheckPermission => self.handle_permission(event),
             IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
             IncomingBaoReadState::ReadLocation => self.handle_location(event),
+            IncomingBaoReadState::CheckManagedCopy => self.handle_managed_copy(event),
+            IncomingBaoReadState::PolicyChallenge => {
+                let Some(gate) = self.gate.as_mut() else {
+                    return self.unexpected(event);
+                };
+                let effects = gate.step(event);
+                match gate.is_complete() {
+                    true => self.finish_challenge(),
+                    false => effects,
+                }
+            }
             IncomingBaoReadState::SendAccepted => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
                     return self.unexpected(event);
@@ -1021,6 +1203,8 @@ mod tests {
             ),
             expected_blake3: Some(hash),
             metadata_only: false,
+            destination: None,
+            known_refs: Vec::new(),
         }
     }
 
