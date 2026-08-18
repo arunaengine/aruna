@@ -3765,7 +3765,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            write_live_jobs(&storage, &obligation, Some(&relationships), None)
+            write_live_jobs(&storage, &obligation, Some(&relationships))
                 .await
                 .unwrap()
                 .queued,
