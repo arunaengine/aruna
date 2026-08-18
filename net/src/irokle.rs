@@ -68,8 +68,8 @@ use aruna_core::structs::{
     WatchInterestDigest, WatchSubscription, admit_band_pool, build_quarantine_entries,
     coordinator_spans, group_owner_index_key, node_usage_key_node_id, persistent_id_change,
     persistent_id_key, persistent_id_target, placement_policy_change, placement_policy_target,
-    quarantine_usage_entry, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
-    watch_interest_key_realm_id,
+    quarantine_usage_entry, reserved_label, verify_policy_authority, watch_interest_dirty_key,
+    watch_interest_key_node_id, watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -4343,11 +4343,33 @@ impl DocumentSyncService {
         store_pid_mapping(&self.storage, self.realm_id, mapping, placement).await
     }
 
+    /// A publication counts only against this realm's current replicated view:
+    /// the original publisher must be a permitted node and its named authorizing
+    /// user must still hold realm-configuration write. A relay or current holder
+    /// never supplies that authority for someone else.
     async fn apply_policy_document(
         &self,
         document: &PlacementPolicyDocument,
         placement: PlacementRef,
     ) -> Result<MetadataPlacementOutcome<bool>> {
+        let Some(config) = read_admin_realm_config(&self.storage, self.realm_id).await? else {
+            return Ok(MetadataPlacementOutcome::Deferred(
+                DocumentSyncDependency::RealmConfig(self.realm_id),
+            ));
+        };
+        let Some(auth) = read_admin_realm_authorization(&self.storage, self.realm_id).await? else {
+            return Ok(MetadataPlacementOutcome::Deferred(
+                DocumentSyncDependency::RealmAuthorization(self.realm_id),
+            ));
+        };
+        if let Err(reason) = verify_policy_authority(document, &config, &auth) {
+            warn!(
+                policy_id = %document.policy_id(),
+                %reason,
+                "Rejecting placement policy without realm-admin publication authority"
+            );
+            return Ok(MetadataPlacementOutcome::Rejected);
+        }
         store_policy_document(&self.storage, self.realm_id, document, placement).await
     }
 
@@ -9327,6 +9349,10 @@ fn validate_policy_document(
     }
     if let Err(error) = document.verified() {
         return Err(format!("policy definition is invalid: {error}"));
+    }
+    // Structural gate: bytes without an authentic publication are never a rule.
+    if let Err(error) = document.verify_publication() {
+        return Err(format!("policy publication is invalid: {error}"));
     }
     if change.kind != DocumentSyncChangeKind::Upsert {
         return Err("policy event is not an upsert".to_string());
@@ -19212,6 +19238,219 @@ mod tests {
         PlacementPolicyDocument::new(realm_id, policy, publication)
     }
 
+    /// Realm view a policy publication is verified against: the publisher is a
+    /// server node and the admin user holds realm-configuration write.
+    fn policy_realm_view(realm_id: RealmId) -> (RealmConfigDocument, RealmAuthorizationDocument) {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.seed_default_placement();
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        let role = Role {
+            role_id: Ulid::from_bytes([1u8; 16]),
+            name: "realm_admin".to_string(),
+            permissions: HashMap::from([(
+                format!("/{realm_id}/admin/**"),
+                aruna_core::structs::Permission::WRITE,
+            )]),
+            assigned_users: HashSet::from([policy_admin(realm_id)]),
+        };
+        let auth = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::from([(role.role_id, role)]),
+            operation_restrictions: HashMap::new(),
+        };
+        (config, auth)
+    }
+
+    async fn write_realm_view(
+        storage: &StorageHandle,
+        config: &RealmConfigDocument,
+        auth: &RealmAuthorizationDocument,
+    ) {
+        let actor = aruna_core::structs::Actor {
+            node_id: node(1),
+            user_id: policy_admin(config.realm_id),
+            realm_id: config.realm_id,
+        };
+        let config_target = DocumentSyncTarget::RealmConfig {
+            realm_id: config.realm_id,
+        };
+        let auth_target = DocumentSyncTarget::RealmAuthorization {
+            realm_id: config.realm_id,
+        };
+        let writes = vec![
+            (
+                config_target.storage_keyspace().to_string(),
+                config_target.storage_key(),
+                Value::from(config.to_bytes(&actor).expect("config encodes")),
+            ),
+            (
+                auth_target.storage_keyspace().to_string(),
+                auth_target.storage_key(),
+                Value::from(auth.to_bytes(&actor).expect("authorization encodes")),
+            ),
+        ];
+        storage_batch_write_to(storage, writes)
+            .await
+            .expect("realm view is stored");
+    }
+
+    fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::VerifiedPolicy {
+        use aruna_core::structs::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
+
+        let policy = PlacementPolicy::new(
+            policy_id,
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some("eu-west".to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    async fn policy_service(realm_id: RealmId, storage: StorageHandle) -> DocumentSyncService {
+        let dir = tempfile::tempdir().expect("doc dir");
+        DocumentSyncService::open_with_persist_policy(
+            test_endpoint(31).await,
+            storage,
+            dir.keep().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens")
+    }
+
+    #[tokio::test]
+    async fn admits_authentic_policy() {
+        let realm_id = RealmId::from_bytes([21u8; 32]);
+        let (_dir, storage) = test_storage();
+        let (config, auth) = policy_realm_view(realm_id);
+        write_realm_view(&storage, &config, &auth).await;
+        let service = policy_service(realm_id, storage.clone()).await;
+
+        let policy = policy_fixture(Ulid::from_bytes([8u8; 16]));
+        let document = signed_policy_document(realm_id, &policy, 1);
+        let placement = config
+            .policy_placement(policy.policy().policy_id)
+            .expect("policy bucket resolves");
+        assert!(matches!(
+            service
+                .apply_policy_document(&document, placement)
+                .await
+                .expect("apply runs"),
+            MetadataPlacementOutcome::Accepted(true)
+        ));
+
+        let target = placement_policy_target(policy.policy().policy_id);
+        assert!(
+            read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+                .await
+                .is_some(),
+            "an authentic publication must be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_forged_publication() {
+        // A self-authoring ordinary node and a relay that substitutes itself as
+        // origin both lack realm-admin publication authority.
+        let realm_id = RealmId::from_bytes([22u8; 32]);
+        let (_dir, storage) = test_storage();
+        let (config, auth) = policy_realm_view(realm_id);
+        write_realm_view(&storage, &config, &auth).await;
+        let service = policy_service(realm_id, storage.clone()).await;
+
+        let policy = policy_fixture(Ulid::from_bytes([9u8; 16]));
+        let placement = config
+            .policy_placement(policy.policy().policy_id)
+            .expect("policy bucket resolves");
+        let authentic = signed_policy_document(realm_id, &policy, 1);
+
+        let secret = iroh::SecretKey::from_bytes(&[2u8; 32]);
+        let self_authored = PlacementPolicyDocument::new(
+            realm_id,
+            &policy,
+            aruna_core::structs::PolicyPublicationClaim::new(
+                realm_id,
+                &policy,
+                secret.public(),
+                UserId::local(Ulid::from_bytes([7u8; 16]), realm_id),
+                Ulid::from_bytes([5u8; 16]),
+                9,
+                [0u8; 32],
+            )
+            .sign(&secret),
+        );
+        let mut relayed = authentic.clone();
+        relayed.publication.publisher = node(2);
+
+        for forged in [self_authored, relayed] {
+            assert!(matches!(
+                service
+                    .apply_policy_document(&forged, placement)
+                    .await
+                    .expect("apply runs"),
+                MetadataPlacementOutcome::Rejected
+            ));
+        }
+
+        let target = placement_policy_target(policy.policy().policy_id);
+        assert!(
+            read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+                .await
+                .is_none(),
+            "a forged publication must leave no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn defers_unknown_authority() {
+        // Without the replicated authorization document the publication cannot
+        // be verified yet, so it waits instead of being accepted or dropped.
+        let realm_id = RealmId::from_bytes([23u8; 32]);
+        let (_dir, storage) = test_storage();
+        let (config, _) = policy_realm_view(realm_id);
+        let actor = aruna_core::structs::Actor {
+            node_id: node(1),
+            user_id: policy_admin(realm_id),
+            realm_id,
+        };
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                target.storage_keyspace().to_string(),
+                target.storage_key(),
+                Value::from(config.to_bytes(&actor).expect("config encodes")),
+            )],
+        )
+        .await
+        .expect("config is stored");
+        let service = policy_service(realm_id, storage.clone()).await;
+
+        let policy = policy_fixture(Ulid::from_bytes([10u8; 16]));
+        let document = signed_policy_document(realm_id, &policy, 1);
+        let placement = config
+            .policy_placement(policy.policy().policy_id)
+            .expect("policy bucket resolves");
+        assert!(matches!(
+            service
+                .apply_policy_document(&document, placement)
+                .await
+                .expect("apply runs"),
+            MetadataPlacementOutcome::Deferred(DocumentSyncDependency::RealmAuthorization(deferred))
+                if deferred == realm_id
+        ));
+    }
+
     #[test]
     fn binds_policy_target() {
         use aruna_core::structs::{
@@ -19257,7 +19496,7 @@ mod tests {
             )
             .is_err()
         );
-        let mut restated = change.clone();
+        let mut restated = change;
         restated.current.actor = node(8);
         assert!(validate_policy_document(policy_id, realm_id, &document, &restated).is_err());
     }
