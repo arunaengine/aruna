@@ -266,8 +266,11 @@ impl SuccessorMint {
             return Ok(Some(self.read_head(txn_id)?));
         };
         let stored = PolicyBulkIntent::from_bytes(value.as_ref())?;
-        if stored.successor_version_id != self.plan.successor_version_id
-            || matches!(stored.outcome, PolicyIntentOutcome::Completed { .. })
+        // A stale intent from an older head is replanned by this pass; only
+        // completed evidence and a concurrent pass on the same head stop it.
+        let same_head = stored.observed_head == self.plan.expected_head;
+        if matches!(stored.outcome, PolicyIntentOutcome::Completed { .. })
+            || (same_head && stored.successor_version_id != self.plan.successor_version_id)
         {
             return Err(SuccessorError::IntentConflict);
         }
@@ -1172,6 +1175,26 @@ mod tests {
         assert_eq!(
             mint.step(read(Some(stored.to_bytes().unwrap())), None),
             Err(SuccessorError::IntentConflict)
+        );
+    }
+
+    #[test]
+    fn replans_stale_intent() {
+        // An intent planned against an older head is replaced by this pass, not
+        // treated as a competing one.
+        let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Union));
+        mint.plan.intent = Some(intent());
+        let mut stored = intent();
+        stored.observed_head =
+            CurrentVersionPointer::new_with_generation(Ulid::from_bytes([1u8; 16]), 2);
+        stored.successor_version_id = Ulid::from_bytes([4u8; 16]);
+        mint.start(None).expect("start builds");
+        mint.step(read(None), None).expect("mutation absent");
+
+        assert!(
+            mint.step(read(Some(stored.to_bytes().unwrap())), None)
+                .expect("stale intent is replanned")
+                .is_some()
         );
     }
 
