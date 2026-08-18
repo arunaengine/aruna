@@ -28,9 +28,18 @@ pub async fn seal_outputs(
         .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
     let outputs = OutputSet::canonical(outputs.to_vec())
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
-    if let Some(digest) =
-        sealed_digest(context, record.job_id, control, &outputs, net.node_id()).await?
+    // A replay re-appends the record it already sealed: the append is
+    // idempotent and a family view that was unavailable before may resolve now.
+    if let Some(sealed) = sealed_record(context, record.job_id, control, &outputs, net.node_id())
+        .await?
+        .map(JobRecordFrame::new)
+        .transpose()
+        .map_err(|error| JobError::permanent(format!("sealed record is unpublishable: {error}")))?
     {
+        let digest = sealed.envelope().digest().map_err(|error| {
+            JobError::permanent(format!("output record digest failed: {error}"))
+        })?;
+        append_output_record(context, record.job_id, control, sealed).await?;
         return Ok(digest);
     }
     let output = ExecutionOutputRecord {
@@ -58,20 +67,20 @@ pub async fn seal_outputs(
     publish_output_record(context, record.job_id, control, frame).await
 }
 
-/// Digest of the record this execution already sealed for the same exact output
-/// set. A replayed finalize reuses it instead of re-signing a second record that
+/// The record this execution already sealed for the same exact output set. A
+/// replayed finalize reuses it instead of re-signing a second record that
 /// differs only by its commit timestamp.
 ///
 /// The stored row is re-verified on read-back: a row whose signature or
 /// publisher no longer proves this node sealed it is not evidence, so a correct
 /// record is sealed again instead of trusting it.
-async fn sealed_digest(
+async fn sealed_record(
     context: &DriverContext,
     job_id: JobId,
     control: &AttemptControl,
     outputs: &OutputSet,
     publisher: NodeId,
-) -> Result<Option<[u8; 32]>, JobError> {
+) -> Result<Option<JobRecordEnvelope>, JobError> {
     let Some(digest) = control.output_record else {
         return Ok(None);
     };
@@ -92,7 +101,8 @@ async fn sealed_digest(
     let JobFamilyRecord::Output(sealed) = &envelope.record else {
         return Ok(None);
     };
-    Ok((sealed.outputs == *outputs && envelope.digest().ok() == Some(digest)).then_some(digest))
+    let matches = sealed.outputs == *outputs && envelope.digest().ok() == Some(digest);
+    Ok(matches.then_some(envelope))
 }
 
 /// The one place this execution's signed output record leaves the workflow. It

@@ -14,8 +14,6 @@
 //! * [`audit`] pages the immutable log with bounded cursors.
 //! * [`transport`] carries records and launch offers between nodes.
 
-use std::time::Duration;
-
 use aruna_core::effects::FrameBoundsError;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::structs::{JobFamilyError, JobRecordError};
@@ -45,8 +43,6 @@ pub const RECORD_PAGE_SIZE: usize = 64;
 pub const MAX_PROJECTION_RECORDS: usize = 4096;
 /// Conflict rows one audit page reports.
 pub const MAX_CONFLICT_ROWS: usize = 32;
-/// Wall-clock budget one record publish or fetch may spend across its holders.
-pub const RECORD_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Why an append, projection, or audit did not complete. A local availability
 /// failure is never reported as a denial of the record.
