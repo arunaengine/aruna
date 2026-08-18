@@ -2,12 +2,16 @@
 //!
 //! The key is `(policy_id, digest)`: an id-only key could accept changed bytes
 //! under a known id, which policy immutability forbids. A stored positive entry
-//! is bytes, never a trusted document, so every lookup verifies it again before
-//! it may be matched against a subject.
+//! is bytes, never a trusted document, so every lookup verifies the definition
+//! and its publication signature again before it may be matched against a
+//! subject. The realm-admin authority behind that publication was verified
+//! before the entry was written, and the retained publication keeps it
+//! auditable afterwards.
 
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
-    PlacementPolicy, PlacementPolicyError, PlacementPolicyRef, RealmId, VerifiedPolicy,
+    PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PolicyAuthorityError,
+    RealmId, VerifiedPolicy,
 };
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
@@ -44,6 +48,8 @@ pub enum PolicyCacheError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
+    #[error(transparent)]
+    Authority(#[from] PolicyAuthorityError),
     /// The stored bytes are not the requested definition, so they are discarded
     /// instead of served.
     #[error("cached policy does not match the requested ref")]
@@ -55,9 +61,10 @@ pub enum PolicyCacheError {
 /// explicit expiry because they are availability hints only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyCacheEntry {
+    /// The authenticated document, so the entry keeps the provenance its
+    /// verification rested on instead of bare policy bytes.
     Verified {
-        realm_id: RealmId,
-        policy: PlacementPolicy,
+        document: PlacementPolicyDocument,
         stored_at_ms: u64,
     },
     Unavailable {
@@ -94,10 +101,9 @@ impl PolicyCacheStats {
 }
 
 impl PolicyCacheEntry {
-    pub fn verified(realm_id: RealmId, policy: &VerifiedPolicy, stored_at_ms: u64) -> Self {
+    pub fn verified(document: &PlacementPolicyDocument, stored_at_ms: u64) -> Self {
         Self::Verified {
-            realm_id,
-            policy: policy.policy().clone(),
+            document: document.clone(),
             stored_at_ms,
         }
     }
@@ -141,28 +147,25 @@ impl PolicyCacheEntry {
         Ok(postcard::from_bytes(bytes).map_err(ConversionError::from)?)
     }
 
-    /// Re-verifies stored bytes against the realm and ref that were asked for.
-    /// Construction from a row is never enough to make a document matchable.
+    /// Re-verifies stored bytes against the realm and ref that were asked for,
+    /// including the publication that authenticated them. Construction from a
+    /// row is never enough to make a document matchable.
     fn accept(
         self,
         realm_id: RealmId,
         policy_ref: &PlacementPolicyRef,
     ) -> Result<VerifiedPolicy, PolicyCacheError> {
-        let Self::Verified {
-            realm_id: stored_realm,
-            policy,
-            ..
-        } = self
-        else {
+        let Self::Verified { document, .. } = self else {
             return Err(PolicyCacheError::Mismatch);
         };
-        if stored_realm != realm_id {
+        if document.realm_id != realm_id {
             return Err(PolicyCacheError::Mismatch);
         }
-        let verified = VerifiedPolicy::verify(policy)?;
+        let verified = VerifiedPolicy::verify(document.policy.clone())?;
         if verified.policy_ref() != *policy_ref {
             return Err(PolicyCacheError::Mismatch);
         }
+        document.verify_publication()?;
         Ok(verified)
     }
 }
@@ -243,7 +246,8 @@ pub fn plan_eviction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::PlacementSelector;
+    use crate::placement_policy::tests::signed_document;
+    use aruna_core::structs::{PlacementPolicy, PlacementSelector};
     use ulid::Ulid;
 
     fn realm() -> RealmId {
@@ -263,6 +267,10 @@ mod tests {
         )
         .expect("policy is valid");
         VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn document(policy: &VerifiedPolicy) -> PlacementPolicyDocument {
+        signed_document(realm(), policy, 1)
     }
 
     fn stored(entry: &PolicyCacheEntry) -> Value {
@@ -286,7 +294,7 @@ mod tests {
     #[test]
     fn lookup_reverifies() {
         let policy = policy(1, "eu-west");
-        let entry = PolicyCacheEntry::verified(realm(), &policy, 10);
+        let entry = PolicyCacheEntry::verified(&document(&policy), 10);
         let value = stored(&entry);
         assert_eq!(
             lookup(Some(&value), realm(), &policy.policy_ref(), 10_000),
@@ -355,7 +363,7 @@ mod tests {
         let policy = policy(1, "eu-west");
         let mut rows: Vec<(Key, Value)> = (0..MAX_CACHE_ENTRIES)
             .map(|index| {
-                let entry = PolicyCacheEntry::verified(realm(), &policy, 100 + index as u64);
+                let entry = PolicyCacheEntry::verified(&document(&policy), 100 + index as u64);
                 (row_key(index), stored(&entry))
             })
             .collect();
@@ -377,7 +385,7 @@ mod tests {
     #[test]
     fn eviction_bounds_bytes() {
         let policy = policy(1, "eu-west");
-        let entry = PolicyCacheEntry::verified(realm(), &policy, 100);
+        let entry = PolicyCacheEntry::verified(&document(&policy), 100);
         let padding = ByteView::from(vec![0u8; MAX_CACHE_BYTES / 4]);
         let rows: Vec<(Key, Value)> = (0..4)
             .map(|index| (row_key(index), padding.clone()))

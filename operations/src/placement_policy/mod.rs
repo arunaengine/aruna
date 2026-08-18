@@ -24,13 +24,13 @@ pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 mod tests {
     use aruna_core::NodeId;
     use aruna_core::structs::{
-        DEFAULT_NODE_WEIGHT, NodePlacementEntry, PlacementDecision, PlacementPolicy,
-        PlacementPolicyDocument, PlacementSelector, PlacementSubject, PolicyPublicationClaim,
-        PolicyResolution, RealmConfigDocument, RealmId, RealmNodeKind, VerifiedPolicy,
-        evaluate_placement,
+        Actor, DEFAULT_NODE_WEIGHT, NodePlacementEntry, Permission, PlacementDecision,
+        PlacementPolicy, PlacementPolicyDocument, PlacementSelector, PlacementSubject,
+        PolicyPublicationClaim, PolicyResolution, RealmAuthorizationDocument, RealmConfigDocument,
+        RealmId, RealmNodeKind, Role, VerifiedPolicy, evaluate_placement,
     };
-    use aruna_core::types::UserId;
-    use std::collections::BTreeMap;
+    use aruna_core::types::{UserId, Value};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use ulid::Ulid;
 
     use crate::placement::resolve_shard_holders;
@@ -59,6 +59,43 @@ mod tests {
         )
         .sign(&secret);
         PlacementPolicyDocument::new(realm_id, policy, publication)
+    }
+
+    /// Realm authorization granting `user` the realm-configuration write every
+    /// policy publication is verified against.
+    pub(crate) fn realm_authorization(
+        realm_id: RealmId,
+        user: UserId,
+    ) -> RealmAuthorizationDocument {
+        let role = Role {
+            role_id: Ulid::from_bytes([1u8; 16]),
+            name: "realm_admin".to_string(),
+            permissions: HashMap::from([(format!("/{realm_id}/admin/**"), Permission::WRITE)]),
+            assigned_users: HashSet::from([user]),
+        };
+        RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::from([(role.role_id, role)]),
+            operation_restrictions: HashMap::new(),
+        }
+    }
+
+    /// Encoded realm config and authorization, the view a policy read verifies
+    /// every publication against.
+    pub(crate) fn realm_view(config: &RealmConfigDocument, user: UserId) -> (Value, Value) {
+        let actor = Actor {
+            node_id: node(1),
+            user_id: user,
+            realm_id: config.realm_id,
+        };
+        (
+            Value::from(config.to_bytes(&actor).expect("config encodes")),
+            Value::from(
+                realm_authorization(config.realm_id, user)
+                    .to_bytes(&actor)
+                    .expect("authorization encodes"),
+            ),
+        )
     }
 
     fn node(seed: u8) -> NodeId {

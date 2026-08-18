@@ -1,7 +1,8 @@
 //! Reading one immutable policy document by ref: local row first, then a
 //! bounded fetch from the holders the policy id resolves to. No catalog is
-//! consulted, and a document that does not hash to the requested digest is
-//! refused rather than returned.
+//! consulted; a document that does not hash to the requested digest, or whose
+//! publication was not accepted under realm-admin authority, is refused rather
+//! than returned.
 
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{
@@ -11,8 +12,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicyFetchEvent, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, RealmConfigDocument,
-    RealmId, VerifiedPolicy, placement_policy_target,
+    PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PolicyAuthorityError,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, VerifiedPolicy,
+    placement_policy_target, verify_policy_authority,
 };
 use aruna_core::types::{Effects, Value};
 use smallvec::smallvec;
@@ -42,18 +44,33 @@ pub enum PolicySource {
     Fetched,
 }
 
+/// One verified policy together with the publication it was authenticated
+/// against, so a caller can cache or audit its provenance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthenticPolicy {
+    pub document: PlacementPolicyDocument,
+    pub policy: VerifiedPolicy,
+}
+
+/// The replicated realm view one publication is verified against.
+#[derive(Debug, Clone, PartialEq)]
+struct RealmView {
+    config: RealmConfigDocument,
+    auth: RealmAuthorizationDocument,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ReadPolicyOperation {
     config: ReadPolicyConfig,
+    realm: Option<Box<RealmView>>,
     state: ReadPolicyState,
-    output: Option<Result<(VerifiedPolicy, PolicySource), ReadPolicyError>>,
+    output: Option<Result<(AuthenticPolicy, PolicySource), ReadPolicyError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum ReadPolicyState {
     Init,
     ReadLocal,
-    ReadConfig,
     /// Holders this fetch was sent to; a holder that answers with another
     /// definition is dropped and the remainder is asked again.
     Fetch {
@@ -71,6 +88,9 @@ pub enum ReadPolicyError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
+    /// The publication does not prove realm-admin authority for this rule.
+    #[error(transparent)]
+    Authority(#[from] PolicyAuthorityError),
     #[error("realm config document missing")]
     RealmConfigMissing,
     #[error("no placement strategy governs policy documents")]
@@ -106,6 +126,7 @@ impl ReadPolicyOperation {
     pub fn new(config: ReadPolicyConfig) -> Self {
         Self {
             config,
+            realm: None,
             state: ReadPolicyState::Init,
             output: None,
         }
@@ -128,45 +149,52 @@ impl ReadPolicyOperation {
         Ok(verified)
     }
 
-    /// A stored row counts only when it is this realm's document and hashes to
-    /// the requested ref.
-    fn accept_local(
-        &self,
-        value: &Value,
-    ) -> Result<(VerifiedPolicy, PolicySource), ReadPolicyError> {
-        let document = PlacementPolicyDocument::from_bytes(value)?;
-        Ok((self.accept_document(document)?, PolicySource::Local))
-    }
-
-    /// A document counts only when it is this realm's and hashes to the
-    /// requested ref, whether it came from a local row or from a holder.
+    /// A document counts only when it is this realm's, hashes to the requested
+    /// ref, and carries an authentic realm-admin publication, whether it came
+    /// from a local row or from a holder.
     fn accept_document(
         &self,
         document: PlacementPolicyDocument,
-    ) -> Result<VerifiedPolicy, ReadPolicyError> {
+    ) -> Result<AuthenticPolicy, ReadPolicyError> {
         if document.realm_id != self.config.realm_id {
             return Err(ReadPolicyError::RealmMismatch);
         }
-        self.accept(document.policy)
+        let policy = self.accept(document.policy.clone())?;
+        let realm = self
+            .realm
+            .as_ref()
+            .ok_or_else(|| ReadPolicyError::Unavailable("realm view unavailable".to_string()))?;
+        verify_policy_authority(&document, &realm.config, &realm.auth)?;
+        Ok(AuthenticPolicy { document, policy })
     }
 
-    fn emit_read_config(&mut self) -> Effects {
-        self.state = ReadPolicyState::ReadConfig;
-        let target = DocumentSyncTarget::RealmConfig {
-            realm_id: self.config.realm_id,
-        };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })]
-    }
-
-    fn plan_fetch(&mut self, config_value: Option<Value>) -> Result<Effects, ReadPolicyError> {
+    /// Keeps the realm view every publication is verified against. Without it
+    /// nothing is authenticated, so the read reports unavailable.
+    fn store_realm(
+        &mut self,
+        config_value: Option<Value>,
+        auth_value: Option<Value>,
+    ) -> Result<(), ReadPolicyError> {
         let Some(config_value) = config_value else {
             return Err(ReadPolicyError::RealmConfigMissing);
         };
-        let config = RealmConfigDocument::from_bytes(&config_value)?;
+        let Some(auth_value) = auth_value else {
+            return Err(ReadPolicyError::Unavailable(
+                "realm authorization document missing".to_string(),
+            ));
+        };
+        self.realm = Some(Box::new(RealmView {
+            config: RealmConfigDocument::from_bytes(&config_value)?,
+            auth: RealmAuthorizationDocument::from_bytes(&auth_value)?,
+        }));
+        Ok(())
+    }
+
+    fn plan_fetch(&mut self) -> Result<Effects, ReadPolicyError> {
+        let config = match self.realm.as_ref() {
+            Some(realm) => realm.config.clone(),
+            None => return Err(ReadPolicyError::RealmConfigMissing),
+        };
         let placement =
             crate::placement::plan_target_placement(&config, &self.target(), Default::default())?
                 .ok_or(ReadPolicyError::PlacementUnavailable)?
@@ -207,7 +235,7 @@ impl ReadPolicyOperation {
             return self.finish(Err(ReadPolicyError::UnexpectedPublisher));
         }
         match self.accept_document(document) {
-            Ok(policy) => self.finish(Ok((policy, PolicySource::Fetched))),
+            Ok(authentic) => self.finish(Ok((authentic, PolicySource::Fetched))),
             Err(error) => {
                 let remaining: Vec<_> = asked
                     .into_iter()
@@ -226,7 +254,7 @@ impl ReadPolicyOperation {
 
     fn finish(
         &mut self,
-        result: Result<(VerifiedPolicy, PolicySource), ReadPolicyError>,
+        result: Result<(AuthenticPolicy, PolicySource), ReadPolicyError>,
     ) -> Effects {
         self.state = if result.is_ok() {
             ReadPolicyState::Finish
@@ -248,15 +276,26 @@ impl ReadPolicyOperation {
 }
 
 impl Operation for ReadPolicyOperation {
-    type Output = (VerifiedPolicy, PolicySource);
+    type Output = (AuthenticPolicy, PolicySource);
     type Error = ReadPolicyError;
 
+    /// The realm view is read with the row: a local hit needs it to verify
+    /// publication authority, and a miss needs it to resolve the holders.
     fn start(&mut self) -> Effects {
         self.state = ReadPolicyState::ReadLocal;
         let target = self.target();
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
+        let config = DocumentSyncTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        let auth = DocumentSyncTarget::RealmAuthorization {
+            realm_id: self.config.realm_id,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (target.storage_keyspace().to_string(), target.storage_key()),
+                (config.storage_keyspace().to_string(), config.storage_key()),
+                (auth.storage_keyspace().to_string(), auth.storage_key()),
+            ],
             txn_id: None,
         })]
     }
@@ -264,25 +303,31 @@ impl Operation for ReadPolicyOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
             ReadPolicyState::ReadLocal => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
-                    Some(value) => {
-                        let result = self.accept_local(&value);
-                        self.finish(result)
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    let [(_, policy_value), (_, config_value), (_, auth_value)] = values.as_slice()
+                    else {
+                        return self
+                            .unexpected_event("policy row and realm view", format!("{values:?}"));
+                    };
+                    if let Err(error) = self.store_realm(config_value.clone(), auth_value.clone()) {
+                        return self.finish(Err(error));
                     }
-                    None => self.emit_read_config(),
-                },
-                Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-                other => self.unexpected_event("local policy read", format!("{other:?}")),
-            },
-            ReadPolicyState::ReadConfig => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    match self.plan_fetch(value) {
-                        Ok(effects) => effects,
-                        Err(error) => self.finish(Err(error)),
+                    match policy_value.clone() {
+                        Some(value) => {
+                            let result = PlacementPolicyDocument::from_bytes(&value)
+                                .map_err(ReadPolicyError::from)
+                                .and_then(|document| self.accept_document(document))
+                                .map(|authentic| (authentic, PolicySource::Local));
+                            self.finish(result)
+                        }
+                        None => match self.plan_fetch() {
+                            Ok(effects) => effects,
+                            Err(error) => self.finish(Err(error)),
+                        },
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-                other => self.unexpected_event("realm config read", format!("{other:?}")),
+                other => self.unexpected_event("local policy read", format!("{other:?}")),
             },
             ReadPolicyState::Fetch { asked } => match event {
                 Event::Net(NetEvent::PolicyFetch(fetched)) => match fetched {
@@ -323,6 +368,7 @@ impl Operation for ReadPolicyOperation {
             ReadPolicyError::NotFound { .. }
                 | ReadPolicyError::Unavailable(_)
                 | ReadPolicyError::DigestMismatch
+                | ReadPolicyError::Authority(_)
         )
     }
 }
@@ -330,11 +376,11 @@ impl Operation for ReadPolicyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement_policy::tests::signed_document;
+    use crate::placement_policy::tests::{admin_user, realm_view, signed_document};
     use aruna_core::NodeId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::{
-        Actor, LabelMatch, PlacementPolicy, PlacementSelector, RealmNodeKind,
+        LabelMatch, PlacementPolicy, PlacementSelector, PolicyPublicationClaim, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use byteview::ByteView;
@@ -375,10 +421,18 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    fn read_result(value: Option<ByteView>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value,
+    /// The one batch the read starts with: policy row plus the realm view every
+    /// publication is verified against. The config is passed in because each
+    /// fixture mints its own strategy ids.
+    fn opened(config: &RealmConfigDocument, policy_row: Option<Value>) -> Event {
+        let (config_value, auth_value) = realm_view(config, admin_user(realm_id()));
+        let key = ByteView::from(Vec::new());
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (key.clone(), policy_row),
+                (key.clone(), Some(config_value)),
+                (key, Some(auth_value)),
+            ],
         })
     }
 
@@ -390,35 +444,39 @@ mod tests {
         })
     }
 
-    fn document(policy: &VerifiedPolicy) -> ByteView {
-        ByteView::from(
-            signed_document(realm_id(), policy, 1)
-                .to_bytes()
-                .expect("document encodes"),
-        )
+    fn encoded(document: &PlacementPolicyDocument) -> Value {
+        Value::from(document.to_bytes().expect("document encodes"))
     }
 
-    fn foreign_document(policy: &VerifiedPolicy) -> ByteView {
-        ByteView::from(
-            signed_document(RealmId::from_bytes([7u8; 32]), policy, 1)
-                .to_bytes()
-                .expect("document encodes"),
+    fn document(policy: &VerifiedPolicy) -> Value {
+        encoded(&signed_document(realm_id(), policy, 1))
+    }
+
+    fn foreign_document(policy: &VerifiedPolicy) -> Value {
+        encoded(&signed_document(RealmId::from_bytes([7u8; 32]), policy, 1))
+    }
+
+    /// A publication signed by node `seed` naming `created_by` as its authority.
+    fn authored(policy: &VerifiedPolicy, seed: u8, created_by: UserId) -> PlacementPolicyDocument {
+        let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+        let publication = PolicyPublicationClaim::new(
+            realm_id(),
+            policy,
+            secret.public(),
+            created_by,
+            Ulid::from_bytes([5u8; 16]),
+            7,
+            [0u8; 32],
         )
+        .sign(&secret);
+        PlacementPolicyDocument::new(realm_id(), policy, publication)
     }
 
     /// Drives one operation to its first fetch and reports the holders it asked.
     fn start_fetch(policy_ref: PlacementPolicyRef) -> (ReadPolicyOperation, Vec<NodeId>) {
         let mut operation = operation(node(9), policy_ref);
         operation.start();
-        operation.step(read_result(None));
-        let actor = Actor {
-            node_id: node(1),
-            user_id: UserId::local(Ulid::from_bytes([2u8; 16]), realm_id()),
-            realm_id: realm_id(),
-        };
-        let effects = operation.step(read_result(Some(ByteView::from(
-            config().to_bytes(&actor).expect("config encodes"),
-        ))));
+        let effects = operation.step(opened(&config(), None));
         let Some(Effect::Net(NetEffect::PolicyFetch(fetch))) = effects.first() else {
             panic!("expected a policy fetch, got {effects:?}");
         };
@@ -426,11 +484,15 @@ mod tests {
         (operation, holders)
     }
 
-    fn fetched(publisher: NodeId, policy: &VerifiedPolicy) -> Event {
+    fn fetched(publisher: NodeId, document: PlacementPolicyDocument) -> Event {
         Event::Net(NetEvent::PolicyFetch(PolicyFetchEvent::Fetched {
             publisher,
-            document: Box::new(signed_document(realm_id(), policy, 1)),
+            document: Box::new(document),
         }))
+    }
+
+    fn answered(publisher: NodeId, policy: &VerifiedPolicy) -> Event {
+        fetched(publisher, signed_document(realm_id(), policy, 1))
     }
 
     #[test]
@@ -441,15 +503,7 @@ mod tests {
         let config = config();
         let mut operation = operation(node(9), policy.policy_ref());
         operation.start();
-        operation.step(read_result(None));
-        let actor = Actor {
-            node_id: node(1),
-            user_id: UserId::local(Ulid::from_bytes([2u8; 16]), realm_id()),
-            realm_id: realm_id(),
-        };
-        let effects = operation.step(read_result(Some(ByteView::from(
-            config.to_bytes(&actor).expect("config encodes"),
-        ))));
+        let effects = operation.step(opened(&config, None));
 
         let Some(Effect::Net(NetEffect::PolicyFetch(fetch))) = effects.first() else {
             panic!("expected a policy fetch, got {effects:?}");
@@ -461,11 +515,10 @@ mod tests {
         let expected = crate::placement::read_holder_sets(&config, &placement).expect("holders");
         assert_eq!(fetch.holders.as_slice(), expected.as_slice());
 
-        operation.step(fetched(expected[0], &policy));
-        assert_eq!(
-            operation.finalize().expect("policy resolves"),
-            (policy, PolicySource::Fetched)
-        );
+        operation.step(answered(expected[0], &policy));
+        let (authentic, source) = operation.finalize().expect("policy resolves");
+        assert_eq!(authentic.policy, policy);
+        assert_eq!(source, PolicySource::Fetched);
     }
 
     #[test]
@@ -475,7 +528,7 @@ mod tests {
         let requested = policy("eu-west");
         let mut operation = operation(node(9), requested.policy_ref());
         operation.start();
-        operation.step(read_result(Some(document(&policy("us-east")))));
+        operation.step(opened(&config(), Some(document(&policy("us-east")))));
         assert_eq!(
             operation.finalize(),
             Err(ReadPolicyError::DigestMismatch),
@@ -488,11 +541,10 @@ mod tests {
         let policy = policy("eu-west");
         let mut operation = operation(node(1), policy.policy_ref());
         operation.start();
-        operation.step(read_result(Some(document(&policy))));
-        assert_eq!(
-            operation.finalize().expect("policy resolves"),
-            (policy, PolicySource::Local)
-        );
+        operation.step(opened(&config(), Some(document(&policy))));
+        let (authentic, source) = operation.finalize().expect("policy resolves");
+        assert_eq!(authentic.policy, policy);
+        assert_eq!(source, PolicySource::Local);
     }
 
     #[test]
@@ -502,8 +554,60 @@ mod tests {
         let policy = policy("eu-west");
         let mut operation = operation(node(1), policy.policy_ref());
         operation.start();
-        operation.step(read_result(Some(foreign_document(&policy))));
+        operation.step(opened(&config(), Some(foreign_document(&policy))));
         assert_eq!(operation.finalize(), Err(ReadPolicyError::RealmMismatch));
+    }
+
+    #[test]
+    fn rejects_forged_bytes() {
+        // A holder that rewrites the publication onto a definition it prefers is
+        // refused: the signature no longer binds this realm and digest.
+        let requested = policy("eu-west");
+        let mut forged = signed_document(realm_id(), &requested, 1);
+        forged.publication.created_by = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id());
+        let (mut operation, holders) = start_fetch(requested.policy_ref());
+        for holder in &holders {
+            operation.step(fetched(*holder, forged.clone()));
+        }
+        assert_eq!(
+            operation.finalize(),
+            Err(ReadPolicyError::Authority(PolicyAuthorityError::Signature))
+        );
+    }
+
+    #[test]
+    fn rejects_unauthorized_author() {
+        // A validly signed policy whose authorizing user holds no realm-admin
+        // write is not an authentic publication.
+        let requested = policy("eu-west");
+        let outsider = UserId::local(Ulid::from_bytes([6u8; 16]), realm_id());
+        let (mut operation, holders) = start_fetch(requested.policy_ref());
+        for holder in &holders {
+            operation.step(fetched(*holder, authored(&requested, 1, outsider)));
+        }
+        assert_eq!(
+            operation.finalize(),
+            Err(ReadPolicyError::Authority(
+                PolicyAuthorityError::Unauthorized
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_publisher() {
+        // A node outside the realm cannot publish a rule, however well it signs.
+        let requested = policy("eu-west");
+        let (mut operation, holders) = start_fetch(requested.policy_ref());
+        for holder in &holders {
+            operation.step(fetched(
+                *holder,
+                authored(&requested, 9, admin_user(realm_id())),
+            ));
+        }
+        assert_eq!(
+            operation.finalize(),
+            Err(ReadPolicyError::Authority(PolicyAuthorityError::Publisher))
+        );
     }
 
     #[test]
@@ -514,16 +618,16 @@ mod tests {
         let (mut operation, holders) = start_fetch(requested.policy_ref());
         assert!(holders.len() >= 2, "the fixture needs a fallback holder");
 
-        let effects = operation.step(fetched(holders[0], &policy("us-east")));
+        let effects = operation.step(answered(holders[0], &policy("us-east")));
         let Some(Effect::Net(NetEffect::PolicyFetch(retry))) = effects.first() else {
             panic!("expected a retry against the remaining holders, got {effects:?}");
         };
         assert_eq!(retry.holders.as_slice(), &holders[1..]);
 
-        operation.step(fetched(holders[1], &requested));
+        operation.step(answered(holders[1], &requested));
         assert_eq!(
-            operation.finalize().expect("policy resolves"),
-            (requested, PolicySource::Fetched)
+            operation.finalize().expect("policy resolves").0.policy,
+            requested
         );
     }
 
@@ -534,7 +638,7 @@ mod tests {
         let requested = policy("eu-west");
         let (mut operation, holders) = start_fetch(requested.policy_ref());
         for holder in &holders {
-            operation.step(fetched(*holder, &policy("us-east")));
+            operation.step(answered(*holder, &policy("us-east")));
         }
         assert_eq!(operation.finalize(), Err(ReadPolicyError::DigestMismatch));
     }
@@ -544,10 +648,32 @@ mod tests {
         // An answer from a node this fetch never asked is not holder evidence.
         let requested = policy("eu-west");
         let (mut operation, _) = start_fetch(requested.policy_ref());
-        operation.step(fetched(node(9), &requested));
+        operation.step(answered(node(9), &requested));
         assert_eq!(
             operation.finalize(),
             Err(ReadPolicyError::UnexpectedPublisher)
         );
+    }
+
+    #[test]
+    fn requires_realm_view() {
+        // Without the replicated authorization document nothing can be
+        // authenticated, so the read reports unavailable instead of trusting it.
+        let policy = policy("eu-west");
+        let mut operation = operation(node(1), policy.policy_ref());
+        operation.start();
+        let key = ByteView::from(Vec::new());
+        let (config_value, _) = realm_view(&config(), admin_user(realm_id()));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (key.clone(), Some(document(&policy))),
+                (key.clone(), Some(config_value)),
+                (key, None),
+            ],
+        }));
+        assert!(matches!(
+            operation.finalize(),
+            Err(ReadPolicyError::Unavailable(_))
+        ));
     }
 }

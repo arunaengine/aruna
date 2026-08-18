@@ -20,7 +20,9 @@ use super::cache::{
     CacheLookup, MAX_CACHE_ENTRIES, PolicyCacheEntry, PolicyCacheStats, cache_key, lookup,
     plan_eviction,
 };
-use super::read::{PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation};
+use super::read::{
+    AuthenticPolicy, PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvePolicyConfig {
@@ -90,16 +92,16 @@ impl ResolvePolicyOperation {
         effects
     }
 
-    /// Keeps the resolved answer, then caches it. Only availability outcomes are
-    /// cached negatively; a fail-closed mismatch is never remembered as a hint.
+    /// Keeps the resolved answer, then caches it. A positive entry is written
+    /// only after the publication was authenticated, and it retains that
+    /// provenance; only availability outcomes are cached negatively.
     fn after_read(
         &mut self,
-        result: Result<(VerifiedPolicy, PolicySource), ReadPolicyError>,
+        result: Result<(AuthenticPolicy, PolicySource), ReadPolicyError>,
     ) -> Effects {
         let entry = match &result {
-            Ok((policy, _)) => Some(PolicyCacheEntry::verified(
-                self.config.realm_id,
-                policy,
+            Ok((authentic, _)) => Some(PolicyCacheEntry::verified(
+                &authentic.document,
                 self.config.now_ms,
             )),
             Err(ReadPolicyError::NotFound { .. } | ReadPolicyError::Unavailable(_)) => {
@@ -107,7 +109,7 @@ impl ResolvePolicyOperation {
             }
             Err(_) => None,
         };
-        self.result = Some(result);
+        self.result = Some(result.map(|(authentic, source)| (authentic.policy, source)));
         let Some(entry) = entry else {
             return self.finish();
         };
@@ -324,9 +326,10 @@ mod tests {
     use aruna_core::effects::NetEffect;
     use aruna_core::events::{NetEvent, PolicyFetchEvent};
     use aruna_core::structs::{
-        PlacementPolicy, PlacementSelector, RealmConfigDocument, RealmNodeKind,
+        PlacementPolicy, PlacementPolicyDocument, PlacementSelector, RealmConfigDocument,
+        RealmNodeKind,
     };
-    use aruna_core::types::{UserId, Value};
+    use aruna_core::types::Value;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -352,26 +355,31 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    fn document(policy: &VerifiedPolicy) -> Value {
-        ByteView::from(
-            super::super::tests::signed_document(realm(), policy, 1)
-                .to_bytes()
-                .expect("document encodes"),
-        )
+    fn document(policy: &VerifiedPolicy) -> PlacementPolicyDocument {
+        super::super::tests::signed_document(realm(), policy, 1)
     }
 
-    fn config() -> Value {
+    fn encoded(policy: &VerifiedPolicy) -> Value {
+        ByteView::from(document(policy).to_bytes().expect("document encodes"))
+    }
+
+    /// The realm view and policy row the inner read starts with.
+    fn opened(policy_row: Option<Value>) -> Event {
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 2);
         config.seed_default_placement();
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
-        let actor = aruna_core::structs::Actor {
-            node_id: node(1),
-            user_id: UserId::local(Ulid::from_bytes([2u8; 16]), realm()),
-            realm_id: realm(),
-        };
-        ByteView::from(config.to_bytes(&actor).expect("config encodes"))
+        let (config_value, auth_value) =
+            super::super::tests::realm_view(&config, super::super::tests::admin_user(realm()));
+        let key = ByteView::from(Vec::new());
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (key.clone(), policy_row),
+                (key.clone(), Some(config_value)),
+                (key, Some(auth_value)),
+            ],
+        })
     }
 
     fn read_result(value: Option<Value>) -> Event {
@@ -395,8 +403,7 @@ mod tests {
     fn fetch_cold(operation: &mut ResolvePolicyOperation, policy: &VerifiedPolicy) -> Effects {
         operation.start();
         operation.step(read_result(None));
-        operation.step(read_result(None));
-        let effects = operation.step(read_result(Some(config())));
+        let effects = operation.step(opened(None));
         let Some(Effect::Net(NetEffect::PolicyFetch(fetch))) = effects.first() else {
             panic!("a cache miss must resolve holders and fetch, got {effects:?}");
         };
@@ -404,7 +411,7 @@ mod tests {
         operation.step(Event::Net(NetEvent::PolicyFetch(
             PolicyFetchEvent::Fetched {
                 publisher: holder,
-                document: Box::new(super::super::tests::signed_document(realm(), policy, 1)),
+                document: Box::new(document(policy)),
             },
         )))
     }
@@ -434,7 +441,7 @@ mod tests {
         assert_eq!(*key, cache_key(&policy.policy_ref()));
         assert_eq!(
             PolicyCacheEntry::from_bytes(value).expect("entry decodes"),
-            PolicyCacheEntry::verified(realm(), &policy, 1_000)
+            PolicyCacheEntry::verified(&document(&policy), 1_000)
         );
 
         operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -451,7 +458,7 @@ mod tests {
         // A durable positive entry must answer without any further effect, so a
         // warm resolve never touches the network.
         let policy = policy(1, "eu-west");
-        let entry = PolicyCacheEntry::verified(realm(), &policy, 10);
+        let entry = PolicyCacheEntry::verified(&document(&policy), 10);
         let mut operation = operation(policy.policy_ref());
         operation.start();
         let effects = operation.step(read_result(Some(ByteView::from(
@@ -474,7 +481,7 @@ mod tests {
         let mut operation = operation(policy.policy_ref());
         fetch_cold(&mut operation, &policy);
 
-        let stale = PolicyCacheEntry::verified(realm(), &policy, 1)
+        let stale = PolicyCacheEntry::verified(&document(&policy), 1)
             .to_bytes()
             .expect("entry encodes");
         let rows: Vec<(Key, Value)> = (0..=MAX_CACHE_ENTRIES)
@@ -523,7 +530,7 @@ mod tests {
         operation.start();
         let effects = operation.step(read_result(None));
         assert!(!effects.is_empty(), "a miss must start a read");
-        let effects = operation.step(read_result(Some(document(&policy(1, "us-east")))));
+        let effects = operation.step(opened(Some(encoded(&policy(1, "us-east")))));
 
         assert!(
             effects.is_empty(),
@@ -538,8 +545,7 @@ mod tests {
         let mut operation = operation(policy.policy_ref());
         operation.start();
         operation.step(read_result(None));
-        operation.step(read_result(None));
-        operation.step(read_result(Some(config())));
+        operation.step(opened(None));
         let effects = operation.step(Event::Net(NetEvent::PolicyFetch(
             PolicyFetchEvent::Unavailable("no holder answered".to_string()),
         )));

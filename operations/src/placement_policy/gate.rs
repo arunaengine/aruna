@@ -117,9 +117,12 @@ impl PolicyGateOperation {
                     refs: vec![policy_ref],
                 })
             }
-            Err(ReadPolicyError::Policy(_)) => self.decide(PlacementDecision::Invalid {
-                policy_ids: vec![policy_ref.policy_id],
-            }),
+            // An unauthenticated publication is an invalid rule, never a grant.
+            Err(ReadPolicyError::Policy(_) | ReadPolicyError::Authority(_)) => {
+                self.decide(PlacementDecision::Invalid {
+                    policy_ids: vec![policy_ref.policy_id],
+                })
+            }
             Err(error) => self.fail(error),
         }
     }
@@ -289,8 +292,8 @@ mod tests {
         let second = policy(2, "us-east");
         let mut operation = operation(vec![first.policy_ref(), second.policy_ref()], "eu-west");
         operation.start();
-        operation.step(cached(&PolicyCacheEntry::verified(realm(), &first, 10)));
-        operation.step(cached(&PolicyCacheEntry::verified(realm(), &second, 10)));
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&first), 10)));
+        operation.step(cached(&PolicyCacheEntry::verified(&document(&second), 10)));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(
@@ -330,10 +333,7 @@ mod tests {
             key: ByteView::from(Vec::new()),
             value: None,
         }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: Some(document(&policy(1, "us-east"))),
-        }));
+        operation.step(opened(Some(encoded(&policy(1, "us-east")))));
 
         assert_eq!(
             operation.finalize().expect("gate decides").decision,
@@ -343,11 +343,32 @@ mod tests {
         );
     }
 
-    fn document(policy: &VerifiedPolicy) -> Value {
-        ByteView::from(
-            crate::placement_policy::tests::signed_document(realm(), policy, 1)
-                .to_bytes()
-                .expect("document encodes"),
-        )
+    fn document(policy: &VerifiedPolicy) -> aruna_core::structs::PlacementPolicyDocument {
+        crate::placement_policy::tests::signed_document(realm(), policy, 1)
+    }
+
+    fn encoded(policy: &VerifiedPolicy) -> Value {
+        ByteView::from(document(policy).to_bytes().expect("document encodes"))
+    }
+
+    /// The realm view and policy row the inner read starts with.
+    fn opened(policy_row: Option<Value>) -> Event {
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm(), Vec::new(), 2);
+        config.seed_default_placement();
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
+        }
+        let (config_value, auth_value) = crate::placement_policy::tests::realm_view(
+            &config,
+            crate::placement_policy::tests::admin_user(realm()),
+        );
+        let key = ByteView::from(Vec::new());
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (key.clone(), policy_row),
+                (key.clone(), Some(config_value)),
+                (key, Some(auth_value)),
+            ],
+        })
     }
 }

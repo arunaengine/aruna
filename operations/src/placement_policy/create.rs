@@ -586,7 +586,7 @@ mod tests {
         )
         .await
         .expect("policy resolves");
-        assert_eq!(read.policy_ref(), policy_ref);
+        assert_eq!(read.policy.policy_ref(), policy_ref);
         assert_eq!(source, PolicySource::Local);
     }
 
@@ -644,7 +644,7 @@ mod tests {
         )
         .await
         .expect("policy resolves");
-        assert_eq!(read.policy(), &created.policy);
+        assert_eq!(read.policy.policy(), &created.policy);
     }
 
     #[tokio::test]
