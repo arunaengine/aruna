@@ -324,8 +324,7 @@ mod tests {
     use aruna_core::effects::NetEffect;
     use aruna_core::events::{NetEvent, PolicyFetchEvent};
     use aruna_core::structs::{
-        PlacementPolicy, PlacementPolicyDocument, PlacementSelector, RealmConfigDocument,
-        RealmNodeKind,
+        PlacementPolicy, PlacementSelector, RealmConfigDocument, RealmNodeKind,
     };
     use aruna_core::types::{UserId, Value};
     use ulid::Ulid;
@@ -355,16 +354,9 @@ mod tests {
 
     fn document(policy: &VerifiedPolicy) -> Value {
         ByteView::from(
-            PlacementPolicyDocument::new(
-                realm(),
-                policy,
-                UserId::local(Ulid::from_bytes([2u8; 16]), realm()),
-                node(1),
-                Ulid::from_bytes([5u8; 16]),
-                7,
-            )
-            .to_bytes()
-            .expect("document encodes"),
+            super::super::tests::signed_document(realm(), policy, 1)
+                .to_bytes()
+                .expect("document encodes"),
         )
     }
 
@@ -412,7 +404,7 @@ mod tests {
         operation.step(Event::Net(NetEvent::PolicyFetch(
             PolicyFetchEvent::Fetched {
                 publisher: holder,
-                policy: Box::new(policy.policy().clone()),
+                document: Box::new(super::super::tests::signed_document(realm(), policy, 1)),
             },
         )))
     }

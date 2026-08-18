@@ -135,10 +135,19 @@ impl ReadPolicyOperation {
         value: &Value,
     ) -> Result<(VerifiedPolicy, PolicySource), ReadPolicyError> {
         let document = PlacementPolicyDocument::from_bytes(value)?;
+        Ok((self.accept_document(document)?, PolicySource::Local))
+    }
+
+    /// A document counts only when it is this realm's and hashes to the
+    /// requested ref, whether it came from a local row or from a holder.
+    fn accept_document(
+        &self,
+        document: PlacementPolicyDocument,
+    ) -> Result<VerifiedPolicy, ReadPolicyError> {
         if document.realm_id != self.config.realm_id {
             return Err(ReadPolicyError::RealmMismatch);
         }
-        Ok((self.accept(document.policy)?, PolicySource::Local))
+        self.accept(document.policy)
     }
 
     fn emit_read_config(&mut self) -> Effects {
@@ -192,12 +201,12 @@ impl ReadPolicyOperation {
         &mut self,
         asked: Vec<aruna_core::NodeId>,
         publisher: aruna_core::NodeId,
-        policy: aruna_core::structs::PlacementPolicy,
+        document: PlacementPolicyDocument,
     ) -> Effects {
         if !asked.contains(&publisher) {
             return self.finish(Err(ReadPolicyError::UnexpectedPublisher));
         }
-        match self.accept(policy) {
+        match self.accept_document(document) {
             Ok(policy) => self.finish(Ok((policy, PolicySource::Fetched))),
             Err(error) => {
                 let remaining: Vec<_> = asked
@@ -277,9 +286,10 @@ impl Operation for ReadPolicyOperation {
             },
             ReadPolicyState::Fetch { asked } => match event {
                 Event::Net(NetEvent::PolicyFetch(fetched)) => match fetched {
-                    PolicyFetchEvent::Fetched { publisher, policy } => {
-                        self.accept_fetched(asked, publisher, *policy)
-                    }
+                    PolicyFetchEvent::Fetched {
+                        publisher,
+                        document,
+                    } => self.accept_fetched(asked, publisher, *document),
                     PolicyFetchEvent::NotFound => self.finish(Err(ReadPolicyError::NotFound {
                         policy_id: self.config.policy_ref.policy_id,
                     })),
@@ -320,11 +330,11 @@ impl Operation for ReadPolicyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placement_policy::tests::signed_document;
     use aruna_core::NodeId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::{
-        Actor, LabelMatch, PlacementPolicy, PlacementPolicyDocument, PlacementSelector,
-        RealmNodeKind,
+        Actor, LabelMatch, PlacementPolicy, PlacementSelector, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use byteview::ByteView;
@@ -382,31 +392,17 @@ mod tests {
 
     fn document(policy: &VerifiedPolicy) -> ByteView {
         ByteView::from(
-            PlacementPolicyDocument::new(
-                realm_id(),
-                policy,
-                UserId::local(Ulid::from_bytes([2u8; 16]), realm_id()),
-                node(1),
-                Ulid::from_bytes([5u8; 16]),
-                7,
-            )
-            .to_bytes()
-            .expect("document encodes"),
+            signed_document(realm_id(), policy, 1)
+                .to_bytes()
+                .expect("document encodes"),
         )
     }
 
     fn foreign_document(policy: &VerifiedPolicy) -> ByteView {
         ByteView::from(
-            PlacementPolicyDocument::new(
-                RealmId::from_bytes([7u8; 32]),
-                policy,
-                UserId::local(Ulid::from_bytes([2u8; 16]), realm_id()),
-                node(1),
-                Ulid::from_bytes([5u8; 16]),
-                7,
-            )
-            .to_bytes()
-            .expect("document encodes"),
+            signed_document(RealmId::from_bytes([7u8; 32]), policy, 1)
+                .to_bytes()
+                .expect("document encodes"),
         )
     }
 
@@ -433,7 +429,7 @@ mod tests {
     fn fetched(publisher: NodeId, policy: &VerifiedPolicy) -> Event {
         Event::Net(NetEvent::PolicyFetch(PolicyFetchEvent::Fetched {
             publisher,
-            policy: Box::new(policy.policy().clone()),
+            document: Box::new(signed_document(realm_id(), policy, 1)),
         }))
     }
 

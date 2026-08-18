@@ -2,15 +2,16 @@
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, NetEvent, PolicySignEvent, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{document_sync_revision_write_entry, shard_manifest_write_entry};
 use aruna_core::structs::{
     Actor, AuthContext, Permission, PlacementPolicy, PlacementPolicyDocument, PlacementPolicyError,
-    PlacementRef, RealmConfigDocument, VerifiedPolicy, placement_policy_change,
-    placement_policy_target,
+    PlacementRef, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
+    RealmConfigDocument, VerifiedPolicy, placement_policy_change, placement_policy_target,
+    policy_admin_path,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, Value};
@@ -52,17 +53,23 @@ enum CreatePolicyState {
     Authorize,
     StartTransaction,
     ReadConfig,
-    ReadFence {
-        document: Box<PlacementPolicyDocument>,
-        placement: PlacementRef,
-        holders: Vec<NodeId>,
-        generation: u64,
-    },
+    ReadFence { pending: Box<PendingPublication> },
+    Sign { pending: Box<PendingPublication> },
     Write,
     Commit,
     ScheduleDrain,
     Finish,
     Error,
+}
+
+/// Everything the write needs once this node's key has signed the publication.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingPublication {
+    policy: VerifiedPolicy,
+    claim: PolicyPublicationClaim,
+    placement: PlacementRef,
+    holders: Vec<NodeId>,
+    generation: u64,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -73,6 +80,12 @@ pub enum CreatePolicyError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
+    #[error(transparent)]
+    Authority(#[from] PolicyAuthorityError),
+    /// This node could not sign the publication, so nothing is published: an
+    /// unsigned policy would carry no provenance a fetcher could verify.
+    #[error("policy publication could not be signed: {0}")]
+    PublicationUnavailable(String),
     #[error("caller may not administer the realm configuration")]
     Unauthorized,
     #[error("realm config document missing")]
@@ -148,18 +161,10 @@ impl CreatePolicyOperation {
         };
         let config = RealmConfigDocument::from_bytes(&config_value)?;
         let verified = VerifiedPolicy::verify(self.config.policy.clone())?;
-        let document = PlacementPolicyDocument::new(
-            self.config.actor.realm_id,
-            &verified,
-            self.config.auth_context.user_id,
-            self.config.actor.node_id,
-            Ulid::generate(),
-            self.config.created_at_ms,
-        );
 
         if let Some(policy_value) = policy_value {
             let existing = PlacementPolicyDocument::from_bytes(&policy_value)?;
-            if !existing.same_definition(&document) {
+            if existing.policy_ref()? != verified.policy_ref() {
                 return Err(PlacementPolicyError::PolicyIdReuse {
                     policy_id: self.policy_id(),
                 }
@@ -177,23 +182,60 @@ impl CreatePolicyOperation {
                 holders: plan.holders,
             });
         }
+        // The signed claim names the config the realm-admin check ran against,
+        // so the publication epoch stays auditable after membership changes.
+        let claim = PolicyPublicationClaim::new(
+            self.config.actor.realm_id,
+            &verified,
+            self.config.actor.node_id,
+            self.config.auth_context.user_id,
+            Ulid::generate(),
+            self.config.created_at_ms,
+            config.digest()?,
+        );
         let generation = fence::write_generation(&config, &plan.placement).unwrap_or_default();
-        if generation == 0 {
-            return self.emit_write(document, plan.placement, plan.holders, generation);
-        }
-        let (key_space, key) = fence::fence_read(&self.config.actor.realm_id, &plan.placement);
-        let txn_id = self.txn_id.ok_or(CreatePolicyError::MissingTransaction)?;
-        self.state = CreatePolicyState::ReadFence {
-            document: Box::new(document),
+        let pending = Box::new(PendingPublication {
+            policy: verified,
+            claim,
             placement: plan.placement,
             holders: plan.holders,
             generation,
-        };
+        });
+        if generation == 0 {
+            return Ok(self.emit_sign(pending));
+        }
+        let (key_space, key) = fence::fence_read(&self.config.actor.realm_id, &plan.placement);
+        let txn_id = self.txn_id.ok_or(CreatePolicyError::MissingTransaction)?;
+        self.state = CreatePolicyState::ReadFence { pending };
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space,
             key,
             txn_id: Some(txn_id),
         })])
+    }
+
+    fn emit_sign(&mut self, pending: Box<PendingPublication>) -> Effects {
+        let claim = pending.claim;
+        self.state = CreatePolicyState::Sign { pending };
+        smallvec![Effect::Net(NetEffect::PolicySign(Box::new(claim)))]
+    }
+
+    /// Binds the signed publication to the planned definition before it is
+    /// written, so a signature that does not authenticate never leaves the node.
+    fn seal(
+        &mut self,
+        pending: PendingPublication,
+        publication: PolicyPublication,
+    ) -> Result<Effects, CreatePolicyError> {
+        let document =
+            PlacementPolicyDocument::new(self.config.actor.realm_id, &pending.policy, publication);
+        document.verify_publication()?;
+        self.emit_write(
+            document,
+            pending.placement,
+            pending.holders,
+            pending.generation,
+        )
     }
 
     /// Row, sync sidecar, shard-manifest entry, and outbox publish in one
@@ -276,7 +318,7 @@ impl Operation for CreatePolicyOperation {
         self.state = CreatePolicyState::Authorize;
         let auth_config = CheckPermissionsConfig {
             auth_context: self.config.auth_context.clone(),
-            path: format!("/{}/admin/config", self.config.actor.realm_id),
+            path: policy_admin_path(self.config.actor.realm_id),
             required_permission: Permission::WRITE,
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -330,23 +372,29 @@ impl Operation for CreatePolicyOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            CreatePolicyState::ReadFence {
-                document,
-                placement,
-                holders,
-                generation,
-            } => match event {
+            CreatePolicyState::ReadFence { pending } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if !fence::admits(value.as_ref(), generation) {
+                    if !fence::admits(value.as_ref(), pending.generation) {
                         return self.fail(CreatePolicyError::PlacementFenced);
                     }
-                    match self.emit_write(*document, placement, holders, generation) {
+                    self.emit_sign(pending)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("placement fence read", format!("{other:?}")),
+            },
+            CreatePolicyState::Sign { pending } => match event {
+                Event::Net(NetEvent::PolicySign(PolicySignEvent::Signed(publication))) => {
+                    match self.seal(*pending, *publication) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("placement fence read", format!("{other:?}")),
+                Event::Net(NetEvent::PolicySign(PolicySignEvent::Unavailable(reason))) => {
+                    self.fail(CreatePolicyError::PublicationUnavailable(reason))
+                }
+                other => {
+                    self.unexpected_event("policy publication signature", format!("{other:?}"))
+                }
             },
             CreatePolicyState::Write => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.emit_commit(),
@@ -422,6 +470,7 @@ mod tests {
     use crate::placement_policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
     use aruna_core::structs::{PlacementSelector, RealmId};
     use aruna_core::types::UserId;
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -457,20 +506,36 @@ mod tests {
         }
     }
 
+    /// A real net handle is part of the fixture: the publication is signed with
+    /// this node's key, so a policy cannot be created without one.
     async fn setup() -> (tempfile::TempDir, DriverContext, Actor) {
         let dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(dir.path().to_str().expect("path")).expect("storage");
+        let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let realm_id = RealmId([21u8; 32]);
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                secret_key: Some(secret.clone()),
+                realm_id,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
         let context = DriverContext {
             storage_handle: storage,
-            net_handle: None,
+            net_handle: Some(net_handle),
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         };
-        let realm_id = RealmId([21u8; 32]);
         let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            node_id: secret.public(),
             user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
             realm_id,
         };

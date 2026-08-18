@@ -18,20 +18,48 @@ pub use create::{CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation};
 pub use gate::{PolicyGateConfig, PolicyGateOperation, PolicyGateOutcome};
 pub use read::{PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation};
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
-pub(crate) use transport::{fetch_policy, serve_local_policy};
+pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 
 #[cfg(test)]
 mod tests {
     use aruna_core::NodeId;
     use aruna_core::structs::{
         DEFAULT_NODE_WEIGHT, NodePlacementEntry, PlacementDecision, PlacementPolicy,
-        PlacementSelector, PlacementSubject, PolicyResolution, RealmConfigDocument, RealmId,
-        RealmNodeKind, VerifiedPolicy, evaluate_placement,
+        PlacementPolicyDocument, PlacementSelector, PlacementSubject, PolicyPublicationClaim,
+        PolicyResolution, RealmConfigDocument, RealmId, RealmNodeKind, VerifiedPolicy,
+        evaluate_placement,
     };
+    use aruna_core::types::UserId;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
     use crate::placement::resolve_shard_holders;
+
+    /// The authorizing user every policy fixture publishes under.
+    pub(crate) fn admin_user(realm_id: RealmId) -> UserId {
+        UserId::local(Ulid::from_bytes([2u8; 16]), realm_id)
+    }
+
+    /// One authentic publication of `policy` by node `seed`, so fixtures carry
+    /// provenance a verifier accepts instead of asserted fields.
+    pub(crate) fn signed_document(
+        realm_id: RealmId,
+        policy: &VerifiedPolicy,
+        seed: u8,
+    ) -> PlacementPolicyDocument {
+        let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+        let publication = PolicyPublicationClaim::new(
+            realm_id,
+            policy,
+            secret.public(),
+            admin_user(realm_id),
+            Ulid::from_bytes([5u8; 16]),
+            7,
+            [0u8; 32],
+        )
+        .sign(&secret);
+        PlacementPolicyDocument::new(realm_id, policy, publication)
+    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

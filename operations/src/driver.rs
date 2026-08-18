@@ -372,6 +372,10 @@ async fn dispatch_effect_until(
         Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
             Box::pin(crate::placement_policy::fetch_policy(context, *fetch)).await,
         )),
+        // Publication signing needs this node's key, which only the handle holds.
+        Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
+            crate::placement_policy::sign_publication(context, *claim),
+        )),
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await

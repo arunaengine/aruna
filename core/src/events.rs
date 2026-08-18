@@ -8,8 +8,8 @@ use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
     BackendLocation, GroupRoutingInputs, HiddenBlobEntry, JobRecordEnvelope, PlacementDecision,
-    PlacementPolicy, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
-    ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    PlacementPolicyDocument, PolicyPublication, RealmId, ReplicationSuboperationResult,
+    ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::{
     document::DocumentSyncNetEvent,
@@ -198,16 +198,26 @@ pub enum NetEvent {
     PolicyFetch(PolicyFetchEvent),
     JobRecord(JobRecordEvent),
     LaunchOffer(LaunchOfferEvent),
+    PolicySign(PolicySignEvent),
     Error(NetError),
 }
 
+/// Reply to a [`crate::effects::NetEffect::PolicySign`]. The adapter signs only
+/// a claim naming this node, so no operation can mint foreign provenance.
+#[derive(Debug, PartialEq)]
+pub enum PolicySignEvent {
+    Signed(Box<PolicyPublication>),
+    Unavailable(String),
+}
+
 /// Reply to a [`crate::effects::PolicyFetchEffect`]. A fetched document is a
-/// candidate only; the operation verifies it against the requested ref.
+/// candidate only; the operation verifies its definition and publication
+/// authority before it may be cached or matched against a subject.
 #[derive(Debug, PartialEq)]
 pub enum PolicyFetchEvent {
     Fetched {
         publisher: NodeId,
-        policy: Box<PlacementPolicy>,
+        document: Box<PlacementPolicyDocument>,
     },
     /// Every reached holder answered without the document.
     NotFound,

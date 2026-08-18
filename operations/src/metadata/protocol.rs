@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{
-    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicy,
+    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicyDocument,
     PlacementPolicyRef, SyncRelationship,
 };
 use aruna_core::types::{GroupId, UserId};
@@ -234,7 +234,7 @@ pub enum MetadataTransportMessage {
     /// `Ok(None)` means this holder has no such document; it never means the
     /// policy does not exist.
     ForwardedPlacementPolicy {
-        result: Result<Option<Box<PlacementPolicy>>, MetadataReadError>,
+        result: Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError>,
     },
 }
 

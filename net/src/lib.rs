@@ -2579,6 +2579,7 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::PolicyFetch(_)) => "policy_fetch",
         Effect::Net(NetEffect::JobRecord(_)) => "job_record",
         Effect::Net(NetEffect::LaunchOffer(_)) => "launch_offer",
+        Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",

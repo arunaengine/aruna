@@ -11,8 +11,8 @@ use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{
     BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey,
-    JobRecordEnvelope, PlacementPolicyRef, PlacementRef, RealmId, ResolvedBackend,
-    ResolvedSourceAccess, SubmissionId,
+    JobRecordEnvelope, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim, RealmId,
+    ResolvedBackend, ResolvedSourceAccess, SubmissionId,
 };
 use crate::task::TaskEffect;
 use crate::types::UserId;
@@ -261,6 +261,9 @@ pub enum NetEffect {
     PolicyFetch(Box<PolicyFetchEffect>),
     JobRecord(Box<JobRecordEffect>),
     LaunchOffer(Box<LaunchOfferEffect>),
+    /// Signs one policy publication claim with this node's key, after the
+    /// operation checked the authorizing user's realm-admin permission.
+    PolicySign(Box<PolicyPublicationClaim>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

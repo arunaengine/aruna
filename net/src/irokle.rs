@@ -3120,11 +3120,11 @@ impl DocumentSyncService {
                             )));
                             continue;
                         }
-                        // The sealed actor is the publishing node, so a document
-                        // signed by anyone else is a forgery.
+                        // The sealed actor is the original publisher, so a relay
+                        // that restates the document is not its author.
                         let expected_actor = irokle_crate::actor_id_for(
                             topic_id,
-                            node_id_to_peer_id(&document.actor),
+                            node_id_to_peer_id(&document.publication.publisher),
                         );
                         if actor_id != expected_actor {
                             warn!(
@@ -19187,13 +19187,36 @@ mod tests {
         );
     }
 
+    /// The user every policy fixture publishes under.
+    fn policy_admin(realm_id: RealmId) -> UserId {
+        UserId::local(Ulid::from_bytes([4u8; 16]), realm_id)
+    }
+
+    /// One authentic publication of `policy` by node `seed`.
+    fn signed_policy_document(
+        realm_id: RealmId,
+        policy: &aruna_core::structs::VerifiedPolicy,
+        seed: u8,
+    ) -> PlacementPolicyDocument {
+        let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+        let publication = aruna_core::structs::PolicyPublicationClaim::new(
+            realm_id,
+            policy,
+            secret.public(),
+            policy_admin(realm_id),
+            Ulid::from_bytes([5u8; 16]),
+            9,
+            [0u8; 32],
+        )
+        .sign(&secret);
+        PlacementPolicyDocument::new(realm_id, policy, publication)
+    }
+
     #[test]
     fn binds_policy_target() {
         use aruna_core::structs::{
-            PlacementPolicy, PlacementPolicyDocument, PlacementSelector, VerifiedPolicy,
-            placement_policy_change,
+            PlacementPolicy, PlacementSelector, VerifiedPolicy, placement_policy_change,
         };
-        use aruna_core::types::UserId;
 
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let policy_id = Ulid::from_bytes([8u8; 16]);
@@ -19212,14 +19235,7 @@ mod tests {
             .expect("policy is valid"),
         )
         .expect("policy verifies");
-        let document = PlacementPolicyDocument::new(
-            realm_id,
-            &policy,
-            UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
-            node(7),
-            Ulid::from_bytes([5u8; 16]),
-            9,
-        );
+        let document = signed_policy_document(realm_id, &policy, 7);
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([6u8; 16]),
             shard: 3,

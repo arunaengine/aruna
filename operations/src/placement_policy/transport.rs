@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, PolicyFetchEffect, StorageEffect};
-use aruna_core::events::{Event, PolicyFetchEvent, StorageEvent};
+use aruna_core::events::{Event, PolicyFetchEvent, PolicySignEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
-    PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, RealmConfigDocument, RealmId,
-    VerifiedPolicy, placement_policy_target,
+    PlacementPolicyDocument, PlacementPolicyRef, PolicyPublicationClaim, RealmConfigDocument,
+    RealmId, VerifiedPolicy, placement_policy_target,
 };
 use tokio::time::timeout_at;
 use tracing::warn;
@@ -47,11 +47,11 @@ pub(crate) async fn fetch_policy(
             };
         match reply {
             MetadataTransportMessage::ForwardedPlacementPolicy {
-                result: Ok(Some(policy)),
+                result: Ok(Some(document)),
             } => {
                 return PolicyFetchEvent::Fetched {
                     publisher: *holder,
-                    policy,
+                    document,
                 };
             }
             MetadataTransportMessage::ForwardedPlacementPolicy { result: Ok(None) } => {
@@ -76,8 +76,26 @@ pub(crate) async fn fetch_policy(
     PolicyFetchEvent::Unavailable("no policy holder answered".to_string())
 }
 
+/// Signs one publication claim with this node's key. A claim naming another
+/// publisher is refused, so no operation can mint provenance for a peer.
+pub(crate) fn sign_publication(
+    context: &DriverContext,
+    claim: PolicyPublicationClaim,
+) -> PolicySignEvent {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return PolicySignEvent::Unavailable("net transport unavailable".to_string());
+    };
+    if claim.publisher != net_handle.node_id() {
+        return PolicySignEvent::Unavailable("claim names another publisher".to_string());
+    }
+    PolicySignEvent::Signed(Box::new(
+        claim.signed_with(|message| net_handle.sign(message)),
+    ))
+}
+
 /// Serves one policy document to a peer. The peer must be a sync-eligible node
-/// of this realm, and the answer must hash to the requested ref.
+/// of this realm, and the answer must hash to the requested ref. The original
+/// publication travels with it: this holder never becomes the author.
 pub(crate) async fn serve_local_policy(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -92,7 +110,7 @@ async fn local_policy_result(
     context: &Arc<DriverContext>,
     peer: NodeId,
     policy_ref: PlacementPolicyRef,
-) -> Result<Option<Box<PlacementPolicy>>, MetadataReadError> {
+) -> Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError> {
     let net_handle = context
         .net_handle
         .as_ref()
@@ -120,7 +138,7 @@ async fn read_policy(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     policy_ref: PlacementPolicyRef,
-) -> Result<Option<PlacementPolicy>, MetadataReadError> {
+) -> Result<Option<PlacementPolicyDocument>, MetadataReadError> {
     let target = placement_policy_target(policy_ref.policy_id);
     let event = context
         .storage_handle
@@ -144,7 +162,7 @@ async fn read_policy(
         return Ok(None);
     }
     match VerifiedPolicy::verify(document.policy.clone()) {
-        Ok(verified) if verified.policy_ref() == policy_ref => Ok(Some(document.policy)),
+        Ok(verified) if verified.policy_ref() == policy_ref => Ok(Some(document)),
         Ok(_) => Ok(None),
         Err(_) => Err(MetadataReadError::Unavailable),
     }

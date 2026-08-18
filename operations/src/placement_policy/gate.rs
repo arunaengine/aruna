@@ -345,16 +345,9 @@ mod tests {
 
     fn document(policy: &VerifiedPolicy) -> Value {
         ByteView::from(
-            aruna_core::structs::PlacementPolicyDocument::new(
-                realm(),
-                policy,
-                aruna_core::types::UserId::local(Ulid::from_bytes([2u8; 16]), realm()),
-                node(1),
-                Ulid::from_bytes([5u8; 16]),
-                7,
-            )
-            .to_bytes()
-            .expect("document encodes"),
+            crate::placement_policy::tests::signed_document(realm(), policy, 1)
+                .to_bytes()
+                .expect("document encodes"),
         )
     }
 }
