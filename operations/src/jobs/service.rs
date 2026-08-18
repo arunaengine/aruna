@@ -40,6 +40,8 @@ use crate::metadata::repository::StorageReadError;
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 
+use super::lifecycle::cancel::cancel_family;
+use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
 pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
@@ -490,7 +492,9 @@ async fn route_record(
             .map_err(JobRouteError::Internal);
     };
     let request = auth_token.map(|auth_token| JobRequest::Record { auth_token, job_id });
-    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    let responder = family_responder(context, job_id).await;
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
+        .with_responder(responder);
     match drive(operation, context).await? {
         JobRouteOutcome::Local => read_record_data(context, user_id, job_id)
             .await
@@ -631,6 +635,11 @@ pub async fn read_job_routed(
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<RoutedJobStatus, JobRouteError> {
     let user_id = auth.user_id;
+    // An external job is answered from the family projection, which any node
+    // that reduced the family can do; only other jobs keep owner routing.
+    if let Some(status) = family_status(context, auth, job_id).await {
+        return status;
+    }
     let Some(net) = context.net_handle.as_ref() else {
         return local_status(context, auth, job_id).await;
     };
@@ -741,7 +750,9 @@ pub async fn read_report_routed(
         last_key: last_key.clone(),
         limit: wire_limit,
     });
-    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    let responder = family_responder(context, job_id).await;
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
+        .with_responder(responder);
     match drive(operation, context).await? {
         JobRouteOutcome::Local => {
             read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
@@ -899,7 +910,10 @@ pub async fn read_artifact_routed(
         };
         return Ok((lookup, read));
     }
-    let owner = resolve_job_owner(context, job_id).await?;
+    let owner = match family_responder(context, job_id).await {
+        Some(responder) => responder,
+        None => resolve_job_owner(context, job_id).await?,
+    };
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     if Some(owner) == local_node {
         let lookup = read_owned_artifact(context, user_id, job_id, now_ms)
@@ -1068,8 +1082,37 @@ fn cancel_outcome(outcome: CancelJobOutcome) -> RoutedCancelOutcome {
     }
 }
 
-/// Cancellation is owner-anchored: it either executes on the immutable owner or
-/// fails `Unavailable`; no passive copy is ever terminalized in its stead.
+/// Cancels one external job by publishing its family record. `None` means the
+/// alias names no family here, so ordinary owner-anchored cancellation applies.
+async fn family_cancel(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Option<Result<RoutedCancelOutcome, JobRouteError>> {
+    let auth = AuthContext {
+        user_id,
+        realm_id: user_id.realm_id,
+        path_restrictions: None,
+    };
+    let published = cancel_family(context, &auth, job_id, auth_token).await?;
+    Some(match published {
+        Ok(()) => match family_status(context, &auth, job_id).await {
+            Some(Ok(status)) => Ok(match status.job.state.is_terminal() {
+                true => RoutedCancelOutcome::AlreadyTerminal(status.job),
+                false => RoutedCancelOutcome::Requested(status.job),
+            }),
+            Some(Err(error)) => Err(error),
+            None => Err(JobRouteError::Unavailable(
+                "cancelled family is no longer projectable".to_string(),
+            )),
+        },
+        Err(error) => Err(error),
+    })
+}
+
+/// Cancellation of a node-local job is owner-anchored: it either executes on the
+/// immutable owner or fails `Unavailable`; no passive copy is terminalized.
 pub async fn cancel_job_routed(
     context: &DriverContext,
     runtime: &JobsRuntime,
@@ -1083,8 +1126,15 @@ pub async fn cancel_job_routed(
             .map(cancel_outcome)
             .map_err(JobRouteError::Internal);
     };
+    // Cancelling an external job is an append-only family record, not an owner
+    // call; the local row of a receipted execution is stopped separately.
+    if let Some(cancelled) = family_cancel(context, user_id, job_id, auth_token.clone()).await {
+        return cancelled;
+    }
     let request = auth_token.map(|auth_token| JobRequest::Cancel { auth_token, job_id });
-    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    let responder = family_responder(context, job_id).await;
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
+        .with_responder(responder);
     match drive(operation, context).await? {
         JobRouteOutcome::Local => cancel_owned_job(context, runtime, user_id, job_id)
             .await

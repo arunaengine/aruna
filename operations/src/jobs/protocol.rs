@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
+use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{AuthContext, JobId, JobPayload, RealmId};
 use aruna_core::types::UserId;
@@ -263,11 +264,13 @@ async fn prepare_response(
             )
             .await
         }
-        JobRequest::Cancel { job_id, .. } => {
+        JobRequest::Cancel {
+            job_id, auth_token, ..
+        } => {
             if let Some(rejected) = owner_gate(context, job_id, local_node).await {
                 return rejected;
             }
-            prepare_cancel(context, runtime, auth.user_id, job_id).await
+            prepare_cancel(context, runtime, &auth, auth_token, job_id).await
         }
         JobRequest::Record { job_id, .. } => {
             if let Some(rejected) = owner_gate(context, job_id, local_node).await {
@@ -305,11 +308,20 @@ async fn prepare_record(
 /// Owner-directed requests are answered only by the derived owner, the sole
 /// absence authority: a non-owner or unresolved owner answers `Unavailable`,
 /// and only a provably invalid id is `NotFound`.
+/// Who may answer for a job here: its immutable owner, or any node that knows
+/// the request family the alias belongs to. An external job has no single
+/// owner, so a family holder or its executor answers for it.
 async fn owner_gate(
     context: &DriverContext,
     job_id: JobId,
     local_node: Option<NodeId>,
 ) -> Option<PreparedResponse> {
+    if crate::jobs::lifecycle::routing::family_of_alias(context, job_id)
+        .await
+        .is_some()
+    {
+        return None;
+    }
     match resolve_job_owner(context, job_id).await {
         Ok(owner) if local_node == Some(owner) => None,
         Ok(_) => Some(PreparedResponse::new(JobResponse::Unavailable(
@@ -428,9 +440,24 @@ async fn prepare_artifact(
 async fn prepare_cancel(
     context: &DriverContext,
     runtime: &Arc<JobsRuntime>,
-    user_id: UserId,
+    auth: &AuthContext,
+    auth_token: MetadataAuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
+    // A forwarded cancel reaches a family holder here: it publishes the record
+    // and then still stops its own local execution row if it has one.
+    if let Some(Err(error)) =
+        crate::jobs::lifecycle::cancel::cancel_family(context, auth, job_id, Some(auth_token)).await
+        && !matches!(error, JobRouteError::Unavailable(_))
+    {
+        return PreparedResponse::new(match error {
+            JobRouteError::Forbidden => JobResponse::Forbidden,
+            JobRouteError::Unauthorized => JobResponse::Unauthorized,
+            JobRouteError::NotFound => JobResponse::NotFound,
+            error => JobResponse::Unavailable(error.to_string()),
+        });
+    }
+    let user_id = auth.user_id;
     let response = match cancel_owned_job(context, runtime, user_id, job_id).await {
         Ok(CancelJobOutcome::NotFound) => JobResponse::NotFound,
         Ok(CancelJobOutcome::AlreadyTerminal(record)) => JobResponse::Cancelled {

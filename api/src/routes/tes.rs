@@ -15,9 +15,9 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
+use aruna_operations::jobs::lifecycle::submit_external_job;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
-    submit_execution_job,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
@@ -512,6 +512,7 @@ pub async fn service_info(
 pub async fn create_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     headers: HeaderMap,
     Json(task): Json<TesTask>,
 ) -> Response {
@@ -544,15 +545,19 @@ pub async fn create_task(
         aruna_core::structs::WorkspaceMode::Kept
     };
 
-    match submit_execution_job(
+    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+        Ok(token) => token,
+        Err(error) => return error.into_response(),
+    };
+    match submit_external_job(
         &state.get_ctx(),
         spec,
         caller.auth.user_id,
-        state.get_node_id(),
         idempotency_key,
         workspace_mode,
         None,
         state.rocrate_limits().artifact_retention_ms,
+        forwarded,
     )
     .await
     {
@@ -1059,7 +1064,7 @@ fn map_task_to_spec(
         collision_policy: Default::default(),
     };
 
-    // Handed over as the raw idempotency key: `submit_execution_job` applies the per-user
+    // Handed over as the raw idempotency key: the ingress applies the per-user
     // `user/` namespacing itself, so TES inherits dedup scoping for free.
     let idempotency_key = task.tags.get(IDEMPOTENCY_TAG_KEY).cloned();
 

@@ -10,10 +10,10 @@ use aruna_core::structs::{
     JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, Permission,
     WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
 };
+use aruna_operations::jobs::lifecycle::submit_external_job;
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
     cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
-    submit_execution_job,
 };
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -425,6 +425,8 @@ pub(crate) fn map_submit_error(
         SubmitJobError::PlacementUnavailable(_) => {
             ServerError::ServiceUnavailableReason("job_placement_unavailable".to_string())
         }
+        SubmitJobError::QuotaDenied(reason) => ServerError::Conflict(reason),
+        SubmitJobError::AuthorityDenied => ServerError::Forbidden,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -677,6 +679,7 @@ pub async fn list_jobs(
 pub async fn submit_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SubmitExecutionRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
@@ -755,15 +758,15 @@ pub async fn submit_job(
         output_prefixes,
         collision_policy: collision_policy(request.collision_policy),
     };
-    let result = submit_execution_job(
+    let result = submit_external_job(
         &state.get_ctx(),
         spec,
         auth.user_id,
-        state.get_node_id(),
         request.idempotency_key,
         workspace_mode,
         workspace_bucket,
         state.rocrate_limits().artifact_retention_ms,
+        forwarded_job_auth(bearer)?,
     )
     .await
     .map_err(map_submit_error)?;
