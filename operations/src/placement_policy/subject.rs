@@ -16,7 +16,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, Key, NodeId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::blob::managed_copy::{
     COPY_PAGE_LIMIT, ManagedCopyError, ManagedCopyPage, scan_effect, transition_effect,
@@ -406,7 +406,7 @@ pub async fn observe_placement(
             None => return Ok(None),
         },
     };
-    drive(
+    let result = drive(
         SubjectScanOperation::new(SubjectScanConfig {
             realm_id,
             observed,
@@ -415,8 +415,21 @@ pub async fn observe_placement(
         }),
         context,
     )
+    .await?;
+    // Compute follows the same observation: a departing node stops offering
+    // execution and publishes its final snapshots, a returning one advertises
+    // again. Best effort, because departure may never block on it.
+    if let Err(error) = crate::node_info::set_departure_state(
+        context,
+        node_id,
+        realm_id,
+        matches!(mode, SubjectScanMode::Depart),
+    )
     .await
-    .map(Some)
+    {
+        warn!(%error, "failed to publish compute departure state");
+    }
+    Ok(Some(result))
 }
 
 async fn read_realm_config(
