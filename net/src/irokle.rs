@@ -19313,12 +19313,15 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    async fn policy_service(realm_id: RealmId, storage: StorageHandle) -> DocumentSyncService {
-        let dir = tempfile::tempdir().expect("doc dir");
+    async fn policy_service(
+        realm_id: RealmId,
+        storage: StorageHandle,
+        root: &Path,
+    ) -> DocumentSyncService {
         DocumentSyncService::open_with_persist_policy(
             test_endpoint(31).await,
             storage,
-            dir.keep().join("document-sync"),
+            root.join("document-sync"),
             &[],
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
@@ -19331,10 +19334,10 @@ mod tests {
     #[tokio::test]
     async fn admits_authentic_policy() {
         let realm_id = RealmId::from_bytes([21u8; 32]);
-        let (_dir, storage) = test_storage();
+        let (dir, storage) = test_storage();
         let (config, auth) = policy_realm_view(realm_id);
         write_realm_view(&storage, &config, &auth).await;
-        let service = policy_service(realm_id, storage.clone()).await;
+        let service = policy_service(realm_id, storage.clone(), dir.path()).await;
 
         let policy = policy_fixture(Ulid::from_bytes([8u8; 16]));
         let document = signed_policy_document(realm_id, &policy, 1);
@@ -19363,10 +19366,10 @@ mod tests {
         // A self-authoring ordinary node and a relay that substitutes itself as
         // origin both lack realm-admin publication authority.
         let realm_id = RealmId::from_bytes([22u8; 32]);
-        let (_dir, storage) = test_storage();
+        let (dir, storage) = test_storage();
         let (config, auth) = policy_realm_view(realm_id);
         write_realm_view(&storage, &config, &auth).await;
-        let service = policy_service(realm_id, storage.clone()).await;
+        let service = policy_service(realm_id, storage.clone(), dir.path()).await;
 
         let policy = policy_fixture(Ulid::from_bytes([9u8; 16]));
         let placement = config
@@ -19416,7 +19419,7 @@ mod tests {
         // Without the replicated authorization document the publication cannot
         // be verified yet, so it waits instead of being accepted or dropped.
         let realm_id = RealmId::from_bytes([23u8; 32]);
-        let (_dir, storage) = test_storage();
+        let (dir, storage) = test_storage();
         let (config, _) = policy_realm_view(realm_id);
         let actor = aruna_core::structs::Actor {
             node_id: node(1),
@@ -19434,7 +19437,7 @@ mod tests {
         )
         .await
         .expect("config is stored");
-        let service = policy_service(realm_id, storage.clone()).await;
+        let service = policy_service(realm_id, storage.clone(), dir.path()).await;
 
         let policy = policy_fixture(Ulid::from_bytes([10u8; 16]));
         let document = signed_policy_document(realm_id, &policy, 1);
