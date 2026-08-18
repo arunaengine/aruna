@@ -162,7 +162,15 @@ async fn read_policy(
         return Ok(None);
     }
     match VerifiedPolicy::verify(document.policy.clone()) {
-        Ok(verified) if verified.policy_ref() == policy_ref => Ok(Some(document)),
+        Ok(verified) if verified.policy_ref() == policy_ref => {
+            // Cheap pre-serve check: a stored row whose publication no longer
+            // authenticates is not evidence, so another holder is asked instead.
+            document.verify_publication().map_err(|error| {
+                warn!(policy_id = %policy_ref.policy_id, error = %error, "Refusing to serve an unauthenticated policy row");
+                MetadataReadError::Unavailable
+            })?;
+            Ok(Some(document))
+        }
         Ok(_) => Ok(None),
         Err(_) => Err(MetadataReadError::Unavailable),
     }

@@ -4252,9 +4252,18 @@ impl DocumentSyncService {
                 .await?
             {
                 MetadataPlacementOutcome::Accepted(_) => Ok(()),
-                MetadataPlacementOutcome::Deferred(_) => Err(NetError::Dht(
-                    "placement policy configuration is unavailable".to_string(),
-                )),
+                // The authority evidence has not replicated in yet. Deferring
+                // keeps the event unapplied and retryable instead of failing it.
+                MetadataPlacementOutcome::Deferred(dependency) => {
+                    warn!(
+                        %policy_id,
+                        ?dependency,
+                        "Deferring a placement policy document until its dependency replicates"
+                    );
+                    Err(NetError::Deferred(format!(
+                        "placement policy {policy_id} awaits its authority evidence"
+                    )))
+                }
                 MetadataPlacementOutcome::Rejected => Err(NetError::Bootstrap(
                     "placement policy has a mismatched placement or reuses its id".to_string(),
                 )),
