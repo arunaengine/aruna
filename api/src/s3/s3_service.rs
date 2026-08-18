@@ -1914,7 +1914,10 @@ impl S3 for ArunaS3Service {
             None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
         }
         .map_err(routing_inputs_error)?;
-        let operation = CreateMultipartUploadOperation::new(CMPI {
+        let gate = gate_context(&self.state, self.realm_id, now_ms())
+            .await
+            .map_err(gate_context_error)?;
+        let mut operation = CreateMultipartUploadOperation::new(CMPI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             group_id,
@@ -1926,6 +1929,9 @@ impl S3 for ArunaS3Service {
             req.input.metadata.clone().unwrap_or_default(),
             req.input.content_type.as_deref(),
         ));
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
 
         let result = drive(operation, &self.state)
             .await

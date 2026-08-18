@@ -10,6 +10,9 @@ use crate::driver::{DriverContext, drive};
 use crate::group_backends::{RecordReadError, parse_read};
 use crate::group_routing::load_group_inputs;
 use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
+use crate::placement_policy::{
+    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReferenceAdvance, ReplicationMode,
@@ -303,6 +306,9 @@ pub struct ReplicateScopeOperation {
     writer_auth_context: Option<AuthContext>,
     reference_advance: Option<ReferenceAdvance>,
     routing: NodeRouting,
+    /// Destination facts of this node, passed to every version sub-operation
+    /// that may materialize reference bytes here.
+    gate_context: Option<GateContext>,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
 }
@@ -324,6 +330,7 @@ impl ReplicateScopeOperation {
             writer_auth_context: None,
             reference_advance: None,
             routing: NodeRouting::default(),
+            gate_context: None,
             result: ReplicateScopeResult {
                 replicated: 0,
                 replicated_bytes: 0,
@@ -338,6 +345,13 @@ impl ReplicateScopeOperation {
     /// Node-local routing, forwarded to every version sub-operation.
     pub fn with_routing(mut self, routing: NodeRouting) -> Self {
         self.routing = routing;
+        self
+    }
+
+    /// The destination this node materializes reference bytes against. Omitting
+    /// it fails every governed reference materialization closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
         self
     }
 
@@ -619,6 +633,10 @@ impl ReplicateScopeOperation {
             None => {
                 ReplicateObjectVersionOperation::new(request).with_routing(self.routing.clone())
             }
+        };
+        let operation = match self.gate_context.clone() {
+            Some(context) => operation.with_gate(context),
+            None => operation,
         };
         let operation = match writer_auth_context {
             Some(auth_context) => operation.with_writer_auth(auth_context),
@@ -920,6 +938,8 @@ pub enum ReplicateObjectVersionError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     ReplicationError(#[from] ReplicationError),
+    #[error(transparent)]
+    PolicyGateError(#[from] PolicyGateError),
     #[error("Version not found")]
     VersionNotFound,
     #[error("Reference version must be materialized before manifest creation")]
@@ -950,6 +970,7 @@ enum ReplicateObjectVersionState {
     LoadRouting,
     ReadBucketRules,
     ReadReferenceSource,
+    ReferencePolicyGate,
     WriteReferenceBlob,
     CleanupReferenceBlob,
     ReadMultipartSummary,
@@ -990,6 +1011,10 @@ pub struct ReplicateObjectVersionOperation {
     /// Refs read from the stored version, carried onto the manifest unchanged.
     version_policies: Vec<PlacementPolicyRef>,
     pending_copy: Option<ManagedCopyKey>,
+    /// Destination facts of this node, evaluated before reference bytes are
+    /// materialized locally.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
@@ -1018,6 +1043,8 @@ impl ReplicateObjectVersionOperation {
             reference_advance: None,
             version_policies: Vec::new(),
             pending_copy: None,
+            gate_context: None,
+            gate: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
@@ -1025,6 +1052,11 @@ impl ReplicateObjectVersionOperation {
 
     pub fn with_routing(mut self, routing: NodeRouting) -> Self {
         self.routing = routing;
+        self
+    }
+
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
         self
     }
 
@@ -1055,6 +1087,7 @@ impl ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::LoadRouting => "LoadRouting",
             ReplicateObjectVersionState::ReadBucketRules => "ReadBucketRules",
             ReplicateObjectVersionState::ReadReferenceSource => "ReadReferenceSource",
+            ReplicateObjectVersionState::ReferencePolicyGate => "ReferencePolicyGate",
             ReplicateObjectVersionState::WriteReferenceBlob => "WriteReferenceBlob",
             ReplicateObjectVersionState::CleanupReferenceBlob => "CleanupReferenceBlob",
             ReplicateObjectVersionState::ReadMultipartSummary => "ReadMultipartSummary",
@@ -1439,7 +1472,51 @@ impl ReplicateObjectVersionOperation {
         }
     }
 
+    /// A reference materializes real bytes on this node, so it passes the same
+    /// destination gate an ordinary write does, before the source is read.
     fn read_reference_source(&mut self) -> Effects {
+        match write_gate(self.gate_context.as_ref(), &self.version_policies) {
+            Ok(None) => self.open_reference_source(),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = ReplicateObjectVersionState::ReferencePolicyGate;
+                match complete {
+                    true => self.finish_reference_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn handle_reference_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_reference_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_reference_gate(&mut self) -> Effects {
+        let Some(gate) = self.gate.take() else {
+            return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+        };
+        let decision = gate
+            .finalize()
+            .map_err(PolicyGateError::from)
+            .and_then(|outcome| gate_decision(outcome.decision));
+        match decision {
+            Ok(()) => self.open_reference_source(),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn open_reference_source(&mut self) -> Effects {
         let Some(access) = self.reference_access.take() else {
             return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
         };
@@ -2064,6 +2141,7 @@ impl Operation for ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::ReadReferenceSource => {
                 self.handle_reference_source_read(event)
             }
+            ReplicateObjectVersionState::ReferencePolicyGate => self.handle_reference_gate(event),
             ReplicateObjectVersionState::WriteReferenceBlob => {
                 self.handle_reference_blob_written(event)
             }

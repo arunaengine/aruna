@@ -34,7 +34,7 @@ use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
     SourceAuthorization, SourceAuthorizationError,
 };
-use crate::driver::{DriverContext, drive, quota_marked_routing};
+use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
@@ -1381,7 +1381,16 @@ async fn process_blob_replication_job(
         }
         Err(error) => return Err(error.to_string()),
     };
+    // Reference materialization writes real bytes on this node, so the job
+    // carries this node's destination facts; a node mid-transition refuses.
+    let gate = match gate_context(context, job.input.auth_context.realm_id, now_ms()).await {
+        Ok(gate) => gate,
+        Err(error) => return Err(error.to_string()),
+    };
     let mut operation = ReplicateScopeOperation::new(job.input.clone()).with_routing(routing);
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
     let mut watch_group_id = None;
     let mut relationship = if let Some(relationship_id) = job.relationship_id {
         let Some(relationship) = stored_relationship else {

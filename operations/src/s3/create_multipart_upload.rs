@@ -1,12 +1,15 @@
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
+use crate::placement_policy::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
+use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus, ResolvedBackend,
-    RoutingError, RoutingSnapshot, resolve_backend,
+    BucketInfo, MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus,
+    PlacementPolicyRef, ResolvedBackend, RoutingError, RoutingSnapshot, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use smallvec::smallvec;
@@ -18,6 +21,8 @@ use ulid::Ulid;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateMultipartUploadState {
     Init,
+    ReadGateBucket,
+    PolicyGate,
     StartTransaction,
     FenceBackend,
     WriteUpload,
@@ -44,6 +49,8 @@ pub enum CreateMultipartUploadError {
     RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
     BackendFenceError(#[from] BackendFenceError),
+    #[error(transparent)]
+    PolicyGateError(#[from] PolicyGateError),
     #[error("CreateMultipartUpload failed")]
     CreateMultipartUploadFailed,
 }
@@ -73,6 +80,14 @@ pub struct CreateMultipartUploadOperation {
     resolved: Option<ResolvedBackend>,
     record: Option<MultipartUpload>,
     metadata: HashMap<String, String>,
+    /// Destination facts of this node. Absent fails every governed upload
+    /// closed and leaves the ungoverned path untouched.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
+    /// Refs and subject the gate admitted, sealed on the upload record so every
+    /// part and the completion inherit exactly what was evaluated here.
+    sealed_policies: Vec<PlacementPolicyRef>,
+    sealed_subject: u64,
     output: Option<Result<CreateMultipartUploadResult, CreateMultipartUploadError>>,
 }
 
@@ -85,12 +100,23 @@ impl CreateMultipartUploadOperation {
             resolved: None,
             record: None,
             metadata: HashMap::new(),
+            gate_context: None,
+            gate: None,
+            sealed_policies: Vec::new(),
+            sealed_subject: 0,
             output: None,
         }
     }
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// The destination this upload is evaluated against. Omitting it leaves the
+    /// ungoverned path untouched and fails every governed upload closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
         self
     }
 
@@ -109,6 +135,77 @@ impl CreateMultipartUploadOperation {
                 Err(error) => return self.emit_error(error.into()),
             };
         self.resolved = Some(resolved);
+        // The destination default is read before the upload exists, so no part
+        // can ever be written under a rule this node was never admitted for.
+        self.state = CreateMultipartUploadState::ReadGateBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+        };
+        let bucket = match value
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.sealed_policies = GatedBucket::observe(bucket.as_ref()).policies;
+        match write_gate(self.gate_context.as_ref(), &self.sealed_policies) {
+            Ok(None) => self.start_transaction(),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = CreateMultipartUploadState::PolicyGate;
+                match complete {
+                    true => self.finish_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn handle_policy_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_gate(&mut self) -> Effects {
+        let Some(gate) = self.gate.take() else {
+            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+        };
+        let outcome = match gate.finalize() {
+            Ok(outcome) => outcome,
+            Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
+        };
+        match gate_decision(outcome.decision) {
+            Ok(()) => {
+                self.sealed_subject = self
+                    .gate_context
+                    .as_ref()
+                    .map_or(0, |context| context.subject.generation);
+                self.start_transaction()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn start_transaction(&mut self) -> Effects {
         self.state = CreateMultipartUploadState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -160,7 +257,8 @@ impl CreateMultipartUploadOperation {
             status: MultipartUploadStatus::Open,
             checksum_hint: self.input.checksum_hint.clone(),
             metadata: self.metadata.clone(),
-            placement_policies: Vec::new(),
+            placement_policies: self.sealed_policies.clone(),
+            subject_generation: self.sealed_subject,
         };
         let value = match record.to_bytes() {
             Ok(value) => value,
@@ -223,6 +321,8 @@ impl Operation for CreateMultipartUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CreateMultipartUploadState::Init => self.handle_init(),
+            CreateMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
+            CreateMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartUploadState::StartTransaction => self.handle_transaction_started(event),
             CreateMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CreateMultipartUploadState::WriteUpload => self.handle_record_written(event),

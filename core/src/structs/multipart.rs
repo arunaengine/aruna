@@ -55,9 +55,25 @@ pub struct MultipartUpload {
     /// sorted. The completed object unions them with the destination default,
     /// so a part-wise copy cannot drop its source's constraints.
     pub placement_policies: Vec<PlacementPolicyRef>,
+    /// Subject generation the CreateMultipartUpload gate admitted this upload
+    /// under. Every part re-checks it before writing bytes; zero is ungoverned.
+    pub subject_generation: u64,
 }
 
 impl MultipartUpload {
+    /// Whether a part may still land here. The create-time gate sealed the refs
+    /// and the subject; a part is only a cheap re-check of that same seal.
+    pub fn admits_part(&self, subject: Option<&crate::structs::NodeSubjectRecord>) -> bool {
+        if self.placement_policies.is_empty() {
+            return true;
+        }
+        subject.is_some_and(|record| {
+            record.subject.generation == self.subject_generation
+                && !record.serving_blocked
+                && !record.policy_draining
+        })
+    }
+
     /// Adds the refs a copied part brought along. Returns whether the sealed set
     /// changed, so an unchanged upload record is not rewritten.
     pub fn merge_policies(
