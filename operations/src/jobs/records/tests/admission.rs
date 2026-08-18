@@ -97,7 +97,7 @@ fn replays_idempotently() {
         &family.holder,
         JobFamilyRecord::Spec(Box::new(family.spec())),
     );
-    let records = stored(&[spec.clone()]);
+    let records = stored(std::slice::from_ref(&spec));
 
     let (admission, plan) = plan_append(&state(Some(&view), &records), &[], spec, None);
     assert_eq!(admission, Admission::Duplicate);

@@ -227,7 +227,7 @@ impl ProjectFamilyOperation {
         let cache = self
             .cache
             .clone()
-            .unwrap_or_else(|| ProjectionCache {
+            .unwrap_or(ProjectionCache {
                 revision: 0,
                 stale: true,
                 projection: None,

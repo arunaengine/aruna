@@ -97,10 +97,10 @@ mod tests {
             sequence: 7,
         };
         let encoded = record_key(&key);
-        assert!(encoded.starts_with(&family_prefix(&family())));
-        assert!(encoded.starts_with(&submission_prefix(SubmissionId([1u8; 32]))));
-        assert!(encoded.starts_with(&kind_prefix(&family(), JobRecordKind::Receipt)));
-        assert!(!encoded.starts_with(&kind_prefix(&family(), JobRecordKind::Launch)));
+        assert!(encoded.starts_with(family_prefix(&family())));
+        assert!(encoded.starts_with(submission_prefix(SubmissionId([1u8; 32]))));
+        assert!(encoded.starts_with(kind_prefix(&family(), JobRecordKind::Receipt)));
+        assert!(!encoded.starts_with(kind_prefix(&family(), JobRecordKind::Launch)));
 
         let cursor = cursor_of(&key).expect("bounded cursor");
         assert_eq!(cursor_key(&cursor), Ok(key));
@@ -125,7 +125,7 @@ mod tests {
         // claiming the same id is retained instead of rebinding the first.
         let job_id = JobId::from_bytes(Ulid::from_bytes([5u8; 16]).to_bytes());
         let key = alias_key(job_id, &family());
-        assert!(key.starts_with(&alias_prefix(job_id)));
+        assert!(key.starts_with(alias_prefix(job_id)));
         assert_eq!(alias_family(&key), Some(family()));
     }
 }
