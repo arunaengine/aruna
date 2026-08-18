@@ -9,12 +9,13 @@ use aruna_core::NodeId;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmId,
-    evaluate_placement,
+    BucketIdentity, BucketInfo, PlacementDecision, PlacementPolicyRef, PlacementSubject,
+    PolicyResolution, RealmId, evaluate_placement,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::collections::BTreeMap;
+use thiserror::Error;
 use tracing::debug;
 use ulid::Ulid;
 
@@ -158,6 +159,110 @@ impl PolicyGateOperation {
 }
 
 type ResolveResult = Result<super::resolve::ResolvedPolicy, ReadPolicyError>;
+
+/// The destination facts a governed write or serve is evaluated against.
+/// Absent means this node advertises no subject, so nothing governed may be
+/// materialized or served here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GateContext {
+    pub realm_id: RealmId,
+    pub subject: PlacementSubject,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum PolicyGateError {
+    #[error("this node advertises no placement subject for governed data")]
+    NoSubject,
+    /// Ids stay out of the message: a public caller must not learn them.
+    #[error("placement policy denies this destination")]
+    Denied { policy_ids: Vec<Ulid> },
+    #[error("a referenced placement policy is not available")]
+    Unavailable { policy_ids: Vec<Ulid> },
+    #[error("a referenced placement policy is invalid or its digest does not match")]
+    Invalid,
+    /// The requester has never resolved these refs; internal peers learn them
+    /// through the handshake, public callers never do.
+    #[error("the destination has not resolved every required placement policy")]
+    Required { refs: Vec<PlacementPolicyRef> },
+    #[error("the destination policy generation changed during this write")]
+    Drift,
+    #[error(transparent)]
+    Read(#[from] ReadPolicyError),
+    #[error(transparent)]
+    Policy(#[from] aruna_core::structs::PlacementPolicyError),
+}
+
+/// Builds the gate for one governed destination. `Ok(None)` means the ref set
+/// is empty, so the ungoverned path runs unchanged and performs no extra I/O.
+pub fn write_gate(
+    context: Option<&GateContext>,
+    refs: &[PlacementPolicyRef],
+) -> Result<Option<PolicyGateOperation>, PolicyGateError> {
+    let refs = PlacementPolicyRef::canonical_set(refs)?;
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    let Some(context) = context else {
+        return Err(PolicyGateError::NoSubject);
+    };
+    Ok(Some(PolicyGateOperation::new(PolicyGateConfig {
+        realm_id: context.realm_id,
+        local_node_id: context.subject.node_id,
+        refs,
+        subject: context.subject.clone(),
+        now_ms: context.now_ms,
+    })))
+}
+
+/// Every non-`Allowed` decision blocks. Nothing here is reinterpreted as a
+/// grant, and an incomplete evaluation is never reported as a denial.
+pub fn gate_decision(decision: PlacementDecision) -> Result<(), PolicyGateError> {
+    match decision {
+        PlacementDecision::Allowed => Ok(()),
+        PlacementDecision::Denied { policy_ids } => Err(PolicyGateError::Denied { policy_ids }),
+        PlacementDecision::Unavailable { policy_ids } => {
+            Err(PolicyGateError::Unavailable { policy_ids })
+        }
+        PlacementDecision::Required { refs } => Err(PolicyGateError::Required { refs }),
+        PlacementDecision::DigestMismatch { .. } | PlacementDecision::Invalid { .. } => {
+            Err(PolicyGateError::Invalid)
+        }
+        PlacementDecision::InvalidInput { reason } => Err(reason.into()),
+    }
+}
+
+/// The destination facts the gate decided on. A change between the gate and the
+/// exposing transaction means the copy would commit refs nothing evaluated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GatedBucket {
+    pub identity: Option<BucketIdentity>,
+    pub generation: u64,
+    pub policies: Vec<PlacementPolicyRef>,
+}
+
+impl GatedBucket {
+    pub fn observe(bucket: Option<&BucketInfo>) -> Self {
+        Self {
+            identity: bucket.map(BucketInfo::identity),
+            generation: bucket.map_or(0, |bucket| bucket.placement_policy_generation),
+            policies: bucket
+                .map(|bucket| bucket.placement_policies.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Union of what a write inherits and what its destination requires. A sender
+/// or copy can only tighten: an inherited ref is never dropped.
+pub fn union_refs(
+    destination: &[PlacementPolicyRef],
+    inherited: &[PlacementPolicyRef],
+) -> Result<Vec<PlacementPolicyRef>, PolicyGateError> {
+    let mut refs = destination.to_vec();
+    refs.extend_from_slice(inherited);
+    Ok(PlacementPolicyRef::canonical_set(&refs)?)
+}
 
 impl Operation for PolicyGateOperation {
     type Output = PolicyGateOutcome;

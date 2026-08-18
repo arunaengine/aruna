@@ -9,11 +9,14 @@ use aruna_core::events::{
     BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
 };
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::keyspaces::{
+    NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+};
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::{
-    BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot,
-    StorageRoutingRule, UsageCounters, usage_backend_keys,
+    BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NODE_SUBJECT_KEY, NodeRouting,
+    NodeSubjectRecord, RealmId, RoutingSnapshot, StorageRoutingRule, UsageCounters,
+    usage_backend_keys,
 };
 use aruna_core::types::{GroupId, NodeId, TxnId};
 use aruna_net::NetHandle;
@@ -31,6 +34,7 @@ use tracing::{Instrument, debug, debug_span, error, trace, warn};
 use crate::group_backends::{RecordReadError, parse_read};
 use crate::group_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
 use crate::metadata::MetadataHandle;
+use crate::placement_policy::GateContext;
 use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
@@ -102,6 +106,40 @@ async fn bucket_rules(
     Ok(parse_read(event, BucketInfo::from_bytes)?
         .map(|info| info.storage_routing)
         .unwrap_or_default())
+}
+
+/// Wall clock for the cache freshness a gate is built with. Operations stay
+/// sans-I/O by taking it as configuration.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// The destination this node evaluates governed writes and serves against.
+/// `None` means it has never advertised a subject, which fails every governed
+/// operation closed; an ungoverned one never consults it.
+pub async fn gate_context(
+    context: &DriverContext,
+    realm_id: RealmId,
+    now_ms: u64,
+) -> Result<Option<GateContext>, RoutingInputsError> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: NODE_SUBJECT_KEY.to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    Ok(
+        parse_read(event, NodeSubjectRecord::from_bytes)?.map(|record| GateContext {
+            realm_id,
+            subject: record.subject,
+            now_ms,
+        }),
+    )
 }
 
 /// Routing inputs for one bucket write, assembled before the operation starts.

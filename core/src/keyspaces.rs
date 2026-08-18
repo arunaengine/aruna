@@ -99,6 +99,9 @@ pub const REFERENCE_METADATA_REFRESH_JOB_KEYSPACE: &str = "reference_metadata_re
 pub const USAGE_STATS_KEYSPACE: &str = "usage_stats";
 pub const USAGE_NODE_STATS_KEYSPACE: &str = "usage_node_stats";
 pub const NODE_INFO_KEYSPACE: &str = "node_info";
+/// Single-row local placement subject and its generation. Governed writes and
+/// internal serves are evaluated against it; a rejoin blocks serving here.
+pub const NODE_SUBJECT_KEYSPACE: &str = "node_subject";
 pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
 pub const NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";

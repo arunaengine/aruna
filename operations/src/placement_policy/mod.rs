@@ -11,16 +11,80 @@ pub mod create;
 pub mod gate;
 pub mod read;
 pub mod resolve;
+pub mod subject;
 pub mod transport;
 
 pub use cache::{PolicyCacheEntry, PolicyCacheError, PolicyCacheStats};
 pub use create::{CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation};
-pub use gate::{PolicyGateConfig, PolicyGateOperation, PolicyGateOutcome};
+pub use gate::{
+    GateContext, GatedBucket, PolicyGateConfig, PolicyGateError, PolicyGateOperation,
+    PolicyGateOutcome, gate_decision, union_refs, write_gate,
+};
 pub use read::{
     AuthenticPolicy, PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
+pub use subject::{
+    SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
+};
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
+
+/// What production wiring establishes before a governed write is possible: an
+/// advertised subject and the policies this node has already resolved.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE};
+    use aruna_core::structs::{
+        NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject, RealmId, VerifiedPolicy,
+    };
+    use aruna_core::types::NodeId;
+    use std::collections::BTreeMap;
+
+    use super::cache::{PolicyCacheEntry, cache_key};
+    use crate::driver::DriverContext;
+
+    pub fn subject(node_id: NodeId, location: &str) -> PlacementSubject {
+        PlacementSubject {
+            node_id,
+            generation: 1,
+            location: location.to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        }
+    }
+
+    pub async fn seed_gate(
+        context: &DriverContext,
+        realm_id: RealmId,
+        subject: PlacementSubject,
+        policies: &[VerifiedPolicy],
+    ) {
+        let record = NodeSubjectRecord::seed(subject).expect("subject is valid");
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+                key: NODE_SUBJECT_KEY.to_vec().into(),
+                value: record.to_bytes().expect("record encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        for policy in policies {
+            let entry = PolicyCacheEntry::verified(realm_id, policy, 0);
+            let _ = context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+                    key: cache_key(&policy.policy_ref()),
+                    value: entry.to_bytes().expect("entry encodes").into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

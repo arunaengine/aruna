@@ -5,10 +5,10 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
 use aruna_core::structs::{
-    BackendLocation, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState, PlacementPolicyError,
-    PlacementPolicyRef, VersionKey,
+    BackendLocation, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY,
+    NodeSubjectRecord, PlacementPolicyError, PlacementPolicyRef, VersionKey,
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 use smallvec::smallvec;
@@ -29,6 +29,12 @@ pub enum ManagedCopyError {
     Unregistered,
     #[error("the local copy is not serveable")]
     NotServeable(ManagedCopyState),
+    #[error("the registration does not describe the requested copy")]
+    Mismatched,
+    #[error("this node advertises no placement subject")]
+    NoSubject,
+    #[error("this node has not revalidated its copies under the current subject")]
+    ServingBlocked,
     #[error("unexpected event during managed-copy removal")]
     InvalidEvent,
 }
@@ -110,16 +116,82 @@ pub fn transition_effect(
 
 /// A governed version is unavailable without a serveable local registration.
 /// An ungoverned version has no refs and never reaches this gate.
-pub fn check_serveable(value: Option<&[u8]>) -> Result<(), ManagedCopyError> {
+pub fn check_serveable(value: Option<&[u8]>) -> Result<ManagedCopyRecord, ManagedCopyError> {
     let Some(value) = value else {
         return Err(ManagedCopyError::Unregistered);
     };
     let record = ManagedCopyRecord::from_bytes(value)?;
     if record.state.is_serveable() {
-        Ok(())
+        Ok(record)
     } else {
         Err(ManagedCopyError::NotServeable(record.state))
     }
+}
+
+/// The copy a caller asked about. Fields the caller cannot know are `None`.
+pub struct CopyRequest<'a> {
+    pub key: &'a ManagedCopyKey,
+    pub node_id: Option<NodeId>,
+    pub blake3: Option<[u8; 32]>,
+    pub refs: &'a [PlacementPolicyRef],
+}
+
+/// A registration is evidence only for the exact copy it was read for. A row
+/// naming another version, backend, node, digest or ref set says nothing about
+/// the requested one and must never make it serveable.
+pub fn validate_registration(
+    value: Option<&[u8]>,
+    request: &CopyRequest<'_>,
+) -> Result<ManagedCopyRecord, ManagedCopyError> {
+    let record = check_serveable(value)?;
+    let matches = &record.key() == request.key
+        && request
+            .node_id
+            .is_none_or(|node_id| record.node_id == node_id)
+        && request
+            .blake3
+            .is_none_or(|hash| record.location.get_blake3() == Some(hash.as_slice()))
+        && !record.location.staging
+        && !record.location.partial
+        && record.policies == PlacementPolicyRef::canonical_set(request.refs)?;
+    match matches {
+        true => Ok(record),
+        false => Err(ManagedCopyError::Mismatched),
+    }
+}
+
+/// Reads the local subject row alongside a registration, so one round trip
+/// answers both "is this copy registered" and "may this node serve at all".
+pub fn serve_reads(
+    key: &ManagedCopyKey,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ManagedCopyError> {
+    Ok(Effect::Storage(StorageEffect::BatchRead {
+        reads: vec![
+            (MANAGED_COPY_KEYSPACE.to_string(), key.to_bytes()?.into()),
+            (
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                Key::from(NODE_SUBJECT_KEY.to_vec()),
+            ),
+        ],
+        txn_id,
+    }))
+}
+
+/// Splits the `serve_reads` answer. A missing subject row is not an admission:
+/// a node that never advertised a subject serves nothing governed.
+pub fn split_serve_reads(
+    values: Vec<(Key, Option<Value>)>,
+) -> Result<(Option<Value>, NodeSubjectRecord), ManagedCopyError> {
+    let mut values = values.into_iter();
+    let (_, copy) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    let (_, subject) = values.next().ok_or(ManagedCopyError::InvalidEvent)?;
+    let subject = subject.ok_or(ManagedCopyError::NoSubject)?;
+    let record = NodeSubjectRecord::from_bytes(subject.as_ref())?;
+    if record.serving_blocked {
+        return Err(ManagedCopyError::ServingBlocked);
+    }
+    Ok((copy, record))
 }
 
 /// Scan prefix covering every local backend holding one logical version.
@@ -254,15 +326,15 @@ impl ManagedCopyRemoval {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedCopyError, ManagedCopyPage, ManagedCopyRemoval, check_serveable, register_effect,
-        scan_effect, transition_effect,
+        CopyRequest, ManagedCopyError, ManagedCopyPage, ManagedCopyRemoval, check_serveable,
+        register_effect, scan_effect, split_serve_reads, transition_effect, validate_registration,
     };
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::structs::{
-        BackendLocation, BackendRef, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
-        VersionKey,
+        BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
+        ManagedCopyState, NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, VersionKey,
     };
     use aruna_core::types::NodeId;
     use std::collections::HashMap;
@@ -371,10 +443,108 @@ mod tests {
                 Err(ManagedCopyError::NotServeable(state))
             );
         }
-        let bytes = record(ManagedCopyState::Registered)
-            .to_bytes()
-            .expect("record encodes");
-        assert_eq!(check_serveable(Some(&bytes)), Ok(()));
+        let registered = record(ManagedCopyState::Registered);
+        let bytes = registered.to_bytes().expect("record encodes");
+        assert_eq!(check_serveable(Some(&bytes)), Ok(registered));
+    }
+
+    #[test]
+    fn registration_must_match() {
+        // A row for another copy is evidence about that copy, never this one.
+        let registered = record(ManagedCopyState::Registered);
+        let bytes = registered.to_bytes().expect("record encodes");
+        let key = registered.key();
+        assert!(
+            validate_registration(
+                Some(&bytes),
+                &CopyRequest {
+                    key: &key,
+                    node_id: Some(node_id()),
+                    blake3: None,
+                    refs: &[],
+                }
+            )
+            .is_ok()
+        );
+
+        let other = ManagedCopyKey::new(
+            VersionKey::new("bucket", "path/file.txt", Ulid::from_bytes([9u8; 16])),
+            BackendRef::node_default(),
+        );
+        for request in [
+            CopyRequest {
+                key: &other,
+                node_id: Some(node_id()),
+                blake3: None,
+                refs: &[],
+            },
+            CopyRequest {
+                key: &key,
+                node_id: Some(iroh::SecretKey::from_bytes(&[1u8; 32]).public()),
+                blake3: None,
+                refs: &[],
+            },
+            CopyRequest {
+                key: &key,
+                node_id: Some(node_id()),
+                blake3: Some([7u8; 32]),
+                refs: &[],
+            },
+            CopyRequest {
+                key: &key,
+                node_id: Some(node_id()),
+                blake3: None,
+                refs: &[PlacementPolicyRef {
+                    policy_id: Ulid::from_bytes([1u8; 16]),
+                    digest: [2u8; 32],
+                }],
+            },
+        ] {
+            assert_eq!(
+                validate_registration(Some(&bytes), &request),
+                Err(ManagedCopyError::Mismatched)
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_node_serves_nothing() {
+        // A rejoin blocks every governed serve until the inventory is revalidated,
+        // even for rows that still read as registered.
+        let registered = record(ManagedCopyState::Registered);
+        let copy: aruna_core::types::Value = registered.to_bytes().expect("record encodes").into();
+        let mut subject = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node_id(),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .expect("subject is valid");
+        subject.serving_blocked = true;
+
+        let reads = |subject: &NodeSubjectRecord| {
+            vec![
+                (aruna_core::types::Key::from(vec![1u8]), Some(copy.clone())),
+                (
+                    aruna_core::types::Key::from(vec![2u8]),
+                    Some(subject.to_bytes().expect("record encodes").into()),
+                ),
+            ]
+        };
+        assert_eq!(
+            split_serve_reads(reads(&subject)),
+            Err(ManagedCopyError::ServingBlocked)
+        );
+        assert!(split_serve_reads(reads(&subject.cleared())).is_ok());
+        assert_eq!(
+            split_serve_reads(vec![
+                (aruna_core::types::Key::from(vec![1u8]), Some(copy)),
+                (aruna_core::types::Key::from(vec![2u8]), None),
+            ]),
+            Err(ManagedCopyError::NoSubject)
+        );
     }
 
     #[test]
@@ -549,13 +719,15 @@ mod driver_tests {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE};
+    use aruna_core::keyspaces::{
+        BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         Backend, BackendConfig, BackendRef, BlobVersion, ManagedCopyKey, ManagedCopyQuarantine,
-        ManagedCopyRecord, ManagedCopyState, PlacementPolicyRef, RealmId, RoutingSnapshot,
-        VersionKey,
+        ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY, NodeSubjectRecord,
+        PlacementPolicyRef, PlacementSubject, RealmId, RoutingSnapshot, VersionKey,
     };
     use aruna_core::types::{GroupId, NodeId, UserId};
     use aruna_net::{NetConfig, NetHandle};
@@ -788,6 +960,30 @@ mod driver_tests {
         .map(|_| ())
     }
 
+    /// Advertises a subject for this node, without which nothing governed may
+    /// be served at all.
+    async fn seed_subject(context: &DriverContext, node_id: NodeId, blocked: bool) {
+        let mut record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id,
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .expect("subject is valid");
+        record.serving_blocked = blocked;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+                key: NODE_SUBJECT_KEY.to_vec().into(),
+                value: record.to_bytes().expect("record encodes").into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
     /// Seals refs on the stored version, the state step 6 mints directly.
     async fn govern_version(context: &DriverContext, version_id: Ulid) {
         let version = read_version(context, version_id)
@@ -810,6 +1006,20 @@ mod driver_tests {
                 txn_id: None,
             })
             .await;
+        // A gated write seals the same refs on the registration, so the
+        // fixture must too or the row describes a different copy.
+        if let Some(mut record) = read_copy(context, version_id).await {
+            record.policies = version.placement_policies.clone();
+            let _ = context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: MANAGED_COPY_KEYSPACE.to_string(),
+                    key: record.key().to_bytes().expect("key encodes").into(),
+                    value: record.to_bytes().expect("record encodes").into(),
+                    txn_id: None,
+                })
+                .await;
+        }
     }
 
     async fn delete_copy(context: &DriverContext, version_id: Ulid) {
@@ -968,6 +1178,7 @@ mod driver_tests {
         let fixture = fixture(&context);
         let version_id = put_object(&context, &fixture).await;
         govern_version(&context, version_id).await;
+        seed_subject(&context, fixture.node_id, false).await;
         let record = read_copy(&context, version_id).await.expect("copy row");
         delete_copy(&context, version_id).await;
 
@@ -988,6 +1199,7 @@ mod driver_tests {
         let fixture = fixture(&context);
         let version_id = put_object(&context, &fixture).await;
         govern_version(&context, version_id).await;
+        seed_subject(&context, fixture.node_id, false).await;
         let mut record = read_copy(&context, version_id).await.expect("copy row");
         record.state = ManagedCopyState::Quarantined(ManagedCopyQuarantine::SubjectTransition);
         let _ = context
@@ -1014,6 +1226,7 @@ mod driver_tests {
         let fixture = fixture(&context);
         let version_id = put_object(&context, &fixture).await;
         govern_version(&context, version_id).await;
+        seed_subject(&context, fixture.node_id, false).await;
         delete_copy(&context, version_id).await;
 
         assert_eq!(
@@ -1022,6 +1235,42 @@ mod driver_tests {
                 ManagedCopyError::Unregistered
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn read_needs_subject() {
+        // A node that never advertised a subject serves nothing governed.
+        let (_temp, context) = full_context().await;
+        let fixture = fixture(&context);
+        let version_id = put_object(&context, &fixture).await;
+        govern_version(&context, version_id).await;
+
+        assert_eq!(
+            get_object(&context, &fixture).await,
+            Err(GetObjectError::ManagedCopyError(
+                ManagedCopyError::NoSubject
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejoin_blocks_read() {
+        // A rejoining node serves nothing until its inventory is revalidated,
+        // even though the registration itself still reads as registered.
+        let (_temp, context) = full_context().await;
+        let fixture = fixture(&context);
+        let version_id = put_object(&context, &fixture).await;
+        govern_version(&context, version_id).await;
+        seed_subject(&context, fixture.node_id, true).await;
+
+        assert_eq!(
+            get_object(&context, &fixture).await,
+            Err(GetObjectError::ManagedCopyError(
+                ManagedCopyError::ServingBlocked
+            ))
+        );
+        seed_subject(&context, fixture.node_id, false).await;
+        assert!(get_object(&context, &fixture).await.is_ok());
     }
 
     #[tokio::test]
