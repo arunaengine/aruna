@@ -179,29 +179,23 @@ pub struct RealmConfigDocument {
     pub band_pools: Vec<BandPool>,
     /// Immutable snapshots of the placement view. `placement_map` stays the
     /// edit surface; only a published map can become a holder-set input.
-    #[serde(default)]
     pub candidate_maps: Vec<CandidatePlacementMap>,
     /// One activated map epoch per `(strategy, bucket)`; the pinned input every
     /// holder resolution reads.
-    #[serde(default)]
     pub placement_activations: Vec<PlacementActivation>,
     /// Non-terminal transitions plus their reduced barrier, proof, and
     /// completion sets.
-    #[serde(default)]
     pub placement_transitions: Vec<PlacementTransition>,
     /// CEL request policies applied realm-wide (Class-1 replicated, so
     /// evaluation is local on every node).
-    #[serde(default)]
     pub request_policies: Vec<crate::request_policy::RequestPolicy>,
     /// Bearer tokens revoked realm-wide. Class-1 replicated, so every node
     /// rejects a token revoked on any other node.
-    #[serde(default)]
     pub revoked_tokens: Vec<TokenRevocation>,
     /// Highest validation/compaction time observed for the revocation set.
     pub revocation_floor: u64,
     /// Operator knowledge the planner reads: directed transfer bandwidth and
     /// the staleness bound of ranking telemetry.
-    #[serde(default)]
     pub compute: crate::structs::RealmComputeConfig,
 }
 
@@ -1913,5 +1907,28 @@ mod test {
         assert_eq!(first, repeat);
         assert_eq!(Some(first.strategy_id), config.default_strategy_id);
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn rejects_missing_compute() {
+        // Fresh format: the compute block is mandatory on decode, so bytes that
+        // stop where the predecessor record ended must not decode at all.
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            user_id: crate::UserId::new(Ulid::generate(), RealmId([7u8; 32])),
+            realm_id: RealmId([7u8; 32]),
+        };
+        let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 2);
+        let encoded = config.to_bytes(&actor).expect("config encodes");
+        let tail = postcard::to_allocvec(&config.compute).expect("compute encodes");
+        assert!(encoded.ends_with(&tail));
+
+        let truncated = &encoded[..encoded.len() - tail.len()];
+
+        assert!(RealmConfigDocument::from_bytes(truncated).is_err());
+        assert_eq!(
+            RealmConfigDocument::from_bytes(&encoded).expect("full record decodes"),
+            config
+        );
     }
 }
