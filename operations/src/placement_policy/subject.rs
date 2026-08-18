@@ -7,13 +7,13 @@
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
+use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY,
-    NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, RealmId,
+    NodeSubjectRecord, PlacementSubject, RealmConfigDocument, RealmId, storage_subject,
 };
-use aruna_core::types::{Effects, Key, TxnId};
+use aruna_core::types::{Effects, Key, NodeId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::debug;
@@ -21,6 +21,7 @@ use tracing::debug;
 use crate::blob::managed_copy::{
     COPY_PAGE_LIMIT, ManagedCopyError, ManagedCopyPage, scan_effect, transition_effect,
 };
+use crate::driver::{DriverContext, drive};
 
 use super::gate::{GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate};
 
@@ -362,16 +363,48 @@ impl Operation for SubjectScanOperation {
     }
 }
 
-/// Refs of every copy one page carries, for prefetching a plan's policies.
-pub fn page_refs(page: &ManagedCopyPage) -> Vec<PlacementPolicyRef> {
-    let mut refs: Vec<PlacementPolicyRef> = page
-        .entries
-        .iter()
-        .flat_map(|(_, record)| record.policies.iter().copied())
-        .collect();
-    refs.sort_unstable();
-    refs.dedup();
-    refs
+/// Reconciles the local subject with the realm's placement map and revalidates
+/// the inventory. `Ok(None)` means this node has no placement entry, so it may
+/// hold nothing governed and advertises no subject at all.
+pub async fn sync_subject(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    mode: SubjectScanMode,
+    now_ms: u64,
+) -> Result<Option<SubjectScanResult>, SubjectScanError> {
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        return Err(SubjectScanError::InvalidEvent("ReadRealmConfig"));
+    };
+    let Some(config) = value
+        .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let Some(entry) = config.placement_entry(node_id) else {
+        return Ok(None);
+    };
+    let observed = storage_subject(entry, 1);
+    drive(
+        SubjectScanOperation::new(SubjectScanConfig {
+            realm_id,
+            observed,
+            mode,
+            now_ms,
+        }),
+        context,
+    )
+    .await
+    .map(Some)
 }
 
 #[cfg(test)]

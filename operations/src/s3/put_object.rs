@@ -3392,3 +3392,232 @@ mod test {
         assert_eq!(count_files(Path::new(&blob_root)), 0);
     }
 }
+
+/// F1 acceptance: no byte-materialization effect and no registration may be
+/// emitted before the destination passed the shared placement gate.
+#[cfg(test)]
+mod gate_test {
+    use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+    use crate::placement_policy::{GateContext, PolicyCacheEntry, PolicyGateError};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::{
+        BucketInfo, PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
+        RealmId, RoutingSnapshot, VerifiedPolicy,
+    };
+    use aruna_core::types::{Effects, NodeId, UserId, Value};
+    use byteview::ByteView;
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::UNIX_EPOCH;
+    use ulid::Ulid;
+
+    const BODY: &[u8] = b"payload";
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    /// A rule that admits exactly one location.
+    fn policy(location: &str) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn gate(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: PlacementSubject {
+                node_id: node(9),
+                generation: 1,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+            now_ms: 1_000,
+        }
+    }
+
+    fn bucket(refs: Vec<PlacementPolicyRef>, generation: u64) -> Value {
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: UNIX_EPOCH,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+            placement_policies: refs,
+            placement_policy_generation: generation,
+        };
+        ByteView::from(info.to_bytes().expect("bucket encodes"))
+    }
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value,
+        })
+    }
+
+    fn operation(location: &str) -> PutObjectOperation {
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            group_id,
+            realm_id: realm(),
+            node_id: node(9),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "governed.txt".to_string(),
+                content_length: Some(BODY.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        })
+        .with_gate(gate(location))
+    }
+
+    fn materializes(effects: &Effects) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Write { .. })))
+    }
+
+    #[test]
+    fn denies_before_write() {
+        // The rule admits another location, so nothing may be written at all.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west");
+        assert!(!materializes(&operation.start()));
+        let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        assert!(!materializes(&effects));
+        let cached = PolicyCacheEntry::verified(realm(), &rule, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        let effects = operation.step(read(Some(ByteView::from(cached))));
+
+        assert!(!materializes(&effects));
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
+        ));
+    }
+
+    #[test]
+    fn unresolved_blocks_write() {
+        // A rule that cannot be obtained blocks; it is never read as a grant.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        let hint = PolicyCacheEntry::unavailable(1_000)
+            .to_bytes()
+            .expect("entry encodes");
+        let effects = operation.step(read(Some(ByteView::from(hint))));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::Unavailable { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn missing_subject_blocks() {
+        // A node that advertises no subject may hold nothing governed.
+        let mut config = operation("eu-west");
+        config.gate_context = None;
+        config.start();
+        let effects = config.step(read(Some(bucket(
+            vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([1u8; 16]),
+                digest: [4u8; 32],
+            }],
+            1,
+        ))));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            config.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::NoSubject))
+        ));
+    }
+
+    #[test]
+    fn ungoverned_skips_gate() {
+        // An ungoverned write reaches the blob effect with no policy round trip.
+        let mut operation = operation("eu-west");
+        operation.start();
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(materializes(&effects));
+    }
+
+    #[test]
+    fn drift_aborts_commit() {
+        // A default changed while the bytes streamed was never evaluated, so
+        // the version must not commit the refs it would now inherit.
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(Vec::new(), 0))));
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
+            location: location(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7u8; 16]),
+        }));
+        let effects = operation.step(read(Some(bucket(vec![policy("us-east").policy_ref()], 1))));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Storage(StorageEffect::AbortTransaction { .. })
+        )));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Drift))
+        ));
+    }
+
+    fn location() -> aruna_core::structs::BackendLocation {
+        aruna_core::structs::BackendLocation {
+            backend: aruna_core::structs::BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "aruna".to_string(),
+            backend_path: "objects/one".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: BODY.len() as u64,
+            hashes: HashMap::from([("blake3".to_string(), vec![6u8; 32])]),
+        }
+    }
+}

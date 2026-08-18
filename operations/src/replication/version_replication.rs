@@ -1,4 +1,7 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
 use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
@@ -23,7 +26,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs,
+    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, ManagedCopyKey,
     MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, Permission,
     PlacementPolicyRef, PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind,
     ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
@@ -904,6 +907,8 @@ impl Operation for ReplicateScopeOperation {
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplicateObjectVersionError {
     #[error(transparent)]
+    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error("could not load the group's routing inputs: {0}")]
     RoutingInputsFailed(String),
@@ -938,6 +943,7 @@ enum ReplicateObjectVersionState {
     Init,
     ReadVersion,
     ReadBlobLocation,
+    CheckManagedCopy,
     ResolveReferenceAccess,
     HeadReferenceSource,
     ReadReferenceState,
@@ -983,6 +989,7 @@ pub struct ReplicateObjectVersionOperation {
     reference_advance: Option<ReferenceAdvance>,
     /// Refs read from the stored version, carried onto the manifest unchanged.
     version_policies: Vec<PlacementPolicyRef>,
+    pending_copy: Option<ManagedCopyKey>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
@@ -1010,6 +1017,7 @@ impl ReplicateObjectVersionOperation {
             writer_auth_context: None,
             reference_advance: None,
             version_policies: Vec::new(),
+            pending_copy: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
@@ -1040,6 +1048,7 @@ impl ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::Init => "Init",
             ReplicateObjectVersionState::ReadVersion => "ReadVersion",
             ReplicateObjectVersionState::ReadBlobLocation => "ReadBlobLocation",
+            ReplicateObjectVersionState::CheckManagedCopy => "CheckManagedCopy",
             ReplicateObjectVersionState::ResolveReferenceAccess => "ResolveReferenceAccess",
             ReplicateObjectVersionState::HeadReferenceSource => "HeadReferenceSource",
             ReplicateObjectVersionState::ReadReferenceState => "ReadReferenceState",
@@ -1991,10 +2000,57 @@ impl Operation for ReplicateObjectVersionOperation {
                 self.replication_version = Some(ReplicationVersion::Materialized {
                     created_at,
                     created_by,
-                    location,
+                    location: location.clone(),
                     source,
                     metadata,
                 });
+                // A governed copy is only pushed to a peer when this node may
+                // still serve it; the destination gates itself on arrival.
+                if self.version_policies.is_empty() {
+                    return self.read_multipart_summary();
+                }
+                let key = ManagedCopyKey::new(
+                    VersionKey::new(
+                        &self.request.bucket,
+                        &self.request.key,
+                        self.request.version_id,
+                    ),
+                    location.backend.clone(),
+                );
+                let effect = match serve_reads(&key, None) {
+                    Ok(effect) => effect,
+                    Err(error) => return self.fail(error.into()),
+                };
+                self.pending_copy = Some(key);
+                self.state = ReplicateObjectVersionState::CheckManagedCopy;
+                smallvec![effect]
+            }
+            ReplicateObjectVersionState::CheckManagedCopy => {
+                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                        received: event,
+                    });
+                };
+                let (copy, _) = match split_serve_reads(values) {
+                    Ok(split) => split,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let Some(key) = self.pending_copy.take() else {
+                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
+                };
+                if let Err(error) = validate_registration(
+                    copy.as_deref(),
+                    &CopyRequest {
+                        key: &key,
+                        node_id: None,
+                        blake3: None,
+                        refs: &self.version_policies,
+                    },
+                ) {
+                    return self.fail(error.into());
+                }
                 self.read_multipart_summary()
             }
             ReplicateObjectVersionState::ResolveReferenceAccess => {

@@ -399,6 +399,7 @@ async fn init_realm(
         .await?;
     }
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    sync_placement_subject(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
         config.node_id,
@@ -472,6 +473,7 @@ async fn join_realm(
         }
     }
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    sync_placement_subject(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
         config.node_id,
@@ -515,6 +517,7 @@ async fn provision_realm(
     }
 
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    sync_placement_subject(driver_ctx.as_ref(), config).await?;
     let allow_genesis = config.is_initial_node();
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
@@ -1148,6 +1151,24 @@ fn parse_disk_limit(value: Option<&str>) -> Result<Option<u64>, &'static str> {
         return Err("disk ceiling must be greater than zero");
     }
     Ok(Some(bytes))
+}
+
+/// Reconciles this node's advertised placement subject with the realm's
+/// placement map before it serves anything. A changed subject blocks governed
+/// serving until the local inventory has been revalidated under it.
+async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
+    aruna_operations::placement_policy::sync_subject(
+        ctx,
+        config.realm_id,
+        config.node_id,
+        aruna_operations::placement_policy::SubjectScanMode::Revalidate(
+            aruna_core::structs::ManagedCopyQuarantine::Rejoin,
+        ),
+        aruna_operations::driver::now_ms(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {

@@ -26,6 +26,7 @@ pub use read::{
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
 pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
+    sync_subject,
 };
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 

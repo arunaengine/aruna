@@ -675,4 +675,52 @@ mod tests {
 
         assert_eq!(*error.code(), S3ErrorCode::AccessDenied);
     }
+
+    #[test]
+    fn hides_policy_ids() {
+        // A public caller may learn that a write was refused, never which rule
+        // refused it or which node the rule names.
+        let policy_id = ulid::Ulid::from_bytes([7u8; 16]);
+        let denied = PutObjectError::PolicyGate(PolicyGateError::Denied {
+            policy_ids: vec![policy_id],
+        })
+        .into_s3_error();
+
+        assert_eq!(
+            *denied.code(),
+            S3ErrorCode::Custom("PlacementPolicyDenied".into())
+        );
+        assert_eq!(denied.status_code(), Some(http::StatusCode::FORBIDDEN));
+        let rendered = format!("{denied:?}");
+        assert!(!rendered.contains(&policy_id.to_string()));
+    }
+
+    #[test]
+    fn hides_copy_state() {
+        // Unregistered, quarantined and blocked must be indistinguishable, so a
+        // caller cannot probe which copies a node holds.
+        let codes: Vec<S3ErrorCode> = [
+            ManagedCopyError::Unregistered,
+            ManagedCopyError::NotServeable(aruna_core::structs::ManagedCopyState::Quarantined(
+                aruna_core::structs::ManagedCopyQuarantine::Rejoin,
+            )),
+            ManagedCopyError::Mismatched,
+            ManagedCopyError::NoSubject,
+            ManagedCopyError::ServingBlocked,
+        ]
+        .into_iter()
+        .map(|error| {
+            GetObjectError::ManagedCopyError(error)
+                .into_s3_error()
+                .code()
+                .clone()
+        })
+        .collect();
+
+        assert!(
+            codes
+                .iter()
+                .all(|code| *code == S3ErrorCode::Custom("PlacementUnavailable".into()))
+        );
+    }
 }

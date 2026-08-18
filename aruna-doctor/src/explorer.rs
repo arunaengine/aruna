@@ -6,26 +6,26 @@ use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
-    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-    GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE,
-    ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-    SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
-    USER_ACCESS_OWNER_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE,
+    BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
+    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
+    GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+    USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
-    ManagedCopyKey, ManagedCopyRecord, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    NodeSubjectRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
-    VersionKey,
+    HeadContenderKey, ManagedCopyKey, ManagedCopyRecord, MultipartObjectMetadataKey,
+    MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
+    MultipartUploadPartKey, NodeSubjectRecord, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
@@ -161,6 +161,8 @@ enum DecodedField {
     VersionKey { value: VersionKey },
     #[serde(rename = "managed_copy_key")]
     ManagedCopyKey { value: ManagedCopyKey },
+    #[serde(rename = "head_contender_key")]
+    HeadContenderKey { value: HeadContenderKey },
     #[serde(rename = "multipart_upload_part_key")]
     MultipartUploadPartKey { value: MultipartUploadPartKey },
     #[serde(rename = "multipart_object_metadata_key")]
@@ -971,12 +973,13 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 35] {
+fn defined_keyspaces() -> [&'static str; 36] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
+        BLOB_HEAD_CONTENDER_KEYSPACE,
         BLOB_HEAD_KEYSPACE,
         BLOB_HIDDEN_RESERVATION_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
@@ -1260,6 +1263,9 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         MANAGED_COPY_KEYSPACE => ManagedCopyKey::from_bytes(key)
             .map(|value| DecodedField::ManagedCopyKey { value })
             .unwrap_or_else(|_| raw_field(key)),
+        BLOB_HEAD_CONTENDER_KEYSPACE => HeadContenderKey::from_bytes(key)
+            .map(|value| DecodedField::HeadContenderKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
         BLOB_LOCATIONS_KEYSPACE => BlobLocationKey::from_bytes(key)
             .map(|value| DecodedField::BlobLocationKey {
                 blake3: hex::encode(value.blake3_hash),
@@ -1502,16 +1508,16 @@ mod tests {
     use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
-        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE,
-        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, DHT_KEYSPACE,
-        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
-        ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-        SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
-        USER_ACCESS_OWNER_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE,
+        BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        BUCKET_STATS_DB, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
+        GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, MANAGED_COPY_KEYSPACE,
+        METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+        METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+        SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+        USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
@@ -1663,6 +1669,7 @@ mod tests {
             ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
             API_STATE_KEYSPACE.to_string(),
             AUTH_KEYSPACE.to_string(),
+            BLOB_HEAD_CONTENDER_KEYSPACE.to_string(),
             BLOB_HEAD_KEYSPACE.to_string(),
             BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
             BLOB_LOCATIONS_KEYSPACE.to_string(),
@@ -1675,11 +1682,13 @@ mod tests {
             DHT_KEYSPACE.to_string(),
             HASH_PATHS_INDEX_KEYSPACE.to_string(),
             DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            MANAGED_COPY_KEYSPACE.to_string(),
             METADATA_AUDIT_KEYSPACE.to_string(),
             METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
             METADATA_HOLDERS_KEYSPACE.to_string(),
             METADATA_INDEX_KEYSPACE.to_string(),
             NODE_STATE_KEYSPACE.to_string(),
+            NODE_SUBJECT_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),

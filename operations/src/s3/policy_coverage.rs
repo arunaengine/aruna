@@ -45,8 +45,9 @@ pub enum AttachmentGap {
 /// fully attached head can still have no serveable copy here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CopyState {
-    /// A local registration exists and is serveable.
-    Compliant,
+    /// A serveable registration exists. It is NOT a compliance claim: only a
+    /// subject revalidation decides whether the copy still satisfies its refs.
+    Registered,
     Quarantined,
     /// No local registration for this version.
     Absent,
@@ -56,7 +57,7 @@ pub enum CopyState {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CopyCounts {
-    pub compliant: usize,
+    pub registered: usize,
     pub quarantined: usize,
     pub absent: usize,
     pub reference_only: usize,
@@ -394,7 +395,7 @@ impl PolicyCoverageOperation {
                 .map(|value| ManagedCopyRecord::from_bytes(value.as_ref()))
                 .transpose()
             {
-                Ok(Some(record)) if record.state.is_serveable() => CopyState::Compliant,
+                Ok(Some(record)) if record.state.is_serveable() => CopyState::Registered,
                 Ok(Some(_)) => CopyState::Quarantined,
                 Ok(None) => CopyState::Absent,
                 Err(error) => return self.fail(error.into()),
@@ -405,7 +406,7 @@ impl PolicyCoverageOperation {
     }
 
     /// Attachment and local copy state are recorded independently, so zero
-    /// attachment gaps never implies that every copy is compliant.
+    /// attachment gaps never implies that every registered copy is compliant.
     fn classify(&mut self, copy_states: Vec<CopyState>) -> Effects {
         let entries = std::mem::take(&mut self.entries);
         let mut copies = copy_states.into_iter();
@@ -430,7 +431,7 @@ impl PolicyCoverageOperation {
                 BlobVersionState::Materialized { .. } => copies.next().unwrap_or(CopyState::Absent),
             };
             match copy {
-                CopyState::Compliant => self.copies.compliant += 1,
+                CopyState::Registered => self.copies.registered += 1,
                 CopyState::Quarantined => self.copies.quarantined += 1,
                 CopyState::Absent => self.copies.absent += 1,
                 CopyState::ReferenceOnly => self.copies.reference_only += 1,
@@ -773,7 +774,7 @@ mod tests {
 
         assert!(report.gaps.is_empty());
         assert_eq!(report.copies.quarantined, 1);
-        assert_eq!(report.copies.compliant, 0);
+        assert_eq!(report.copies.registered, 0);
     }
 
     #[test]
@@ -789,7 +790,7 @@ mod tests {
 
         assert_eq!(report.gaps.len(), 1);
         assert_eq!(report.gaps[0].attachment, AttachmentGap::Partial);
-        assert_eq!(report.gaps[0].copy, Some(CopyState::Compliant));
+        assert_eq!(report.gaps[0].copy, Some(CopyState::Registered));
     }
 
     #[test]

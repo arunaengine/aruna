@@ -104,6 +104,8 @@ pub enum IncomingVersionReplicationError {
     PolicyGate(#[from] PolicyGateError),
     #[error(transparent)]
     ManagedCopy(#[from] ManagedCopyError),
+    #[error("the placement gate finished without a pending negotiation")]
+    GateNotPending,
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
@@ -867,7 +869,7 @@ impl IncomingVersionReplicationOperation {
 
     fn finish_gate(&mut self) -> Effects {
         let (Some(gate), Some(result)) = (self.gate.take(), self.pending_negotiation.take()) else {
-            return self.fail(IncomingVersionReplicationError::MissingCurrentVersionGeneration);
+            return self.fail(IncomingVersionReplicationError::GateNotPending);
         };
         let outcome = match gate.finalize() {
             Ok(outcome) => outcome,

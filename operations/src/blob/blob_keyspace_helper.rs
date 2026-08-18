@@ -238,25 +238,6 @@ pub fn head_contender_effects(
     })])
 }
 
-/// Bounded scan of the claimants observed for one object generation.
-pub fn head_contender_scan(
-    context: &HeadAliasContext,
-    generation: u64,
-    start_after: Option<Key>,
-    limit: usize,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Iter {
-        key_space: BLOB_HEAD_CONTENDER_KEYSPACE.to_string(),
-        prefix: Some(
-            HeadContenderKey::generation_prefix(&context.bucket, &context.key, generation)?.into(),
-        ),
-        start: start_after.map(IterStart::After),
-        limit,
-        txn_id,
-    }))
-}
-
 pub fn build_head_transition_effects(
     context: &HeadAliasContext,
     new_pointer: Option<CurrentVersionPointer>,
@@ -288,7 +269,7 @@ pub fn build_head_transition_effects(
 mod tests {
     use super::{
         HeadAliasContext, add_hash_path_index_effect, build_head_transition_effects,
-        iter_hash_page, iter_hash_path_index_effect,
+        head_contender_effects, iter_hash_page, iter_hash_path_index_effect,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::structs::{CurrentVersionPointer, HashPathIndexKey, RealmId};
@@ -366,6 +347,46 @@ mod tests {
             effects[1],
             Effect::Storage(StorageEffect::Write { .. })
         ));
+    }
+
+    #[test]
+    fn contenders_record_both() {
+        // Both claimants of one generation are retained, whichever one won.
+        let context = alias_context();
+        let candidate = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([9u8; 16]), 7);
+        let existing = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([1u8; 16]), 7);
+        let effects = head_contender_effects(&context, &candidate, Some(&existing), None).unwrap();
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one contender batch");
+        };
+        let recorded: Vec<Ulid> = writes
+            .iter()
+            .map(|(_, key, _)| {
+                aruna_core::structs::HeadContenderKey::from_bytes(key.as_ref())
+                    .unwrap()
+                    .version_id
+            })
+            .collect();
+        assert_eq!(recorded, vec![existing.version_id, candidate.version_id]);
+    }
+
+    #[test]
+    fn contenders_need_same_generation() {
+        // A higher generation is an ordinary advance, not a contended head.
+        let context = alias_context();
+        let candidate = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([9u8; 16]), 8);
+        let existing = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([1u8; 16]), 7);
+        assert!(
+            head_contender_effects(&context, &candidate, Some(&existing), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            head_contender_effects(&context, &candidate, None, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
