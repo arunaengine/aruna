@@ -44,7 +44,7 @@ mod tests {
     use aruna_core::storage_format::{
         STORAGE_FORMAT_EPOCH, STORAGE_FORMAT_KEY, StorageFormatMarker,
     };
-    use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
+    use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode, Readable};
     use tempfile::tempdir;
 
     fn open(path: &std::path::Path) -> OptimisticTxDatabase {
@@ -114,7 +114,9 @@ mod tests {
         let records = db
             .keyspace("s3_buckets", KeyspaceCreateOptions::default)
             .expect("record keyspace");
-        records.insert(b"bucket", b"record").expect("record writes");
+        records
+            .insert(b"bucket".as_slice(), b"record".as_slice())
+            .expect("record writes");
 
         assert!(ensure_format(&db, "predecessor").is_err());
     }
@@ -140,6 +142,7 @@ mod tests {
                     older.to_bytes().expect("marker encodes"),
                 )
                 .expect("marker writes");
+            db.persist(PersistMode::SyncAll).expect("marker persists");
         }
 
         assert!(crate::FjallStorage::open(&path).is_err());

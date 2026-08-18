@@ -2029,6 +2029,7 @@ mod tests {
                     StorageFormatMarker::default().to_bytes().unwrap(),
                 )
                 .unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
         }
 
         let output = list_keyspaces(temp.path().to_str().unwrap()).unwrap();
