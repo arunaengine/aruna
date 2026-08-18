@@ -6,7 +6,7 @@ use aruna_core::structs::{
 };
 use tracing::{debug, warn};
 
-use super::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use super::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError};
 use super::store::{persist_output_record, read_output_record};
 use crate::driver::{DriverContext, drive};
 
@@ -168,6 +168,12 @@ async fn append_output_record(
             Ok(())
         }
         Ok(_) => Ok(()),
+        // A realm this node has no config for cannot derive a family placement
+        // at all; the record stays durable locally instead of failing the run.
+        Err(RecordStoreError::RealmConfigMissing) => {
+            debug!(job_id = %job_id, "Output record deferred: realm config unavailable");
+            Ok(())
+        }
         Err(error) => Err(JobError::retryable(format!(
             "output record append failed: {error}"
         ))),
