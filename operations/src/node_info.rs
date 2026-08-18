@@ -800,7 +800,12 @@ mod tests {
     }
 
     async fn write_realm_config(ctx: &DriverContext, config: &RealmConfigDocument) {
-        let node_id = config.node_ids().unwrap()[0];
+        // A removal fixture writes a config that no longer names any node.
+        let node_id = config
+            .node_ids()
+            .ok()
+            .and_then(|ids| ids.first().copied())
+            .unwrap_or_else(|| node(1));
         let actor = aruna_core::structs::Actor {
             node_id,
             user_id: aruna_core::types::UserId::nil(config.realm_id),
