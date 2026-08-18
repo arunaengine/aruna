@@ -2834,6 +2834,8 @@ impl JobRecordEnvelope {
         let Some(receipt) = context.receipt else {
             return Ok(self.local_output(output, context));
         };
+        // The exact receipt digest seals the target's membership and subject
+        // generations, so binding to it binds the epoch the work was accepted in.
         match output.execution_id == receipt.execution_id
             && output.executor_node_id == receipt.executor_node_id
             && output.job_id == receipt.job_id
@@ -4177,6 +4179,15 @@ mod tests {
         for (kind, signed) in holder_records() {
             assert_eq!(
                 signed.verify(&outsider),
+                Err(JobRecordError::NotHolder(kind))
+            );
+        }
+
+        // A caller that resolved no view at all grants nothing.
+        let unresolved = JobRecordContext::new(RealmId([8u8; 32]), family(), placement());
+        for (kind, signed) in holder_records() {
+            assert_eq!(
+                signed.verify(&unresolved),
                 Err(JobRecordError::NotHolder(kind))
             );
         }
