@@ -16,9 +16,16 @@
 //! * [`cancel`] publishes the append-only cancellation intent.
 //! * [`routing`] answers external reads from the family projection.
 
+use std::time::Duration;
+
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::handle::Handle;
 use aruna_core::structs::{JobFamilyError, JobId, JobRecordError};
+use aruna_core::task::TaskEvent;
+use aruna_storage::StorageHandle;
+use aruna_tasks::TaskHandle;
 use thiserror::Error;
+use tracing::warn;
 
 use super::records::RecordStoreError;
 
@@ -79,3 +86,30 @@ pub enum LifecycleError {
 
 #[cfg(test)]
 mod tests;
+
+/// Re-arms the replication and witness queues after a restart. Both queues are
+/// durable rows, so the timers only have to be brought back, never the work.
+pub async fn restore_lifecycle_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
+    let pending = crate::jobs::store::iter_prefix_page(
+        storage,
+        aruna_core::keyspaces::JOB_WITNESS_DEADLINE_KEYSPACE,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .map(|(rows, _)| !rows.is_empty())
+    .unwrap_or(false);
+    let mut timers = vec![outbox::schedule_outbox_drain(outbox::OUTBOX_RETRY_AFTER)];
+    if pending {
+        timers.push(witness::schedule_witness_drain(Duration::from_secs(1)));
+    }
+    for timer in timers {
+        if let aruna_core::events::Event::Task(TaskEvent::Error { message, .. }) =
+            task_handle.send_effect(timer).await
+        {
+            warn!(message = %message, "Failed to restore a job lifecycle timer");
+        }
+    }
+}

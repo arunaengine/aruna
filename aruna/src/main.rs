@@ -35,6 +35,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_holder;
 use aruna_operations::jobs::drain::restore_job_queue_timer;
+use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
@@ -759,6 +760,7 @@ async fn start_background(background: Background) {
     jobs_runtime.start();
     task_queues.start(&shutdown).await;
     restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
+    restore_lifecycle_timers(&driver_ctx.storage_handle, &task_handle).await;
     spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
     let recovery_ctx = driver_ctx.clone();
