@@ -1,3 +1,9 @@
+//! Application Layer Protocol Negotiation identifiers for Aruna streams.
+//!
+//! The version suffix is the whole compatibility contract: a peer whose frames
+//! differ never negotiates the ALPN, so it fails the connection instead of
+//! decoding foreign bytes. There is no fallback ALPN and no downgrade.
+
 /// Application Layer Protocol Negotiation identifiers for Aruna streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Alpn {
@@ -23,26 +29,26 @@ impl Alpn {
     pub const fn as_bytes(&self) -> &'static [u8] {
         match self {
             Alpn::Dht => b"aruna/dht/2",
-            Alpn::Bao => b"aruna/bao/1",
+            Alpn::Bao => b"aruna/bao/2",
             Alpn::DocumentSync => irokle::net::IROKLE_SYNC_ALPN,
-            Alpn::Metadata => b"aruna/metadata/1",
+            Alpn::Metadata => b"aruna/metadata/2",
             Alpn::NativeReference => b"aruna/native/1",
             Alpn::Notification => b"aruna/notification/1",
             Alpn::Shard => b"aruna/shard/1",
-            Alpn::JobControl => b"aruna/job-control/1",
+            Alpn::JobControl => b"aruna/job-control/2",
         }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         match bytes {
             b"aruna/dht/2" => Some(Alpn::Dht),
-            b"aruna/bao/1" => Some(Alpn::Bao),
+            b"aruna/bao/2" => Some(Alpn::Bao),
             irokle::net::IROKLE_SYNC_ALPN => Some(Alpn::DocumentSync),
-            b"aruna/metadata/1" => Some(Alpn::Metadata),
+            b"aruna/metadata/2" => Some(Alpn::Metadata),
             b"aruna/native/1" => Some(Alpn::NativeReference),
             b"aruna/notification/1" => Some(Alpn::Notification),
             b"aruna/shard/1" => Some(Alpn::Shard),
-            b"aruna/job-control/1" => Some(Alpn::JobControl),
+            b"aruna/job-control/2" => Some(Alpn::JobControl),
             _ => None,
         }
     }
@@ -52,16 +58,16 @@ impl std::fmt::Display for Alpn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Alpn::Dht => write!(f, "aruna/dht/2"),
-            Alpn::Bao => write!(f, "aruna/bao/1"),
+            Alpn::Bao => write!(f, "aruna/bao/2"),
             Alpn::DocumentSync => match std::str::from_utf8(irokle::net::IROKLE_SYNC_ALPN) {
                 Ok(value) => write!(f, "{value}"),
                 Err(_) => write!(f, "<invalid-document-sync-alpn>"),
             },
-            Alpn::Metadata => write!(f, "aruna/metadata/1"),
+            Alpn::Metadata => write!(f, "aruna/metadata/2"),
             Alpn::NativeReference => write!(f, "aruna/native/1"),
             Alpn::Notification => write!(f, "aruna/notification/1"),
             Alpn::Shard => write!(f, "aruna/shard/1"),
-            Alpn::JobControl => write!(f, "aruna/job-control/1"),
+            Alpn::JobControl => write!(f, "aruna/job-control/2"),
         }
     }
 }
@@ -100,5 +106,35 @@ mod tests {
     #[test]
     fn test_alpn_unknown() {
         assert_eq!(Alpn::from_bytes(b"unknown"), None);
+    }
+
+    #[test]
+    fn refuses_predecessor_alpns() {
+        // An old peer must fail ALPN negotiation instead of decoding new frames
+        // as if they were its own.
+        for predecessor in [
+            b"aruna/bao/1".as_slice(),
+            b"aruna/metadata/1".as_slice(),
+            b"aruna/job-control/1".as_slice(),
+        ] {
+            assert_eq!(Alpn::from_bytes(predecessor), None);
+        }
+    }
+
+    #[test]
+    fn advertises_display_bytes() {
+        // Accept lists use `as_bytes` and diagnostics use `Display`; a peer that
+        // dials the displayed name must reach the same protocol.
+        for alpn in [
+            Alpn::Dht,
+            Alpn::Bao,
+            Alpn::Metadata,
+            Alpn::NativeReference,
+            Alpn::Notification,
+            Alpn::Shard,
+            Alpn::JobControl,
+        ] {
+            assert_eq!(alpn.to_string().as_bytes(), alpn.as_bytes());
+        }
     }
 }
