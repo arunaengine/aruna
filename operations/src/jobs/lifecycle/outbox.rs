@@ -43,6 +43,16 @@ pub fn schedule_outbox_drain(after: Duration) -> Effect {
     })
 }
 
+/// Asks the drain to run now, after a record was queued for replication.
+pub async fn kick(context: &DriverContext) {
+    if let Some(task) = context.task_handle.as_ref() {
+        use aruna_core::handle::Handle;
+        let _ = task
+            .send_effect(schedule_outbox_drain(Duration::ZERO))
+            .await;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRecordConfig {
     pub realm_id: RealmId,

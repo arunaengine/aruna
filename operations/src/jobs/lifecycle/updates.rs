@@ -140,6 +140,7 @@ pub async fn publish_state(
     match appended {
         Ok(_) => {
             debug!(state = state.name(), "Execution update published");
+            super::outbox::kick(context).await;
             true
         }
         Err(error) => {

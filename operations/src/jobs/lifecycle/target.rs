@@ -218,6 +218,7 @@ async fn reserve_and_run(
             return Err(LaunchDecline::Capacity);
         }
     }
+    super::outbox::kick(context.as_ref()).await;
     materialize_local(context.as_ref(), &round.spec, round.local, now).await;
     ReceiptFrame::new(envelope).map_err(|_| LaunchDecline::Unauthorized)
 }

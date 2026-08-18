@@ -101,13 +101,11 @@ pub async fn submit_external_job(
         scope,
         retention_ms,
     };
-    let identity = request
-        .identity()
-        .map_err(|error| SubmitJobError::Conversion(error))?;
+    let identity = request.identity().map_err(SubmitJobError::Conversion)?;
     quota_gate(request.spec.group_id, &effective_resources(&request.spec))
         .map_err(|denied| SubmitJobError::QuotaDenied(denied.to_string()))?;
     let (config, local) = local_view(context).await?;
-    let view = family_view(&config, local, &identity)?;
+    let view = family_view(&config, &identity)?;
     if view.holds(local) {
         let admitted = admit_here(context, &request, &identity, &config, local).await?;
         return Ok(AcceptedSubmission {
@@ -137,10 +135,8 @@ async fn local_view(
 /// availability failure, never an accepted job.
 fn family_view(
     config: &RealmConfigDocument,
-    local: NodeId,
     identity: &RequestIdentity,
 ) -> Result<FamilyView, SubmitJobError> {
-    let _ = local;
     FamilyView::resolve(config, config.realm_id, identity.family()).ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("job family placement is unavailable".to_string())
     })
@@ -227,9 +223,10 @@ async fn admit_here(
     )
     .await
     .map_err(admission_error)?;
-    // Scheduling is armed only after the claim is durable, so a failed commit
-    // never leaves a witness round pointing at a family that does not exist.
+    // Scheduling and replication are armed only after the claim is durable, so
+    // a failed commit never leaves a round pointing at a family that is absent.
     arm_family(context, identity.family(), now_ms).await;
+    super::outbox::kick(context).await;
     Ok((admitted.job_id, admitted.created))
 }
 

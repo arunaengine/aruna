@@ -15,7 +15,8 @@ use aruna_core::events::{
     JobRecordEvent, JobRecordPage, JobRecordRejection, LaunchDecline, LaunchOfferEvent,
 };
 use aruna_core::structs::{
-    JobFamilyId, JobRecordError, PlacementRef, RealmConfigDocument, RealmId, SubmissionId,
+    JobFamilyId, JobRecordError, JobRecordKind, PlacementRef, RealmConfigDocument, RealmId,
+    SubmissionId,
 };
 use tokio::time::timeout_at;
 use tracing::warn;
@@ -322,6 +323,8 @@ async fn accept_record(
     if derived != placement {
         return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
+    let kind = record.envelope().kind();
+    let now_ms = aruna_core::util::unix_timestamp_millis();
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
             realm_id: authority.realm_id,
@@ -329,7 +332,7 @@ async fn accept_record(
             record,
             local: None,
             origin: RecordOrigin::Peer(peer),
-            now_ms: aruna_core::util::unix_timestamp_millis(),
+            now_ms,
         }),
         context.as_ref(),
     )
@@ -338,6 +341,13 @@ async fn accept_record(
         warn!(error = %error, "Job record append failed");
         ServeError::Unavailable
     })?;
+    // Learning a claim makes this holder a witness of that family, and learning
+    // a cancellation must stop the round it already armed.
+    if matches!(outcome.admission, Admission::Authentic)
+        && matches!(kind, JobRecordKind::Claim | JobRecordKind::Cancel)
+    {
+        crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
+    }
     match outcome.admission {
         // A pending record is durable here and is admitted as soon as its
         // evidence arrives, so the publisher has nothing left to retry.
