@@ -30,6 +30,7 @@ pub mod outbox;
 pub mod plan;
 pub mod reservation;
 pub mod routing;
+pub mod stage;
 pub mod target;
 pub mod updates;
 pub mod witness;

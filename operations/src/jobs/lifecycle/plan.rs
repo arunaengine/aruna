@@ -252,7 +252,7 @@ async fn resolve_inputs(
 
 /// The blake3 of a version this node does not hold locally, read from the
 /// replicated version record.
-async fn version_hash(
+pub async fn version_hash(
     context: &DriverContext,
     bucket: &str,
     key: &str,

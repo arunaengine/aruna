@@ -803,6 +803,72 @@ fn output_object(
     }
 }
 
+/// One input's bytes plus the facts the workspace write needs, from the local
+/// copy or from a remote holder.
+struct StagedSource {
+    blob: BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>,
+    location: Option<BackendLocation>,
+    size: Option<u64>,
+    source_policies: Vec<PlacementPolicyRef>,
+}
+
+impl StagedSource {
+    fn from_local(get: crate::s3::get_object::GetObjectResult) -> Self {
+        Self {
+            blob: get.blob,
+            location: get.location,
+            size: get
+                .source_metadata
+                .as_ref()
+                .map(|metadata| metadata.content_length),
+            source_policies: get.source_policies,
+        }
+    }
+}
+
+/// Stages one exact version from a legal holder. The sealed version and hash
+/// are resolved first, so a remote read can never substitute other bytes.
+async fn remote_source(
+    context: &DriverContext,
+    record: &JobRecord,
+    input: &InputSelection,
+    version: Option<Ulid>,
+) -> Result<StagedSource, JobError> {
+    let InputSource::S3 {
+        bucket: src_bucket,
+        key: src_key,
+        ..
+    } = &input.source;
+    let head = Box::pin(drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: src_bucket.clone(),
+            key: src_key.clone(),
+            version_id: version,
+        }),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    .map_err(|error| JobError::retryable(format!("input head failed: {error}")))?
+    .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
+    let resolved = head
+        .resolved_version_id
+        .or(head.version_id)
+        .ok_or_else(|| JobError::permanent("input version is unresolved".to_string()))?;
+    let blake3 = crate::jobs::lifecycle::plan::version_hash(context, src_bucket, src_key, resolved)
+        .await
+        .ok_or_else(|| JobError::retryable("input version is not materialized".to_string()))?;
+    let staged =
+        crate::jobs::lifecycle::stage::stage_remote_input(context, record, input, resolved, blake3)
+            .await?;
+    Ok(StagedSource {
+        blob: staged.blob,
+        location: None,
+        size: Some(staged.size),
+        source_policies: head.source_policies,
+    })
+}
+
 async fn stage_one_input(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -858,7 +924,7 @@ async fn stage_one_input(
             "input {src_bucket}/{src_key} access denied"
         )));
     }
-    let get = Box::pin(drive(
+    let local = Box::pin(drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: src_bucket.clone(),
             key: src_key.clone(),
@@ -871,9 +937,18 @@ async fn stage_one_input(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
-    .map_err(source_input_error)?
-    .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
+    .and_then(|result| result.transpose());
+    // A target that holds no copy stages the exact sealed version from a legal
+    // holder through the managed-copy handshake instead of failing the launch.
+    let staged = match local {
+        Ok(Some(get)) => StagedSource::from_local(get),
+        Ok(None) => Box::pin(remote_source(context, record, input, version)).await?,
+        Err(error) => match Box::pin(remote_source(context, record, input, version)).await {
+            Ok(staged) => staged,
+            Err(_) => return Err(source_input_error(error)),
+        },
+    };
+    let get = staged;
 
     let destination = match Box::pin(drive(
         HeadObjectOperation::new(HeadObjectInput {
@@ -918,7 +993,11 @@ async fn stage_one_input(
         }
     }
 
-    let content_length = get.location.as_ref().map(|location| location.blob_size);
+    let content_length = get
+        .location
+        .as_ref()
+        .map(|location| location.blob_size)
+        .or(get.size);
     let realm_config = Box::pin(drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
         context,
