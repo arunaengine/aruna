@@ -1,11 +1,14 @@
+use aruna_core::NodeId;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::{
     AttemptControl, ExecutionOutputRecord, JobError, JobFamilyRecord, JobId, JobRecord,
-    JobRecordEnvelope, OutputObject, OutputSet, SubmissionId,
+    JobRecordEnvelope, LocalExecution, OutputObject, OutputSet, SubmissionId,
 };
+use tracing::{debug, warn};
 
+use super::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::store::{persist_output_record, read_output_record};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
 /// Build, sign, and make durable this execution's exact output record, then
 /// return the digest terminal success must name. Success is refused when this
@@ -25,7 +28,9 @@ pub async fn seal_outputs(
         .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
     let outputs = OutputSet::canonical(outputs.to_vec())
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
-    if let Some(digest) = sealed_digest(context, record.job_id, control, &outputs).await? {
+    if let Some(digest) =
+        sealed_digest(context, record.job_id, control, &outputs, net.node_id()).await?
+    {
         return Ok(digest);
     }
     let output = ExecutionOutputRecord {
@@ -56,11 +61,16 @@ pub async fn seal_outputs(
 /// Digest of the record this execution already sealed for the same exact output
 /// set. A replayed finalize reuses it instead of re-signing a second record that
 /// differs only by its commit timestamp.
+///
+/// The stored row is re-verified on read-back: a row whose signature or
+/// publisher no longer proves this node sealed it is not evidence, so a correct
+/// record is sealed again instead of trusting it.
 async fn sealed_digest(
     context: &DriverContext,
     job_id: JobId,
     control: &AttemptControl,
     outputs: &OutputSet,
+    publisher: NodeId,
 ) -> Result<Option<[u8; 32]>, JobError> {
     let Some(digest) = control.output_record else {
         return Ok(None);
@@ -71,16 +81,26 @@ async fn sealed_digest(
     let Some(envelope) = envelope else {
         return Ok(None);
     };
+    if envelope.published_by != publisher || envelope.verify_signature().is_err() {
+        warn!(
+            job_id = %job_id,
+            attempt_epoch = control.attempt_epoch,
+            "Stored output record does not authenticate; sealing a new one"
+        );
+        return Ok(None);
+    }
     let JobFamilyRecord::Output(sealed) = &envelope.record else {
         return Ok(None);
     };
     Ok((sealed.outputs == *outputs && envelope.digest().ok() == Some(digest)).then_some(digest))
 }
 
-/// The one place this execution's signed output record leaves the workflow.
-/// It is durable locally before terminal success is allowed to name its digest;
-/// the append-only record store's publish/replicate call attaches here, after
-/// the local write and before the digest is returned.
+/// The one place this execution's signed output record leaves the workflow. It
+/// is durable locally before terminal success may name its digest, and it is
+/// appended to the family record store here, after the local write and before
+/// the digest is returned. The append marks it for family replication only when
+/// the replicated chain proves it: a record proven by this node's own fence
+/// alone stays local until its receipt exists.
 async fn publish_output_record(
     context: &DriverContext,
     job_id: JobId,
@@ -96,7 +116,52 @@ async fn publish_output_record(
     persist_output_record(&context.storage_handle, job_id, control, digest, bytes)
         .await
         .map_err(|error| JobError::retryable(format!("output record write failed: {error}")))?;
+    append_output_record(context, job_id, control, frame).await?;
     Ok(digest)
+}
+
+/// Appends the sealed record to the append-only store. A realm that cannot
+/// resolve the family view yet defers the record instead of failing the
+/// execution: the record is already durable and the append is idempotent.
+async fn append_output_record(
+    context: &DriverContext,
+    job_id: JobId,
+    control: &AttemptControl,
+    frame: JobRecordFrame,
+) -> Result<(), JobError> {
+    let Some(net) = context.net_handle.as_ref() else {
+        return Err(JobError::permanent("output record needs a net handle"));
+    };
+    let envelope = frame.envelope();
+    let JobFamilyRecord::Output(output) = &envelope.record else {
+        return Err(JobError::permanent("sealed record is not an output record"));
+    };
+    let config = AppendRecordConfig {
+        realm_id: envelope.realm_id,
+        local_node_id: net.node_id(),
+        local: Some(LocalExecution {
+            node_id: net.node_id(),
+            execution_id: control.execution_id,
+            fence_digest: control.fence_digest(job_id),
+            spec_digest: output.spec_digest,
+        }),
+        record: frame.clone(),
+        origin: RecordOrigin::Local,
+        now_ms: aruna_core::util::unix_timestamp_millis(),
+    };
+    match drive(AppendRecordOperation::new(config), context).await {
+        Ok(outcome) if outcome.deferred => {
+            debug!(
+                job_id = %job_id,
+                "Output record deferred: the local job family view is unavailable"
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(JobError::retryable(format!(
+            "output record append failed: {error}"
+        ))),
+    }
 }
 
 #[cfg(test)]
