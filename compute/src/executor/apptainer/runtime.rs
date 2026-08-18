@@ -249,16 +249,15 @@ fn configure_cgroup(launch: &LaunchRecord) -> Result<(), BackendError> {
         launch.pids_limit.to_string(),
     )
     .map_err(io_error)?;
-    if let Some(memory) = launch.memory_bytes {
-        std::fs::write(launch.cgroup.join("memory.max"), memory.to_string()).map_err(io_error)?;
-    }
-    if let Some(cores) = launch.cpu_cores {
-        let quota = u64::from(cores)
-            .checked_mul(100_000)
-            .ok_or_else(|| BackendError::InvalidSpec("CPU limit overflows".to_string()))?;
-        std::fs::write(launch.cgroup.join("cpu.max"), format!("{quota} 100000"))
-            .map_err(io_error)?;
-    }
+    std::fs::write(
+        launch.cgroup.join("memory.max"),
+        launch.memory_bytes.to_string(),
+    )
+    .map_err(io_error)?;
+    let quota = u64::from(launch.cpu_cores)
+        .checked_mul(100_000)
+        .ok_or_else(|| BackendError::InvalidSpec("CPU limit overflows".to_string()))?;
+    std::fs::write(launch.cgroup.join("cpu.max"), format!("{quota} 100000")).map_err(io_error)?;
     Ok(())
 }
 

@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::DockerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit};
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
@@ -635,6 +635,22 @@ fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendEr
             "resource ceilings must be greater than zero".to_string(),
         ));
     }
+    // The container is created with these two ceilings, so an attempt neither
+    // the sealed spec nor the backend bounds must never start.
+    enforced_limit(
+        spec.resources.ram_bytes,
+        config
+            .default_mem_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok()),
+        "memory",
+    )?;
+    enforced_limit(
+        spec.resources.cpu_cores.map(u64::from),
+        config
+            .default_nano_cpus
+            .and_then(|cpus| u64::try_from(cpus).ok()),
+        "cpu",
+    )?;
     Ok(())
 }
 
@@ -1042,7 +1058,9 @@ fn build_config(
         network_mode: match spec.security.network {
             NetworkAccess::Isolated => Some("none".to_string()),
             NetworkAccess::Open => None,
-            NetworkAccess::S3Only => None,
+            // Docker enforces no S3-only egress, so the mode fails closed here
+            // as well as in validation instead of opening the network.
+            NetworkAccess::S3Only => Some("none".to_string()),
         },
         readonly_rootfs: Some(spec.security.read_only_rootfs),
         auto_remove: Some(false),
@@ -1098,6 +1116,7 @@ impl ExecutorBackend for DockerBackend {
             file_staging: true,
             direct_s3: true,
             local_site: true,
+            limits: self.config.envelope,
             ..BackendCaps::default()
         }
     }
@@ -2048,6 +2067,37 @@ mod tests {
             Err(BackendError::InvalidSpec(_))
         ));
         assert!(validate_image_volumes(&DockerConfig::default(), &inspect).is_ok());
+    }
+
+    #[test]
+    fn refuses_unbounded_attempt() {
+        // With no sealed ceiling and no backend default, the container would run
+        // against the whole host, so it must never be created.
+        let unbounded = DockerConfig {
+            default_mem_bytes: None,
+            default_nano_cpus: None,
+            ..DockerConfig::default()
+        };
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        assert!(validate_spec(&unbounded, &spec).is_err());
+
+        spec.resources.ram_bytes = Some(64 * 1024 * 1024);
+        assert!(validate_spec(&unbounded, &spec).is_err());
+        spec.resources.cpu_cores = Some(1);
+        assert!(validate_spec(&unbounded, &spec).is_ok());
+    }
+
+    #[test]
+    fn network_fails_closed() {
+        // Docker enforces no S3-only egress, so that mode must not open the
+        // network even if it ever reached the container body.
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.security.network = NetworkAccess::S3Only;
+        let host = build_config(&DockerConfig::default(), &fence(), &spec)
+            .host_config
+            .unwrap();
+        assert_eq!(host.network_mode.as_deref(), Some("none"));
+        assert!(validate_spec(&DockerConfig::default(), &spec).is_err());
     }
 
     #[test]
