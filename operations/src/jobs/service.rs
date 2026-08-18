@@ -1145,6 +1145,80 @@ mod tests {
         iroh::SecretKey::from_bytes(&[7u8; 32]).public()
     }
 
+    #[tokio::test]
+    async fn caps_declared_outputs() {
+        // The declaration bound is the immutable record's bound, so a valid
+        // local success can never be impossible to publish.
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId([1u8; 32]);
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
+                .map(|index| aruna_core::structs::WorkspaceOutput {
+                    container_path: format!("/out/{index}"),
+                    dest_key: format!("out/{index}"),
+                })
+                .collect(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+
+        let error = submit_execution_job(
+            &context,
+            spec.clone(),
+            UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
+            node_id(),
+            None,
+            WorkspaceMode::Kept,
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SubmitJobError::TooManyOutputs {
+                limit: MAX_EXECUTION_OUTPUTS
+            }
+        ));
+
+        spec.workspace_outputs.pop();
+        assert!(!matches!(
+            submit_execution_job(
+                &context,
+                spec,
+                UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
+                node_id(),
+                None,
+                WorkspaceMode::Kept,
+                None,
+                1,
+            )
+            .await,
+            Err(SubmitJobError::TooManyOutputs { .. })
+        ));
+    }
+
     #[test]
     fn validates_artifact_size() {
         assert!(artifact_size_matches(None, 0));
