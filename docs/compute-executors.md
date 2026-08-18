@@ -146,6 +146,34 @@ Required configuration:
 - `ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER`: CSI driver name for S3 mounts. Unset
   disables S3-mount staging; set it to the deployed driver, for example
   `s3.csi.scality.com`.
+- `ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT`: workload ServiceAccount; defaults to
+  `aruna-workload`.
+- `ARUNA_COMPUTE_K8S_EXECUTION_LOCATION`: placement location of the worker
+  nodes. Workers do not run on the controller, so this is the location the
+  backend advertises.
+- `ARUNA_COMPUTE_K8S_EXECUTION_LABELS`: `key=value,key2=value2` placement labels
+  of those worker nodes.
+- `ARUNA_COMPUTE_K8S_NODE_SELECTOR`: `key=value` selector stamped on every task
+  and helper pod.
+
+Worker placement counts as proven only when both the execution location and the
+node selector are configured. Without them the backend advertises no location
+and no labels at all, so it stays eligible for unplaced work and never claims
+the controller's site. It then also reports no network-policy enforcement.
+
+## Execution envelope
+
+Every backend advertises static ceilings and refuses an attempt it cannot bound:
+
+- `ARUNA_COMPUTE_MAX_CPU_CORES`, `ARUNA_COMPUTE_MAX_RAM_BYTES`,
+  `ARUNA_COMPUTE_MAX_DISK_BYTES`, `ARUNA_COMPUTE_MAX_CONCURRENT`: the node's
+  static ceilings. They hard-filter placement, and advertised availability is
+  derived from them minus the node's current reservations. Availability only
+  ranks targets; exact admission stays the target-side reservation.
+
+An unset ceiling is unmeasured, never zero, so it filters nothing. CPU and
+memory of one attempt always carry a bound: the sealed request's own, else the
+backend default. An attempt neither of them bounds is refused.
 
 The Kubernetes executor supports Kubernetes 1.32 or newer. Files mode requires a
 CSI driver that enforces `ReadWriteOncePod`. Each attempt creates a suspended Job

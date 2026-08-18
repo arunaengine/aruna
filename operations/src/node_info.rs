@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -367,6 +367,54 @@ pub async fn refresh_node_info_heartbeat(
     document.updated_at_ms = now;
     write_node_info_document(&ctx.storage_handle, &document).await?;
     replicate_node_info(ctx, node_id, realm_id).await
+}
+
+/// The locally observed nonterminal admitted demand of one group: this node's
+/// own current families merged with every advertisement it holds for a current
+/// realm member. The bool reports that some publisher understated its demand.
+///
+/// This is the input of [`aruna_core::compute_quota::admits`]. It is exact for
+/// this node's own admissions, which is what makes a local cap race exact, and
+/// approximate across partitions, which is the accepted overshoot bound. A node
+/// the realm no longer places is skipped: its usage stays in audit but is no
+/// longer capacity of the remaining realm.
+pub async fn group_demand(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    group_id: &aruna_core::types::GroupId,
+) -> Result<(ResourceTotals, bool), String> {
+    let config = load_realm_config(ctx, realm_id).await?;
+    let members: BTreeSet<NodeId> = config
+        .node_ids()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect();
+    let local = demand_snapshot(ctx, AdvertisementEpoch::default()).await?;
+    let mut snapshots = vec![local];
+    let mut start: Option<Key> = None;
+    loop {
+        let (page, next) = iter_page(ctx, NODE_INFO_KEYSPACE, None, start).await?;
+        for (_, value) in &page {
+            match postcard::from_bytes::<NodeInfoDocument>(value.as_ref()) {
+                Ok(document)
+                    if document.node_id != node_id && members.contains(&document.node_id) =>
+                {
+                    snapshots.push(document.demand)
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "skipping undecodable node info advertisement"),
+            }
+        }
+        match next {
+            Some(cursor) => start = Some(cursor),
+            None => break,
+        }
+    }
+    Ok(aruna_core::compute_quota::merge_demand(
+        snapshots.iter(),
+        group_id,
+    ))
 }
 
 /// The single durable departure-report row of this node.
@@ -1322,6 +1370,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merges_group_demand() {
+        // A family two publishers observe counts once, a removed publisher's
+        // demand stops counting, and the local view is current, not the last
+        // heartbeat's.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        let local = node(1);
+        let peer = node(2);
+        let removed = node(3);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local, peer])).await;
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
+
+        let epoch = AdvertisementEpoch::default();
+        let shared = DemandFamily {
+            submission_id: family(1).submission_id,
+            request_digest: family(1).request_digest,
+            resources: aruna_core::structs::EffectiveResources {
+                cpu_cores: 2,
+                ram_bytes: 1_024,
+                disk_bytes: 2_048,
+                max_walltime_ms: 60_000,
+                preemptible: false,
+            },
+        };
+        let own = DemandFamily {
+            submission_id: family(4).submission_id,
+            request_digest: family(4).request_digest,
+            ..shared
+        };
+        for (node_id, families) in [(peer, vec![shared]), (removed, vec![own])] {
+            let mut document = NodeInfoDocument {
+                node_id,
+                executors: Vec::new(),
+                labels: BTreeMap::new(),
+                urls: NodeUrls {
+                    api: None,
+                    s3: None,
+                },
+                utilization: NodeUtilization {
+                    storage_bytes_used: 0,
+                    documents_held: None,
+                    load_permille: None,
+                    heartbeat_at_ms: 1,
+                },
+                updated_at_ms: 1,
+                epoch,
+                compute_draining: false,
+                leaving: false,
+                demand: ComputeDemandSnapshot::default(),
+                reservation: ComputeReservationSnapshot::default(),
+            };
+            document.demand.groups = vec![DemandGroup {
+                group_id,
+                families,
+                truncated: false,
+            }];
+            write_node_info_document(&ctx.storage_handle, &document)
+                .await
+                .unwrap();
+        }
+
+        let (totals, truncated) = group_demand(&ctx, realm_id, local, &group_id)
+            .await
+            .unwrap();
+
+        // The peer republishes the family this node already holds locally.
+        assert_eq!(totals.count, 1);
+        assert_eq!(totals.cpu_cores, 2);
+        assert!(!truncated);
+        assert_eq!(
+            group_demand(&ctx, realm_id, local, &Ulid::from_bytes([9u8; 16]))
+                .await
+                .unwrap()
+                .0
+                .count,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn departure_stops_offers() {
         // Departure revokes future eligibility and reports what it could not
         // resolve, without deleting a reservation or blocking removal.
@@ -1377,6 +1507,64 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn removal_revokes_eligibility() {
+        // A node the realm no longer places learns of its removal through config
+        // sync. It stops offering execution without ending a receipted one.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([13u8; 32]);
+        let local = node(1);
+        let mut config = realm_config(realm_id, &[local]);
+        config.placement_map.push(NodePlacementEntry {
+            node_id: local,
+            location: String::new(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        });
+        write_realm_config(&ctx, &config).await;
+        let subject = aruna_core::structs::storage_subject(&config.placement_map[0], 1);
+        let record = NodeSubjectRecord::seed(subject).expect("subject is valid");
+        write_row(
+            &ctx,
+            NODE_SUBJECT_KEYSPACE,
+            Key::from(NODE_SUBJECT_KEY.to_vec()),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        write_reservation(&ctx, Ulid::from_bytes([7u8; 16]), 2).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        config.placement_map.clear();
+        config.nodes.clear();
+        write_realm_config(&ctx, &config).await;
+        crate::placement_policy::observe_placement(&ctx, realm_id, local, 10)
+            .await
+            .expect("observation completes");
+
+        let stored = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .expect("document");
+        assert!(stored.leaving && stored.compute_draining);
+        assert!(!stored.offers_compute(false));
+        // The receipted execution keeps its reservation and its audit trail.
+        assert_eq!(read_reservations(&ctx).await.unwrap().len(), 1);
+        assert_eq!(stored.reservation.reserved.count, 1);
     }
 
     #[tokio::test]
