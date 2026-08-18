@@ -134,6 +134,13 @@ fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
             heartbeat_at_ms: 5,
         },
         updated_at_ms: 5,
+        epoch: aruna_core::structs::AdvertisementEpoch {
+            membership_generation: 1,
+            publisher_generation: 1,
+            observed_at_ms: 5,
+        },
+        compute_draining: false,
+        leaving: false,
     }
     .to_bytes()
     .expect("node info serializes")

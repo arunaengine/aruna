@@ -4292,7 +4292,14 @@ impl DocumentSyncService {
             // Structural guard for the shared node-info keyspace, mirroring the
             // node-usage guard above so the generic storage write can never
             // persist an unvalidated node info document.
-            validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+            let incoming =
+                validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+            let stored = self
+                .storage_read(target.storage_keyspace().to_string(), target.storage_key())
+                .await?;
+            if !node_info_supersedes(&incoming, stored.as_ref().map(|value| value.as_ref())) {
+                return Ok(());
+            }
         }
         self.storage_write(
             target.storage_keyspace().to_string(),
@@ -4908,6 +4915,7 @@ fn realm_config_from_reducer_materialization(
     let discovery = reducer_state.materialized_realm_config_discovery()?;
     let mut config = RealmConfigDocument {
         realm_id,
+        compute: Default::default(),
         metadata_replication,
         oidc_providers: Vec::new(),
         discovery,
@@ -9308,25 +9316,35 @@ fn validate_watch_subscription_target(
 }
 
 /// Validates the self-consistency of a replicated node-info document against its
-/// sync target: the payload must decode and its embedded `node_id` must match the
-/// target's node. Does not check the publisher's identity (the caller enforces
-/// that against the signed actor).
+/// sync target: the payload must decode within its bounds, advertise only
+/// execution sites of its own node, and match the target's node. Does not check
+/// the publisher's identity (the caller enforces that against the signed actor).
 fn validate_node_info_upsert(
     target: &DocumentSyncTarget,
     bytes: &[u8],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<NodeInfoDocument, String> {
     let DocumentSyncTarget::NodeInfo { node_id, .. } = target else {
         return Err("target is not a node info document".to_string());
     };
     let document = NodeInfoDocument::from_bytes(bytes)
-        .map_err(|error| format!("undecodable node info document: {error}"))?;
+        .map_err(|error| format!("invalid node info document: {error}"))?;
     if document.node_id != *node_id {
         return Err(format!(
             "node info document node id {} does not match target node id {node_id}",
             document.node_id
         ));
     }
-    Ok(())
+    Ok(document)
+}
+
+/// Whether an incoming advertisement replaces the stored one. Undecodable
+/// stored bytes are replaced; an equal or older epoch is not applied, so a
+/// delayed pre-rejoin advertisement cannot shadow the current one.
+fn node_info_supersedes(incoming: &NodeInfoDocument, stored: Option<&[u8]>) -> bool {
+    match stored.and_then(|bytes| NodeInfoDocument::from_bytes(bytes).ok()) {
+        Some(current) => incoming.supersedes(&current),
+        None => true,
+    }
 }
 
 /// Validates a replicated PID mapping against its sync target and change: the
@@ -19178,7 +19196,9 @@ mod tests {
 
     #[test]
     fn validate_node_info_upsert_accepts_owner_and_rejects_forgeries() {
-        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization};
+        use aruna_core::structs::{
+            AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+        };
 
         let node_id = node(7);
         let realm_id = RealmId::from_bytes([2u8; 32]);
@@ -19199,6 +19219,13 @@ mod tests {
                 heartbeat_at_ms: 5,
             },
             updated_at_ms: 5,
+            epoch: AdvertisementEpoch {
+                membership_generation: 1,
+                publisher_generation: 1,
+                observed_at_ms: 5,
+            },
+            compute_draining: false,
+            leaving: false,
         };
         assert!(validate_node_info_upsert(&target, &owned.to_bytes().unwrap()).is_ok());
 
@@ -19218,6 +19245,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn stale_advertisement_is_skipped() {
+        // A delayed advertisement from an older rejoin epoch must not replace
+        // the newer one this node already stored.
+        use aruna_core::structs::{
+            AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+        };
+
+        let document = |membership: u64, publisher: u64| NodeInfoDocument {
+            node_id: node(7),
+            executors: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 1,
+                documents_held: None,
+                load_permille: None,
+                heartbeat_at_ms: 5,
+            },
+            updated_at_ms: 5,
+            epoch: AdvertisementEpoch {
+                membership_generation: membership,
+                publisher_generation: publisher,
+                observed_at_ms: 5,
+            },
+            compute_draining: false,
+            leaving: false,
+        };
+        let current = document(7, 1).to_bytes().expect("document serializes");
+
+        assert!(node_info_supersedes(&document(7, 2), Some(&current)));
+        assert!(!node_info_supersedes(&document(6, 900), Some(&current)));
+        assert!(!node_info_supersedes(&document(7, 1), Some(&current)));
+        assert!(node_info_supersedes(&document(1, 1), None));
+        assert!(node_info_supersedes(&document(1, 1), Some(b"corrupt")));
     }
 
     /// The user every policy fixture publishes under.
@@ -20004,7 +20071,9 @@ mod tests {
     }
 
     fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
-        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization};
+        use aruna_core::structs::{
+            AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+        };
 
         NodeInfoDocument {
             node_id,
@@ -20021,6 +20090,13 @@ mod tests {
                 heartbeat_at_ms: updated_at_ms,
             },
             updated_at_ms,
+            epoch: AdvertisementEpoch {
+                membership_generation: 1,
+                publisher_generation: updated_at_ms,
+                observed_at_ms: updated_at_ms,
+            },
+            compute_draining: false,
+            leaving: false,
         }
         .to_bytes()
         .expect("node info serializes")
