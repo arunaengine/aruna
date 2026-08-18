@@ -24,6 +24,7 @@ pub mod list_parts;
 pub mod list_user_access;
 pub mod listing;
 pub mod policy_bulk;
+pub mod policy_mutation;
 pub mod policy_coverage;
 pub mod policy_successor;
 pub mod put_bucket_replication;
