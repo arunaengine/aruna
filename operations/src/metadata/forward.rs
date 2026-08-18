@@ -933,6 +933,8 @@ pub(crate) async fn apply_forwarded_write(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> MetadataTransportMessage {
+    // Debug poll frames reserve stack for every branch at once, so each awaiting
+    // branch is boxed to keep only the active one on the stack.
     let Some(net_handle) = context.net_handle.as_ref() else {
         return forwarded_unavailable(&message);
     };
@@ -957,32 +959,35 @@ pub(crate) async fn apply_forwarded_write(
         ..
     } = &message
     {
-        let Some(metadata) = context.metadata_handle.as_ref() else {
-            return reject("forwarded metadata read needs a metadata handle");
-        };
-        let result = match metadata
-            .authorize_read_peer(peer, auth_token.clone(), false)
-            .await
-        {
-            Ok(auth)
-                if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
-            {
-                get_visible_metadata_document(
-                    context.as_ref(),
-                    realm_id,
-                    GetVisibleMetadataDocumentRequest {
-                        document_id: *document_id,
-                        auth,
-                    },
-                )
+        return Box::pin(async {
+            let Some(metadata) = context.metadata_handle.as_ref() else {
+                return reject("forwarded metadata read needs a metadata handle");
+            };
+            let result = match metadata
+                .authorize_read_peer(peer, auth_token.clone(), false)
                 .await
-                .map(Box::new)
-                .map_err(read_error)
-            }
-            Ok(_) => Err(MetadataReadError::Unavailable),
-            Err(error) => Err(error),
-        };
-        return MetadataTransportMessage::ForwardedRead { result };
+            {
+                Ok(auth)
+                    if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
+                {
+                    get_visible_metadata_document(
+                        context.as_ref(),
+                        realm_id,
+                        GetVisibleMetadataDocumentRequest {
+                            document_id: *document_id,
+                            auth,
+                        },
+                    )
+                    .await
+                    .map(Box::new)
+                    .map_err(read_error)
+                }
+                Ok(_) => Err(MetadataReadError::Unavailable),
+                Err(error) => Err(error),
+            };
+            MetadataTransportMessage::ForwardedRead { result }
+        })
+        .await;
     }
 
     let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
@@ -999,55 +1004,59 @@ pub(crate) async fn apply_forwarded_write(
             payload,
             ..
         } => {
-            let normalized_document_path =
-                MetadataRegistryRecord::normalize_document_path(&document_path);
-            if normalized_document_path.is_empty() {
-                return reject("forwarded metadata create has an empty document path");
-            }
-            let path = MetadataRegistryRecord::permission_path_for(
-                &realm_id,
-                group_id,
-                &normalized_document_path,
-                document_id,
-            );
-            if let Err(error) = authorize_write(context, auth.clone(), path).await {
-                return forward_auth_error(error);
-            }
-            let create_config = CreateMetadataDocumentConfig {
-                actor: Actor {
-                    node_id: net_handle.node_id(),
-                    user_id: auth.user_id,
-                    realm_id,
-                },
-                group_id,
-                document_id,
-                document_path,
-                public,
-                payload,
-            };
-            match forwarded_create_replay(context, &create_config).await {
-                Ok(Some(response)) => return response,
-                Ok(None) => {}
-                Err(error) => return reject(error),
-            }
-            let operation = CreateMetadataDocumentOperation::new_forwarded(create_config.clone());
-            match create_metadata_document(operation, context.clone()).await {
-                Ok(created) => MetadataTransportMessage::ForwardedRecord {
-                    record: Box::new(created.record),
-                },
-                // Lost the race against a concurrent delivery of the same
-                // forward: the winner's record is the answer, not an error.
-                Err(CreateMetadataDocumentError::DocumentAlreadyExists) => {
-                    match forwarded_create_replay(context, &create_config).await {
-                        Ok(Some(response)) => response,
-                        Ok(None) => reject(format!(
-                            "forwarded metadata create for `{document_id}` raced a delete"
-                        )),
-                        Err(error) => reject(error),
-                    }
+            Box::pin(async {
+                let normalized_document_path =
+                    MetadataRegistryRecord::normalize_document_path(&document_path);
+                if normalized_document_path.is_empty() {
+                    return reject("forwarded metadata create has an empty document path");
                 }
-                Err(error) => reject(format!("forwarded metadata create failed: {error}")),
-            }
+                let path = MetadataRegistryRecord::permission_path_for(
+                    &realm_id,
+                    group_id,
+                    &normalized_document_path,
+                    document_id,
+                );
+                if let Err(error) = authorize_write(context, auth.clone(), path).await {
+                    return forward_auth_error(error);
+                }
+                let create_config = CreateMetadataDocumentConfig {
+                    actor: Actor {
+                        node_id: net_handle.node_id(),
+                        user_id: auth.user_id,
+                        realm_id,
+                    },
+                    group_id,
+                    document_id,
+                    document_path,
+                    public,
+                    payload,
+                };
+                match forwarded_create_replay(context, &create_config).await {
+                    Ok(Some(response)) => return response,
+                    Ok(None) => {}
+                    Err(error) => return reject(error),
+                }
+                let operation =
+                    CreateMetadataDocumentOperation::new_forwarded(create_config.clone());
+                match create_metadata_document(operation, context.clone()).await {
+                    Ok(created) => MetadataTransportMessage::ForwardedRecord {
+                        record: Box::new(created.record),
+                    },
+                    // Lost the race against a concurrent delivery of the same
+                    // forward: the winner's record is the answer, not an error.
+                    Err(CreateMetadataDocumentError::DocumentAlreadyExists) => {
+                        match forwarded_create_replay(context, &create_config).await {
+                            Ok(Some(response)) => response,
+                            Ok(None) => reject(format!(
+                                "forwarded metadata create for `{document_id}` raced a delete"
+                            )),
+                            Err(error) => reject(error),
+                        }
+                    }
+                    Err(error) => reject(format!("forwarded metadata create failed: {error}")),
+                }
+            })
+            .await
         }
         MetadataTransportMessage::ForwardUpdateDocument {
             document_id,
@@ -1055,79 +1064,87 @@ pub(crate) async fn apply_forwarded_write(
             mutation,
             ..
         } => {
-            let record =
-                match held_record(context, &config, net_handle.node_id(), document_id).await {
-                    Ok(record) => record,
-                    Err(HeldRecordError::NotFound) => {
-                        return MetadataTransportMessage::ForwardedWriteNotFound;
-                    }
-                    Err(HeldRecordError::Unavailable(error)) => {
-                        warn!(%document_id, %error, "Forwarded metadata update is unavailable");
-                        return MetadataTransportMessage::ForwardedWriteUnavailable;
-                    }
-                };
-            if let Err(error) =
-                authorize_write(context, auth.clone(), record.permission_path.clone()).await
-            {
-                return forward_auth_error(error);
-            }
-            let operation = UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-                actor: Actor {
-                    node_id: net_handle.node_id(),
-                    user_id: auth.user_id,
-                    realm_id,
-                },
-                group_id: record.group_id,
-                document_id,
-                public: public.unwrap_or(record.public),
-                mutation,
-            });
-            match update_metadata_document(operation, context.as_ref()).await {
-                Ok(record) => MetadataTransportMessage::ForwardedRecord {
-                    record: Box::new(record),
-                },
-                Err(UpdateMetadataDocumentError::RawLimit) => {
-                    MetadataTransportMessage::ForwardedMetadataHistoryCapacity
+            Box::pin(async {
+                let record =
+                    match held_record(context, &config, net_handle.node_id(), document_id).await {
+                        Ok(record) => record,
+                        Err(HeldRecordError::NotFound) => {
+                            return MetadataTransportMessage::ForwardedWriteNotFound;
+                        }
+                        Err(HeldRecordError::Unavailable(error)) => {
+                            warn!(%document_id, %error, "Forwarded metadata update is unavailable");
+                            return MetadataTransportMessage::ForwardedWriteUnavailable;
+                        }
+                    };
+                if let Err(error) =
+                    authorize_write(context, auth.clone(), record.permission_path.clone()).await
+                {
+                    return forward_auth_error(error);
                 }
-                Err(UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(
-                    message,
-                ))) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
-                Err(error) => reject(format!("forwarded metadata update failed: {error}")),
-            }
+                let operation =
+                    UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+                        actor: Actor {
+                            node_id: net_handle.node_id(),
+                            user_id: auth.user_id,
+                            realm_id,
+                        },
+                        group_id: record.group_id,
+                        document_id,
+                        public: public.unwrap_or(record.public),
+                        mutation,
+                    });
+                match update_metadata_document(operation, context.as_ref()).await {
+                    Ok(record) => MetadataTransportMessage::ForwardedRecord {
+                        record: Box::new(record),
+                    },
+                    Err(UpdateMetadataDocumentError::RawLimit) => {
+                        MetadataTransportMessage::ForwardedMetadataHistoryCapacity
+                    }
+                    Err(UpdateMetadataDocumentError::MetadataError(
+                        MetadataError::InvalidInput(message),
+                    )) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
+                    Err(error) => reject(format!("forwarded metadata update failed: {error}")),
+                }
+            })
+            .await
         }
         MetadataTransportMessage::ForwardDeleteDocument { document_id, .. } => {
-            let record =
-                match held_record(context, &config, net_handle.node_id(), document_id).await {
-                    Ok(record) => record,
-                    Err(HeldRecordError::NotFound) => {
-                        return MetadataTransportMessage::ForwardedWriteNotFound;
-                    }
-                    Err(HeldRecordError::Unavailable(error)) => {
-                        warn!(%document_id, %error, "Forwarded metadata delete is unavailable");
-                        return MetadataTransportMessage::ForwardedWriteUnavailable;
-                    }
-                };
-            if pid_authority_node(&config, realm_id, document_id) != Some(net_handle.node_id()) {
-                return MetadataTransportMessage::ForwardedWriteUnavailable;
-            }
-            if let Err(error) =
-                authorize_write(context, auth.clone(), record.permission_path.clone()).await
-            {
-                return forward_auth_error(error);
-            }
-            let operation = DeleteMetadataDocumentOperation::new(
-                Actor {
-                    node_id: net_handle.node_id(),
-                    user_id: auth.user_id,
-                    realm_id,
-                },
-                record.group_id,
-                document_id,
-            );
-            match delete_metadata_document(operation, context.as_ref(), document_id).await {
-                Ok(()) => MetadataTransportMessage::ForwardedDelete,
-                Err(error) => reject(format!("forwarded metadata delete failed: {error}")),
-            }
+            Box::pin(async {
+                let record =
+                    match held_record(context, &config, net_handle.node_id(), document_id).await {
+                        Ok(record) => record,
+                        Err(HeldRecordError::NotFound) => {
+                            return MetadataTransportMessage::ForwardedWriteNotFound;
+                        }
+                        Err(HeldRecordError::Unavailable(error)) => {
+                            warn!(%document_id, %error, "Forwarded metadata delete is unavailable");
+                            return MetadataTransportMessage::ForwardedWriteUnavailable;
+                        }
+                    };
+                if pid_authority_node(&config, realm_id, document_id) != Some(net_handle.node_id())
+                {
+                    return MetadataTransportMessage::ForwardedWriteUnavailable;
+                }
+                if let Err(error) =
+                    authorize_write(context, auth.clone(), record.permission_path.clone()).await
+                {
+                    return forward_auth_error(error);
+                }
+                let operation = DeleteMetadataDocumentOperation::new(
+                    Actor {
+                        node_id: net_handle.node_id(),
+                        user_id: auth.user_id,
+                        realm_id,
+                    },
+                    record.group_id,
+                    document_id,
+                );
+                match delete_metadata_document(operation, context.as_ref(), document_id).await {
+                    Ok(()) => MetadataTransportMessage::ForwardedDelete,
+                    Err(error) => reject(format!("forwarded metadata delete failed: {error}")),
+                }
+            })
+            .await
         }
         other => reject(format!(
             "unexpected forwarded metadata message: {}",
