@@ -168,7 +168,7 @@ async fn bridges_local_row() {
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;
     let mut row = aruna_core::structs::JobRecord::new(
         family.job_id,
-        aruna_core::structs::JobPayload::Execution(execution_payload()),
+        aruna_core::structs::JobPayload::Execution(super::fixture::payload()),
         super::fixture::user(),
         family.holder.public(),
         1_000,
@@ -293,25 +293,4 @@ async fn retains_conflict_row() {
         panic!("the stored record is a claim");
     };
     assert_eq!(kept.accepted_at_ms, claim.accepted_at_ms);
-}
-
-fn execution_payload() -> aruna_core::structs::ExecutionSpec {
-    aruna_core::structs::ExecutionSpec {
-        group_id: ulid::Ulid::from_bytes([2u8; 16]),
-        name: None,
-        description: None,
-        tags: Default::default(),
-        image: "alpine:3".to_string(),
-        entrypoint: None,
-        command: Vec::new(),
-        workdir: None,
-        env: Default::default(),
-        resources: Default::default(),
-        executor_constraint: None,
-        inputs: Vec::new(),
-        file_outputs: Vec::new(),
-        workspace_outputs: Vec::new(),
-        output_prefixes: Vec::new(),
-        collision_policy: Default::default(),
-    }
 }

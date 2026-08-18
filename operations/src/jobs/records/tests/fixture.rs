@@ -299,7 +299,7 @@ pub fn user() -> UserId {
     UserId::new(Ulid::from_bytes([8u8; 16]), REALM)
 }
 
-fn payload() -> ExecutionSpec {
+pub fn payload() -> ExecutionSpec {
     ExecutionSpec {
         group_id: Ulid::from_bytes([2u8; 16]),
         name: None,
