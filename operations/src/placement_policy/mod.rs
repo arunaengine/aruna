@@ -22,6 +22,8 @@ pub use create::{CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation};
 pub use diagnostics::{
     CacheCoverage, CopyViolation, DiagnosticsInput, DiagnosticsReport, PolicyDiagnosticsOperation,
 };
+pub(crate) use forward::apply_forwarded_policy;
+pub use forward::create_policy_routed;
 pub use gate::{
     GateContext, GatedBucket, PolicyGateConfig, PolicyGateError, PolicyGateOperation,
     PolicyGateOutcome, gate_decision, union_refs, write_gate,
@@ -35,8 +37,6 @@ pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
     sync_subject,
 };
-pub use forward::create_policy_routed;
-pub(crate) use forward::apply_forwarded_policy;
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 
 /// What production wiring establishes before a governed write is possible: an

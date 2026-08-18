@@ -397,9 +397,9 @@ impl SuccessorMint {
         }
         self.state = MintState::ScanCopies;
         Ok(Some(smallvec![scan_effect(
-            Some(version_scope(&self.plan.version_key(
-                self.plan.expected_head.version_id
-            ))?),
+            Some(version_scope(
+                &self.plan.version_key(self.plan.expected_head.version_id)
+            )?),
             None,
             COPY_PAGE_LIMIT,
             txn_id,
@@ -438,7 +438,14 @@ impl SuccessorMint {
         let version = self.plan.version_key(self.plan.expected_head.version_id);
         let refs = predecessor.placement_policies.clone();
         let reusable = page.entries.into_iter().find_map(|(key, record)| {
-            reusable_copy(&key, &record, &version, self.plan.subject.node_id, hash, &refs)
+            reusable_copy(
+                &key,
+                &record,
+                &version,
+                self.plan.subject.node_id,
+                hash,
+                &refs,
+            )
         });
         match reusable {
             Some(location) => self.write_records(txn_id, Some(location)),
@@ -1116,12 +1123,20 @@ mod tests {
             .expect("head matches");
         mint.step(read(Some(bucket().to_bytes().unwrap())), None)
             .expect("bucket matches");
-        mint.step(read(Some(materialized(Vec::new()).to_bytes().unwrap())), None)
-            .expect("version decodes");
+        mint.step(
+            read(Some(materialized(Vec::new()).to_bytes().unwrap())),
+            None,
+        )
+        .expect("version decodes");
 
         assert_eq!(
-            mint.step(read(Some(materialized(Vec::new()).to_bytes().unwrap())), None),
-            Err(SuccessorError::VersionCollision(Ulid::from_bytes([9u8; 16])))
+            mint.step(
+                read(Some(materialized(Vec::new()).to_bytes().unwrap())),
+                None
+            ),
+            Err(SuccessorError::VersionCollision(Ulid::from_bytes(
+                [9u8; 16]
+            )))
         );
     }
 
@@ -1228,14 +1243,20 @@ mod tests {
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
 
-        assert_eq!(mint.step(copies(Vec::new()), None).expect("scan decides"), None);
+        assert_eq!(
+            mint.step(copies(Vec::new()), None).expect("scan decides"),
+            None
+        );
         assert_eq!(
             mint.outcome(),
             Some(&SuccessorOutcome::Blocked(
                 PolicyBlockedReason::SourceUnavailable
             ))
         );
-        assert!(!mint.wrote(), "a blocked mutation without a run writes nothing");
+        assert!(
+            !mint.wrote(),
+            "a blocked mutation without a run writes nothing"
+        );
     }
 
     #[test]

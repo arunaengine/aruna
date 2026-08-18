@@ -550,11 +550,9 @@ impl PolicyBulkOperation {
         let Some(candidate) = self.candidates.get(self.index) else {
             return self.after_page();
         };
-        let (Some(intent), Some(run), Some(group_id)) = (
-            candidate.intent.clone(),
-            self.run.as_ref(),
-            self.group_id,
-        ) else {
+        let (Some(intent), Some(run), Some(group_id)) =
+            (candidate.intent.clone(), self.run.as_ref(), self.group_id)
+        else {
             return self.fail(BulkError::InvalidEvent);
         };
         let plan = SuccessorPlan {
@@ -1099,7 +1097,11 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    async fn set_default(context: &DriverContext, fixture: &Fixture, refs: Vec<PlacementPolicyRef>) {
+    async fn set_default(
+        context: &DriverContext,
+        fixture: &Fixture,
+        refs: Vec<PlacementPolicyRef>,
+    ) {
         drive(
             PutBucketPlacementOperation::new(PutBucketPlacementInput {
                 bucket: BUCKET.to_string(),
@@ -1524,7 +1526,8 @@ mod tests {
             ),
         );
 
-        let minted = first.expect("first pass runs").minted + second.expect("second pass runs").minted;
+        let minted =
+            first.expect("first pass runs").minted + second.expect("second pass runs").minted;
         assert!(minted <= 1, "at most one successor may be minted");
         assert_eq!(count_versions(&context, OBJECT).await, 1 + minted);
         let head = read_head(&context, OBJECT).await;

@@ -246,7 +246,8 @@ impl Operation for PolicyMutationOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PolicyMutationError::InvalidEvent))
+        self.output
+            .unwrap_or(Err(PolicyMutationError::InvalidEvent))
     }
 
     fn abort(&mut self) -> Effects {
@@ -334,7 +335,11 @@ mod tests {
                 Ulid::from_bytes([7u8; 16]),
                 4,
             ),
-            bucket_identity: (Ulid::from_bytes([2u8; 16]), UNIX_EPOCH, UserId::nil(realm_id())),
+            bucket_identity: (
+                Ulid::from_bytes([2u8; 16]),
+                UNIX_EPOCH,
+                UserId::nil(realm_id()),
+            ),
             target_refs: policies.iter().map(VerifiedPolicy::policy_ref).collect(),
             subject: PlacementSubject {
                 node_id: node_id(),

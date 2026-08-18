@@ -95,8 +95,10 @@ impl PolicySetResolver {
         match resolver.finalize() {
             Ok(resolved) => {
                 self.stats.merge(resolved.stats);
-                self.resolved
-                    .insert(policy_ref.policy_id, PolicyResolution::Known(resolved.policy));
+                self.resolved.insert(
+                    policy_ref.policy_id,
+                    PolicyResolution::Known(resolved.policy),
+                );
                 self.next_ref()
             }
             Err(error) => match self.mode {

@@ -494,7 +494,10 @@ mod tests {
         assert_eq!(
             written.placement_policies,
             PlacementPolicyRef::canonical_set(
-                &policies.iter().map(VerifiedPolicy::policy_ref).collect::<Vec<_>>()
+                &policies
+                    .iter()
+                    .map(VerifiedPolicy::policy_ref)
+                    .collect::<Vec<_>>()
             )
             .expect("refs are canonical")
         );
