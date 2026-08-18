@@ -3308,6 +3308,8 @@ mod tests {
             },
             compute_draining: false,
             leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         };
         state
             .get_ctx()

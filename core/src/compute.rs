@@ -66,6 +66,8 @@ pub enum AdvertisementError {
     #[error("advertised url exceeds its bound")]
     InvalidUrl,
     #[error(transparent)]
+    Snapshot(#[from] crate::compute_quota::SnapshotError),
+    #[error(transparent)]
     Subject(#[from] PlacementPolicyError),
 }
 

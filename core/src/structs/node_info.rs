@@ -1,5 +1,6 @@
 use crate::NodeId;
 use crate::compute::{AdvertisementError, ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
+use crate::compute_quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::errors::ConversionError;
 use crate::structs::{MAX_LABEL_KEY_LEN, MAX_LABEL_VALUE_LEN};
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,12 @@ impl AdvertisementEpoch {
     fn order(&self) -> (u64, u64) {
         (self.membership_generation, self.publisher_generation)
     }
+
+    /// Membership generation first, so a wiped node that rejoins publishes a
+    /// superseding epoch even though its own counter restarted at one.
+    pub fn supersedes(&self, other: &Self) -> bool {
+        self.order() > other.order()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -64,6 +71,11 @@ pub struct NodeInfoDocument {
     pub compute_draining: bool,
     /// Graceful departure announced; the node is leaving the realm.
     pub leaving: bool,
+    /// Logical admission demand this node observes, for the group quota view.
+    pub demand: ComputeDemandSnapshot,
+    /// Exact local physical reservations. It ranks targets and is never added
+    /// to logical demand: the two controls count different things.
+    pub reservation: ComputeReservationSnapshot,
 }
 
 impl NodeInfoDocument {
@@ -83,13 +95,26 @@ impl NodeInfoDocument {
             }
         }
         validate_labels(&self.labels)?;
+        self.demand.validate()?;
+        if self.demand.epoch.supersedes(&self.epoch)
+            || self.reservation.epoch.supersedes(&self.epoch)
+        {
+            return Err(SnapshotError::EpochAhead.into());
+        }
         self.urls.validate()
     }
 
     /// Whether this advertisement replaces `stored`. Equal epochs do not
     /// supersede, so a replayed advertisement never rewrites observed facts.
     pub fn supersedes(&self, stored: &Self) -> bool {
-        self.node_id == stored.node_id && self.epoch.order() > stored.epoch.order()
+        self.node_id == stored.node_id && self.epoch.supersedes(&stored.epoch)
+    }
+
+    /// Whether this advertisement may still receive new execution offers.
+    /// Removal from membership revokes future eligibility only: the document,
+    /// its executors, and any receipted execution stay untouched.
+    pub fn offers_compute(&self, is_member: bool) -> bool {
+        is_member && !self.leaving && !self.compute_draining
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -186,6 +211,14 @@ mod tests {
             epoch,
             compute_draining: false,
             leaving: false,
+            demand: ComputeDemandSnapshot {
+                epoch,
+                ..Default::default()
+            },
+            reservation: ComputeReservationSnapshot {
+                epoch,
+                ..Default::default()
+            },
         }
     }
 
@@ -232,6 +265,68 @@ mod tests {
         let duplicate = document.executors[0].clone();
         document.executors.push(duplicate);
         assert!(document.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_snapshot_ahead() {
+        // A snapshot may not claim a newer epoch than the advertisement that
+        // carries it, otherwise it would outlive its own supersession order.
+        let mut document = document(node(1), epoch(4, 9));
+        document.demand.epoch = epoch(5, 1);
+        assert_eq!(
+            document.validate(),
+            Err(AdvertisementError::Snapshot(SnapshotError::EpochAhead))
+        );
+
+        let mut document = document(node(1), epoch(4, 9));
+        document.reservation.epoch = epoch(4, 10);
+        assert!(document.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_demand() {
+        use crate::compute_quota::{DemandFamily, DemandGroup};
+        use crate::structs::{EffectiveResources, SubmissionId};
+
+        let mut document = document(node(1), epoch(1, 1));
+        document.demand.groups = vec![DemandGroup {
+            group_id: ulid::Ulid::from_bytes([1; 16]),
+            families: (0..2)
+                .map(|seed| DemandFamily {
+                    submission_id: SubmissionId([1; 32]),
+                    request_digest: [seed; 32],
+                    resources: EffectiveResources {
+                        cpu_cores: 1,
+                        ram_bytes: 0,
+                        disk_bytes: 0,
+                        max_walltime_ms: 1,
+                        preemptible: false,
+                    },
+                })
+                .rev()
+                .collect(),
+            truncated: false,
+        }];
+        assert!(document.validate().is_err());
+        assert!(NodeInfoDocument::from_bytes(&postcard::to_allocvec(&document).unwrap()).is_err());
+    }
+
+    #[test]
+    fn removal_revokes_offers() {
+        // Removal from membership stops new offers without erasing anything the
+        // node advertised or claiming its executions ended.
+        let document = document(node(1), epoch(1, 1));
+        assert!(document.offers_compute(true));
+        assert!(!document.offers_compute(false));
+        assert_eq!(document.executors.len(), 1);
+
+        let mut leaving = document.clone();
+        leaving.leaving = true;
+        assert!(!leaving.offers_compute(true));
+
+        let mut drained = document.clone();
+        drained.compute_draining = true;
+        assert!(!drained.offers_compute(true));
     }
 
     #[test]

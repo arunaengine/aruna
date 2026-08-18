@@ -141,6 +141,8 @@ fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
         },
         compute_draining: false,
         leaving: false,
+        demand: Default::default(),
+        reservation: Default::default(),
     }
     .to_bytes()
     .expect("node info serializes")

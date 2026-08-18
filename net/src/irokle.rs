@@ -19237,6 +19237,8 @@ mod tests {
             },
             compute_draining: false,
             leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         };
         assert!(validate_node_info_upsert(&target, &owned.to_bytes().unwrap()).is_ok());
 
@@ -19288,6 +19290,8 @@ mod tests {
             },
             compute_draining: false,
             leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         };
         let current = document(7, 1).to_bytes().expect("document serializes");
 
@@ -20108,6 +20112,8 @@ mod tests {
             },
             compute_draining: false,
             leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         }
         .to_bytes()
         .expect("node info serializes")
