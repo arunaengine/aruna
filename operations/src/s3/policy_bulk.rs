@@ -105,6 +105,9 @@ enum BulkState {
     ResolveUnion,
     ReadIntents,
     Mint,
+    /// The finished mint left a cleanup effect whose event must be consumed
+    /// before the next object opens its own transaction.
+    Settle,
     StartStatus,
     ReadStatus,
     WriteStatus,
@@ -139,6 +142,8 @@ pub struct PolicyBulkOperation {
     candidates: Vec<Candidate>,
     index: usize,
     mint: Option<MintPolicySuccessorOperation>,
+    /// Outcome of a mint that is still cleaning up.
+    settled: Option<Result<SuccessorOutcome, SuccessorError>>,
     /// The status the closing transaction writes once the pass has finished.
     pending_status: Option<PolicyBulkStatus>,
     report: BulkReport,
@@ -171,6 +176,7 @@ impl PolicyBulkOperation {
             candidates: Vec::new(),
             index: 0,
             mint: None,
+            settled: None,
             pending_status: None,
             report,
             output: None,
@@ -734,7 +740,10 @@ impl Operation for PolicyBulkOperation {
     fn step(&mut self, event: Event) -> Effects {
         // The mint and the resolver classify their own storage failures.
         let event = match (self.state, event) {
-            (BulkState::Mint | BulkState::Resolve | BulkState::ResolveUnion, event) => event,
+            (
+                BulkState::Mint | BulkState::Settle | BulkState::Resolve | BulkState::ResolveUnion,
+                event,
+            ) => event,
             (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
             (_, event) => event,
         };
@@ -815,11 +824,20 @@ impl Operation for PolicyBulkOperation {
                 let Some(mint) = self.mint.take() else {
                     return self.fail(BulkError::InvalidEvent);
                 };
-                let mut settled = effects;
                 let outcome = mint.finalize();
-                settled.extend(self.record_outcome(outcome));
-                settled
+                if effects.is_empty() {
+                    return self.record_outcome(outcome);
+                }
+                self.settled = Some(outcome);
+                self.state = BulkState::Settle;
+                effects
             }
+            // The cleanup event belongs to the finished mint, so it decides
+            // nothing here.
+            BulkState::Settle => match self.settled.take() {
+                Some(outcome) => self.record_outcome(outcome),
+                None => self.fail(BulkError::InvalidEvent),
+            },
             BulkState::StartStatus => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self.fail(BulkError::InvalidEvent);
@@ -1452,6 +1470,83 @@ mod tests {
             intent.successor_version_id
         );
         assert_eq!(count_versions(&context, OBJECT).await, 2);
+    }
+
+    async fn write_intent(context: &DriverContext, intent: &PolicyBulkIntent) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: POLICY_BULK_INTENT_KEYSPACE.to_string(),
+                key: intent.key().to_bytes().expect("key encodes").into(),
+                value: intent.to_bytes().expect("intent encodes").into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    async fn write_version(
+        context: &DriverContext,
+        key: &str,
+        version_id: Ulid,
+        version: &BlobVersion,
+    ) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new(BUCKET, key, version_id)
+                    .to_bytes()
+                    .expect("key encodes")
+                    .into(),
+                value: version.to_bytes().expect("version encodes").into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn conflict_keeps_page() {
+        // A collision on the first object must neither overwrite it nor abandon
+        // the rest of the page.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let first = put_object(&context, &fixture, "a.txt").await;
+        put_object(&context, &fixture, "b.txt").await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let operation_id = Ulid::generate();
+        let taken = Ulid::generate();
+        write_intent(
+            &context,
+            &PolicyBulkIntent {
+                operation_id,
+                key: "a.txt".to_string(),
+                observed_head: read_head(&context, "a.txt").await,
+                successor_version_id: taken,
+                outcome: PolicyIntentOutcome::Planned,
+            },
+        )
+        .await;
+        let stored = read_version(&context, "a.txt", first).await;
+        write_version(&context, "a.txt", taken, &stored).await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(report.replanned, 1);
+        assert_eq!(report.minted, 1);
+        assert_eq!(read_head(&context, "a.txt").await.version_id, first);
+        let head = read_head(&context, "b.txt").await;
+        assert_eq!(
+            read_version(&context, "b.txt", head.version_id)
+                .await
+                .placement_policies,
+            vec![policy.policy_ref()]
+        );
     }
 
     #[tokio::test]
