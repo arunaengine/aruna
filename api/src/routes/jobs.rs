@@ -1623,6 +1623,154 @@ mod tests {
     use tempfile::TempDir;
     use ulid::Ulid;
 
+    /// One reduced family with a duplicate success and a locally exhausted view.
+    fn family_report_fixture() -> FamilyReport {
+        use aruna_core::jobs::{JobKind, JobStatusView};
+        use aruna_core::structs::{
+            EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec,
+            LogicalJobState, OutputObject, PlacementRef, SubmissionId,
+        };
+
+        let created_by = user(2);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let submission_id = SubmissionId([5u8; 32]);
+        let resources = EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 1,
+            disk_bytes: 0,
+            max_walltime_ms: 1_000,
+            preemptible: false,
+        };
+        let payload = ExecutionSpec {
+            group_id: Ulid::from_bytes([6u8; 16]),
+            name: None,
+            description: None,
+            tags: BTreeMap::new(),
+            image: "img".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            workdir: None,
+            env: BTreeMap::new(),
+            resources: aruna_core::structs::ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+        FamilyReport {
+            job: JobStatusView {
+                job_id,
+                created_by,
+                kind: JobKind::Execution,
+                state: JobState::Indeterminate,
+                attempts: 2,
+                cancel_requested: false,
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                finished_at_ms: None,
+                progress: JobProgress::new("phases"),
+                last_error: None,
+                result: None,
+                workspace_bucket: None,
+                workspace_mode: WorkspaceMode::Kept,
+            },
+            spec: LogicalJobSpec {
+                submission_id,
+                job_id,
+                origin_node_id: node_id(),
+                realm_id: realm(),
+                group_id: payload.group_id,
+                created_by,
+                created_at_ms: 10,
+                payload,
+                request_digest: [7u8; 32],
+                spec_digest: [8u8; 32],
+                resources,
+                retry: JobRetryPolicy {
+                    max_launches_per_witness: 3,
+                },
+                admission: JobAdmissionRecord {
+                    submission_id,
+                    request_digest: [7u8; 32],
+                    job_id,
+                    group_id: Ulid::from_bytes([6u8; 16]),
+                    admitting_node_id: node_id(),
+                    membership_generation: 0,
+                    resources,
+                    admitted_at_ms: 10,
+                },
+                placement: PlacementRef::NIL,
+            },
+            submission_id,
+            request_digest: [7u8; 32],
+            canonical_job_id: job_id,
+            aliases: vec![job_id, JobId::from_bytes([4u8; 16])],
+            conflicts: 1,
+            state: LogicalJobState::Indeterminate,
+            canonical_execution_id: None,
+            executions: 2,
+            duplicate_successes: 1,
+            outputs: vec![OutputObject {
+                bucket: "dest".to_string(),
+                key: "out/r.txt".to_string(),
+                version_id: Ulid::from_bytes([9u8; 16]),
+                execution_id: Ulid::from_bytes([10u8; 16]),
+                container_path: "/out/r.txt".to_string(),
+                size: 3,
+                digest: None,
+            }],
+            revision: 4,
+            digest: [11u8; 32],
+            cancel_requested: false,
+            responder: Some(node_id()),
+            partial: true,
+            locally_exhausted: true,
+            plan: None,
+        }
+    }
+
+    #[test]
+    fn partitioned_view_is_marked() {
+        // A partitioned read must name its responder and say that it is local
+        // and exhausted here, without ever reading as a converged failure.
+        let response = family_response(&family_report_fixture());
+
+        assert_eq!(response.logical_state, "indeterminate");
+        assert!(response.locally_exhausted);
+        assert!(response.partial);
+        assert!(response.eventually_consistent);
+        assert_eq!(
+            response.responder_node_id.as_deref(),
+            Some(&*node_id().to_string())
+        );
+        assert_eq!(response.alias_count, 2);
+        assert_eq!(response.conflict_count, 1);
+        assert_eq!(response.duplicate_successes, 1);
+        assert_eq!(response.revision, 4);
+        assert_eq!(response.projection_digest.len(), 64);
+        assert!(response.canonical_execution_id.is_none());
+    }
+
+    #[test]
+    fn outputs_keep_exact_versions() {
+        // The exact VersionId and its producing execution are the identity of a
+        // job output; the object's current version is a different question.
+        let response = family_response(&family_report_fixture());
+
+        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(
+            response.outputs[0].version_id,
+            Ulid::from_bytes([9u8; 16]).to_string()
+        );
+        assert_eq!(
+            response.outputs[0].execution_id,
+            Ulid::from_bytes([10u8; 16]).to_string()
+        );
+        assert_eq!(response.outputs[0].bucket, "dest");
+    }
+
     fn realm() -> RealmId {
         RealmId([1u8; 32])
     }
