@@ -21,6 +21,7 @@ pub mod notifications;
 pub mod oai;
 pub mod onboarding;
 pub mod pid;
+pub mod placement;
 pub mod policies;
 pub mod rocrate_import;
 pub mod search;
@@ -53,6 +54,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(metadata::router())
         .merge(oai::router())
         .merge(pid::router())
+        .merge(placement::router())
         .merge(rocrate_import::router())
         .merge(notifications::router())
         .merge(policies::router())
@@ -127,10 +129,14 @@ mod tests {
         ("DELETE", "/pid/{document_id}"),
         ("DELETE", "/users/credentials/{access_key_id}"),
         ("GET", "/admin/onboarding/secrets"),
+        ("GET", "/admin/placement-diagnostics"),
+        ("GET", "/admin/placement-policies/{policy_id}"),
         ("GET", "/admin/sync-quarantine"),
         ("GET", "/admin/sync-quarantine/{record_id}"),
         ("GET", "/audit"),
         ("GET", "/blobs/locations"),
+        ("GET", "/buckets/{bucket}/placement"),
+        ("GET", "/buckets/{bucket}/placement/coverage"),
         ("GET", "/buckets/{bucket}/storage-routing"),
         ("GET", "/data/sync-relationships"),
         ("GET", "/data/sync-relationships/{id}"),
@@ -200,8 +206,11 @@ mod tests {
         ("PATCH", "/users/info"),
         ("PATCH", "/users/{id}"),
         ("POST", "/admin/onboarding/secrets"),
+        ("POST", "/admin/placement-policies"),
         ("POST", "/admin/sync-quarantine/{record_id}/acknowledge"),
         ("POST", "/blobs/replicate"),
+        ("POST", "/buckets/{bucket}/placement/objects"),
+        ("POST", "/buckets/{bucket}/placement/runs"),
         ("POST", "/data/sync-relationships"),
         ("POST", "/data/sync-relationships/{id}/run"),
         ("POST", "/ga4gh/drs/v1/objects"),
@@ -246,6 +255,7 @@ mod tests {
         ("POST", "/users/register"),
         ("POST", "/users/resolve"),
         ("POST", "/users/tokens/revoke"),
+        ("PUT", "/buckets/{bucket}/placement"),
         ("PUT", "/buckets/{bucket}/storage-routing"),
         ("PUT", "/groups/{group_id}/connectors/{connector_id}"),
         ("PUT", "/groups/{group_id}/storage-backends/{backend_id}"),
