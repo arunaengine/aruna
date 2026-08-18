@@ -12,9 +12,10 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
     InputMode, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
-    OutputDestination, OutputObject, OutputSelection, PathRestriction, Permission, UserAccess,
-    WorkspaceMode, blob_bucket_permission_path, blob_group_permission_path,
-    blob_object_permission_path, ensure_confined_relative_path, workspace_credential_id,
+    OutputDestination, OutputObject, OutputSelection, PathRestriction, Permission,
+    PlacementPolicyRef, UserAccess, WorkspaceMode, blob_bucket_permission_path,
+    blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
+    workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -23,7 +24,10 @@ use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
+use crate::driver::{
+    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
+    routing_snapshot,
+};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::store::reserve_output_commits;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
@@ -512,6 +516,10 @@ pub async fn capture_outputs(
             )
         })
         .collect();
+    // Plan section 10: an output inherits the union of its inputs' refs and the
+    // destination default, so a result can never be less constrained than what
+    // produced it.
+    let inherited = Box::pin(staged_input_policies(context, spec, record)).await?;
     let mut outputs = Vec::with_capacity(selections.len());
     for (selection, (bucket, key)) in selections.iter().zip(&destinations) {
         let Some(version_id) = reserved.get(&(bucket.as_str(), key.as_str())).copied() else {
@@ -528,11 +536,54 @@ pub async fn capture_outputs(
                 selection,
                 version_id,
                 control.execution_id,
+                &inherited,
             ))
             .await?,
         );
     }
     Ok(outputs)
+}
+
+/// Union of the refs every staged input carries. Read from the workspace copies
+/// themselves, so a restarted capture inherits exactly what staging sealed.
+async fn staged_input_policies(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+) -> Result<Vec<PlacementPolicyRef>, JobError> {
+    let bucket = super::job_bucket(record);
+    if bucket.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut refs = Vec::new();
+    for input in &spec.inputs {
+        let head = Box::pin(drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: input.dest_key.clone(),
+                version_id: None,
+            }),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose());
+        match head {
+            Ok(Some(result)) => refs.extend(result.source_policies),
+            Ok(None)
+            | Err(
+                HeadObjectError::NoSuchKey
+                | HeadObjectError::NoSuchVersion
+                | HeadObjectError::DeleteMarker,
+            ) => {}
+            Err(error) => {
+                return Err(JobError::retryable(format!(
+                    "input policy lookup failed: {error}"
+                )));
+            }
+        }
+    }
+    PlacementPolicyRef::canonical_set(&refs)
+        .map_err(|error| JobError::permanent(format!("input policy refs invalid: {error}")))
 }
 
 fn destination_of(selection: &OutputSelection) -> (String, String) {
@@ -618,6 +669,7 @@ async fn put_file_output(
     output: &OutputSelection,
     version_id: Ulid,
     execution_id: Ulid,
+    inherited: &[PlacementPolicyRef],
 ) -> Result<OutputObject, JobError> {
     let OutputDestination::S3 { bucket, key } = &output.destination;
     let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
@@ -682,39 +734,44 @@ async fn put_file_output(
     let routing = routing_snapshot(context, spec.group_id, bucket)
         .await
         .map_err(|error| routing_error("output write", error))?;
-    let result = Box::pin(drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: record.created_by,
-            group_id: spec.group_id,
-            realm_id: record.created_by.realm_id,
-            node_id,
-            request: PutObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                content_length: Some(size),
-                body: Some(body),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: Some(version_id),
-            quota_ceiling,
-            routing,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    // A failure caused by the container-side stream keeps its own
-    // retryable/permanent classification instead of the put's.
-    .map_err(
-        |error| match stream_error.lock().ok().and_then(|mut e| e.take()) {
-            Some(backend_error) => output_read_error(&backend_error),
-            None => put_object_error("output write", error),
+    let gate = gate_context(context, record.created_by.realm_id, now_ms())
+        .await
+        .map_err(|error| gate_error("output write", error))?;
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: record.created_by,
+        group_id: spec.group_id,
+        realm_id: record.created_by.realm_id,
+        node_id,
+        request: PutObjectInput {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            content_length: Some(size),
+            body: Some(body),
         },
-    )?
-    .ok_or_else(|| JobError::retryable("output write returned no version"))?;
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: Some(version_id),
+        quota_ceiling,
+        routing,
+    })
+    .with_inherited_policies(inherited.to_vec());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let result = Box::pin(drive(operation, context))
+        .await
+        .and_then(|result| result.transpose())
+        // A failure caused by the container-side stream keeps its own
+        // retryable/permanent classification instead of the put's.
+        .map_err(
+            |error| match stream_error.lock().ok().and_then(|mut e| e.take()) {
+                Some(backend_error) => output_read_error(&backend_error),
+                None => put_object_error("output write", error),
+            },
+        )?
+        .ok_or_else(|| JobError::retryable("output write returned no version"))?;
     Ok(output_object(output, bucket, key, &result, execution_id))
 }
 
@@ -873,31 +930,38 @@ async fn stage_one_input(
     let routing = routing_snapshot(context, spec.group_id, bucket)
         .await
         .map_err(|error| routing_error("input stage", error))?;
-    Box::pin(drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: record.created_by,
-            group_id: spec.group_id,
-            realm_id: record.created_by.realm_id,
-            node_id,
-            request: PutObjectInput {
-                bucket: bucket.to_string(),
-                key: input.dest_key.clone(),
-                content_length,
-                body: Some(get.blob),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: None,
-            quota_ceiling,
-            routing,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| put_object_error("input stage", error))?;
+    let gate = gate_context(context, record.created_by.realm_id, now_ms())
+        .await
+        .map_err(|error| gate_error("input stage", error))?;
+    // The staged copy carries the source version's refs: staging can only
+    // tighten what the workspace bucket already requires.
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: record.created_by,
+        group_id: spec.group_id,
+        realm_id: record.created_by.realm_id,
+        node_id,
+        request: PutObjectInput {
+            bucket: bucket.to_string(),
+            key: input.dest_key.clone(),
+            content_length,
+            body: Some(get.blob),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling,
+        routing,
+    })
+    .with_inherited_policies(get.source_policies.clone());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    Box::pin(drive(operation, context))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| put_object_error("input stage", error))?;
     Ok(())
 }
 
@@ -956,6 +1020,12 @@ fn put_object_error(scope: &str, error: PutObjectError) -> JobError {
     } else {
         JobError::permanent(message)
     }
+}
+
+/// A node mid-transition admits nothing governed. That ends on its own, so the
+/// attempt parks and retries instead of failing the job.
+fn gate_error(scope: &str, error: GateContextError) -> JobError {
+    JobError::retryable(format!("{scope} destination unavailable: {error}"))
 }
 
 fn routing_error(scope: &str, error: RoutingInputsError) -> JobError {

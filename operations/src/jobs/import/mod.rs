@@ -63,7 +63,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
-use crate::driver::{bucket_snapshot, drive};
+use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
@@ -851,36 +851,42 @@ async fn write_next(
             Some(_) => ImportFailure::Retryable(error.to_string()),
             None => ImportFailure::Permanent(error.to_string()),
         })?;
-    let result = drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: spec.auth_context.user_id,
-            group_id: bucket_info.group_id,
-            realm_id: spec.auth_context.realm_id,
-            node_id: ctx.owner_node_id,
-            request: PutObjectInput {
-                bucket: spec.target.bucket.clone(),
-                key: entry.target_key.clone(),
-                content_length: Some(entry.uncompressed_size),
-                body: Some(body),
-            },
-            expected_checksums: vec![ExpectedChecksum {
-                algorithm: ChecksumAlgorithm::Crc32,
-                digest: entry.crc32.to_be_bytes().to_vec(),
-            }],
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: Some(entry.version_id),
-            quota_ceiling: quota,
-            routing,
-        })
-        .with_bucket_guard(bucket_info)
-        .with_rocrate_limits(spec.limits.clone())
-        .with_restrictions(spec.auth_context.path_restrictions.clone()),
-        &ctx.driver,
-    )
-    .await
-    .and_then(|result| result.transpose());
+    // The archive entry is external, so it carries no refs of its own: only
+    // the destination default governs the imported object.
+    let gate = gate_context(&ctx.driver, spec.auth_context.realm_id, now_ms())
+        .await
+        .map_err(classify_gate)?;
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: spec.auth_context.user_id,
+        group_id: bucket_info.group_id,
+        realm_id: spec.auth_context.realm_id,
+        node_id: ctx.owner_node_id,
+        request: PutObjectInput {
+            bucket: spec.target.bucket.clone(),
+            key: entry.target_key.clone(),
+            content_length: Some(entry.uncompressed_size),
+            body: Some(body),
+        },
+        expected_checksums: vec![ExpectedChecksum {
+            algorithm: ChecksumAlgorithm::Crc32,
+            digest: entry.crc32.to_be_bytes().to_vec(),
+        }],
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: Some(entry.version_id),
+        quota_ceiling: quota,
+        routing,
+    })
+    .with_bucket_guard(bucket_info)
+    .with_rocrate_limits(spec.limits.clone())
+    .with_restrictions(spec.auth_context.path_restrictions.clone());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let result = drive(operation, &ctx.driver)
+        .await
+        .and_then(|result| result.transpose());
     let result = match result {
         Ok(result) => result,
         Err(_) if ctx.cancel.is_cancelled() => return Err(ImportFailure::Cancelled),
@@ -2100,4 +2106,10 @@ mod tests {
             Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty()
         ));
     }
+}
+
+/// A node that cannot build a destination gate is retryable: the transition it
+/// is in ends on its own, and the import resumes from its checkpoint.
+fn classify_gate(error: GateContextError) -> ImportFailure {
+    ImportFailure::Retryable(error.to_string())
 }

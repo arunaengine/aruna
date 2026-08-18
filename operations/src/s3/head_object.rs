@@ -97,6 +97,9 @@ pub struct HeadObjectResult {
     pub checksum_type: MultipartChecksumType,
     pub composite_hashes: HashMap<String, Vec<u8>>,
     pub part_count: Option<usize>,
+    /// Refs sealed on the version that was described. A derived write unions
+    /// them with its destination default and never drops one.
+    pub source_policies: Vec<PlacementPolicyRef>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -468,6 +471,7 @@ impl HeadObjectOperation {
             checksum_type: self.checksum_type,
             composite_hashes: self.composite_hashes.clone(),
             part_count: self.part_count,
+            source_policies: self.source_policies.clone(),
         }));
 
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -529,6 +533,7 @@ impl HeadObjectOperation {
                     checksum_type: self.checksum_type,
                     composite_hashes: self.composite_hashes.clone(),
                     part_count: self.part_count,
+                    source_policies: self.source_policies.clone(),
                 }));
                 smallvec![]
             }

@@ -1,4 +1,7 @@
-use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
+use crate::driver::{
+    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
+    routing_snapshot,
+};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_version_source_binding;
 use crate::staging::read_source::{
@@ -55,6 +58,8 @@ pub enum MaterializeSnapshotError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Routing(#[from] RoutingInputsError),
+    #[error(transparent)]
+    Gate(#[from] GateContextError),
 }
 
 pub async fn materialize_snapshot(
@@ -105,32 +110,36 @@ pub async fn materialize_snapshot(
         });
     }
     let routing = routing_snapshot(context, input.group_id, &input.bucket).await?;
-    let put_result = drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: input.user_id,
-            group_id: input.group_id,
-            realm_id: input.realm_id,
-            node_id: input.node_id,
-            request: PutObjectInput {
-                bucket: input.bucket,
-                key: input.key,
-                content_length: Some(read_result.metadata.content_length),
-                body: Some(read_result.stream),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source: Some(version_source.clone()),
-            preassigned_version_id: None,
-            quota_ceiling: input.quota_ceiling,
-            routing,
-        })
-        .with_bucket_guard(input.expected_bucket)
-        .with_restrictions(input.restrictions.clone()),
-        context,
-    )
-    .await
-    .and_then(|result| result.transpose())?;
+    // The staging source is external, so it carries no refs of its own: only
+    // the destination default governs the snapshot.
+    let gate = gate_context(context, input.realm_id, now_ms()).await?;
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: input.user_id,
+        group_id: input.group_id,
+        realm_id: input.realm_id,
+        node_id: input.node_id,
+        request: PutObjectInput {
+            bucket: input.bucket,
+            key: input.key,
+            content_length: Some(read_result.metadata.content_length),
+            body: Some(read_result.stream),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: Some(version_source.clone()),
+        preassigned_version_id: None,
+        quota_ceiling: input.quota_ceiling,
+        routing,
+    })
+    .with_bucket_guard(input.expected_bucket)
+    .with_restrictions(input.restrictions.clone());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let put_result = drive(operation, context)
+        .await
+        .and_then(|result| result.transpose())?;
     let put_result = put_result.ok_or(PutObjectError::PutObjectFailed)?;
 
     Ok(MaterializeSnapshotResult {
