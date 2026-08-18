@@ -692,6 +692,9 @@ impl Operation for MintPolicySuccessorOperation {
         match self.state {
             OperationState::Init => self.start(),
             OperationState::StartTransaction => {
+                if let Event::Storage(StorageEvent::Error { error }) = event {
+                    return self.fail(error.into());
+                }
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self.fail(SuccessorError::InvalidEvent);
                 };
@@ -711,6 +714,9 @@ impl Operation for MintPolicySuccessorOperation {
                 Err(error) => self.fail(error),
             },
             OperationState::CommitTransaction => {
+                if let Event::Storage(StorageEvent::Error { error }) = event {
+                    return self.fail(error.into());
+                }
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return self.fail(SuccessorError::InvalidEvent);
                 };

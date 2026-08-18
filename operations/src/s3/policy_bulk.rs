@@ -1,48 +1,51 @@
 //! Bounded bulk application of a bucket default to current heads.
 //!
-//! A run seals one `(bucket identity, generation, target refs)` target. Each
-//! object gets a durable intent naming its observed head and one preassigned
-//! successor VersionId, and the successor is minted through the same per-version
-//! operation the single-object mutation uses. The application is additive: it
-//! unions the sealed refs with the head re-read inside the mint transaction, so
-//! applying a default never removes an object's existing constraints.
+//! A run seals one `(bucket identity, generation, target refs)` target in its
+//! own transaction. Each object is minted through the same per-version
+//! sub-operation the single-object mutation uses, which re-reads the sealed
+//! default, the head and the intent inside its commit boundary. The application
+//! is additive: it unions the sealed refs with the head re-read inside the mint
+//! transaction, so applying a default never removes an object's constraints.
 
 use crate::blob::blob_keyspace_helper::HeadAliasContext;
-use crate::driver::{DriverContext, drive};
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
-    MintPolicySuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
+    MintPolicySuccessorOperation, SealedDefault, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, PlacementPolicyRef, PlacementSubject,
-    PolicyBlockedReason, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkRun, PolicyBulkStatus,
-    PolicyIntentOutcome, PolicyRefMode, PolicyResolution, RealmId, VersionKey,
+    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, Permission, PlacementPolicyRef,
+    PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkRun,
+    PolicyBulkStatus, PolicyIntentOutcome, PolicyRefMode, PolicyResolution, VersionKey,
+    policy_admin_path,
 };
-use aruna_core::types::{GroupId, Key, NodeId};
+use aruna_core::types::{Effects, Key, TxnId};
+use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 /// Upper bound on the heads one pass touches.
 pub const BULK_PAGE_LIMIT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BulkInput {
+pub struct BulkConfig {
     pub operation_id: Ulid,
     pub bucket: String,
-    pub realm_id: RealmId,
-    pub group_id: GroupId,
-    pub node_id: NodeId,
     pub auth_context: AuthContext,
     pub subject: PlacementSubject,
-    pub resolved: BTreeMap<Ulid, PolicyResolution>,
     pub start_after: Option<Key>,
     pub limit: usize,
+    pub now_ms: u64,
+    pub created_at: SystemTime,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,76 +83,622 @@ pub enum BulkError {
     Successor(#[from] SuccessorError),
     #[error("The specified bucket does not exist.")]
     NoSuchBucket,
+    #[error("caller may not administer the realm configuration")]
+    Unauthorized,
     #[error("the run was sealed against a different bucket record")]
     BucketChanged,
     #[error("unexpected event during the bulk pass")]
     InvalidEvent,
 }
 
-/// Runs one bounded pass. Returns the sealed target, what the pass observed and
-/// a resumable cursor; blocked objects stay in the run instead of completing.
-pub async fn run_policy_bulk(
-    context: &DriverContext,
-    input: BulkInput,
-) -> Result<BulkReport, BulkError> {
-    let bucket = read_bucket(context, &input.bucket).await?;
-    let run = match read_run(context, input.operation_id).await? {
-        Some(run) => run,
-        None => seal_run(context, &input, &bucket).await?,
-    };
-    if run.bucket != input.bucket || run.bucket_identity != bucket.identity() {
-        return Err(BulkError::BucketChanged);
-    }
-    // A default change ends the run: one pass never mixes two policies.
-    if run.generation != bucket.placement_policy_generation
-        || run.target_refs != bucket.placement_policies
-    {
-        let superseded = write_status(context, run, PolicyBulkStatus::Superseded).await?;
-        return Ok(empty_report(&input, &superseded));
-    }
-    if run.status != PolicyBulkStatus::Active {
-        return Ok(empty_report(&input, &run));
-    }
-
-    let mut report = empty_report(&input, &run);
-    let page = scan_page(context, &input).await?;
-    report.cursor = page.cursor.clone();
-    report.complete = page.cursor.is_none();
-    for (key, pointer, version) in page.entries {
-        report.observed += 1;
-        if version.state == BlobVersionState::Deleted || covered(&version, &run.target_refs) {
-            report.covered += 1;
-            continue;
-        }
-        apply_object(context, &input, &run, key, pointer, &mut report).await?;
-    }
-
-    // Converged only when a full rescan from the start found nothing to do.
-    if input.start_after.is_none()
-        && report.complete
-        && report.minted == 0
-        && report.replanned == 0
-        && report.blocked.is_empty()
-    {
-        let completed = write_status(context, run, PolicyBulkStatus::Completed).await?;
-        report.status = completed.status;
-    }
-    Ok(report)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BulkState {
+    Init,
+    Authorize,
+    StartSeal,
+    ReadSeal,
+    WriteRun,
+    CommitSeal,
+    Resolve,
+    ScanHeads,
+    ReadVersions,
+    ResolveUnion,
+    ReadIntents,
+    Mint,
+    StartStatus,
+    ReadStatus,
+    WriteStatus,
+    CommitStatus,
+    Finish,
+    Error,
 }
 
-fn empty_report(input: &BulkInput, run: &PolicyBulkRun) -> BulkReport {
-    BulkReport {
-        operation_id: input.operation_id,
-        status: run.status,
-        generation: run.generation,
-        target_refs: run.target_refs.clone(),
-        observed: 0,
-        covered: 0,
-        minted: 0,
-        replanned: 0,
-        blocked: Vec::new(),
-        cursor: None,
-        complete: false,
+/// One head this pass observed, with the durable intent it is minted under.
+#[derive(Clone, Debug, PartialEq)]
+struct Candidate {
+    key: String,
+    pointer: CurrentVersionPointer,
+    /// Refs the observed head already carries; the union mint needs them
+    /// resolved before it can decide.
+    refs: Vec<PlacementPolicyRef>,
+    intent: Option<PolicyBulkIntent>,
+}
+
+/// Runs one bounded pass over this responder's own heads. Nothing here claims
+/// whole-bucket or realm-wide convergence: the report states what this node
+/// observed and what stays a resumable gap.
+#[derive(Debug, PartialEq)]
+pub struct PolicyBulkOperation {
+    config: BulkConfig,
+    state: BulkState,
+    txn_id: Option<TxnId>,
+    group_id: Option<Ulid>,
+    run: Option<PolicyBulkRun>,
+    resolver: Option<PolicySetResolver>,
+    resolved: BTreeMap<Ulid, PolicyResolution>,
+    candidates: Vec<Candidate>,
+    index: usize,
+    mint: Option<MintPolicySuccessorOperation>,
+    /// The status the closing transaction writes once the pass has finished.
+    pending_status: Option<PolicyBulkStatus>,
+    report: BulkReport,
+    output: Option<Result<BulkReport, BulkError>>,
+}
+
+impl PolicyBulkOperation {
+    pub fn new(config: BulkConfig) -> Self {
+        let report = BulkReport {
+            operation_id: config.operation_id,
+            status: PolicyBulkStatus::Active,
+            generation: 0,
+            target_refs: Vec::new(),
+            observed: 0,
+            covered: 0,
+            minted: 0,
+            replanned: 0,
+            blocked: Vec::new(),
+            cursor: None,
+            complete: false,
+        };
+        Self {
+            config,
+            state: BulkState::Init,
+            txn_id: None,
+            group_id: None,
+            run: None,
+            resolver: None,
+            resolved: BTreeMap::new(),
+            candidates: Vec::new(),
+            index: 0,
+            mint: None,
+            pending_status: None,
+            report,
+            output: None,
+        }
+    }
+
+    fn page_limit(&self) -> usize {
+        self.config.limit.clamp(1, BULK_PAGE_LIMIT)
+    }
+
+    fn fail(&mut self, error: BulkError) -> Effects {
+        let cleanup = self.abort();
+        self.state = BulkState::Error;
+        self.output = Some(Err(error));
+        cleanup
+    }
+
+    fn finish(&mut self) -> Effects {
+        if let Some(run) = self.run.as_ref() {
+            self.report.status = run.status;
+        }
+        self.output = Some(Ok(self.report.clone()));
+        self.state = BulkState::Finish;
+        smallvec![]
+    }
+
+    /// Rolls the run transaction back and reports what the pass observed.
+    fn stop(&mut self) -> Effects {
+        let mut effects = self.abort();
+        effects.extend(self.finish());
+        effects
+    }
+
+    /// The run's own transaction: sealing, superseding and completion are all
+    /// compare-and-set writes against the row this pass just read.
+    fn read_seal(&mut self, txn_id: TxnId) -> Result<Effects, BulkError> {
+        self.txn_id = Some(txn_id);
+        self.state = BulkState::ReadSeal;
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    S3_BUCKET_KEYSPACE.to_string(),
+                    Key::from(self.config.bucket.as_bytes().to_vec()),
+                ),
+                (
+                    POLICY_BULK_RUN_KEYSPACE.to_string(),
+                    Key::from(PolicyBulkRun::key(self.config.operation_id)?),
+                ),
+            ],
+            txn_id: Some(txn_id),
+        })])
+    }
+
+    fn handle_seal(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.fail(BulkError::InvalidEvent);
+        };
+        let [(_, bucket_value), (_, run_value)] = values.as_slice() else {
+            return self.fail(BulkError::InvalidEvent);
+        };
+        let Some(bucket_value) = bucket_value.as_ref() else {
+            return self.fail(BulkError::NoSuchBucket);
+        };
+        let bucket = match BucketInfo::from_bytes(bucket_value.as_ref()) {
+            Ok(bucket) => bucket,
+            Err(error) => return self.fail(error.into()),
+        };
+        let stored = match run_value
+            .as_ref()
+            .map(|value| PolicyBulkRun::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(stored) => stored,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.group_id = Some(bucket.group_id);
+        self.report.generation = bucket.placement_policy_generation;
+        self.report.target_refs = bucket.placement_policies.clone();
+
+        let Some(run) = stored else {
+            let run = PolicyBulkRun {
+                operation_id: self.config.operation_id,
+                bucket: self.config.bucket.clone(),
+                bucket_identity: bucket.identity(),
+                generation: bucket.placement_policy_generation,
+                target_refs: bucket.placement_policies.clone(),
+                status: PolicyBulkStatus::Active,
+            };
+            return self.write_run(run);
+        };
+        if run.bucket != self.config.bucket || run.bucket_identity != bucket.identity() {
+            return self.fail(BulkError::BucketChanged);
+        }
+        self.report.generation = run.generation;
+        self.report.target_refs = run.target_refs.clone();
+        // A default change ends the run: one pass never mixes two policies.
+        if run.generation != bucket.placement_policy_generation
+            || run.target_refs != bucket.placement_policies
+        {
+            let mut superseded = run;
+            superseded.status = PolicyBulkStatus::Superseded;
+            return self.write_run(superseded);
+        }
+        if run.status != PolicyBulkStatus::Active {
+            self.run = Some(run);
+            return self.stop();
+        }
+        self.run = Some(run);
+        match self.txn_id {
+            Some(txn_id) => {
+                self.state = BulkState::CommitSeal;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            None => self.fail(BulkError::InvalidEvent),
+        }
+    }
+
+    fn write_run(&mut self, run: PolicyBulkRun) -> Effects {
+        let (key, value) = match (PolicyBulkRun::key(run.operation_id), run.to_bytes()) {
+            (Ok(key), Ok(value)) => (key, value),
+            (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
+        };
+        self.run = Some(run);
+        self.state = BulkState::WriteRun;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: POLICY_BULK_RUN_KEYSPACE.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// After the seal commits, the pass either stops or resolves its target.
+    fn after_seal(&mut self) -> Effects {
+        self.txn_id = None;
+        let stopped = self
+            .run
+            .as_ref()
+            .is_none_or(|run| run.status != PolicyBulkStatus::Active);
+        if stopped {
+            return self.finish();
+        }
+        self.resolve_refs()
+    }
+
+    fn resolve_refs(&mut self) -> Effects {
+        let refs = self
+            .run
+            .as_ref()
+            .map(|run| run.target_refs.clone())
+            .unwrap_or_default();
+        let mut resolver = PolicySetResolver::new(
+            self.config.auth_context.realm_id,
+            self.config.subject.node_id,
+            self.config.now_ms,
+            // A rule this node cannot obtain blocks its objects; the run stays
+            // resumable instead of failing.
+            ResolveMode::Lenient,
+            &refs,
+        );
+        let step = resolver.start();
+        self.resolver = Some(resolver);
+        self.state = BulkState::Resolve;
+        self.after_resolve(step)
+    }
+
+    fn after_resolve(&mut self, step: ResolveStep) -> Effects {
+        match step {
+            ResolveStep::Pending(effects) => effects,
+            ResolveStep::Done | ResolveStep::Failed(..) => {
+                if let Some(resolver) = self.resolver.take() {
+                    self.resolved.extend(resolver.into_resolutions());
+                }
+                self.scan_heads()
+            }
+        }
+    }
+
+    fn scan_heads(&mut self) -> Effects {
+        let prefix = match BlobHeadKey::bucket_prefix(&self.config.bucket) {
+            Ok(prefix) => prefix,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = BulkState::ScanHeads;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: self.config.start_after.clone().map(IterStart::After),
+            limit: self.page_limit(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_heads(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.fail(BulkError::InvalidEvent);
+        };
+        self.report.cursor = next_start_after;
+        self.report.complete = self.report.cursor.is_none();
+        if values.is_empty() {
+            return self.after_page();
+        }
+        let mut reads = Vec::with_capacity(values.len());
+        for (key, value) in values {
+            let head = match BlobHeadKey::from_bytes(key.as_ref()) {
+                Ok(head) => head,
+                Err(error) => return self.fail(error.into()),
+            };
+            let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
+                Ok(pointer) => pointer,
+                Err(error) => return self.fail(error.into()),
+            };
+            let version_key = VersionKey::new(&self.config.bucket, &head.key, pointer.version_id);
+            let encoded = match version_key.to_bytes() {
+                Ok(encoded) => encoded,
+                Err(error) => return self.fail(error.into()),
+            };
+            reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(encoded)));
+            self.candidates.push(Candidate {
+                key: head.key,
+                pointer,
+                refs: Vec::new(),
+                intent: None,
+            });
+        }
+        self.state = BulkState::ReadVersions;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })]
+    }
+
+    fn handle_versions(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.fail(BulkError::InvalidEvent);
+        };
+        if values.len() != self.candidates.len() {
+            return self.fail(BulkError::InvalidEvent);
+        }
+        let target = self
+            .run
+            .as_ref()
+            .map(|run| run.target_refs.clone())
+            .unwrap_or_default();
+        let candidates = std::mem::take(&mut self.candidates);
+        let mut pending = Vec::with_capacity(candidates.len());
+        for (mut candidate, (_, value)) in candidates.into_iter().zip(values) {
+            self.report.observed += 1;
+            let Some(value) = value else {
+                continue;
+            };
+            let version = match BlobVersion::from_bytes(value.as_ref()) {
+                Ok(version) => version,
+                Err(error) => return self.fail(error.into()),
+            };
+            if version.state == BlobVersionState::Deleted || covered(&version, &target) {
+                self.report.covered += 1;
+                continue;
+            }
+            candidate.refs = version.placement_policies;
+            pending.push(candidate);
+        }
+        self.candidates = pending;
+        if self.candidates.is_empty() {
+            return self.after_page();
+        }
+        self.resolve_union()
+    }
+
+    /// The union a mint seals also contains the refs the head already carries,
+    /// so they have to be authenticated too before any of them may be evaluated.
+    fn resolve_union(&mut self) -> Effects {
+        let mut refs = Vec::new();
+        for candidate in &self.candidates {
+            for policy_ref in &candidate.refs {
+                if !self.resolved.contains_key(&policy_ref.policy_id) {
+                    refs.push(*policy_ref);
+                }
+            }
+        }
+        if refs.is_empty() {
+            return self.read_intents();
+        }
+        let mut resolver = PolicySetResolver::new(
+            self.config.auth_context.realm_id,
+            self.config.subject.node_id,
+            self.config.now_ms,
+            ResolveMode::Lenient,
+            &refs,
+        );
+        let step = resolver.start();
+        self.resolver = Some(resolver);
+        self.state = BulkState::ResolveUnion;
+        self.after_union(step)
+    }
+
+    fn after_union(&mut self, step: ResolveStep) -> Effects {
+        match step {
+            ResolveStep::Pending(effects) => effects,
+            ResolveStep::Done | ResolveStep::Failed(..) => {
+                if let Some(resolver) = self.resolver.take() {
+                    self.resolved.extend(resolver.into_resolutions());
+                }
+                self.read_intents()
+            }
+        }
+    }
+
+    fn read_intents(&mut self) -> Effects {
+        let mut reads = Vec::with_capacity(self.candidates.len());
+        for candidate in &self.candidates {
+            let key = PolicyBulkIntentKey::new(self.config.operation_id, candidate.key.clone());
+            let encoded = match key.to_bytes() {
+                Ok(encoded) => encoded,
+                Err(error) => return self.fail(error.into()),
+            };
+            reads.push((POLICY_BULK_INTENT_KEYSPACE.to_string(), Key::from(encoded)));
+        }
+        self.state = BulkState::ReadIntents;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })]
+    }
+
+    /// Reuses the intent planned for this head, replans one whose head moved,
+    /// and never re-mints one an earlier pass completed.
+    fn handle_intents(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.fail(BulkError::InvalidEvent);
+        };
+        if values.len() != self.candidates.len() {
+            return self.fail(BulkError::InvalidEvent);
+        }
+        let candidates = std::mem::take(&mut self.candidates);
+        let mut pending = Vec::with_capacity(candidates.len());
+        for (mut candidate, (_, value)) in candidates.into_iter().zip(values) {
+            let stored = match value
+                .map(|value| PolicyBulkIntent::from_bytes(value.as_ref()))
+                .transpose()
+            {
+                Ok(stored) => stored,
+                Err(error) => return self.fail(error.into()),
+            };
+            let intent = match stored {
+                Some(intent) if matches!(intent.outcome, PolicyIntentOutcome::Completed { .. }) => {
+                    self.report.covered += 1;
+                    continue;
+                }
+                Some(intent) if intent.observed_head == candidate.pointer => intent,
+                stale => {
+                    if stale.is_some() {
+                        self.report.replanned += 1;
+                    }
+                    PolicyBulkIntent {
+                        operation_id: self.config.operation_id,
+                        key: candidate.key.clone(),
+                        observed_head: candidate.pointer.clone(),
+                        successor_version_id: Ulid::generate(),
+                        outcome: PolicyIntentOutcome::Planned,
+                    }
+                }
+            };
+            candidate.intent = Some(intent);
+            pending.push(candidate);
+        }
+        self.candidates = pending;
+        self.index = 0;
+        self.mint_next()
+    }
+
+    fn mint_next(&mut self) -> Effects {
+        let Some(candidate) = self.candidates.get(self.index) else {
+            return self.after_page();
+        };
+        let (Some(intent), Some(run), Some(group_id)) = (
+            candidate.intent.clone(),
+            self.run.as_ref(),
+            self.group_id,
+        ) else {
+            return self.fail(BulkError::InvalidEvent);
+        };
+        let plan = SuccessorPlan {
+            context: HeadAliasContext::new(
+                self.config.auth_context.realm_id,
+                group_id,
+                self.config.subject.node_id,
+                self.config.bucket.clone(),
+                candidate.key.clone(),
+            ),
+            // The preassigned successor is also the mutation identity, so a
+            // retried pass replays onto the same version instead of minting
+            // another.
+            mutation_id: intent.successor_version_id,
+            expected_head: intent.observed_head.clone(),
+            bucket_identity: run.bucket_identity,
+            target_refs: run.target_refs.clone(),
+            mode: PolicyRefMode::Union,
+            successor_version_id: intent.successor_version_id,
+            created_at: self.config.created_at,
+            auth_context: self.config.auth_context.clone(),
+            subject: self.config.subject.clone(),
+            resolved: self.resolved.clone(),
+            sealed_default: Some(SealedDefault {
+                generation: run.generation,
+                refs: run.target_refs.clone(),
+            }),
+            intent: Some(intent),
+        };
+        let mut mint = MintPolicySuccessorOperation::new(plan);
+        let effects = mint.start();
+        self.mint = Some(mint);
+        self.state = BulkState::Mint;
+        effects
+    }
+
+    fn record_outcome(&mut self, result: Result<SuccessorOutcome, SuccessorError>) -> Effects {
+        let key = self
+            .candidates
+            .get(self.index)
+            .map(|candidate| candidate.key.clone())
+            .unwrap_or_default();
+        self.index += 1;
+        match result {
+            Ok(SuccessorOutcome::Minted { .. }) => self.report.minted += 1,
+            Ok(SuccessorOutcome::Replayed { .. }) => self.report.covered += 1,
+            Ok(SuccessorOutcome::Blocked(reason)) => {
+                self.report.blocked.push(BlockedGap { key, reason })
+            }
+            // The default moved on: the run stops instead of committing an old
+            // target against a new default.
+            Err(SuccessorError::DefaultChanged { .. }) => {
+                return self.close_run(PolicyBulkStatus::Superseded);
+            }
+            // A head that moved, an id another mutation took, an intent a
+            // concurrent pass owns, and a lost commit race are all replanned by
+            // the next pass.
+            Err(
+                SuccessorError::HeadConflict { .. }
+                | SuccessorError::VersionCollision(_)
+                | SuccessorError::IntentConflict
+                | SuccessorError::Storage(StorageError::TransactionConflict),
+            ) => self.report.replanned += 1,
+            // A head that lost its version or became a delete marker is retained
+            // as a blocked gap: the pass must not claim it as completed.
+            Err(SuccessorError::HeadDeleted | SuccessorError::VersionMissing) => {
+                self.report.blocked.push(BlockedGap {
+                    key,
+                    reason: PolicyBlockedReason::SourceUnavailable,
+                })
+            }
+            Err(error) => return self.fail(error.into()),
+        }
+        self.mint_next()
+    }
+
+    /// Converged only when a full rescan from the start found nothing to do.
+    fn after_page(&mut self) -> Effects {
+        let converged = self.config.start_after.is_none()
+            && self.report.complete
+            && self.report.minted == 0
+            && self.report.replanned == 0
+            && self.report.blocked.is_empty();
+        if !converged {
+            return self.finish();
+        }
+        self.close_run(PolicyBulkStatus::Completed)
+    }
+
+    /// Status transitions are compare-and-set: only an active run moves on, so
+    /// a replayed or concurrent pass cannot revive or downgrade a finished one.
+    fn close_run(&mut self, status: PolicyBulkStatus) -> Effects {
+        self.pending_status = Some(status);
+        self.state = BulkState::StartStatus;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn read_status(&mut self, txn_id: TxnId) -> Effects {
+        self.txn_id = Some(txn_id);
+        self.state = BulkState::ReadStatus;
+        let key = match PolicyBulkRun::key(self.config.operation_id) {
+            Ok(key) => key,
+            Err(error) => return self.fail(error.into()),
+        };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: POLICY_BULK_RUN_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_status(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(BulkError::InvalidEvent);
+        };
+        let stored = match value
+            .map(|value| PolicyBulkRun::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(stored) => stored,
+            Err(error) => return self.fail(error.into()),
+        };
+        let (Some(mut run), Some(status)) = (stored, self.pending_status) else {
+            return self.stop();
+        };
+        if run.status != PolicyBulkStatus::Active {
+            self.run = Some(run);
+            return self.stop();
+        }
+        run.status = status;
+        let (key, value) = match (PolicyBulkRun::key(run.operation_id), run.to_bytes()) {
+            (Ok(key), Ok(value)) => (key, value),
+            (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
+        };
+        self.run = Some(run);
+        self.state = BulkState::WriteStatus;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: POLICY_BULK_RUN_KEYSPACE.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: self.txn_id,
+        })]
     }
 }
 
@@ -159,323 +708,171 @@ fn covered(version: &BlobVersion, target: &[PlacementPolicyRef]) -> bool {
         .all(|policy| version.placement_policies.contains(policy))
 }
 
-/// Plans or reuses the object's intent, mints its successor, and records the
-/// outcome. A head that moved is replanned from the new head, never advanced
-/// from the one the scan saw.
-async fn apply_object(
-    context: &DriverContext,
-    input: &BulkInput,
-    run: &PolicyBulkRun,
-    key: String,
-    pointer: CurrentVersionPointer,
-    report: &mut BulkReport,
-) -> Result<(), BulkError> {
-    let stored = read_intent(context, input.operation_id, &key).await?;
-    if let Some(intent) = stored.as_ref()
-        && matches!(intent.outcome, PolicyIntentOutcome::Completed { .. })
-    {
-        report.covered += 1;
-        return Ok(());
-    }
-    let intent = match stored {
-        Some(intent) if intent.observed_head == pointer => intent,
-        stale => {
-            if stale.is_some() {
-                report.replanned += 1;
-            }
-            let planned = plan_intent(input.operation_id, &key, pointer);
-            write_intent(context, &planned).await?;
-            planned
-        }
-    };
+impl Operation for PolicyBulkOperation {
+    type Output = BulkReport;
+    type Error = BulkError;
 
-    let plan = SuccessorPlan {
-        context: HeadAliasContext::new(
-            input.realm_id,
-            input.group_id,
-            input.node_id,
-            input.bucket.clone(),
-            key.clone(),
-        ),
-        // The preassigned successor is also the mutation identity, so a retried
-        // pass replays onto the same version instead of minting another.
-        mutation_id: intent.successor_version_id,
-        expected_head: intent.observed_head.clone(),
-        bucket_identity: run.bucket_identity,
-        target_refs: run.target_refs.clone(),
-        mode: PolicyRefMode::Union,
-        successor_version_id: intent.successor_version_id,
-        created_at: SystemTime::now(),
-        auth_context: input.auth_context.clone(),
-        subject: input.subject.clone(),
-        resolved: input.resolved.clone(),
-        intent: Some(intent.clone()),
-    };
-
-    match drive(MintPolicySuccessorOperation::new(plan), context).await {
-        Ok(SuccessorOutcome::Minted { .. }) => {
-            report.minted += 1;
-            Ok(())
-        }
-        Ok(SuccessorOutcome::Replayed {
-            version_id,
-            materialized,
-            ..
-        }) => {
-            let mut receipt = intent;
-            receipt.outcome = PolicyIntentOutcome::Completed {
-                version_id,
-                materialized,
-            };
-            write_intent(context, &receipt).await?;
-            report.covered += 1;
-            Ok(())
-        }
-        Ok(SuccessorOutcome::Blocked(reason)) => {
-            let mut blocked = intent;
-            blocked.outcome = PolicyIntentOutcome::Blocked(reason);
-            write_intent(context, &blocked).await?;
-            report.blocked.push(BlockedGap { key, reason });
-            Ok(())
-        }
-        Err(SuccessorError::HeadConflict { current }) => {
-            report.replanned += 1;
-            if let Some(current) = current {
-                write_intent(context, &plan_intent(input.operation_id, &key, current)).await?;
-            }
-            Ok(())
-        }
-        // A head that lost its version or became a delete marker is retained as
-        // a blocked gap: the pass must not claim it as completed.
-        Err(SuccessorError::HeadDeleted) | Err(SuccessorError::VersionMissing) => {
-            let mut blocked = intent;
-            blocked.outcome = PolicyIntentOutcome::Blocked(PolicyBlockedReason::SourceUnavailable);
-            write_intent(context, &blocked).await?;
-            report.blocked.push(BlockedGap {
-                key,
-                reason: PolicyBlockedReason::SourceUnavailable,
-            });
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn plan_intent(
-    operation_id: Ulid,
-    key: &str,
-    observed_head: CurrentVersionPointer,
-) -> PolicyBulkIntent {
-    PolicyBulkIntent {
-        operation_id,
-        key: key.to_string(),
-        observed_head,
-        successor_version_id: Ulid::generate(),
-        outcome: PolicyIntentOutcome::Planned,
-    }
-}
-
-struct HeadPage {
-    entries: Vec<(String, CurrentVersionPointer, BlobVersion)>,
-    cursor: Option<Key>,
-}
-
-async fn scan_page(context: &DriverContext, input: &BulkInput) -> Result<HeadPage, BulkError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            prefix: Some(BlobHeadKey::bucket_prefix(&input.bucket)?.into()),
-            start: input.start_after.clone().map(IterStart::After),
-            limit: input.limit.clamp(1, BULK_PAGE_LIMIT),
-            txn_id: None,
-        })
-        .await;
-    let Event::Storage(StorageEvent::IterResult {
-        values,
-        next_start_after,
-    }) = event
-    else {
-        return Err(storage_error(event));
-    };
-
-    let mut heads = Vec::with_capacity(values.len());
-    let mut reads = Vec::with_capacity(values.len());
-    for (key, value) in values {
-        let head = BlobHeadKey::from_bytes(key.as_ref())?;
-        let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
-        let version_key = VersionKey::new(&input.bucket, &head.key, pointer.version_id);
-        reads.push((
-            BLOB_VERSIONS_KEYSPACE.to_string(),
-            version_key.to_bytes()?.into(),
-        ));
-        heads.push((head.key, pointer));
-    }
-    if heads.is_empty() {
-        return Ok(HeadPage {
-            entries: Vec::new(),
-            cursor: next_start_after,
-        });
-    }
-
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
-        .await;
-    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-        return Err(storage_error(event));
-    };
-    if values.len() != heads.len() {
-        return Err(BulkError::InvalidEvent);
-    }
-    let mut entries = Vec::with_capacity(heads.len());
-    for ((key, pointer), (_, value)) in heads.into_iter().zip(values) {
-        let Some(value) = value else {
-            continue;
+    fn start(&mut self) -> Effects {
+        self.state = BulkState::Authorize;
+        let auth_config = CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path: policy_admin_path(self.config.auth_context.realm_id),
+            required_permission: Permission::WRITE,
         };
-        entries.push((key, pointer, BlobVersion::from_bytes(value.as_ref())?));
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(auth_config),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
     }
-    Ok(HeadPage {
-        entries,
-        cursor: next_start_after,
-    })
-}
 
-async fn read_bucket(context: &DriverContext, bucket: &str) -> Result<BucketInfo, BulkError> {
-    let value = read_key(context, S3_BUCKET_KEYSPACE, bucket.as_bytes().to_vec()).await?;
-    let Some(value) = value else {
-        return Err(BulkError::NoSuchBucket);
-    };
-    Ok(BucketInfo::from_bytes(value.as_ref())?)
-}
-
-async fn read_run(
-    context: &DriverContext,
-    operation_id: Ulid,
-) -> Result<Option<PolicyBulkRun>, BulkError> {
-    let value = read_key(
-        context,
-        POLICY_BULK_RUN_KEYSPACE,
-        PolicyBulkRun::key(operation_id)?,
-    )
-    .await?;
-    value
-        .map(|value| PolicyBulkRun::from_bytes(value.as_ref()))
-        .transpose()
-        .map_err(BulkError::from)
-}
-
-async fn seal_run(
-    context: &DriverContext,
-    input: &BulkInput,
-    bucket: &BucketInfo,
-) -> Result<PolicyBulkRun, BulkError> {
-    let run = PolicyBulkRun {
-        operation_id: input.operation_id,
-        bucket: input.bucket.clone(),
-        bucket_identity: bucket.identity(),
-        generation: bucket.placement_policy_generation,
-        target_refs: bucket.placement_policies.clone(),
-        status: PolicyBulkStatus::Active,
-    };
-    write_run(context, &run).await?;
-    Ok(run)
-}
-
-async fn write_status(
-    context: &DriverContext,
-    mut run: PolicyBulkRun,
-    status: PolicyBulkStatus,
-) -> Result<PolicyBulkRun, BulkError> {
-    run.status = status;
-    write_run(context, &run).await?;
-    Ok(run)
-}
-
-async fn write_run(context: &DriverContext, run: &PolicyBulkRun) -> Result<(), BulkError> {
-    write_key(
-        context,
-        POLICY_BULK_RUN_KEYSPACE,
-        PolicyBulkRun::key(run.operation_id)?,
-        run.to_bytes()?,
-    )
-    .await
-}
-
-async fn read_intent(
-    context: &DriverContext,
-    operation_id: Ulid,
-    key: &str,
-) -> Result<Option<PolicyBulkIntent>, BulkError> {
-    let value = read_key(
-        context,
-        POLICY_BULK_INTENT_KEYSPACE,
-        PolicyBulkIntentKey::new(operation_id, key).to_bytes()?,
-    )
-    .await?;
-    value
-        .map(|value| PolicyBulkIntent::from_bytes(value.as_ref()))
-        .transpose()
-        .map_err(BulkError::from)
-}
-
-async fn write_intent(context: &DriverContext, intent: &PolicyBulkIntent) -> Result<(), BulkError> {
-    write_key(
-        context,
-        POLICY_BULK_INTENT_KEYSPACE,
-        intent.key().to_bytes()?,
-        intent.to_bytes()?,
-    )
-    .await
-}
-
-async fn read_key(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<aruna_core::types::Value>, BulkError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(storage_error(other)),
+    fn step(&mut self, event: Event) -> Effects {
+        // The mint and the resolver classify their own storage failures.
+        let event = match (self.state, event) {
+            (BulkState::Mint | BulkState::Resolve | BulkState::ResolveUnion, event) => event,
+            (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
+            (_, event) => event,
+        };
+        match self.state {
+            BulkState::Init => self.start(),
+            BulkState::Authorize => {
+                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
+                else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                match allowed {
+                    Ok(true) => {
+                        self.state = BulkState::StartSeal;
+                        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                            read: false
+                        })]
+                    }
+                    Ok(false) => self.fail(BulkError::Unauthorized),
+                    Err(error) => {
+                        warn!(error = %error, "Bulk policy authorization check failed");
+                        self.fail(BulkError::Unauthorized)
+                    }
+                }
+            }
+            BulkState::StartSeal => {
+                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                match self.read_seal(txn_id) {
+                    Ok(effects) => effects,
+                    Err(error) => self.fail(error),
+                }
+            }
+            BulkState::ReadSeal => self.handle_seal(event),
+            BulkState::WriteRun => {
+                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                match self.txn_id {
+                    Some(txn_id) => {
+                        self.state = BulkState::CommitSeal;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    None => self.fail(BulkError::InvalidEvent),
+                }
+            }
+            BulkState::CommitSeal => {
+                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                self.after_seal()
+            }
+            BulkState::Resolve => {
+                let Some(resolver) = self.resolver.as_mut() else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                let step = resolver.step(event);
+                self.after_resolve(step)
+            }
+            BulkState::ScanHeads => self.handle_heads(event),
+            BulkState::ReadVersions => self.handle_versions(event),
+            BulkState::ResolveUnion => {
+                let Some(resolver) = self.resolver.as_mut() else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                let step = resolver.step(event);
+                self.after_union(step)
+            }
+            BulkState::ReadIntents => self.handle_intents(event),
+            BulkState::Mint => {
+                let Some(mint) = self.mint.as_mut() else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                let effects = mint.step(event);
+                if !mint.is_complete() {
+                    return effects;
+                }
+                let Some(mint) = self.mint.take() else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                let mut settled = effects;
+                let outcome = mint.finalize();
+                settled.extend(self.record_outcome(outcome));
+                settled
+            }
+            BulkState::StartStatus => {
+                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                self.read_status(txn_id)
+            }
+            BulkState::ReadStatus => self.handle_status(event),
+            BulkState::WriteStatus => {
+                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                match self.txn_id {
+                    Some(txn_id) => {
+                        self.state = BulkState::CommitStatus;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    None => self.fail(BulkError::InvalidEvent),
+                }
+            }
+            BulkState::CommitStatus => {
+                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+                    return self.fail(BulkError::InvalidEvent);
+                };
+                self.txn_id = None;
+                self.finish()
+            }
+            BulkState::Finish | BulkState::Error => smallvec![],
+        }
     }
-}
 
-async fn write_key(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-    value: Vec<u8>,
-) -> Result<(), BulkError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(storage_error(other)),
+    fn is_complete(&self) -> bool {
+        matches!(self.state, BulkState::Finish | BulkState::Error)
     }
-}
 
-fn storage_error(event: Event) -> BulkError {
-    match event {
-        Event::Storage(StorageEvent::Error { error }) => BulkError::Storage(error),
-        _ => BulkError::InvalidEvent,
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(BulkError::InvalidEvent))
+    }
+
+    fn abort(&mut self) -> Effects {
+        let mut effects: Effects = match self.resolver.as_mut() {
+            Some(resolver) => resolver.abort(),
+            None => smallvec![],
+        };
+        if let Some(mint) = self.mint.as_mut() {
+            effects.extend(mint.abort());
+        }
+        if let Some(txn_id) = self.txn_id.take() {
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+        }
+        effects
+    }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            BulkError::Unauthorized | BulkError::NoSuchBucket | BulkError::BucketChanged
+        )
     }
 }
 
@@ -484,8 +881,13 @@ fn storage_error(event: Event) -> BulkError {
 /// keeps the object as a resumable gap.
 #[cfg(test)]
 mod tests {
-    use super::{BULK_PAGE_LIMIT, BulkInput, run_policy_bulk};
+    use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, PolicyBulkOperation};
+    use crate::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive, gate_context};
+    use crate::placement_policy::cache::cache_key;
     use crate::placement_policy::fixtures::{seed_gate, subject};
     use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -493,21 +895,22 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
+        PLACEMENT_POLICY_CACHE_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        AuthContext, Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
+        Actor, AuthContext, Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion,
+        BucketInfo, CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord,
+        POLICY_BULK_INTENT_KEYSPACE, PlacementPolicy, PlacementPolicyRef, PlacementSelector,
         PolicyBlockedReason, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkStatus,
-        PolicyIntentOutcome, PolicyResolution, RealmId, RoutingSnapshot, VerifiedPolicy,
-        VersionKey,
+        PolicyIntentOutcome, RealmId, RoutingSnapshot, VerifiedPolicy, VersionKey,
     };
-    use aruna_core::types::{GroupId, NodeId, UserId};
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_core::types::{GroupId, Key, NodeId, UserId};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
-    use std::collections::{BTreeMap, HashMap};
+    use aruna_tasks::TaskHandle;
+    use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -523,15 +926,30 @@ mod tests {
         user_id: UserId,
     }
 
+    /// A realm with a claimed administrator, an advertised subject and the rule
+    /// these tests attach already resolved, which is what production wiring
+    /// establishes before a governed write is possible.
     async fn full_context() -> (TempDir, DriverContext, Fixture) {
         let temp_handle = tempdir().expect("temp dir");
         let temp_root = temp_handle.path().to_str().expect("utf8 path");
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).expect("blob root");
         let storage_handle = storage::FjallStorage::open(temp_root).expect("storage opens");
-        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-            .await
-            .expect("net handle");
+        let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                secret_key: Some(secret.clone()),
+                realm_id,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .expect("net handle");
         let blob_handle = BlobHandler::new(
             BackendConfig {
                 backend_type: Backend::FileSystem,
@@ -547,23 +965,44 @@ mod tests {
         )
         .await
         .expect("blob handle");
-        let realm_id = RealmId::from_bytes([1u8; 32]);
         let fixture = Fixture {
             realm_id,
             group_id: Ulid::generate(),
             node_id: net_handle.node_id(),
-            user_id: UserId::local(Ulid::generate(), realm_id),
+            user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
         };
         let context = DriverContext {
             storage_handle,
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
             metadata_handle: None,
-            task_handle: None,
+            task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         };
-        // The node advertises a subject and has already resolved the rule these
-        // tests attach, which is what production wiring establishes at startup.
+        let actor = Actor {
+            node_id: fixture.node_id,
+            user_id: fixture.user_id,
+            realm_id,
+        };
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "policy realm".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            &context,
+        )
+        .await
+        .expect("realm is created");
+        drive(
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput { actor }),
+            &context,
+        )
+        .await
+        .expect("admin is claimed");
         seed_gate(
             &context,
             realm_id,
@@ -645,17 +1084,31 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    async fn set_default(
-        context: &DriverContext,
-        fixture: &Fixture,
-        refs: Vec<PlacementPolicyRef>,
-    ) {
+    fn second_policy(node_id: NodeId) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([6u8; 16]),
+            "second".to_string(),
+            vec![PlacementSelector {
+                node_id: Some(node_id),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    async fn set_default(context: &DriverContext, fixture: &Fixture, refs: Vec<PlacementPolicyRef>) {
         drive(
             PutBucketPlacementOperation::new(PutBucketPlacementInput {
                 bucket: BUCKET.to_string(),
                 group_id: fixture.group_id,
                 policies: refs,
                 expected_generation: None,
+                auth_context: auth(fixture),
+                local_node_id: fixture.node_id,
+                now_ms: 1_000,
             }),
             context,
         )
@@ -663,33 +1116,24 @@ mod tests {
         .expect("default is set");
     }
 
-    fn bulk_input(
-        fixture: &Fixture,
-        resolved: BTreeMap<Ulid, PolicyResolution>,
-        operation_id: Ulid,
-    ) -> BulkInput {
-        BulkInput {
+    fn auth(fixture: &Fixture) -> AuthContext {
+        AuthContext {
+            user_id: fixture.user_id,
+            realm_id: fixture.realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    fn config(fixture: &Fixture, operation_id: Ulid) -> BulkConfig {
+        BulkConfig {
             operation_id,
             bucket: BUCKET.to_string(),
-            realm_id: fixture.realm_id,
-            group_id: fixture.group_id,
-            node_id: fixture.node_id,
-            auth_context: AuthContext {
-                user_id: fixture.user_id,
-                realm_id: fixture.realm_id,
-                path_restrictions: None,
-            },
-            subject: PlacementSubject {
-                node_id: fixture.node_id,
-                generation: 1,
-                location: "eu-west".to_string(),
-                labels: BTreeMap::new(),
-                executor_kind: None,
-                local_to_controller: true,
-            },
-            resolved,
+            auth_context: auth(fixture),
+            subject: subject(fixture.node_id, "eu-west"),
             start_after: None,
             limit: BULK_PAGE_LIMIT,
+            now_ms: 1_000,
+            created_at: SystemTime::now(),
         }
     }
 
@@ -730,15 +1174,41 @@ mod tests {
         BlobVersion::from_bytes(value.expect("version exists").as_ref()).expect("version decodes")
     }
 
+    /// Every stored version of one object, so a pass can be shown to mint at
+    /// most one successor however often it runs.
+    async fn count_versions(context: &DriverContext, key: &str) -> usize {
+        let prefix: Key = VersionKey::object_prefix(BUCKET, key)
+            .expect("prefix encodes")
+            .into();
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                prefix: Some(prefix),
+                start: None,
+                limit: 64,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage iter result");
+        };
+        values.len()
+    }
+
+    async fn copy_key(key: &str, version_id: Ulid) -> ManagedCopyKey {
+        ManagedCopyKey::new(
+            VersionKey::new(BUCKET, key, version_id),
+            BackendRef::node_default(),
+        )
+    }
+
     async fn read_copy(
         context: &DriverContext,
         key: &str,
         version_id: Ulid,
     ) -> Option<ManagedCopyRecord> {
-        let managed_key = ManagedCopyKey::new(
-            VersionKey::new(BUCKET, key, version_id),
-            BackendRef::node_default(),
-        );
+        let managed_key = copy_key(key, version_id).await;
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
@@ -751,6 +1221,34 @@ mod tests {
             panic!("unexpected storage read result");
         };
         value.map(|value| ManagedCopyRecord::from_bytes(value.as_ref()).expect("record decodes"))
+    }
+
+    async fn take_copy(context: &DriverContext, key: &str, version_id: Ulid) -> ManagedCopyRecord {
+        let record = read_copy(context, key, version_id)
+            .await
+            .expect("copy row exists");
+        let managed_key = copy_key(key, version_id).await;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: MANAGED_COPY_KEYSPACE.to_string(),
+                key: managed_key.to_bytes().expect("key encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        record
+    }
+
+    async fn restore_copy(context: &DriverContext, record: &ManagedCopyRecord) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: MANAGED_COPY_KEYSPACE.to_string(),
+                key: record.key().to_bytes().expect("key encodes").into(),
+                value: record.to_bytes().expect("record encodes").into(),
+                txn_id: None,
+            })
+            .await;
     }
 
     async fn read_intent(
@@ -776,62 +1274,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_snapshots_default() {
-        // The version seals the default observed in its own transaction.
-        let (_temp, context, fixture) = full_context().await;
-        write_bucket(&context, &fixture).await;
-        let policy = policy(fixture.node_id);
-        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
-
-        let version_id = put_object(&context, &fixture, OBJECT).await;
-
-        let version = read_version(&context, OBJECT, version_id).await;
-        assert_eq!(version.placement_policies, vec![policy.policy_ref()]);
-        let copy = read_copy(&context, OBJECT, version_id)
-            .await
-            .expect("copy row");
-        assert_eq!(copy.policies, vec![policy.policy_ref()]);
-    }
-
-    #[tokio::test]
-    async fn put_stays_ungoverned() {
-        // A bucket without a default must write exactly what it wrote before.
-        let (_temp, context, fixture) = full_context().await;
-        write_bucket(&context, &fixture).await;
-
-        let version_id = put_object(&context, &fixture, OBJECT).await;
-
-        assert!(
-            read_version(&context, OBJECT, version_id)
-                .await
-                .placement_policies
-                .is_empty()
-        );
-        assert!(
-            read_copy(&context, OBJECT, version_id)
-                .await
-                .expect("copy row")
-                .policies
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn bulk_mints_successor() {
         let (_temp, context, fixture) = full_context().await;
         write_bucket(&context, &fixture).await;
         let predecessor = put_object(&context, &fixture, OBJECT).await;
         let policy = policy(fixture.node_id);
         set_default(&context, &fixture, vec![policy.policy_ref()]).await;
-        let resolved = BTreeMap::from([(
-            policy.policy().policy_id,
-            PolicyResolution::Known(policy.clone()),
-        )]);
         let operation_id = Ulid::generate();
 
-        let report = run_policy_bulk(
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
             &context,
-            bulk_input(&fixture, resolved.clone(), operation_id),
         )
         .await
         .expect("pass runs");
@@ -863,27 +1316,66 @@ mod tests {
         ));
 
         // A second pass observes no gap and converges.
-        let second = run_policy_bulk(&context, bulk_input(&fixture, resolved, operation_id))
-            .await
-            .expect("second pass runs");
+        let second = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("second pass runs");
         assert_eq!(second.minted, 0);
         assert_eq!(second.covered, 1);
         assert_eq!(second.status, PolicyBulkStatus::Completed);
     }
 
     #[tokio::test]
+    async fn denies_non_admin() {
+        // Applying a bucket default is a realm-configuration change.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        put_object(&context, &fixture, OBJECT).await;
+        let mut config = config(&fixture, Ulid::generate());
+        config.auth_context.user_id = UserId::local(Ulid::from_bytes([9u8; 16]), fixture.realm_id);
+
+        let denied = drive(PolicyBulkOperation::new(config), &context).await;
+
+        assert_eq!(denied, Err(BulkError::Unauthorized));
+    }
+
+    /// Drops the durable cache entry, leaving a ref this node can no longer
+    /// authenticate because no holder answers in a single-node realm.
+    async fn evict_policy(context: &DriverContext, policy: &VerifiedPolicy) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+                key: cache_key(&policy.policy_ref()),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn bulk_blocks_unresolved() {
-        // Without the policy document the object stays a resumable gap.
+        // A ref the node can no longer obtain leaves the object a resumable gap
+        // instead of granting anything.
         let (_temp, context, fixture) = full_context().await;
         write_bucket(&context, &fixture).await;
         let predecessor = put_object(&context, &fixture, OBJECT).await;
-        let policy = policy(fixture.node_id);
-        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let unknown = second_policy(fixture.node_id);
+        seed_gate(
+            &context,
+            fixture.realm_id,
+            subject(fixture.node_id, "eu-west"),
+            &[unknown.clone()],
+        )
+        .await;
+        set_default(&context, &fixture, vec![unknown.policy_ref()]).await;
+        evict_policy(&context, &unknown).await;
         let operation_id = Ulid::generate();
 
-        let report = run_policy_bulk(
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
             &context,
-            bulk_input(&fixture, BTreeMap::new(), operation_id),
         )
         .await
         .expect("pass runs");
@@ -895,6 +1387,63 @@ mod tests {
         );
         assert_eq!(read_head(&context, OBJECT).await.version_id, predecessor);
         assert_eq!(report.status, PolicyBulkStatus::Active);
+        assert!(matches!(
+            read_intent(&context, operation_id, OBJECT).await,
+            Some(PolicyBulkIntent {
+                outcome: PolicyIntentOutcome::Blocked(PolicyBlockedReason::PolicyUnresolved),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocked_copy_resumes() {
+        // No compliant local copy blocks the mint; once the ordinary movement
+        // path has registered verified bytes again the same run completes it.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let predecessor = put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let operation_id = Ulid::generate();
+        let copy = take_copy(&context, OBJECT, predecessor).await;
+
+        let blocked = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("first pass runs");
+
+        assert_eq!(
+            blocked.blocked.first().map(|gap| gap.reason),
+            Some(PolicyBlockedReason::SourceUnavailable)
+        );
+        assert_eq!(read_head(&context, OBJECT).await.version_id, predecessor);
+        let intent = read_intent(&context, operation_id, OBJECT)
+            .await
+            .expect("blocked intent is durable");
+        assert_eq!(
+            intent.outcome,
+            PolicyIntentOutcome::Blocked(PolicyBlockedReason::SourceUnavailable)
+        );
+
+        restore_copy(&context, &copy).await;
+        let resumed = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("second pass runs");
+
+        assert_eq!(resumed.minted, 1);
+        // The blocked intent kept its successor id, so resuming mints exactly
+        // the version the first pass had planned.
+        assert_eq!(
+            read_head(&context, OBJECT).await.version_id,
+            intent.successor_version_id
+        );
+        assert_eq!(count_versions(&context, OBJECT).await, 2);
     }
 
     #[tokio::test]
@@ -906,17 +1455,17 @@ mod tests {
         let policy = policy(fixture.node_id);
         set_default(&context, &fixture, vec![policy.policy_ref()]).await;
         let operation_id = Ulid::generate();
-        run_policy_bulk(
+        drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
             &context,
-            bulk_input(&fixture, BTreeMap::new(), operation_id),
         )
         .await
         .expect("first pass runs");
 
         set_default(&context, &fixture, Vec::new()).await;
-        let report = run_policy_bulk(
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
             &context,
-            bulk_input(&fixture, BTreeMap::new(), operation_id),
         )
         .await
         .expect("second pass runs");
@@ -927,31 +1476,66 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_reuses_successor() {
-        // Repeating a pass must reuse the assigned VersionId, not mint another.
+        // A lost response must reuse the assigned VersionId, not mint another.
         let (_temp, context, fixture) = full_context().await;
         write_bucket(&context, &fixture).await;
         put_object(&context, &fixture, OBJECT).await;
         let policy = policy(fixture.node_id);
         set_default(&context, &fixture, vec![policy.policy_ref()]).await;
-        let resolved = BTreeMap::from([(
-            policy.policy().policy_id,
-            PolicyResolution::Known(policy.clone()),
-        )]);
         let operation_id = Ulid::generate();
-        run_policy_bulk(
+        drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
             &context,
-            bulk_input(&fixture, resolved.clone(), operation_id),
         )
         .await
         .expect("first pass runs");
         let successor = read_head(&context, OBJECT).await;
 
-        let report = run_policy_bulk(&context, bulk_input(&fixture, resolved, operation_id))
-            .await
-            .expect("second pass runs");
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("second pass runs");
 
         assert_eq!(report.minted, 0);
         assert_eq!(read_head(&context, OBJECT).await, successor);
+        assert_eq!(count_versions(&context, OBJECT).await, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_passes_agree() {
+        // Two runs applying the same default may race, but only one successor
+        // can exist: the loser sees a changed head and replans.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+
+        let (first, second) = tokio::join!(
+            drive(
+                PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+                &context
+            ),
+            drive(
+                PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+                &context
+            ),
+        );
+
+        let minted = first.expect("first pass runs").minted + second.expect("second pass runs").minted;
+        assert!(minted <= 1, "at most one successor may be minted");
+        assert_eq!(count_versions(&context, OBJECT).await, 1 + minted);
+        let head = read_head(&context, OBJECT).await;
+        if minted == 1 {
+            assert_eq!(
+                read_version(&context, OBJECT, head.version_id)
+                    .await
+                    .placement_policies,
+                vec![policy.policy_ref()]
+            );
+        }
     }
 
     #[tokio::test]
@@ -963,35 +1547,22 @@ mod tests {
         set_default(&context, &fixture, vec![first.policy_ref()]).await;
         put_object(&context, &fixture, OBJECT).await;
 
-        let second = VerifiedPolicy::verify(
-            PlacementPolicy::new(
-                Ulid::from_bytes([6u8; 16]),
-                "second".to_string(),
-                vec![PlacementSelector {
-                    node_id: Some(fixture.node_id),
-                    location: None,
-                    labels: Vec::new(),
-                    executor_kind: None,
-                }],
-            )
-            .expect("policy is valid"),
+        let second = second_policy(fixture.node_id);
+        seed_gate(
+            &context,
+            fixture.realm_id,
+            subject(fixture.node_id, "eu-west"),
+            &[second.clone()],
         )
-        .expect("policy verifies");
+        .await;
         set_default(&context, &fixture, vec![second.policy_ref()]).await;
-        let resolved = BTreeMap::from([
-            (
-                first.policy().policy_id,
-                PolicyResolution::Known(first.clone()),
-            ),
-            (
-                second.policy().policy_id,
-                PolicyResolution::Known(second.clone()),
-            ),
-        ]);
 
-        let report = run_policy_bulk(&context, bulk_input(&fixture, resolved, Ulid::generate()))
-            .await
-            .expect("pass runs");
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
 
         assert_eq!(report.minted, 1);
         let head = read_head(&context, OBJECT).await;
@@ -1007,14 +1578,13 @@ mod tests {
         let policy = policy(fixture.node_id);
         set_default(&context, &fixture, vec![policy.policy_ref()]).await;
         let version_id = put_object(&context, &fixture, OBJECT).await;
-        let resolved = BTreeMap::from([(
-            policy.policy().policy_id,
-            PolicyResolution::Known(policy.clone()),
-        )]);
 
-        let report = run_policy_bulk(&context, bulk_input(&fixture, resolved, Ulid::generate()))
-            .await
-            .expect("pass runs");
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
 
         assert_eq!(report.covered, 1);
         assert_eq!(report.minted, 0);
@@ -1029,14 +1599,13 @@ mod tests {
         let predecessor = put_object(&context, &fixture, OBJECT).await;
         let policy = policy(fixture.node_id);
         set_default(&context, &fixture, vec![policy.policy_ref()]).await;
-        let resolved = BTreeMap::from([(
-            policy.policy().policy_id,
-            PolicyResolution::Known(policy.clone()),
-        )]);
 
-        run_policy_bulk(&context, bulk_input(&fixture, resolved, Ulid::generate()))
-            .await
-            .expect("pass runs");
+        drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
 
         let head = read_head(&context, OBJECT).await;
         let successor = read_version(&context, OBJECT, head.version_id).await;
