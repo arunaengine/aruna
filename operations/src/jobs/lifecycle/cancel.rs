@@ -36,7 +36,8 @@ pub async fn cancel_family(
     auth_token: Option<MetadataAuthToken>,
 ) -> Option<Result<(), JobRouteError>> {
     family_of_alias(context, job_id).await?;
-    let (projection, spec) = family_projection(context, job_id).await?;
+    let (projected, spec) = family_projection(context, job_id).await?;
+    let projection = projected.projection?;
     let authority = match cancel_authority(context, auth, &spec).await {
         Some(authority) => authority,
         None => return Some(Err(JobRouteError::Forbidden)),

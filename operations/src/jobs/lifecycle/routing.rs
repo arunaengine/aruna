@@ -20,7 +20,9 @@ use super::witness::load_family;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::{alias_family, alias_prefix};
-use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
+use crate::jobs::records::{
+    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
+};
 use crate::jobs::service::RoutedJobStatus;
 use crate::jobs::store::iter_prefix_page;
 
@@ -48,7 +50,7 @@ pub async fn family_of_alias(context: &DriverContext, job_id: JobId) -> Option<J
 pub async fn family_projection(
     context: &DriverContext,
     job_id: JobId,
-) -> Option<(JobProjection, LogicalJobSpec)> {
+) -> Option<(ProjectedFamily, LogicalJobSpec)> {
     let projected = drive(
         ProjectFamilyOperation::new(ProjectFamilyConfig {
             family: FamilyRef::Alias(job_id),
@@ -59,15 +61,13 @@ pub async fn family_projection(
     )
     .await
     .ok()?;
-    let projection = projected.projection?;
+    let canonical = projected.projection.as_ref()?.canonical_job_id;
     let records = load_family(context, projected.family).await;
     let spec = records.iter().find_map(|envelope| match &envelope.record {
-        JobFamilyRecord::Spec(spec) if spec.job_id == projection.canonical_job_id => {
-            Some(spec.as_ref().clone())
-        }
+        JobFamilyRecord::Spec(spec) if spec.job_id == canonical => Some(spec.as_ref().clone()),
         _ => None,
     })?;
-    Some((projection, spec))
+    Some((projected, spec))
 }
 
 /// Answers one status read from the family. `None` means the alias names no
@@ -77,11 +77,12 @@ pub async fn family_status(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Option<Result<RoutedJobStatus, JobRouteError>> {
-    let (projection, spec) = family_projection(context, job_id).await?;
+    let (projected, spec) = family_projection(context, job_id).await?;
     // Reads stay self-scoped: another submitter's job is absent, never refused.
     if spec.created_by != auth.user_id {
         return Some(Err(JobRouteError::NotFound));
     }
+    let projection = projected.projection?;
     Some(Ok(RoutedJobStatus {
         job: status_view(job_id, &projection, &spec),
         run_crate: None,
@@ -91,7 +92,8 @@ pub async fn family_status(
 /// The node that can serve bytes for this family: the canonical successful
 /// execution's executor, otherwise any execution's, otherwise none.
 pub async fn family_responder(context: &DriverContext, job_id: JobId) -> Option<NodeId> {
-    let (projection, _) = family_projection(context, job_id).await?;
+    let (projected, _) = family_projection(context, job_id).await?;
+    let projection = projected.projection?;
     projection
         .executions
         .iter()
@@ -108,7 +110,11 @@ pub async fn family_responder(context: &DriverContext, job_id: JobId) -> Option<
 
 /// The current response shape, rebuilt from immutable records. Extra fields of
 /// the family model belong to the surface round, not to this routing swap.
-fn status_view(job_id: JobId, projection: &JobProjection, spec: &LogicalJobSpec) -> JobStatusView {
+pub(crate) fn status_view(
+    job_id: JobId,
+    projection: &JobProjection,
+    spec: &LogicalJobSpec,
+) -> JobStatusView {
     let (mode, bucket) = workspace_of(&spec.payload);
     let workspace_bucket = match mode {
         WorkspaceMode::Existing => bucket,
