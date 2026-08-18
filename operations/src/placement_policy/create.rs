@@ -468,6 +468,8 @@ mod tests {
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
     use crate::placement_policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
+    use aruna_core::handle::Handle;
+    use aruna_core::structs::verify_policy_authority;
     use aruna_core::structs::{PlacementSelector, RealmId};
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -588,6 +590,60 @@ mod tests {
         .expect("policy resolves");
         assert_eq!(read.policy.policy_ref(), policy_ref);
         assert_eq!(source, PolicySource::Local);
+    }
+
+    #[tokio::test]
+    async fn publishes_admin_authority() {
+        // What creation emits is exactly what an independent verifier accepts:
+        // the publication names this node and the realm admin who authorized it.
+        let (_dir, context, actor) = setup().await;
+        let document = drive(
+            CreatePolicyOperation::new(config(&actor, policy("eu-west"))),
+            &context,
+        )
+        .await
+        .expect("policy is created");
+
+        assert_eq!(document.publication.publisher, actor.node_id);
+        assert_eq!(document.publication.created_by, actor.user_id);
+        let realm_config = read_document(
+            &context,
+            DocumentSyncTarget::RealmConfig {
+                realm_id: actor.realm_id,
+            },
+        )
+        .await;
+        let realm_auth = read_document(
+            &context,
+            DocumentSyncTarget::RealmAuthorization {
+                realm_id: actor.realm_id,
+            },
+        )
+        .await;
+        assert_eq!(
+            verify_policy_authority(
+                &document,
+                &RealmConfigDocument::from_bytes(&realm_config).expect("config decodes"),
+                &aruna_core::structs::RealmAuthorizationDocument::from_bytes(&realm_auth)
+                    .expect("authorization decodes"),
+            ),
+            Ok(())
+        );
+    }
+
+    async fn read_document(context: &DriverContext, target: DocumentSyncTarget) -> Value {
+        let event = context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                txn_id: None,
+            }))
+            .await;
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.expect("row exists"),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
     }
 
     #[tokio::test]
