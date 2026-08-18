@@ -8,6 +8,7 @@
 
 pub mod cache;
 pub mod create;
+pub mod diagnostics;
 pub mod gate;
 pub mod read;
 pub mod resolve;
@@ -17,6 +18,9 @@ pub mod transport;
 
 pub use cache::{PolicyCacheEntry, PolicyCacheError, PolicyCacheStats};
 pub use create::{CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation};
+pub use diagnostics::{
+    CacheCoverage, CopyViolation, DiagnosticsInput, DiagnosticsReport, PolicyDiagnosticsOperation,
+};
 pub use gate::{
     GateContext, GatedBucket, PolicyGateConfig, PolicyGateError, PolicyGateOperation,
     PolicyGateOutcome, gate_decision, union_refs, write_gate,
