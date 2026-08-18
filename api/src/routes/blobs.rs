@@ -2,8 +2,10 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, blob_bucket_permission_path, blob_object_permission_path,
+    AuthContext, BucketInfo, Permission, VersionKey, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
+use aruna_operations::blob::head_contenders::{HeadContendersInput, HeadContendersOperation};
 use aruna_operations::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::location_summary::{
@@ -43,6 +45,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(BlobsApiDoc::openapi())
         .routes(routes!(replicate_blob))
         .routes(routes!(blob_locations))
+        .routes(routes!(blob_contenders))
 }
 
 /// Replication targets are few and operator-controlled, so the fan-out stays
@@ -689,6 +692,116 @@ fn add_candidate(candidates: &mut BTreeSet<Destination>, destination: Destinatio
     }
     candidates.insert(destination);
     true
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ContendersQuery {
+    pub bucket: String,
+    pub path: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BlobContendersResponse {
+    pub bucket: String,
+    pub key: String,
+    /// Head generation the audit read; absent from the request means the one
+    /// the current head names here.
+    pub generation: u64,
+    /// Every VersionId this node observed claiming that generation, ascending.
+    pub contenders: Vec<String>,
+    /// The generation holds more claimants than the bound allows, so this list
+    /// is a prefix of what happened, never the whole of it.
+    pub truncated: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/blobs/contenders",
+    tag = "blobs",
+    summary = "List the versions that claimed one head generation",
+    description = "Requires a bearer token issued by this realm and READ on the object. Concurrent writers in different partitions can each create a version that claims the same head generation; convergence then makes exactly one of them the current head and keeps every other one retrievable under its own VersionId. This route reports those claimants for one generation, which is how a caller learns that an object had concurrent versions without S3 GET or HEAD ever exposing a second head. The answer is responder-local: it lists what this node observed, so another node may have observed a claimant this one has not yet, and `truncated` means the generation holds more rows than the bounded scan reads. Omitting `generation` audits the generation the current head names here; naming an older one audits that history instead. It never changes a head and never selects a winner.",
+    params(
+        ("bucket" = String, Query, description = "Bucket holding the object, as known to this node"),
+        ("path" = String, Query, description = "Object key within the bucket, without a leading slash"),
+        ("version_id" = Option<String>, Query, description = "Version whose head the audit starts from, as a ULID; defaults to the current head and a malformed value is 400"),
+        ("generation" = Option<u64>, Query, description = "Exact head generation to audit; defaults to the generation the current head names")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Every VersionId this responder observed claiming the generation, ascending; the audited version appears when it was itself a claimant",
+            body = BlobContendersResponse,
+            example = json!({
+                "bucket": "lab-raw",
+                "key": "runs/2026-04-09/reads.fastq.gz",
+                "generation": 4,
+                "contenders": [
+                    "01JABCDEF0123456789ABCDEFG",
+                    "01JABCDEG0123456789ABCDEFG"
+                ],
+                "truncated": false
+            })
+        ),
+        (status = 400, description = "Malformed version id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the object", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn blob_contenders(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<ContendersQuery>,
+) -> ServerResult<Json<BlobContendersResponse>> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    let version_id = query
+        .version_id
+        .as_deref()
+        .map(ulid::Ulid::from_string)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest)?
+        .unwrap_or_else(ulid::Ulid::nil);
+    crate::auth::ensure_permission(
+        &state,
+        &auth,
+        blob_object_permission_path(
+            state.get_realm_id(),
+            load_bucket(&state, &query.bucket).await?.group_id,
+            state.get_node_id(),
+            &query.bucket,
+            &query.path,
+        ),
+        Permission::READ,
+    )
+    .await?;
+    let result = drive(
+        HeadContendersOperation::new(HeadContendersInput {
+            version: VersionKey::new(&query.bucket, &query.path, version_id),
+            generation: query.generation,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    Ok(Json(BlobContendersResponse {
+        bucket: query.bucket,
+        key: query.path,
+        generation: result.generation,
+        contenders: result
+            .contenders
+            .iter()
+            .map(ulid::Ulid::to_string)
+            .collect(),
+        truncated: result.truncated,
+    }))
 }
 
 #[cfg(test)]

@@ -234,6 +234,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "placement.rs",
+        "resolve_placement_quarantine",
+        "realm-admin WRITE checked inside ResolveQuarantineOperation",
+    ),
+    (
+        "placement.rs",
         "run_bucket_placement",
         "realm-admin WRITE checked inside PolicyBulkOperation",
     ),

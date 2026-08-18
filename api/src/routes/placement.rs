@@ -13,7 +13,7 @@ use crate::server_state::ServerState;
 use aruna_core::structs::{
     Actor, AuthContext, CurrentVersionPointer, LabelMatch, PlacementPolicy,
     PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
-    PolicyBlockedReason, PolicyBulkStatus,
+    PolicyBlockedReason, PolicyBulkStatus, VersionKey,
 };
 use aruna_operations::driver::{drive, gate_context};
 use aruna_operations::metadata::forward::MetadataWriteError;
@@ -24,7 +24,10 @@ use aruna_operations::placement_policy::diagnostics::{
 use aruna_operations::placement_policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
-use aruna_operations::placement_policy::{PolicyForwardError, create_policy_routed};
+use aruna_operations::placement_policy::{
+    PolicyForwardError, QuarantineError, ResolveQuarantineConfig, ResolveQuarantineOperation,
+    create_policy_routed,
+};
 use aruna_operations::s3::bucket_placement::{
     PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation,
 };
@@ -64,6 +67,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(mint_object_placement))
         .routes(routes!(run_bucket_placement))
         .routes(routes!(get_placement_coverage))
+        .routes(routes!(resolve_placement_quarantine))
 }
 
 /// A rule reference: the immutable policy id plus the digest of its definition.
@@ -1183,6 +1187,116 @@ pub async fn get_placement_diagnostics(
         cursor: report.cursor.map(hex::encode),
         complete: report.complete,
     }))
+}
+
+/// One quarantined copy an operator decides about, named exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct QuarantineResolveRequest {
+    /// `revalidate` re-evaluates every local copy against the current subject;
+    /// `release` first drops the local registrations of the named version.
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct QuarantineResolveResponse {
+    pub released: bool,
+    pub scanned: usize,
+    pub restored: usize,
+    pub quarantined: usize,
+    /// True once nothing quarantined remains: this node admits and serves
+    /// governed data again.
+    pub cleared: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/placement-quarantine",
+    tag = "placement",
+    summary = "Resolve the quarantined copies that block governed admission",
+    description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path, checked inside the operation. A subject transition, a rejoin or a failed revalidation leaves non-compliant copies quarantined, and while any of them remains this node serves no governed data and admits no new governed work, including new execution targets. This route is how an operator ends that state. List the quarantined copies with `GET /admin/placement-diagnostics` first: each violation names the exact bucket, key and version to act on. `action` of `revalidate` re-evaluates every local registration against the subject this node advertises now, restoring the ones that comply again; `action` of `release` additionally drops every local registration of the one named version first, which makes that version locally unavailable rather than serveable and never deletes data on another node. A release needs `bucket`, `key` and `version_id`; sending them with `revalidate` is refused so an accidental release is impossible. The block ends only when the walk finds nothing quarantined, which the response reports as `cleared`; a still-quarantined copy leaves the node draining, which is the safe state, not an error.",
+    request_body(
+        content = QuarantineResolveRequest,
+        description = "The decision plus, for a release, the exact version it applies to",
+        example = json!({
+            "action": "release",
+            "bucket": "datasets",
+            "key": "raw/sample.fastq",
+            "version_id": "01K2ZK4Q0X3D5M6P7R8S9T0V3B"
+        })
+    ),
+    responses(
+        (status = 200, description = "What the walk decided, and whether governed admission is open again", body = QuarantineResolveResponse, example = json!({
+            "released": true,
+            "scanned": 128,
+            "restored": 127,
+            "quarantined": 0,
+            "cleared": true
+        })),
+        (status = 400, description = "Unknown `action`, a release without an exact version, or a version that could not be parsed", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resolve_placement_quarantine(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<QuarantineResolveRequest>,
+) -> ServerResult<Json<QuarantineResolveResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let release = quarantine_release(&request)?;
+    let resolution = drive(
+        ResolveQuarantineOperation::new(ResolveQuarantineConfig {
+            auth_context: auth.clone(),
+            realm_id: auth.realm_id,
+            release,
+            now_ms: now_ms(),
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        QuarantineError::Unauthorized => ServerError::Forbidden,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    Ok(Json(QuarantineResolveResponse {
+        released: resolution.released,
+        scanned: resolution.scanned,
+        restored: resolution.restored,
+        quarantined: resolution.quarantined,
+        cleared: resolution.cleared,
+    }))
+}
+
+/// The version a release names, or `None` for a plain revalidation. A version
+/// sent with `revalidate` is refused rather than silently ignored.
+fn quarantine_release(request: &QuarantineResolveRequest) -> ServerResult<Option<VersionKey>> {
+    let named = request.bucket.is_some() || request.key.is_some() || request.version_id.is_some();
+    match request.action.as_str() {
+        "revalidate" if !named => Ok(None),
+        "release" => {
+            let (Some(bucket), Some(key), Some(version_id)) = (
+                request.bucket.as_deref(),
+                request.key.as_deref(),
+                request.version_id.as_deref(),
+            ) else {
+                return Err(ServerError::BadRequestReason(
+                    "a release names an exact bucket, key and version_id".to_string(),
+                ));
+            };
+            let version_id = Ulid::from_string(version_id).map_err(|_| ServerError::BadRequest)?;
+            Ok(Some(VersionKey::new(bucket, key, version_id)))
+        }
+        _ => Err(ServerError::BadRequestReason(
+            "action must be revalidate or release".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
