@@ -677,6 +677,9 @@ mod tests {
         operation.start();
         let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
         operation.step(stored(&record));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
 
         let effects = operation.step(page(vec![copy(ManagedCopyState::Registered, Vec::new())]));
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {

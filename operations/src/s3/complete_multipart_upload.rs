@@ -3174,7 +3174,7 @@ mod gate_tests {
         assert!(!composes(&effects));
         assert_eq!(
             operation.pending_error,
-            Some(CompleteMultipartUploadError::PolicyGateError(
+            Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Denied {
                     policy_ids: vec![rule.policy().policy_id]
                 }
@@ -3196,7 +3196,7 @@ mod gate_tests {
         assert!(!composes(&effects));
         assert!(matches!(
             operation.pending_error,
-            Some(CompleteMultipartUploadError::PolicyGateError(
+            Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Unavailable { .. }
             ))
         ));
@@ -3216,7 +3216,7 @@ mod gate_tests {
         assert!(!composes(&effects));
         assert_eq!(
             operation.pending_error,
-            Some(CompleteMultipartUploadError::PolicyGateError(
+            Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::NoSubject
             ))
         );
@@ -3252,7 +3252,7 @@ mod gate_tests {
 
         assert_eq!(
             operation.pending_error,
-            Some(CompleteMultipartUploadError::PolicyGateError(
+            Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Drift
             ))
         );

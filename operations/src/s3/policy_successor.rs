@@ -441,14 +441,7 @@ impl SuccessorMint {
         let version = self.plan.version_key(self.plan.expected_head.version_id);
         let refs = predecessor.placement_policies.clone();
         let reusable = page.entries.into_iter().find_map(|(key, record)| {
-            reusable_copy(
-                &key,
-                &record,
-                &version,
-                self.plan.subject.node_id,
-                hash,
-                &refs,
-            )
+            reusable_copy(&key, &record, &version, &self.plan.subject, hash, &refs)
         });
         match reusable {
             Some(location) => self.write_records(txn_id, Some(location)),
@@ -595,7 +588,7 @@ fn reusable_copy(
     key: &ManagedCopyKey,
     record: &ManagedCopyRecord,
     version: &VersionKey,
-    node_id: aruna_core::NodeId,
+    subject: &PlacementSubject,
     blob_hash: [u8; 32],
     refs: &[PlacementPolicyRef],
 ) -> Option<BackendLocation> {
@@ -604,9 +597,10 @@ fn reusable_copy(
     }
     let request = CopyRequest {
         key,
-        node_id: Some(node_id),
+        node_id: Some(subject.node_id),
         blake3: Some(blob_hash),
         refs,
+        subject_generation: Some(subject.generation),
     };
     let bytes = record.to_bytes().ok()?;
     let validated = validate_registration(Some(bytes.as_slice()), &request).ok()?;

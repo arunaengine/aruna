@@ -1619,9 +1619,11 @@ mod routing_test {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: None,
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"bucket".to_vec().into(), None),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1672,9 +1674,11 @@ mod routing_test {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: None,
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"bucket".to_vec().into(), None),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
@@ -1925,12 +1929,17 @@ mod test {
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == S3_BUCKET_KEYSPACE
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+                if reads.first().map(|(space, _)| space.as_str()) == Some(S3_BUCKET_KEYSPACE)
         ));
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"mybucket".to_vec().into(),
-            value: Some(recreated.to_bytes().unwrap().into()),
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    b"mybucket".to_vec().into(),
+                    Some(recreated.to_bytes().unwrap().into()),
+                ),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
 
         // The terminal state is complete, so this is the only chance to release
@@ -3686,9 +3695,9 @@ mod gate_test {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
         }
-        let (config_value, auth_value) = crate::placement_policy::tests::realm_view(
+        let (config_value, auth_value) = crate::placement_policy::fixtures::realm_view(
             &config,
-            crate::placement_policy::tests::admin_user(realm()),
+            crate::placement_policy::fixtures::admin_user(realm()),
         );
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {

@@ -52,7 +52,7 @@ pub(crate) mod fixtures {
     use std::collections::BTreeMap;
 
     use super::cache::{PolicyCacheEntry, cache_key};
-    pub(crate) use super::tests::signed_document;
+    pub(crate) use super::tests::{admin_user, realm_view, signed_document};
     use crate::driver::DriverContext;
 
     pub fn subject(node_id: NodeId, location: &str) -> PlacementSubject {

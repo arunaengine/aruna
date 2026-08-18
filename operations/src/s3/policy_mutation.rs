@@ -411,7 +411,7 @@ mod tests {
         // An authorized caller with an authenticated ref reaches the mint, and
         // the mint owns the assigned successor id.
         let policy = policy(1);
-        let mut operation = PolicyMutationOperation::new(config(&[policy.clone()]));
+        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
         operation.start();
         operation.step(authorized(true));
         let effects = operation.step(cached(&policy));

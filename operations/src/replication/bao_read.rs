@@ -1224,13 +1224,16 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, RealmConfigDocument,
-        RealmId, RealmNodeKind, VersionedObjectArn,
+        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, PlacementPolicyRef,
+        RealmConfigDocument, RealmId, RealmNodeKind, VersionedObjectArn,
     };
     use aruna_core::types::Effects;
     use ulid::Ulid;
 
-    use super::{BaoReadOperation, BaoReadOutput, IncomingBaoReadOperation, IncomingBaoReadResult};
+    use super::{
+        BaoReadError, BaoReadOperation, BaoReadOutput, IncomingBaoReadOperation,
+        IncomingBaoReadResult,
+    };
     use crate::replication::protocol::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage,
     };

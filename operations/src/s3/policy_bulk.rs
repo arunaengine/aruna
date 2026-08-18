@@ -1392,7 +1392,7 @@ mod tests {
             &context,
             fixture.realm_id,
             subject(fixture.node_id, "eu-west"),
-            &[unknown.clone()],
+            std::slice::from_ref(&unknown),
         )
         .await;
         set_default(&context, &fixture, vec![unknown.policy_ref()]).await;
@@ -1656,7 +1656,7 @@ mod tests {
             &context,
             fixture.realm_id,
             subject(fixture.node_id, "eu-west"),
-            &[second.clone()],
+            std::slice::from_ref(&second),
         )
         .await;
         set_default(&context, &fixture, vec![second.policy_ref()]).await;

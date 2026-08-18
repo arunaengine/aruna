@@ -2814,7 +2814,7 @@ mod tests {
     fn make_bucket_info(group_id: Ulid) -> BucketInfo {
         BucketInfo {
             group_id,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH,
             created_by: test_user_id(),
             cors_configuration: None,
             replication: None,
@@ -2824,7 +2824,7 @@ mod tests {
         }
     }
 
-    fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationManifest {
+    pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationManifest {
         let blob = match kind {
             ReplicationItemKind::Materialized => {
                 let location = make_location();
@@ -2891,7 +2891,7 @@ mod tests {
         }
     }
 
-    fn make_reference_manifest() -> VersionReplicationManifest {
+    pub(super) fn make_reference_manifest() -> VersionReplicationManifest {
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut source = make_source_binding();
         source.descriptor.kind = SourceConnectorKind::ArunaNative;
@@ -3095,17 +3095,26 @@ mod tests {
     }
 
     fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
+        start_apply_with(op, None)
+    }
+
+    /// `bucket` must echo what negotiation sealed, or None when no bucket was
+    /// read; the drift re-check compares the two.
+    fn start_apply_with(
+        op: &mut IncomingVersionReplicationOperation,
+        bucket: Option<aruna_core::types::Value>,
+    ) -> Ulid {
         let txn_id = Ulid::generate();
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
         op.destination_group_id = Some(Ulid::generate());
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let _effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_eq!(op.state, IncomingVersionReplicationState::CheckDrift);
         // The apply transaction re-reads the destination default and the local
         // subject before it exposes anything.
         let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(vec![0u8; 4].into(), None), (vec![1u8; 4].into(), None)],
+            values: vec![(vec![0u8; 4].into(), bucket), (vec![1u8; 4].into(), None)],
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::VerifyReplaced);
         assert!(matches!(
@@ -3308,7 +3317,10 @@ mod tests {
                 ReplicationNegotiationResult::NeedVersionOnly
             )
         ));
-        let txn_id = start_apply_transaction(&mut op);
+        let txn_id = start_apply_with(
+            &mut op,
+            Some(make_bucket_info(test_group_id()).to_bytes().unwrap().into()),
+        );
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(
@@ -3561,7 +3573,10 @@ mod tests {
                 ReplicationNegotiationResult::NeedVersionOnly
             )
         ));
-        let txn_id = start_apply_transaction(&mut op);
+        let txn_id = start_apply_with(
+            &mut op,
+            Some(make_bucket_info(test_group_id()).to_bytes().unwrap().into()),
+        );
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(

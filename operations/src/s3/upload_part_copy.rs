@@ -389,7 +389,7 @@ mod test {
             checksum_hint: None,
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
-            subject_generation: 0,
+            subject_generation: 1,
         };
         let event = context
             .storage_handle
