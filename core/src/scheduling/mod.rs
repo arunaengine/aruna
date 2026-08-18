@@ -11,7 +11,7 @@ mod digest;
 mod eligibility;
 mod facts;
 
-pub use cost::{InputRoute, LinkIndex, UNKNOWN_PERMILLE};
+pub use cost::{InputRoute, UNKNOWN_PERMILLE};
 pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
 pub use eligibility::{PolicyVerdict, RejectionVerdict};
 pub use facts::{
@@ -82,7 +82,7 @@ pub fn plan_execution(
 ) -> Result<ExecutionPlan, PlanError> {
     compute.validate()?;
     let request = request.canonical()?;
-    let links = LinkIndex::new(compute);
+    let links = cost::LinkIndex::new(compute);
     let mut ranked = Vec::new();
     let mut rejected = Vec::new();
 
@@ -147,7 +147,7 @@ pub fn plan_execution(
 fn routes(
     request: &PlanRequest,
     candidate: &TargetCandidate,
-    links: &LinkIndex<'_>,
+    links: &cost::LinkIndex<'_>,
 ) -> Result<Vec<InputRoute>, RejectionVerdict> {
     request
         .inputs

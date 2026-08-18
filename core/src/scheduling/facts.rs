@@ -4,9 +4,9 @@
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
 use crate::structs::{
-    ComputeConfigError, EffectiveResources, LabelMatch, MAX_POLICY_REFS, MAX_SELECTOR_LABELS,
-    PlacementPolicyError, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmNodeKind,
-    SubmissionId, VersionedObjectArn,
+    ComputeConfigError, EffectiveResources, LabelMatch, MAX_SELECTOR_LABELS, PlacementPolicyError,
+    PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmNodeKind, SubmissionId,
+    VersionedObjectArn,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -36,8 +36,6 @@ pub enum PlanError {
     CandidateCount,
     #[error("a request declares at most {MAX_SELECTOR_LABELS} required labels")]
     LabelCount,
-    #[error("a request carries at most {MAX_POLICY_REFS} output policy refs")]
-    OutputPolicyCount,
     #[error("destination key {key} is claimed by two inputs")]
     DuplicateInput { key: String },
     #[error("input {key} pins a version its source does not name")]
