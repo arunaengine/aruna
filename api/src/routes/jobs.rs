@@ -185,7 +185,7 @@ pub struct JobOutputResponse {
     /// may be a later, unrelated write.
     pub version_id: String,
     pub execution_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_path: String,
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]

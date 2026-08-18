@@ -69,7 +69,7 @@ pub struct JobAuditRecord {
     pub spec_digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_digest: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<JobOutputResponse>,
     pub at_ms: u64,
 }
@@ -251,6 +251,7 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
                         "job_id": "01JJRSTVWXYZ0123456789ABCD",
                         "canonical_alias": true,
                         "spec_digest": "7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e",
+                        "outputs": [],
                         "at_ms": 1755500000000u64
                     },
                     {
@@ -282,8 +283,7 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
         (status = 400, description = "Unknown `scope`, a cursor that is not a record key of this log, or a `limit` outside 1..=64", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
-        (status = 404, description = "No external job with that id is known here, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
-        (status = 503, description = "The family could not be reduced here right now; retryable", body = ErrorResponse)
+        (status = 404, description = "No external job with that id is known at this responder, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable, and a responder that never held the family answers the same way, so page the node that accepted the submission", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
