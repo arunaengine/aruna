@@ -216,7 +216,8 @@ pub struct JobFamilyResponse {
     pub aliases: Vec<String>,
     pub alias_count: u32,
     /// Other request families of the same submission: idempotency conflicts a
-    /// partition may have accepted elsewhere.
+    /// partition may have accepted elsewhere. Counted from a bounded scan, so a
+    /// very large family may understate it.
     pub conflict_count: u32,
     pub logical_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -684,7 +685,7 @@ fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> 
     path = "/jobs/",
     tag = "jobs",
     summary = "List the caller's jobs on this node",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused even for its own jobs. The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs this node owns, ordered newest first. Jobs owned by other nodes are never merged in, so a caller that submitted against another node pages that node's listing instead (submission answers with the owning node's base URL). Jobs the system creates for its own bookkeeping are never listed. `limit` defaults to 50 and is capped at 200, `cursor` continues a previous page, and a page without `next_cursor` is the last one.",
+    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused even for its own jobs. The page is self-scoped and node-local: it holds only jobs the caller submitted and only jobs this node owns, ordered newest first. Jobs recorded on other nodes are never merged in, so a caller that submitted against another node pages that node's listing instead (submission answers with the `origin_node_url` it was accepted at). A distributed execution job is listed where it was admitted or is running; read one by id for the replicated family view, which any node holding its records can answer. Jobs the system creates for its own bookkeeping are never listed. `limit` defaults to 50 and is capped at 200, `cursor` continues a previous page, and a page without `next_cursor` is the last one.",
     params(
         ("limit" = Option<usize>, Query, description = "Maximum jobs in one page. Default 50, clamped to at most 200; 0 is treated as unset"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous page's `next_cursor`: 24 bytes, base64url without padding. Anything else is rejected with 400. Absent starts at the newest job"),
