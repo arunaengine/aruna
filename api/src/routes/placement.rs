@@ -197,8 +197,10 @@ pub struct CoverageQuery {
     /// `current` (default) or `historical`.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Opaque continuation returned by the previous page.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Page bound; the server default applies when omitted.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -237,8 +239,10 @@ pub struct CoverageResponse {
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct DiagnosticsQuery {
+    /// Opaque continuation returned by the previous page.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Page bound; the server default applies when omitted.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -521,9 +525,20 @@ async fn bucket_info(
     tag = "placement",
     summary = "Publish an immutable placement policy",
     description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path; the check runs inside the operation, so a caller without it is refused before anything is written. The definition is immutable: publishing the same id with the same selectors returns the stored document unchanged, while the same id with different selectors is refused with 409 and never replaces the stored rule. Omitting `policy_id` mints one. The document is committed on a holder of the bucket its id resolves to; when this node holds none, the publication is forwarded to a current holder under the caller's own token, and that holder re-runs the same admin check, so a relay never becomes the author. A 503 means no holder could be reached or this node cannot sign, and nothing was published. The response carries the publisher, the authorizing user and the definition digest that every later reference must name.",
-    request_body = CreatePolicyRequest,
+    request_body(content = CreatePolicyRequest, example = json!({
+        "name": "eu-residency",
+        "allowed": [{ "location": "eu-west" }]
+    })),
     responses(
-        (status = 200, description = "The published document, or the identical one that already existed", body = PolicyResponse),
+        (status = 200, description = "The published document, or the identical one that already existed", body = PolicyResponse, example = json!({
+            "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+            "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+            "name": "eu-residency",
+            "allowed": [{ "location": "eu-west" }],
+            "publisher": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+            "created_by": "01K2ZK4Q0X3D5M6P7R8S9T0V2A@0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "created_at_ms": 1755500000000u64
+        })),
         (status = 400, description = "The definition is invalid, or an id, node id or digest could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
@@ -582,7 +597,15 @@ pub async fn create_placement_policy(
         ("digest" = String, Query, description = "Lowercase hex of the 32-byte definition digest")
     ),
     responses(
-        (status = 200, description = "The authenticated policy document", body = PolicyResponse),
+        (status = 200, description = "The authenticated policy document", body = PolicyResponse, example = json!({
+            "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+            "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+            "name": "eu-residency",
+            "allowed": [{ "location": "eu-west" }],
+            "publisher": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+            "created_by": "01K2ZK4Q0X3D5M6P7R8S9T0V2A@0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "created_at_ms": 1755500000000u64
+        })),
         (status = 400, description = "The id or digest could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm", body = ErrorResponse),
@@ -630,7 +653,14 @@ pub struct PolicyRefQuery {
     description = "Requires a bearer token issued for this realm. This is a node-local read of the replicated bucket record: a default written on another node can be missing until it arrives here. The `generation` is the counter every default change advances, and it is what a bulk run seals and what a compare-and-set update must present. A bucket that has never been given a default returns an empty list at its current generation.",
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     responses(
-        (status = 200, description = "The default ref set and the generation it was written at", body = BucketPlacementResponse),
+        (status = 200, description = "The default ref set and the generation it was written at", body = BucketPlacementResponse, example = json!({
+            "bucket": "datasets",
+            "policies": [{
+                "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+            }],
+            "generation": 3
+        })),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
@@ -662,9 +692,22 @@ pub async fn get_bucket_placement(
     summary = "Replace a bucket's default placement policies",
     description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path, checked inside the operation. The submitted list replaces the whole default set; an empty list clears it. Every ref is resolved and authenticated through the ordinary policy read before it can become a default, so a ref no holder can supply is refused with 503 and the stored default is untouched. A real change advances `placement_policy_generation` exactly once inside the same transaction; submitting the set that is already stored commits nothing and returns the current generation, so a replay cannot supersede a bulk run that sealed the same refs. Sending `expected_generation` makes the change a compare-and-set that is refused with 409 when another writer moved the default first. The default governs versions minted after it: stored versions keep their own refs until a successor is minted for them.",
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
-    request_body = BucketPlacementRequest,
+    request_body(content = BucketPlacementRequest, example = json!({
+        "policies": [{
+            "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+            "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+        }],
+        "expected_generation": 3
+    })),
     responses(
-        (status = 200, description = "The default set as stored, with the generation it now carries", body = BucketPlacementResponse),
+        (status = 200, description = "The default set as stored, with the generation it now carries", body = BucketPlacementResponse, example = json!({
+            "bucket": "datasets",
+            "policies": [{
+                "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+            }],
+            "generation": 4
+        })),
         (status = 400, description = "A ref could not be parsed, or the set is not a valid ref set", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
@@ -711,9 +754,26 @@ pub async fn put_bucket_placement(
     summary = "Attach an exact policy set to one object",
     description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path, checked inside the operation. This is an exact replacement, not a union: the successor carries exactly the submitted refs, so an explicit mutation may tighten or relax. Nothing stored is rewritten; a new version is minted that carries the new refs and the predecessor's bytes, and the predecessor keeps its own refs. The mutation advances the head only while it still is exactly `expected_version_id` at `expected_generation` and the bucket is still the same record, so a concurrent write is reported as 409 and the caller replans from the new head. Repeating the same `mutation_id` with the same parameters returns the version the first attempt assigned, which is what makes a lost response safe; the same id with different parameters is a 409. A materialized object needs a verified local copy of its bytes on a destination the new refs admit: without one the response is `blocked` with a reason and nothing was written, and the ordinary movement path has to stage and register compliant bytes first. A reference-only head mints a successor and registers no copy.",
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
-    request_body = ObjectPlacementRequest,
+    request_body(content = ObjectPlacementRequest, example = json!({
+        "key": "raw/sample.fastq",
+        "mutation_id": "01K2ZK4Q0X3D5M6P7R8S9T0V4C",
+        "expected_version_id": "01K2ZK4Q0X3D5M6P7R8S9T0V3B",
+        "expected_generation": 7,
+        "policies": [{
+            "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+            "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+        }]
+    })),
     responses(
-        (status = 200, description = "The minted, replayed or blocked outcome", body = ObjectPlacementResponse),
+        (status = 200, description = "The minted, replayed or blocked outcome", body = ObjectPlacementResponse, example = json!({
+            "outcome": "minted",
+            "version_id": "01K2ZK4Q0X3D5M6P7R8S9T0V5D",
+            "materialized": true,
+            "policies": [{
+                "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+            }]
+        })),
         (status = 400, description = "An id, version id or ref could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
@@ -805,9 +865,27 @@ fn mutation_response(outcome: SuccessorOutcome) -> ObjectPlacementResponse {
     summary = "Apply the bucket default to this responder's current heads",
     description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path, checked inside the operation. The first call under an `operation_id` seals the run against the bucket's exact identity, generation and default ref set; repeating that id resumes the sealed run, and every later pass is bound to what was sealed. The application is additive: each object's successor carries the union of the refs its head already had and the sealed target, so applying a default never removes a constraint. Exact replacement is a separate surface. One pass walks a bounded page of this responder's own heads and returns a `cursor` to continue with; heads that already carry the target and delete markers are counted as covered. An object whose bytes cannot be reused, whose destination the refs deny, or whose policy cannot be authenticated is retained as a durable blocked gap and retried by a later pass rather than being reported as done. A head that moved is replanned instead of advanced. When the bucket default changes the run is marked superseded and stops, so one run never mixes two policies. `complete` means this node's bounded iterator was exhausted, never that another partition converged.",
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
-    request_body = BulkRunRequest,
+    request_body(content = BulkRunRequest, example = json!({
+        "operation_id": "01K2ZK4Q0X3D5M6P7R8S9T0V6E",
+        "limit": 64
+    })),
     responses(
-        (status = 200, description = "What this pass observed, plus the resumable cursor and the run status", body = BulkRunResponse),
+        (status = 200, description = "What this pass observed, plus the resumable cursor and the run status", body = BulkRunResponse, example = json!({
+            "operation_id": "01K2ZK4Q0X3D5M6P7R8S9T0V6E",
+            "status": "active",
+            "generation": 3,
+            "target_policies": [{
+                "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+            }],
+            "observed": 64,
+            "covered": 58,
+            "minted": 4,
+            "replanned": 1,
+            "blocked": [{ "key": "raw/sample.fastq", "reason": "source_unavailable" }],
+            "cursor": "6b0d",
+            "complete": false
+        })),
         (status = 400, description = "The operation id or cursor could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
@@ -880,7 +958,29 @@ const SCAN_DEFAULT_LIMIT: usize = 128;
         CoverageQuery
     ),
     responses(
-        (status = 200, description = "The bounded, responder-local coverage page", body = CoverageResponse),
+        (status = 200, description = "The bounded, responder-local coverage page", body = CoverageResponse, example = json!({
+            "bucket": "datasets",
+            "scope": "current",
+            "generation": 3,
+            "target_policies": [{
+                "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+            }],
+            "observed": 64,
+            "deleted": 2,
+            "gaps": [{
+                "key": "raw/sample.fastq",
+                "version_id": "01K2ZK4Q0X3D5M6P7R8S9T0V3B",
+                "attachment": "missing",
+                "copy": "registered"
+            }],
+            "registered": 60,
+            "quarantined": 1,
+            "absent": 1,
+            "reference_only": 2,
+            "complete": true,
+            "limits": ["responder-local", "current-heads-only"]
+        })),
         (status = 400, description = "The scope, cursor or limit could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
@@ -985,7 +1085,32 @@ fn coverage_response(
     description = "Requires a bearer token issued for this realm and READ on the realm configuration path, checked inside the operation. Everything reported is an observation of this node's own rows: the placement subject it advertises, whether serving is currently blocked or draining, and a bounded page of its registered copies. A copy that is quarantined or was last seen on a departed node is listed as a violation with the refs it was registered under; a serveable registration is counted but never listed, and it is not by itself a compliance claim. Cache figures are diagnostics only and never policy truth: an evicted entry only costs a refetch, and a negative entry is an availability hint that expires. `complete` refers to this node's bounded copy iterator, and `cache_truncated` says the cache scan hit its own bound.",
     params(DiagnosticsQuery),
     responses(
-        (status = 200, description = "The responder-local enforcement, violation and cache page", body = DiagnosticsResponse),
+        (status = 200, description = "The responder-local enforcement, violation and cache page", body = DiagnosticsResponse, example = json!({
+            "subject_generation": 5,
+            "subject_location": "eu-west",
+            "policy_draining": false,
+            "serving_blocked": false,
+            "observed": 128,
+            "registered": 126,
+            "quarantined": 2,
+            "unresolved_departed": 0,
+            "violations": [{
+                "bucket": "datasets",
+                "key": "raw/sample.fastq",
+                "version_id": "01K2ZK4Q0X3D5M6P7R8S9T0V3B",
+                "state": "quarantined",
+                "policies": [{
+                    "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                    "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+                }]
+            }],
+            "cache_entries": 12,
+            "cache_verified": 11,
+            "cache_unavailable": 1,
+            "cache_bytes": 18432,
+            "cache_truncated": false,
+            "complete": true
+        })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse)
