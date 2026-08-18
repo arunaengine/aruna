@@ -11,8 +11,8 @@ use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{
     BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey,
-    JobRecordEnvelope, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim, RealmId,
-    ResolvedBackend, ResolvedSourceAccess, SubmissionId,
+    JobRecordEnvelope, JobRecordKind, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim,
+    RealmId, ResolvedBackend, ResolvedSourceAccess, SubmissionId,
 };
 use crate::task::TaskEffect;
 use crate::types::UserId;
@@ -300,6 +300,8 @@ pub enum FrameBoundsError {
     RecordCount,
     #[error("record must encode to at most {MAX_JOB_RECORD_BYTES} bytes")]
     RecordBytes,
+    #[error("frame must carry the one record kind it is defined for")]
+    RecordKind,
     #[error("page must encode to at most {MAX_JOB_RECORD_PAGE_BYTES} bytes")]
     PageBytes,
     #[error(transparent)]
@@ -428,6 +430,41 @@ impl TryFrom<JobRecordEnvelope> for JobRecordFrame {
     }
 }
 
+/// One bounded launch offer. Decoding rejects an oversized frame and any record
+/// that is not a launch, so a peer's offer is refused before the target does
+/// any admission work on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "JobRecordEnvelope")]
+pub struct LaunchFrame(JobRecordEnvelope);
+
+impl LaunchFrame {
+    pub fn new(envelope: JobRecordEnvelope) -> Result<Self, FrameBoundsError> {
+        if envelope.kind() != JobRecordKind::Launch {
+            return Err(FrameBoundsError::RecordKind);
+        }
+        if encoded_len(&envelope)? > MAX_JOB_RECORD_BYTES {
+            return Err(FrameBoundsError::RecordBytes);
+        }
+        Ok(Self(envelope))
+    }
+
+    pub fn envelope(&self) -> &JobRecordEnvelope {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> JobRecordEnvelope {
+        self.0
+    }
+}
+
+impl TryFrom<JobRecordEnvelope> for LaunchFrame {
+    type Error = FrameBoundsError;
+
+    fn try_from(envelope: JobRecordEnvelope) -> Result<Self, Self::Error> {
+        Self::new(envelope)
+    }
+}
+
 /// Fetch of one immutable placement-policy document from the holders the
 /// operation resolved. The adapter tries them in order and never routes; the
 /// operation verifies id, realm, and digest before it caches anything.
@@ -471,7 +508,7 @@ pub enum JobRecordEffect {
 pub struct LaunchOfferEffect {
     pub realm_id: RealmId,
     pub target: ExecutionTargetId,
-    pub launch: Box<JobRecordEnvelope>,
+    pub launch: Box<LaunchFrame>,
     pub deadline: Duration,
 }
 
@@ -613,6 +650,35 @@ pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvel
     JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
 }
 
+/// One signed launch whose encoded size grows with the executor-kind width.
+#[cfg(test)]
+fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
+    use crate::structs::{JobFamilyRecord, JobId, LaunchIntent, PlacementRef, SubmissionId};
+
+    let secret = iroh::SecretKey::from_bytes(&[4u8; 32]);
+    let record = JobFamilyRecord::Launch(Box::new(LaunchIntent {
+        launch_id: Ulid::from_bytes([8u8; 16]),
+        submission_id: SubmissionId([1u8; 32]),
+        request_digest: [2u8; 32],
+        job_id: JobId::from_bytes([5u8; 16]),
+        scheduler_node_id: secret.public(),
+        scheduler_seq: 0,
+        witness_placement: PlacementRef {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            shard: 2,
+        },
+        holder_generation: 3,
+        target: ExecutionTargetId {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            executor_kind: "d".repeat(kind_bytes),
+        },
+        plan_digest: [6u8; 32],
+        spec_digest: [7u8; 32],
+        created_at_ms: 1,
+    }));
+    JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,6 +761,39 @@ mod tests {
         let encoded = postcard::to_allocvec(&envelope).expect("record encodes");
         assert!(postcard::from_bytes::<JobRecordFrame>(&encoded).is_err());
         assert!(JobRecordFrame::new(sized_envelope(2, 8)).is_ok());
+    }
+
+    #[test]
+    fn bounds_launch_offer() {
+        // An offer is refused for size or kind before any admission work runs.
+        assert_eq!(
+            LaunchFrame::new(sized_launch(MAX_JOB_RECORD_BYTES)),
+            Err(FrameBoundsError::RecordBytes)
+        );
+        assert_eq!(
+            LaunchFrame::new(sized_envelope(1, 8)),
+            Err(FrameBoundsError::RecordKind)
+        );
+        let offered = sized_launch(8);
+        let frame = LaunchFrame::new(offered.clone()).expect("bounded launch");
+        assert_eq!(frame.envelope(), &offered);
+
+        let encoded = postcard::to_allocvec(&sized_envelope(1, 8)).expect("record encodes");
+        assert!(postcard::from_bytes::<LaunchFrame>(&encoded).is_err());
+        let oversized =
+            postcard::to_allocvec(&sized_launch(MAX_JOB_RECORD_BYTES)).expect("record encodes");
+        assert!(postcard::from_bytes::<LaunchFrame>(&oversized).is_err());
+    }
+
+    #[test]
+    fn launch_keeps_publisher() {
+        // Bounding an offer never rewrites what its scheduler signed.
+        let offered = sized_launch(8);
+        let frame = LaunchFrame::new(offered.clone()).expect("bounded launch");
+        let bytes = postcard::to_allocvec(&frame).expect("frame encodes");
+        let relayed: LaunchFrame = postcard::from_bytes(&bytes).expect("frame decodes");
+        assert_eq!(relayed.envelope(), &offered);
+        assert!(relayed.envelope().verify_signature().is_ok());
     }
 
     #[test]
