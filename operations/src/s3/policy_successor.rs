@@ -547,6 +547,7 @@ impl SuccessorMint {
                 self.plan.subject.node_id,
                 location,
                 &self.sealed_refs,
+                self.plan.subject.generation,
                 version_id.timestamp_ms(),
             )?);
         }

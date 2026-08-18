@@ -8,7 +8,7 @@ use crate::s3::checksum::{
     verify_trailer_stream,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
-use crate::s3::error::{IntoS3Error, routing_inputs_error};
+use crate::s3::error::{IntoS3Error, gate_context_error, routing_inputs_error};
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
@@ -1653,7 +1653,7 @@ impl S3 for ArunaS3Service {
         let input = convert_input(req.input)?;
         let gate = gate_context(&self.state, self.realm_id, now_ms())
             .await
-            .map_err(routing_inputs_error)?;
+            .map_err(gate_context_error)?;
         let mut operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
             group_id,
@@ -2221,7 +2221,7 @@ impl S3 for ArunaS3Service {
 
         let gate = gate_context(&self.state, self.realm_id, now_ms())
             .await
-            .map_err(routing_inputs_error)?;
+            .map_err(gate_context_error)?;
         let mut operation = CompleteMultipartUploadOperation::new(CMUI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),

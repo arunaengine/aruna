@@ -798,6 +798,9 @@ pub struct ManagedCopyRecord {
     pub location: BackendLocation,
     /// Refs sealed with the copy, canonically sorted. Empty means unrestricted.
     pub policies: Vec<PlacementPolicyRef>,
+    /// Subject generation the gate admitted this copy under. A later advance
+    /// makes the row evidence about a subject this node no longer advertises.
+    pub subject_generation: u64,
     pub registered_at_ms: u64,
     pub state: ManagedCopyState,
 }
@@ -816,9 +819,17 @@ impl ManagedCopyRecord {
             node_id,
             location,
             policies: PlacementPolicyRef::canonical_set(&policies)?,
+            subject_generation: 0,
             registered_at_ms,
             state,
         })
+    }
+
+    /// Seals the admitting subject generation. Zero means no gate ever ran, so
+    /// the row can never match a node that advertises a subject.
+    pub fn sealed_under(mut self, subject_generation: u64) -> Self {
+        self.subject_generation = subject_generation;
+        self
     }
 
     pub fn key(&self) -> ManagedCopyKey {

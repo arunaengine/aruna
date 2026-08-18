@@ -911,7 +911,7 @@ impl IncomingBaoReadOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
         };
-        let Some((copy, _)) = split_serve_reads(values).ok() else {
+        let Some((copy, subject)) = split_serve_reads(values).ok() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
         let (Some(location), Some(version)) =
@@ -927,6 +927,7 @@ impl IncomingBaoReadOperation {
                 node_id: Some(self.local_node),
                 blake3: self.blob_hash,
                 refs: &self.version_refs,
+                subject_generation: Some(subject.subject.generation),
             },
         )
         .is_err()

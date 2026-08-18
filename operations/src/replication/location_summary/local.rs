@@ -600,7 +600,7 @@ impl LocationSummaryOperation {
         let Some((key, location)) = self.pending_copy.take() else {
             return self.answer();
         };
-        let serveable = split_serve_reads(values).is_ok_and(|(copy, _)| {
+        let serveable = split_serve_reads(values).is_ok_and(|(copy, subject)| {
             validate_registration(
                 copy.as_deref(),
                 &CopyRequest {
@@ -608,6 +608,7 @@ impl LocationSummaryOperation {
                     node_id: self.local_node,
                     blake3: self.blake3,
                     refs: &self.version_refs,
+                    subject_generation: Some(subject.subject.generation),
                 },
             )
             .is_ok()

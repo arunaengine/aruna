@@ -4,12 +4,13 @@ use crate::blob::blob_keyspace_helper::{
 };
 use crate::blob::cleanup::PendingCleanup;
 use crate::blob::managed_copy::{
-    CopyRequest, ManagedCopyError, read_effect, register_effect, validate_registration,
+    CopyRequest, ManagedCopyError, register_effect, serve_reads, split_serve_reads,
+    validate_registration,
 };
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, union_refs,
-    write_gate,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
@@ -256,6 +257,15 @@ impl PutObjectOperation {
         self
     }
 
+    /// Subject generation the gate admitted this write under; zero for an
+    /// ungoverned write, which no subject ever evaluated.
+    fn sealed_subject(&self) -> u64 {
+        self.gated_bucket
+            .as_ref()
+            .and_then(|gated| gated.subject_generation)
+            .unwrap_or_default()
+    }
+
     /// Union of the destination default read in this transaction and whatever
     /// the write inherited. Both empty leaves the version ungoverned.
     fn effective_policies(&self) -> Vec<PlacementPolicyRef> {
@@ -337,7 +347,9 @@ impl PutObjectOperation {
             return self.emit_error(PutObjectError::InvalidPreassignedVersion);
         };
         let key = ManagedCopyKey::new(self.version_key(version_id), location.backend.clone());
-        let effect = match read_effect(&key, None) {
+        // The replay hands back bytes, so it answers the same question a serve
+        // does: is this copy registered *and* may this node serve at all.
+        let effect = match serve_reads(&key, None) {
             Ok(effect) => effect,
             Err(error) => return self.emit_error(error.into()),
         };
@@ -347,8 +359,12 @@ impl PutObjectOperation {
     }
 
     fn handle_preassigned_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let (value, subject) = match split_serve_reads(values) {
+            Ok(split) => split,
+            Err(error) => return self.emit_error(error.into()),
         };
         let (Some(version_id), Some(location)) = (self.version_id, self.replay_location.take())
         else {
@@ -362,6 +378,7 @@ impl PutObjectOperation {
                 node_id: Some(self.config.node_id),
                 blake3: None,
                 refs: &self.replay_policies,
+                subject_generation: Some(subject.subject.generation),
             },
         ) {
             Ok(_) => self.finish_replay(location),
@@ -411,12 +428,17 @@ impl PutObjectOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.emit_error(error.into()),
         };
-        let gated = GatedBucket::observe(bucket.as_ref());
-        let refs = match union_refs(&gated.policies, &self.inherited_policies) {
+        let refs = match union_refs(
+            &GatedBucket::observe(bucket.as_ref()).policies,
+            &self.inherited_policies,
+        ) {
             Ok(refs) => refs,
             Err(error) => return self.emit_error(error.into()),
         };
-        self.gated_bucket = Some(gated);
+        self.gated_bucket = Some(
+            GatedBucket::observe(bucket.as_ref())
+                .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
+        );
         match write_gate(self.gate_context.as_ref(), &refs) {
             Ok(None) => self.write_blob(),
             Ok(Some(mut gate)) => {
@@ -538,11 +560,7 @@ impl PutObjectOperation {
             // Read unconditionally: the version snapshots the default this
             // transaction observes, not one read before the bytes streamed.
             self.state = PutObjectState::CheckBucket;
-            smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key: self.config.request.bucket.as_bytes().into(),
-                txn_id: self.txn_id,
-            })]
+            smallvec![drift_reads(&self.config.request.bucket, self.txn_id)]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
@@ -569,15 +587,11 @@ impl PutObjectOperation {
     }
 
     fn handle_bucket_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
-        let current = match value
-            .as_ref()
-            .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(current) => current,
+        let (current, subject) = match split_drift_reads(values) {
+            Ok(split) => split,
             Err(error) => return self.emit_error(error.into()),
         };
         if self.expected_bucket.is_some()
@@ -592,12 +606,13 @@ impl PutObjectOperation {
         // The refs the version commits must be the refs the gate admitted: a
         // default changed while the bytes streamed was never evaluated.
         let observed = GatedBucket::observe(current.as_ref());
-        if self
-            .gated_bucket
-            .as_ref()
-            .is_some_and(|gated| gated != &observed)
-        {
-            return self.emit_error(PolicyGateError::Drift.into());
+        if let Some(gated) = self.gated_bucket.as_ref() {
+            if !gated.matches(&observed) {
+                return self.emit_error(PolicyGateError::Drift.into());
+            }
+            if let Err(error) = gated.check_subject(subject.as_ref()) {
+                return self.emit_error(error.into());
+            }
         }
         self.bucket_policies = observed.policies;
         self.start_fence()
@@ -885,6 +900,7 @@ impl PutObjectOperation {
             self.config.node_id,
             &location,
             &self.sealed_policies,
+            self.sealed_subject(),
             version_id.timestamp_ms(),
             self.txn_id,
         ) {

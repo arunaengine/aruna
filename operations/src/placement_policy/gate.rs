@@ -6,13 +6,15 @@
 //! authorization denied.
 
 use aruna_core::NodeId;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::Event;
+use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BucketIdentity, BucketInfo, PlacementDecision, PlacementPolicyRef, PlacementSubject,
-    PolicyResolution, RealmId, evaluate_placement,
+    BucketIdentity, BucketInfo, NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementDecision,
+    PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmId, evaluate_placement,
 };
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -187,6 +189,14 @@ pub enum PolicyGateError {
     Required { refs: Vec<PlacementPolicyRef> },
     #[error("the destination policy generation changed during this write")]
     Drift,
+    /// This node is mid-transition, so it admits nothing governed until its
+    /// inventory has been revalidated under the new subject.
+    #[error("this node is not admitting governed data right now")]
+    AdmissionStopped,
+    #[error("unexpected event during a placement drift re-check")]
+    InvalidEvent,
+    #[error(transparent)]
+    Conversion(#[from] aruna_core::errors::ConversionError),
     #[error(transparent)]
     Read(#[from] ReadPolicyError),
     #[error(transparent)]
@@ -239,6 +249,9 @@ pub struct GatedBucket {
     pub identity: Option<BucketIdentity>,
     pub generation: u64,
     pub policies: Vec<PlacementPolicyRef>,
+    /// Subject generation the gate ran against. `None` leaves the write
+    /// ungoverned, so no subject advance can invalidate it.
+    pub subject_generation: Option<u64>,
 }
 
 impl GatedBucket {
@@ -249,8 +262,79 @@ impl GatedBucket {
             policies: bucket
                 .map(|bucket| bucket.placement_policies.clone())
                 .unwrap_or_default(),
+            subject_generation: None,
         }
     }
+
+    /// Seals the subject the gate decided under. Only a governed write has one.
+    pub fn sealed_under(mut self, context: Option<&GateContext>, governed: bool) -> Self {
+        self.subject_generation = governed
+            .then(|| context.map(|c| c.subject.generation))
+            .flatten();
+        self
+    }
+
+    /// True when the destination facts the gate decided on still hold. The
+    /// sealed subject is checked separately, against the live subject row.
+    pub fn matches(&self, observed: &Self) -> bool {
+        self.identity == observed.identity
+            && self.generation == observed.generation
+            && self.policies == observed.policies
+    }
+
+    /// Re-check inside the exposing transaction. A missing subject row, an
+    /// advanced generation, or a node that entered draining all mean the copy
+    /// would commit refs that nothing evaluated against the current subject.
+    pub fn check_subject(
+        &self,
+        observed: Option<&NodeSubjectRecord>,
+    ) -> Result<(), PolicyGateError> {
+        let Some(sealed) = self.subject_generation else {
+            return Ok(());
+        };
+        match observed {
+            Some(record)
+                if record.subject.generation == sealed
+                    && !record.serving_blocked
+                    && !record.policy_draining =>
+            {
+                Ok(())
+            }
+            _ => Err(PolicyGateError::Drift),
+        }
+    }
+}
+
+/// Reads the destination bucket and the local subject in one round trip, so the
+/// exposing transaction re-checks every fact the gate decided on.
+pub fn drift_reads(bucket: &str, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::BatchRead {
+        reads: vec![
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.as_bytes().into()),
+            (
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                Key::from(NODE_SUBJECT_KEY.to_vec()),
+            ),
+        ],
+        txn_id,
+    })
+}
+
+/// Splits the `drift_reads` answer into the two records it re-checks.
+pub fn split_drift_reads(
+    values: Vec<(Key, Option<Value>)>,
+) -> Result<(Option<BucketInfo>, Option<NodeSubjectRecord>), PolicyGateError> {
+    let mut values = values.into_iter();
+    let (_, bucket) = values.next().ok_or(PolicyGateError::InvalidEvent)?;
+    let (_, subject) = values.next().ok_or(PolicyGateError::InvalidEvent)?;
+    Ok((
+        bucket
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?,
+        subject
+            .map(|value| NodeSubjectRecord::from_bytes(value.as_ref()))
+            .transpose()?,
+    ))
 }
 
 /// Union of what a write inherits and what its destination requires. A sender

@@ -525,7 +525,7 @@ impl GetObjectOperation {
                 received: event,
             });
         };
-        let (copy, _) = match split_serve_reads(values) {
+        let (copy, subject) = match split_serve_reads(values) {
             Ok(split) => split,
             Err(err) => return self.emit_error(err.into()),
         };
@@ -540,6 +540,7 @@ impl GetObjectOperation {
                 node_id: Some(self.input.node_id),
                 blake3: Some(key.blake3_hash),
                 refs: &self.source_policies,
+                subject_generation: Some(subject.subject.generation),
             },
         ) {
             return self.emit_error(err.into());

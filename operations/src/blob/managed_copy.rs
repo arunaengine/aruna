@@ -46,11 +46,18 @@ pub fn register_effect(
     node_id: NodeId,
     location: &BackendLocation,
     policies: &[PlacementPolicyRef],
+    subject_generation: u64,
     registered_at_ms: u64,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ManagedCopyError> {
-    let (key_space, key, value) =
-        register_entry(version, node_id, location, policies, registered_at_ms)?;
+    let (key_space, key, value) = register_entry(
+        version,
+        node_id,
+        location,
+        policies,
+        subject_generation,
+        registered_at_ms,
+    )?;
     Ok(Effect::Storage(StorageEffect::Write {
         key_space,
         key,
@@ -60,12 +67,14 @@ pub fn register_effect(
 }
 
 /// The same registration as a batch entry, for a transaction that commits the
-/// copy together with the version it belongs to.
+/// copy together with the version it belongs to. `subject_generation` is the
+/// one the gate admitted under, so the row names the subject that allowed it.
 pub fn register_entry(
     version: VersionKey,
     node_id: NodeId,
     location: &BackendLocation,
     policies: &[PlacementPolicyRef],
+    subject_generation: u64,
     registered_at_ms: u64,
 ) -> Result<(String, Key, Value), ManagedCopyError> {
     if location.staging || location.partial {
@@ -78,7 +87,8 @@ pub fn register_entry(
         policies.to_vec(),
         registered_at_ms,
         ManagedCopyState::Registered,
-    )?;
+    )?
+    .sealed_under(subject_generation);
     Ok((
         MANAGED_COPY_KEYSPACE.to_string(),
         record.key().to_bytes()?.into(),
@@ -134,6 +144,9 @@ pub struct CopyRequest<'a> {
     pub node_id: Option<NodeId>,
     pub blake3: Option<[u8; 32]>,
     pub refs: &'a [PlacementPolicyRef],
+    /// Subject generation this node advertises now. A governed row sealed under
+    /// an older one describes a subject that no longer exists here.
+    pub subject_generation: Option<u64>,
 }
 
 /// A registration is evidence only for the exact copy it was read for. A row
@@ -144,6 +157,7 @@ pub fn validate_registration(
     request: &CopyRequest<'_>,
 ) -> Result<ManagedCopyRecord, ManagedCopyError> {
     let record = check_serveable(value)?;
+    let refs = PlacementPolicyRef::canonical_set(request.refs)?;
     let matches = &record.key() == request.key
         && request
             .node_id
@@ -153,7 +167,11 @@ pub fn validate_registration(
             .is_none_or(|hash| record.location.get_blake3() == Some(hash.as_slice()))
         && !record.location.staging
         && !record.location.partial
-        && record.policies == PlacementPolicyRef::canonical_set(request.refs)?;
+        && (refs.is_empty()
+            || request
+                .subject_generation
+                .is_none_or(|generation| record.subject_generation == generation))
+        && record.policies == refs;
     match matches {
         true => Ok(record),
         false => Err(ManagedCopyError::Mismatched),
@@ -385,7 +403,7 @@ mod tests {
         // A staging or partial write must never become a serveable registration.
         for location in [location(true, false), location(false, true)] {
             assert_eq!(
-                register_effect(version(), node_id(), &location, &[], 7, None),
+                register_effect(version(), node_id(), &location, &[], 1, 7, None),
                 Err(ManagedCopyError::UnstableCopy)
             );
         }
@@ -399,6 +417,7 @@ mod tests {
             node_id(),
             &location(false, false),
             &[],
+            1,
             7,
             Some(txn_id),
         )
@@ -462,6 +481,7 @@ mod tests {
                     node_id: Some(node_id()),
                     blake3: None,
                     refs: &[],
+                    subject_generation: None,
                 }
             )
             .is_ok()
@@ -477,18 +497,21 @@ mod tests {
                 node_id: Some(node_id()),
                 blake3: None,
                 refs: &[],
+                subject_generation: None,
             },
             CopyRequest {
                 key: &key,
                 node_id: Some(iroh::SecretKey::from_bytes(&[1u8; 32]).public()),
                 blake3: None,
                 refs: &[],
+                subject_generation: None,
             },
             CopyRequest {
                 key: &key,
                 node_id: Some(node_id()),
                 blake3: Some([7u8; 32]),
                 refs: &[],
+                subject_generation: None,
             },
             CopyRequest {
                 key: &key,
@@ -498,6 +521,7 @@ mod tests {
                     policy_id: Ulid::from_bytes([1u8; 16]),
                     digest: [2u8; 32],
                 }],
+                subject_generation: None,
             },
         ] {
             assert_eq!(
@@ -694,8 +718,16 @@ mod tests {
     #[test]
     fn caller_supplies_time() {
         // Registration must not read a clock inside the sans-I/O operation.
-        let effect = register_effect(version(), node_id(), &location(false, false), &[], 42, None)
-            .expect("effect builds");
+        let effect = register_effect(
+            version(),
+            node_id(),
+            &location(false, false),
+            &[],
+            1,
+            42,
+            None,
+        )
+        .expect("effect builds");
         let Effect::Storage(StorageEffect::Write { value, .. }) = effect else {
             panic!("expected a storage write");
         };
@@ -863,6 +895,7 @@ mod driver_tests {
             record.node_id,
             &record.location,
             &record.policies,
+            record.subject_generation,
             record.registered_at_ms,
             None,
         )
@@ -1010,6 +1043,7 @@ mod driver_tests {
         // fixture must too or the row describes a different copy.
         if let Some(mut record) = read_copy(context, version_id).await {
             record.policies = version.placement_policies.clone();
+            record.subject_generation = 1;
             let _ = context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {

@@ -207,10 +207,17 @@ impl SubjectScanOperation {
         self.transition(record, state)
     }
 
+    /// A restored copy is re-sealed under the subject that just admitted it, so
+    /// its row never claims a generation this node no longer advertises.
     fn transition(&mut self, record: ManagedCopyRecord, state: ManagedCopyState) -> Effects {
-        if record.state == state {
+        let generation = match state {
+            ManagedCopyState::Registered => self.result.generation,
+            _ => record.subject_generation,
+        };
+        if record.state == state && record.subject_generation == generation {
             return self.next_copy();
         }
+        let record = record.sealed_under(generation);
         match transition_effect(&record, state, self.txn_id) {
             Ok(effect) => {
                 self.state = ScanState::Transition;

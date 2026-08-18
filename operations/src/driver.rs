@@ -120,11 +120,14 @@ pub fn now_ms() -> u64 {
 /// The destination this node evaluates governed writes and serves against.
 /// `None` means it has never advertised a subject, which fails every governed
 /// operation closed; an ungoverned one never consults it.
+///
+/// A node whose inventory is being revalidated refuses instead: new governed
+/// admissions stop the moment a transition, rejoin or departure is observed.
 pub async fn gate_context(
     context: &DriverContext,
     realm_id: RealmId,
     now_ms: u64,
-) -> Result<Option<GateContext>, RoutingInputsError> {
+) -> Result<Option<GateContext>, GateContextError> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -133,13 +136,29 @@ pub async fn gate_context(
             txn_id: None,
         })
         .await;
-    Ok(
-        parse_read(event, NodeSubjectRecord::from_bytes)?.map(|record| GateContext {
-            realm_id,
-            subject: record.subject,
-            now_ms,
-        }),
-    )
+    let Some(record) = parse_read(event, NodeSubjectRecord::from_bytes)
+        .map_err(RoutingInputsError::BucketRules)?
+    else {
+        return Ok(None);
+    };
+    if record.serving_blocked || record.policy_draining {
+        return Err(GateContextError::AdmissionStopped);
+    }
+    Ok(Some(GateContext {
+        realm_id,
+        subject: record.subject,
+        now_ms,
+    }))
+}
+
+/// Why a caller could not build a destination gate. Kept apart from routing so
+/// a refusing node is never mistaken for an unreadable record.
+#[derive(Debug, Error, PartialEq)]
+pub enum GateContextError {
+    #[error(transparent)]
+    Routing(#[from] RoutingInputsError),
+    #[error("this node is not admitting governed data right now")]
+    AdmissionStopped,
 }
 
 /// Routing inputs for one bucket write, assembled before the operation starts.

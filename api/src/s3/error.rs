@@ -2,7 +2,7 @@ use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
-use aruna_operations::driver::RoutingInputsError;
+use aruna_operations::driver::{GateContextError, RoutingInputsError};
 use aruna_operations::placement_policy::PolicyGateError;
 use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
 use aruna_operations::s3::bucket_cors::{
@@ -105,8 +105,10 @@ fn policy_gate_error(error: &PolicyGateError, action: &str) -> S3Error {
         PolicyGateError::Unavailable { .. }
         | PolicyGateError::Required { .. }
         | PolicyGateError::Drift
+        | PolicyGateError::AdmissionStopped
         | PolicyGateError::Read(_) => placement_unavailable_error(),
         PolicyGateError::Invalid | PolicyGateError::Policy(_) => placement_denied_error(action),
+        PolicyGateError::InvalidEvent | PolicyGateError::Conversion(_) => internal_error(error),
     }
 }
 
@@ -126,6 +128,15 @@ fn backend_full_error(backend: &str) -> S3Error {
 pub(crate) fn routing_inputs_error(error: RoutingInputsError) -> S3Error {
     warn!(error = %error, "Refusing write with unreadable routing inputs");
     s3_error!(InternalError, "Storage routing inputs are unavailable")
+}
+
+/// A node mid-transition admits nothing governed. The refusal is retryable and
+/// says nothing about which rule or subject is being revalidated.
+pub(crate) fn gate_context_error(error: GateContextError) -> S3Error {
+    match error {
+        GateContextError::Routing(error) => routing_inputs_error(error),
+        GateContextError::AdmissionStopped => placement_unavailable_error(),
+    }
 }
 
 fn no_such_upload_error() -> S3Error {
@@ -429,6 +440,7 @@ impl IntoS3Error for CopyObjectError {
             CopyObjectError::Get(err) => err.into_s3_error(),
             CopyObjectError::Put(err) => err.into_s3_error(),
             CopyObjectError::Routing(err) => routing_inputs_error(err),
+            CopyObjectError::Gate(err) => gate_context_error(err),
             CopyObjectError::PreconditionFailed => s3_error!(
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."

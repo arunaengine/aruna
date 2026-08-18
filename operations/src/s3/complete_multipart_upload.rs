@@ -6,8 +6,8 @@ use crate::blob::cleanup::{PendingCleanup, schedule_blob_cleanup_effect};
 use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, union_refs,
-    write_gate,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
@@ -272,6 +272,15 @@ impl CompleteMultipartUploadOperation {
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
         self.restrictions = restrictions;
         self
+    }
+
+    /// Subject generation the gate admitted this completion under; zero for an
+    /// ungoverned object, which no subject ever evaluated.
+    fn sealed_subject(&self) -> u64 {
+        self.gated_bucket
+            .as_ref()
+            .and_then(|gated| gated.subject_generation)
+            .unwrap_or_default()
     }
 
     /// The terminal state is complete, so the driver never calls `abort` for us;
@@ -736,17 +745,19 @@ impl CompleteMultipartUploadOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.schedule_error(error.into()),
         };
-        let gated = GatedBucket::observe(bucket.as_ref());
         let inherited = self
             .upload_record
             .as_ref()
             .map(|upload| upload.placement_policies.clone())
             .unwrap_or_default();
-        let refs = match union_refs(&gated.policies, &inherited) {
+        let refs = match union_refs(&GatedBucket::observe(bucket.as_ref()).policies, &inherited) {
             Ok(refs) => refs,
             Err(error) => return self.schedule_error(error.into()),
         };
-        self.gated_bucket = Some(gated);
+        self.gated_bucket = Some(
+            GatedBucket::observe(bucket.as_ref())
+                .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
+        );
         match write_gate(self.gate_context.as_ref(), &refs) {
             Ok(None) => self.compose_blob(),
             Ok(Some(mut gate)) => {
@@ -854,38 +865,29 @@ impl CompleteMultipartUploadOperation {
         // The version snapshots the default this transaction observes, not one
         // read while the parts were still being uploaded.
         self.state = CompleteMultipartUploadState::ReadBucketDefault;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
+        smallvec![drift_reads(&self.input.bucket, self.txn_id)]
     }
 
     fn handle_default_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
-        match value
-            .as_ref()
-            .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(bucket) => {
-                // The refs the version commits must be the refs the gate
-                // admitted: a default changed during the compose was never
-                // evaluated against this node.
-                let observed = GatedBucket::observe(bucket.as_ref());
-                if self
-                    .gated_bucket
-                    .as_ref()
-                    .is_some_and(|gated| gated != &observed)
-                {
-                    return self.schedule_error(PolicyGateError::Drift.into());
-                }
-                self.bucket_policies = observed.policies;
-            }
+        let (bucket, subject) = match split_drift_reads(values) {
+            Ok(split) => split,
             Err(error) => return self.schedule_error(error.into()),
+        };
+        // The refs the version commits must be the refs the gate admitted: a
+        // default or subject changed during the compose was never evaluated.
+        let observed = GatedBucket::observe(bucket.as_ref());
+        if let Some(gated) = self.gated_bucket.as_ref() {
+            if !gated.matches(&observed) {
+                return self.schedule_error(PolicyGateError::Drift.into());
+            }
+            if let Err(error) = gated.check_subject(subject.as_ref()) {
+                return self.schedule_error(error.into());
+            }
         }
+        self.bucket_policies = observed.policies;
 
         let Some(location) = self.composed_location.clone() else {
             return self
@@ -1193,6 +1195,7 @@ impl CompleteMultipartUploadOperation {
             self.input.node_id,
             &location,
             &self.sealed_policies,
+            self.sealed_subject(),
             version_id.timestamp_ms(),
             self.txn_id,
         ) {

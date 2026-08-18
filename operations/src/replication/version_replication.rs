@@ -2033,7 +2033,7 @@ impl Operation for ReplicateObjectVersionOperation {
                         received: event,
                     });
                 };
-                let (copy, _) = match split_serve_reads(values) {
+                let (copy, subject) = match split_serve_reads(values) {
                     Ok(split) => split,
                     Err(error) => return self.fail(error.into()),
                 };
@@ -2047,6 +2047,7 @@ impl Operation for ReplicateObjectVersionOperation {
                         node_id: None,
                         blake3: None,
                         refs: &self.version_policies,
+                        subject_generation: Some(subject.subject.generation),
                     },
                 ) {
                     return self.fail(error.into());

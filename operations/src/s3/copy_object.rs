@@ -1,5 +1,6 @@
 use crate::driver::{
-    DriverContext, RoutingInputsError, drive, gate_context, now_ms, routing_snapshot,
+    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
+    routing_snapshot,
 };
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -58,6 +59,8 @@ pub enum CopyObjectError {
     Put(#[from] PutObjectError),
     #[error(transparent)]
     Routing(#[from] RoutingInputsError),
+    #[error(transparent)]
+    Gate(#[from] GateContextError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
 }

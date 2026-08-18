@@ -7,7 +7,8 @@ use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
 use crate::placement_policy::{
-    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, union_refs, write_gate,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
@@ -65,6 +66,7 @@ enum IncomingVersionReplicationState {
     SendNegotiation,
     ReceiveBlob,
     StartTransaction,
+    CheckDrift,
     VerifyReplaced,
     ReadReplacedMetadata,
     DeleteReplacedMetadata,
@@ -229,6 +231,9 @@ pub struct IncomingVersionReplicationOperation {
     /// Refs the gate admitted: the manifest's set unioned with what the local
     /// version already carried, so a sender cannot drop an inherited ref.
     gated_refs: Vec<PlacementPolicyRef>,
+    /// Destination facts the gate decided on, re-read inside the apply
+    /// transaction so a default or subject change cannot expose a stale replica.
+    gated_bucket: Option<GatedBucket>,
     pending_negotiation: Option<ReplicationNegotiationResult>,
 }
 
@@ -283,6 +288,7 @@ impl IncomingVersionReplicationOperation {
             gate_context: None,
             gate: None,
             gated_refs: Vec::new(),
+            gated_bucket: None,
             pending_negotiation: None,
         }
     }
@@ -339,6 +345,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::SendNegotiation => "SendNegotiation",
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
+            IncomingVersionReplicationState::CheckDrift => "CheckDrift",
             IncomingVersionReplicationState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
             IncomingVersionReplicationState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
@@ -825,16 +832,25 @@ impl IncomingVersionReplicationOperation {
         ) {
             return self.reply_negotiation(result);
         }
-        let inherited = self
+        let mut inherited = self
             .replaced_version
             .as_ref()
             .map(|version| version.placement_policies.clone())
             .unwrap_or_default();
+        // The local default governs this copy too: a sender's manifest can only
+        // add refs to what this destination already requires.
+        if let Some(gated) = self.gated_bucket.as_ref() {
+            inherited.extend(gated.policies.iter().copied());
+        }
         let refs = match union_refs(&self.manifest.placement_policies, &inherited) {
             Ok(refs) => refs,
             Err(error) => return self.reject_negotiation(error.into()),
         };
         self.gated_refs = refs.clone();
+        self.gated_bucket = self
+            .gated_bucket
+            .take()
+            .map(|gated| gated.sealed_under(self.gate_context.as_ref(), !refs.is_empty()));
         match write_gate(self.gate_context.as_ref(), &refs) {
             Ok(None) => self.reply_negotiation(result),
             Ok(Some(mut gate)) => {
@@ -934,6 +950,22 @@ impl IncomingVersionReplicationOperation {
             limit: 10_000,
             txn_id: self.txn_id,
         })]
+    }
+
+    /// Re-reads the facts the negotiation gate decided on, inside the very
+    /// transaction that exposes the replica.
+    fn check_drift(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::CheckDrift;
+        smallvec![drift_reads(&self.manifest.bucket, self.txn_id)]
+    }
+
+    /// Subject generation the gate admitted this replica under; zero when the
+    /// version is ungoverned.
+    fn sealed_subject(&self) -> u64 {
+        self.gated_bucket
+            .as_ref()
+            .and_then(|gated| gated.subject_generation)
+            .unwrap_or_default()
     }
 
     fn verify_replaced(&mut self) -> Effects {
@@ -1353,6 +1385,7 @@ impl IncomingVersionReplicationOperation {
                 self.local_node_id,
                 &location,
                 &self.gated_refs,
+                self.sealed_subject(),
                 self.manifest.version_id.timestamp_ms(),
                 self.txn_id,
             ) {
@@ -1851,6 +1884,7 @@ impl Operation for IncomingVersionReplicationOperation {
                 );
 
                 self.destination_group_id = Some(bucket_info.group_id);
+                self.gated_bucket = Some(GatedBucket::observe(Some(&bucket_info)));
                 self.destination_rules = bucket_info.storage_routing;
                 self.load_destination_routing()
             }
@@ -2243,6 +2277,29 @@ impl Operation for IncomingVersionReplicationOperation {
                     txn_id = %txn_id,
                     "Started incoming replication transaction"
                 );
+                self.check_drift()
+            }
+            IncomingVersionReplicationState::CheckDrift => {
+                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                        received: event,
+                    });
+                };
+                let (bucket, subject) = match split_drift_reads(values) {
+                    Ok(split) => split,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let observed = GatedBucket::observe(bucket.as_ref());
+                if let Some(gated) = self.gated_bucket.as_ref() {
+                    if !gated.matches(&observed) {
+                        return self.fail(PolicyGateError::Drift.into());
+                    }
+                    if let Err(error) = gated.check_subject(subject.as_ref()) {
+                        return self.fail(error.into());
+                    }
+                }
                 self.verify_replaced()
             }
             IncomingVersionReplicationState::VerifyReplaced => {
