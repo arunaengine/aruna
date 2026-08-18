@@ -135,7 +135,8 @@ async fn separates_peer_authority() {
 #[tokio::test]
 async fn refuses_unknown_offer() {
     // A launch offer from a node outside the realm is declined before any
-    // admission work; an authenticated one is retained and left undecided.
+    // admission work, and an offer naming another target is not this node's
+    // launch to accept.
     let (_dir, context, net, family) = fixture().await;
     let spec = family.spec();
     let launch = family.launch(&spec, family.holder.public(), 0);
@@ -152,7 +153,9 @@ async fn refuses_unknown_offer() {
     );
     assert_eq!(
         serve_launch_offer(&context, super::fixture::node(2), offer).await,
-        MetadataTransportMessage::ForwardedWriteUnavailable
+        MetadataTransportMessage::ForwardedLaunchOffer {
+            result: Err(LaunchDecline::Unauthorized),
+        }
     );
     net.shutdown().await;
 }

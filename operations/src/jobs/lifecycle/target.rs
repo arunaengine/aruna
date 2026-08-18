@@ -273,7 +273,7 @@ fn spec_of(records: &[JobRecordEnvelope], intent: &LaunchIntent) -> Option<Logic
 
 /// The receipt this target already issued for the same launch id. A different
 /// launch digest under one id is a conflict, never a second acceptance.
-fn existing_receipt(
+pub(crate) fn existing_receipt(
     records: &[JobRecordEnvelope],
     intent: &LaunchIntent,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {

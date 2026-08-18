@@ -15,6 +15,7 @@ use crate::jobs::lifecycle::reservation::{
     ExecutionReservation, ReleaseExecutionOperation, ReserveExecutionConfig,
     ReserveExecutionOperation, fits, held_reservations, job_reservation,
 };
+use crate::jobs::lifecycle::target::existing_receipt;
 use crate::jobs::lifecycle::updates::chain_for;
 use crate::jobs::records::tests::fixture::{Family, REALM, context};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
@@ -222,4 +223,36 @@ async fn output_binds_receipt() {
     assert_eq!(chain.family, family.family());
     assert_eq!(chain.spec_digest, spec.spec_digest);
     assert_eq!(chain.receipt_digest, receipt.digest().expect("digest"));
+}
+
+#[test]
+fn replays_launch_offer() {
+    // Replaying one launch returns the receipt already issued for it, while the
+    // same launch id under different bytes is a conflict, never a second run.
+    let family = Family::new([1u8; 32]);
+    let spec = family.spec();
+    let launch = family.launch(&spec, family.holder.public(), 0);
+    let receipt = family.receipt(&launch, 1);
+    let records = vec![family.sign(
+        &family.target,
+        JobFamilyRecord::Receipt(Box::new(receipt.clone())),
+    )];
+
+    let replayed = existing_receipt(&records, &launch).expect("receipt is known");
+    assert_eq!(
+        replayed.expect("receipt frame").envelope().digest(),
+        family
+            .sign(
+                &family.target,
+                JobFamilyRecord::Receipt(Box::new(receipt.clone()))
+            )
+            .digest()
+    );
+
+    let mut altered = launch.clone();
+    altered.plan_digest = [9u8; 32];
+    assert_eq!(
+        existing_receipt(&records, &altered),
+        Some(Err(aruna_core::events::LaunchDecline::LaunchConflict))
+    );
 }
