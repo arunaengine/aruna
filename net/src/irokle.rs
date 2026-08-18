@@ -10489,6 +10489,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opener_declares_this_format() {
+        // Two same-format peers must pass the fence: our own opener carries the
+        // tag the admission check demands, so bootstrap is unaffected.
+        let root = TempDir::new().expect("tempdir");
+        let service = open_restart_service(root.path(), "storage").await;
+        let topic = DocumentSyncTarget::RealmConfig {
+            realm_id: restart_realm(),
+        }
+        .sync_topic_id(restart_realm(), &PlacementRef::NIL);
+        service
+            .ensure_document_sync_topics(&[topic], Vec::new())
+            .expect("topics are created");
+
+        let open = SyncMessage::Open(service.node().sync_open(topic));
+
+        assert_eq!(admit_realm_format(&[open]), Ok(()));
+    }
+
+    #[tokio::test]
     async fn admits_known_peers() {
         // An inbound sync stream is refused before any read unless the pusher
         // is a configured realm peer.

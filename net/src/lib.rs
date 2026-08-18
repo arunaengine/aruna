@@ -3411,6 +3411,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_predecessor_alpn() -> Result<()> {
+        // An old peer must fail negotiation. It may never reach a handler and
+        // decode current frames as if they were its own.
+        let (accepting, _dir) = test_net_handle().await?;
+        let dialer = Endpoint::builder(presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[77u8; 32]))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .expect("bind addr configures")
+            .bind()
+            .await
+            .expect("dialer endpoint binds");
+
+        assert!(
+            dialer
+                .connect(accepting.endpoint_addr(), b"aruna/bao/1")
+                .await
+                .is_err()
+        );
+        assert!(
+            dialer
+                .connect(accepting.endpoint_addr(), Alpn::Bao.as_bytes())
+                .await
+                .is_ok()
+        );
+
+        accepting.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn outbound_streams_reuse_pooled_connection() -> Result<()> {
         let (a, _a_dir) = test_net_handle().await?;
         let (b, _b_dir) = test_net_handle().await?;
