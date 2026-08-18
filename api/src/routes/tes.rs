@@ -15,7 +15,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
-use aruna_operations::jobs::lifecycle::submit_external_job;
+use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
 };
@@ -667,13 +667,22 @@ pub async fn get_task(
         Ok(token) => token,
         Err(error) => return TesError::from_server(error).into_response(),
     };
-    // The owner is the sole 404 authority; a non-owner routes or reports 503.
-    let record =
-        match read_record_routed(&state.get_ctx(), caller.auth.user_id, job_id, forwarded).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return TesError::not_found("TES task not found").into_response(),
-            Err(error) => return TesError::from_job_route(error).into_response(),
-        };
+    // A distributed external job is projected from the replicated family, so
+    // this surface reports the same logical view and the same exact output
+    // VersionIds as the native REST status.
+    let record = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
+        Some(Ok(report)) => family_record(&report),
+        Some(Err(error)) => return TesError::from_job_route(error).into_response(),
+        // The owner is the sole 404 authority; a non-owner routes or reports 503.
+        None => {
+            match read_record_routed(&state.get_ctx(), caller.auth.user_id, job_id, forwarded).await
+            {
+                Ok(Some(record)) => record,
+                Ok(None) => return TesError::not_found("TES task not found").into_response(),
+                Err(error) => return TesError::from_job_route(error).into_response(),
+            }
+        }
+    };
     // Only execution jobs are TES tasks; other job kinds are not addressable here.
     if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
@@ -1225,6 +1234,38 @@ fn tes_state(record: &JobRecord) -> TesState {
         },
         JobState::Cancelled => TesState::Canceled,
     }
+}
+
+/// The reduced family as the local row shape every TES projection reads. Only
+/// the canonical successful execution supplies outputs, and they keep their
+/// exact VersionIds, so a later unrelated write never becomes this task's
+/// result.
+fn family_record(report: &FamilyReport) -> JobRecord {
+    let mut record = JobRecord::new(
+        report.job.job_id,
+        JobPayload::Execution(report.spec.payload.clone()),
+        report.spec.created_by,
+        report.spec.origin_node_id,
+        report.spec.created_at_ms,
+        report.job.updated_at_ms,
+        None,
+    );
+    record.state = report.job.state;
+    record.attempts = report.job.attempts;
+    record.cancel_requested = report.cancel_requested;
+    record.workspace_mode = report.job.workspace_mode;
+    record.workspace_bucket = report.job.workspace_bucket.clone();
+    record.finished_at_ms = report.job.finished_at_ms;
+    record.result =
+        (report.job.state == JobState::Succeeded).then(|| JobResultPayload::Execution {
+            exit_code: None,
+            workspace_bucket: report.job.workspace_bucket.clone(),
+            outputs: report.outputs.clone(),
+            stdout: String::new(),
+            stderr: String::new(),
+            output_digest: None,
+        });
+    record
 }
 
 fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
@@ -2439,6 +2480,139 @@ mod tests {
             )
         );
         assert_eq!(full.logs[0].outputs[0].path, "/out/report.txt");
+    }
+
+    #[test]
+    fn family_keeps_exact_versions() {
+        // The TES view of a distributed job is the same logical projection as
+        // the native REST one: the canonical execution's exact VersionIds, and
+        // no result at all while the family has no canonical success.
+        use aruna_core::jobs::{JobKind, JobStatusView};
+        use aruna_core::structs::{
+            EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
+            LogicalJobState, OutputObject, PlacementRef, RealmId, SubmissionId, WorkspaceMode,
+        };
+        use aruna_operations::jobs::lifecycle::FamilyReport;
+
+        let realm_id = RealmId([1u8; 32]);
+        let created_by = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let submission_id = SubmissionId([5u8; 32]);
+        let resources = EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 1,
+            disk_bytes: 0,
+            max_walltime_ms: 1_000,
+            preemptible: false,
+        };
+        let mut payload = ExecutionSpec {
+            group_id: Ulid::from_bytes([6u8; 16]),
+            name: None,
+            description: None,
+            tags: BTreeMap::new(),
+            image: "img".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            workdir: None,
+            env: BTreeMap::new(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+        payload.name = Some("family task".to_string());
+        let spec = LogicalJobSpec {
+            submission_id,
+            job_id,
+            origin_node_id: node_id,
+            realm_id,
+            group_id: payload.group_id,
+            created_by,
+            created_at_ms: 10,
+            payload,
+            request_digest: [7u8; 32],
+            spec_digest: [8u8; 32],
+            resources,
+            retry: JobRetryPolicy {
+                max_launches_per_witness: 3,
+            },
+            admission: JobAdmissionRecord {
+                submission_id,
+                request_digest: [7u8; 32],
+                job_id,
+                group_id: Ulid::from_bytes([6u8; 16]),
+                admitting_node_id: node_id,
+                membership_generation: 0,
+                resources,
+                admitted_at_ms: 10,
+            },
+            placement: PlacementRef::NIL,
+        };
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        let execution_id = Ulid::from_bytes([10u8; 16]);
+        let report = FamilyReport {
+            job: JobStatusView {
+                job_id,
+                created_by,
+                kind: JobKind::Execution,
+                state: JobState::Succeeded,
+                attempts: 2,
+                cancel_requested: false,
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                finished_at_ms: Some(20),
+                progress: JobProgress::new("phases"),
+                last_error: None,
+                result: None,
+                workspace_bucket: Some("ws".to_string()),
+                workspace_mode: WorkspaceMode::Kept,
+            },
+            spec,
+            submission_id,
+            request_digest: [7u8; 32],
+            canonical_job_id: job_id,
+            aliases: vec![job_id],
+            conflicts: 0,
+            state: LogicalJobState::Succeeded,
+            canonical_execution_id: Some(execution_id),
+            executions: 2,
+            duplicate_successes: 1,
+            outputs: vec![OutputObject {
+                bucket: "dest".to_string(),
+                key: "out/r.txt".to_string(),
+                version_id,
+                execution_id,
+                container_path: "/out/report.txt".to_string(),
+                size: 12,
+                digest: None,
+            }],
+            revision: 3,
+            digest: [11u8; 32],
+            cancel_requested: false,
+            responder: Some(node_id),
+            partial: false,
+            locally_exhausted: false,
+            plan: None,
+        };
+
+        let task = project_task(&family_record(&report), TesView::Full, "http://x");
+
+        assert_eq!(task.state, Some(TesState::Complete));
+        assert_eq!(
+            task.logs[0].outputs[0].url,
+            format!("s3://dest/out/r.txt?versionId={version_id}")
+        );
+
+        let mut running = report.clone();
+        running.job.state = JobState::Running;
+        running.state = LogicalJobState::Running;
+        let pending = project_task(&family_record(&running), TesView::Full, "http://x");
+        assert_eq!(pending.state, Some(TesState::Running));
+        assert!(pending.logs[0].outputs.is_empty());
     }
 
     #[test]
