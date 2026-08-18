@@ -191,19 +191,23 @@ impl ReadPolicyOperation {
     }
 
     fn plan_fetch(&mut self) -> Result<Effects, ReadPolicyError> {
-        let config = match self.realm.as_ref() {
-            Some(realm) => realm.config.clone(),
-            None => return Err(ReadPolicyError::RealmConfigMissing),
+        let holders = {
+            let Some(realm) = self.realm.as_ref() else {
+                return Err(ReadPolicyError::RealmConfigMissing);
+            };
+            let placement = crate::placement::plan_target_placement(
+                &realm.config,
+                &self.target(),
+                Default::default(),
+            )?
+            .ok_or(ReadPolicyError::PlacementUnavailable)?
+            .placement;
+            read_holder_sets(&realm.config, &placement)?
+                .into_iter()
+                .filter(|holder| *holder != self.config.local_node_id)
+                .take(MAX_POLICY_FETCH_HOLDERS)
+                .collect()
         };
-        let placement =
-            crate::placement::plan_target_placement(&config, &self.target(), Default::default())?
-                .ok_or(ReadPolicyError::PlacementUnavailable)?
-                .placement;
-        let holders: Vec<_> = read_holder_sets(&config, &placement)?
-            .into_iter()
-            .filter(|holder| *holder != self.config.local_node_id)
-            .take(MAX_POLICY_FETCH_HOLDERS)
-            .collect();
         self.emit_fetch(holders)
     }
 

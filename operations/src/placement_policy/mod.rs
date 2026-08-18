@@ -16,7 +16,9 @@ pub mod transport;
 pub use cache::{PolicyCacheEntry, PolicyCacheError, PolicyCacheStats};
 pub use create::{CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation};
 pub use gate::{PolicyGateConfig, PolicyGateOperation, PolicyGateOutcome};
-pub use read::{PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation};
+pub use read::{
+    AuthenticPolicy, PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
+};
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 

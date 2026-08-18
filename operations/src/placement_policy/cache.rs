@@ -334,6 +334,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tampered_entry() {
+        // A row whose provenance was rewritten resolves again instead of being
+        // served: the cache may only answer with an authenticated publication.
+        let policy = policy(1, "eu-west");
+        let mut document = document(&policy);
+        document.publication.created_at_ms += 1;
+        let value = stored(&PolicyCacheEntry::verified(&document, 10));
+        assert_eq!(
+            lookup(Some(&value), realm(), &policy.policy_ref(), 10_000),
+            CacheLookup::Miss
+        );
+    }
+
+    #[test]
     fn negative_expires() {
         let entry = PolicyCacheEntry::unavailable(1_000);
         let value = stored(&entry);
