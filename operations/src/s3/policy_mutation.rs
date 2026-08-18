@@ -234,7 +234,13 @@ impl Operation for PolicyMutationOperation {
                         self.state = MutationState::Finish;
                         effects
                     }
-                    Err(error) => self.fail(error.into()),
+                    // The mint's own cleanup still has to run before the failure
+                    // is reported.
+                    Err(error) => {
+                        let mut cleanup = effects;
+                        cleanup.extend(self.fail(error.into()));
+                        cleanup
+                    }
                 }
             }
             MutationState::Finish | MutationState::Error => smallvec![],
