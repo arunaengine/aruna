@@ -28,7 +28,7 @@ use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
@@ -217,6 +217,13 @@ async fn reserve_and_run(
             return Err(LaunchDecline::Capacity);
         }
     }
+    info!(
+        job_id = %round.spec.job_id,
+        execution_id = %execution_id,
+        executor_kind = %round.intent.target.executor_kind,
+        subject_generation = sealed_subject.0,
+        "Target admitted a launch and sealed its receipt"
+    );
     super::outbox::kick(context.as_ref()).await;
     materialize_local(context.as_ref(), &round.spec, round.local, now).await;
     ReceiptFrame::new(envelope).map_err(|_| LaunchDecline::Unauthorized)

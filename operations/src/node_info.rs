@@ -29,7 +29,7 @@ use aruna_core::types::{Key, Value};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
-use tracing::warn;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -457,6 +457,13 @@ pub async fn set_departure_state(
     if departing {
         write_departure_report(ctx, document.epoch.membership_generation, now).await?;
     }
+    info!(
+        leaving = departing,
+        compute_draining = draining,
+        membership_generation = document.epoch.membership_generation,
+        reserved = document.reservation.reserved.count,
+        "Compute departure state published"
+    );
     write_node_info_document(&ctx.storage_handle, &document).await?;
     replicate_node_info(ctx, node_id, realm_id).await?;
     Ok(true)
@@ -486,6 +493,12 @@ pub async fn set_operator_drain(
     document.reservation = reservation_snapshot(ctx, document.epoch).await?;
     document.demand = demand_snapshot(ctx, document.epoch).await?;
     document.updated_at_ms = now;
+    info!(
+        operator_draining = draining,
+        leaving = document.leaving,
+        reserved = document.reservation.reserved.count,
+        "Operator compute drain published"
+    );
     write_node_info_document(&ctx.storage_handle, &document).await?;
     replicate_node_info(ctx, node_id, realm_id).await?;
     Ok(true)

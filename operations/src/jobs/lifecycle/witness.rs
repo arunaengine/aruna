@@ -23,7 +23,7 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, NodeId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
@@ -290,6 +290,15 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
             return RoundOutcome::Retry { after_ms: base };
         }
     };
+    info!(
+        sequence,
+        selected = plan.selected.is_some(),
+        alternatives = plan.alternatives.len(),
+        rejected = plan.rejected.len(),
+        omitted = plan.omitted,
+        retryable = plan.retryable,
+        "Witness planning round decided"
+    );
     explain.sequence = sequence;
     explain.overlapping = !mine.is_empty();
     explain.plan = plan;

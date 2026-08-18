@@ -6,6 +6,7 @@ use aruna_core::NodeId;
 use aruna_core::compute_quota::{ComputeQuota, QuotaDenied, admits};
 use aruna_core::structs::{EffectiveResources, RealmConfigDocument};
 use aruna_core::types::GroupId;
+use tracing::info;
 
 /// Standing-quota decision before one submission is logically admitted.
 /// `Ok(Some(reason))` is a denial the admission applies only to a FRESH claim;
@@ -30,6 +31,17 @@ pub async fn quota_refusal(
         .map_err(|error| format!("quota demand view unavailable: {error}"))?;
     match admits(&view, &quota, resources) {
         Ok(()) => Ok(None),
-        Err(denied) => Ok(Some(denied)),
+        Err(denied) => {
+            info!(
+                group_id = %group_id,
+                scope = ?denied.scope,
+                dimension = ?denied.dimension,
+                observed = denied.observed,
+                requested = denied.requested,
+                limit = denied.limit,
+                "Standing compute quota refused a new admission"
+            );
+            Ok(Some(denied))
+        }
     }
 }

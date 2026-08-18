@@ -244,6 +244,8 @@ impl SubjectScanOperation {
             generation = self.result.generation,
             scanned = self.result.scanned,
             quarantined = self.result.quarantined,
+            restored = self.result.restored,
+            departing = matches!(self.config.mode, SubjectScanMode::Depart),
             "Placement subject scan finished"
         );
         self.output = Some(Ok(self.result.clone()));

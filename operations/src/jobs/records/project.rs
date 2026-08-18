@@ -275,10 +275,30 @@ impl ProjectFamilyOperation {
             return self.fail(RecordStoreError::UnknownAlias);
         };
         let revision = self.cache.as_ref().map_or(0, |cache| cache.revision);
+        let duplicates = self
+            .projection
+            .as_ref()
+            .map(|projection| {
+                projection
+                    .executions
+                    .iter()
+                    .filter(|execution| {
+                        execution.role == aruna_core::structs::ExecutionRole::DuplicateSuccess
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
         debug!(
             revision,
             records = self.records.len(),
             cached,
+            executions = self
+                .projection
+                .as_ref()
+                .map(|projection| projection.executions.len())
+                .unwrap_or_default(),
+            duplicate_successes = duplicates,
+            truncated = self.truncated,
             "Job family projection resolved"
         );
         self.outcome = Some(Ok(ProjectedFamily {
