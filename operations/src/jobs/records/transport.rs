@@ -399,9 +399,9 @@ async fn serve_page(
 }
 
 /// Serves one inbound launch offer. The offer is bounded and kind-checked at
-/// decode and retained as an immutable record; exact target admission, its
-/// reservation, and the signed receipt belong to the lifecycle round, so this
-/// node reports the offer as undecided rather than declining it.
+/// decode; exact admission, the capacity reservation, and the signed receipt
+/// are the target's own decision. An undecidable offer is answered as
+/// unavailable, never as a refusal: the scheduler must be free to retry it.
 pub async fn serve_launch_offer(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -422,29 +422,13 @@ pub async fn serve_launch_offer(
             result: Err(LaunchDecline::Unauthorized),
         };
     }
-    let record = match JobRecordFrame::new(launch.into_inner()) {
-        Ok(record) => record,
-        Err(error) => {
-            warn!(error = %error, "Refusing an unbounded launch offer");
-            return MetadataTransportMessage::ForwardedLaunchOffer {
-                result: Err(LaunchDecline::Unauthorized),
-            };
-        }
-    };
-    if let Err(error) = drive(
-        AppendRecordOperation::new(AppendRecordConfig {
-            realm_id,
-            local_node_id: net_handle.node_id(),
-            record,
-            local: None,
-            origin: RecordOrigin::Peer(peer),
-            now_ms: aruna_core::util::unix_timestamp_millis(),
-        }),
-        context.as_ref(),
-    )
-    .await
-    {
-        warn!(error = %error, "Launch offer append failed");
+    match crate::jobs::lifecycle::target::admit_launch(context, launch).await {
+        Some(Ok(receipt)) => MetadataTransportMessage::ForwardedLaunchOffer {
+            result: Ok(Box::new(receipt)),
+        },
+        Some(Err(reason)) => MetadataTransportMessage::ForwardedLaunchOffer {
+            result: Err(reason),
+        },
+        None => MetadataTransportMessage::ForwardedWriteUnavailable,
     }
-    MetadataTransportMessage::ForwardedWriteUnavailable
 }

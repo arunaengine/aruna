@@ -27,6 +27,8 @@ pub mod ids;
 pub mod ingress;
 pub mod outbox;
 pub mod plan;
+pub mod reservation;
+pub mod target;
 pub mod witness;
 
 pub use admit::{AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission};
@@ -55,6 +57,9 @@ pub enum LifecycleError {
     /// This node does not hold the submission family, so it may not admit it.
     #[error("this node does not hold the submission family placement")]
     NotHolder,
+    /// Exact local admission found no capacity for the sealed resources.
+    #[error("no local capacity for the sealed execution resources")]
+    Capacity,
     /// The same idempotency key is already bound to a different request.
     #[error("idempotency key already bound to job {existing_job_id}")]
     IdempotencyConflict { existing_job_id: JobId },
