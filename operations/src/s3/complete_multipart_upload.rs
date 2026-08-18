@@ -5,6 +5,10 @@ use crate::blob::blob_keyspace_helper::{
 use crate::blob::cleanup::{PendingCleanup, schedule_blob_cleanup_effect};
 use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
+use crate::placement_policy::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, union_refs,
+    write_gate,
+};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -45,6 +49,8 @@ pub enum CompleteMultipartUploadState {
     WriteUploadCompleting,
     CommitMarkTransaction,
     ReadUploadParts,
+    ReadGateBucket,
+    PolicyGate,
     ComposeBlob,
     StartFinalizeTransaction,
     ReadBucketDefault,
@@ -122,6 +128,8 @@ pub enum CompleteMultipartUploadError {
     QuotaGateError(#[from] QuotaGateError),
     #[error(transparent)]
     ManagedCopyError(#[from] ManagedCopyError),
+    #[error(transparent)]
+    PolicyGate(#[from] PolicyGateError),
     #[error(transparent)]
     PolicyError(#[from] PlacementPolicyError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
@@ -201,6 +209,12 @@ pub struct CompleteMultipartUploadOperation {
     sealed_policies: Vec<PlacementPolicyRef>,
     /// Destination default, read inside the finalize transaction.
     bucket_policies: Vec<PlacementPolicyRef>,
+    /// Destination facts of this node. Absent means no governed object may be
+    /// composed or registered here.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
+    /// What the gate decided on, re-read inside the finalize transaction.
+    gated_bucket: Option<GatedBucket>,
 }
 
 impl CompleteMultipartUploadOperation {
@@ -234,6 +248,9 @@ impl CompleteMultipartUploadOperation {
             restrictions: None,
             sealed_policies: Vec::new(),
             bucket_policies: Vec::new(),
+            gate_context: None,
+            gate: None,
+            gated_bucket: None,
         }
     }
 
@@ -245,6 +262,13 @@ impl CompleteMultipartUploadOperation {
     /// The uploader's credential restrictions. They are persisted on the durable
     /// replication obligation, so a scoped upload cannot escalate to unscoped
     /// when the obligation repair path enqueues replication instead.
+    /// The destination this completion is evaluated against. Omitting it leaves
+    /// the ungoverned path untouched and fails every governed one closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
+        self
+    }
+
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
         self.restrictions = restrictions;
         self
@@ -688,19 +712,99 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err),
         };
         self.upload_parts = upload_parts;
-        self.resolved_parts = resolved.clone();
+        self.resolved_parts = resolved;
 
+        // The destination default is read before the compose, so the gate that
+        // admits the object sees the refs the version would actually carry.
+        self.state = CompleteMultipartUploadState::ReadGateBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let bucket = match value
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(error) => return self.schedule_error(error.into()),
+        };
+        let gated = GatedBucket::observe(bucket.as_ref());
+        let inherited = self
+            .upload_record
+            .as_ref()
+            .map(|upload| upload.placement_policies.clone())
+            .unwrap_or_default();
+        let refs = match union_refs(&gated.policies, &inherited) {
+            Ok(refs) => refs,
+            Err(error) => return self.schedule_error(error.into()),
+        };
+        self.gated_bucket = Some(gated);
+        match write_gate(self.gate_context.as_ref(), &refs) {
+            Ok(None) => self.compose_blob(),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = CompleteMultipartUploadState::PolicyGate;
+                match complete {
+                    true => self.finish_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn handle_policy_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_gate(&mut self) -> Effects {
+        let Some(gate) = self.gate.take() else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let outcome = match gate.finalize() {
+            Ok(outcome) => outcome,
+            Err(error) => return self.schedule_error(PolicyGateError::from(error).into()),
+        };
+        match gate_decision(outcome.decision) {
+            Ok(()) => self.compose_blob(),
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn compose_blob(&mut self) -> Effects {
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
+        let parts = self
+            .resolved_parts
+            .iter()
+            .map(|part| part.location.clone())
+            .collect();
         self.state = CompleteMultipartUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             resolved: pinned,
             created_by: self.input.created_by,
-            parts: resolved.into_iter().map(|part| part.location).collect(),
+            parts,
         })]
     }
 
@@ -767,9 +871,18 @@ impl CompleteMultipartUploadOperation {
             .transpose()
         {
             Ok(bucket) => {
-                self.bucket_policies = bucket
-                    .map(|bucket| bucket.placement_policies)
-                    .unwrap_or_default();
+                // The refs the version commits must be the refs the gate
+                // admitted: a default changed during the compose was never
+                // evaluated against this node.
+                let observed = GatedBucket::observe(bucket.as_ref());
+                if self
+                    .gated_bucket
+                    .as_ref()
+                    .is_some_and(|gated| gated != &observed)
+                {
+                    return self.schedule_error(PolicyGateError::Drift.into());
+                }
+                self.bucket_policies = observed.policies;
             }
             Err(error) => return self.schedule_error(error.into()),
         }
@@ -1622,6 +1735,8 @@ impl Operation for CompleteMultipartUploadOperation {
                 self.handle_mark_committed(event)
             }
             CompleteMultipartUploadState::ReadUploadParts => self.handle_upload_parts_read(event),
+            CompleteMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
+            CompleteMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
             CompleteMultipartUploadState::ComposeBlob => self.handle_blob_composed(event),
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)

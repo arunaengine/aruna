@@ -30,7 +30,9 @@ use aruna_core::structs::{
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::{DriverContext, bucket_snapshot, drive, routing_snapshot};
+use aruna_operations::driver::{
+    DriverContext, bucket_snapshot, drive, gate_context, now_ms, routing_snapshot,
+};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
@@ -1649,7 +1651,10 @@ impl S3 for ArunaS3Service {
         }
         .map_err(routing_inputs_error)?;
         let input = convert_input(req.input)?;
-        let operation = PutObjectOperation::new(PutObjectConfig {
+        let gate = gate_context(&self.state, self.realm_id, now_ms())
+            .await
+            .map_err(routing_inputs_error)?;
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
             group_id,
             realm_id: self.realm_id,
@@ -1666,6 +1671,9 @@ impl S3 for ArunaS3Service {
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_metadata(metadata)
         .with_restrictions(replication_auth.path_restrictions.clone());
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
 
         let result = drive(operation, &self.state)
             .await
@@ -2211,7 +2219,10 @@ impl S3 for ArunaS3Service {
             .unwrap_or_default();
         validate_composite_part_count(&checksum_request, completed_parts.len())?;
 
-        let operation = CompleteMultipartUploadOperation::new(CMUI {
+        let gate = gate_context(&self.state, self.realm_id, now_ms())
+            .await
+            .map_err(routing_inputs_error)?;
+        let mut operation = CompleteMultipartUploadOperation::new(CMUI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             upload_id,
@@ -2228,6 +2239,9 @@ impl S3 for ArunaS3Service {
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_restrictions(replication_auth.path_restrictions.clone());
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
 
         let result = drive(operation, &self.state)
             .await

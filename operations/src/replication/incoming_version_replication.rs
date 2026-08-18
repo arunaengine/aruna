@@ -3,8 +3,12 @@ use crate::blob::blob_keyspace_helper::{
     build_head_transition_effects, head_contender_effects, write_blob_location_effect,
     write_blob_version_effect,
 };
+use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
+use crate::placement_policy::{
+    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, union_refs, write_gate,
+};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,
@@ -30,10 +34,10 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
-    RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey, ReplicationItemKind,
-    ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits, RoutingError, StorageRoutingRule,
-    UsageDelta, VersionKey, WriteOwner, blob_bucket_permission_path, blob_object_permission_path,
-    resolve_backend,
+    PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey,
+    ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits,
+    RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
+    blob_bucket_permission_path, blob_object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
@@ -57,6 +61,7 @@ enum IncomingVersionReplicationState {
     EnforceQuota,
     FinishQuotaCheck,
     ReadExistingBlob,
+    PolicyGate,
     SendNegotiation,
     ReceiveBlob,
     StartTransaction,
@@ -95,6 +100,10 @@ enum IncomingVersionReplicationState {
 pub enum IncomingVersionReplicationError {
     #[error(transparent)]
     Policy(#[from] aruna_core::structs::PlacementPolicyError),
+    #[error(transparent)]
+    PolicyGate(#[from] PolicyGateError),
+    #[error(transparent)]
+    ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
@@ -211,6 +220,14 @@ pub struct IncomingVersionReplicationOperation {
     destination_full: Option<RoutingError>,
     manifest_policy: Option<String>,
     writer_policy: Option<String>,
+    /// Destination facts of this node. Absent means no governed replica may be
+    /// materialized or registered here.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
+    /// Refs the gate admitted: the manifest's set unioned with what the local
+    /// version already carried, so a sender cannot drop an inherited ref.
+    gated_refs: Vec<PlacementPolicyRef>,
+    pending_negotiation: Option<ReplicationNegotiationResult>,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -261,7 +278,18 @@ impl IncomingVersionReplicationOperation {
             destination_full: None,
             manifest_policy: None,
             writer_policy: None,
+            gate_context: None,
+            gate: None,
+            gated_refs: Vec::new(),
+            pending_negotiation: None,
         }
+    }
+
+    /// The destination this replica is evaluated against. Omitting it leaves
+    /// ungoverned replication unchanged and fails every governed one closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
+        self
     }
 
     /// Node-local routing, so this receiver picks its own backend.
@@ -305,6 +333,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::EnforceQuota => "EnforceQuota",
             IncomingVersionReplicationState::FinishQuotaCheck => "FinishQuotaCheck",
             IncomingVersionReplicationState::ReadExistingBlob => "ReadExistingBlob",
+            IncomingVersionReplicationState::PolicyGate => "PolicyGate",
             IncomingVersionReplicationState::SendNegotiation => "SendNegotiation",
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
@@ -785,7 +814,72 @@ impl IncomingVersionReplicationOperation {
             .map_err(IncomingVersionReplicationError::RoutingFailed)
     }
 
+    /// Nothing is admitted before the destination is evaluated: the reply that
+    /// invites bytes is itself behind the gate.
     fn send_negotiation(&mut self, result: ReplicationNegotiationResult) -> Effects {
+        if matches!(
+            result,
+            ReplicationNegotiationResult::AlreadyReplicatedVersion
+        ) {
+            return self.reply_negotiation(result);
+        }
+        let inherited = self
+            .replaced_version
+            .as_ref()
+            .map(|version| version.placement_policies.clone())
+            .unwrap_or_default();
+        let refs = match union_refs(&self.manifest.placement_policies, &inherited) {
+            Ok(refs) => refs,
+            Err(error) => return self.reject_negotiation(error.into()),
+        };
+        self.gated_refs = refs.clone();
+        match write_gate(self.gate_context.as_ref(), &refs) {
+            Ok(None) => self.reply_negotiation(result),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.pending_negotiation = Some(result);
+                self.state = IncomingVersionReplicationState::PolicyGate;
+                match complete {
+                    true => self.finish_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.reject_negotiation(error.into()),
+        }
+    }
+
+    fn handle_policy_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "an active placement gate",
+                received: event,
+            });
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_gate(&mut self) -> Effects {
+        let (Some(gate), Some(result)) = (self.gate.take(), self.pending_negotiation.take()) else {
+            return self.fail(IncomingVersionReplicationError::MissingCurrentVersionGeneration);
+        };
+        let outcome = match gate.finalize() {
+            Ok(outcome) => outcome,
+            Err(error) => return self.reject_negotiation(PolicyGateError::from(error).into()),
+        };
+        match gate_decision(outcome.decision) {
+            Ok(()) => self.reply_negotiation(result),
+            Err(error) => self.reject_negotiation(error.into()),
+        }
+    }
+
+    fn reply_negotiation(&mut self, result: ReplicationNegotiationResult) -> Effects {
         self.negotiation_result = Some(result.clone());
         self.state = IncomingVersionReplicationState::SendNegotiation;
         let payload = match VersionReplicationMessage::VersionNegotiationResponse(result).to_bytes()
@@ -1189,7 +1283,10 @@ impl IncomingVersionReplicationOperation {
         let (version, materialized_hash) = match self.manifest.kind {
             ReplicationItemKind::Materialized => {
                 if self.is_reference_item() {
-                    let version = match self.reference_version() {
+                    let version = match self
+                        .reference_version()
+                        .and_then(|version| Ok(version.with_policies(self.gated_refs.clone())?))
+                    {
                         Ok(version) => version,
                         Err(error) => return self.fail(error),
                     };
@@ -1214,7 +1311,7 @@ impl IncomingVersionReplicationOperation {
                     )
                     .with_metadata(self.manifest.metadata.clone())
                     .with_publisher(self.publisher_node_id)
-                    .with_policies(self.manifest.placement_policies.clone())
+                    .with_policies(self.gated_refs.clone())
                     {
                         Ok(materialized) => materialized,
                         Err(err) => return self.fail(err.into()),
@@ -1241,6 +1338,23 @@ impl IncomingVersionReplicationOperation {
             match add_hash_path_index_effect(&context, hash, self.manifest.version_id, self.txn_id)
             {
                 Ok(index_effect) => self.pending_version_effects.push_back(index_effect),
+                Err(err) => return self.fail(err.into()),
+            }
+            // The replica becomes serveable exactly when its version commits.
+            // A reference item materializes nothing and registers nothing.
+            let location = match self.effective_materialized_location() {
+                Ok(location) => location,
+                Err(err) => return self.fail(err),
+            };
+            match register_effect(
+                version_key,
+                self.local_node_id,
+                &location,
+                &self.gated_refs,
+                self.manifest.version_id.timestamp_ms(),
+                self.txn_id,
+            ) {
+                Ok(register) => self.pending_version_effects.push_back(register),
                 Err(err) => return self.fail(err.into()),
             }
         }
@@ -2034,6 +2148,7 @@ impl Operation for IncomingVersionReplicationOperation {
                     self.request_blob_version()
                 }
             }
+            IncomingVersionReplicationState::PolicyGate => self.handle_policy_gate(event),
             IncomingVersionReplicationState::SendNegotiation => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
@@ -2891,6 +3006,22 @@ mod tests {
                 if key_space == BLOB_LOCATIONS_KEYSPACE
         ));
         effects
+    }
+
+    /// A same-generation compare records both claimants before the head moves,
+    /// so the contender evidence write is drained first.
+    fn drain_contenders(
+        op: &mut IncomingVersionReplicationOperation,
+        effects: aruna_core::types::Effects,
+    ) -> aruna_core::types::Effects {
+        match effects.as_slice() {
+            [Effect::Storage(StorageEffect::BatchWrite { .. })] => {
+                op.step(Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: vec![],
+                }))
+            }
+            _ => effects,
+        }
     }
 
     fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
@@ -3939,6 +4070,7 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
+        let effects = drain_contenders(&mut op, effects);
 
         assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
@@ -4032,6 +4164,7 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
+        let effects = drain_contenders(&mut op, effects);
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected blob version write")
@@ -4108,6 +4241,30 @@ mod tests {
         assert_eq!(index_key.bucket, manifest.bucket);
         assert_eq!(index_key.key, manifest.key);
 
+        // The replica registers its managed copy in the same transaction.
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the managed-copy registration")
+        };
+        assert_eq!(key_space, aruna_core::keyspaces::MANAGED_COPY_KEYSPACE);
+        assert_eq!(
+            aruna_core::structs::ManagedCopyRecord::from_bytes(value.as_ref())
+                .unwrap()
+                .version,
+            aruna_core::structs::VersionKey::new(
+                &manifest.bucket,
+                &manifest.key,
+                manifest.version_id
+            )
+        );
+
         let effects = op.step(Event::Storage(StorageEvent::WriteResult {
             key: vec![0u8; 4].into(),
         }));
@@ -4167,6 +4324,7 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
+        let effects = drain_contenders(&mut op, effects);
 
         assert_eq!(
             op.state,
@@ -4234,6 +4392,7 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
+        let effects = drain_contenders(&mut op, effects);
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::ReadCurrentVersion
@@ -4279,6 +4438,7 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
+        let effects = drain_contenders(&mut op, effects);
 
         assert_eq!(
             op.state,
@@ -4340,6 +4500,7 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
+        let effects = drain_contenders(&mut op, effects);
 
         assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(

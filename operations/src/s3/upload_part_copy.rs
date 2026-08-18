@@ -274,6 +274,8 @@ async fn validate_destination_upload(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::driver::gate_context;
+    use crate::placement_policy::fixtures::{seed_gate, subject};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
@@ -338,32 +340,32 @@ mod test {
         key: &str,
         data: &'static [u8],
     ) {
-        drive(
-            PutObjectOperation::new(PutObjectConfig {
-                user_id: UserId::local(Ulid::generate(), realm_id),
-                group_id,
-                realm_id,
-                node_id,
-                request: PutObjectInput {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    content_length: Some(data.len() as u64),
-                    body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(data))),
-                },
-                expected_checksums: vec![],
-                checksum_type: None,
-                exists: false,
-                version_source: None,
-                preassigned_version_id: None,
-                quota_ceiling: None,
-                routing: RoutingSnapshot::single(group_id),
-            }),
-            context,
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        let gate = gate_context(context, realm_id, 1_000)
+            .await
+            .expect("subject reads");
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                content_length: Some(data.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(data))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        });
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
+        drive(operation, context).await.unwrap().unwrap().unwrap();
     }
 
     async fn seed_multipart_upload(
@@ -483,10 +485,22 @@ mod test {
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let upload_id = Ulid::generate();
-        let policy = aruna_core::structs::PlacementPolicyRef {
-            policy_id: Ulid::from_bytes([4u8; 16]),
-            digest: [4u8; 32],
-        };
+        let rule = aruna_core::structs::VerifiedPolicy::verify(
+            aruna_core::structs::PlacementPolicy::new(
+                Ulid::from_bytes([4u8; 16]),
+                "residency".to_string(),
+                vec![aruna_core::structs::PlacementSelector {
+                    node_id: Some(node_id),
+                    location: None,
+                    labels: Vec::new(),
+                    executor_kind: None,
+                }],
+            )
+            .expect("policy is valid"),
+        )
+        .expect("policy verifies");
+        let policy = rule.policy_ref();
+        seed_gate(&context, realm_id, subject(node_id, "eu-west"), &[rule]).await;
         seed_governed_bucket(&context, group_id, user_id, vec![policy]).await;
 
         put_source(

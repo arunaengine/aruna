@@ -7,7 +7,9 @@ use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
-use crate::driver::{DriverContext, drive, node_routing, quota_marked_routing};
+use crate::driver::{
+    DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
+};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
@@ -691,7 +693,21 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                 return;
                                             }
                                         };
-                                        let op = IncomingVersionReplicationOperation::new(
+                                        let gate = match gate_context(
+                                            self.context.as_ref(),
+                                            *net_handle.realm_id(),
+                                            now_ms(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(gate) => gate,
+                                            Err(error) => {
+                                                error!(peer = %node_id, error = %error, "Refusing inbound replication with unreadable placement subject");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
+                                        };
+                                        let mut op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),
                                             *net_handle.realm_id(),
@@ -702,6 +718,9 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         .with_publisher_node(node_id)
                                         .with_manifest_policy(manifest_path)
                                         .with_writer_policy(writer_path);
+                                        if let Some(gate) = gate {
+                                            op = op.with_gate(gate);
+                                        }
                                         match drive(op, self.context.as_ref()).await {
                                             Ok(Ok(result)) => {
                                                 emit_replication_watch(
@@ -744,6 +763,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         )
                                         .with_policy_paths(policy_paths)
                                         .with_policy_candidates(policy_candidates, had_denial)
+                                        .with_now(now_ms())
                                         .with_snapshot();
                                         if let Err(error) =
                                             drive(op, self.context.as_ref()).await

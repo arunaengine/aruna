@@ -485,7 +485,8 @@ fn storage_error(event: Event) -> BulkError {
 #[cfg(test)]
 mod tests {
     use super::{BULK_PAGE_LIMIT, BulkInput, run_policy_bulk};
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{DriverContext, drive, gate_context};
+    use crate::placement_policy::fixtures::{seed_gate, subject};
     use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
@@ -561,6 +562,15 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
+        // The node advertises a subject and has already resolved the rule these
+        // tests attach, which is what production wiring establishes at startup.
+        seed_gate(
+            &context,
+            realm_id,
+            subject(fixture.node_id, "eu-west"),
+            &[policy(fixture.node_id)],
+        )
+        .await;
         (temp_handle, context, fixture)
     }
 
@@ -587,33 +597,37 @@ mod tests {
     }
 
     async fn put_object(context: &DriverContext, fixture: &Fixture, key: &str) -> Ulid {
-        drive(
-            PutObjectOperation::new(PutObjectConfig {
-                user_id: fixture.user_id,
-                group_id: fixture.group_id,
-                realm_id: fixture.realm_id,
-                node_id: fixture.node_id,
-                request: PutObjectInput {
-                    bucket: BUCKET.to_string(),
-                    key: key.to_string(),
-                    content_length: Some(BODY.len() as u64),
-                    body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
-                },
-                expected_checksums: vec![],
-                checksum_type: None,
-                exists: false,
-                version_source: None,
-                preassigned_version_id: None,
-                quota_ceiling: None,
-                routing: RoutingSnapshot::single(fixture.group_id),
-            }),
-            context,
-        )
-        .await
-        .expect("put drives")
-        .expect("put succeeds")
-        .expect("put returns a result")
-        .version_id
+        let gate = gate_context(context, fixture.realm_id, 1_000)
+            .await
+            .expect("subject reads");
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
+            user_id: fixture.user_id,
+            group_id: fixture.group_id,
+            realm_id: fixture.realm_id,
+            node_id: fixture.node_id,
+            request: PutObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                content_length: Some(BODY.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(fixture.group_id),
+        });
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
+        drive(operation, context)
+            .await
+            .expect("put drives")
+            .expect("put succeeds")
+            .expect("put returns a result")
+            .version_id
     }
 
     fn policy(node_id: NodeId) -> VerifiedPolicy {
