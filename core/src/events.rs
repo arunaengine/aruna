@@ -1,13 +1,13 @@
 use crate::audit::AuditPageBatch;
 use crate::effects::{
     FetchCursor, FrameBoundsError, JobRecordFrame, MAX_JOB_RECORD_PAGE, MAX_JOB_RECORD_PAGE_BYTES,
-    encoded_len,
+    ReceiptFrame, encoded_len,
 };
 use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
-    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, JobRecordEnvelope, PlacementDecision,
+    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, PlacementDecision,
     PlacementPolicyDocument, PolicyPublication, RealmId, ReplicationSuboperationResult,
     ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
@@ -295,7 +295,7 @@ pub enum JobRecordEvent {
 }
 
 /// Why a holder refused an append-only job record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobRecordRejection {
     /// The responder does not hold that family placement; resolve holders again.
     NotHolder,
@@ -313,7 +313,9 @@ pub enum JobRecordRejection {
 pub enum LaunchOfferEvent {
     Accepted {
         target: NodeId,
-        receipt: Box<JobRecordEnvelope>,
+        /// Bounded and kind-checked: an acceptance is refused before the
+        /// scheduler replicates it, exactly like the offer it answers.
+        receipt: Box<ReceiptFrame>,
     },
     Declined {
         target: NodeId,
@@ -323,8 +325,10 @@ pub enum LaunchOfferEvent {
     Unavailable(String),
 }
 
-/// Why an execution target refused a launch offer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why an execution target refused a launch offer. The policy detail travels
+/// with the decline; the lifecycle round that starts sending `Policy` is
+/// responsible for bounding the ref list it puts in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LaunchDecline {
     /// The offering scheduler is not a holder in the target's current view.
     NotHolder,

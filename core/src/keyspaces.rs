@@ -142,6 +142,26 @@ pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
 /// Signed immutable output records, keyed by ExecutionId.
 pub const JOB_OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
 pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
+
+// Append-only distributed job-record store.
+/// Immutable authentic record envelopes, keyed by `JobRecordKey`. A key is
+/// written once: the same digest replays as a no-op and a different digest is
+/// retained in the conflict keyspace instead of overwriting it.
+pub const JOB_FAMILY_RECORD_KEYSPACE: &str = "job_family_records";
+/// Bounded records whose predecessor evidence, or whose local holder view, is
+/// not available yet. A pending record is never projected or relayed.
+pub const JOB_FAMILY_PENDING_KEYSPACE: &str = "job_family_pending";
+/// Explicit same-key/different-digest evidence, keyed by record key and digest.
+/// Quarantined records stay auditable and never enter a projection.
+pub const JOB_FAMILY_CONFLICT_KEYSPACE: &str = "job_family_conflicts";
+/// Alias index: one accepted `JobId` to the request family that admitted it.
+pub const JOB_FAMILY_ALIAS_KEYSPACE: &str = "job_family_aliases";
+/// Per-family projection cache and its bounded revision. Derived state only; it
+/// is rebuilt from the immutable records and is never authority.
+pub const JOB_FAMILY_PROJECTION_KEYSPACE: &str = "job_family_projections";
+/// Locally published authentic records awaiting family replication, keyed by
+/// record key. Only a replicated-authority record is ever queued here.
+pub const JOB_FAMILY_OUTBOX_KEYSPACE: &str = "job_family_outbox";
 pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 pub const ROCRATE_JOB_STATE_KEYSPACE: &str = "rocrate_job_state";
 pub const ROCRATE_UPLOAD_KEYSPACE: &str = "rocrate_uploads";

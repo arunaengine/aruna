@@ -465,6 +465,41 @@ impl TryFrom<JobRecordEnvelope> for LaunchFrame {
     }
 }
 
+/// One bounded execution receipt. A target's acceptance travels in its own
+/// signed envelope, so the reply to a launch offer is bounded and kind-checked
+/// before the scheduler does any work on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "JobRecordEnvelope")]
+pub struct ReceiptFrame(JobRecordEnvelope);
+
+impl ReceiptFrame {
+    pub fn new(envelope: JobRecordEnvelope) -> Result<Self, FrameBoundsError> {
+        if envelope.kind() != JobRecordKind::Receipt {
+            return Err(FrameBoundsError::RecordKind);
+        }
+        if encoded_len(&envelope)? > MAX_JOB_RECORD_BYTES {
+            return Err(FrameBoundsError::RecordBytes);
+        }
+        Ok(Self(envelope))
+    }
+
+    pub fn envelope(&self) -> &JobRecordEnvelope {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> JobRecordEnvelope {
+        self.0
+    }
+}
+
+impl TryFrom<JobRecordEnvelope> for ReceiptFrame {
+    type Error = FrameBoundsError;
+
+    fn try_from(envelope: JobRecordEnvelope) -> Result<Self, Self::Error> {
+        Self::new(envelope)
+    }
+}
+
 /// Fetch of one immutable placement-policy document from the holders the
 /// operation resolved. The adapter tries them in order and never routes; the
 /// operation verifies id, realm, and digest before it caches anything.
@@ -679,12 +714,61 @@ fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
     JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
 }
 
+/// One signed receipt whose encoded size grows with the executor-kind width.
+#[cfg(test)]
+pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
+    use crate::structs::{ExecutionReceipt, JobFamilyRecord, JobId, SubmissionId};
+
+    let secret = iroh::SecretKey::from_bytes(&[6u8; 32]);
+    let record = JobFamilyRecord::Receipt(Box::new(ExecutionReceipt {
+        execution_id: Ulid::from_bytes([8u8; 16]),
+        launch_id: Ulid::from_bytes([9u8; 16]),
+        launch_digest: [1u8; 32],
+        submission_id: SubmissionId([1u8; 32]),
+        request_digest: [2u8; 32],
+        job_id: JobId::from_bytes([5u8; 16]),
+        executor_node_id: secret.public(),
+        target: ExecutionTargetId {
+            node_id: secret.public(),
+            executor_kind: "d".repeat(kind_bytes),
+        },
+        spec_digest: [7u8; 32],
+        membership_generation: 4,
+        subject_generation: 5,
+        subject_digest: [8u8; 32],
+        accepted_at_ms: 1,
+    }));
+    JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn bounds_receipt_reply() {
+        // A launch reply is bounded and kind-checked before the scheduler acts.
+        assert_eq!(
+            ReceiptFrame::new(sized_receipt(MAX_JOB_RECORD_BYTES)),
+            Err(FrameBoundsError::RecordBytes)
+        );
+        assert_eq!(
+            ReceiptFrame::new(sized_launch(8)),
+            Err(FrameBoundsError::RecordKind)
+        );
+        let accepted = sized_receipt(8);
+        let frame = ReceiptFrame::new(accepted.clone()).expect("bounded receipt");
+        let bytes = postcard::to_allocvec(&frame).expect("frame encodes");
+        let relayed: ReceiptFrame = postcard::from_bytes(&bytes).expect("frame decodes");
+        assert_eq!(relayed.envelope(), &accepted);
+        assert!(relayed.envelope().verify_signature().is_ok());
+
+        let launch = postcard::to_allocvec(&sized_launch(8)).expect("record encodes");
+        assert!(postcard::from_bytes::<ReceiptFrame>(&launch).is_err());
     }
 
     #[test]

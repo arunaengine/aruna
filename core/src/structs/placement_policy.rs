@@ -31,7 +31,7 @@ pub const MAX_POLICY_REFS: usize = 8;
 /// stays acceptable, while a larger input is rejected before it is allocated.
 pub const MAX_POLICY_REF_INPUT: usize = 2 * MAX_POLICY_REFS;
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum PlacementPolicyError {
     #[error("policy id must not be nil")]
     NilPolicyId,
@@ -135,7 +135,7 @@ pub enum PolicyResolution {
 }
 
 /// Outcome of evaluating a governed ref set against one subject.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementDecision {
     Allowed,
     /// Refs this node has never resolved; the caller fetches them and retries.
