@@ -1334,51 +1334,72 @@ impl MetadataHandle {
 
         let process_started = Instant::now();
         let mut response_body = None;
+        // Debug poll frames reserve stack for every arm at once, so each awaiting
+        // arm is boxed to keep only the active one on the stack.
         let response = match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
                 graph_iris,
                 sparql,
-            } => match self.authorize_read_peer(peer, auth_token, false).await {
-                Ok(auth_context) => {
-                    match query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql)
-                        .await
-                    {
-                        Ok(results) => MetadataTransportMessage::QueryResults {
-                            result: Ok(results),
-                        },
-                        Err(error) => MetadataTransportMessage::QueryResults {
-                            result: Err(metadata_read_error(error)),
-                        },
+            } => {
+                Box::pin(async {
+                    match self.authorize_read_peer(peer, auth_token, false).await {
+                        Ok(auth_context) => {
+                            match query_local_graphs(
+                                self.inner.clone(),
+                                auth_context,
+                                graph_iris,
+                                sparql,
+                            )
+                            .await
+                            {
+                                Ok(results) => MetadataTransportMessage::QueryResults {
+                                    result: Ok(results),
+                                },
+                                Err(error) => MetadataTransportMessage::QueryResults {
+                                    result: Err(metadata_read_error(error)),
+                                },
+                            }
+                        }
+                        Err(error) => MetadataTransportMessage::QueryResults { result: Err(error) },
                     }
-                }
-                Err(error) => MetadataTransportMessage::QueryResults { result: Err(error) },
-            },
+                })
+                .await
+            }
             MetadataTransportMessage::SearchGraphs {
                 auth_token,
                 graph_iris,
                 query,
                 limit,
                 group_id,
-            } => match self.authorize_read_peer(peer, auth_token, false).await {
-                Ok(auth_context) => match search_local_graphs(
-                    self.inner.clone(),
-                    auth_context,
-                    graph_iris,
-                    query,
-                    clamp_remote_search_graph_limit(limit),
-                    group_id,
-                    None,
-                )
+            } => {
+                Box::pin(async {
+                    match self.authorize_read_peer(peer, auth_token, false).await {
+                        Ok(auth_context) => match search_local_graphs(
+                            self.inner.clone(),
+                            auth_context,
+                            graph_iris,
+                            query,
+                            clamp_remote_search_graph_limit(limit),
+                            group_id,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(hits) => {
+                                MetadataTransportMessage::SearchResults { result: Ok(hits) }
+                            }
+                            Err(error) => MetadataTransportMessage::SearchResults {
+                                result: Err(metadata_read_error(error)),
+                            },
+                        },
+                        Err(error) => {
+                            MetadataTransportMessage::SearchResults { result: Err(error) }
+                        }
+                    }
+                })
                 .await
-                {
-                    Ok(hits) => MetadataTransportMessage::SearchResults { result: Ok(hits) },
-                    Err(error) => MetadataTransportMessage::SearchResults {
-                        result: Err(metadata_read_error(error)),
-                    },
-                },
-                Err(error) => MetadataTransportMessage::SearchResults { result: Err(error) },
-            },
+            }
             MetadataTransportMessage::FilteredSearchGraphs {
                 auth_token,
                 graph_iris,
@@ -1387,80 +1408,99 @@ impl MetadataHandle {
                 predicate_iri,
                 object_iri,
                 group_id,
-            } => match self.authorize_read_peer(peer, auth_token, false).await {
-                Ok(auth_context) => match search_local_graphs(
-                    self.inner.clone(),
-                    auth_context,
-                    graph_iris,
-                    query,
-                    clamp_remote_search_graph_limit(limit),
-                    group_id,
-                    Some((predicate_iri, object_iri)),
-                )
+            } => {
+                Box::pin(async {
+                    match self.authorize_read_peer(peer, auth_token, false).await {
+                        Ok(auth_context) => match search_local_graphs(
+                            self.inner.clone(),
+                            auth_context,
+                            graph_iris,
+                            query,
+                            clamp_remote_search_graph_limit(limit),
+                            group_id,
+                            Some((predicate_iri, object_iri)),
+                        )
+                        .await
+                        {
+                            Ok(hits) => {
+                                MetadataTransportMessage::SearchResults { result: Ok(hits) }
+                            }
+                            Err(error) => MetadataTransportMessage::SearchResults {
+                                result: Err(metadata_read_error(error)),
+                            },
+                        },
+                        Err(error) => {
+                            MetadataTransportMessage::SearchResults { result: Err(error) }
+                        }
+                    }
+                })
                 .await
-                {
-                    Ok(hits) => MetadataTransportMessage::SearchResults { result: Ok(hits) },
-                    Err(error) => MetadataTransportMessage::SearchResults {
-                        result: Err(metadata_read_error(error)),
-                    },
-                },
-                Err(error) => MetadataTransportMessage::SearchResults { result: Err(error) },
-            },
+            }
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
                 query,
                 limit,
-            } => match bucket_search_auth(
-                &self.inner.auth_validation,
-                &self.inner.storage_handle,
-                peer,
-                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                auth_token,
-            )
-            .await
-            {
-                Ok(auth) => match self.inner.net_handle.as_ref() {
-                    Some(net_handle) => match search_local_buckets(
-                        context.as_ref(),
-                        SearchBucketsInput {
-                            auth,
-                            realm_id: *net_handle.realm_id(),
-                            node_id: net_handle.node_id(),
-                            query,
-                            limit,
-                            start_after: None,
-                        },
+            } => {
+                Box::pin(async {
+                    match bucket_search_auth(
+                        &self.inner.auth_validation,
+                        &self.inner.storage_handle,
+                        peer,
+                        self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
+                        auth_token,
                     )
                     .await
                     {
-                        Ok(hits) => {
-                            MetadataTransportMessage::BucketSearchResults { result: Ok(hits) }
-                        }
-                        Err(_) => MetadataTransportMessage::BucketSearchResults {
-                            result: Err(MetadataReadError::Unavailable),
+                        Ok(auth) => match self.inner.net_handle.as_ref() {
+                            Some(net_handle) => match search_local_buckets(
+                                context.as_ref(),
+                                SearchBucketsInput {
+                                    auth,
+                                    realm_id: *net_handle.realm_id(),
+                                    node_id: net_handle.node_id(),
+                                    query,
+                                    limit,
+                                    start_after: None,
+                                },
+                            )
+                            .await
+                            {
+                                Ok(hits) => MetadataTransportMessage::BucketSearchResults {
+                                    result: Ok(hits),
+                                },
+                                Err(_) => MetadataTransportMessage::BucketSearchResults {
+                                    result: Err(MetadataReadError::Unavailable),
+                                },
+                            },
+                            None => MetadataTransportMessage::BucketSearchResults {
+                                result: Err(MetadataReadError::Unavailable),
+                            },
                         },
-                    },
-                    None => MetadataTransportMessage::BucketSearchResults {
-                        result: Err(MetadataReadError::Unavailable),
-                    },
-                },
-                Err(error) => MetadataTransportMessage::BucketSearchResults { result: Err(error) },
-            },
+                        Err(error) => {
+                            MetadataTransportMessage::BucketSearchResults { result: Err(error) }
+                        }
+                    }
+                })
+                .await
+            }
             MetadataTransportMessage::CreateSyncMirror {
                 auth_token,
                 source_group_id,
                 relationship,
                 extras,
             } => {
-                self.apply_sync_mirror(
-                    context,
-                    peer,
-                    auth_token,
-                    *relationship,
-                    Some(source_group_id),
-                    false,
-                    extras,
-                )
+                Box::pin(async {
+                    self.apply_sync_mirror(
+                        context,
+                        peer,
+                        auth_token,
+                        *relationship,
+                        Some(source_group_id),
+                        false,
+                        extras,
+                    )
+                    .await
+                })
                 .await
             }
             MetadataTransportMessage::DeleteSyncMirror {
@@ -1468,12 +1508,26 @@ impl MetadataHandle {
                 relationship,
                 extras,
             } => {
-                self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true, extras)
+                Box::pin(async {
+                    self.apply_sync_mirror(
+                        context,
+                        peer,
+                        auth_token,
+                        *relationship,
+                        None,
+                        true,
+                        extras,
+                    )
                     .await
+                })
+                .await
             }
             query @ MetadataTransportMessage::QueryDocument { .. } => {
-                let result = super::forward::apply_document_query(context, peer, query).await;
-                MetadataTransportMessage::DocumentQueryResults { result }
+                Box::pin(async {
+                    let result = super::forward::apply_document_query(context, peer, query).await;
+                    MetadataTransportMessage::DocumentQueryResults { result }
+                })
+                .await
             }
             MetadataTransportMessage::ForwardPathLookup {
                 auth_token,
@@ -1481,24 +1535,11 @@ impl MetadataHandle {
                 document_path,
                 config_digest,
             } => {
-                let result = match self.authorize_read_peer(peer, auth_token, true).await {
-                    Ok(auth) => match context.net_handle.as_ref() {
-                        Some(net) => {
-                            let realm_id = *net.realm_id();
-                            if !config_digest_matches(context.as_ref(), realm_id, &config_digest)
-                                .await
-                            {
-                                Err(MetadataReadError::Unavailable)
-                            } else {
-                                let result = super::api::local_path_candidates(
-                                    context.as_ref(),
-                                    realm_id,
-                                    group_id,
-                                    &document_path,
-                                    auth.as_ref(),
-                                )
-                                .await
-                                .map_err(claim_read_error);
+                Box::pin(async {
+                    let result = match self.authorize_read_peer(peer, auth_token, true).await {
+                        Ok(auth) => match context.net_handle.as_ref() {
+                            Some(net) => {
+                                let realm_id = *net.realm_id();
                                 if !config_digest_matches(
                                     context.as_ref(),
                                     realm_id,
@@ -1508,15 +1549,35 @@ impl MetadataHandle {
                                 {
                                     Err(MetadataReadError::Unavailable)
                                 } else {
-                                    result
+                                    let result = super::api::local_path_candidates(
+                                        context.as_ref(),
+                                        realm_id,
+                                        group_id,
+                                        &document_path,
+                                        auth.as_ref(),
+                                    )
+                                    .await
+                                    .map_err(claim_read_error);
+                                    if !config_digest_matches(
+                                        context.as_ref(),
+                                        realm_id,
+                                        &config_digest,
+                                    )
+                                    .await
+                                    {
+                                        Err(MetadataReadError::Unavailable)
+                                    } else {
+                                        result
+                                    }
                                 }
                             }
-                        }
-                        None => Err(MetadataReadError::Unavailable),
-                    },
-                    Err(error) => Err(error),
-                };
-                MetadataTransportMessage::ForwardedPathLookup { result }
+                            None => Err(MetadataReadError::Unavailable),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    MetadataTransportMessage::ForwardedPathLookup { result }
+                })
+                .await
             }
             MetadataTransportMessage::ForwardPathResolution {
                 auth_token,
@@ -1524,32 +1585,11 @@ impl MetadataHandle {
                 document_path,
                 config_digest,
             } => {
-                let result = match self.authorize_read_peer(peer, auth_token, false).await {
-                    Ok(auth) => match context.net_handle.as_ref() {
-                        Some(net) => {
-                            let realm_id = *net.realm_id();
-                            if !config_digest_matches(context.as_ref(), realm_id, &config_digest)
-                                .await
-                            {
-                                Err(MetadataReadError::Unavailable)
-                            } else {
-                                let result = super::api::resolve_local_path(
-                                    context.as_ref(),
-                                    realm_id,
-                                    super::api::MetadataPathLookupRequest {
-                                        group_id,
-                                        document_path,
-                                        auth,
-                                    },
-                                )
-                                .await
-                                .map(|result| {
-                                    Box::new(super::protocol::MetadataPathResolution {
-                                        winner: result.winner,
-                                        conflicts: result.conflicts,
-                                    })
-                                })
-                                .map_err(claim_read_error);
+                Box::pin(async {
+                    let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                        Ok(auth) => match context.net_handle.as_ref() {
+                            Some(net) => {
+                                let realm_id = *net.realm_id();
                                 if !config_digest_matches(
                                     context.as_ref(),
                                     realm_id,
@@ -1559,66 +1599,126 @@ impl MetadataHandle {
                                 {
                                     Err(MetadataReadError::Unavailable)
                                 } else {
-                                    result
+                                    let result = super::api::resolve_local_path(
+                                        context.as_ref(),
+                                        realm_id,
+                                        super::api::MetadataPathLookupRequest {
+                                            group_id,
+                                            document_path,
+                                            auth,
+                                        },
+                                    )
+                                    .await
+                                    .map(|result| {
+                                        Box::new(super::protocol::MetadataPathResolution {
+                                            winner: result.winner,
+                                            conflicts: result.conflicts,
+                                        })
+                                    })
+                                    .map_err(claim_read_error);
+                                    if !config_digest_matches(
+                                        context.as_ref(),
+                                        realm_id,
+                                        &config_digest,
+                                    )
+                                    .await
+                                    {
+                                        Err(MetadataReadError::Unavailable)
+                                    } else {
+                                        result
+                                    }
                                 }
                             }
-                        }
-                        None => Err(MetadataReadError::Unavailable),
-                    },
-                    Err(error) => Err(error),
-                };
-                MetadataTransportMessage::ForwardedPathResolution { result }
+                            None => Err(MetadataReadError::Unavailable),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    MetadataTransportMessage::ForwardedPathResolution { result }
+                })
+                .await
             }
             forward @ MetadataTransportMessage::ForwardExportDocument { .. } => {
-                match super::forward::apply_forwarded_export(context, peer, forward, metadata_bytes)
+                Box::pin(async {
+                    match super::forward::apply_forwarded_export(
+                        context,
+                        peer,
+                        forward,
+                        metadata_bytes,
+                    )
                     .await
-                {
-                    Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
-                        Ok(bytes) => {
-                            let length = bytes.len() as u64;
-                            if length > metadata_body_limit(metadata_bytes) {
-                                MetadataTransportMessage::ForwardedExport {
-                                    result: Err(MetadataReadError::Unavailable),
+                    {
+                        Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
+                            Ok(bytes) => {
+                                let length = bytes.len() as u64;
+                                if length > metadata_body_limit(metadata_bytes) {
+                                    MetadataTransportMessage::ForwardedExport {
+                                        result: Err(MetadataReadError::Unavailable),
+                                    }
+                                } else {
+                                    response_body = Some(bytes);
+                                    MetadataTransportMessage::ForwardedExport { result: Ok(length) }
                                 }
-                            } else {
-                                response_body = Some(bytes);
-                                MetadataTransportMessage::ForwardedExport { result: Ok(length) }
                             }
-                        }
-                        Err(_) => MetadataTransportMessage::ForwardedExport {
-                            result: Err(MetadataReadError::Unavailable),
+                            Err(_) => MetadataTransportMessage::ForwardedExport {
+                                result: Err(MetadataReadError::Unavailable),
+                            },
                         },
-                    },
-                    Err(error) => MetadataTransportMessage::ForwardedExport { result: Err(error) },
-                }
+                        Err(error) => {
+                            MetadataTransportMessage::ForwardedExport { result: Err(error) }
+                        }
+                    }
+                })
+                .await
             }
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
             | MetadataTransportMessage::ForwardReadDocument { .. }) => {
-                super::forward::apply_forwarded_write(context, peer, forward).await
+                Box::pin(async {
+                    super::forward::apply_forwarded_write(context, peer, forward).await
+                })
+                .await
             }
             MetadataTransportMessage::ForwardAuditPage { request } => {
-                super::audit::serve_local_audit(context, peer, request, audit_deadline).await
+                Box::pin(async {
+                    super::audit::serve_local_audit(context, peer, request, audit_deadline).await
+                })
+                .await
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
-                super::forward::apply_token_revoke(context, peer, forward).await
+                Box::pin(async { super::forward::apply_token_revoke(context, peer, forward).await })
+                    .await
             }
             forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
-                super::forward::apply_forwarded_pid(context, peer, forward).await
+                Box::pin(async {
+                    super::forward::apply_forwarded_pid(context, peer, forward).await
+                })
+                .await
             }
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
-                crate::placement_policy::serve_local_policy(context, peer, policy_ref).await
+                Box::pin(async {
+                    crate::placement_policy::serve_local_policy(context, peer, policy_ref).await
+                })
+                .await
             }
             record @ (MetadataTransportMessage::ForwardJobRecord { .. }
             | MetadataTransportMessage::ForwardJobRecordPage { .. }) => {
-                crate::jobs::records::serve_job_record(context, peer, record).await
+                Box::pin(async {
+                    crate::jobs::records::serve_job_record(context, peer, record).await
+                })
+                .await
             }
             MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-                crate::jobs::records::serve_launch_offer(context, peer, *launch).await
+                Box::pin(async {
+                    crate::jobs::records::serve_launch_offer(context, peer, *launch).await
+                })
+                .await
             }
             forward @ MetadataTransportMessage::ForwardCreatePlacementPolicy { .. } => {
-                crate::placement_policy::apply_forwarded_policy(context, peer, forward).await
+                Box::pin(async {
+                    crate::placement_policy::apply_forwarded_policy(context, peer, forward).await
+                })
+                .await
             }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
