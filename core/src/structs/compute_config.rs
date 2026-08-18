@@ -16,6 +16,11 @@ pub const MAX_LOCATION_LINKS: usize = 256;
 pub const DEFAULT_PESSIMISTIC_BANDWIDTH: u64 = 12_500_000;
 /// Age above which an availability sample only counts as unknown.
 pub const DEFAULT_AVAILABILITY_STALE_MS: u64 = 300_000;
+/// Delay one witness rank waits before it plans a submission itself. With
+/// replication factor `RF`, `witness_base_delay_ms * (RF - 1)` is the worst-case
+/// wait before any witness launches while higher ranks are down, so an operator
+/// tunes the leaderless failover latency here instead of in a hidden constant.
+pub const DEFAULT_WITNESS_BASE_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ComputeConfigError {
@@ -27,6 +32,8 @@ pub enum ComputeConfigError {
     ZeroBandwidth,
     #[error("link {from} -> {to} is configured twice")]
     DuplicateLink { from: String, to: String },
+    #[error("witness base delay must be greater than zero")]
+    ZeroWitnessDelay,
 }
 
 /// One directed transfer estimate between two placement locations. Direction
@@ -45,6 +52,8 @@ pub struct RealmComputeConfig {
     /// expensive and size-sensitive instead of impossible.
     pub pessimistic_bandwidth_bytes_per_sec: u64,
     pub availability_stale_after_ms: u64,
+    /// Per-rank fallback delay of the leaderless witness schedule.
+    pub witness_base_delay_ms: u64,
 }
 
 impl Default for RealmComputeConfig {
@@ -53,6 +62,7 @@ impl Default for RealmComputeConfig {
             links: Vec::new(),
             pessimistic_bandwidth_bytes_per_sec: DEFAULT_PESSIMISTIC_BANDWIDTH,
             availability_stale_after_ms: DEFAULT_AVAILABILITY_STALE_MS,
+            witness_base_delay_ms: DEFAULT_WITNESS_BASE_DELAY_MS,
         }
     }
 }
@@ -66,6 +76,11 @@ impl RealmComputeConfig {
         }
         if self.pessimistic_bandwidth_bytes_per_sec == 0 {
             return Err(ComputeConfigError::ZeroBandwidth);
+        }
+        // Zero would let every rank plan at once, which is the launch storm the
+        // ranked fallback exists to avoid.
+        if self.witness_base_delay_ms == 0 {
+            return Err(ComputeConfigError::ZeroWitnessDelay);
         }
         let mut seen = BTreeSet::new();
         for link in &self.links {
@@ -134,6 +149,14 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+        assert_eq!(
+            RealmComputeConfig {
+                witness_base_delay_ms: 0,
+                ..Default::default()
+            }
+            .validate(),
+            Err(ComputeConfigError::ZeroWitnessDelay)
         );
     }
 }

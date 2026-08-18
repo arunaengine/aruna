@@ -30,6 +30,8 @@ pub enum TaskKey {
     // a new variant only ever goes at the end: inserting one would make every
     // persisted timer behind it decode as a different task.
     DrainBlobReclaimQueue,
+    DrainJobFamilyOutbox,
+    DrainJobWitnessQueue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

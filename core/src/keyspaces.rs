@@ -162,6 +162,14 @@ pub const JOB_FAMILY_PROJECTION_KEYSPACE: &str = "job_family_projections";
 /// Locally published authentic records awaiting family replication, keyed by
 /// record key. Only a replicated-authority record is ever queued here.
 pub const JOB_FAMILY_OUTBOX_KEYSPACE: &str = "job_family_outbox";
+/// Exact local capacity held for one accepted execution, keyed by ExecutionId.
+/// The row is written with the signed receipt and released at terminal state.
+pub const JOB_RESERVATION_KEYSPACE: &str = "job_reservations";
+/// Persisted witness fallback deadlines, keyed by due time and family, so a
+/// later-ranked witness still plans after a restart.
+pub const JOB_WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
+/// Bounded explain record of the plan a witness sealed before it launched.
+pub const JOB_PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
 pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 pub const ROCRATE_JOB_STATE_KEYSPACE: &str = "rocrate_job_state";
 pub const ROCRATE_UPLOAD_KEYSPACE: &str = "rocrate_uploads";

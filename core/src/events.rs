@@ -7,7 +7,7 @@ use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceErro
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
-    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, PlacementDecision,
+    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, MAX_POLICY_REF_INPUT, PlacementDecision,
     PlacementPolicyDocument, PolicyPublication, RealmId, ReplicationSuboperationResult,
     ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
@@ -325,9 +325,46 @@ pub enum LaunchOfferEvent {
     Unavailable(String),
 }
 
+/// The placement detail one decline may carry. Decoding rejects an oversized
+/// ref or id list and an `Allowed` decision, so a peer can neither force an
+/// unbounded allocation nor answer a refusal with a grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PlacementDecision")]
+pub struct DeclinedPolicy(PlacementDecision);
+
+impl DeclinedPolicy {
+    pub fn new(decision: PlacementDecision) -> Result<Self, FrameBoundsError> {
+        let listed = match &decision {
+            PlacementDecision::Allowed => return Err(FrameBoundsError::RecordKind),
+            PlacementDecision::Required { refs } | PlacementDecision::DigestMismatch { refs } => {
+                refs.len()
+            }
+            PlacementDecision::Unavailable { policy_ids }
+            | PlacementDecision::Invalid { policy_ids }
+            | PlacementDecision::Denied { policy_ids } => policy_ids.len(),
+            PlacementDecision::InvalidInput { .. } => 0,
+        };
+        match listed <= MAX_POLICY_REF_INPUT {
+            true => Ok(Self(decision)),
+            false => Err(FrameBoundsError::RecordCount),
+        }
+    }
+
+    pub fn decision(&self) -> &PlacementDecision {
+        &self.0
+    }
+}
+
+impl TryFrom<PlacementDecision> for DeclinedPolicy {
+    type Error = FrameBoundsError;
+
+    fn try_from(decision: PlacementDecision) -> Result<Self, Self::Error> {
+        Self::new(decision)
+    }
+}
+
 /// Why an execution target refused a launch offer. The policy detail travels
-/// with the decline; the lifecycle round that starts sending `Policy` is
-/// responsible for bounding the ref list it puts in it.
+/// with the decline in its own bounded wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LaunchDecline {
     /// The offering scheduler is not a holder in the target's current view.
@@ -335,7 +372,7 @@ pub enum LaunchDecline {
     /// Realm or group authorization denied the sealed submitter.
     Unauthorized,
     /// Placement evaluation blocked the execution subject; never `Allowed`.
-    Policy(PlacementDecision),
+    Policy(DeclinedPolicy),
     /// Exact local admission found no capacity for the sealed resources.
     Capacity,
     /// The target is draining or leaving and accepts no new work.
