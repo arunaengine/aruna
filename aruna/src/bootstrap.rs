@@ -10,6 +10,7 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE}
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket,
 };
+use aruna_core::realm_format::verify_realm_epoch;
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -188,6 +189,9 @@ pub async fn fetch_core_onboarding_documents(
         .as_deref()
         .ok_or("missing onboarding sync ticket")?;
     let onboarding_sync_ticket = OnboardingSyncTicket::decode(onboarding_sync_ticket)?;
+    // A retained ticket is re-checked here: no document is fetched from a realm
+    // running another wire format.
+    verify_realm_epoch(onboarding_sync_ticket.payload.format_epoch)?;
     let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
         return Err("net handle unavailable".into());
     };
