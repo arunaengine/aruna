@@ -1952,7 +1952,7 @@ async fn held_record(
     Ok(record)
 }
 
-async fn authorize_forwarded_caller(
+pub(crate) async fn authorize_forwarded_caller(
     context: &Arc<DriverContext>,
     peer: NodeId,
     realm_id: RealmId,
@@ -1969,6 +1969,9 @@ async fn authorize_forwarded_caller(
         | MetadataTransportMessage::ForwardDeleteDocument { auth_token, .. } => auth_token.clone(),
         MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } => {
             Some(auth_token.clone())
+        }
+        MetadataTransportMessage::ForwardCreatePlacementPolicy { auth_token, .. } => {
+            auth_token.clone()
         }
         _ => None,
     };
@@ -2030,7 +2033,7 @@ fn create_forward_holders(
     Some((placement, holders))
 }
 
-async fn forward_to_holders(
+pub(crate) async fn forward_to_holders(
     context: &Arc<DriverContext>,
     holders: &[NodeId],
     message: MetadataTransportMessage,
@@ -2195,13 +2198,13 @@ fn forwarded_unavailable(message: &MetadataTransportMessage) -> MetadataTranspor
     }
 }
 
-enum ForwardAuthError {
+pub(crate) enum ForwardAuthError {
     Unauthorized,
     Forbidden,
     Unavailable(String),
 }
 
-fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMessage {
+pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMessage {
     match error {
         ForwardAuthError::Unauthorized => MetadataTransportMessage::ForwardedWriteDenied {
             error: MetadataWriteAuthError::Unauthorized,

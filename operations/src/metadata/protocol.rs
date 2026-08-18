@@ -3,8 +3,8 @@ use std::sync::Arc;
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{
-    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicyDocument,
-    PlacementPolicyRef, SyncRelationship,
+    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicy,
+    PlacementPolicyDocument, PlacementPolicyRef, SyncRelationship,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -235,6 +235,18 @@ pub enum MetadataTransportMessage {
     /// policy does not exist.
     ForwardedPlacementPolicy {
         result: Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError>,
+    },
+    /// A realm-admin publication routed to a holder of the policy's bucket,
+    /// because only a holder may commit the immutable document. Appended last so
+    /// existing variant indices stay stable.
+    ForwardCreatePlacementPolicy {
+        auth_token: Option<MetadataAuthToken>,
+        policy: Box<PlacementPolicy>,
+        created_at_ms: u64,
+    },
+    /// The document the holder committed, or the identical one it already had.
+    ForwardedPlacementPolicyCreated {
+        document: Box<PlacementPolicyDocument>,
     },
 }
 
