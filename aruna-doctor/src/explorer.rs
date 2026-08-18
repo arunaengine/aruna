@@ -2431,6 +2431,8 @@ mod tests {
                 preemptible: false,
             },
             created_at_ms: 21,
+            subject_generation: 3,
+            subject_digest: [9u8; 32],
         };
         let decoded = decode_entry(
             JOB_RESERVATION_KEYSPACE,

@@ -10543,7 +10543,7 @@ mod tests {
     fn admits_matching_format() {
         // A same-format opener is admitted; another epoch and an undeclared
         // format are both refused before any document reaches the reducer.
-        let topic = irokle_crate::TopicId::hash(b"format-fence".to_vec());
+        let topic = irokle_crate::TopicId::hash(b"format-fence");
         let open = |event_type_id: Option<&str>| {
             SyncMessage::Open(irokle_crate::sync::SyncOpen {
                 protocol: String::from_utf8_lossy(irokle_crate::net::IROKLE_SYNC_ALPN).into_owned(),

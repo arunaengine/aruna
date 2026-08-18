@@ -654,7 +654,7 @@ mod tests {
         let snapshot_path = marked_snapshot(temp.path(), Some(&foreign.to_bytes().unwrap()));
 
         let stats =
-            import_snapshot_into_new_database(&snapshot_path, &temp.path().join("foreign-target"))
+            import_snapshot_into_new_database(&snapshot_path, temp.path().join("foreign-target"))
                 .unwrap();
 
         assert_eq!(stats.format, Some(foreign));
@@ -669,7 +669,7 @@ mod tests {
         let snapshot_path = marked_snapshot(temp.path(), None);
 
         let stats =
-            import_snapshot_into_new_database(&snapshot_path, &temp.path().join("bare-target"))
+            import_snapshot_into_new_database(&snapshot_path, temp.path().join("bare-target"))
                 .unwrap();
 
         assert_eq!(stats.format, None);
@@ -688,7 +688,7 @@ mod tests {
         let snapshot_path = marked_snapshot(temp.path(), Some(&current.to_bytes().unwrap()));
 
         let stats =
-            import_snapshot_into_new_database(&snapshot_path, &temp.path().join("current-target"))
+            import_snapshot_into_new_database(&snapshot_path, temp.path().join("current-target"))
                 .unwrap();
 
         assert_eq!(stats.format, Some(current));

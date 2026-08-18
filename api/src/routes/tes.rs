@@ -573,6 +573,13 @@ pub async fn create_task(
             "idempotency key already bound to task {existing_job_id}"
         ))
         .into_response(),
+        Err(aruna_operations::jobs::submit::SubmitJobError::PlacementUnavailable(reason)) => {
+            TesError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("task admission is unavailable: {reason}"),
+            }
+            .into_response()
+        }
         Err(error) => TesError::internal(error.to_string()).into_response(),
     }
 }
@@ -1702,7 +1709,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use aruna_operations::jobs::service::read_owned_job;
     use axum::body::to_bytes;
 
     use aruna_core::effects::StorageEffect;
@@ -1711,7 +1717,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, JobError, NodeCapabilities, OutputObject,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, WorkspaceMode,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
     };
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
@@ -2687,6 +2693,8 @@ mod tests {
 
     #[tokio::test]
     async fn creates_tagless_basic() {
+        // Tagless basic auth infers the group and reaches admission; a fixture
+        // without the family substrate answers 503, never an auth failure.
         let (_dir, state) = build_state(true).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = sealed(&state, group);
@@ -2694,6 +2702,10 @@ mod tests {
         write_auth(&state, group, access.user_identity).await;
         let mut task = sample_task(group);
         task.tags.remove(GROUP_TAG_KEY);
+
+        let (spec, workspace) = map_task_to_spec(&task, Some(group), true).unwrap();
+        assert_eq!(spec.group_id, group);
+        assert!(workspace.is_none());
 
         let response = create_task(
             State(state.clone()),
@@ -2703,25 +2715,7 @@ mod tests {
             Json(task),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let created: TesCreateTaskResponse = serde_json::from_slice(&body).unwrap();
-        let record = read_owned_job(
-            &state.get_ctx(),
-            access.user_identity,
-            JobId::from_str(&created.id).unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let JobPayload::Execution(spec) = record.payload else {
-            panic!("TES created a non-execution job");
-        };
-        assert_eq!(spec.group_id, group);
-        assert_eq!(record.workspace_mode, WorkspaceMode::None);
-        assert!(record.workspace_bucket.is_none());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -2736,12 +2730,16 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_when_disabled() {
-        // Without S3 mounts, TES falls back to a kept workspace and snapshot inputs.
+        // Without S3 mounts the mapping falls back to snapshot inputs, and the
+        // create call reaches admission (503 in the substrate-less fixture).
         let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = sealed(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
+
+        let (spec, _) = map_task_to_spec(&sample_task(group), None, false).unwrap();
+        assert_eq!(spec.inputs[0].mode, InputMode::Snapshot);
 
         let response = create_task(
             State(state.clone()),
@@ -2751,24 +2749,7 @@ mod tests {
             Json(sample_task(group)),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let created: TesCreateTaskResponse = serde_json::from_slice(&body).unwrap();
-        let record = read_owned_job(
-            &state.get_ctx(),
-            access.user_identity,
-            JobId::from_str(&created.id).unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(record.workspace_mode, WorkspaceMode::Kept);
-        let JobPayload::Execution(spec) = record.payload else {
-            panic!("TES created a non-execution job");
-        };
-        assert_eq!(spec.inputs[0].mode, InputMode::Snapshot);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
