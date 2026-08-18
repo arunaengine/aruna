@@ -10,9 +10,7 @@
 use std::sync::Arc;
 
 use aruna_core::structs::{AuthContext, JobFamilyRecord, JobId, JobRecordEnvelope};
-use aruna_operations::jobs::lifecycle::{
-    AuditPaging, AuditRange, MAX_AUDIT_PAGE, family_audit, family_report,
-};
+use aruna_operations::jobs::lifecycle::{AuditPaging, AuditRange, family_audit, family_report};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -351,6 +349,7 @@ pub async fn get_job_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_operations::jobs::lifecycle::MAX_AUDIT_PAGE;
 
     fn query(cursor: Option<&str>, limit: Option<usize>) -> AuditQuery {
         AuditQuery {
