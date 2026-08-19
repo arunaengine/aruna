@@ -49,7 +49,8 @@ use super::protocol::{
 use super::search_cursor::{
     METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
     METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
-    SearchPageCursor, SearchWatermark, paginate, query_fingerprint, resume_fetch_limit,
+    SearchPageCursor, SearchWatermark, merge_search_hits, paginate, query_fingerprint,
+    resume_fetch_limit,
 };
 use super::summary_cache::summary_cache;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -1937,6 +1938,11 @@ pub async fn search_metadata(
     {
         return Err(MetadataApiError::BadRequest);
     }
+    if let Some(iri) = request.conforms_to.take() {
+        request.conforms_to = crate::metadata::profile_validation::equivalent_profile_iris(&iri)
+            .into_iter()
+            .next();
+    }
     let page_size = request
         .limit
         .unwrap_or(METADATA_SEARCH_DEFAULT_PAGE_SIZE)
@@ -2716,7 +2722,7 @@ fn merge_pending_metadata_records(
     }
 }
 
-async fn load_record_by_document(
+pub(crate) async fn load_record_by_document(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
@@ -2848,7 +2854,7 @@ pub(crate) fn metadata_read_request(
     )
 }
 
-async fn ensure_record_readable(
+pub(crate) async fn ensure_record_readable(
     context: &DriverContext,
     realm_id: RealmId,
     auth: Option<&AuthContext>,
@@ -4429,25 +4435,32 @@ async fn run_search_distributed(
             );
             let hits = match conforms_to {
                 Some(object_iri) => {
-                    handle
-                        .search_authorized_local_filtered(
-                            auth,
-                            graph_iris,
-                            query,
-                            limit,
-                            super::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
-                            object_iri,
-                            group_id,
-                        )
-                        .await
+                    let mut hits = Vec::new();
+                    for object_iri in
+                        crate::metadata::profile_validation::equivalent_profile_iris(&object_iri)
+                    {
+                        hits.extend(
+                            handle
+                                .search_authorized_local_filtered(
+                                    auth.clone(),
+                                    graph_iris.clone(),
+                                    query.clone(),
+                                    limit,
+                                    super::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
+                                    object_iri,
+                                    group_id,
+                                )
+                                .await
+                                .map_err(super::handle::metadata_read_error)?,
+                        );
+                    }
+                    merge_search_hits(hits).into_iter().take(limit).collect()
                 }
-                None => {
-                    handle
-                        .search_authorized_local(auth, graph_iris, query, limit, group_id)
-                        .await
-                }
+                None => handle
+                    .search_authorized_local(auth, graph_iris, query, limit, group_id)
+                    .await
+                    .map_err(super::handle::metadata_read_error)?,
             };
-            let hits = hits.map_err(super::handle::metadata_read_error)?;
             Ok((hits, limit))
         },
     );
@@ -4472,18 +4485,26 @@ async fn run_search_distributed(
             );
             let hits = match conforms_to {
                 Some(object_iri) => {
-                    handle
-                        .request_remote_filtered_search_graphs(
-                            node_id,
-                            auth_token,
-                            graph_iris,
-                            query,
-                            limit,
-                            super::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
-                            object_iri,
-                            group_id,
-                        )
-                        .await?
+                    let mut hits = Vec::new();
+                    for object_iri in
+                        crate::metadata::profile_validation::equivalent_profile_iris(&object_iri)
+                    {
+                        hits.extend(
+                            handle
+                                .request_remote_filtered_search_graphs(
+                                    node_id,
+                                    auth_token.clone(),
+                                    graph_iris.clone(),
+                                    query.clone(),
+                                    limit,
+                                    super::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
+                                    object_iri,
+                                    group_id,
+                                )
+                                .await?,
+                        );
+                    }
+                    merge_search_hits(hits).into_iter().take(limit).collect()
                 }
                 None => {
                     handle

@@ -1983,6 +1983,26 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn import_path_keeps_profile_gate_rejections_permanent() {
+        let finding = aruna_core::metadata::MetadataProfileValidationFinding {
+            code: "unsupported_constraint".to_string(),
+            severity: aruna_core::metadata::MetadataProfileValidationSeverity::Violation,
+            focus_node: None,
+            path: None,
+            rule: "http://www.w3.org/ns/shacl#minLength".to_string(),
+            message: "unsupported".to_string(),
+            profile_revision: None,
+            completeness: aruna_core::metadata::MetadataProfileValidationCompleteness::Incomplete,
+        };
+        let failure = classify_metadata(MetadataWriteError::Create(
+            crate::create_metadata_document::CreateMetadataDocumentError::MetadataError(
+                aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
+            ),
+        ));
+        assert!(matches!(failure, ImportFailure::Permanent(_)));
+    }
+
     #[tokio::test]
     async fn panic_releases_upload() {
         let fixture = setup_driver_context().await;

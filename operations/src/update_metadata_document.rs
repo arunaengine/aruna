@@ -7,14 +7,15 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataApplyRoCrateRequest,
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentLifecycleRecord,
-    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRawOriginBudget,
-    MetadataRequestDurability, raw_quotas,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
+    MetadataProfileValidationStatus, MetadataRawOriginBudget, MetadataRequestDurability,
+    raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     document_sync_revision_write_entry, metadata_create_acceptance_key,
     metadata_document_lifecycle_write_entry, metadata_event_log_key, metadata_event_log_prefix,
-    raw_budget_entry, raw_budget_key,
+    metadata_profile_validation_status_write_entry, raw_budget_entry, raw_budget_key,
 };
 use aruna_core::structs::{
     MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument,
@@ -34,6 +35,9 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_materialization_status,
     schedule_metadata_materialization_drain_effect,
+};
+use crate::metadata::profile_validation::{
+    not_profiled_status, stale_status, submission_has_profile_tag, validate_submission,
 };
 use crate::metadata::projector::{create_event_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
@@ -78,6 +82,7 @@ pub struct UpdateMetadataDocumentOperation {
     /// Buckets this update publishes onto and the activation generation each
     /// resolved at, read as a fence inside the write transaction.
     fenced: Vec<(PlacementRef, u64)>,
+    profile_validation_status: Option<MetadataProfileValidationStatus>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -130,6 +135,18 @@ pub enum UpdateMetadataDocumentError {
 
 impl UpdateMetadataDocumentOperation {
     pub fn new(config: UpdateMetadataDocumentConfig) -> Self {
+        let profile_validation_status = match &config.mutation {
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld }
+                if !submission_has_profile_tag(jsonld) =>
+            {
+                Some(not_profiled_status(config.document_id))
+            }
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { .. } => None,
+            UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
+            | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. } => {
+                Some(stale_status(config.document_id, "dataset_revision_changed"))
+            }
+        };
         Self {
             config,
             txn_id: None,
@@ -140,6 +157,7 @@ impl UpdateMetadataDocumentOperation {
             accepted_create: None,
             realm_config: None,
             fenced: Vec::new(),
+            profile_validation_status,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -319,6 +337,17 @@ impl UpdateMetadataDocumentOperation {
             return Err(UpdateMetadataDocumentError::RawLimit);
         };
         writes.push(raw_budget_entry(raw_budget)?);
+        let Some(mut profile_status) = self.profile_validation_status.clone() else {
+            return Err(MetadataError::Backend(
+                "profile validation status is missing before update commit".to_string(),
+            )
+            .into());
+        };
+        profile_status.document_id = event.record.document_id;
+        profile_status.dataset_revision = event.event_id;
+        writes.push(metadata_profile_validation_status_write_entry(
+            &profile_status,
+        )?);
         Ok(Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -513,9 +542,18 @@ impl UpdateMetadataDocumentOperation {
 }
 
 pub async fn update_metadata_document(
-    operation: UpdateMetadataDocumentOperation,
+    mut operation: UpdateMetadataDocumentOperation,
     context: &DriverContext,
 ) -> Result<MetadataRegistryRecord, UpdateMetadataDocumentError> {
+    operation.profile_validation_status = Some(match &operation.config.mutation {
+        UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
+            validate_submission(context, operation.config.document_id, jsonld).await?
+        }
+        UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
+        | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. } => {
+            stale_status(operation.config.document_id, "dataset_revision_changed")
+        }
+    });
     let cache_generation = context
         .metadata_handle
         .as_ref()

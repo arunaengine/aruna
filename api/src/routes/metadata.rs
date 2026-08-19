@@ -2,11 +2,12 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission_with, parse_group_id, require_realm_auth,
     require_unrestricted_realm_auth,
 };
-use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::error::{ErrorResponse, ProfileValidationFindingResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
-    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationState,
+    MetadataProfileValidationStatus, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{
     Actor, AuthContext, ExportRoCrateSpec, MetadataRegistryRecord, Permission, WatchEvent,
@@ -40,7 +41,11 @@ use aruna_operations::metadata::forward::{
     export_rocrate_routed as run_export_rocrate,
     get_metadata_routed as run_get_visible_metadata_document, is_user_origin,
     origin_holds_document as run_origin_holds_document,
+    profile_validation_status_routed as run_profile_validation_status,
     update_metadata_document_routed as run_update_metadata_document,
+};
+use aruna_operations::metadata::profile_validation::{
+    SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::request_policy::PolicyRequestExtras;
@@ -94,6 +99,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(list_metadata_documents))
         .routes(routes!(get_metadata_path))
         .routes(routes!(get_metadata_document, delete_metadata_document))
+        .routes(routes!(profile_validation_capabilities))
+        .routes(routes!(get_profile_validation_status))
+        .routes(routes!(revalidate_profile))
         .routes(routes!(export_metadata_rocrate, replace_metadata_rocrate))
         .routes(routes!(submit_rocrate_export))
         .routes(routes!(add_metadata_data_entity))
@@ -116,6 +124,63 @@ pub struct MetadataDocumentSummary {
     pub replicas: usize,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProfileValidationCapabilitiesResponse {
+    pub evaluator: String,
+    pub supported_constraints: Vec<String>,
+    pub unsupported_constraint_policy: String,
+    pub public_profile_iri_template: String,
+    pub legacy_profile_iri_template: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProfileValidationStatusResponse {
+    pub document_id: String,
+    pub dataset_revision: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_iri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    pub evaluator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validated_at_ms: Option<u64>,
+    pub findings: Vec<ProfileValidationFindingResponse>,
+    pub completeness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+}
+
+impl From<MetadataProfileValidationStatus> for ProfileValidationStatusResponse {
+    fn from(status: MetadataProfileValidationStatus) -> Self {
+        Self {
+            document_id: status.document_id.to_string(),
+            dataset_revision: status.dataset_revision.to_string(),
+            state: match status.state {
+                MetadataProfileValidationState::NotProfiled => "not_profiled",
+                MetadataProfileValidationState::Valid => "valid",
+                MetadataProfileValidationState::Invalid => "invalid",
+                MetadataProfileValidationState::Stale => "stale",
+            }
+            .to_string(),
+            profile_id: status.profile_id.map(|id| id.to_string()),
+            profile_iri: status.profile_iri,
+            profile_revision: status.profile_revision.map(|revision| revision.to_string()),
+            evaluator: status.evaluator,
+            validated_at_ms: status.validated_at_ms,
+            findings: status.findings.into_iter().map(Into::into).collect(),
+            completeness: match status.completeness {
+                MetadataProfileValidationCompleteness::Complete => "complete",
+                MetadataProfileValidationCompleteness::Incomplete => "incomplete",
+            }
+            .to_string(),
+            stale_reason: status.stale_reason,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -901,6 +966,107 @@ pub async fn get_metadata_path(
             conflicts: result.conflicts.iter().map(ToString::to_string).collect(),
         }),
     ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/metadata/profile-validation/capabilities",
+    tag = "metadata",
+    summary = "Get backend Profile validation capabilities",
+    description = "P0-1 evaluator decision: this backend uses the stable ProfileConstraintEvaluator adapter with SHACL Core compiled to SPARQL and evaluated by the repository's pinned spareval engine; the rudof shacl_validation candidate was unavailable in the offline registry. The exact supported dispatch and constraint set is sh:targetClass, sh:targetNode, sh:property, sh:path with predicate IRI paths, sh:minCount, sh:maxCount, sh:datatype, sh:class, sh:nodeKind, sh:pattern, sh:in, sh:hasValue, sh:closed, sh:ignoredProperties, sh:severity, and sh:deactivated. The accepted annotation terms are sh:message, sh:name, sh:description, sh:order, and sh:group. Any other SHACL construct fails closed with an unsupported_constraint finding.",
+    responses((status = 200, description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms", body = ProfileValidationCapabilitiesResponse))
+)]
+pub async fn profile_validation_capabilities()
+-> (StatusCode, Json<ProfileValidationCapabilitiesResponse>) {
+    (
+        StatusCode::OK,
+        Json(ProfileValidationCapabilitiesResponse {
+            evaluator: evaluator_name().to_string(),
+            supported_constraints: SUPPORTED_PROFILE_CONSTRAINTS
+                .iter()
+                .map(|constraint| (*constraint).to_string())
+                .collect(),
+            unsupported_constraint_policy: "fail_closed".to_string(),
+            public_profile_iri_template: "https://w3id.org/aruna/profile/{id}".to_string(),
+            legacy_profile_iri_template: "https://w3id.org/aruna/{id}".to_string(),
+        }),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/metadata/{document_id}/profile-validation",
+    tag = "metadata",
+    summary = "Get revision-bound Profile validation status",
+    description = "Returns the durable validation status written atomically with the accepted metadata revision. The response becomes stale when either the Dataset revision or the exact registered Profile revision changes. Authentication is optional and uses the same document READ rules as metadata retrieval.",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    responses(
+        (status = 200, description = "Current, invalid, unprofiled, or stale revision-bound validation status", body = ProfileValidationStatusResponse),
+        (status = 400, description = "Document id is not a structured metadata id", body = ErrorResponse),
+        (status = 401, description = "A holder rejected the forwarded credential", body = ErrorResponse),
+        (status = 403, description = "READ is denied", body = ErrorResponse),
+        (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
+        (status = 503, description = "No holder can supply the exact status", body = ErrorResponse)
+    ),
+    security((), ("bearer_auth" = []))
+)]
+pub async fn get_profile_validation_status(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Path(document_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<ProfileValidationStatusResponse>)> {
+    let document_id = parse_document_id(&document_id)?;
+    let status = run_profile_validation_status(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        GetVisibleMetadataDocumentRequest { document_id, auth },
+        forwarded_auth_token(bearer_token)?,
+        false,
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(status.into())))
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/{document_id}/profile-validation/revalidate",
+    tag = "metadata",
+    summary = "Revalidate a metadata document against its exact current Profile revision",
+    description = "Reconstructs validation from the last accepted raw Dataset revision and the registered Profile's current exact revision, fences the Dataset revision, and durably replaces the status. Requires an authenticated caller allowed to READ the document.",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    responses(
+        (status = 200, description = "Fresh valid, invalid, or unprofiled status", body = ProfileValidationStatusResponse),
+        (status = 400, description = "Document id or Profile tag is invalid", body = ErrorResponse),
+        (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
+        (status = 403, description = "READ is denied", body = ErrorResponse),
+        (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
+        (status = 503, description = "The Profile, validator, Dataset revision, or a holder is temporarily unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn revalidate_profile(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Path(document_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<ProfileValidationStatusResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let document_id = parse_document_id(&document_id)?;
+    let status = run_profile_validation_status(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        GetVisibleMetadataDocumentRequest {
+            document_id,
+            auth: Some(auth),
+        },
+        forwarded_auth_token(bearer_token)?,
+        true,
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(status.into())))
 }
 
 #[utoipa::path(
@@ -1752,7 +1918,7 @@ pub async fn query_all_metadata(
     description = "Authentication is optional and changes the result: hits are restricted to metadata the caller may read, so an anonymous request returns fewer documents. Either q or conforms_to must be given. Distributed searches fan out to at most 32 realm node partitions, at most 8 of them concurrently, under an overall deadline of a few seconds; nodes_failed counts the partitions that failed, timed out or were dropped by that cap, and any non-zero value means the page is a partial view of the realm. Pagination is cursor-based and stops at a server-side depth of 1000 hits per node, which is reported as truncated. Hits come from each node's own index, so a document whose write was only just accepted may not be findable yet.",
     params(
         ("q" = Option<String>, Query, description = "Free-text search query, matched against indexed literals. Optional when conforms_to is set; a request with neither is rejected with 400"),
-        ("conforms_to" = Option<String>, Query, description = "Exact RO-Crate conformsTo profile IRI, for example https://w3id.org/ro/crate/1.2. Must be a valid absolute IRI and is matched exactly, never as a prefix"),
+        ("conforms_to" = Option<String>, Query, description = "RO-Crate conformsTo profile IRI. Registered https://w3id.org/aruna/profile/{id} and legacy https://w3id.org/aruna/{id} forms resolve to the same exact registered Profile; other absolute IRIs are matched exactly, never as a prefix"),
         ("group_id" = Option<String>, Query, description = "Restrict hits to a single group ULID"),
         ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100). Hits are ordered by descending score"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous response's next_cursor. Bound to the original query; replaying it with a changed query returns 400. Paging is best-effort: results may shift under concurrent metadata churn or node failures"),
@@ -2130,6 +2296,9 @@ fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
         MetadataError::InvalidInput(_) => ServerError::BadRequest,
         MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
+        MetadataError::ProfileValidation(findings) => {
+            ServerError::MetadataProfileValidation(findings)
+        }
         MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }

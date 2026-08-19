@@ -10,7 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
 };
-use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
+use aruna_core::metadata::{
+    MetadataCreateEventRecord, MetadataError, MetadataProfileValidationStatus, MetadataQueryResults,
+};
 use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
     Actor, AuthContext, JobId, MetadataRegistryRecord, MintPersistentIdSpec, Permission,
@@ -38,11 +40,13 @@ use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
-    MetadataApiError, export_metadata_rocrate, get_visible_metadata_document,
+    MetadataApiError, ensure_record_readable, export_metadata_rocrate,
+    get_visible_metadata_document, load_record_by_document,
 };
 use crate::metadata::handle::{
     MetadataRequestDelivery, MetadataRequestError, MetadataWritePeerError,
 };
+use crate::metadata::profile_validation::{current_validation_status, revalidate_current};
 use crate::metadata::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
     PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
@@ -434,6 +438,132 @@ pub async fn get_metadata_routed(
     }
 }
 
+/// Reads or recomputes Profile status on the document's holders. The holder
+/// performs the same per-document READ check as the ordinary metadata route.
+pub async fn profile_validation_status_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    request: GetVisibleMetadataDocumentRequest,
+    auth_token: Option<MetadataAuthToken>,
+    revalidate: bool,
+) -> Result<MetadataProfileValidationStatus, MetadataApiError> {
+    if context.net_handle.is_none() {
+        let record = load_record_by_document(context.as_ref(), request.document_id).await?;
+        ensure_record_readable(
+            context.as_ref(),
+            realm_id,
+            request.auth.as_ref(),
+            &record,
+            None,
+        )
+        .await?;
+        return if revalidate {
+            revalidate_current(context.as_ref(), &record).await
+        } else {
+            current_validation_status(context.as_ref(), &record).await
+        }
+        .map_err(|_| MetadataApiError::ServiceUnavailable);
+    }
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let holders =
+        read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
+    let holder_count = holders.len();
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let context = Arc::clone(context);
+    let metadata = context.metadata_handle.clone();
+    let request_template = request.clone();
+    let (responses, timed_out) = read_holders(holders, move |holder| {
+        let context = context.clone();
+        let metadata = metadata.clone();
+        let request = request_template.clone();
+        let auth_token = auth_token.clone();
+        Box::pin(async move {
+            if Some(holder) == local_node {
+                let record = load_record_by_document(context.as_ref(), request.document_id)
+                    .await
+                    .map_err(read_error)?;
+                ensure_record_readable(
+                    context.as_ref(),
+                    realm_id,
+                    request.auth.as_ref(),
+                    &record,
+                    None,
+                )
+                .await
+                .map_err(read_error)?;
+                if revalidate {
+                    revalidate_current(context.as_ref(), &record).await
+                } else {
+                    current_validation_status(context.as_ref(), &record).await
+                }
+                .map_err(|_| MetadataReadError::Unavailable)
+            } else {
+                let Some(metadata) = metadata else {
+                    return Err(MetadataReadError::Unavailable);
+                };
+                match metadata
+                    .request_forwarded_write(
+                        holder,
+                        MetadataTransportMessage::ForwardProfileValidationStatus {
+                            auth_token,
+                            config_digest,
+                            document_id: request.document_id,
+                            revalidate,
+                        },
+                    )
+                    .await
+                {
+                    Ok(MetadataTransportMessage::ForwardedProfileValidationStatus { result }) => {
+                        result.map(|status| *status)
+                    }
+                    _ => Err(MetadataReadError::Unavailable),
+                }
+            }
+        })
+    })
+    .await;
+    let mut not_found = 0usize;
+    let mut success = None;
+    let mut auth_error = None;
+    let mut unavailable = timed_out;
+    for (_, response) in responses {
+        match response {
+            Ok(status) => {
+                success.get_or_insert(status);
+            }
+            Err(MetadataReadError::Unauthorized) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
+            }
+            Err(MetadataReadError::Forbidden) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
+            }
+            Err(MetadataReadError::NotFound) => not_found += 1,
+            Err(MetadataReadError::Unavailable) => unavailable = true,
+        }
+    }
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if success.is_some() && not_found > 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(status) = success {
+        return Ok(status);
+    }
+    if !unavailable && holder_count > 0 && not_found == holder_count {
+        Err(MetadataApiError::NotFound)
+    } else {
+        Err(MetadataApiError::ServiceUnavailable)
+    }
+}
+
 /// Exports locally on a holder or forwards with the caller's bearer or
 /// peer-attested internal principal for another READ check.
 pub async fn export_rocrate_routed(
@@ -625,6 +755,10 @@ pub async fn create_metadata_document_routed(
         MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
             "holder returned a metadata create record for another document".to_string(),
         )),
+        MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
+            CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings))
+                .into(),
+        ),
         other => Err(unexpected_response(other)),
     }
 }
@@ -724,6 +858,10 @@ pub async fn update_metadata_document_routed(
         )),
         MetadataTransportMessage::ForwardedUpdateInvalidInput { message } => Err(
             UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into(),
+        ),
+        MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
+            UpdateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings))
+                .into(),
         ),
         other => Err(unexpected_response(other)),
     }
@@ -946,7 +1084,10 @@ pub(crate) async fn apply_forwarded_write(
         MetadataTransportMessage::ForwardCreateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardUpdateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardDeleteDocument { config_digest, .. }
-        | MetadataTransportMessage::ForwardReadDocument { config_digest, .. } => *config_digest,
+        | MetadataTransportMessage::ForwardReadDocument { config_digest, .. }
+        | MetadataTransportMessage::ForwardProfileValidationStatus { config_digest, .. } => {
+            *config_digest
+        }
         _ => return reject("unexpected forwarded metadata message"),
     };
     if config.digest().ok() != Some(expected_digest) {
@@ -986,6 +1127,64 @@ pub(crate) async fn apply_forwarded_write(
                 Err(error) => Err(error),
             };
             MetadataTransportMessage::ForwardedRead { result }
+        })
+        .await;
+    }
+
+    if let MetadataTransportMessage::ForwardProfileValidationStatus {
+        auth_token,
+        document_id,
+        revalidate,
+        ..
+    } = &message
+    {
+        return Box::pin(async {
+            let Some(metadata) = context.metadata_handle.as_ref() else {
+                return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                    result: Err(MetadataReadError::Unavailable),
+                };
+            };
+            let result = match metadata
+                .authorize_read_peer(peer, auth_token.clone(), false)
+                .await
+            {
+                Ok(auth)
+                    if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
+                {
+                    let record = match load_record_by_document(context.as_ref(), *document_id).await
+                    {
+                        Ok(record) => record,
+                        Err(error) => {
+                            return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                                result: Err(read_error(error)),
+                            };
+                        }
+                    };
+                    if let Err(error) = ensure_record_readable(
+                        context.as_ref(),
+                        realm_id,
+                        auth.as_ref(),
+                        &record,
+                        None,
+                    )
+                    .await
+                    {
+                        return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                            result: Err(read_error(error)),
+                        };
+                    }
+                    if *revalidate {
+                        revalidate_current(context.as_ref(), &record).await
+                    } else {
+                        current_validation_status(context.as_ref(), &record).await
+                    }
+                    .map(Box::new)
+                    .map_err(|_| MetadataReadError::Unavailable)
+                }
+                Ok(_) => Err(MetadataReadError::Unavailable),
+                Err(error) => Err(error),
+            };
+            MetadataTransportMessage::ForwardedProfileValidationStatus { result }
         })
         .await;
     }
@@ -1053,6 +1252,9 @@ pub(crate) async fn apply_forwarded_write(
                             Err(error) => reject(error),
                         }
                     }
+                    Err(CreateMetadataDocumentError::MetadataError(
+                        MetadataError::ProfileValidation(findings),
+                    )) => MetadataTransportMessage::ForwardedProfileValidation { findings },
                     Err(error) => reject(format!("forwarded metadata create failed: {error}")),
                 }
             })
@@ -1103,6 +1305,9 @@ pub(crate) async fn apply_forwarded_write(
                     Err(UpdateMetadataDocumentError::MetadataError(
                         MetadataError::InvalidInput(message),
                     )) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
+                    Err(UpdateMetadataDocumentError::MetadataError(
+                        MetadataError::ProfileValidation(findings),
+                    )) => MetadataTransportMessage::ForwardedProfileValidation { findings },
                     Err(error) => reject(format!("forwarded metadata update failed: {error}")),
                 }
             })
@@ -2202,6 +2407,11 @@ fn forwarded_unavailable(message: &MetadataTransportMessage) -> MetadataTranspor
     match message {
         MetadataTransportMessage::ForwardReadDocument { .. } => {
             MetadataTransportMessage::ForwardedRead {
+                result: Err(MetadataReadError::Unavailable),
+            }
+        }
+        MetadataTransportMessage::ForwardProfileValidationStatus { .. } => {
+            MetadataTransportMessage::ForwardedProfileValidationStatus {
                 result: Err(MetadataReadError::Unavailable),
             }
         }

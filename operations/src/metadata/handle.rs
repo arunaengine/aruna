@@ -235,6 +235,9 @@ pub struct MetadataHandleOptions {
     /// host parallelism; set explicitly when cgroup limits make
     /// `available_parallelism` unrepresentative.
     pub backend_pool_size: Option<usize>,
+    /// Test/maintenance fault injection. Tagged writes fail closed while an
+    /// untagged crate continues through ordinary structural validation.
+    pub profile_validation_disabled: bool,
 }
 
 impl MetadataHandleOptions {
@@ -250,6 +253,11 @@ impl MetadataHandleOptions {
 
     pub fn with_backend_pool_size(mut self, backend_pool_size: usize) -> Self {
         self.backend_pool_size = Some(backend_pool_size.max(1));
+        self
+    }
+
+    pub fn with_profile_validation_disabled(mut self, disabled: bool) -> Self {
+        self.profile_validation_disabled = disabled;
         self
     }
 }
@@ -284,6 +292,7 @@ struct MetadataInner {
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
+    profile_validation_disabled: bool,
 }
 
 #[derive(Clone)]
@@ -882,6 +891,7 @@ impl MetadataHandle {
                 )),
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
+                profile_validation_disabled: metadata_options.profile_validation_disabled,
             }),
             storage_priority: StoragePriority::Foreground,
         })
@@ -980,6 +990,10 @@ impl MetadataHandle {
 
     pub(crate) fn visibility_generation(&self) -> u64 {
         self.inner.visibility_cache.current_generation()
+    }
+
+    pub(crate) fn profile_validation_available(&self) -> bool {
+        !self.inner.profile_validation_disabled
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next
@@ -1730,7 +1744,8 @@ impl MetadataHandle {
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardReadDocument { .. }) => {
+            | MetadataTransportMessage::ForwardReadDocument { .. }
+            | MetadataTransportMessage::ForwardProfileValidationStatus { .. }) => {
                 Box::pin(async {
                     super::forward::apply_forwarded_write(context, peer, forward).await
                 })
@@ -1822,6 +1837,8 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedJobRecordPage { .. }
             | MetadataTransportMessage::ForwardedLaunchOffer { .. }
             | MetadataTransportMessage::ForwardedJobSubmission { .. }
+            | MetadataTransportMessage::ForwardedProfileValidation { .. }
+            | MetadataTransportMessage::ForwardedProfileValidationStatus { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4538,6 +4555,7 @@ pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
         | MetadataError::HandleMissing
         | MetadataError::TaskJoin(_)
         | MetadataError::Validation(_)
+        | MetadataError::ProfileValidation(_)
         | MetadataError::Persist(_)
         | MetadataError::Storage(_)
         | MetadataError::Backend(_) => MetadataReadError::Unavailable,
@@ -4621,6 +4639,15 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedLaunchOffer { .. } => "forwarded_launch_offer",
         MetadataTransportMessage::ForwardJobSubmission { .. } => "forward_job_submission",
         MetadataTransportMessage::ForwardedJobSubmission { .. } => "forwarded_job_submission",
+        MetadataTransportMessage::ForwardedProfileValidation { .. } => {
+            "forwarded_profile_validation"
+        }
+        MetadataTransportMessage::ForwardProfileValidationStatus { .. } => {
+            "forward_profile_validation_status"
+        }
+        MetadataTransportMessage::ForwardedProfileValidationStatus { .. } => {
+            "forwarded_profile_validation_status"
+        }
     }
 }
 

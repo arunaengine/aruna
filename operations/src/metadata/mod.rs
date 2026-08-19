@@ -4,6 +4,7 @@ pub mod forward;
 mod handle;
 mod iri_index;
 pub mod materialization_queue;
+pub mod profile_validation;
 pub mod projector;
 pub(crate) mod protocol;
 pub mod prune_queue;

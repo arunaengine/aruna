@@ -4,7 +4,10 @@ use std::time::SystemTime;
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
-use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
+use aruna_core::metadata::{
+    MetadataProfileValidationFinding, MetadataProfileValidationStatus, MetadataQueryResults,
+    MetadataSearchHit,
+};
 use aruna_core::structs::{
     MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicy,
     PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId, SyncRelationship,
@@ -312,6 +315,23 @@ pub enum MetadataTransportMessage {
     },
     ObjectSearchResults {
         result: Result<ObjectSearchNodePage, MetadataReadError>,
+    },
+    /// A structured Profile gate rejection returned by a holder.
+    /// Appended after the object-search variants so every existing postcard
+    /// discriminant, including theirs, remains stable.
+    ForwardedProfileValidation {
+        findings: Vec<MetadataProfileValidationFinding>,
+    },
+    /// Read or deterministically recompute a document's revision-bound Profile
+    /// status on a holder, under the caller's READ authority.
+    ForwardProfileValidationStatus {
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        revalidate: bool,
+    },
+    ForwardedProfileValidationStatus {
+        result: Result<Box<MetadataProfileValidationStatus>, MetadataReadError>,
     },
 }
 

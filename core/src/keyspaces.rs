@@ -24,6 +24,7 @@ pub const METADATA_DOCUMENT_LIFECYCLE_KEYSPACE: &str = "metadata_document_lifecy
 pub const METADATA_GRAPH_LIFECYCLE_KEYSPACE: &str = "metadata_graph_lifecycle";
 pub const METADATA_GRAPH_PRUNE_JOB_KEYSPACE: &str = "metadata_graph_prune_jobs";
 pub const METADATA_MATERIALIZATION_STATUS_KEYSPACE: &str = "metadata_materialization_status";
+pub const METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE: &str = "metadata_profile_validation_status";
 pub const METADATA_RAW_REVISION_KEYSPACE: &str = "metadata_raw_revisions";
 pub const METADATA_RAW_BUDGET_KEYSPACE: &str = "metadata_raw_budgets";
 pub const METADATA_MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";

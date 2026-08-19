@@ -95,6 +95,15 @@ fn storage_is_transient(error: &StorageError) -> bool {
 /// rejected document stays permanent.
 fn metadata_error_transient(error: &MetadataError) -> bool {
     match error {
+        MetadataError::ProfileValidation(findings) => {
+            !findings.is_empty()
+                && findings.iter().all(|finding| {
+                    matches!(
+                        finding.code.as_str(),
+                        "profile_unavailable" | "validator_unavailable"
+                    )
+                })
+        }
         MetadataError::Validation(_)
         | MetadataError::InvalidInput(_)
         | MetadataError::InvalidEffect => false,
@@ -106,6 +115,10 @@ fn metadata_error_transient(error: &MetadataError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::metadata::{
+        MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
+        MetadataProfileValidationSeverity,
+    };
 
     fn handle() -> aruna_core::structured_id::PlacementHandle {
         aruna_core::structured_id::PlacementHandle::new(1).expect("handle")
@@ -118,6 +131,38 @@ mod tests {
             pointer: "/@graph".to_string(),
             entity_id: None,
         }]
+    }
+
+    fn profile_finding(code: &str) -> MetadataProfileValidationFinding {
+        MetadataProfileValidationFinding {
+            code: code.to_string(),
+            severity: MetadataProfileValidationSeverity::Violation,
+            focus_node: None,
+            path: None,
+            rule: code.to_string(),
+            message: code.to_string(),
+            profile_revision: None,
+            completeness: MetadataProfileValidationCompleteness::Incomplete,
+        }
+    }
+
+    #[test]
+    fn profile_gate_is_permanent_except_for_unavailable_dependencies() {
+        let permanent = create(CreateMetadataDocumentError::MetadataError(
+            MetadataError::ProfileValidation(vec![profile_finding("unsupported_constraint")]),
+        ));
+        assert!(matches!(
+            classify_metadata(permanent),
+            MetadataFailure::Permanent(_)
+        ));
+
+        let retryable = create(CreateMetadataDocumentError::MetadataError(
+            MetadataError::ProfileValidation(vec![profile_finding("validator_unavailable")]),
+        ));
+        assert!(matches!(
+            classify_metadata(retryable),
+            MetadataFailure::Retryable(_)
+        ));
     }
 
     fn create(error: CreateMetadataDocumentError) -> MetadataWriteError {

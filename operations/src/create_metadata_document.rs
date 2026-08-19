@@ -9,11 +9,12 @@ use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
     METADATA_RAW_BYTES_LIMIT, MetadataCreateCrateRequest, MetadataCreateEventPayload,
     MetadataCreateEventRecord, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
-    MetadataRequestDurability, raw_quotas,
+    MetadataProfileValidationStatus, MetadataRequestDurability, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    metadata_create_acceptance_key, metadata_create_acceptance_write_entry, raw_budget_entry,
+    metadata_create_acceptance_key, metadata_create_acceptance_write_entry,
+    metadata_profile_validation_status_write_entry, raw_budget_entry,
 };
 use aruna_core::structs::{
     Actor, BindingError, DocumentClass, MetadataRegistryRecord, PlacementRef, PlacementScope,
@@ -29,6 +30,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::metadata::profile_validation::{
+    not_profiled_status, submission_has_profile_tag, validate_submission,
+};
 use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{
     metadata_create_event_and_pending_projection_write_entries, read_registry_by_document_effect,
@@ -91,6 +95,7 @@ pub struct CreateMetadataDocumentOperation {
     state: CreateMetadataDocumentState,
     record: Option<MetadataRegistryRecord>,
     create_event: Option<MetadataCreateEventRecord>,
+    profile_validation_status: Option<MetadataProfileValidationStatus>,
     output: Option<Result<CreateMetadataDocumentResult, CreateMetadataDocumentError>>,
 }
 
@@ -148,6 +153,17 @@ pub enum CreateMetadataDocumentError {
 
 impl CreateMetadataDocumentOperation {
     pub fn new(config: CreateMetadataDocumentConfig) -> Self {
+        let profile_validation_status = match &config.payload {
+            CreateMetadataDocumentPayload::Scaffold { .. } => {
+                Some(not_profiled_status(config.document_id))
+            }
+            CreateMetadataDocumentPayload::RoCrate { jsonld }
+                if !submission_has_profile_tag(jsonld) =>
+            {
+                Some(not_profiled_status(config.document_id))
+            }
+            CreateMetadataDocumentPayload::RoCrate { .. } => None,
+        };
         Self {
             config,
             skip_existing_check: false,
@@ -157,6 +173,7 @@ impl CreateMetadataDocumentOperation {
             state: CreateMetadataDocumentState::Init,
             record: None,
             create_event: None,
+            profile_validation_status,
             output: None,
         }
     }
@@ -191,6 +208,7 @@ impl CreateMetadataDocumentOperation {
             state: CreateMetadataDocumentState::Init,
             record: None,
             create_event: None,
+            profile_validation_status: self.profile_validation_status.clone(),
             output: None,
         }
     }
@@ -481,10 +499,21 @@ impl CreateMetadataDocumentOperation {
         }) else {
             return self.fail(CreateMetadataDocumentError::RawLimit);
         };
+        let Some(mut status) = self.profile_validation_status.clone() else {
+            return self.fail(
+                MetadataError::Backend(
+                    "profile validation status is missing before create commit".to_string(),
+                )
+                .into(),
+            );
+        };
+        status.document_id = create_event.record.document_id;
+        status.dataset_revision = create_event.event_id;
         let writes = metadata_create_event_and_pending_projection_write_entries(&create_event)
             .and_then(|mut writes| {
                 writes.push(raw_budget_entry(&raw_budget)?);
                 writes.push(metadata_create_acceptance_write_entry(&create_event)?);
+                writes.push(metadata_profile_validation_status_write_entry(&status)?);
                 Ok(writes)
             });
         match writes {
@@ -611,6 +640,14 @@ pub async fn create_metadata_document(
         let document_id = mint_local_id(context.as_ref(), &template.config).await?;
         template.config.document_id = document_id.as_ulid();
     }
+    template.profile_validation_status = Some(match &template.config.payload {
+        CreateMetadataDocumentPayload::RoCrate { jsonld } => {
+            validate_submission(context.as_ref(), template.config.document_id, jsonld).await?
+        }
+        CreateMetadataDocumentPayload::Scaffold { .. } => {
+            not_profiled_status(template.config.document_id)
+        }
+    });
     let mut attempt = 0usize;
     let created = loop {
         match drive(template.fresh_copy(), context.as_ref()).await {

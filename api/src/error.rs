@@ -1,7 +1,7 @@
 use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
-use aruna_core::metadata::MetadataValidationViolation;
+use aruna_core::metadata::{MetadataProfileValidationFinding, MetadataValidationViolation};
 use aruna_operations::auth::ArunaBearerTokenError;
 use axum::Json;
 use axum::http::StatusCode;
@@ -48,6 +48,8 @@ pub enum ServerError {
     BadRequestMessage(String),
     #[error("Metadata validation failed")]
     MetadataValidation(Vec<MetadataValidationViolation>),
+    #[error("Metadata Profile validation failed")]
+    MetadataProfileValidation(Vec<MetadataProfileValidationFinding>),
     #[error("Bad gateway")]
     BadGateway,
     #[error("{0}")]
@@ -155,6 +157,9 @@ pub struct ErrorResponse {
     /// Structured metadata validation failures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub violations: Option<Vec<ValidationViolationResponse>>,
+    /// Structured Profile validation findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub findings: Option<Vec<ProfileValidationFindingResponse>>,
     /// The exact standing-quota refusal behind a 409, when one caused it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaDeniedResponse>,
@@ -206,6 +211,38 @@ pub struct ValidationViolationResponse {
     pub entity_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProfileValidationFindingResponse {
+    pub code: String,
+    pub severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub rule: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    pub completeness: String,
+}
+
+impl From<MetadataProfileValidationFinding> for ProfileValidationFindingResponse {
+    fn from(finding: MetadataProfileValidationFinding) -> Self {
+        Self {
+            code: finding.code,
+            severity: format!("{:?}", finding.severity).to_lowercase(),
+            focus_node: finding.focus_node,
+            path: finding.path,
+            rule: finding.rule,
+            message: finding.message,
+            profile_revision: finding
+                .profile_revision
+                .map(|revision| revision.to_string()),
+            completeness: format!("{:?}", finding.completeness).to_lowercase(),
+        }
+    }
+}
+
 impl From<MetadataValidationViolation> for ValidationViolationResponse {
     fn from(violation: MetadataValidationViolation) -> Self {
         Self {
@@ -227,6 +264,7 @@ impl ErrorResponse {
             code: None,
             details: None,
             violations: None,
+            findings: None,
             quota: None,
         }
     }
@@ -251,6 +289,13 @@ impl ErrorResponse {
     #[must_use]
     pub fn with_violations(mut self, violations: Vec<ValidationViolationResponse>) -> Self {
         self.violations = Some(violations);
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn with_findings(mut self, findings: Vec<ProfileValidationFindingResponse>) -> Self {
+        self.findings = Some(findings);
         self
     }
 
@@ -281,15 +326,19 @@ impl IntoResponse for ServerError {
         if let ServerError::MetadataValidation(violations) = &self {
             body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
         }
+        if let ServerError::MetadataProfileValidation(findings) = &self {
+            body = body.with_findings(findings.iter().cloned().map(Into::into).collect());
+        }
         if let ServerError::ComputeQuotaDenied(denied) = &self {
             body = body.with_quota((*denied).into());
         }
 
         let mut response = (status, Json(body)).into_response();
         if matches!(
-            self,
+            &self,
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_)
-        ) {
+        ) || matches!(&self, ServerError::MetadataProfileValidation(findings) if profile_validation_unavailable(findings))
+        {
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
@@ -315,6 +364,13 @@ impl ServerError {
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_)
             | ServerError::MetadataValidation(_) => StatusCode::BAD_REQUEST,
+            ServerError::MetadataProfileValidation(findings) => {
+                if profile_validation_unavailable(findings) {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            }
             ServerError::BadGateway | ServerError::BadGatewayReason(_) => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -337,6 +393,10 @@ impl ServerError {
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_) => "Bad request".to_string(),
             ServerError::MetadataValidation(_) => "Validation failed".to_string(),
+            ServerError::MetadataProfileValidation(findings) => findings.first().map_or_else(
+                || "profile_validation_failed".to_string(),
+                |finding| finding.code.clone(),
+            ),
             ServerError::BadGateway | ServerError::BadGatewayReason(_) => "Bad gateway".to_string(),
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 "Service unavailable".to_string()
@@ -353,6 +413,15 @@ impl ServerError {
     }
 }
 
+fn profile_validation_unavailable(findings: &[MetadataProfileValidationFinding]) -> bool {
+    findings.iter().any(|finding| {
+        matches!(
+            finding.code.as_str(),
+            "profile_unavailable" | "validator_unavailable"
+        )
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum ServerSetupError {
     #[error(transparent)]
@@ -366,7 +435,10 @@ pub enum ServerSetupError {
 #[cfg(test)]
 mod tests {
     use super::{ErrorResponse, ServerError};
-    use aruna_core::metadata::MetadataValidationViolation;
+    use aruna_core::metadata::{
+        MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
+        MetadataProfileValidationSeverity, MetadataValidationViolation,
+    };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -388,6 +460,40 @@ mod tests {
         let violations = body.violations.unwrap();
         assert_eq!(violations[0].code, "missing_root_data_entity");
         assert_eq!(violations[0].pointer, "/@graph");
+    }
+
+    #[tokio::test]
+    async fn profile_validation_is_structured_and_unavailability_is_retryable() {
+        let finding = |code: &str| MetadataProfileValidationFinding {
+            code: code.to_string(),
+            severity: MetadataProfileValidationSeverity::Violation,
+            focus_node: Some("https://example.test/dataset".to_string()),
+            path: Some("http://schema.org/identifier".to_string()),
+            rule: "http://www.w3.org/ns/shacl#minCount".to_string(),
+            message: "identifier is required".to_string(),
+            profile_revision: None,
+            completeness: MetadataProfileValidationCompleteness::Complete,
+        };
+        let rejected =
+            ServerError::MetadataProfileValidation(vec![finding("constraint_violation")])
+                .into_response();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse =
+            serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body.code.as_deref(), Some("constraint_violation"));
+        let findings = body.findings.expect("structured findings are returned");
+        assert_eq!(findings[0].severity, "violation");
+        assert_eq!(findings[0].completeness, "complete");
+
+        let unavailable =
+            ServerError::MetadataProfileValidation(vec![finding("validator_unavailable")])
+                .into_response();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("1"))
+        );
     }
 
     #[tokio::test]
