@@ -337,24 +337,33 @@ pub(crate) async fn create_group_via_http(
     bearer_token: &str,
     name: &str,
 ) -> TestResult<CreateGroupResponse> {
-    let response = reqwest::Client::new()
-        .post(format!("{base_url}/api/v1/groups"))
-        .bearer_auth(bearer_token)
-        .json(&CreateGroupRequest {
-            name: name.to_string(),
-        })
-        .send()
-        .await?;
-
-    if response.status() != StatusCode::CREATED {
-        return Err(std::io::Error::other(format!(
-            "unexpected create group status: {}",
-            response.status()
-        ))
-        .into());
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + WAIT_CAP;
+    loop {
+        let response = client
+            .post(format!("{base_url}/api/v1/groups"))
+            .bearer_auth(bearer_token)
+            .json(&CreateGroupRequest {
+                name: name.to_string(),
+            })
+            .send()
+            .await?;
+        if response.status() == StatusCode::CREATED {
+            return Ok(response.json().await?);
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status != StatusCode::CONFLICT
+            || !body.contains("concurrent group creation conflict; retry")
+            || Instant::now() >= deadline
+        {
+            return Err(std::io::Error::other(format!(
+                "unexpected create group status: {status} body={body}"
+            ))
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
     }
-
-    Ok(response.json().await?)
 }
 
 pub(crate) async fn get_group_via_http(
