@@ -784,10 +784,15 @@ pub async fn list_tasks(
     };
 
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
-    let tasks = records
-        .iter()
-        .map(|record| project_task(record, view, &base_url))
-        .collect();
+    let mut tasks = Vec::with_capacity(records.len());
+    for record in records {
+        let record = match family_report(&state.get_ctx(), &caller.auth, record.job_id).await {
+            Some(Ok(report)) => family_record(&report),
+            Some(Err(error)) => return TesError::from_job_route(error).into_response(),
+            None => record,
+        };
+        tasks.push(project_task(&record, view, &base_url));
+    }
 
     tes_json_response(
         StatusCode::OK,
