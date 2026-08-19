@@ -263,6 +263,8 @@ mod tests {
         ("POST", "/users/credentials"),
         ("POST", "/users/register"),
         ("POST", "/users/resolve"),
+        ("POST", "/users/s3-sessions"),
+        ("POST", "/users/s3-sessions/{access_key_id}/refresh"),
         ("POST", "/users/tokens/revoke"),
         ("PUT", "/admin/compute/config"),
         ("PUT", "/buckets/{bucket}/placement"),
