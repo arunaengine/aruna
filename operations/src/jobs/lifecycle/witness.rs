@@ -163,7 +163,7 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
 /// One bounded pass over the persisted deadlines. Returns true while rows
 /// remain, so the caller re-arms instead of spinning.
 pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bool {
-    let rows = match iter_prefix_page(
+    let (rows, mut remaining) = match iter_prefix_page(
         &context.storage_handle,
         JOB_WITNESS_DEADLINE_KEYSPACE,
         None,
@@ -173,13 +173,12 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
     )
     .await
     {
-        Ok((rows, _)) => rows,
+        Ok((rows, next)) => (rows, next.is_some()),
         Err(error) => {
             warn!(error = %error, "Witness deadline scan failed");
             return true;
         }
     };
-    let mut remaining = false;
     for (key, value) in rows {
         let Some(family) = deadline_family(&key) else {
             continue;
@@ -209,6 +208,50 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
         }
     }
     remaining
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::records::tests::fixture::{Family, context};
+
+    #[tokio::test]
+    async fn keeps_later_deadlines() {
+        // A full pass must re-arm the drain for rows on its next page.
+        let fixture = Family::new([1u8; 32]);
+        let (_dir, ctx) = context(&fixture.config, fixture.holder.public()).await;
+        for index in 0..=WITNESS_DRAIN_BATCH {
+            let family = JobFamilyId {
+                submission_id: aruna_core::structs::SubmissionId([index as u8; 32]),
+                request_digest: [index as u8; 32],
+            };
+            write_row(
+                &ctx,
+                JOB_WITNESS_DEADLINE_KEYSPACE,
+                &deadline_key(&family),
+                &WitnessDeadline {
+                    due_at_ms: 0,
+                    rank: index as u32,
+                },
+            )
+            .await
+            .expect("deadline writes");
+        }
+
+        assert!(drain_witness_deadlines(&ctx, 1).await);
+        let (rows, _) = iter_prefix_page(
+            &ctx.storage_handle,
+            JOB_WITNESS_DEADLINE_KEYSPACE,
+            None,
+            None,
+            WITNESS_DRAIN_BATCH,
+            None,
+        )
+        .await
+        .expect("deadlines scan");
+        assert_eq!(rows.len(), 1);
+        assert!(!drain_witness_deadlines(&ctx, 1).await);
+    }
 }
 
 /// What one round leaves behind: nothing more to do for this family here, or a
