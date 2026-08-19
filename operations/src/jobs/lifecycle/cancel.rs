@@ -121,34 +121,46 @@ async fn publish_cancel(
         JobRouteError::Unavailable("job family holder view unavailable".to_string())
     })?;
     if !view.holds(local) {
-        let holder = view
+        for holder in view
             .holders()
             .iter()
             .copied()
-            .find(|holder| view.holds(*holder))
-            .ok_or_else(|| {
-                JobRouteError::Unavailable("job family has no current holder".to_string())
-            })?;
-        return match send_job_request(
-            context,
-            holder,
-            JobRequest::Cancel {
-                auth_token: MetadataAuthToken::internal(auth.clone()),
-                job_id: spec.job_id,
-            },
-        )
-        .await?
-        .response
+            .filter(|holder| view.holds(*holder))
         {
-            JobResponse::Cancelled { .. } => Ok(()),
-            JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-            JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-            JobResponse::NotFound => Err(JobRouteError::NotFound),
-            JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
-            response => Err(JobRouteError::Unavailable(format!(
-                "unexpected family cancel response: {response:?}"
-            ))),
-        };
+            let response = match send_job_request(
+                context,
+                holder,
+                JobRequest::Cancel {
+                    auth_token: MetadataAuthToken::internal(auth.clone()),
+                    job_id: spec.job_id,
+                },
+            )
+            .await
+            {
+                Ok(response) => response.response,
+                Err(error) => {
+                    debug!(peer = %holder, error = %error, "Family cancellation forwarding failed");
+                    continue;
+                }
+            };
+            match response {
+                JobResponse::Cancelled { .. } => return Ok(()),
+                JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+                JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+                JobResponse::NotFound => return Err(JobRouteError::NotFound),
+                JobResponse::Unavailable(error) => {
+                    debug!(peer = %holder, error, "Family cancellation holder unavailable");
+                }
+                response => {
+                    return Err(JobRouteError::Unavailable(format!(
+                        "unexpected family cancel response: {response:?}"
+                    )));
+                }
+            }
+        }
+        return Err(JobRouteError::Unavailable(
+            "job family has no reachable holder".to_string(),
+        ));
     }
     let record = JobCancelRecord {
         cancel_id: Ulid::generate(),
