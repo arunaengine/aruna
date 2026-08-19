@@ -204,7 +204,7 @@ async fn admit_here(
         JobFamilyRecord::Spec(Box::new(spec)),
     )?;
     let claim_frame = sign_frame(context, config.realm_id, JobFamilyRecord::Claim(claim))?;
-    let quota_refusal = crate::jobs::quota::quota_refusal(
+    let (quota_refusal, quota_revision) = crate::jobs::quota::quota_refusal(
         context,
         config,
         local,
@@ -226,6 +226,7 @@ async fn admit_here(
             }),
             now_ms,
             quota_refusal,
+            quota_revision,
         }),
         context,
     )

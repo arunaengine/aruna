@@ -1,8 +1,10 @@
 //! Local admission, idempotent replay, conflict visibility, and the reads the
 //! family projection answers afterwards.
 
-use aruna_core::effects::JobRecordFrame;
-use aruna_core::keyspaces::JOB_FAMILY_OUTBOX_KEYSPACE;
+use aruna_core::effects::{JobRecordFrame, StorageEffect};
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE};
 use aruna_core::structs::{
     AuthContext, JobFamilyRecord, JobId, JobState, LogicalJobSpec, SubmissionClaim, WorkspaceMode,
 };
@@ -46,11 +48,58 @@ async fn admit(
             candidate: Box::new(candidate(family, spec, claim)),
             now_ms: 3_000,
             quota_refusal: None,
+            quota_revision: None,
         }),
         context,
     )
     .await
     .map(|admitted| (admitted.job_id, admitted.created))
+}
+
+#[tokio::test]
+async fn rejects_stale_quota() {
+    // A concurrent fresh admission invalidates the allow decision.
+    let family = Family::new([1u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let spec = family.spec();
+    let claim = family.claim(&spec);
+    let event = ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key: spec.group_id.to_bytes().as_slice().into(),
+            value: postcard::to_allocvec(&1u64)
+                .expect("revision encodes")
+                .into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+
+    let error = drive(
+        AdmitSubmissionOperation::new(AdmitSubmissionConfig {
+            realm_id: REALM,
+            local_node_id: family.holder.public(),
+            submission_id: family.submission_id,
+            request_digest: family.request_digest,
+            candidate: Box::new(candidate(&family, spec, claim)),
+            now_ms: 3_000,
+            quota_refusal: None,
+            quota_revision: Some(0),
+        }),
+        &ctx,
+    )
+    .await
+    .expect_err("stale quota check is refused");
+
+    assert_eq!(
+        error,
+        LifecycleError::Storage(StorageError::TransactionConflict)
+    );
+    assert_eq!(family_of_alias(&ctx, family.job_id).await, Ok(None));
 }
 
 #[tokio::test]

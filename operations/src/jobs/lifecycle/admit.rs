@@ -8,6 +8,7 @@
 use aruna_core::compute_quota::QuotaDenied;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
@@ -50,6 +51,8 @@ pub struct AdmitSubmissionConfig {
     /// A standing-quota refusal evaluated before the transaction. It applies
     /// only to a fresh admission: a replayed claim settles before this check.
     pub quota_refusal: Option<QuotaDenied>,
+    /// The group revision that the successful quota check observed.
+    pub quota_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +220,14 @@ impl AdmitSubmissionOperation {
             },
             None => 0,
         };
+        if self
+            .config
+            .quota_revision
+            .is_some_and(|expected| expected != self.quota_revision)
+        {
+            self.outcome = Some(Err(StorageError::TransactionConflict.into()));
+            return self.cancel(txn_id);
+        }
         self.state = AdmitState::ReadCache { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
