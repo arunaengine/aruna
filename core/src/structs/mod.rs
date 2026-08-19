@@ -30,6 +30,7 @@ mod s3_session;
 mod source_access;
 mod source_connector;
 mod staging;
+mod storage_purge;
 #[allow(clippy::module_inception)]
 mod structs;
 mod sync_quarantine;
@@ -67,6 +68,7 @@ pub use s3_session::*;
 pub use source_access::*;
 pub use source_connector::*;
 pub use staging::*;
+pub use storage_purge::*;
 pub use structs::*;
 pub use sync_quarantine::*;
 pub use sync_relationship::*;

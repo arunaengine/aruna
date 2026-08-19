@@ -93,6 +93,10 @@ pub const SYNC_REFERENCE_STATE_KEYSPACE: &str = "sync_reference_state";
 pub const S3_MULTIPART_OBJECT_METADATA_KEYSPACE: &str = "s3_multipart_object_metadata";
 pub const S3_MULTIPART_UPLOAD_KEYSPACE: &str = "s3_multipart_uploads";
 pub const S3_MULTIPART_UPLOAD_PART_KEYSPACE: &str = "s3_multipart_upload_parts";
+/// One active, scope-aware permanent-purge fence per bucket.
+pub const S3_PURGE_FENCE_KEYSPACE: &str = "s3_purge_fences";
+/// Durable inventory and batch counters for resumable permanent-purge jobs.
+pub const S3_PURGE_CHECKPOINT_KEYSPACE: &str = "s3_purge_checkpoints";
 pub const BLOB_REPLICATION_JOB_KEYSPACE: &str = "blob_replication_jobs";
 pub const BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replication_obligations";
 pub const REFERENCE_METADATA_REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";

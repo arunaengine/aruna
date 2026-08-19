@@ -6,17 +6,18 @@ use aruna_core::keyspaces::{
     JOB_ACTIVE_USER_KEYSPACE, JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ATTEMPT_CONTROL_KEYSPACE,
     JOB_DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE,
     JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
-    ROCRATE_JOB_STATE_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
+    ROCRATE_JOB_STATE_KEYSPACE, S3_PURGE_CHECKPOINT_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobExecutionClass,
     JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope, JobRecordError, JobResultPayload,
-    JobState, JobTransitionError, RunCrateStatus, UserAccess, attempt_control_key,
-    cleanup_dedup_key, cleanup_job_id, crate_job_id, encode_job_dedup_value, job_active_key,
-    job_due_index_key, job_entry_key, job_entry_prefix, job_lease_index_key, job_owner_cursor,
-    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
-    job_run_crate_key, parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key,
-    rocrate_plan_key, run_crate_dedup_key, validate_transition, workspace_credential_id,
+    JobState, JobTransitionError, RunCrateStatus, StoragePurgeCheckpoint, UserAccess,
+    attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id, encode_job_dedup_value,
+    job_active_key, job_due_index_key, job_entry_key, job_entry_prefix, job_lease_index_key,
+    job_owner_cursor, job_owner_index_key, job_owner_index_prefix, job_prune_index_key,
+    job_record_key, job_run_crate_key, parse_entry_key, parse_job_dedup_value,
+    parse_job_owner_index_key, rocrate_plan_key, run_crate_dedup_key, validate_transition,
+    workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -370,6 +371,46 @@ pub async fn put_staging_checkpoint(
     .await
 }
 
+pub async fn put_purge_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    checkpoint: &StoragePurgeCheckpoint,
+) -> Result<(), JobMutationError> {
+    let value = checkpoint
+        .to_bytes()
+        .map(ByteView::from)
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    put_job_checkpoint(
+        storage,
+        job_id,
+        token,
+        S3_PURGE_CHECKPOINT_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        value,
+    )
+    .await
+}
+
+pub async fn read_purge_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<StoragePurgeCheckpoint>, JobMutationError> {
+    read_raw(
+        storage,
+        S3_PURGE_CHECKPOINT_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        None,
+    )
+    .await
+    .map_err(JobMutationError::Storage)?
+    .map(|value| {
+        StoragePurgeCheckpoint::from_bytes(value.as_ref())
+            .map_err(|error| JobMutationError::Storage(error.to_string()))
+    })
+    .transpose()
+}
+
 pub async fn put_rocrate_checkpoint(
     storage: &StorageHandle,
     job_id: JobId,
@@ -564,15 +605,35 @@ where
                     _ => {}
                 }
             }
-            let (writes, deletes) = index_deltas(&old, &record)
+            let terminal = !old.state.is_terminal() && record.state.is_terminal();
+            let mut terminal_deletes = Vec::new();
+            if terminal && let JobPayload::StoragePurge(spec) = &record.payload {
+                if let Some(delete) = crate::s3::purge_fence::owned_terminal_fence_delete(
+                    storage,
+                    txn_id,
+                    record.job_id,
+                    &spec.scope,
+                )
+                .await
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?
+                {
+                    terminal_deletes.push(delete);
+                }
+                terminal_deletes.push((
+                    S3_PURGE_CHECKPOINT_KEYSPACE.to_string(),
+                    ByteView::from(record.job_id.to_bytes().to_vec()),
+                ));
+            }
+            let (writes, mut deletes) = index_deltas(&old, &record)
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+            deletes.extend(terminal_deletes);
             batch_write(storage, writes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
             batch_delete(storage, deletes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
-            if !old.state.is_terminal() && record.state.is_terminal() {
+            if terminal {
                 insert_crate_obligation(storage, txn_id, &record).await?;
                 insert_cleanup_obligation(storage, txn_id, &record).await?;
                 mark_crate_failed(storage, txn_id, &record).await?;

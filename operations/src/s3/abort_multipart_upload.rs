@@ -70,6 +70,7 @@ pub struct AbortMultipartUploadOperation {
     upload_record: Option<MultipartUpload>,
     upload_parts: Vec<MultipartUploadPart>,
     cleanup_index: usize,
+    allow_in_progress: bool,
     pending_error: Option<AbortMultipartUploadError>,
     output: Option<Result<(), AbortMultipartUploadError>>,
 }
@@ -83,9 +84,18 @@ impl AbortMultipartUploadOperation {
             upload_record: None,
             upload_parts: Vec::new(),
             cleanup_index: 0,
+            allow_in_progress: false,
             pending_error: None,
             output: None,
         }
+    }
+
+    /// A purge owns the destination write fence, so it may recover uploads
+    /// stranded by a crashed completion or abort. Ordinary S3 aborts retain the
+    /// Open-only behavior.
+    pub fn including_in_progress(mut self) -> Self {
+        self.allow_in_progress = true;
+        self
     }
 
     /// The terminal state is complete, so the driver never calls `abort` for us;
@@ -120,7 +130,7 @@ impl AbortMultipartUploadOperation {
         if record.bucket != self.input.bucket || record.key != self.input.key {
             return Err(AbortMultipartUploadError::UploadTargetMismatch);
         }
-        if record.status != MultipartUploadStatus::Open {
+        if !self.allow_in_progress && record.status != MultipartUploadStatus::Open {
             return Err(AbortMultipartUploadError::UploadNotOpen);
         }
         Ok(())

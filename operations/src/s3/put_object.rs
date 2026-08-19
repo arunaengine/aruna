@@ -14,6 +14,7 @@ use crate::placement_policy::{
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
@@ -50,11 +51,13 @@ pub enum PutObjectState {
     ReadPreassignedCopy,
     ReadGateBucket,
     PolicyGate,
+    CheckPurgeFenceBeforeWrite,
     WriteBlob,
     CleanupFailedWrite,
     QueueCleanupRow,
     WriteCleanupRow,
     StartTransaction,
+    CheckPurgeFence,
     CheckBucket,
     FenceBackend,
     CheckHashLookup,
@@ -119,6 +122,8 @@ pub enum PutObjectError {
     PolicyError(#[from] PlacementPolicyError),
     #[error(transparent)]
     PolicyGate(#[from] PolicyGateError),
+    #[error(transparent)]
+    PurgeFence(#[from] PurgeFenceError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
@@ -440,7 +445,7 @@ impl PutObjectOperation {
                 .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
         match write_gate(self.gate_context.as_ref(), &refs) {
-            Ok(None) => self.write_blob(),
+            Ok(None) => self.check_purge_fence_before_write(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
                 let complete = gate.is_complete();
@@ -475,6 +480,18 @@ impl PutObjectOperation {
             Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
         };
         match gate_decision(outcome.decision) {
+            Ok(()) => self.check_purge_fence_before_write(),
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn check_purge_fence_before_write(&mut self) -> Effects {
+        self.state = PutObjectState::CheckPurgeFenceBeforeWrite;
+        smallvec![write_fence_read(&self.config.request.bucket, None)]
+    }
+
+    fn handle_purge_fence_before_write(&mut self, event: Event) -> Effects {
+        match check_write_fence(event, &self.config.request.bucket, &self.config.request.key) {
             Ok(()) => self.write_blob(),
             Err(error) => self.emit_error(error.into()),
         }
@@ -557,13 +574,23 @@ impl PutObjectOperation {
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
-            // Read unconditionally: the version snapshots the default this
-            // transaction observes, not one read before the bytes streamed.
-            self.state = PutObjectState::CheckBucket;
-            smallvec![drift_reads(&self.config.request.bucket, self.txn_id)]
+            self.state = PutObjectState::CheckPurgeFence;
+            smallvec![write_fence_read(&self.config.request.bucket, self.txn_id)]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
+    }
+
+    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+        if let Err(error) =
+            check_write_fence(event, &self.config.request.bucket, &self.config.request.key)
+        {
+            return self.cleanup_failed_write(error.into());
+        }
+        // Read unconditionally: the version snapshots the default this
+        // transaction observes, not one read before the bytes streamed.
+        self.state = PutObjectState::CheckBucket;
+        smallvec![drift_reads(&self.config.request.bucket, self.txn_id)]
     }
 
     fn start_fence(&mut self) -> Effects {
@@ -1391,11 +1418,15 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(event),
             PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
             PutObjectState::PolicyGate => self.handle_policy_gate(event),
+            PutObjectState::CheckPurgeFenceBeforeWrite => {
+                self.handle_purge_fence_before_write(event)
+            }
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
+            PutObjectState::CheckPurgeFence => self.handle_purge_fence_checked(event),
             PutObjectState::CheckBucket => self.handle_bucket_checked(event),
             PutObjectState::FenceBackend => self.handle_backend_fenced(event),
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),

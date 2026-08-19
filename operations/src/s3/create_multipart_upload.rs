@@ -2,6 +2,7 @@ use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -24,6 +25,7 @@ pub enum CreateMultipartUploadState {
     ReadGateBucket,
     PolicyGate,
     StartTransaction,
+    CheckPurgeFence,
     FenceBackend,
     WriteUpload,
     CommitTransaction,
@@ -51,6 +53,8 @@ pub enum CreateMultipartUploadError {
     BackendFenceError(#[from] BackendFenceError),
     #[error(transparent)]
     PolicyGateError(#[from] PolicyGateError),
+    #[error(transparent)]
+    PurgeFence(#[from] PurgeFenceError),
     #[error("CreateMultipartUpload failed")]
     CreateMultipartUploadFailed,
 }
@@ -222,6 +226,14 @@ impl CreateMultipartUploadOperation {
         };
 
         self.txn_id = Some(txn_id);
+        self.state = CreateMultipartUploadState::CheckPurgeFence;
+        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
+    }
+
+    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+            return self.emit_error(error.into());
+        }
         let Some(resolved) = self.resolved.as_ref() else {
             return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
         };
@@ -324,6 +336,7 @@ impl Operation for CreateMultipartUploadOperation {
             CreateMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
             CreateMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartUploadState::StartTransaction => self.handle_transaction_started(event),
+            CreateMultipartUploadState::CheckPurgeFence => self.handle_purge_fence_checked(event),
             CreateMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CreateMultipartUploadState::WriteUpload => self.handle_record_written(event),
             CreateMultipartUploadState::CommitTransaction => {

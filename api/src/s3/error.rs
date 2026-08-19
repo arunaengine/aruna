@@ -23,6 +23,7 @@ use aruna_operations::s3::list_multipart_uploads::ListMultipartUploadsError;
 use aruna_operations::s3::list_object_versions::ListObjectVersionsError;
 use aruna_operations::s3::list_objects_v2::ListObjectsV2Error;
 use aruna_operations::s3::list_parts::ListPartsError;
+use aruna_operations::s3::purge_fence::PurgeFenceError;
 use aruna_operations::s3::put_object::PutObjectError;
 use aruna_operations::s3::upload_part::UploadPartError;
 use aruna_operations::s3::upload_part_copy::UploadPartCopyError;
@@ -74,6 +75,16 @@ fn placement_unavailable_error() -> S3Error {
     let mut error = S3Error::with_message(
         S3ErrorCode::Custom("PlacementUnavailable".into()),
         "The requested object is not currently available from this node.".to_string(),
+    );
+    error.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+    error
+}
+
+fn purge_in_progress_error() -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("PurgeInProgress".into()),
+        "Writes to this object scope are temporarily suspended while a permanent purge is in progress; retry later."
+            .to_string(),
     );
     error.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
     error
@@ -262,6 +273,7 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::WriteFailed(message) => write_failed_error(&message, "PutObject"),
             PutObjectError::PolicyGate(ref error) => policy_gate_error(error, "PutObject"),
             PutObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
+            PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
             err => internal_error(err),
         }
     }
@@ -272,6 +284,9 @@ impl IntoS3Error for CreateMultipartUploadError {
         match self {
             CreateMultipartUploadError::RoutingFailed(RoutingError::BackendFull(backend)) => {
                 backend_full_error(&backend.to_string())
+            }
+            CreateMultipartUploadError::PurgeFence(PurgeFenceError::Suspended) => {
+                purge_in_progress_error()
             }
             err => internal_error(err),
         }
@@ -290,6 +305,7 @@ impl IntoS3Error for UploadPartError {
             UploadPartError::IncompleteBody => incomplete_body_error(),
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
             UploadPartError::PolicyGateError(ref error) => policy_gate_error(error, "UploadPart"),
+            UploadPartError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
             err => internal_error(err),
         }
     }
@@ -364,6 +380,9 @@ impl IntoS3Error for CompleteMultipartUploadError {
                 policy_gate_error(error, "CompleteMultipartUpload")
             }
             CompleteMultipartUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
+            CompleteMultipartUploadError::PurgeFence(PurgeFenceError::Suspended) => {
+                purge_in_progress_error()
+            }
             err => internal_error(err),
         }
     }
@@ -489,6 +508,7 @@ impl IntoS3Error for DeleteObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             DeleteObjectError::NoSuchVersion => no_such_version_error(),
+            DeleteObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
             err => internal_error(err),
         }
     }
@@ -583,6 +603,21 @@ mod tests {
             UploadPartError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
         ] {
             assert_eq!(*error.code(), S3ErrorCode::InternalError);
+        }
+    }
+
+    #[test]
+    fn maps_purge_fence_as_retryable() {
+        for error in [
+            PutObjectError::PurgeFence(PurgeFenceError::Suspended).into_s3_error(),
+            CompleteMultipartUploadError::PurgeFence(PurgeFenceError::Suspended).into_s3_error(),
+            DeleteObjectError::PurgeFence(PurgeFenceError::Suspended).into_s3_error(),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::Custom("PurgeInProgress".into()));
+            assert_eq!(
+                error.status_code(),
+                Some(http::StatusCode::SERVICE_UNAVAILABLE)
+            );
         }
     }
 

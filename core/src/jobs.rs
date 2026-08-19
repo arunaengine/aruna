@@ -25,6 +25,7 @@ pub enum JobKind {
     ExportRoCrate,
     Harvest,
     MintPersistentId,
+    StoragePurge,
 }
 
 impl JobKind {
@@ -39,6 +40,7 @@ impl JobKind {
             Self::ExportRoCrate => "export_rocrate",
             Self::Harvest => "harvest",
             Self::MintPersistentId => "mint_persistent_id",
+            Self::StoragePurge => "storage_purge",
         }
     }
 
@@ -63,6 +65,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::ExportRoCrate(_) => Self::ExportRoCrate,
             JobPayload::Harvest(_) => Self::Harvest,
             JobPayload::MintPersistentId(_) => Self::MintPersistentId,
+            JobPayload::StoragePurge(_) => Self::StoragePurge,
         }
     }
 }

@@ -1,5 +1,6 @@
 pub mod cleanup;
 pub mod compute;
+pub mod purge;
 pub mod reconcile;
 pub mod run_crate;
 pub mod workspace;

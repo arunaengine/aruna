@@ -10,6 +10,7 @@ use crate::placement_policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
@@ -45,6 +46,7 @@ use ulid::Ulid;
 pub enum CompleteMultipartUploadState {
     Init,
     StartMarkTransaction,
+    CheckPurgeFenceForMark,
     ReadUploadForMark,
     WriteUploadCompleting,
     CommitMarkTransaction,
@@ -53,6 +55,7 @@ pub enum CompleteMultipartUploadState {
     PolicyGate,
     ComposeBlob,
     StartFinalizeTransaction,
+    CheckPurgeFenceForFinalize,
     ReadBucketDefault,
     FenceBackend,
     CheckHashLookup,
@@ -132,6 +135,8 @@ pub enum CompleteMultipartUploadError {
     PolicyGate(#[from] PolicyGateError),
     #[error(transparent)]
     PolicyError(#[from] PlacementPolicyError),
+    #[error(transparent)]
+    PurgeFence(#[from] PurgeFenceError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
@@ -561,11 +566,19 @@ impl CompleteMultipartUploadOperation {
             return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
+        self.state = CompleteMultipartUploadState::CheckPurgeFenceForMark;
+        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
+    }
+
+    fn handle_mark_purge_fence_checked(&mut self, event: Event) -> Effects {
+        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+            return self.emit_error(error.into());
+        }
         self.state = CompleteMultipartUploadState::ReadUploadForMark;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
+            txn_id: self.txn_id,
         })]
     }
 
@@ -862,6 +875,14 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
+        self.state = CompleteMultipartUploadState::CheckPurgeFenceForFinalize;
+        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
+    }
+
+    fn handle_finalize_purge_fence_checked(&mut self, event: Event) -> Effects {
+        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+            return self.schedule_error(error.into());
+        }
         // The version snapshots the default this transaction observes, not one
         // read while the parts were still being uploaded.
         self.state = CompleteMultipartUploadState::ReadBucketDefault;
@@ -1730,6 +1751,9 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::StartMarkTransaction => {
                 self.handle_mark_transaction_started(event)
             }
+            CompleteMultipartUploadState::CheckPurgeFenceForMark => {
+                self.handle_mark_purge_fence_checked(event)
+            }
             CompleteMultipartUploadState::ReadUploadForMark => {
                 self.handle_upload_read_for_mark(event)
             }
@@ -1743,6 +1767,9 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::ComposeBlob => self.handle_blob_composed(event),
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)
+            }
+            CompleteMultipartUploadState::CheckPurgeFenceForFinalize => {
+                self.handle_finalize_purge_fence_checked(event)
             }
             CompleteMultipartUploadState::ReadBucketDefault => self.handle_default_read(event),
             CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),

@@ -13,7 +13,8 @@ use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
 use crate::structs::{
     AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentIdSpec,
-    PlacementPolicyRef, PlacementRef, RealmId, StagingStrategy,
+    PlacementPolicyRef, PlacementRef, RealmId, StagingStrategy, StoragePurgeResult,
+    StoragePurgeScope, StoragePurgeSpec,
 };
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
@@ -690,6 +691,8 @@ pub enum JobPayload {
     /// Idempotent w3id persistent-identifier registration for a document.
     /// Idempotency key is the document id; a re-mint returns the same PID.
     MintPersistentId(MintPersistentIdSpec),
+    /// One server-side permanent purge family, scoped to a file, prefix, or bucket.
+    StoragePurge(StoragePurgeSpec),
 }
 
 impl JobPayload {
@@ -705,6 +708,7 @@ impl JobPayload {
             JobPayload::TerminalCleanup { .. } => "terminal_cleanup",
             JobPayload::Harvest(_) => "harvest",
             JobPayload::MintPersistentId(_) => "mint_persistent_id",
+            JobPayload::StoragePurge(_) => "storage_purge",
         }
     }
 
@@ -717,6 +721,7 @@ impl JobPayload {
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_) => "items",
             JobPayload::Harvest(_) => "records",
+            JobPayload::StoragePurge(_) => "entries",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => "steps",
@@ -732,6 +737,7 @@ impl JobPayload {
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_)
             | JobPayload::Harvest(_)
+            | JobPayload::StoragePurge(_)
             | JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
@@ -757,7 +763,11 @@ impl JobPayload {
     /// it reaches a terminal state. Replaying the request while the job is still
     /// retained must resolve to the same job identity and the same result.
     pub fn dedup_until_prune(&self) -> bool {
-        self.is_rocrate() || matches!(self, JobPayload::MintPersistentId(_))
+        self.is_rocrate()
+            || matches!(
+                self,
+                JobPayload::MintPersistentId(_) | JobPayload::StoragePurge(_)
+            )
     }
 
     pub fn rocrate_limits(&self) -> Option<&RoCrateLimits> {
@@ -974,6 +984,7 @@ pub enum JobResultPayload {
         pid: String,
         newly_minted: bool,
     },
+    StoragePurge(StoragePurgeResult),
 }
 
 impl JobResultPayload {
@@ -988,6 +999,7 @@ impl JobResultPayload {
             JobResultPayload::ExportRoCrate(_) => "export_rocrate",
             JobResultPayload::Harvest { .. } => "harvest",
             JobResultPayload::PersistentId { .. } => "persistent_id",
+            JobResultPayload::StoragePurge(_) => "storage_purge",
         }
     }
 
@@ -1141,6 +1153,29 @@ impl JobResultPayload {
                 "pid": pid,
                 "newly_minted": newly_minted,
             }),
+            JobResultPayload::StoragePurge(result) => {
+                let scope = match &result.scope {
+                    StoragePurgeScope::File { bucket, key } => {
+                        serde_json::json!({"kind": "file", "bucket": bucket, "key": key})
+                    }
+                    StoragePurgeScope::Prefix { bucket, prefix } => serde_json::json!({
+                        "kind": "prefix",
+                        "bucket": bucket,
+                        "prefix": prefix,
+                    }),
+                    StoragePurgeScope::Bucket { bucket } => {
+                        serde_json::json!({"kind": "bucket", "bucket": bucket})
+                    }
+                };
+                serde_json::json!({
+                    "scope": scope,
+                    "versions_removed": result.versions_removed,
+                    "multipart_uploads_removed": result.multipart_uploads_removed,
+                    "batches_completed": result.batches_completed,
+                    "bucket_deleted": result.bucket_deleted,
+                    "emptiness_proven": result.emptiness_proven,
+                })
+            }
         }
     }
 }
