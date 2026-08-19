@@ -26,9 +26,12 @@ pub async fn quota_refusal(
     if quota == ComputeQuota::default() {
         return Ok(None);
     }
-    let (view, _truncated) = group_demand(context, config.realm_id, local, &group_id)
+    let (view, truncated) = group_demand(context, config.realm_id, local, &group_id)
         .await
         .map_err(|error| format!("quota demand view unavailable: {error}"))?;
+    if truncated {
+        return Err("quota demand view is truncated".to_string());
+    }
     match admits(&view, &quota, resources) {
         Ok(()) => Ok(None),
         Err(denied) => {

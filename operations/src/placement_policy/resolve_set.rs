@@ -211,7 +211,18 @@ mod tests {
             resolver.step(cached(&first)),
             ResolveStep::Pending(_)
         ));
-        assert_eq!(resolver.step(cached(&second)), ResolveStep::Done);
+        assert!(matches!(
+            resolver.step(super::super::fixtures::authority(realm())),
+            ResolveStep::Pending(_)
+        ));
+        assert!(matches!(
+            resolver.step(cached(&second)),
+            ResolveStep::Pending(_)
+        ));
+        assert_eq!(
+            resolver.step(super::super::fixtures::authority(realm())),
+            ResolveStep::Done
+        );
 
         assert_eq!(resolver.resolutions().len(), 2);
         assert!(matches!(

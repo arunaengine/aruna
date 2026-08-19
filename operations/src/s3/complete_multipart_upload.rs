@@ -3168,7 +3168,8 @@ mod gate_tests {
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
-        let effects = operation.step(read(Some(cached.into())));
+        operation.step(read(Some(cached.into())));
+        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
 
         assert!(!composes(&effects));
         assert_eq!(

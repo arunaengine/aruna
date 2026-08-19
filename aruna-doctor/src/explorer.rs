@@ -2423,6 +2423,7 @@ mod tests {
         let reservation = JobReservationRecord {
             execution_id,
             job_id: aruna_core::structs::JobId::from_bytes(Ulid::from_bytes([5u8; 16]).to_bytes()),
+            logical_job_id: aruna_core::structs::JobId::from_bytes([5u8; 16]),
             resources: aruna_core::structs::EffectiveResources {
                 cpu_cores: 2,
                 ram_bytes: 1024,

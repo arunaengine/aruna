@@ -8,7 +8,7 @@
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
@@ -16,8 +16,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    EffectiveResources, JobFamilyRecord, JobId, LaunchIntent, RealmConfigDocument, RealmId,
-    RecordVerdict,
+    EffectiveResources, JobFamilyRecord, JobId, JobRecord, LaunchIntent, RealmConfigDocument,
+    RealmId, RecordVerdict,
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 
@@ -30,7 +30,7 @@ use crate::driver::DriverContext;
 use crate::jobs::records::keys::{family_prefix, record_key};
 use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::{iter_prefix_page, job_insert_entries};
 
 /// Reservations one capacity decision reads. A node cannot run more concurrent
 /// executions than this without its backend ceiling stopping it first.
@@ -78,22 +78,30 @@ pub fn fits(
 }
 
 /// Reservations this node currently holds, oldest key first.
-pub async fn held_reservations(context: &DriverContext) -> Vec<ExecutionReservation> {
-    match iter_prefix_page(
-        &context.storage_handle,
-        JOB_RESERVATION_KEYSPACE,
-        None,
-        None,
-        MAX_RESERVATION_SCAN,
-        None,
-    )
-    .await
-    {
-        Ok((rows, _)) => rows
-            .into_iter()
-            .filter_map(|(_, value)| from_bytes::<ExecutionReservation>(&value).ok())
-            .collect(),
-        Err(_) => Vec::new(),
+pub async fn held_reservations(
+    context: &DriverContext,
+) -> Result<Vec<ExecutionReservation>, String> {
+    let mut held = Vec::new();
+    let mut cursor = None;
+    loop {
+        let (rows, next) = iter_prefix_page(
+            &context.storage_handle,
+            JOB_RESERVATION_KEYSPACE,
+            None,
+            cursor,
+            MAX_RESERVATION_SCAN,
+            None,
+        )
+        .await?;
+        for (_, value) in rows {
+            held.push(
+                from_bytes::<ExecutionReservation>(&value).map_err(|error| error.to_string())?,
+            );
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(held),
+        }
     }
 }
 
@@ -102,11 +110,11 @@ pub async fn held_reservations(context: &DriverContext) -> Vec<ExecutionReservat
 pub async fn job_reservation(
     context: &DriverContext,
     job_id: JobId,
-) -> Option<ExecutionReservation> {
-    held_reservations(context)
-        .await
+) -> Result<Option<ExecutionReservation>, String> {
+    Ok(held_reservations(context)
+        .await?
         .into_iter()
-        .find(|row| row.job_id == job_id)
+        .find(|row| row.job_id == job_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,12 +126,14 @@ pub struct ReserveExecutionConfig {
     pub receipt: JobRecordFrame,
     pub launch: Box<LaunchIntent>,
     pub job_id: JobId,
+    pub logical_job_id: JobId,
     pub execution_id: Ulid,
     pub resources: EffectiveResources,
     /// Execution site the receipt sealed, kept so the local attempt can fence
     /// itself against a subject this node no longer advertises.
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
+    pub record: Box<JobRecord>,
     pub now_ms: u64,
 }
 
@@ -134,6 +144,7 @@ pub struct ReserveExecutionOperation {
     config: ReserveExecutionConfig,
     view: Option<FamilyView>,
     held: Vec<ExecutionReservation>,
+    cursor: Option<Key>,
     cache: Option<ProjectionCache>,
     state: ReserveState,
     outcome: Option<Result<Ulid, LifecycleError>>,
@@ -159,6 +170,7 @@ impl ReserveExecutionOperation {
             config,
             view: None,
             held: Vec::new(),
+            cursor: None,
             cache: None,
             state: ReserveState::Init,
             outcome: None,
@@ -206,7 +218,7 @@ impl ReserveExecutionOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: JOB_RESERVATION_KEYSPACE.to_string(),
             prefix: None,
-            start: None,
+            start: self.cursor.clone().map(IterStart::After),
             limit: MAX_RESERVATION_SCAN,
             txn_id: Some(txn_id),
         })]
@@ -260,8 +272,11 @@ impl ReserveExecutionOperation {
         let JobFamilyRecord::Receipt(_) = &receipt.record else {
             return Err(LifecycleError::NotHolder);
         };
+        if self.config.record.job_id != self.config.job_id {
+            return Err(LifecycleError::NotHolder);
+        }
         let key = record_key(&receipt.key());
-        Ok(vec![
+        let mut writes = vec![
             (
                 JOB_RESERVATION_KEYSPACE.to_string(),
                 reservation_key(self.config.execution_id),
@@ -269,6 +284,7 @@ impl ReserveExecutionOperation {
                     to_bytes(&ExecutionReservation {
                         execution_id: self.config.execution_id,
                         job_id: self.config.job_id,
+                        logical_job_id: self.config.logical_job_id,
                         resources: self.config.resources,
                         created_at_ms: self.config.now_ms,
                         subject_generation: self.config.subject_generation,
@@ -299,7 +315,15 @@ impl ReserveExecutionOperation {
                     to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice(),
                 ),
             ),
-        ])
+        ];
+        writes.extend(
+            job_insert_entries(self.config.record.as_ref())?
+                .into_iter()
+                .filter(|(key_space, _, _)| {
+                    key_space != aruna_core::keyspaces::JOB_OWNER_INDEX_KEYSPACE
+                }),
+        );
+        Ok(writes)
     }
 
     fn commit(&mut self, txn_id: TxnId) -> Effects {
@@ -365,12 +389,26 @@ impl Operation for ReserveExecutionOperation {
                 other => self.unexpected("transaction start", format!("{other:?}")),
             },
             ReserveState::Scan { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    self.held = values
-                        .into_iter()
-                        .filter_map(|(_, value)| from_bytes::<ExecutionReservation>(&value).ok())
-                        .collect();
-                    self.decide(txn_id)
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    for (_, value) in values {
+                        match from_bytes::<ExecutionReservation>(&value) {
+                            Ok(reservation) => self.held.push(reservation),
+                            Err(error) => {
+                                self.outcome = Some(Err(error.into()));
+                                return self.cancel(txn_id);
+                            }
+                        }
+                    }
+                    match next_start_after {
+                        Some(cursor) => {
+                            self.cursor = Some(cursor);
+                            self.scan(txn_id)
+                        }
+                        None => self.decide(txn_id),
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("reservation scan", format!("{other:?}")),

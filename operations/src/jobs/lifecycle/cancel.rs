@@ -7,7 +7,7 @@
 //! success is projected with `cancel_requested` set.
 
 use aruna_core::effects::JobRecordFrame;
-use aruna_core::jobs::JobRequest;
+use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::structs::{
     AuthContext, CancelAuthority, JobCancelRecord, JobFamilyRecord, JobId, JobRecordEnvelope,
     LogicalJobSpec, Permission, blob_group_permission_path,
@@ -21,7 +21,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::protocol::send_job_request;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::load_realm_config;
 use crate::request_authorization::authorize;
@@ -35,9 +35,21 @@ pub async fn cancel_family(
     job_id: JobId,
     auth_token: Option<MetadataAuthToken>,
 ) -> Option<Result<(), JobRouteError>> {
-    family_of_alias(context, job_id).await?;
-    let (projected, spec) = family_projection(context, job_id).await?;
-    let projection = projected.projection?;
+    match family_of_alias(context, job_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    }
+    let (projected, spec) = match family_projection(context, job_id).await {
+        Ok(Some(projected)) => projected,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let Some(projection) = projected.projection else {
+        return Some(Err(JobRouteError::Unavailable(
+            "job family has no projection".to_string(),
+        )));
+    };
     let authority = match cancel_authority(context, auth, &spec).await {
         Some(authority) => authority,
         None => return Some(Err(JobRouteError::Forbidden)),
@@ -105,12 +117,38 @@ async fn publish_cancel(
         submission_id: spec.submission_id,
         request_digest: spec.request_digest,
     };
-    let holds =
-        FamilyView::resolve(&config, realm_id, family).is_some_and(|view| view.holds(local));
-    if !holds {
-        return Err(JobRouteError::Unavailable(
-            "this node does not hold the job family".to_string(),
-        ));
+    let view = FamilyView::resolve(&config, realm_id, family).ok_or_else(|| {
+        JobRouteError::Unavailable("job family holder view unavailable".to_string())
+    })?;
+    if !view.holds(local) {
+        let holder = view
+            .holders()
+            .iter()
+            .copied()
+            .find(|holder| view.holds(*holder))
+            .ok_or_else(|| {
+                JobRouteError::Unavailable("job family has no current holder".to_string())
+            })?;
+        return match send_job_request(
+            context,
+            holder,
+            JobRequest::Cancel {
+                auth_token: MetadataAuthToken::internal(auth.clone()),
+                job_id: spec.job_id,
+            },
+        )
+        .await?
+        .response
+        {
+            JobResponse::Cancelled { .. } => Ok(()),
+            JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => Err(JobRouteError::NotFound),
+            JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
+            response => Err(JobRouteError::Unavailable(format!(
+                "unexpected family cancel response: {response:?}"
+            ))),
+        };
     }
     let record = JobCancelRecord {
         cancel_id: Ulid::generate(),
@@ -131,7 +169,7 @@ async fn publish_cancel(
     .map_err(|error| JobRouteError::Internal(error.to_string()))?;
     let frame = JobRecordFrame::new(envelope)
         .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-    drive(
+    let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
             realm_id,
             local_node_id: local,
@@ -144,6 +182,14 @@ async fn publish_cancel(
     )
     .await
     .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
+    if !matches!(
+        outcome.admission,
+        Admission::Authentic | Admission::Duplicate
+    ) {
+        return Err(JobRouteError::Unavailable(
+            "job cancellation is awaiting authentic admission".to_string(),
+        ));
+    }
     debug!(job_id = %spec.job_id, "Job cancellation published");
     Ok(())
 }

@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     AuthContext, ExecutionRole, JobFamilyId, JobId, JobProjection, LogicalJobSpec, LogicalJobState,
-    OutputObject, PhysicalExecutionState, SubmissionId,
+    OutputObject, PhysicalExecutionResult, PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::types::{Key, NodeId};
 use tracing::debug;
@@ -61,6 +61,7 @@ pub struct FamilyReport {
     pub conflicts: u32,
     pub state: LogicalJobState,
     pub canonical_execution_id: Option<ulid::Ulid>,
+    pub canonical_result: Option<PhysicalExecutionResult>,
     pub executions: u32,
     pub duplicate_successes: u32,
     pub outputs: Vec<OutputObject>,
@@ -85,7 +86,11 @@ pub async fn family_report(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Option<Result<FamilyReport, JobRouteError>> {
-    let (projected, spec) = family_projection(context, job_id).await?;
+    let (projected, spec) = match family_projection(context, job_id).await {
+        Ok(Some(projected)) => projected,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
     // Reads stay self-scoped: another submitter's job is absent, never refused.
     if spec.created_by != auth.user_id {
         return Some(Err(JobRouteError::NotFound));
@@ -109,6 +114,13 @@ pub async fn family_report(
         conflicts: sibling_families(context, family).await,
         state: projection.state,
         canonical_execution_id: projection.canonical_execution_id,
+        canonical_result: projection.canonical_execution_id.and_then(|execution_id| {
+            projection
+                .executions
+                .iter()
+                .find(|execution| execution.execution_id == execution_id)
+                .and_then(|execution| execution.result.clone())
+        }),
         executions: projection.executions.len() as u32,
         duplicate_successes: projection
             .executions
@@ -280,7 +292,11 @@ pub async fn family_audit(
     range: AuditRange,
     paging: AuditPaging,
 ) -> Option<Result<AuditPage, JobRouteError>> {
-    let (projected, spec) = family_projection(context, job_id).await?;
+    let (projected, spec) = match family_projection(context, job_id).await {
+        Ok(Some(projected)) => projected,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
     if spec.created_by != auth.user_id {
         return Some(Err(JobRouteError::NotFound));
     }

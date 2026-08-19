@@ -1,8 +1,10 @@
 //! The append, projection, and audit operations against real storage.
 
-use aruna_core::effects::{JobRecordFrame, PageLimit};
+use aruna_core::effects::{JobRecordFrame, PageLimit, StorageEffect};
+use aruna_core::keyspaces::JOB_KEYSPACE;
 use aruna_core::structs::{
-    JobFamilyRecord, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
+    JobFamilyRecord, JobId, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
+    job_record_key,
 };
 
 use super::fixture::{Family, REALM};
@@ -113,12 +115,11 @@ async fn replays_without_change() {
 }
 
 #[tokio::test]
-async fn bridges_local_row() {
-    // The mutable job row is a local cache of the projection: a succeeded
-    // family settles the row that the existing status surfaces read.
+async fn keeps_attempt_state() {
+    // Family projection may settle its logical cache but never a physical attempt.
     let family = Family::new([3u8; 32]);
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;
-    let mut row = aruna_core::structs::JobRecord::new(
+    let mut logical = aruna_core::structs::JobRecord::new(
         family.job_id,
         aruna_core::structs::JobPayload::Execution(super::fixture::payload()),
         super::fixture::user(),
@@ -127,10 +128,22 @@ async fn bridges_local_row() {
         1_000,
         None,
     );
-    row.state = JobState::Running;
-    crate::jobs::store::insert_job(&context.storage_handle, &row)
+    logical.state = JobState::Running;
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: JOB_KEYSPACE.to_string(),
+            key: job_record_key(logical.job_id),
+            value: logical.to_bytes().expect("logical row encodes").into(),
+            txn_id: None,
+        })
+        .await;
+    let physical_id = JobId::from_bytes([10u8; 16]);
+    let mut physical = logical.clone();
+    physical.job_id = physical_id;
+    crate::jobs::store::insert_job(&context.storage_handle, &physical)
         .await
-        .expect("job row inserted");
+        .expect("physical row inserted");
 
     for envelope in family.run(1, 0, PhysicalExecutionState::Succeeded) {
         append(&context, &family, envelope).await;
@@ -145,6 +158,11 @@ async fn bridges_local_row() {
         .expect("job row read")
         .expect("job row exists");
     assert_eq!(stored.state, JobState::Succeeded);
+    let physical = crate::jobs::store::read_job_record(&context.storage_handle, physical_id, None)
+        .await
+        .expect("physical row read")
+        .expect("physical row exists");
+    assert_eq!(physical.state, JobState::Running);
 }
 
 #[tokio::test]

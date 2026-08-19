@@ -16,11 +16,12 @@ use aruna_core::util::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::reservation::{ReleaseExecutionOperation, job_reservation};
+use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
 use super::routing::family_of_alias;
 use super::witness::load_family;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::store::read_job_record;
 
 /// The replicated identity of one physical execution, read back from the
 /// receipt that authorized it. Without it there is no distributed chain to
@@ -37,8 +38,13 @@ pub struct ExecutionChain {
 
 /// Resolves the receipt chain of one local job, if a target admitted it here.
 pub async fn execution_chain(context: &DriverContext, job_id: JobId) -> Option<ExecutionChain> {
-    let execution_id = job_reservation(context, job_id).await?.execution_id;
-    chain_for(context, job_id, execution_id).await
+    let reservation = job_reservation(context, job_id).await.ok()??;
+    chain_for(
+        context,
+        reservation.logical_job_id,
+        reservation.execution_id,
+    )
+    .await
 }
 
 /// The chain of one exact execution id, used where the attempt control already
@@ -48,7 +54,7 @@ pub async fn chain_for(
     job_id: JobId,
     execution_id: Ulid,
 ) -> Option<ExecutionChain> {
-    let family = family_of_alias(context, job_id).await?;
+    let family = family_of_alias(context, job_id).await.ok()??;
     let records = load_family(context, family).await;
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Receipt(receipt) if receipt.execution_id == execution_id => {
@@ -73,6 +79,7 @@ pub async fn publish_state(
     chain: &ExecutionChain,
     state: PhysicalExecutionState,
     result: Option<PhysicalExecutionResult>,
+    observed_at_ms: u64,
 ) -> bool {
     let Some(net) = context.net_handle.as_ref() else {
         return false;
@@ -107,7 +114,7 @@ pub async fn publish_state(
         sequence: mine.len() as u64,
         previous_digest: previous,
         state,
-        observed_at_ms: unix_timestamp_millis(),
+        observed_at_ms,
         result,
     };
     let envelope = match JobRecordEnvelope::signed_with(
@@ -138,10 +145,19 @@ pub async fn publish_state(
     )
     .await;
     match appended {
-        Ok(_) => {
+        Ok(outcome)
+            if matches!(
+                outcome.admission,
+                Admission::Authentic | Admission::Duplicate
+            ) =>
+        {
             debug!(state = state.name(), "Execution update published");
             super::outbox::kick(context).await;
             true
+        }
+        Ok(outcome) => {
+            warn!(admission = ?outcome.admission, "Execution update was not admitted");
+            false
         }
         Err(error) => {
             warn!(error = %error, "Execution update append failed");
@@ -160,18 +176,18 @@ pub async fn publish_progress(
     let Some(chain) = execution_chain(context, job_id).await else {
         return;
     };
-    publish_state(context, &chain, state, None).await;
+    publish_state(context, &chain, state, None, unix_timestamp_millis()).await;
 }
 
 /// Publishes the terminal state of a receipted execution and releases its
 /// reservation. Success names the digest of the output record sealed before it,
 /// so a success can never be projected without its exact outputs.
-pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) {
+pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bool {
     let Some(state) = terminal_state(record.state) else {
-        return;
+        return true;
     };
     let Some(chain) = execution_chain(context, record.job_id).await else {
-        return;
+        return false;
     };
     let result = PhysicalExecutionResult {
         exit_code: exit_code(record.result.as_ref()),
@@ -181,10 +197,34 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) {
             .as_ref()
             .and_then(|error| ResultMessage::new(error.message.clone()).ok()),
     };
-    publish_state(context, &chain, state, Some(result)).await;
+    let observed_at_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
+    if !publish_state(context, &chain, state, Some(result), observed_at_ms).await {
+        return false;
+    }
     if let Err(error) = drive(ReleaseExecutionOperation::new(chain.execution_id), context).await {
         warn!(error = %error, "Execution reservation release failed");
+        return false;
     }
+    true
+}
+
+/// Retries terminal publication and capacity release for every durable local
+/// terminal execution that still has a reservation.
+pub async fn settle_terminals(context: &DriverContext) -> Result<(), String> {
+    for reservation in held_reservations(context).await? {
+        let Some(record) =
+            read_job_record(&context.storage_handle, reservation.job_id, None).await?
+        else {
+            continue;
+        };
+        if record.state.is_terminal() && !publish_terminal(context, &record).await {
+            return Err(format!(
+                "terminal obligation for execution {} remains pending",
+                reservation.execution_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn terminal_state(state: JobState) -> Option<PhysicalExecutionState> {

@@ -59,6 +59,14 @@ async fn reports_exact_outputs() {
 
     assert_eq!(report.state, LogicalJobState::Succeeded);
     assert!(report.canonical_execution_id.is_some());
+    assert_eq!(
+        report
+            .canonical_result
+            .as_ref()
+            .and_then(|result| result.exit_code),
+        Some(0)
+    );
+    assert!(report.job.finished_at_ms.is_some());
     assert_eq!(report.submission_id, family.submission_id);
     assert_eq!(report.canonical_job_id, family.job_id);
     assert!(!report.outputs.is_empty());

@@ -546,7 +546,11 @@ pub async fn create_task(
     };
 
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
-        Ok(token) => token,
+        Ok(token) => token.or_else(|| {
+            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+                caller.auth.clone(),
+            ))
+        }),
         Err(error) => return error.into_response(),
     };
     match submit_external_job(
@@ -671,7 +675,11 @@ pub async fn get_task(
     };
 
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
-        Ok(token) => token,
+        Ok(token) => token.or_else(|| {
+            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+                caller.auth.clone(),
+            ))
+        }),
         Err(error) => return TesError::from_server(error).into_response(),
     };
     // A distributed external job is projected from the replicated family, so
@@ -832,21 +840,28 @@ pub async fn cancel_task(
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
-        Ok(token) => token,
+        Ok(token) => token.or_else(|| {
+            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+                caller.auth.clone(),
+            ))
+        }),
         Err(error) => return TesError::from_server(error).into_response(),
     };
-    // Group scoping needs the owner record; the owner is the 404 authority.
-    let record = match read_record_routed(
-        &state.get_ctx(),
-        caller.auth.user_id,
-        job_id,
-        forwarded.clone(),
-    )
-    .await
-    {
-        Ok(Some(record)) => record,
-        Ok(None) => return TesError::not_found("TES task not found").into_response(),
-        Err(error) => return TesError::from_job_route(error).into_response(),
+    let record = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
+        Some(Ok(report)) => family_record(&report),
+        Some(Err(error)) => return TesError::from_job_route(error).into_response(),
+        None => match read_record_routed(
+            &state.get_ctx(),
+            caller.auth.user_id,
+            job_id,
+            forwarded.clone(),
+        )
+        .await
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => return TesError::not_found("TES task not found").into_response(),
+            Err(error) => return TesError::from_job_route(error).into_response(),
+        },
     };
     if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
@@ -1262,15 +1277,22 @@ fn family_record(report: &FamilyReport) -> JobRecord {
     record.cancel_requested = report.cancel_requested;
     record.workspace_mode = report.job.workspace_mode;
     record.workspace_bucket = report.job.workspace_bucket.clone();
+    record.retention_ms = report.spec.retention_ms;
     record.finished_at_ms = report.job.finished_at_ms;
     record.result =
         (report.job.state == JobState::Succeeded).then(|| JobResultPayload::Execution {
-            exit_code: None,
+            exit_code: report
+                .canonical_result
+                .as_ref()
+                .and_then(|result| result.exit_code),
             workspace_bucket: report.job.workspace_bucket.clone(),
             outputs: report.outputs.clone(),
             stdout: String::new(),
             stderr: String::new(),
-            output_digest: None,
+            output_digest: report
+                .canonical_result
+                .as_ref()
+                .and_then(|result| result.output_digest),
         });
     record
 }
@@ -2539,6 +2561,7 @@ mod tests {
             group_id: payload.group_id,
             created_by,
             created_at_ms: 10,
+            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
             payload,
             request_digest: [7u8; 32],
             spec_digest: [8u8; 32],
@@ -2585,6 +2608,11 @@ mod tests {
             conflicts: 0,
             state: LogicalJobState::Succeeded,
             canonical_execution_id: Some(execution_id),
+            canonical_result: Some(aruna_core::structs::PhysicalExecutionResult {
+                exit_code: Some(0),
+                output_digest: Some([12u8; 32]),
+                message: None,
+            }),
             executions: 2,
             duplicate_successes: 1,
             outputs: vec![OutputObject {

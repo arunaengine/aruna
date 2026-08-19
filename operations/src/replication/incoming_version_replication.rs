@@ -5647,6 +5647,7 @@ mod gate_tests {
             key: Vec::new().into(),
             value: Some(cached.into()),
         }));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
 
         assert!(rejected(&operation));
     }

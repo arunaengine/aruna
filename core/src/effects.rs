@@ -707,6 +707,8 @@ fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
             node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
             executor_kind: "d".repeat(kind_bytes),
         },
+        inputs: Vec::new(),
+        output_policies: Vec::new(),
         plan_digest: [6u8; 32],
         spec_digest: [7u8; 32],
         created_at_ms: 1,

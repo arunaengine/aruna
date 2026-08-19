@@ -77,7 +77,10 @@ pub enum PolicyCacheEntry {
 /// never reported as a denial and is replaced by the next resolve.
 #[derive(Debug, PartialEq)]
 pub enum CacheLookup {
-    Hit(Box<VerifiedPolicy>),
+    Hit {
+        document: Box<PlacementPolicyDocument>,
+        policy: Box<VerifiedPolicy>,
+    },
     /// A live availability hint; the caller reports unavailable without a fetch.
     Negative,
     Miss,
@@ -154,7 +157,7 @@ impl PolicyCacheEntry {
         self,
         realm_id: RealmId,
         policy_ref: &PlacementPolicyRef,
-    ) -> Result<VerifiedPolicy, PolicyCacheError> {
+    ) -> Result<(PlacementPolicyDocument, VerifiedPolicy), PolicyCacheError> {
         let Self::Verified { document, .. } = self else {
             return Err(PolicyCacheError::Mismatch);
         };
@@ -166,7 +169,7 @@ impl PolicyCacheEntry {
             return Err(PolicyCacheError::Mismatch);
         }
         document.verify_publication()?;
-        Ok(verified)
+        Ok((document, verified))
     }
 }
 
@@ -199,7 +202,10 @@ pub fn lookup(
         return CacheLookup::Negative;
     }
     match entry.accept(realm_id, policy_ref) {
-        Ok(policy) => CacheLookup::Hit(Box::new(policy)),
+        Ok((document, policy)) => CacheLookup::Hit {
+            document: Box::new(document),
+            policy: Box::new(policy),
+        },
         Err(_) => CacheLookup::Miss,
     }
 }
@@ -298,7 +304,10 @@ mod tests {
         let value = stored(&entry);
         assert_eq!(
             lookup(Some(&value), realm(), &policy.policy_ref(), 10_000),
-            CacheLookup::Hit(Box::new(policy.clone()))
+            CacheLookup::Hit {
+                document: Box::new(document(&policy)),
+                policy: Box::new(policy.clone()),
+            }
         );
 
         let other = policy_ref_of(2);

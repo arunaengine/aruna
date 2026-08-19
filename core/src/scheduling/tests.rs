@@ -338,6 +338,15 @@ fn saturates_transfer_cost() {
 }
 
 #[test]
+fn accepts_input_bound() {
+    // The planner accepts the same 512-input limit as the public APIs.
+    let inputs = (0..MAX_PLAN_INPUTS)
+        .map(|index| resolved_input(&format!("input-{index}"), (index % 255) as u8 + 1))
+        .collect();
+    assert!(request(inputs).canonical().is_ok());
+}
+
+#[test]
 fn envelope_rejects_target() {
     // Static ceilings hard-filter; free capacity never does.
     let target = node(2);

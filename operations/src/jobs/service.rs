@@ -492,7 +492,7 @@ async fn route_record(
             .map_err(JobRouteError::Internal);
     };
     let request = auth_token.map(|auth_token| JobRequest::Record { auth_token, job_id });
-    let responder = family_responder(context, job_id).await;
+    let responder = family_responder(context, job_id).await?;
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
         .with_responder(responder);
     match drive(operation, context).await? {
@@ -750,7 +750,7 @@ pub async fn read_report_routed(
         last_key: last_key.clone(),
         limit: wire_limit,
     });
-    let responder = family_responder(context, job_id).await;
+    let responder = family_responder(context, job_id).await?;
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
         .with_responder(responder);
     match drive(operation, context).await? {
@@ -910,7 +910,7 @@ pub async fn read_artifact_routed(
         };
         return Ok((lookup, read));
     }
-    let owner = match family_responder(context, job_id).await {
+    let owner = match family_responder(context, job_id).await? {
         Some(responder) => responder,
         None => resolve_job_owner(context, job_id).await?,
     };
@@ -1129,10 +1129,21 @@ pub async fn cancel_job_routed(
     // Cancelling an external job is an append-only family record, not an owner
     // call; the local row of a receipted execution is stopped separately.
     if let Some(cancelled) = family_cancel(context, user_id, job_id, auth_token.clone()).await {
+        if cancelled.is_ok() {
+            for reservation in super::lifecycle::reservation::held_reservations(context)
+                .await
+                .map_err(JobRouteError::Unavailable)?
+                .into_iter()
+                .filter(|reservation| reservation.logical_job_id == job_id)
+            {
+                runtime.request_cancel(reservation.job_id);
+            }
+            kick_drain(context).await;
+        }
         return cancelled;
     }
     let request = auth_token.map(|auth_token| JobRequest::Cancel { auth_token, job_id });
-    let responder = family_responder(context, job_id).await;
+    let responder = family_responder(context, job_id).await?;
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
         .with_responder(responder);
     match drive(operation, context).await? {

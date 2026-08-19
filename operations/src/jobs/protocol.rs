@@ -316,11 +316,14 @@ async fn owner_gate(
     job_id: JobId,
     local_node: Option<NodeId>,
 ) -> Option<PreparedResponse> {
-    if crate::jobs::lifecycle::routing::family_of_alias(context, job_id)
-        .await
-        .is_some()
-    {
-        return None;
+    match crate::jobs::lifecycle::routing::family_of_alias(context, job_id).await {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(error) => {
+            return Some(PreparedResponse::new(JobResponse::Unavailable(
+                error.to_string(),
+            )));
+        }
     }
     match resolve_job_owner(context, job_id).await {
         Ok(owner) if local_node == Some(owner) => None,
@@ -444,18 +447,97 @@ async fn prepare_cancel(
     auth_token: MetadataAuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
+    match holds_family(context, job_id).await {
+        Ok(false) => {
+            let reservations =
+                match crate::jobs::lifecycle::reservation::held_reservations(context).await {
+                    Ok(reservations) => reservations,
+                    Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+                };
+            let mut stopped = None;
+            for reservation in reservations
+                .into_iter()
+                .filter(|reservation| reservation.logical_job_id == job_id)
+            {
+                match cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await {
+                    Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
+                        stopped = Some((record, true));
+                    }
+                    Ok(CancelJobOutcome::Requested(record)) => {
+                        stopped = Some((record, false));
+                    }
+                    Ok(CancelJobOutcome::NotFound) => {}
+                    Err(error) => {
+                        return PreparedResponse::new(JobResponse::Unavailable(error));
+                    }
+                }
+            }
+            if let Some((record, terminal)) = stopped {
+                let mut job = JobStatusView::from(&record);
+                job.job_id = job_id;
+                return PreparedResponse::new(JobResponse::Cancelled { job, terminal });
+            }
+        }
+        Ok(true) => {}
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+    }
     // A forwarded cancel reaches a family holder here: it publishes the record
     // and then still stops its own local execution row if it has one.
-    if let Some(Err(error)) =
-        crate::jobs::lifecycle::cancel::cancel_family(context, auth, job_id, Some(auth_token)).await
-        && !matches!(error, JobRouteError::Unavailable(_))
+    match crate::jobs::lifecycle::cancel::cancel_family(
+        context,
+        auth,
+        job_id,
+        Some(auth_token.clone()),
+    )
+    .await
     {
-        return PreparedResponse::new(match error {
-            JobRouteError::Forbidden => JobResponse::Forbidden,
-            JobRouteError::Unauthorized => JobResponse::Unauthorized,
-            JobRouteError::NotFound => JobResponse::NotFound,
-            error => JobResponse::Unavailable(error.to_string()),
-        });
+        Some(Ok(())) => {
+            let reservations =
+                match crate::jobs::lifecycle::reservation::held_reservations(context).await {
+                    Ok(reservations) => reservations,
+                    Err(error) => {
+                        return PreparedResponse::new(JobResponse::Unavailable(error));
+                    }
+                };
+            for reservation in reservations
+                .into_iter()
+                .filter(|reservation| reservation.logical_job_id == job_id)
+            {
+                if let Err(error) =
+                    cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await
+                {
+                    return PreparedResponse::new(JobResponse::Unavailable(error));
+                }
+            }
+            return match crate::jobs::lifecycle::routing::family_status(context, auth, job_id).await
+            {
+                Some(Ok(status)) => PreparedResponse::new(JobResponse::Cancelled {
+                    terminal: status.job.state.is_terminal(),
+                    job: status.job,
+                }),
+                Some(Err(JobRouteError::Forbidden)) => {
+                    PreparedResponse::new(JobResponse::Forbidden)
+                }
+                Some(Err(JobRouteError::Unauthorized)) => {
+                    PreparedResponse::new(JobResponse::Unauthorized)
+                }
+                Some(Err(JobRouteError::NotFound)) | None => {
+                    PreparedResponse::new(JobResponse::NotFound)
+                }
+                Some(Err(error)) => {
+                    PreparedResponse::new(JobResponse::Unavailable(error.to_string()))
+                }
+            };
+        }
+        Some(Err(error)) => {
+            return PreparedResponse::new(match error {
+                JobRouteError::Forbidden => JobResponse::Forbidden,
+                JobRouteError::Unauthorized => JobResponse::Unauthorized,
+                JobRouteError::NotFound => JobResponse::NotFound,
+                error => JobResponse::Unavailable(error.to_string()),
+            });
+        }
+        None => {}
     }
     let user_id = auth.user_id;
     let response = match cancel_owned_job(context, runtime, user_id, job_id).await {
@@ -471,6 +553,25 @@ async fn prepare_cancel(
         Err(error) => JobResponse::Unavailable(error),
     };
     PreparedResponse::new(response)
+}
+
+async fn holds_family(context: &DriverContext, job_id: JobId) -> Result<bool, JobRouteError> {
+    let Some(family) = crate::jobs::lifecycle::routing::family_of_alias(context, job_id).await?
+    else {
+        return Ok(false);
+    };
+    let net = context
+        .net_handle
+        .as_ref()
+        .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
+    let config = crate::metadata::api::load_realm_config(context, *net.realm_id())
+        .await
+        .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
+    let view = crate::jobs::records::verify::FamilyView::resolve(&config, *net.realm_id(), family)
+        .ok_or_else(|| {
+            JobRouteError::Unavailable("job family holder view unavailable".to_string())
+        })?;
+    Ok(view.holds(net.node_id()))
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {

@@ -158,17 +158,25 @@ impl AppendRecordOperation {
 
     fn read_row(&mut self, txn_id: TxnId) -> Effects {
         self.state = AppendState::ReadRow { txn_id };
+        let mut reads = vec![
+            (
+                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                record_key(&self.envelope().key()),
+            ),
+            (
+                JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+                family_prefix(&self.family()),
+            ),
+        ];
+        if let aruna_core::structs::JobFamilyRecord::Update(update) = &self.envelope().record
+            && let Some(sequence) = update.sequence.checked_sub(1)
+        {
+            let mut key = self.envelope().key();
+            key.sequence = sequence;
+            reads.push((JOB_FAMILY_RECORD_KEYSPACE.to_string(), record_key(&key)));
+        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    JOB_FAMILY_RECORD_KEYSPACE.to_string(),
-                    record_key(&self.envelope().key()),
-                ),
-                (
-                    JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
-                    family_prefix(&self.family()),
-                ),
-            ],
+            reads,
             txn_id: Some(txn_id),
         })]
     }
@@ -455,6 +463,12 @@ impl Operation for AppendRecordOperation {
                     }
                     if let Some((_, Some(value))) = values.next() {
                         self.cache = from_bytes::<ProjectionCache>(&value).ok();
+                    }
+                    if let Some((key, Some(value))) = values.next()
+                        && let Ok(record_key) = JobRecordKey::from_bytes(&key)
+                        && let Ok(envelope) = from_bytes::<JobRecordEnvelope>(&value)
+                    {
+                        self.stored.insert(record_key, envelope);
                     }
                     self.scan_evidence(txn_id)
                 }

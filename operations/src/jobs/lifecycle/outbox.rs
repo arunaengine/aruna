@@ -211,7 +211,6 @@ pub async fn drain_family_outbox(context: &DriverContext) -> bool {
             return true;
         }
     };
-    let pending = entries.len();
     for (key, _) in entries {
         let Ok(record_key) = JobRecordKey::from_bytes(&key) else {
             continue;
@@ -231,6 +230,12 @@ pub async fn drain_family_outbox(context: &DriverContext) -> bool {
             .filter(|holder| *holder != local)
             .take(MAX_JOB_RECORD_HOLDERS)
             .collect();
+        if holders.is_empty() {
+            if !clear_entry(context, key).await {
+                return true;
+            }
+            continue;
+        }
         let Ok(holders) = HolderList::new(holders) else {
             continue;
         };
@@ -245,7 +250,36 @@ pub async fn drain_family_outbox(context: &DriverContext) -> bool {
             warn!(error = %error, "Job record replication failed");
         }
     }
-    pending >= OUTBOX_DRAIN_BATCH
+    match iter_prefix_page(
+        &context.storage_handle,
+        JOB_FAMILY_OUTBOX_KEYSPACE,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    {
+        Ok((entries, _)) => !entries.is_empty(),
+        Err(error) => {
+            warn!(error = %error, "Job family outbox rescan failed");
+            true
+        }
+    }
+}
+
+async fn clear_entry(context: &DriverContext, key: Key) -> bool {
+    matches!(
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await,
+        Event::Storage(StorageEvent::DeleteResult { .. })
+    )
 }
 
 async fn read_record(context: &DriverContext, key: &Key) -> Option<JobRecordFrame> {

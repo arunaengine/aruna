@@ -6,9 +6,9 @@
 
 use aruna_core::NodeId;
 use aruna_core::structs::{
-    ExecutionReceipt, HolderView, JobFamilyId, JobFamilyRecord, JobId, JobRecordContext,
-    LaunchIntent, LocalExecution, LogicalJobSpec, PlacementRef, RealmConfigDocument, RealmId,
-    WitnessBudgetRecord,
+    ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobId,
+    JobRecordContext, LaunchIntent, LocalExecution, LogicalJobSpec, PlacementRef,
+    RealmConfigDocument, RealmId, WitnessBudgetRecord,
 };
 use ulid::Ulid;
 
@@ -75,6 +75,7 @@ impl FamilyView {
             budget: evidence.budget,
             launch: evidence.launch,
             receipt: evidence.receipt,
+            previous_update: evidence.previous_update,
             local,
         }
     }
@@ -88,6 +89,7 @@ pub struct Evidence<'a> {
     pub budget: Option<&'a WitnessBudgetRecord>,
     pub launch: Option<&'a LaunchIntent>,
     pub receipt: Option<&'a ExecutionReceipt>,
+    pub previous_update: Option<&'a ExecutionUpdate>,
 }
 
 /// The authentic predecessor records of one family, indexed for selection.
@@ -97,6 +99,7 @@ pub struct EvidenceSet {
     budgets: Vec<WitnessBudgetRecord>,
     launches: Vec<LaunchIntent>,
     receipts: Vec<ExecutionReceipt>,
+    updates: Vec<ExecutionUpdate>,
 }
 
 impl EvidenceSet {
@@ -108,10 +111,9 @@ impl EvidenceSet {
             JobFamilyRecord::Budget(budget) => self.budgets.push(*budget),
             JobFamilyRecord::Launch(launch) => self.launches.push(launch.as_ref().clone()),
             JobFamilyRecord::Receipt(receipt) => self.receipts.push(receipt.as_ref().clone()),
-            JobFamilyRecord::Claim(_)
-            | JobFamilyRecord::Update(_)
-            | JobFamilyRecord::Output(_)
-            | JobFamilyRecord::Cancel(_) => {}
+            JobFamilyRecord::Update(update) => self.updates.push(update.as_ref().clone()),
+            JobFamilyRecord::Claim(_) | JobFamilyRecord::Output(_) | JobFamilyRecord::Cancel(_) => {
+            }
         }
     }
 
@@ -138,6 +140,10 @@ impl EvidenceSet {
             },
             JobFamilyRecord::Update(update) => Evidence {
                 receipt: self.receipt_by_execution(update.execution_id),
+                previous_update: update
+                    .sequence
+                    .checked_sub(1)
+                    .and_then(|sequence| self.update_by_sequence(update.execution_id, sequence)),
                 ..Evidence::default()
             },
             JobFamilyRecord::Output(output) => Evidence {
@@ -181,5 +187,11 @@ impl EvidenceSet {
         self.receipts
             .iter()
             .find(|receipt| receipt.execution_id == execution_id)
+    }
+
+    fn update_by_sequence(&self, execution_id: Ulid, sequence: u64) -> Option<&ExecutionUpdate> {
+        self.updates
+            .iter()
+            .find(|update| update.execution_id == execution_id && update.sequence == sequence)
     }
 }

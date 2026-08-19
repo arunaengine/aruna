@@ -10,14 +10,14 @@ use std::time::Duration;
 
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, LaunchOfferEffect, NetEffect};
-use aruna_core::events::{Event, LaunchOfferEvent, NetEvent};
+use aruna_core::events::{Event, LaunchDecline, LaunchOfferEvent, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{JOB_PLAN_EXPLAIN_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::structs::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, RealmConfigDocument, WitnessBudgetRecord,
+    PhysicalExecutionState, PlacementDecision, RealmConfigDocument, WitnessBudgetRecord,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, NodeId};
@@ -34,7 +34,7 @@ use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
-    AppendRecordConfig, AppendRecordOperation, MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE,
+    Admission, AppendRecordConfig, AppendRecordOperation, MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE,
     RecordOrigin,
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
@@ -248,28 +248,14 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         Some(budget) => budget,
         None => return RoundOutcome::Retry { after_ms: base },
     };
-    let mine: Vec<&LaunchIntent> = records
+    let mine: Vec<&JobRecordEnvelope> = records
         .iter()
-        .filter_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Launch(launch) if launch.scheduler_node_id == local => {
-                Some(launch.as_ref())
-            }
-            _ => None,
+        .filter(|envelope| match &envelope.record {
+            JobFamilyRecord::Launch(launch) => launch.scheduler_node_id == local,
+            _ => false,
         })
         .collect();
     let sequence = mine.len() as u32;
-    if sequence >= budget.max_launches {
-        debug!(sequence, "Witness budget is exhausted for this request");
-        return RoundOutcome::Done;
-    }
-    // An unconfirmed launch may still be admitted at its target, so the next
-    // sequence waits one base delay and is then marked potentially overlapping.
-    let overlapping = mine
-        .iter()
-        .any(|launch| launch.created_at_ms + base > now_ms);
-    if overlapping {
-        return RoundOutcome::Retry { after_ms: base };
-    }
     let mut explain = read_row::<WitnessExplain>(
         context,
         JOB_PLAN_EXPLAIN_KEYSPACE,
@@ -283,6 +269,36 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         overlapping: false,
         sealed_at_ms: now_ms,
     });
+    if let Some(envelope) = mine.iter().max_by_key(|envelope| match &envelope.record {
+        JobFamilyRecord::Launch(launch) => launch.scheduler_seq,
+        _ => 0,
+    }) && let JobFamilyRecord::Launch(launch) = &envelope.record
+        && !explain.declined.contains(&launch.target)
+    {
+        if launch.created_at_ms.saturating_add(base) > now_ms {
+            return RoundOutcome::Retry { after_ms: base };
+        }
+        let Ok(frame) = JobRecordFrame::new((*envelope).clone()) else {
+            return RoundOutcome::Done;
+        };
+        return offer(
+            context,
+            Offer {
+                realm_id,
+                local,
+                family,
+                frame,
+                target: launch.target.clone(),
+                now_ms,
+                base_delay_ms: base,
+            },
+        )
+        .await;
+    }
+    if sequence >= budget.max_launches {
+        debug!(sequence, "Witness budget is exhausted for this request");
+        return RoundOutcome::Done;
+    }
     let plan = match build_plan(context, &config, &spec, &explain.declined, now_ms).await {
         Ok(plan) => plan,
         Err(error) => {
@@ -333,6 +349,8 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         witness_placement: view.placement,
         holder_generation: holder_generation(&config, &view),
         target: selection.target.clone(),
+        inputs: selection.inputs,
+        output_policies: selection.output_policies,
         plan_digest: selection.plan_digest,
         spec_digest: spec.spec_digest,
         created_at_ms: now_ms,
@@ -390,17 +408,43 @@ async fn offer(context: &DriverContext, offered: Offer) -> RoundOutcome {
     });
     match drive(operation, context).await {
         Ok(OfferOutcome::Accepted(receipt)) => {
-            append_local(context, realm_id, local, receipt, now_ms).await;
-            RoundOutcome::Done
+            match append_local(context, realm_id, local, receipt, now_ms).await {
+                true => RoundOutcome::Done,
+                false => RoundOutcome::Retry {
+                    after_ms: base_delay_ms,
+                },
+            }
         }
-        // A definitive decline advances to the next ranked target at once.
-        Ok(OfferOutcome::Declined) => {
-            record_decline(context, &family, local, target).await;
-            RoundOutcome::Retry { after_ms: 0 }
+        Ok(OfferOutcome::Declined(reason)) => {
+            if reason == LaunchDecline::Cancelled {
+                return RoundOutcome::Done;
+            }
+            if permanent_decline(&reason) {
+                record_decline(context, &family, local, target).await;
+                RoundOutcome::Retry { after_ms: 0 }
+            } else {
+                RoundOutcome::Retry {
+                    after_ms: base_delay_ms,
+                }
+            }
         }
         Ok(OfferOutcome::Unavailable) | Err(_) => RoundOutcome::Retry {
             after_ms: base_delay_ms,
         },
+    }
+}
+
+fn permanent_decline(reason: &LaunchDecline) -> bool {
+    match reason {
+        LaunchDecline::Unauthorized | LaunchDecline::LaunchConflict => true,
+        LaunchDecline::Policy(policy) => !matches!(
+            policy.decision(),
+            PlacementDecision::Required { .. } | PlacementDecision::Unavailable { .. }
+        ),
+        LaunchDecline::NotHolder
+        | LaunchDecline::Capacity
+        | LaunchDecline::Draining
+        | LaunchDecline::Cancelled => false,
     }
 }
 
@@ -515,7 +559,10 @@ async fn append_local(
         now_ms,
     });
     match drive(operation, context).await {
-        Ok(outcome) => !outcome.deferred,
+        Ok(outcome) => matches!(
+            outcome.admission,
+            Admission::Authentic | Admission::Duplicate
+        ),
         Err(error) => {
             warn!(error = %error, "Witness record append failed");
             false
@@ -647,7 +694,7 @@ async fn write_row<T: Serialize>(
 #[derive(Debug, PartialEq)]
 pub enum OfferOutcome {
     Accepted(JobRecordFrame),
-    Declined,
+    Declined(LaunchDecline),
     /// The target never answered; it may still have accepted the launch.
     Unavailable,
 }
@@ -696,7 +743,7 @@ impl Operation for OfferLaunchOperation {
             }
             Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Declined { target, reason })) => {
                 debug!(peer = %target, reason = ?reason, "Execution target declined a launch");
-                Ok(OfferOutcome::Declined)
+                Ok(OfferOutcome::Declined(reason))
             }
             Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(message))) => {
                 debug!(message, "Execution target did not answer the offer");

@@ -170,6 +170,7 @@ async fn admit_here(
         request_digest: identity.request_digest,
         spec_digest: [0u8; 32],
         resources: effective_resources(&request.spec),
+        retention_ms: request.retention_ms,
         retry: JobRetryPolicy {
             max_launches_per_witness: MAX_LAUNCHES_PER_WITNESS,
         },

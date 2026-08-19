@@ -14,9 +14,10 @@ use aruna_core::scheduling::{
 };
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    BlobVersion, BlobVersionState, InputMode, InputSource, LogicalJobSpec, NodeInfoDocument,
-    PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument, RealmNodeKind,
-    VersionKey, VersionedObjectArn,
+    AuthContext, BlobVersion, BlobVersionState, InputMode, InputSource, LogicalJobSpec,
+    NodeInfoDocument, OutputDestination, Permission, PlacementPolicyRef, PlacementSubject,
+    PolicyResolution, RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn,
+    WorkspaceMode, blob_group_permission_path, storage_subject,
 };
 use aruna_core::types::NodeId;
 use thiserror::Error;
@@ -28,6 +29,9 @@ use crate::blob_holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::node_info::read_node_info_document;
 use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
+use crate::request_authorization::authorize;
+use crate::request_policy::PolicyRequestExtras;
+use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 
 /// Tag that pins the container network mode, shared with the executor path.
@@ -60,11 +64,14 @@ pub async fn build_plan(
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
     let documents = advertisements(context, config).await;
-    let inputs = resolve_inputs(context, config, spec, &documents, local).await?;
-    let output_policies = inputs
+    let inputs = resolve_inputs(context, config, spec, local).await?;
+    let mut output_policies = inputs
         .iter()
         .flat_map(|input| input.policies.clone())
         .collect::<Vec<_>>();
+    output_policies.extend(destination_policies(context, spec).await?);
+    output_policies.sort_unstable();
+    output_policies.dedup();
     let policies = resolve_policies(context, spec, &inputs, &output_policies, now_ms, local).await;
     let request = PlanRequest {
         submission_id: spec.submission_id,
@@ -79,7 +86,7 @@ pub async fn build_plan(
         inputs,
         output_policies,
         policies,
-        candidates: candidates(config, &documents, excluded),
+        candidates: candidates(context, config, spec, &documents, excluded).await,
         now_ms,
     };
     Ok(plan_execution(&request, &config.compute)?)
@@ -105,8 +112,10 @@ async fn advertisements(
 
 /// One candidate per advertised backend. `node_kind` and `active` come from the
 /// realm config; a document may only describe a backend, never its own standing.
-fn candidates(
+async fn candidates(
+    context: &DriverContext,
     config: &RealmConfigDocument,
+    spec: &LogicalJobSpec,
     documents: &BTreeMap<NodeId, NodeInfoDocument>,
     excluded: &[ExecutionTargetId],
 ) -> Vec<TargetCandidate> {
@@ -116,6 +125,7 @@ fn candidates(
             continue;
         };
         let entry = config.placement_entry(*node_id);
+        let group_allowed = target_allowed(context, spec, *node_id).await;
         for capability in &document.executors {
             let target = capability.target(*node_id);
             if excluded.contains(&target) {
@@ -127,7 +137,7 @@ fn candidates(
                 active: !document.leaving,
                 compute_draining: document.compute_draining
                     || entry.is_some_and(|entry| entry.draining),
-                group_allowed: true,
+                group_allowed,
                 capability: capability.clone(),
                 load_permille: document.utilization.load_permille,
             });
@@ -137,6 +147,24 @@ fn candidates(
         }
     }
     candidates
+}
+
+async fn target_allowed(context: &DriverContext, spec: &LogicalJobSpec, target: NodeId) -> bool {
+    let auth = AuthContext {
+        user_id: spec.created_by,
+        realm_id: spec.realm_id,
+        path_restrictions: None,
+    };
+    authorize(
+        context,
+        spec.realm_id,
+        &auth,
+        &blob_group_permission_path(spec.realm_id, spec.group_id, target),
+        &Permission::WRITE,
+        PolicyRequestExtras::rest(),
+    )
+    .await
+    .is_ok()
 }
 
 fn node_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeKind> {
@@ -153,7 +181,6 @@ async fn resolve_inputs(
     context: &DriverContext,
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
-    documents: &BTreeMap<NodeId, NodeInfoDocument>,
     local: NodeId,
 ) -> Result<Vec<ResolvedInput>, PlanBuildError> {
     let mut inputs = Vec::new();
@@ -222,15 +249,7 @@ async fn resolve_inputs(
                     .map(|metadata| metadata.content_length)
             })
             .unwrap_or_default();
-        let holders = input_holders(
-            context,
-            config,
-            documents,
-            blake3,
-            local,
-            head.location.is_some(),
-        )
-        .await;
+        let holders = input_holders(context, config, blake3, local, head.location.is_some()).await;
         inputs.push(ResolvedInput {
             destination_key: input.dest_key.clone(),
             source: VersionedObjectArn {
@@ -285,7 +304,6 @@ pub async fn version_hash(
 async fn input_holders(
     context: &DriverContext,
     config: &RealmConfigDocument,
-    documents: &BTreeMap<NodeId, NodeInfoDocument>,
     blake3: [u8; 32],
     local: NodeId,
     held_locally: bool,
@@ -308,40 +326,57 @@ async fn input_holders(
     nodes
         .into_iter()
         .map(|node_id| InputHolder {
-            subject: holder_subject(config, documents, node_id),
+            subject: holder_subject(config, node_id),
             node_id,
         })
         .collect()
 }
 
-/// The subject a holder's copy sits on: its advertised execution site when it
-/// published one, otherwise its placement entry in the realm config.
-fn holder_subject(
-    config: &RealmConfigDocument,
-    documents: &BTreeMap<NodeId, NodeInfoDocument>,
-    node_id: NodeId,
-) -> PlacementSubject {
-    if let Some(subject) = documents
-        .get(&node_id)
-        .and_then(|document| document.executors.first())
-        .map(|capability| capability.subject.clone())
-    {
-        return PlacementSubject {
-            executor_kind: None,
-            ..subject
-        };
-    }
+/// A holder's storage subject comes from its realm placement entry, never an
+/// advertised executor site.
+fn holder_subject(config: &RealmConfigDocument, node_id: NodeId) -> PlacementSubject {
     let entry = config.placement_entry(node_id);
+    if let Some(entry) = entry {
+        return storage_subject(entry, 1);
+    }
     PlacementSubject {
         node_id,
         generation: 0,
-        location: entry
-            .map(|entry| entry.effective_location().to_string())
-            .unwrap_or_default(),
-        labels: entry.map(|entry| entry.labels.clone()).unwrap_or_default(),
+        location: String::new(),
+        labels: BTreeMap::new(),
         executor_kind: None,
         local_to_controller: false,
     }
+}
+
+async fn destination_policies(
+    context: &DriverContext,
+    spec: &LogicalJobSpec,
+) -> Result<Vec<PlacementPolicyRef>, PlanBuildError> {
+    let mut buckets = std::collections::BTreeSet::new();
+    for output in &spec.payload.file_outputs {
+        let OutputDestination::S3 { bucket, .. } = &output.destination;
+        buckets.insert(bucket.clone());
+    }
+    let (mode, workspace) = ids::workspace_of(&spec.payload);
+    if mode == WorkspaceMode::Existing
+        && let Some(bucket) = workspace
+    {
+        buckets.insert(bucket);
+    }
+    let mut policies = Vec::new();
+    for bucket in buckets {
+        let info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
+            .await
+            .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?
+            .transpose()
+            .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?
+            .ok_or_else(|| {
+                PlanBuildError::Unavailable(format!("output bucket {bucket} is unavailable"))
+            })?;
+        policies.extend(info.placement_policies);
+    }
+    Ok(policies)
 }
 
 /// Every distinct policy ref of the request, resolved through the ordinary
@@ -388,7 +423,7 @@ async fn resolve_policies(
 
 /// Mounted inputs need an S3 mount at the target; everything else is staged as
 /// files into the workspace.
-fn staging_mode(spec: &LogicalJobSpec) -> StagingMode {
+pub(crate) fn staging_mode(spec: &LogicalJobSpec) -> StagingMode {
     match spec
         .payload
         .inputs
@@ -401,7 +436,7 @@ fn staging_mode(spec: &LogicalJobSpec) -> StagingMode {
 }
 
 /// Network mode pinned by the request tag, defaulting to no egress.
-fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
+pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
     match spec.payload.tags.get(NETWORK_TAG_KEY).map(String::as_str) {
         Some("open") => NetworkAccess::Open,
         _ => NetworkAccess::Isolated,

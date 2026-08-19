@@ -187,9 +187,13 @@ pub async fn run_execution_job(
 
         // A receipted execution already has its identity: the fenced attempt
         // binds that exact ExecutionId so its outputs chain to the receipt.
-        let receipted = job_reservation(&context, job_id)
-            .await
-            .map(|reservation| reservation.execution_id);
+        let receipted = match job_reservation(&context, job_id).await {
+            Ok(reservation) => reservation.map(|reservation| reservation.execution_id),
+            Err(error) => {
+                warn!(job_id = %job_id, %error, "Execution reservation lookup failed");
+                return None;
+            }
+        };
         // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
         let intent = AttemptIntent {
             attempt_no,
@@ -366,7 +370,10 @@ pub async fn resolve_backend(
         .select(constraint.as_ref())
         .cloned()
         .ok_or_else(|| JobError::permanent("no eligible executor for job"))?;
-    let Some(sealed) = sealed_site(context, job_id).await else {
+    let Some(sealed) = sealed_site(context, job_id)
+        .await
+        .map_err(JobError::retryable)?
+    else {
         return Ok(selected);
     };
     let Some(subject) = read_local_subject(context)
@@ -401,12 +408,17 @@ pub async fn resolve_backend(
 
 /// Subject generation and digest one receipted execution was accepted under.
 /// `None` for a local job that never reserved capacity: the unfenced path.
-async fn sealed_site(context: &DriverContext, job_id: JobId) -> Option<(u64, [u8; 32])> {
-    let reservation = job_reservation(context, job_id).await?;
-    match reservation.subject_generation {
+async fn sealed_site(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<(u64, [u8; 32])>, String> {
+    let Some(reservation) = job_reservation(context, job_id).await? else {
+        return Ok(None);
+    };
+    Ok(match reservation.subject_generation {
         0 => None,
         generation => Some((generation, reservation.subject_digest)),
-    }
+    })
 }
 
 async fn prepare_workspace(
@@ -2728,6 +2740,7 @@ mod tests {
         let reservation = JobReservationRecord {
             execution_id: Ulid::from_bytes([0xA1; 16]),
             job_id,
+            logical_job_id: job_id,
             resources: aruna_core::structs::EffectiveResources {
                 cpu_cores: 1,
                 ram_bytes: 1,

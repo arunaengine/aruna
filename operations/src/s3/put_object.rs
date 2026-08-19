@@ -3539,7 +3539,8 @@ mod gate_test {
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
-        let effects = operation.step(read(Some(ByteView::from(cached))));
+        operation.step(read(Some(ByteView::from(cached))));
+        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(operation.is_complete());
@@ -3663,6 +3664,7 @@ mod gate_test {
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
         }));
@@ -3742,7 +3744,8 @@ mod gate_test {
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
-        let effects = operation.step(read(Some(ByteView::from(cached))));
+        operation.step(read(Some(ByteView::from(cached))));
+        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(matches!(

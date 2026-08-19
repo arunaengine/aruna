@@ -29,7 +29,9 @@ use ulid::Ulid;
 pub struct PlannedInput {
     pub destination_key: String,
     pub version_id: Ulid,
+    pub blake3: [u8; 32],
     pub bytes: u64,
+    pub policies: Vec<crate::structs::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.
     pub source_node_id: Option<crate::NodeId>,
     pub transfer_ms: u64,
@@ -56,6 +58,7 @@ pub struct Selection {
     pub subject_generation: u64,
     pub score: TargetScore,
     pub inputs: Vec<PlannedInput>,
+    pub output_policies: Vec<crate::structs::PlacementPolicyRef>,
     pub plan_digest: [u8; 32],
 }
 
@@ -132,6 +135,7 @@ pub fn plan_execution(
             subject_generation: candidate.capability.subject.generation,
             score: *score,
             inputs: planned_inputs(&request, routes),
+            output_policies: request.output_policies.clone(),
             plan_digest: digest::plan_digest(&request, candidate, routes, score),
         });
     Ok(ExecutionPlan {
@@ -170,7 +174,9 @@ fn planned_inputs(request: &PlanRequest, routes: &[InputRoute]) -> Vec<PlannedIn
         .map(|(input, route)| PlannedInput {
             destination_key: input.destination_key.clone(),
             version_id: input.version_id,
+            blake3: input.blake3,
             bytes: input.bytes,
+            policies: input.policies.clone(),
             source_node_id: route.source_node_id,
             transfer_ms: route.transfer_ms,
             known_link: route.known_link,

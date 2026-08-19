@@ -22,7 +22,7 @@ use aruna_core::structs::{
     AdvertisementEpoch, BackendCatalog, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
     JobRecordKind, LogicalJobState, NODE_SUBJECT_KEY, NodeInfoDocument, NodeSubjectRecord,
     NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
-    STORAGE_CLASS_LABEL_PREFIX, node_info_storage_key,
+    STORAGE_CLASS_LABEL_PREFIX, SubmissionId, node_info_storage_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -36,6 +36,7 @@ use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
+use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
 use crate::placement::{build_view, held_buckets};
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
@@ -138,6 +139,7 @@ async fn reservation_snapshot(
     ctx: &DriverContext,
     epoch: AdvertisementEpoch,
 ) -> Result<ComputeReservationSnapshot, String> {
+    crate::jobs::lifecycle::updates::settle_terminals(ctx).await?;
     let mut reserved = ResourceTotals::default();
     for record in read_reservations(ctx).await? {
         reserved.add(&record.resources);
@@ -151,10 +153,10 @@ async fn read_reservations(ctx: &DriverContext) -> Result<Vec<JobReservationReco
     loop {
         let (page, next) = iter_page(ctx, JOB_RESERVATION_KEYSPACE, None, start).await?;
         for (_, value) in &page {
-            match postcard::from_bytes::<JobReservationRecord>(value.as_ref()) {
-                Ok(record) => records.push(record),
-                Err(error) => warn!(%error, "skipping undecodable execution reservation"),
-            }
+            records.push(
+                postcard::from_bytes::<JobReservationRecord>(value.as_ref())
+                    .map_err(|error| error.to_string())?,
+            );
         }
         match next {
             Some(cursor) => start = Some(cursor),
@@ -177,8 +179,8 @@ async fn demand_snapshot(
     let mut start: Option<Key> = None;
     loop {
         let (page, next) = iter_page(ctx, JOB_FAMILY_PROJECTION_KEYSPACE, None, start).await?;
-        for (_, value) in &page {
-            let Some(family) = nonterminal_family(value) else {
+        for (key, value) in &page {
+            let Some(family) = nonterminal_family(ctx, key, value).await? else {
                 continue;
             };
             if families >= MAX_DEMAND_FAMILIES {
@@ -214,24 +216,66 @@ async fn demand_snapshot(
             }
         })
         .collect();
-    Ok(ComputeDemandSnapshot { epoch, groups })
+    Ok(ComputeDemandSnapshot {
+        epoch,
+        groups,
+        truncated,
+    })
 }
 
 /// The family of one projection row that still holds logical demand. Succeeded
 /// and cancelled families released theirs; `Indeterminate` has not.
-fn nonterminal_family(value: &Value) -> Option<JobFamilyId> {
-    let projection = from_bytes::<ProjectionCache>(value.as_ref())
-        .ok()?
-        .projection?;
+async fn nonterminal_family(
+    ctx: &DriverContext,
+    key: &Key,
+    value: &Value,
+) -> Result<Option<JobFamilyId>, String> {
+    let family = projection_family(key)?;
+    let cache = from_bytes::<ProjectionCache>(value.as_ref()).ok();
+    let projection = match cache {
+        Some(cache) if !cache.stale => cache.projection,
+        _ => {
+            drive(
+                ProjectFamilyOperation::new(ProjectFamilyConfig {
+                    family: FamilyRef::Family(family),
+                    now_ms: unix_timestamp_millis(),
+                    rebuild: false,
+                }),
+                ctx,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .projection
+        }
+    };
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
     match projection.state {
         LogicalJobState::Queued | LogicalJobState::Running | LogicalJobState::Indeterminate => {
-            Some(JobFamilyId {
+            Ok(Some(JobFamilyId {
                 submission_id: projection.submission_id,
                 request_digest: projection.request_digest,
-            })
+            }))
         }
-        LogicalJobState::Succeeded | LogicalJobState::Cancelled => None,
+        LogicalJobState::Succeeded | LogicalJobState::Cancelled => Ok(None),
     }
+}
+
+fn projection_family(key: &Key) -> Result<JobFamilyId, String> {
+    let bytes: &[u8] = key.as_ref();
+    let submission_id = bytes
+        .get(..32)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "malformed family projection key".to_string())?;
+    let request_digest = bytes
+        .get(32..64)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "malformed family projection key".to_string())?;
+    Ok(JobFamilyId {
+        submission_id: SubmissionId(submission_id),
+        request_digest,
+    })
 }
 
 /// The group and sealed ceilings of one family, read from its immutable spec.
@@ -404,7 +448,7 @@ pub async fn group_demand(
                     snapshots.push(document.demand)
                 }
                 Ok(_) => {}
-                Err(error) => warn!(%error, "skipping undecodable node info advertisement"),
+                Err(error) => return Err(error.to_string()),
             }
         }
         match next {
@@ -1289,6 +1333,7 @@ mod tests {
             group_id,
             created_by: aruna_core::types::UserId::nil(realm_id),
             created_at_ms: 1_000,
+            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
             payload: aruna_core::structs::ExecutionSpec {
                 group_id,
                 name: None,
@@ -1380,6 +1425,7 @@ mod tests {
         let record = JobReservationRecord {
             execution_id,
             job_id: aruna_core::structs::JobId::from_bytes([9u8; 16]),
+            logical_job_id: aruna_core::structs::JobId::from_bytes([9u8; 16]),
             resources: aruna_core::structs::EffectiveResources {
                 cpu_cores: cpu,
                 ram_bytes: 512,

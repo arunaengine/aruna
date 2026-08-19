@@ -501,7 +501,14 @@ mod test {
         )
         .expect("policy verifies");
         let policy = rule.policy_ref();
-        seed_gate(&context, realm_id, subject(node_id, "eu-west"), &[rule]).await;
+        seed_gate(
+            &context,
+            realm_id,
+            user_id,
+            subject(node_id, "eu-west"),
+            &[rule],
+        )
+        .await;
         seed_governed_bucket(&context, group_id, user_id, vec![policy]).await;
 
         put_source(

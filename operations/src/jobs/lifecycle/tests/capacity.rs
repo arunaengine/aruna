@@ -2,17 +2,18 @@
 //! the release that frees it again.
 
 use aruna_core::compute::ResourceEnvelope;
-use aruna_core::effects::JobRecordFrame;
+use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::structs::{
-    EffectiveResources, JobFamilyRecord, JobRecordBody, LaunchIntent, LogicalJobSpec,
+    EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody, LaunchIntent,
+    LogicalJobSpec,
 };
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::reservation::{
-    ExecutionReservation, ReleaseExecutionOperation, ReserveExecutionConfig,
+    ExecutionReservation, MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
     ReserveExecutionOperation, fits, held_reservations, job_reservation,
 };
 use crate::jobs::lifecycle::target::existing_receipt;
@@ -84,6 +85,16 @@ async fn reserve(
         JobFamilyRecord::Receipt(Box::new(receipt.clone())),
     ))
     .expect("bounded receipt");
+    let spec = family.spec();
+    let record = JobRecord::new(
+        receipt.job_id,
+        JobPayload::Execution(spec.payload),
+        spec.created_by,
+        family.target.public(),
+        4_000,
+        4_000,
+        None,
+    );
     drive(
         ReserveExecutionOperation::new(ReserveExecutionConfig {
             realm_id: REALM,
@@ -92,10 +103,12 @@ async fn reserve(
             receipt: frame,
             launch: Box::new(launch.clone()),
             job_id: receipt.job_id,
+            logical_job_id: receipt.job_id,
             execution_id: receipt.execution_id,
             resources: resources(),
             subject_generation: receipt.subject_generation,
             subject_digest: receipt.subject_digest,
+            record: Box::new(record),
             now_ms: 4_000,
         }),
         ctx,
@@ -110,6 +123,7 @@ fn holds_static_ceilings() {
     let held = vec![ExecutionReservation {
         execution_id: Ulid::from_bytes([1u8; 16]),
         job_id: aruna_core::structs::JobId::from_bytes([2u8; 16]),
+        logical_job_id: aruna_core::structs::JobId::from_bytes([2u8; 16]),
         resources: resources(),
         created_at_ms: 1,
         subject_generation: 1,
@@ -129,6 +143,48 @@ fn holds_static_ceilings() {
 }
 
 #[tokio::test]
+async fn pages_reservations() {
+    // Capacity accounting must include reservations beyond one storage page.
+    let family = Family::new([9u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let writes = (0..=MAX_RESERVATION_SCAN)
+        .map(|index| {
+            let execution_id = Ulid::from(index as u128 + 1);
+            let reservation = ExecutionReservation {
+                execution_id,
+                job_id: family.job_id,
+                logical_job_id: family.job_id,
+                resources: resources(),
+                created_at_ms: index as u64,
+                subject_generation: 1,
+                subject_digest: [0u8; 32],
+            };
+            (
+                JOB_RESERVATION_KEYSPACE.to_string(),
+                execution_id.to_bytes().as_slice().into(),
+                postcard::to_allocvec(&reservation)
+                    .expect("reservation encodes")
+                    .into(),
+            )
+        })
+        .collect();
+    ctx.storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+
+    assert_eq!(
+        held_reservations(&ctx)
+            .await
+            .expect("reservation scan")
+            .len(),
+        MAX_RESERVATION_SCAN + 1
+    );
+}
+
+#[tokio::test]
 async fn reserves_exact_capacity() {
     // Two offers competing for one slot cannot both be admitted, and the
     // refused one leaves neither a reservation nor a receipt behind.
@@ -144,7 +200,13 @@ async fn reserves_exact_capacity() {
         .expect_err("second offer exceeds the ceiling");
 
     assert_eq!(refused, LifecycleError::Capacity);
-    assert_eq!(held_reservations(&ctx).await.len(), 1);
+    assert_eq!(
+        held_reservations(&ctx)
+            .await
+            .expect("reservation scan")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -160,8 +222,15 @@ async fn persists_receipt_first() {
 
     let reservation = job_reservation(&ctx, spec.job_id)
         .await
+        .expect("reservation scan")
         .expect("reservation is durable");
     assert_eq!(reservation.execution_id, execution_id);
+    assert!(
+        crate::jobs::store::read_job_record(&ctx.storage_handle, spec.job_id, None)
+            .await
+            .expect("physical row read")
+            .is_some()
+    );
     let (records, _) = iter_prefix_page(
         &ctx.storage_handle,
         JOB_FAMILY_RECORD_KEYSPACE,

@@ -6,11 +6,15 @@
 //! never as a denial.
 
 use aruna_core::NodeId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_CACHE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{PlacementPolicyRef, RealmId, VerifiedPolicy};
+use aruna_core::structs::{
+    PlacementPolicyRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId, VerifiedPolicy,
+    verify_policy_authority,
+};
 use aruna_core::types::{Effects, Key};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -44,6 +48,7 @@ pub struct ResolvedPolicy {
 pub struct ResolvePolicyOperation {
     config: ResolvePolicyConfig,
     reader: Option<ReadPolicyOperation>,
+    cached: Option<AuthenticPolicy>,
     pending: Option<PendingEntry>,
     stats: PolicyCacheStats,
     state: ResolveState,
@@ -60,6 +65,7 @@ struct PendingEntry {
 enum ResolveState {
     Init,
     ReadCache,
+    Revalidate,
     Resolve,
     Scan,
     Evict,
@@ -73,6 +79,7 @@ impl ResolvePolicyOperation {
         Self {
             config,
             reader: None,
+            cached: None,
             pending: None,
             stats: PolicyCacheStats::default(),
             state: ResolveState::Init,
@@ -90,6 +97,54 @@ impl ResolvePolicyOperation {
         self.reader = Some(reader);
         self.state = ResolveState::Resolve;
         effects
+    }
+
+    fn revalidate(&mut self, authentic: AuthenticPolicy) -> Effects {
+        self.cached = Some(authentic);
+        self.state = ResolveState::Revalidate;
+        let config = DocumentSyncTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        let auth = DocumentSyncTarget::RealmAuthorization {
+            realm_id: self.config.realm_id,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (config.storage_keyspace().to_string(), config.storage_key()),
+                (auth.storage_keyspace().to_string(), auth.storage_key()),
+            ],
+            txn_id: None,
+        })]
+    }
+
+    fn accept_cached(&mut self, values: Vec<(Key, Option<ByteView>)>) -> Effects {
+        let [(_, config_value), (_, auth_value)] = values.as_slice() else {
+            return self.unexpected_event("realm config and authorization", format!("{values:?}"));
+        };
+        let Some(config_value) = config_value else {
+            return self.fail(ReadPolicyError::RealmConfigMissing);
+        };
+        let Some(auth_value) = auth_value else {
+            return self.fail(ReadPolicyError::Unavailable(
+                "realm authorization document missing".to_string(),
+            ));
+        };
+        let config = match RealmConfigDocument::from_bytes(config_value) {
+            Ok(config) => config,
+            Err(error) => return self.fail(error.into()),
+        };
+        let auth = match RealmAuthorizationDocument::from_bytes(auth_value) {
+            Ok(auth) => auth,
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(authentic) = self.cached.take() else {
+            return self.unexpected_event("cached policy", String::new());
+        };
+        if let Err(error) = verify_policy_authority(&authentic.document, &config, &auth) {
+            return self.fail(error.into());
+        }
+        self.result = Some(Ok((authentic.policy, PolicySource::Cached)));
+        self.finish()
     }
 
     /// Keeps the resolved answer, then caches it. A positive entry is written
@@ -204,10 +259,12 @@ impl Operation for ResolvePolicyOperation {
                         &self.config.policy_ref,
                         self.config.now_ms,
                     ) {
-                        CacheLookup::Hit(policy) => {
+                        CacheLookup::Hit { document, policy } => {
                             self.stats.hits = 1;
-                            self.result = Some(Ok((*policy, PolicySource::Cached)));
-                            self.finish()
+                            self.revalidate(AuthenticPolicy {
+                                document: *document,
+                                policy: *policy,
+                            })
                         }
                         CacheLookup::Negative => {
                             self.stats.hits = 1;
@@ -227,6 +284,13 @@ impl Operation for ResolvePolicyOperation {
                     self.start_read()
                 }
                 other => self.unexpected_event("policy cache read", format!("{other:?}")),
+            },
+            ResolveState::Revalidate => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    self.accept_cached(values)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("realm authority read", format!("{other:?}")),
             },
             ResolveState::Resolve => {
                 let Some(reader) = self.reader.as_mut() else {
@@ -363,15 +427,18 @@ mod tests {
         ByteView::from(document(policy).to_bytes().expect("document encodes"))
     }
 
-    /// The realm view and policy row the inner read starts with.
-    fn opened(policy_row: Option<Value>) -> Event {
+    fn realm_values() -> (Value, Value) {
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 2);
         config.seed_default_placement();
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
-        let (config_value, auth_value) =
-            super::super::tests::realm_view(&config, super::super::tests::admin_user(realm()));
+        super::super::tests::realm_view(&config, super::super::tests::admin_user(realm()))
+    }
+
+    /// The realm view and policy row the inner read starts with.
+    fn opened(policy_row: Option<Value>) -> Event {
+        let (config_value, auth_value) = realm_values();
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -379,6 +446,14 @@ mod tests {
                 (key.clone(), Some(config_value)),
                 (key, Some(auth_value)),
             ],
+        })
+    }
+
+    fn authority() -> Event {
+        let (config_value, auth_value) = realm_values();
+        let key = ByteView::from(Vec::new());
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(key.clone(), Some(config_value)), (key, Some(auth_value))],
         })
     }
 
@@ -454,9 +529,8 @@ mod tests {
     }
 
     #[test]
-    fn serves_warm_entry() {
-        // A durable positive entry must answer without any further effect, so a
-        // warm resolve never touches the network.
+    fn revalidates_warm_entry() {
+        // Cached publication bytes must still pass current realm authority.
         let policy = policy(1, "eu-west");
         let entry = PolicyCacheEntry::verified(&document(&policy), 10);
         let mut operation = operation(policy.policy_ref());
@@ -464,9 +538,11 @@ mod tests {
         let effects = operation.step(read_result(Some(ByteView::from(
             entry.to_bytes().expect("entry encodes"),
         ))));
-
-        assert!(effects.is_empty(), "a warm hit must emit no effect");
-        assert!(operation.is_complete());
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::BatchRead { .. }))
+        ));
+        assert!(operation.step(authority()).is_empty());
         let resolved = operation.finalize().expect("policy resolves");
         assert_eq!(resolved.source, PolicySource::Cached);
         assert_eq!(resolved.stats.hits, 1);

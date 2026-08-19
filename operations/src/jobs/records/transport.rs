@@ -349,14 +349,11 @@ async fn accept_record(
         crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
     }
     match outcome.admission {
-        // A pending record is durable here and is admitted as soon as its
-        // evidence arrives, so the publisher has nothing left to retry.
-        Admission::Authentic
-        | Admission::Local
-        | Admission::Duplicate
-        | Admission::Pending(PendingNeed::Evidence(_) | PendingNeed::LocalView) => Ok(()),
+        Admission::Authentic | Admission::Duplicate => Ok(()),
+        Admission::Local
+        | Admission::Pending(PendingNeed::Evidence(_) | PendingNeed::LocalView)
+        | Admission::PendingFull => Err(ServeError::Unavailable),
         Admission::Conflict => Err(ServeError::Refused(JobRecordRejection::Conflict)),
-        Admission::PendingFull => Err(ServeError::Unavailable),
         Admission::Rejected(
             JobRecordError::BadSignature
             | JobRecordError::WrongPublisher(_)

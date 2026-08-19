@@ -473,6 +473,7 @@ mod test {
         seed_gate(
             &context,
             realm_id,
+            user_id,
             subject(node_id, "eu-west"),
             &[source.clone(), dest.clone()],
         )

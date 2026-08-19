@@ -414,7 +414,8 @@ mod tests {
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
         operation.start();
         operation.step(authorized(true));
-        let effects = operation.step(cached(&policy));
+        operation.step(cached(&policy));
+        let effects = operation.step(crate::placement_policy::fixtures::authority(realm_id()));
 
         assert!(matches!(
             effects.as_slice(),

@@ -21,7 +21,7 @@ use super::keys::{alias_family, alias_prefix, family_prefix, record_key};
 use super::reduce::reduce_family;
 use super::rows::{ProjectionCache, from_bytes, to_bytes};
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
-use crate::jobs::store::{JobDeletes, JobWrites, index_deltas};
+use crate::jobs::store::{JobDeletes, JobWrites};
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;
@@ -174,13 +174,12 @@ impl ProjectFamilyOperation {
         })]
     }
 
-    /// Bridges the reduced state into the mutable job rows this node keeps as a
-    /// local cache. A row that already settled terminally, or whose local state
-    /// machine forbids the transition, is left untouched, and the schedule
-    /// indexes move with the row through the shared job-store deltas.
+    /// Bridges the reduced state into the unscheduled logical cache rows. A row
+    /// that already settled terminally, or whose state machine forbids the
+    /// transition, is left untouched.
     fn bridge(&self, values: Vec<(Key, Option<Value>)>) -> (JobWrites, JobDeletes) {
         let mut writes: JobWrites = Vec::new();
-        let mut deletes: JobDeletes = Vec::new();
+        let deletes: JobDeletes = Vec::new();
         let Some(projection) = self.projection.as_ref() else {
             return (writes, deletes);
         };
@@ -211,11 +210,14 @@ impl ProjectFamilyOperation {
             if state.is_terminal() && bridged.finished_at_ms.is_none() {
                 bridged.finished_at_ms = Some(self.config.now_ms);
             }
-            let Ok((row_writes, row_deletes)) = index_deltas(&record, &bridged) else {
+            let Ok(bytes) = bridged.to_bytes() else {
                 continue;
             };
-            writes.extend(row_writes);
-            deletes.extend(row_deletes);
+            writes.push((
+                JOB_KEYSPACE.to_string(),
+                job_record_key(bridged.job_id),
+                Value::from(bytes.as_slice()),
+            ));
         }
         (writes, deletes)
     }

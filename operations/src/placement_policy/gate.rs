@@ -482,7 +482,9 @@ mod tests {
         let mut operation = operation(vec![first.policy_ref(), second.policy_ref()], "eu-west");
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&first), 10)));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
         operation.step(cached(&PolicyCacheEntry::verified(&document(&second), 10)));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(

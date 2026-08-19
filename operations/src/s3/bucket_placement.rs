@@ -465,6 +465,7 @@ mod tests {
         refs.sort_by_key(|policy| policy.policy_ref());
         for policy in refs {
             operation.step(cached(policy));
+            operation.step(crate::placement_policy::fixtures::authority(realm_id()));
         }
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),

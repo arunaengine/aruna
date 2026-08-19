@@ -21,7 +21,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::{alias_family, alias_prefix};
 use crate::jobs::records::{
-    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
+    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
 };
 use crate::jobs::service::RoutedJobStatus;
 use crate::jobs::store::iter_prefix_page;
@@ -32,7 +32,10 @@ const MAX_ALIAS_FAMILIES: usize = 8;
 
 /// The request family one accepted alias belongs to. Ordered by key, so two
 /// families claiming one alias resolve identically on every replica.
-pub async fn family_of_alias(context: &DriverContext, job_id: JobId) -> Option<JobFamilyId> {
+pub async fn family_of_alias(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<JobFamilyId>, JobRouteError> {
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
         JOB_FAMILY_ALIAS_KEYSPACE,
@@ -42,16 +45,16 @@ pub async fn family_of_alias(context: &DriverContext, job_id: JobId) -> Option<J
         None,
     )
     .await
-    .ok()?;
-    rows.iter().filter_map(|(key, _)| alias_family(key)).min()
+    .map_err(JobRouteError::Unavailable)?;
+    Ok(rows.iter().filter_map(|(key, _)| alias_family(key)).min())
 }
 
 /// The reduced family of one alias plus the sealed spec of its canonical claim.
 pub async fn family_projection(
     context: &DriverContext,
     job_id: JobId,
-) -> Option<(ProjectedFamily, LogicalJobSpec)> {
-    let projected = drive(
+) -> Result<Option<(ProjectedFamily, LogicalJobSpec)>, JobRouteError> {
+    let projected = match drive(
         ProjectFamilyOperation::new(ProjectFamilyConfig {
             family: FamilyRef::Alias(job_id),
             now_ms: unix_timestamp_millis(),
@@ -60,14 +63,25 @@ pub async fn family_projection(
         context,
     )
     .await
-    .ok()?;
-    let canonical = projected.projection.as_ref()?.canonical_job_id;
+    {
+        Ok(projected) => projected,
+        Err(RecordStoreError::UnknownAlias) => return Ok(None),
+        Err(error) => return Err(JobRouteError::Unavailable(error.to_string())),
+    };
+    let canonical = projected
+        .projection
+        .as_ref()
+        .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?
+        .canonical_job_id;
     let records = load_family(context, projected.family).await;
     let spec = records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Spec(spec) if spec.job_id == canonical => Some(spec.as_ref().clone()),
         _ => None,
-    })?;
-    Some((projected, spec))
+    });
+    Ok(Some((
+        projected,
+        spec.ok_or_else(|| JobRouteError::Unavailable("job family spec unavailable".to_string()))?,
+    )))
 }
 
 /// Answers one status read from the family. `None` means the alias names no
@@ -77,7 +91,11 @@ pub async fn family_status(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Option<Result<RoutedJobStatus, JobRouteError>> {
-    let (projected, spec) = family_projection(context, job_id).await?;
+    let (projected, spec) = match family_projection(context, job_id).await {
+        Ok(Some(projected)) => projected,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
     // Reads stay self-scoped: another submitter's job is absent, never refused.
     if spec.created_by != auth.user_id {
         return Some(Err(JobRouteError::NotFound));
@@ -91,10 +109,17 @@ pub async fn family_status(
 
 /// The node that can serve bytes for this family: the canonical successful
 /// execution's executor, otherwise any execution's, otherwise none.
-pub async fn family_responder(context: &DriverContext, job_id: JobId) -> Option<NodeId> {
-    let (projected, _) = family_projection(context, job_id).await?;
-    let projection = projected.projection?;
-    projection
+pub async fn family_responder(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<NodeId>, JobRouteError> {
+    let Some((projected, _)) = family_projection(context, job_id).await? else {
+        return Ok(None);
+    };
+    let projection = projected
+        .projection
+        .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?;
+    Ok(projection
         .executions
         .iter()
         .find(|execution| execution.role == ExecutionRole::Canonical)
@@ -105,7 +130,7 @@ pub async fn family_responder(context: &DriverContext, job_id: JobId) -> Option<
                 .find(|execution| execution.state == PhysicalExecutionState::Succeeded)
         })
         .or_else(|| projection.executions.first())
-        .map(|execution| execution.executor_node_id)
+        .map(|execution| execution.executor_node_id))
 }
 
 /// The current response shape, rebuilt from immutable records. Extra fields of
@@ -123,6 +148,27 @@ pub(crate) fn status_view(
         ),
         WorkspaceMode::None => None,
     };
+    let terminal = projection
+        .canonical_execution_id
+        .and_then(|execution_id| {
+            projection
+                .executions
+                .iter()
+                .find(|execution| execution.execution_id == execution_id)
+        })
+        .or_else(|| {
+            projection
+                .executions
+                .iter()
+                .filter(|execution| execution.state.is_terminal())
+                .max_by_key(|execution| execution.observed_at_ms)
+        });
+    let updated_at_ms = projection
+        .executions
+        .iter()
+        .filter_map(|execution| execution.observed_at_ms)
+        .max()
+        .unwrap_or(spec.created_at_ms);
     JobStatusView {
         job_id,
         created_by: spec.created_by,
@@ -131,8 +177,11 @@ pub(crate) fn status_view(
         attempts: projection.executions.len() as u32,
         cancel_requested: projection.cancel_requested,
         created_at_ms: spec.created_at_ms,
-        updated_at_ms: spec.created_at_ms,
-        finished_at_ms: None,
+        updated_at_ms,
+        finished_at_ms: local_state(projection.state)
+            .is_terminal()
+            .then(|| terminal.and_then(|execution| execution.observed_at_ms))
+            .flatten(),
         progress: JobProgress::new("phases"),
         last_error: None,
         result: result_view(projection, workspace_bucket.clone()),
@@ -147,14 +196,21 @@ fn result_view(projection: &JobProjection, bucket: Option<String>) -> Option<ser
     if projection.state != LogicalJobState::Succeeded {
         return None;
     }
+    let result = projection.canonical_execution_id.and_then(|execution_id| {
+        projection
+            .executions
+            .iter()
+            .find(|execution| execution.execution_id == execution_id)
+            .and_then(|execution| execution.result.as_ref())
+    });
     Some(
         JobResultPayload::Execution {
-            exit_code: None,
+            exit_code: result.and_then(|result| result.exit_code),
             workspace_bucket: bucket,
             outputs: projection.outputs.as_slice().to_vec(),
             stdout: String::new(),
             stderr: String::new(),
-            output_digest: None,
+            output_digest: result.and_then(|result| result.output_digest),
         }
         .to_public_json(),
     )

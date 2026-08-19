@@ -10,19 +10,22 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-    JOB_FAMILY_RECORD_KEYSPACE,
+    JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
+    JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE,
+    JOB_OWNER_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordKey, LogicalJobSpec,
-    RealmConfigDocument, RealmId, RecordVerdict, SubmissionClaim, SubmissionId,
+    JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
+    RealmConfigDocument, RealmId, RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode,
+    job_owner_index_key, job_record_key,
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 use smallvec::smallvec;
 use tracing::debug;
 
-use super::{LifecycleError, MAX_SUBMISSION_SCAN};
+use super::LifecycleError;
+use super::ids::workspace_of;
 use crate::jobs::records::keys::{alias_key, family_prefix, record_key, submission_prefix};
 use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
@@ -63,8 +66,8 @@ pub struct AdmitSubmissionOperation {
     config: AdmitSubmissionConfig,
     view: Option<FamilyView>,
     claims: Vec<(JobFamilyId, SubmissionClaim)>,
-    cursor: Option<JobRecordKey>,
-    scanned: usize,
+    cursor: Option<Key>,
+    quota_revision: u64,
     cache: Option<ProjectionCache>,
     state: AdmitState,
     outcome: Option<Result<AdmittedSubmission, LifecycleError>>,
@@ -76,6 +79,7 @@ enum AdmitState {
     ReadConfig,
     Begin,
     Scan { txn_id: TxnId },
+    ReadQuota { txn_id: TxnId },
     ReadCache { txn_id: TxnId },
     Write { txn_id: TxnId },
     Commit { txn_id: TxnId },
@@ -91,7 +95,7 @@ impl AdmitSubmissionOperation {
             view: None,
             claims: Vec::new(),
             cursor: None,
-            scanned: 0,
+            quota_revision: 0,
             cache: None,
             state: AdmitState::Init,
             outcome: None,
@@ -108,6 +112,7 @@ impl AdmitSubmissionOperation {
     fn txn(&self) -> Option<TxnId> {
         match self.state {
             AdmitState::Scan { txn_id }
+            | AdmitState::ReadQuota { txn_id }
             | AdmitState::ReadCache { txn_id }
             | AdmitState::Write { txn_id }
             | AdmitState::Commit { txn_id }
@@ -138,33 +143,26 @@ impl AdmitSubmissionOperation {
     }
 
     /// Claims of every request family under this submission, so a replay and an
-    /// idempotency conflict are both decided from the same bounded scan.
+    /// idempotency conflict are both decided from the same transaction scan.
     fn scan(&mut self, txn_id: TxnId) -> Effects {
         self.state = AdmitState::Scan { txn_id };
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: Some(submission_prefix(self.config.submission_id)),
-            start: self.cursor.map(|key| IterStart::After(record_key(&key))),
+            start: self.cursor.clone().map(IterStart::After),
             limit: RECORD_PAGE_SIZE,
             txn_id: Some(txn_id),
         })]
     }
 
-    fn keep_claims(&mut self, values: Vec<(Key, Value)>) -> bool {
-        let full = values.len() >= RECORD_PAGE_SIZE;
-        self.scanned = self.scanned.saturating_add(values.len());
-        for (key, value) in values {
-            if let Ok(record_key) = JobRecordKey::from_bytes(&key) {
-                self.cursor = Some(record_key);
-            }
-            let Ok(envelope) = from_bytes::<JobRecordEnvelope>(&value) else {
-                continue;
-            };
+    fn keep_claims(&mut self, values: Vec<(Key, Value)>) -> Result<(), LifecycleError> {
+        for (_, value) in values {
+            let envelope = from_bytes::<JobRecordEnvelope>(&value)?;
             if let JobFamilyRecord::Claim(claim) = &envelope.record {
                 self.claims.push((envelope.family(), *claim));
             }
         }
-        full && self.scanned < MAX_SUBMISSION_SCAN
+        Ok(())
     }
 
     /// The canonical alias of one family: the smallest claim key, exactly the
@@ -199,6 +197,26 @@ impl AdmitSubmissionOperation {
             self.outcome = Some(Err(LifecycleError::QuotaDenied(denied)));
             return self.cancel(txn_id);
         }
+        self.state = AdmitState::ReadQuota { txn_id };
+        let JobFamilyRecord::Spec(spec) = &self.config.candidate.spec.envelope().record else {
+            self.outcome = Some(Err(LifecycleError::NotHolder));
+            return self.cancel(txn_id);
+        };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key: Key::from(spec.group_id.to_bytes().as_slice()),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn read_cache(&mut self, txn_id: TxnId, value: Option<Value>) -> Effects {
+        self.quota_revision = match value {
+            Some(value) => match from_bytes::<u64>(&value) {
+                Ok(revision) => revision,
+                Err(error) => return self.fail(error.into()),
+            },
+            None => 0,
+        };
         self.state = AdmitState::ReadCache { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
@@ -267,6 +285,22 @@ impl AdmitSubmissionOperation {
             JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
             family_prefix(&self.family()),
             Value::from(to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice()),
+        ));
+        let record = logical_record(sealed);
+        writes.push((
+            JOB_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+            Value::from(record.to_bytes()?.as_slice()),
+        ));
+        writes.push((
+            JOB_OWNER_INDEX_KEYSPACE.to_string(),
+            job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
+            Value::from(Vec::<u8>::new().as_slice()),
+        ));
+        writes.push((
+            JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            Key::from(sealed.group_id.to_bytes().as_slice()),
+            Value::from(to_bytes(&self.quota_revision.saturating_add(1))?.as_slice()),
         ));
         Ok(writes)
     }
@@ -362,14 +396,31 @@ impl Operation for AdmitSubmissionOperation {
                 other => self.unexpected("transaction start", format!("{other:?}")),
             },
             AdmitState::Scan { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    match self.keep_claims(values) {
-                        true => self.scan(txn_id),
-                        false => self.decide(txn_id),
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    if let Err(error) = self.keep_claims(values) {
+                        self.outcome = Some(Err(error));
+                        return self.cancel(txn_id);
+                    }
+                    match next_start_after {
+                        Some(cursor) => {
+                            self.cursor = Some(cursor);
+                            self.scan(txn_id)
+                        }
+                        None => self.decide(txn_id),
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("submission scan", format!("{other:?}")),
+            },
+            AdmitState::ReadQuota { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.read_cache(txn_id, value)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected("quota revision read", format!("{other:?}")),
             },
             AdmitState::ReadCache { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -430,4 +481,27 @@ impl Operation for AdmitSubmissionOperation {
                 | LifecycleError::Store(RecordStoreError::UnknownAlias)
         )
     }
+}
+
+fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
+    let (mode, bucket) = workspace_of(&spec.payload);
+    let mut record = JobRecord::new(
+        spec.job_id,
+        JobPayload::Execution(spec.payload.clone()),
+        spec.created_by,
+        spec.origin_node_id,
+        spec.created_at_ms,
+        spec.created_at_ms,
+        None,
+    );
+    record.retention_ms = spec.retention_ms;
+    record.workspace_mode = mode;
+    record.workspace_bucket = match mode {
+        WorkspaceMode::Existing => bucket,
+        WorkspaceMode::Temporary | WorkspaceMode::Kept => {
+            Some(JobRecord::workspace_bucket_name(spec.job_id))
+        }
+        WorkspaceMode::None => None,
+    };
+    record
 }

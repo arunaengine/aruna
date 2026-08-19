@@ -64,7 +64,16 @@ async fn admits_local_claim() {
 
     assert!(created);
     assert_eq!(job_id, family.job_id);
-    assert_eq!(family_of_alias(&ctx, job_id).await, Some(family.family()));
+    assert_eq!(
+        family_of_alias(&ctx, job_id).await,
+        Ok(Some(family.family()))
+    );
+    let record = crate::jobs::store::read_job_record(&ctx.storage_handle, job_id, None)
+        .await
+        .expect("logical row read")
+        .expect("logical row exists");
+    assert_eq!(record.state, JobState::Queued);
+    assert_eq!(record.retention_ms, family.spec().retention_ms);
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,
         JOB_FAMILY_OUTBOX_KEYSPACE,
@@ -94,7 +103,7 @@ async fn replays_matching_claim() {
     assert_eq!(second, first);
     assert_eq!(
         family_of_alias(&ctx, JobId::from_bytes([4u8; 16])).await,
-        None
+        Ok(None)
     );
 }
 
@@ -117,7 +126,10 @@ async fn reports_key_conflict() {
             existing_job_id: first
         }
     );
-    assert_eq!(family_of_alias(&ctx, first).await, Some(family.family()));
+    assert_eq!(
+        family_of_alias(&ctx, first).await,
+        Ok(Some(family.family()))
+    );
 }
 
 #[tokio::test]

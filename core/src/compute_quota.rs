@@ -92,6 +92,7 @@ pub struct DemandGroup {
 pub struct ComputeDemandSnapshot {
     pub epoch: AdvertisementEpoch,
     pub groups: Vec<DemandGroup>,
+    pub truncated: bool,
 }
 
 impl ComputeDemandSnapshot {
@@ -140,7 +141,10 @@ pub struct ComputeReservationSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobReservationRecord {
     pub execution_id: Ulid,
+    /// Mutable row of this exact physical execution.
     pub job_id: JobId,
+    /// Stable external alias of the logical request family.
+    pub logical_job_id: JobId,
     pub resources: EffectiveResources,
     pub created_at_ms: u64,
     /// Execution site the receipt sealed. The local attempt refuses to start
@@ -172,6 +176,7 @@ pub fn merge_demand<'a>(
     let mut totals = ResourceTotals::default();
     let mut truncated = false;
     for snapshot in snapshots {
+        truncated |= snapshot.truncated;
         let Some(group) = snapshot.group(group_id) else {
             continue;
         };
@@ -375,6 +380,7 @@ mod tests {
     fn snapshot(group_id: GroupId, families: Vec<DemandFamily>) -> ComputeDemandSnapshot {
         ComputeDemandSnapshot {
             epoch: AdvertisementEpoch::default(),
+            truncated: false,
             groups: vec![DemandGroup {
                 group_id,
                 families,
@@ -411,6 +417,9 @@ mod tests {
         let group_id = Ulid::from_bytes([1; 16]);
         let mut snapshot = snapshot(group_id, vec![family(1, 2)]);
         snapshot.groups[0].truncated = true;
+        assert!(merge_demand([&snapshot], &group_id).1);
+        snapshot.groups.clear();
+        snapshot.truncated = true;
         assert!(merge_demand([&snapshot], &group_id).1);
     }
 
@@ -510,6 +519,7 @@ mod tests {
 
         let mut groups = ComputeDemandSnapshot {
             epoch: AdvertisementEpoch::default(),
+            truncated: false,
             groups: vec![
                 DemandGroup {
                     group_id: Ulid::from_bytes([2; 16]),

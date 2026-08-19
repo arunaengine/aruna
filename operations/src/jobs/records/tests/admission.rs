@@ -174,3 +174,33 @@ fn keeps_local_record() {
     assert!(!plan.admitted[0].authentic);
     assert!(relayable(&plan, family.target.public()).is_empty());
 }
+
+#[test]
+fn waits_for_predecessor() {
+    // A later execution update cannot become durable authority before sequence zero.
+    let family = Family::new([7u8; 32]);
+    let view = family.view();
+    let spec = family.spec();
+    let launch = family.launch(&spec, family.holder.public(), 0);
+    let receipt = family.receipt(&launch, 1);
+    let records = stored(&[family.sign(
+        &family.target,
+        JobFamilyRecord::Receipt(Box::new(receipt.clone())),
+    )]);
+    let update = family.update(
+        &receipt,
+        1,
+        [9u8; 32],
+        aruna_core::structs::PhysicalExecutionState::Running,
+        None,
+    );
+    let candidate = family.sign(&family.target, JobFamilyRecord::Update(Box::new(update)));
+
+    let (admission, plan) = plan_append(&state(Some(&view), &records), &[], candidate, None);
+
+    assert_eq!(
+        admission,
+        Admission::Pending(PendingNeed::Evidence(JobRecordKind::Update))
+    );
+    assert!(plan.admitted.is_empty());
+}

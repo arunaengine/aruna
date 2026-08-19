@@ -47,12 +47,15 @@ pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 /// advertised subject and the policies this node has already resolved.
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE};
     use aruna_core::structs::{
-        NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject, RealmId, VerifiedPolicy,
+        NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyDocument, PlacementSubject,
+        PolicyPublicationClaim, RealmConfigDocument, RealmId, RealmNodeKind, VerifiedPolicy,
     };
-    use aruna_core::types::NodeId;
+    use aruna_core::types::{Key, NodeId, UserId};
     use std::collections::BTreeMap;
 
     use super::cache::{PolicyCacheEntry, cache_key};
@@ -70,12 +73,54 @@ pub(crate) mod fixtures {
         }
     }
 
+    pub fn authority(realm_id: RealmId) -> Event {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.seed_default_placement();
+        for seed in [1, 9] {
+            config.ensure_node(
+                iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+                RealmNodeKind::Server,
+            );
+        }
+        let (config_value, auth_value) = realm_view(&config, admin_user(realm_id));
+        let key: Key = Vec::new().into();
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(key.clone(), Some(config_value)), (key, Some(auth_value))],
+        })
+    }
+
     pub async fn seed_gate(
         context: &DriverContext,
         realm_id: RealmId,
+        user_id: UserId,
         subject: PlacementSubject,
         policies: &[VerifiedPolicy],
     ) {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.seed_default_placement();
+        config.ensure_node(subject.node_id, RealmNodeKind::Server);
+        config.ensure_node(
+            iroh::SecretKey::from_bytes(&[9; 32]).public(),
+            RealmNodeKind::Server,
+        );
+        let (config_value, auth_value) = realm_view(&config, user_id);
+        for (target, value) in [
+            (DocumentSyncTarget::RealmConfig { realm_id }, config_value),
+            (
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                auth_value,
+            ),
+        ] {
+            let _ = context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: target.storage_keyspace().to_string(),
+                    key: target.storage_key(),
+                    value,
+                    txn_id: None,
+                })
+                .await;
+        }
         let record = NodeSubjectRecord::seed(subject).expect("subject is valid");
         let _ = context
             .storage_handle
@@ -87,7 +132,25 @@ pub(crate) mod fixtures {
             })
             .await;
         for policy in policies {
-            let entry = PolicyCacheEntry::verified(&signed_document(realm_id, policy, 9), 0);
+            let publisher = record.subject.node_id;
+            let publication = PolicyPublicationClaim::new(
+                realm_id,
+                policy,
+                publisher,
+                user_id,
+                ulid::Ulid::from_bytes([5u8; 16]),
+                7,
+                [0u8; 32],
+            )
+            .signed_with(|message| {
+                context
+                    .net_handle
+                    .as_ref()
+                    .expect("fixture has a net handle")
+                    .sign(message)
+            });
+            let document = PlacementPolicyDocument::new(realm_id, policy, publication);
+            let entry = PolicyCacheEntry::verified(&document, 0);
             let _ = context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {

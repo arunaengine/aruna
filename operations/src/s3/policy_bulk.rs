@@ -1028,6 +1028,7 @@ mod tests {
         seed_gate(
             &context,
             realm_id,
+            fixture.user_id,
             subject(fixture.node_id, "eu-west"),
             &[policy(fixture.node_id)],
         )
@@ -1390,6 +1391,7 @@ mod tests {
         seed_gate(
             &context,
             fixture.realm_id,
+            fixture.user_id,
             subject(fixture.node_id, "eu-west"),
             std::slice::from_ref(&unknown),
         )
@@ -1654,6 +1656,7 @@ mod tests {
         seed_gate(
             &context,
             fixture.realm_id,
+            fixture.user_id,
             subject(fixture.node_id, "eu-west"),
             std::slice::from_ref(&second),
         )

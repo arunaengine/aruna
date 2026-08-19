@@ -78,6 +78,8 @@ pub fn reduce_family(
         let state = chain
             .last()
             .map_or(PhysicalExecutionState::Accepted, |update| update.state);
+        let observed_at_ms = chain.last().map(|update| update.observed_at_ms);
+        let result = chain.last().and_then(|update| update.result.clone());
         if !state.is_terminal() {
             active = true;
         }
@@ -92,6 +94,8 @@ pub fn reduce_family(
             executor_node_id: receipt.executor_node_id,
             state,
             role: ExecutionRole::Redundant,
+            observed_at_ms,
+            result,
         });
     }
 

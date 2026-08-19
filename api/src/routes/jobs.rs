@@ -1685,6 +1685,7 @@ mod tests {
                 group_id: payload.group_id,
                 created_by,
                 created_at_ms: 10,
+                retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
                 payload,
                 request_digest: [7u8; 32],
                 spec_digest: [8u8; 32],
@@ -1711,6 +1712,7 @@ mod tests {
             conflicts: 1,
             state: LogicalJobState::Indeterminate,
             canonical_execution_id: None,
+            canonical_result: None,
             executions: 2,
             duplicate_successes: 1,
             outputs: vec![OutputObject {

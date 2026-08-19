@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use aruna_compute::ExecutorRegistry;
-use aruna_core::compute::{ExecutorCapability, ExecutorKind, ResourceEnvelope};
+use aruna_core::compute::{ExecutorCapability, ExecutorKind, NetworkAccess, ResourceEnvelope};
 use aruna_core::effects::{
     Effect, HolderList, JobRecordEffect, JobRecordFrame, LaunchFrame, MAX_JOB_RECORD_HOLDERS,
     NetEffect, PageLimit, ReceiptFrame,
@@ -18,10 +18,10 @@ use aruna_core::effects::{
 use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, NetEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobPayload, JobRecord,
-    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, Permission, PlacementDecision,
-    PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument,
-    blob_group_permission_path, evaluate_placement,
+    AuthContext, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
+    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, OutputDestination, Permission,
+    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument,
+    RealmNodeKind, WorkspaceMode, blob_group_permission_path, evaluate_placement,
 };
 use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
@@ -32,20 +32,23 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
-use super::ids::workspace_of;
+use super::ids::{self, workspace_of};
+use super::plan::{network_access, staging_mode, version_hash};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use super::witness::load_family;
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::store::insert_job;
+use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
 use crate::node_info::read_node_info_document;
 use crate::placement::resolve_shard_holders;
 use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::request_authorization::authorize;
 use crate::request_policy::PolicyRequestExtras;
+use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
+use aruna_core::structs::checksum::HASH_BLAKE3;
 
 /// Wall-clock budget of the record fetch that pulls a missing sealed spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -94,12 +97,11 @@ pub async fn admit_launch(
     if cancelled(family, &records) {
         return Some(Err(LaunchDecline::Cancelled));
     }
-    let Some(capability) = local_capability(context.as_ref(), local, &intent).await else {
-        return Some(Err(LaunchDecline::Draining));
+    let capability = match local_capability(context.as_ref(), &config, local, &intent, &spec).await
+    {
+        Ok(capability) => capability,
+        Err(decline) => return Some(Err(decline)),
     };
-    if capability.policy_draining {
-        return Some(Err(LaunchDecline::Draining));
-    }
     match gate_context(context.as_ref(), realm_id, now_ms()).await {
         Err(GateContextError::AdmissionStopped) => return Some(Err(LaunchDecline::Draining)),
         Err(GateContextError::Routing(_)) => return None,
@@ -108,11 +110,15 @@ pub async fn admit_launch(
     if let Err(decline) = authorize_submitter(context.as_ref(), &spec, local).await {
         return Some(Err(decline));
     }
-    if let Some(decision) = placement_verdict(context.as_ref(), &spec, &capability.subject).await {
-        return Some(Err(match DeclinedPolicy::new(decision) {
-            Ok(policy) => LaunchDecline::Policy(policy),
-            Err(_) => LaunchDecline::Unauthorized,
-        }));
+    match placement_verdict(context.as_ref(), &spec, &intent, &capability.subject).await {
+        Ok(Some(decision)) => {
+            return Some(Err(match DeclinedPolicy::new(decision) {
+                Ok(policy) => LaunchDecline::Policy(policy),
+                Err(_) => LaunchDecline::Unauthorized,
+            }));
+        }
+        Ok(None) => {}
+        Err(decline) => return Some(Err(decline)),
     }
     let limits = match backend_limits(context.as_ref(), &intent) {
         Some(limits) => limits,
@@ -155,6 +161,21 @@ async fn reserve_and_run(
 ) -> Result<ReceiptFrame, LaunchDecline> {
     let now = unix_timestamp_millis();
     let execution_id = Ulid::generate();
+    let physical_job_id = mint_local_job(
+        context.as_ref(),
+        round.realm_id,
+        round.local,
+        Some(&execution_id.to_bytes()),
+    )
+    .await
+    .map_err(|_| LaunchDecline::Draining)?;
+    let record = materialize_local(
+        &round.spec,
+        &round.intent,
+        physical_job_id,
+        round.local,
+        now,
+    )?;
     let membership_generation = read_node_info_document(&context.storage_handle, round.local)
         .await
         .ok()
@@ -199,11 +220,13 @@ async fn reserve_and_run(
             envelope: round.limits,
             receipt: frame,
             launch: Box::new(round.intent.clone()),
-            job_id: round.spec.job_id,
+            job_id: physical_job_id,
+            logical_job_id: round.spec.job_id,
             execution_id,
             resources: round.spec.resources,
             subject_generation: sealed_subject.0,
             subject_digest: sealed_subject.1,
+            record: Box::new(record),
             now_ms: now,
         }),
         context.as_ref(),
@@ -219,46 +242,65 @@ async fn reserve_and_run(
     }
     info!(
         job_id = %round.spec.job_id,
+        physical_job_id = %physical_job_id,
         execution_id = %execution_id,
         executor_kind = %round.intent.target.executor_kind,
         subject_generation = sealed_subject.0,
         "Target admitted a launch and sealed its receipt"
     );
     super::outbox::kick(context.as_ref()).await;
-    materialize_local(context.as_ref(), &round.spec, round.local, now).await;
+    schedule_local(context.as_ref()).await;
     ReceiptFrame::new(envelope).map_err(|_| LaunchDecline::Unauthorized)
 }
 
-/// Writes the local execution row post-receipt, so the existing drain claims
-/// and runs the sealed plan exactly like a locally submitted execution.
-async fn materialize_local(
-    context: &DriverContext,
+fn materialize_local(
     spec: &LogicalJobSpec,
+    intent: &LaunchIntent,
+    job_id: aruna_core::structs::JobId,
     local: NodeId,
     now_ms: u64,
-) {
+) -> Result<JobRecord, LaunchDecline> {
+    let mut payload = spec.payload.clone();
+    for input in &mut payload.inputs {
+        let Some(pin) = intent
+            .inputs
+            .iter()
+            .find(|pin| pin.destination_key == input.dest_key)
+        else {
+            return Err(LaunchDecline::Unauthorized);
+        };
+        let InputSource::S3 { version_id, .. } = &mut input.source;
+        *version_id = Some(pin.version_id.to_string());
+    }
+    payload.resources.cpu_cores = Some(spec.resources.cpu_cores);
+    payload.resources.ram_bytes = Some(spec.resources.ram_bytes);
+    payload.resources.disk_bytes = Some(spec.resources.disk_bytes);
+    payload.resources.max_walltime_ms = Some(spec.resources.max_walltime_ms);
+    payload.resources.preemptible = spec.resources.preemptible;
+    payload.executor_constraint = Some(intent.target.executor_kind.clone());
     let (mode, bucket) = workspace_of(&spec.payload);
     let mut record = JobRecord::new(
-        spec.job_id,
-        JobPayload::Execution(spec.payload.clone()),
+        job_id,
+        JobPayload::Execution(payload),
         spec.created_by,
         local,
         now_ms,
         now_ms,
         None,
     );
+    record.retention_ms = spec.retention_ms;
     record.workspace_mode = mode;
     record.workspace_bucket = match mode {
-        aruna_core::structs::WorkspaceMode::Existing => bucket,
-        aruna_core::structs::WorkspaceMode::Temporary
-        | aruna_core::structs::WorkspaceMode::Kept => {
+        WorkspaceMode::Existing => bucket,
+        WorkspaceMode::Temporary | WorkspaceMode::Kept => {
             Some(JobRecord::workspace_bucket_name(spec.job_id))
         }
-        aruna_core::structs::WorkspaceMode::None => None,
+        WorkspaceMode::None => None,
     };
-    if let Err(error) = insert_job(&context.storage_handle, &record).await {
-        warn!(job_id = %spec.job_id, error = %error, "Receipted execution row could not be written");
-    }
+    Ok(record)
+}
+
+async fn schedule_local(context: &DriverContext) {
     if let Some(task) = context.task_handle.as_ref() {
         use aruna_core::handle::Handle;
         let _ = task
@@ -306,21 +348,75 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
 /// This node's own advertisement for the offered executor kind.
 async fn local_capability(
     context: &DriverContext,
+    config: &RealmConfigDocument,
     local: NodeId,
     intent: &LaunchIntent,
-) -> Option<ExecutorCapability> {
+    spec: &LogicalJobSpec,
+) -> Result<ExecutorCapability, LaunchDecline> {
     let document = read_node_info_document(&context.storage_handle, local)
         .await
-        .ok()
-        .flatten()?;
-    if document.leaving || document.compute_draining {
-        return None;
+        .map_err(|_| LaunchDecline::Draining)?
+        .ok_or(LaunchDecline::Draining)?;
+    if !config
+        .sync_eligible_node_ids()
+        .is_ok_and(|members| members.contains(&local))
+    {
+        return Err(LaunchDecline::Unauthorized);
     }
-    document
+    let kind = config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == local.to_string())
+        .map(|node| &node.kind)
+        .ok_or(LaunchDecline::Unauthorized)?;
+    if matches!(kind, RealmNodeKind::Local | RealmNodeKind::User) {
+        return Err(LaunchDecline::Unauthorized);
+    }
+    if document.leaving
+        || document.compute_draining
+        || config
+            .placement_entry(local)
+            .is_some_and(|entry| entry.draining)
+    {
+        return Err(LaunchDecline::Draining);
+    }
+    let capability = document
         .executors
         .iter()
         .find(|capability| capability.kind == intent.target.executor_kind)
         .cloned()
+        .ok_or(LaunchDecline::Unauthorized)?;
+    if capability.policy_draining {
+        return Err(LaunchDecline::Draining);
+    }
+    if capability.validate(local).is_err()
+        || spec
+            .payload
+            .executor_constraint
+            .as_deref()
+            .is_some_and(|kind| kind.trim() != capability.kind.trim())
+        || !capability.supports(staging_mode(spec))
+        || !capability.limits.fits(&spec.resources)
+    {
+        return Err(LaunchDecline::Unauthorized);
+    }
+    let labels = ids::required_labels(&spec.payload).map_err(|_| LaunchDecline::Unauthorized)?;
+    if !labels.iter().all(|label| {
+        capability
+            .subject
+            .labels
+            .get(label.key.trim())
+            .map(|value| value.trim())
+            == Some(label.value.trim())
+    }) {
+        return Err(LaunchDecline::Unauthorized);
+    }
+    let protected = !intent.output_policies.is_empty()
+        || intent.inputs.iter().any(|input| !input.policies.is_empty());
+    if protected && network_access(spec) == NetworkAccess::Open && !capability.network_policy {
+        return Err(LaunchDecline::Unauthorized);
+    }
+    Ok(capability)
 }
 
 fn backend_limits(context: &DriverContext, intent: &LaunchIntent) -> Option<ResourceEnvelope> {
@@ -359,29 +455,76 @@ async fn authorize_submitter(
 async fn placement_verdict(
     context: &DriverContext,
     spec: &LogicalJobSpec,
+    intent: &LaunchIntent,
     subject: &PlacementSubject,
-) -> Option<PlacementDecision> {
-    let mut refs: Vec<PlacementPolicyRef> = Vec::new();
+) -> Result<Option<PlacementDecision>, LaunchDecline> {
+    if intent.inputs.len() != spec.payload.inputs.len() {
+        return Err(LaunchDecline::Unauthorized);
+    }
+    let mut inputs: Vec<Vec<PlacementPolicyRef>> = Vec::new();
     for input in &spec.payload.inputs {
-        let aruna_core::structs::InputSource::S3 { bucket, key, .. } = &input.source;
+        let InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } = &input.source;
+        let pin = intent
+            .inputs
+            .iter()
+            .find(|pin| pin.destination_key == input.dest_key)
+            .ok_or(LaunchDecline::Unauthorized)?;
+        let requested = version_id
+            .as_deref()
+            .map(Ulid::from_string)
+            .transpose()
+            .map_err(|_| LaunchDecline::Unauthorized)?;
+        if requested.is_some_and(|requested| requested != pin.version_id) {
+            return Err(LaunchDecline::Unauthorized);
+        }
         let head = drive(
             HeadObjectOperation::new(HeadObjectInput {
                 bucket: bucket.clone(),
                 key: key.clone(),
-                version_id: None,
+                version_id: Some(pin.version_id),
             }),
             context,
         )
-        .await;
-        if let Ok(Some(Ok(head))) = head {
-            refs.extend(head.source_policies);
+        .await
+        .map_err(|_| LaunchDecline::Draining)?
+        .transpose()
+        .map_err(|_| LaunchDecline::Draining)?
+        .ok_or(LaunchDecline::Draining)?;
+        let version = head.resolved_version_id.or(head.version_id);
+        let hash = head
+            .location
+            .as_ref()
+            .and_then(|location| location.hashes.get(HASH_BLAKE3))
+            .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
+        let hash = match hash {
+            Some(hash) => hash,
+            None => version_hash(context, bucket, key, pin.version_id)
+                .await
+                .ok_or(LaunchDecline::Draining)?,
+        };
+        let mut policies = head.source_policies;
+        policies.sort_unstable();
+        policies.dedup();
+        if version != Some(pin.version_id) || hash != pin.blake3 || policies != pin.policies {
+            return Err(LaunchDecline::Unauthorized);
         }
+        inputs.push(policies);
     }
+    let mut output_policies = inputs.iter().flatten().copied().collect::<Vec<_>>();
+    output_policies.extend(current_destinations(context, spec).await?);
+    output_policies.sort_unstable();
+    output_policies.dedup();
+    if output_policies != intent.output_policies {
+        return Err(LaunchDecline::Unauthorized);
+    }
+    let mut refs = output_policies.clone();
+    refs.extend(inputs.iter().flatten().copied());
     refs.sort_unstable();
     refs.dedup();
-    if refs.is_empty() {
-        return None;
-    }
     let mut policies: BTreeMap<Ulid, PolicyResolution> = BTreeMap::new();
     for policy_ref in &refs {
         let resolution = drive(
@@ -402,10 +545,43 @@ async fn placement_verdict(
             },
         );
     }
-    match evaluate_placement(&refs, &policies, subject) {
-        PlacementDecision::Allowed => None,
-        decision => Some(decision),
+    for policy_set in
+        std::iter::once(output_policies.as_slice()).chain(inputs.iter().map(Vec::as_slice))
+    {
+        match evaluate_placement(policy_set, &policies, subject) {
+            PlacementDecision::Allowed => {}
+            decision => return Ok(Some(decision)),
+        }
     }
+    Ok(None)
+}
+
+async fn current_destinations(
+    context: &DriverContext,
+    spec: &LogicalJobSpec,
+) -> Result<Vec<PlacementPolicyRef>, LaunchDecline> {
+    let mut buckets = std::collections::BTreeSet::new();
+    for output in &spec.payload.file_outputs {
+        let OutputDestination::S3 { bucket, .. } = &output.destination;
+        buckets.insert(bucket.clone());
+    }
+    let (mode, workspace) = workspace_of(&spec.payload);
+    if mode == WorkspaceMode::Existing
+        && let Some(bucket) = workspace
+    {
+        buckets.insert(bucket);
+    }
+    let mut policies = Vec::new();
+    for bucket in buckets {
+        let info = drive(GetBucketInfoOperation::new(bucket), context)
+            .await
+            .map_err(|_| LaunchDecline::Draining)?
+            .transpose()
+            .map_err(|_| LaunchDecline::Draining)?
+            .ok_or(LaunchDecline::Draining)?;
+        policies.extend(info.placement_policies);
+    }
+    Ok(policies)
 }
 
 async fn append_record(
@@ -417,7 +593,7 @@ async fn append_record(
     let Ok(frame) = JobRecordFrame::new(envelope) else {
         return false;
     };
-    drive(
+    match drive(
         AppendRecordOperation::new(AppendRecordConfig {
             realm_id,
             local_node_id: local,
@@ -429,7 +605,13 @@ async fn append_record(
         context.as_ref(),
     )
     .await
-    .is_ok()
+    {
+        Ok(outcome) => matches!(
+            outcome.admission,
+            Admission::Authentic | Admission::Duplicate
+        ),
+        Err(_) => false,
+    }
 }
 
 /// Pulls one bounded page of the family from its holders, so a target that has
@@ -534,5 +716,70 @@ impl Operation for FetchFamilyOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::scheduling::PlannedInput;
+    use aruna_core::structs::{InputMode, InputSelection, JobId};
+
+    use super::*;
+    use crate::jobs::records::tests::fixture::Family;
+
+    #[test]
+    fn materializes_sealed_facts() {
+        // The physical row must execute the exact input, resources, backend, and retention sealed.
+        let family = Family::new([8u8; 32]);
+        let mut spec = family.spec();
+        spec.payload.inputs.push(InputSelection {
+            source: InputSource::S3 {
+                bucket: "source".to_string(),
+                key: "reads.fastq".to_string(),
+                version_id: None,
+            },
+            dest_key: "reads.fastq".to_string(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        });
+        let mut launch = family.launch(&spec, family.holder.public(), 0);
+        let version_id = Ulid::from_bytes([11u8; 16]);
+        launch.inputs.push(PlannedInput {
+            destination_key: "reads.fastq".to_string(),
+            version_id,
+            blake3: [12u8; 32],
+            bytes: 3,
+            policies: Vec::new(),
+            source_node_id: None,
+            transfer_ms: 0,
+            known_link: true,
+        });
+
+        let record = materialize_local(
+            &spec,
+            &launch,
+            JobId::from_bytes([10u8; 16]),
+            family.target.public(),
+            4_000,
+        )
+        .expect("launch materializes");
+        let JobPayload::Execution(payload) = record.payload else {
+            panic!("expected execution payload");
+        };
+        let InputSource::S3 {
+            version_id: pinned, ..
+        } = &payload.inputs[0].source;
+        let expected_version = version_id.to_string();
+        assert_eq!(pinned.as_deref(), Some(expected_version.as_str()));
+        assert_eq!(payload.resources.cpu_cores, Some(spec.resources.cpu_cores));
+        assert_eq!(payload.resources.ram_bytes, Some(spec.resources.ram_bytes));
+        assert_eq!(
+            payload.resources.disk_bytes,
+            Some(spec.resources.disk_bytes)
+        );
+        assert_eq!(payload.executor_constraint, Some("docker".to_string()));
+        assert_eq!(record.retention_ms, spec.retention_ms);
     }
 }

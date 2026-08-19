@@ -13,7 +13,7 @@ use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
 use crate::structs::{
     AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentIdSpec,
-    PlacementRef, RealmId, StagingStrategy,
+    PlacementPolicyRef, PlacementRef, RealmId, StagingStrategy,
 };
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
@@ -1784,6 +1784,7 @@ pub struct LogicalJobSpec {
     pub request_digest: [u8; 32],
     pub spec_digest: [u8; 32],
     pub resources: EffectiveResources,
+    pub retention_ms: u64,
     pub retry: JobRetryPolicy,
     pub admission: JobAdmissionRecord,
     /// Family placement derived from `submission_id`, never from the alias bucket.
@@ -1892,6 +1893,8 @@ pub struct LaunchIntent {
     /// Audit and ranking evidence; it never proves historical holder authority.
     pub holder_generation: u64,
     pub target: ExecutionTargetId,
+    pub inputs: Vec<crate::scheduling::PlannedInput>,
+    pub output_policies: Vec<PlacementPolicyRef>,
     pub plan_digest: [u8; 32],
     pub spec_digest: [u8; 32],
     pub created_at_ms: u64,
@@ -2531,6 +2534,7 @@ pub struct JobRecordContext<'a> {
     pub budget: Option<&'a WitnessBudgetRecord>,
     pub launch: Option<&'a LaunchIntent>,
     pub receipt: Option<&'a ExecutionReceipt>,
+    pub previous_update: Option<&'a ExecutionUpdate>,
     pub local: Option<&'a LocalExecution>,
 }
 
@@ -2547,6 +2551,7 @@ impl<'a> JobRecordContext<'a> {
             budget: None,
             launch: None,
             receipt: None,
+            previous_update: None,
             local: None,
         }
     }
@@ -2807,15 +2812,25 @@ impl JobRecordEnvelope {
         let Some(receipt) = context.receipt else {
             return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Receipt));
         };
-        // Sequence zero roots the chain at the receipt, which seals the target's
-        // membership and subject generations; later links chain by digest.
-        let rooted = update.sequence > 0 || update.previous_digest == receipt.digest()?;
-        match update.execution_id == receipt.execution_id
-            && update.executor_node_id == receipt.executor_node_id
-            && rooted
+        if update.execution_id != receipt.execution_id
+            || update.executor_node_id != receipt.executor_node_id
         {
-            true => Ok(RecordVerdict::Authentic),
-            false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt)),
+            return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt));
+        }
+        match update.sequence {
+            0 if update.previous_digest == receipt.digest()? => Ok(RecordVerdict::Authentic),
+            0 => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt)),
+            sequence => match context.previous_update {
+                None => Ok(RecordVerdict::MissingEvidence(JobRecordKind::Update)),
+                Some(previous)
+                    if previous.execution_id == update.execution_id
+                        && previous.sequence == sequence - 1
+                        && previous.digest()? == update.previous_digest =>
+                {
+                    Ok(RecordVerdict::Authentic)
+                }
+                Some(_) => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Update)),
+            },
         }
     }
 
@@ -2985,6 +3000,8 @@ pub struct ProjectedExecution {
     pub executor_node_id: NodeId,
     pub state: PhysicalExecutionState,
     pub role: ExecutionRole,
+    pub observed_at_ms: Option<u64>,
+    pub result: Option<PhysicalExecutionResult>,
 }
 
 /// Deterministic reduction of one request family. It is derived from immutable
@@ -3563,6 +3580,7 @@ mod tests {
             group_id: Ulid::from_bytes([7u8; 16]),
             created_by: user(8, 2),
             created_at_ms: 1_700_000_000_000,
+            retention_ms: DEFAULT_JOB_RETENTION_MS,
             payload: ExecutionSpec {
                 group_id: Ulid::from_bytes([7u8; 16]),
                 name: None,
@@ -3630,6 +3648,8 @@ mod tests {
             witness_placement: placement(),
             holder_generation: 11,
             target: target(),
+            inputs: Vec::new(),
+            output_policies: Vec::new(),
             plan_digest: [12u8; 32],
             spec_digest: spec_digest(),
             created_at_ms: 1_700_000_000_000,
@@ -3724,6 +3744,12 @@ mod tests {
                 executor_node_id: node_id(9),
                 state: PhysicalExecutionState::Succeeded,
                 role: ExecutionRole::Canonical,
+                observed_at_ms: Some(1_700_000_001_000),
+                result: Some(PhysicalExecutionResult {
+                    exit_code: Some(0),
+                    output_digest: Some([16u8; 32]),
+                    message: None,
+                }),
             }],
             outputs: OutputSet::canonical(vec![sample_output()]).expect("canonical outputs"),
             cancel_requested: false,
@@ -3776,16 +3802,16 @@ mod tests {
             digests,
             [
                 "6574d19e7b5a36c99e21fbd21b129e3ca457ba55474809f7c7ac5b7dd7544c6d",
-                "551b48534d452eae653137159ca4c8f3514d763a6189e72641d87c95b7fbe65c",
+                "f5a4aa462e41daa9d02c1d52332dea2622e34bf1615ee00d963231171239b7ca",
                 "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
-                "6b75f1a8a153c42e3bbf5c312091e54a624f71f16824bc11d0a43b028c5a0255",
-                "e8d31f6e84d50a99569c384eee9d85ec285b61760ac17f3eb9e800f75f992d0d",
-                "1fe5e3557fa18cf3768780374c4b6db60d1fa4f095bd6df2b9845ef46ee0d997",
-                "3b3ad4c422586915c1c969fef1cbc79d454ee8e98d5c71cb8fb3d585e9e91be4",
-                "168955b25fab893b9adeca11c3a5ae1f3b32e8ae1f96933dd44eeaffe9b1b545",
-                "228d051ff582fdc9a422197fc788a239552e10876ee5b17e0fa2085279929b6b",
-                "6e3f11e167e81b8f84fa1923fc41ebf594288041104ff55ae953f5c1576c6311",
-                "9739d83be3ed5c46b18de67ae1a0fea04ce4e05218882b2ffa675ceab4151eb9",
+                "1179ae7aa095437c8e423dafec06b766e393d20eb294e17d8ced40b4acc01258",
+                "d817501141f3a64cb3d6106b207368122ef2f6fbf48762f7d56876a757910aab",
+                "8ed5a1d9603df92b66d56e0fe8660eb891be06961ce6a69da913b913651091c6",
+                "52bb4f72f8434c170fabebf20f462af3a3bd9ac7ee887a2911cab18261a2451d",
+                "ae3c0df5824a69b067256bb4a3c8aea720f76a51c4adcc449e9349f454776dc4",
+                "eefb4bd7c589f63396401be6699cfee72e9bfaa4db6ca04086d09419911d0498",
+                "b8139069d6bd0d8740708a4c789c49bb464b2928c59f4eeb2d9ed07a53ab4a55",
+                "ccf917fadca6ca2bf8c6ccec353cf7c59504a2176f1831ec00f1efe78491d0c3",
             ]
         );
         assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);

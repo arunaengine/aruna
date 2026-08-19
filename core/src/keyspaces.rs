@@ -165,6 +165,7 @@ pub const JOB_FAMILY_OUTBOX_KEYSPACE: &str = "job_family_outbox";
 /// Exact local capacity held for one accepted execution, keyed by ExecutionId.
 /// The row is written with the signed receipt and released at terminal state.
 pub const JOB_RESERVATION_KEYSPACE: &str = "job_reservations";
+pub const JOB_ADMISSION_QUOTA_KEYSPACE: &str = "job_admission_quota";
 /// Persisted witness fallback deadlines, keyed by due time and family, so a
 /// later-ranked witness still plans after a restart.
 pub const JOB_WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";

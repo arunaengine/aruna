@@ -14,7 +14,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 /// Maximum inputs one plan pins.
-pub const MAX_PLAN_INPUTS: usize = 64;
+pub const MAX_PLAN_INPUTS: usize = 512;
 /// Maximum registered holders considered per input.
 pub const MAX_INPUT_HOLDERS: usize = 32;
 /// Maximum advertised targets one plan ranks.
