@@ -25,11 +25,12 @@ jobs:
   instrumented:
     name: Instrumented tests
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget. Tests use libtest's default
-    # parallelism; the large restart profiles run in the stress job below.
+    # Hang cap, not a performance budget. Instrumented multi-node tests use two
+    # threads to avoid runner oversubscription; large restart profiles run below.
     timeout-minutes: 90
     env:
       LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
+      RUST_TEST_THREADS: 2
 
     steps:
       - name: Check out repository
