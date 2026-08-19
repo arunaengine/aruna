@@ -3034,22 +3034,6 @@ mod tests {
         effects
     }
 
-    /// A same-generation compare records both claimants before the head moves,
-    /// so the contender evidence write is drained first.
-    fn drain_contenders(
-        op: &mut IncomingVersionReplicationOperation,
-        effects: aruna_core::types::Effects,
-    ) -> aruna_core::types::Effects {
-        match effects.as_slice() {
-            [Effect::Storage(StorageEffect::BatchWrite { .. })] => {
-                op.step(Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: vec![],
-                }))
-            }
-            _ => effects,
-        }
-    }
-
     /// The apply transaction's drift re-check answered with an absent bucket
     /// and an absent subject, which an ungoverned replica passes.
     fn no_drift() -> Event {
@@ -4126,8 +4110,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-        let effects = drain_contenders(&mut op, effects);
-
         assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
@@ -4221,8 +4203,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-        let effects = drain_contenders(&mut op, effects);
-
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected blob version write")
         };
@@ -4381,8 +4361,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-        let effects = drain_contenders(&mut op, effects);
-
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::ReadCurrentVersion
@@ -4449,7 +4427,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-        let effects = drain_contenders(&mut op, effects);
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::ReadCurrentVersion
@@ -4476,7 +4453,8 @@ mod tests {
     }
 
     #[test]
-    fn same_generation_higher_ulid_overwrites_current_pointer() {
+    fn higher_ulid_skips() {
+        // A same-generation incoming version cannot replace the node-local head.
         let existing_version_id = Ulid::from_bytes([1u8; 16]);
         let incoming_version_id = Ulid::from_bytes([9u8; 16]);
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
@@ -4486,7 +4464,7 @@ mod tests {
             Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
-            manifest.clone(),
+            manifest,
         );
         start_apply_transaction(&mut op);
         let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
@@ -4495,46 +4473,12 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-        let effects = drain_contenders(&mut op, effects);
-
-        assert_eq!(
-            op.state,
-            IncomingVersionReplicationState::ReadCurrentVersion
-        );
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
                 if key_space == BLOB_VERSIONS_KEYSPACE
         ));
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: Some(
-                BlobVersion::materialized(
-                    [2u8; 32],
-                    BackendRef::node_default(),
-                    SystemTime::now(),
-                    test_user_id(),
-                    None,
-                )
-                .to_bytes()
-                .unwrap()
-                .into(),
-            ),
-        }));
-
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, value, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected blob head write")
-        };
-        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
-        assert_eq!(
-            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
-            CurrentVersionPointer::new_with_generation(incoming_version_id, 7)
-        );
     }
 
     #[test]
@@ -4557,8 +4501,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-        let effects = drain_contenders(&mut op, effects);
-
         assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
