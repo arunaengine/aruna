@@ -7,17 +7,16 @@ use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
-    AUTH_KEYSPACE, BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE,
-    BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BUCKET_STATS_DB, COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
-    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-    GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
-    JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
-    JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
-    JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE,
+    CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE,
+    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE,
+    JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
+    JOB_FAMILY_RECORD_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE,
+    JOB_RESERVATION_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
     PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
@@ -29,13 +28,12 @@ use aruna_core::storage_format::{STORAGE_FORMAT_KEY, StorageFormatMarker};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
-    HeadContenderKey, JobFamilyId, JobRecordEnvelope, JobRecordKey, ManagedCopyKey,
-    ManagedCopyRecord, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, NodeSubjectRecord,
-    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
-    PlacementPolicyDocument, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkRun,
-    PolicyMutationRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
-    VersionKey,
+    JobFamilyId, JobRecordEnvelope, JobRecordKey, ManagedCopyKey, ManagedCopyRecord,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+    MultipartUploadPart, MultipartUploadPartKey, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
+    POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PlacementPolicyDocument, PolicyBulkIntent,
+    PolicyBulkIntentKey, PolicyBulkRun, PolicyMutationRecord, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
@@ -179,8 +177,6 @@ enum DecodedField {
     VersionKey { value: VersionKey },
     #[serde(rename = "managed_copy_key")]
     ManagedCopyKey { value: ManagedCopyKey },
-    #[serde(rename = "head_contender_key")]
-    HeadContenderKey { value: HeadContenderKey },
     #[serde(rename = "multipart_upload_part_key")]
     MultipartUploadPartKey { value: MultipartUploadPartKey },
     #[serde(rename = "multipart_object_metadata_key")]
@@ -1196,13 +1192,12 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 53] {
+fn defined_keyspaces() -> [&'static str; 52] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
-        BLOB_HEAD_CONTENDER_KEYSPACE,
         BLOB_HEAD_KEYSPACE,
         BLOB_HIDDEN_RESERVATION_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
@@ -1542,9 +1537,6 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         MANAGED_COPY_KEYSPACE => ManagedCopyKey::from_bytes(key)
             .map(|value| DecodedField::ManagedCopyKey { value })
             .unwrap_or_else(|_| raw_field(key)),
-        BLOB_HEAD_CONTENDER_KEYSPACE => HeadContenderKey::from_bytes(key)
-            .map(|value| DecodedField::HeadContenderKey { value })
-            .unwrap_or_else(|_| raw_field(key)),
         BLOB_LOCATIONS_KEYSPACE => BlobLocationKey::from_bytes(key)
             .map(|value| DecodedField::BlobLocationKey {
                 blake3: hex::encode(value.blake3_hash),
@@ -1597,7 +1589,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             |bytes| postcard::from_bytes::<StorageFormatMarker>(bytes),
             |data| DecodedValue::StorageFormatMarker { data },
         ),
-        BLOB_HEAD_CONTENDER_KEYSPACE => decode_contender_value(value),
         JOB_OUTPUT_RECORD_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
@@ -1761,17 +1752,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         }),
         _ => raw_value(value, None),
     }
-}
-
-/// Contender rows are key-only evidence; an empty value is the record itself.
-fn decode_contender_value(value: &[u8]) -> DecodedValue {
-    if value.is_empty() {
-        return DecodedValue::HeadContenderMarker;
-    }
-    raw_value(
-        value,
-        Some("head contender rows carry no value".to_string()),
-    )
 }
 
 /// Policy, mutation and bulk-run rows are all keyed by a postcard-encoded id;
@@ -2036,16 +2016,16 @@ mod tests {
     use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
-        AUTH_KEYSPACE, BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE,
-        BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        BUCKET_STATS_DB, COMPUTE_DEPARTURE_KEYSPACE, DHT_KEYSPACE,
-        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE,
-        JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-        JOB_FAMILY_RECORD_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE,
-        JOB_RESERVATION_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
-        METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-        METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB,
+        COMPUTE_DEPARTURE_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
+        JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+        JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
         PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
@@ -2058,7 +2038,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, Group, HashPathIndexKey, HeadContenderKey, MultipartChecksumType,
+        CurrentVersionPointer, Group, HashPathIndexKey, MultipartChecksumType,
         MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
         MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus,
         POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
@@ -2210,7 +2190,6 @@ mod tests {
             ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
             API_STATE_KEYSPACE.to_string(),
             AUTH_KEYSPACE.to_string(),
-            BLOB_HEAD_CONTENDER_KEYSPACE.to_string(),
             BLOB_HEAD_KEYSPACE.to_string(),
             BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
             BLOB_LOCATIONS_KEYSPACE.to_string(),
@@ -2579,17 +2558,6 @@ mod tests {
                 .format_epoch,
             None
         );
-    }
-
-    #[test]
-    fn decodes_contender_row() {
-        // Contender evidence lives entirely in the key; the row carries no value.
-        let key = HeadContenderKey::new("bucket", "a.tar", 4, Ulid::from_bytes([6_u8; 16]));
-
-        let decoded = decode_entry(BLOB_HEAD_CONTENDER_KEYSPACE, &key.to_bytes().unwrap(), b"");
-
-        assert_eq!(decoded.key, DecodedField::HeadContenderKey { value: key });
-        assert_eq!(decoded.value, DecodedValue::HeadContenderMarker);
     }
 
     #[test]

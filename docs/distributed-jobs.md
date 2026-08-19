@@ -72,7 +72,7 @@ This is not the same as the object's S3 latest version:
 - **Job canonical output** is what the canonical execution wrote. Retrieve it
   with the exact VersionId (`GET /object?versionId=…`), which is also what the
   TES task log URLs carry.
-- **S3 latest** is the convergent last-write-wins head of that key. A duplicate
+- **S3 latest** is the node-local last-write-wins head of that key. A duplicate
   execution, a later unrelated upload, or a copy from another node can all make
   a different version the latest one.
 

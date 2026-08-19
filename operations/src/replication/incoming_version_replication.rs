@@ -1,7 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read,
-    build_head_transition_effects, head_contender_effects, write_blob_location_effect,
-    write_blob_version_effect,
+    build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
@@ -75,7 +74,6 @@ enum IncomingVersionReplicationState {
     VerifyExistingBlob,
     WriteBlobLocation,
     ReadObjectLookup,
-    WriteHeadContenders,
     ReadCurrentVersion,
     ApplyHeadTransition,
     WriteBlobVersion,
@@ -354,7 +352,6 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::VerifyExistingBlob => "VerifyExistingBlob",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
-            IncomingVersionReplicationState::WriteHeadContenders => "WriteHeadContenders",
             IncomingVersionReplicationState::ReadCurrentVersion => "ReadCurrentVersion",
             IncomingVersionReplicationState::ApplyHeadTransition => "ApplyHeadTransition",
             IncomingVersionReplicationState::WriteBlobVersion => "WriteBlobVersion",
@@ -1269,28 +1266,7 @@ impl IncomingVersionReplicationOperation {
             self.pending_new_pointer = None;
             self.pending_new_current_hash = None;
         }
-        self.record_contenders(&candidate, existing_pointer.as_ref())
-    }
-
-    /// A losing candidate is still audit evidence, so both claimants of the
-    /// generation are recorded before the head transition continues.
-    fn record_contenders(
-        &mut self,
-        candidate: &CurrentVersionPointer,
-        existing: Option<&CurrentVersionPointer>,
-    ) -> Effects {
-        let context = match self.alias_context() {
-            Ok(context) => context,
-            Err(err) => return self.fail(err),
-        };
-        match head_contender_effects(&context, candidate, existing, self.txn_id) {
-            Ok(effects) if effects.is_empty() => self.resume_head_transition(),
-            Ok(effects) => {
-                self.state = IncomingVersionReplicationState::WriteHeadContenders;
-                effects
-            }
-            Err(err) => self.fail(err.into()),
-        }
+        self.resume_head_transition()
     }
 
     /// Continues exactly where `write_object_lookup_after_compare` left off; the
@@ -2436,16 +2412,6 @@ impl Operation for IncomingVersionReplicationOperation {
                     "Compared destination current version pointer"
                 );
                 self.write_object_lookup_after_compare(value.as_deref())
-            }
-            IncomingVersionReplicationState::WriteHeadContenders => {
-                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                        received: event,
-                    });
-                };
-                self.resume_head_transition()
             }
             IncomingVersionReplicationState::ReadCurrentVersion => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {

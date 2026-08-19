@@ -778,8 +778,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        MANAGED_COPY_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     };
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
@@ -1368,13 +1367,8 @@ mod tests {
             .expect("head write");
         let pointer = CurrentVersionPointer::from_bytes(value).expect("pointer decodes");
         assert_eq!(pointer.version_id, mint.plan.successor_version_id);
-        // The head is read and written under one exact expected pointer, so the
-        // successor advances one generation and records no contender.
+        // The head is read and written under one exact expected pointer.
         assert_eq!(pointer.generation, head().generation + 1);
-        assert!(
-            !spaces.contains(&BLOB_HEAD_CONTENDER_KEYSPACE),
-            "a compare-and-set advance cannot contend with itself"
-        );
     }
 
     #[test]

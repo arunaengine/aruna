@@ -232,7 +232,6 @@ mod tests {
         ("/admin/compute/drain", "post"),
         ("/admin/compute/snapshots", "get"),
         ("/admin/placement-quarantine", "post"),
-        ("/blobs/contenders", "get"),
         ("/jobs/{job_id}/audit", "get"),
     ];
 

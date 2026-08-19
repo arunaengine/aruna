@@ -903,9 +903,8 @@ impl CurrentVersionPointer {
         }
     }
 
-    /// Checked local advancement. Saturating here would mint a pointer that
-    /// compares equal to its predecessor and win the tie on VersionId bytes
-    /// alone, so an exhausted generation fails the mutation instead.
+    /// Checked local advancement. Saturating would stop producing a later
+    /// generation, so an exhausted counter fails the mutation instead.
     pub fn next_for(existing: Option<&Self>, version_id: Ulid) -> Result<Self, ConversionError> {
         let generation = match existing {
             Some(pointer) => pointer
@@ -917,86 +916,10 @@ impl CurrentVersionPointer {
         Ok(Self::new_with_generation(version_id, generation))
     }
 
-    /// The accepted convergent order. Every local and incoming head writer
-    /// selects through this rule, so message arrival can never change the head.
-    pub fn order(&self) -> HeadOrder {
-        (self.generation, self.version_id.to_bytes())
-    }
-
-    /// True when this candidate may become the head. Equality is included so a
-    /// duplicate delivery rewrites the identical pointer instead of regressing.
+    /// True for an identical replay or a later generation. Different versions
+    /// of one generation cannot occur for a node-local head.
     pub fn supersedes(&self, current: Option<&Self>) -> bool {
-        current.is_none_or(|current| self.order() >= current.order())
-    }
-
-    /// Two versions claiming one generation. The loser stays retrievable by
-    /// VersionId; only the head choice is decided by `order`.
-    pub fn contends(&self, other: &Self) -> bool {
-        self.generation == other.generation && self.version_id != other.version_id
-    }
-
-    /// Deterministic reduction over any arrival order or duplication.
-    pub fn select_head<'a>(
-        candidates: impl IntoIterator<Item = &'a Self>,
-    ) -> Option<&'a CurrentVersionPointer> {
-        candidates.into_iter().max_by_key(|pointer| pointer.order())
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
-/// `(generation, VersionId bytes)`: the convergent object-head order.
-pub type HeadOrder = (u64, [u8; 16]);
-
-/// One responder-local observation that two versions claimed the same head
-/// generation. The row is evidence for audit; it never decides the head.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HeadContenderKey {
-    pub bucket: String,
-    pub key: String,
-    pub generation: u64,
-    pub version_id: Ulid,
-}
-
-#[derive(Serialize)]
-struct HeadContenderPrefix<'a> {
-    bucket: &'a str,
-    key: &'a str,
-    generation: u64,
-}
-
-impl HeadContenderKey {
-    pub fn new(
-        bucket: impl Into<String>,
-        key: impl Into<String>,
-        generation: u64,
-        version_id: Ulid,
-    ) -> Self {
-        Self {
-            bucket: bucket.into(),
-            key: key.into(),
-            generation,
-            version_id,
-        }
-    }
-
-    /// Scans every claimant this node observed for one object generation.
-    pub fn generation_prefix(
-        bucket: &str,
-        key: &str,
-        generation: u64,
-    ) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&HeadContenderPrefix {
-            bucket,
-            key,
-            generation,
-        })?)
+        current.is_none_or(|current| self == current || self.generation > current.generation)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1293,9 +1216,9 @@ mod tests {
     use super::{
         Backend, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
-        HashPathIndexKey, HeadContenderKey, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine,
-        ManagedCopyRecord, ManagedCopyState, VersionKey, blob_bucket_permission_path,
-        blob_group_permission_path, blob_object_permission_path,
+        HashPathIndexKey, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
+        ManagedCopyState, VersionKey, blob_bucket_permission_path, blob_group_permission_path,
+        blob_object_permission_path,
     };
     use crate::NodeId;
     use crate::errors::ConversionError;
@@ -1314,68 +1237,14 @@ mod tests {
     }
 
     #[test]
-    fn head_order_breaks_ties() {
-        // Same generation from two partitions: VersionId bytes decide, and the
-        // loser is never mistaken for the head.
-        let low = pointer(7, 1);
-        let high = pointer(7, 2);
-        assert!(high.order() > low.order());
-        assert!(high.supersedes(Some(&low)));
-        assert!(!low.supersedes(Some(&high)));
-        assert!(high.contends(&low));
-        assert!(!high.contends(&pointer(8, 1)));
-    }
-
-    #[test]
-    fn head_order_beats_arrival() {
-        // Every permutation of the same candidate set converges to one head,
-        // and a duplicate delivery cannot move it.
-        let candidates = [pointer(3, 9), pointer(4, 1), pointer(4, 5), pointer(2, 255)];
-        let expected = pointer(4, 5);
-        for rotation in 0..candidates.len() {
-            let mut permuted: Vec<CurrentVersionPointer> = candidates.to_vec();
-            permuted.rotate_left(rotation);
-            permuted.push(permuted[0].clone());
-            assert_eq!(
-                CurrentVersionPointer::select_head(permuted.iter()),
-                Some(&expected)
-            );
-        }
-    }
-
-    #[test]
-    fn markers_share_the_order() {
-        // A delete marker, a reference advance and an ordinary write are all
-        // just pointers: every permutation converges on the same head and no
-        // VersionId is dropped from the candidate set.
-        let write = pointer(6, 1);
-        let marker = pointer(7, 2);
-        let advance = pointer(7, 8);
-        let candidates = [write.clone(), marker.clone(), advance.clone()];
-        for rotation in 0..candidates.len() {
-            let mut permuted: Vec<CurrentVersionPointer> = candidates.to_vec();
-            permuted.rotate_left(rotation);
-            assert_eq!(
-                CurrentVersionPointer::select_head(permuted.iter()),
-                Some(&advance)
-            );
-            // Losing versions stay retrievable: reduction selects, never prunes.
-            for candidate in &candidates {
-                assert!(permuted.contains(candidate));
-            }
-        }
-        assert!(marker.contends(&advance));
-        assert!(!write.contends(&marker));
-    }
-
-    #[test]
     fn duplicate_delivery_holds() {
         // An identical pointer may be rewritten, so a replayed message is
         // idempotent instead of being refused.
         let head = pointer(5, 3);
         assert!(head.supersedes(Some(&head)));
-        assert!(!head.contends(&head));
         assert!(head.supersedes(None));
+        assert!(!pointer(5, 4).supersedes(Some(&head)));
+        assert!(pointer(6, 1).supersedes(Some(&head)));
     }
 
     #[test]
@@ -1390,21 +1259,8 @@ mod tests {
         assert_eq!(
             CurrentVersionPointer::next_for(Some(&exhausted), Ulid::from_bytes([2u8; 16])),
             Err(ConversionError::HeadGenerationExhausted),
-            "a wrapped generation would silently win the convergent order"
+            "a wrapped generation would no longer be newer"
         );
-    }
-
-    #[test]
-    fn contender_key_scopes() {
-        let key = HeadContenderKey::new("bucket", "path/file.txt", 4, Ulid::from_bytes([6u8; 16]));
-        let bytes = key.to_bytes().expect("key encodes");
-        let prefix =
-            HeadContenderKey::generation_prefix("bucket", "path/file.txt", 4).expect("prefix");
-        assert!(bytes.starts_with(&prefix));
-        assert_eq!(HeadContenderKey::from_bytes(&bytes).expect("decodes"), key);
-        let other =
-            HeadContenderKey::generation_prefix("bucket", "path/file.txt", 5).expect("prefix");
-        assert!(!bytes.starts_with(&other));
     }
 
     #[test]

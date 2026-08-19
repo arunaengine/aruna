@@ -78,9 +78,6 @@ pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
 /// locally; it is never evidence about another node's copies.
 pub const MANAGED_COPY_KEYSPACE: &str = "managed_copies";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
-/// Responder-local evidence that two versions claimed one head generation.
-/// Written with the head transition that observed them; audit only.
-pub const BLOB_HEAD_CONTENDER_KEYSPACE: &str = "blob_head_contenders";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";

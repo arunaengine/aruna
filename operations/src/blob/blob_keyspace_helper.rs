@@ -1,12 +1,11 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_CONTENDER_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
-    HashPathIndexKey, HeadContenderKey, RealmId, VersionKey,
+    HashPathIndexKey, RealmId, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, TxnId};
 use byteview::ByteView;
@@ -206,38 +205,6 @@ pub fn iter_hash_page(
     }))
 }
 
-/// Records both claimants of one head generation. Emitted before the head
-/// write that observed them, so a lost race is auditable even though only the
-/// convergent order decides which VersionId the head names.
-pub fn head_contender_effects(
-    context: &HeadAliasContext,
-    candidate: &CurrentVersionPointer,
-    existing: Option<&CurrentVersionPointer>,
-    txn_id: Option<TxnId>,
-) -> Result<Effects, ConversionError> {
-    let Some(existing) = existing.filter(|existing| candidate.contends(existing)) else {
-        return Ok(smallvec![]);
-    };
-    let mut writes = Vec::with_capacity(2);
-    for version_id in [existing.version_id, candidate.version_id] {
-        let key = HeadContenderKey::new(
-            context.bucket.clone(),
-            context.key.clone(),
-            candidate.generation,
-            version_id,
-        );
-        writes.push((
-            BLOB_HEAD_CONTENDER_KEYSPACE.to_string(),
-            key.to_bytes()?.into(),
-            ByteView::from(Vec::<u8>::new()),
-        ));
-    }
-    Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-        writes,
-        txn_id,
-    })])
-}
-
 pub fn build_head_transition_effects(
     context: &HeadAliasContext,
     new_pointer: Option<CurrentVersionPointer>,
@@ -269,7 +236,7 @@ pub fn build_head_transition_effects(
 mod tests {
     use super::{
         HeadAliasContext, add_hash_path_index_effect, build_head_transition_effects,
-        head_contender_effects, iter_hash_page, iter_hash_path_index_effect,
+        iter_hash_page, iter_hash_path_index_effect,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::structs::{CurrentVersionPointer, HashPathIndexKey, RealmId};
@@ -347,46 +314,6 @@ mod tests {
             effects[1],
             Effect::Storage(StorageEffect::Write { .. })
         ));
-    }
-
-    #[test]
-    fn contenders_record_both() {
-        // Both claimants of one generation are retained, whichever one won.
-        let context = alias_context();
-        let candidate = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([9u8; 16]), 7);
-        let existing = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([1u8; 16]), 7);
-        let effects = head_contender_effects(&context, &candidate, Some(&existing), None).unwrap();
-
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one contender batch");
-        };
-        let recorded: Vec<Ulid> = writes
-            .iter()
-            .map(|(_, key, _)| {
-                aruna_core::structs::HeadContenderKey::from_bytes(key.as_ref())
-                    .unwrap()
-                    .version_id
-            })
-            .collect();
-        assert_eq!(recorded, vec![existing.version_id, candidate.version_id]);
-    }
-
-    #[test]
-    fn contenders_need_same_generation() {
-        // A higher generation is an ordinary advance, not a contended head.
-        let context = alias_context();
-        let candidate = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([9u8; 16]), 8);
-        let existing = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([1u8; 16]), 7);
-        assert!(
-            head_contender_effects(&context, &candidate, Some(&existing), None)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            head_contender_effects(&context, &candidate, None, None)
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]

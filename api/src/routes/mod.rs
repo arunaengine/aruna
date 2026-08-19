@@ -140,7 +140,6 @@ mod tests {
         ("GET", "/admin/sync-quarantine"),
         ("GET", "/admin/sync-quarantine/{record_id}"),
         ("GET", "/audit"),
-        ("GET", "/blobs/contenders"),
         ("GET", "/blobs/locations"),
         ("GET", "/buckets/{bucket}/placement"),
         ("GET", "/buckets/{bucket}/placement/coverage"),
