@@ -8,7 +8,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::{MetadataError, MetadataProfileValidationState};
 use aruna_core::storage_entries::metadata_event_log_prefix;
-use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, DocumentClass, HandleRange, PlacementBinding, PlacementScope, RealmConfigDocument,
+    RealmId, RealmNodeKind, band_start,
+};
+use aruna_core::structured_id::PlacementHandle;
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_local_document,
@@ -542,6 +546,24 @@ async fn build_context(
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(node_id, RealmNodeKind::Server);
+    let range = HandleRange {
+        range_id: Ulid::from_bytes([1; 16]),
+        owner: node_id,
+        start: band_start(0),
+        end: band_start(1),
+    };
+    config.placement_handle_ranges.push(range);
+    config.placement_bindings.push(PlacementBinding {
+        handle: PlacementHandle::new(range.start).expect("band start is a valid handle"),
+        scope: PlacementScope::Realm(realm_id),
+        document_class: DocumentClass::JobControl,
+        strategy_id: config
+            .default_strategy_id
+            .expect("seeded config has a default strategy"),
+        allocator_range_id: Some(range.range_id),
+        allocated_by: Some(node_id),
+        allocated_at_ms: Some(1),
+    });
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
