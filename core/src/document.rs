@@ -531,8 +531,6 @@ fn metadata_graph_lifecycle_topic_id(graph_iri: &str) -> Ulid {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
-// Keep in step with `realm_format::REALM_FORMAT_TAG`: the derive needs a
-// literal, and `tag_names_the_epoch` fails if the two ever drift.
 #[irokle(type_id = "aruna.document.v3")]
 pub enum DocumentSyncEvent {
     Upsert {
@@ -637,7 +635,6 @@ mod tests {
     use crate::structs::PlacementRef;
     use crate::structs::RealmId;
     use crate::types::UserId;
-    use irokle::Event as _;
     use ulid::Ulid;
 
     fn test_ulid(seed: u8) -> Ulid {
@@ -902,14 +899,6 @@ mod tests {
         assert_ne!(
             realm_config.sync_topic_id(realm_id, &placement_a),
             shard_topic_id(realm_id, &placement_a)
-        );
-    }
-
-    #[test]
-    fn document_sync_event_type_id_is_stable() {
-        assert_eq!(
-            DocumentSyncEvent::TYPE_ID,
-            crate::realm_format::REALM_FORMAT_TAG
         );
     }
 

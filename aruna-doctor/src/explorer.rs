@@ -20,11 +20,10 @@ use aruna_core::keyspaces::{
     PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-    SOURCE_CONNECTOR_SECRET_KEYSPACE, STORAGE_FORMAT_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
-    USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
+    SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+    USER_ACCESS_OWNER_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
-use aruna_core::storage_format::{STORAGE_FORMAT_KEY, StorageFormatMarker};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
@@ -91,8 +90,6 @@ struct UnresolvedLocation {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct KeyspacesOutput {
-    /// Read only: the doctor reports the stored epoch and never writes one.
-    format_epoch: Option<u32>,
     database_path: String,
     keyspaces: Vec<KeyspaceEntry>,
     missing_keyspaces: Vec<KeyspaceEntry>,
@@ -241,10 +238,6 @@ enum DecodedValue {
     NodeSubjectRecord {
         data: NodeSubjectRecord,
     },
-    StorageFormatMarker {
-        data: StorageFormatMarker,
-    },
-    HeadContenderMarker,
     JobOutputRecord {
         data: JsonJobRecordEnvelope,
     },
@@ -1180,7 +1173,6 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     missing_keyspaces.sort_by(|left, right| left.name.cmp(&right.name));
 
     Ok(KeyspacesOutput {
-        format_epoch: read_format_epoch(&db)?,
         database_path: database_path.to_string(),
         keyspaces: keyspaces
             .into_iter()
@@ -1192,7 +1184,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 52] {
+fn defined_keyspaces() -> [&'static str; 51] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -1242,28 +1234,10 @@ fn defined_keyspaces() -> [&'static str; 52] {
         S3_MULTIPART_UPLOAD_PART_KEYSPACE,
         SOURCE_CONNECTOR_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_SECRET_KEYSPACE,
-        STORAGE_FORMAT_KEYSPACE,
         SYNC_PLACEMENT_KEYSPACE,
         USER_ACCESS_KEYSPACE,
         USER_ACCESS_OWNER_KEYSPACE,
     ]
-}
-
-/// Reports the stored format epoch of one root. A root the running build would
-/// refuse still has to be inspectable, so a foreign marker reports `None`.
-fn read_format_epoch(db: &OptimisticTxDatabase) -> Result<Option<u32>, ExplorerError> {
-    if !db
-        .list_keyspace_names()
-        .iter()
-        .any(|name| name.as_ref() == STORAGE_FORMAT_KEYSPACE)
-    {
-        return Ok(None);
-    }
-    let keyspace = db.keyspace(STORAGE_FORMAT_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let stored = db.read_tx().get(&keyspace, STORAGE_FORMAT_KEY)?;
-    Ok(stored
-        .and_then(|bytes| postcard::from_bytes::<StorageFormatMarker>(&bytes).ok())
-        .map(|marker| marker.epoch))
 }
 
 fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutput, ExplorerError> {
@@ -1494,7 +1468,6 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
         | NODE_SUBJECT_KEYSPACE
-        | STORAGE_FORMAT_KEYSPACE
         | COMPUTE_DEPARTURE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
         JOB_FAMILY_RECORD_KEYSPACE | JOB_FAMILY_PENDING_KEYSPACE | JOB_FAMILY_OUTBOX_KEYSPACE => {
@@ -1584,11 +1557,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         NODE_SUBJECT_KEYSPACE => decode_value_with(value, NodeSubjectRecord::from_bytes, |data| {
             DecodedValue::NodeSubjectRecord { data }
         }),
-        STORAGE_FORMAT_KEYSPACE => decode_value_with(
-            value,
-            |bytes| postcard::from_bytes::<StorageFormatMarker>(bytes),
-            |data| DecodedValue::StorageFormatMarker { data },
-        ),
         JOB_OUTPUT_RECORD_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
@@ -2029,13 +1997,10 @@ mod tests {
         PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-        SOURCE_CONNECTOR_SECRET_KEYSPACE, STORAGE_FORMAT_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
-        USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
+        SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+        USER_ACCESS_OWNER_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::storage_format::{
-        STORAGE_FORMAT_EPOCH, STORAGE_FORMAT_KEY, StorageFormatMarker,
-    };
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, Group, HashPathIndexKey, MultipartChecksumType,
@@ -2233,7 +2198,6 @@ mod tests {
             S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
             SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
             SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-            STORAGE_FORMAT_KEYSPACE.to_string(),
             SYNC_PLACEMENT_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
             USER_ACCESS_OWNER_KEYSPACE.to_string(),
@@ -2495,68 +2459,6 @@ mod tests {
         assert_eq!(
             decoded.value,
             DecodedValue::ComputeDepartureReport { data: report }
-        );
-    }
-
-    #[test]
-    fn decodes_format_marker() {
-        let marker = StorageFormatMarker::default();
-
-        let decoded = decode_entry(
-            STORAGE_FORMAT_KEYSPACE,
-            STORAGE_FORMAT_KEY,
-            &marker.to_bytes().unwrap(),
-        );
-
-        assert_eq!(
-            decoded.key,
-            DecodedField::Utf8 {
-                value: "epoch".to_string()
-            }
-        );
-        assert_eq!(
-            decoded.value,
-            DecodedValue::StorageFormatMarker { data: marker }
-        );
-    }
-
-    #[test]
-    fn reports_format_epoch() {
-        // The doctor reads the epoch of any root; it never writes or repairs one.
-        let temp = tempdir().unwrap();
-        {
-            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
-            let keyspace = db
-                .keyspace(STORAGE_FORMAT_KEYSPACE, KeyspaceCreateOptions::default)
-                .unwrap();
-            keyspace
-                .insert(
-                    STORAGE_FORMAT_KEY,
-                    StorageFormatMarker::default().to_bytes().unwrap(),
-                )
-                .unwrap();
-            db.persist(fjall::PersistMode::SyncAll).unwrap();
-        }
-
-        let output = list_keyspaces(temp.path().to_str().unwrap()).unwrap();
-
-        assert_eq!(output.format_epoch, Some(STORAGE_FORMAT_EPOCH));
-    }
-
-    #[test]
-    fn reports_absent_epoch() {
-        let temp = tempdir().unwrap();
-        {
-            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
-            db.keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
-                .unwrap();
-        }
-
-        assert_eq!(
-            list_keyspaces(temp.path().to_str().unwrap())
-                .unwrap()
-                .format_epoch,
-            None
         );
     }
 

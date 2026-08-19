@@ -45,7 +45,6 @@ use aruna_core::metadata::{
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::permission_path::compile_permission_matcher;
-use aruna_core::realm_format::{RealmFormatError, verify_realm_format};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
@@ -453,8 +452,6 @@ impl DocumentSyncService {
         let db = fjall::OptimisticTxDatabase::builder(&storage_path)
             .manual_journal_persist(true)
             .open()
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        aruna_storage::ensure_format(&db, &storage_path.to_string_lossy())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let fanout_cursors = db
             .keyspace(
@@ -1018,16 +1015,6 @@ impl DocumentSyncService {
         .await
         .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT))??;
         let read_elapsed = stream_started.elapsed();
-        // Format fence: the peer's own declaration decides admission before a
-        // single replicated document reaches the reducer.
-        if let Err(error) = admit_realm_format(&messages) {
-            warn!(
-                peer = %node_id_to_peer_id(&peer),
-                error = %error,
-                "Refused an inbound document sync stream from another realm format"
-            );
-            return Err(NetError::RealmFormat(error));
-        }
         let message_count = messages.len();
         let handle_started = Instant::now();
         let net = self.net.clone();
@@ -9642,25 +9629,6 @@ async fn read_inbound_sync_messages(
     Ok((messages, topics.into_iter().collect()))
 }
 
-/// Refuses an inbound sync stream that declares another realm wire format.
-/// A genesis puller has no topic state yet and may open without a declaration,
-/// but a declared mismatch and a summary without one are refused: a peer that
-/// claims topic state always knows its format, and there is no downgrade.
-fn admit_realm_format(messages: &[SyncMessage]) -> std::result::Result<(), RealmFormatError> {
-    for message in messages {
-        match message {
-            SyncMessage::Open(open) => {
-                if open.event_type_id.is_some() {
-                    verify_realm_format(open.event_type_id.as_deref())?;
-                }
-            }
-            SyncMessage::Summary(summary) => verify_realm_format(summary.event_type_id.as_deref())?,
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 async fn read_next_inbound_sync_frame(
     recv: &mut iroh::endpoint::RecvStream,
     bytes_read: &mut usize,
@@ -10510,25 +10478,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opener_declares_this_format() {
-        // Two same-format peers must pass the fence: our own opener carries the
-        // tag the admission check demands, so bootstrap is unaffected.
-        let root = TempDir::new().expect("tempdir");
-        let service = open_restart_service(root.path(), "storage").await;
-        let topic = DocumentSyncTarget::RealmConfig {
-            realm_id: restart_realm(),
-        }
-        .sync_topic_id(restart_realm(), &PlacementRef::NIL);
-        service
-            .ensure_document_sync_topics(&[topic], Vec::new())
-            .expect("topics are created");
-
-        let open = SyncMessage::Open(service.node().sync_open(topic));
-
-        assert_eq!(admit_realm_format(&[open]), Ok(()));
-    }
-
-    #[tokio::test]
     async fn admits_known_peers() {
         // An inbound sync stream is refused before any read unless the pusher
         // is a configured realm peer.
@@ -10542,47 +10491,6 @@ mod tests {
             .expect("peer added");
         let permit = service.admit_inbound(stranger);
         assert!(permit.is_ok());
-    }
-
-    #[test]
-    fn admits_matching_format() {
-        // A same-format or stateless (genesis-pull) opener is admitted; a
-        // declared other epoch is refused before any document is applied, and
-        // a summary, which always names its topic state, may not stay silent.
-        let topic = irokle_crate::TopicId::hash(b"format-fence");
-        let open = |event_type_id: Option<&str>| {
-            SyncMessage::Open(irokle_crate::sync::SyncOpen {
-                protocol: String::from_utf8_lossy(irokle_crate::net::IROKLE_SYNC_ALPN).into_owned(),
-                topic_id: topic,
-                peer_id: peer(7),
-                event_type_id: event_type_id.map(str::to_string),
-            })
-        };
-
-        assert_eq!(
-            admit_realm_format(&[open(Some(DocumentSyncEvent::TYPE_ID))]),
-            Ok(())
-        );
-        assert_eq!(
-            admit_realm_format(&[open(Some("aruna.document.v2"))]),
-            Err(RealmFormatError::Mismatch {
-                declared: "aruna.document.v2".to_string()
-            })
-        );
-        assert_eq!(admit_realm_format(&[open(None)]), Ok(()));
-
-        let summary = SyncMessage::Summary(irokle_crate::sync::SyncSummary {
-            topic_id: topic,
-            event_type_id: None,
-            fingerprint: [0u8; 32],
-            heads: Default::default(),
-            actor_clock: Default::default(),
-            actor_tips: Default::default(),
-        });
-        assert_eq!(
-            admit_realm_format(&[summary]),
-            Err(RealmFormatError::Absent)
-        );
     }
 
     #[test]

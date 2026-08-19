@@ -1,4 +1,3 @@
-use aruna_core::realm_format::RealmFormatError;
 use iroh::endpoint::VarIntBoundsExceeded;
 use std::time::Duration;
 use thiserror::Error;
@@ -22,11 +21,6 @@ pub enum NetError {
     /// callers must drop it without a full-topic reconcile.
     #[error("Admission rejected: {0}")]
     AdmissionRejected(String),
-
-    /// The peer runs another realm wire format. Refused before any replicated
-    /// document is applied, and never retried: there is no negotiation.
-    #[error(transparent)]
-    RealmFormat(#[from] RealmFormatError),
 
     #[error("Timeout after {0:?}")]
     Timeout(Duration),
@@ -56,10 +50,7 @@ impl NetError {
     /// Whether this rejection happened before any payload processing, so no
     /// partial local state can exist to reconcile.
     pub fn is_admission_rejection(&self) -> bool {
-        matches!(
-            self,
-            NetError::AdmissionRejected(_) | NetError::RealmFormat(_)
-        )
+        matches!(self, NetError::AdmissionRejected(_))
     }
 }
 
