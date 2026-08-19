@@ -1292,9 +1292,11 @@ fn family_record(report: &FamilyReport) -> JobRecord {
                 .as_ref()
                 .and_then(|result| result.exit_code),
             workspace_bucket: report.job.workspace_bucket.clone(),
-            outputs: (report.job.state == JobState::Succeeded)
-                .then(|| report.outputs.clone())
-                .unwrap_or_default(),
+            outputs: if report.job.state == JobState::Succeeded {
+                report.outputs.clone()
+            } else {
+                Vec::new()
+            },
             stdout: String::new(),
             stderr: String::new(),
             output_digest: report

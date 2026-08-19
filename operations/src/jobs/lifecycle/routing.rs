@@ -214,9 +214,11 @@ fn result_view(projection: &JobProjection, bucket: Option<String>) -> Option<ser
         JobResultPayload::Execution {
             exit_code: result.and_then(|result| result.exit_code),
             workspace_bucket: bucket,
-            outputs: (projection.state == LogicalJobState::Succeeded)
-                .then(|| projection.outputs.as_slice().to_vec())
-                .unwrap_or_default(),
+            outputs: if projection.state == LogicalJobState::Succeeded {
+                projection.outputs.as_slice().to_vec()
+            } else {
+                Vec::new()
+            },
             stdout: String::new(),
             stderr: String::new(),
             output_digest: result.and_then(|result| result.output_digest),
