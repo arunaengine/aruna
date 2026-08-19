@@ -22,7 +22,10 @@ use ulid::Ulid;
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
 use crate::jobs::lifecycle::ids::SubmissionRequest;
 use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
-use crate::metadata::api::MetadataRoCrateExportView;
+use crate::metadata::api::{
+    MetadataReferencePreflightNodeExecution, MetadataReferencePreflightNodeRequest,
+    MetadataRoCrateExportView,
+};
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::s3::search_objects::{ObjectKeyMatch, ObjectSearchNodePage};
@@ -332,6 +335,15 @@ pub enum MetadataTransportMessage {
     },
     ForwardedProfileValidationStatus {
         result: Result<Box<MetadataProfileValidationStatus>, MetadataReadError>,
+    },
+    /// One node's exact-IRI backlink and location-impact partition. Appended after
+    /// the existing tail variants so all prior postcard discriminants remain stable.
+    ReferencePreflight {
+        auth_token: Option<MetadataAuthToken>,
+        request: Box<MetadataReferencePreflightNodeRequest>,
+    },
+    ReferencePreflightResults {
+        result: Result<Box<MetadataReferencePreflightNodeExecution>, MetadataReadError>,
     },
 }
 

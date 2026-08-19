@@ -27,13 +27,15 @@ use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
     MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataListOrder,
-    MetadataPathLookupRequest, MetadataQueryRequest, MetadataReferenceEntry,
-    MetadataReferencesExecution, MetadataReferencesRequest,
+    MetadataPathLookupRequest, MetadataPreflightStorageOperation, MetadataQueryRequest,
+    MetadataReferenceEntry, MetadataReferencePreflightExecution, MetadataReferencePreflightRequest,
+    MetadataReferencePreflightTarget, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     forwarded_bearer, list_visible_metadata_documents as run_list_visible_metadata_documents,
     load_realm_config, lookup_metadata_path as run_lookup_metadata_path,
     query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
-    references_metadata as run_references_metadata, search_metadata as run_search_metadata,
+    references_metadata as run_references_metadata,
+    references_preflight as run_references_preflight, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
@@ -95,6 +97,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         ))
         .routes(routes!(search_metadata))
         .routes(routes!(metadata_references))
+        .routes(routes!(metadata_reference_preflight))
         .routes(routes!(query_all_metadata))
         .routes(routes!(list_metadata_documents))
         .routes(routes!(get_metadata_path))
@@ -452,6 +455,104 @@ pub struct MetadataReferencesResponse {
     /// `limit` and continuation is not yet supported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MetadataReferencePreflightTargetBody {
+    ContentW3ids {
+        content_w3ids: Vec<String>,
+        #[serde(default)]
+        remove_all_resolvable_locations: bool,
+    },
+    BucketPrefix {
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        #[serde(default)]
+        operation: MetadataPreflightStorageOperationBody,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataPreflightStorageOperationBody {
+    #[default]
+    LatestVersionTombstone,
+    AllVersionsPurge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencePreflightBody {
+    pub target: MetadataReferencePreflightTargetBody,
+    #[serde(default)]
+    pub mode: Option<MetadataQueryMode>,
+    #[serde(default = "default_allow_partial")]
+    pub allow_partial: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightLocationResponse {
+    pub node_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightVisibleReferenceResponse {
+    pub document_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightTargetResponse {
+    pub content_w3id: String,
+    pub targeted_versions: Vec<MetadataPreflightLocationResponse>,
+    pub visible_references: Vec<MetadataPreflightVisibleReferenceResponse>,
+    pub hidden_references_exist: bool,
+    pub would_remove_last_resolvable_aruna_location: bool,
+    pub location_impact_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightExcludedFormResponse {
+    pub form: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightNodeFreshnessResponse {
+    pub node_id: String,
+    pub index_state: String,
+    pub oldest_status_updated_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightCoverageResponse {
+    pub queried_scope: String,
+    pub queried_forms: Vec<String>,
+    pub excluded_forms: Vec<MetadataPreflightExcludedFormResponse>,
+    pub node_freshness: Vec<MetadataPreflightNodeFreshnessResponse>,
+    pub target_resolution_complete: bool,
+    pub path_style_endpoint_coverage_complete: bool,
+    pub realm_coverage_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencePreflightResponse {
+    pub targets: Vec<MetadataPreflightTargetResponse>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub complete: bool,
+    pub failed_partitions: Vec<String>,
+    pub coverage: MetadataPreflightCoverageResponse,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2129,6 +2230,174 @@ fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/metadata/references/preflight",
+    tag = "metadata",
+    summary = "Preflight destructive content operations against metadata backlinks",
+    description = "Maps a bounded exact content-W3ID set or an authorized bucket/prefix inventory to canonical content identities, then queries canonical and known legacy location IRIs. Local mode reports realm coverage incomplete. Distributed mode fans out to realm nodes and reports per-node index freshness, failed partitions, and stable cursor pagination. With allow_partial=false, any failed, stale, or otherwise incomplete partition returns 503 rather than silently downgrading the request. Restricted referencing documents are represented only by hidden_references_exist; their count and identity are never returned.",
+    request_body = MetadataReferencePreflightBody,
+    responses(
+        (status = 200, description = "Reference warnings, location impact, pagination, and explicit coverage metadata", body = MetadataReferencePreflightResponse),
+        (status = 400, description = "Malformed or oversized target set, unsupported content identity, or invalid cursor", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Wrong realm or insufficient WRITE permission for the bucket/prefix", body = ErrorResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+        (status = 503, description = "Strict lookup could not produce complete current coverage", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn metadata_reference_preflight(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Json(request): Json<MetadataReferencePreflightBody>,
+) -> ServerResult<(StatusCode, Json<MetadataReferencePreflightResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let target = match request.target {
+        MetadataReferencePreflightTargetBody::ContentW3ids {
+            content_w3ids,
+            remove_all_resolvable_locations,
+        } => MetadataReferencePreflightTarget::ContentW3ids {
+            content_w3ids,
+            remove_all_resolvable_locations,
+        },
+        MetadataReferencePreflightTargetBody::BucketPrefix {
+            bucket,
+            prefix,
+            operation,
+        } => MetadataReferencePreflightTarget::BucketPrefix {
+            bucket,
+            prefix,
+            operation: match operation {
+                MetadataPreflightStorageOperationBody::LatestVersionTombstone => {
+                    MetadataPreflightStorageOperation::LatestVersionTombstone
+                }
+                MetadataPreflightStorageOperationBody::AllVersionsPurge => {
+                    MetadataPreflightStorageOperation::AllVersionsPurge
+                }
+            },
+        },
+    };
+    let s3_endpoint = state
+        .interface_state()
+        .await
+        .s3
+        .map(|interface| interface.base_url);
+    let execution = run_references_preflight(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataReferencePreflightRequest {
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            target,
+            s3_endpoint,
+            limit: request.limit,
+            cursor: request.cursor,
+            mode: map_query_mode(request.mode),
+            target_nodes: None,
+            allow_partial: request.allow_partial,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(map_preflight_response(execution))))
+}
+
+fn map_preflight_response(
+    execution: MetadataReferencePreflightExecution,
+) -> MetadataReferencePreflightResponse {
+    MetadataReferencePreflightResponse {
+        targets: execution
+            .targets
+            .into_iter()
+            .map(|target| MetadataPreflightTargetResponse {
+                content_w3id: target.content_w3id,
+                targeted_versions: target
+                    .targeted_versions
+                    .into_iter()
+                    .map(|location| MetadataPreflightLocationResponse {
+                        node_id: location.node_id.to_string(),
+                        bucket: location.bucket,
+                        key: location.key,
+                        version_id: location.version_id.to_string(),
+                    })
+                    .collect(),
+                visible_references: target
+                    .visible_references
+                    .into_iter()
+                    .map(|reference| MetadataPreflightVisibleReferenceResponse {
+                        document_id: reference.document_id,
+                        title: reference.title,
+                    })
+                    .collect(),
+                hidden_references_exist: target.hidden_references_exist,
+                would_remove_last_resolvable_aruna_location: target
+                    .would_remove_last_resolvable_aruna_location,
+                location_impact_complete: target.location_impact_complete,
+            })
+            .collect(),
+        next_cursor: execution.next_cursor,
+        truncated: execution.truncated,
+        nodes_queried: execution.nodes_queried,
+        nodes_failed: execution.nodes_failed,
+        complete: execution.complete,
+        failed_partitions: execution
+            .failed_partitions
+            .into_iter()
+            .map(|node_id| node_id.to_string())
+            .collect(),
+        coverage: MetadataPreflightCoverageResponse {
+            queried_scope: execution.coverage.queried_scope.to_string(),
+            queried_forms: execution
+                .coverage
+                .queried_forms
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            excluded_forms: execution
+                .coverage
+                .excluded_forms
+                .into_iter()
+                .map(|excluded| MetadataPreflightExcludedFormResponse {
+                    form: excluded.form.to_string(),
+                    reason: excluded.reason.to_string(),
+                })
+                .collect(),
+            node_freshness: execution
+                .coverage
+                .node_freshness
+                .into_iter()
+                .map(|freshness| MetadataPreflightNodeFreshnessResponse {
+                    node_id: freshness.node_id.to_string(),
+                    index_state: match freshness.index_state {
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Current => {
+                            "current"
+                        }
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Pending => {
+                            "pending"
+                        }
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Failed => {
+                            "failed"
+                        }
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Mixed => {
+                            "mixed"
+                        }
+                    }
+                    .to_string(),
+                    oldest_status_updated_at_ms: freshness.oldest_status_updated_at_ms,
+                })
+                .collect(),
+            target_resolution_complete: execution.coverage.target_resolution_complete,
+            path_style_endpoint_coverage_complete: execution
+                .coverage
+                .path_style_endpoint_coverage_complete,
+            realm_coverage_complete: execution.coverage.realm_coverage_complete,
+        },
+    }
+}
+
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     MetaResourceId::parse(document_id)
         .map(|id| id.as_ulid())
@@ -2632,7 +2901,8 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, TASK_TIMER_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE,
     };
     use aruna_core::metadata::{
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -2643,8 +2913,10 @@ mod tests {
         metadata_materialization_status_write_entry, metadata_registry_delete_entries,
     };
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, METADATA_HANDLE, NodeCapabilities,
+        BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group,
+        GroupAuthorizationDocument, HashPathIndexKey, METADATA_HANDLE, NodeCapabilities,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+        VersionKey,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
@@ -2674,6 +2946,7 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     struct TestState {
@@ -5674,6 +5947,35 @@ mod tests {
         .map(|(_, Json(response))| response)
     }
 
+    async fn preflight_route(
+        test: &TestState,
+        auth: Option<AuthContext>,
+        target: MetadataReferencePreflightTargetBody,
+        mode: MetadataQueryMode,
+        allow_partial: bool,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> ServerResult<MetadataReferencePreflightResponse> {
+        metadata_reference_preflight(
+            State(test.state.clone()),
+            Extension(auth),
+            Extension(None),
+            Json(MetadataReferencePreflightBody {
+                target,
+                mode: Some(mode),
+                allow_partial,
+                limit,
+                cursor,
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+    }
+
+    fn preflight_w3id(hash: [u8; 32]) -> String {
+        format!("https://w3id.org/aruna/data/{}", hex::encode(hash))
+    }
+
     async fn create_linking_doc(
         test: &TestState,
         auth: AuthContext,
@@ -6046,6 +6348,268 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(full.references.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn preflight_distinguishes_no_references_incomplete_and_unauthorized() {
+        let test = setup_state().await;
+        let w3id = preflight_w3id([31u8; 32]);
+        let target = || MetadataReferencePreflightTargetBody::ContentW3ids {
+            content_w3ids: vec![w3id.clone()],
+            remove_all_resolvable_locations: false,
+        };
+
+        let no_references = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            target(),
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(no_references.complete);
+        assert!(no_references.targets[0].visible_references.is_empty());
+        assert!(!no_references.targets[0].hidden_references_exist);
+        assert!(!no_references.coverage.realm_coverage_complete);
+        let excluded_forms = no_references
+            .coverage
+            .excluded_forms
+            .iter()
+            .map(|excluded| excluded.form.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            excluded_forms,
+            HashSet::from([
+                "literal_content_url",
+                "imported_relative_identity",
+                "imported_external_identity",
+            ])
+        );
+
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/pending-preflight",
+            "Pending preflight",
+            true,
+            &[("license", &w3id)],
+        )
+        .await;
+        let incomplete = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            target(),
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!incomplete.complete);
+        assert!(
+            incomplete
+                .coverage
+                .node_freshness
+                .iter()
+                .any(|freshness| { matches!(freshness.index_state.as_str(), "pending" | "mixed") })
+        );
+        let strict = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            target(),
+            MetadataQueryMode::Local,
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(strict, Err(ServerError::ServiceUnavailable)));
+
+        let unauthorized = preflight_route(
+            &test,
+            None,
+            target(),
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(unauthorized, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn preflight_hidden_references_expose_only_boolean() {
+        let test = setup_state().await;
+        let realm_id = test.state.get_realm_id();
+        let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let foreign_group = Ulid::generate();
+        seed_group_owned_by(&test, foreign_group, foreign_user).await;
+        let foreign_auth = AuthContext {
+            user_id: foreign_user,
+            realm_id,
+            path_restrictions: None,
+        };
+        let w3id = preflight_w3id([32u8; 32]);
+        let visible_id = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/visible-preflight",
+            "Visible preflight",
+            true,
+            &[("license", &w3id)],
+        )
+        .await;
+        let hidden_id = create_linking_doc(
+            &test,
+            foreign_auth,
+            foreign_group,
+            "datasets/hidden-preflight",
+            "Restricted preflight secret",
+            false,
+            &[("license", &w3id)],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            MetadataReferencePreflightTargetBody::ContentW3ids {
+                content_w3ids: vec![w3id],
+                remove_all_resolvable_locations: false,
+            },
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let target = &response.targets[0];
+        assert!(target.hidden_references_exist);
+        assert_eq!(target.visible_references.len(), 1);
+        assert_eq!(target.visible_references[0].document_id, visible_id);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(&hidden_id));
+        assert!(!serialized.contains("Restricted preflight secret"));
+        assert!(!serialized.contains("hidden_references_count"));
+    }
+
+    #[tokio::test]
+    async fn preflight_bucket_prefix_finds_legacy_s3_ids() {
+        let test = setup_state().await;
+        test.state
+            .register_s3_interface("127.0.0.1:9000".parse().unwrap(), "https://s3.example.test")
+            .await;
+        let bucket = "preflight-bucket";
+        let key = "folder/file.bin";
+        let hash = [33u8; 32];
+        let version_id = Ulid::generate();
+        let ctx = test.state.get_ctx();
+        let bucket_info = BucketInfo {
+            group_id: test.group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test.auth.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        };
+        write_doc(
+            &ctx,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().into(),
+            bucket_info.to_bytes().unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(bucket, key).to_bytes().unwrap().into(),
+            CurrentVersionPointer::new(version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, key, version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            BlobVersion::materialized(
+                hash,
+                BackendRef::node_default(),
+                SystemTime::UNIX_EPOCH,
+                test.auth.user_id,
+                None,
+            )
+            .to_bytes()
+            .unwrap()
+            .into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                hash,
+                version_id,
+                test.state.get_realm_id(),
+                test.group_id,
+                test.state.get_node_id(),
+                bucket,
+                key,
+            )
+            .to_bytes()
+            .unwrap()
+            .into(),
+            Vec::<u8>::new().into(),
+        )
+        .await;
+        let document_id = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/legacy-s3-reference",
+            "Legacy S3 reference",
+            true,
+            &[("license", &format!("s3://{bucket}/{key}"))],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            MetadataReferencePreflightTargetBody::BucketPrefix {
+                bucket: bucket.to_string(),
+                prefix: Some("folder/".to_string()),
+                operation: MetadataPreflightStorageOperationBody::AllVersionsPurge,
+            },
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.targets.len(), 1);
+        let target = &response.targets[0];
+        assert_eq!(target.content_w3id, preflight_w3id(hash));
+        assert_eq!(target.targeted_versions.len(), 1);
+        assert_eq!(target.visible_references[0].document_id, document_id);
+        assert!(target.would_remove_last_resolvable_aruna_location);
+        assert!(response.coverage.path_style_endpoint_coverage_complete);
     }
 
     async fn create_test_metadata_document(

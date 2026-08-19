@@ -1453,6 +1453,42 @@ impl MetadataHandle {
                 })
                 .await
             }
+            MetadataTransportMessage::ReferencePreflight {
+                auth_token,
+                request,
+            } => {
+                Box::pin(async {
+                    let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                        Ok(auth) => match context.net_handle.as_ref() {
+                            Some(net) => {
+                                let endpoint = crate::node_info::read_node_info_document(
+                                    &context.storage_handle,
+                                    net.node_id(),
+                                )
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|document| document.urls.s3);
+                                super::api::references_preflight_local(
+                                    context.as_ref(),
+                                    *net.realm_id(),
+                                    net.node_id(),
+                                    auth,
+                                    *request,
+                                    endpoint,
+                                )
+                                .await
+                                .map(Box::new)
+                                .map_err(super::api::preflight_read_error)
+                            }
+                            None => Err(MetadataReadError::Unavailable),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    MetadataTransportMessage::ReferencePreflightResults { result }
+                })
+                .await
+            }
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
                 query,
@@ -1839,6 +1875,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedJobSubmission { .. }
             | MetadataTransportMessage::ForwardedProfileValidation { .. }
             | MetadataTransportMessage::ForwardedProfileValidationStatus { .. }
+            | MetadataTransportMessage::ReferencePreflightResults { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -2713,6 +2750,31 @@ impl MetadataHandle {
             Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
+    }
+
+    pub async fn request_remote_reference_preflight(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        request: super::api::MetadataReferencePreflightNodeRequest,
+    ) -> Result<super::api::MetadataReferencePreflightNodeExecution, MetadataReadError> {
+        match send_remote_metadata_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::ReferencePreflight {
+                auth_token,
+                request: Box::new(request),
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ReferencePreflightResults { result } => {
+                result.map(|result| *result)
+            }
+            _ => Err(MetadataReadError::Unavailable),
+        }
     }
 }
 
@@ -4648,6 +4710,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedProfileValidationStatus { .. } => {
             "forwarded_profile_validation_status"
         }
+        MetadataTransportMessage::ReferencePreflight { .. } => "reference_preflight",
+        MetadataTransportMessage::ReferencePreflightResults { .. } => "reference_preflight_results",
     }
 }
 
