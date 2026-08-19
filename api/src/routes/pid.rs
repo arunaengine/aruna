@@ -1,6 +1,7 @@
-//! w3id persistent-identifier landing resolution. A PID is the document graph IRI
-//! `https://w3id.org/aruna/{document_id}`; every operation routes to the single
-//! authority that reads and writes the mapping.
+//! Automatic typed w3id lifecycle and landing resolution. Ordinary documents
+//! use `https://w3id.org/aruna/{document_id}`; Profiles use only
+//! `https://w3id.org/aruna/profile/{document_id}`. Every lifecycle read and
+//! transition routes to the document's single PID authority.
 
 use std::sync::Arc;
 
@@ -9,14 +10,16 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::OpenApi;
+use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_core::structs::{
     AuthContext, DEFAULT_JOB_RETENTION_MS, MetadataRegistryRecord, MintPersistentIdSpec,
-    Permission, PersistentIdStatus,
+    Permission, PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
+    PersistentIdStatus,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
@@ -24,7 +27,9 @@ use aruna_operations::jobs::service::submit_mint_pid;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::forward::{resolve_pid_routed, withdraw_pid_routed};
+use aruna_operations::metadata::forward::{
+    read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
+};
 
 use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
@@ -42,6 +47,8 @@ pub struct PidApiDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(PidApiDoc::openapi()).routes(routes!(
         resolve_pid,
+        resolve_profile_pid,
+        list_persistent_ids,
         mint_pid,
         withdraw_pid
     ))
@@ -56,7 +63,7 @@ fn rocrate_location(document_id: Ulid) -> String {
     path = "/pid/{document_id}",
     tag = "pid",
     summary = "Resolve a w3id persistent identifier",
-    description = "Public landing route behind https://w3id.org/aruna/{document_id}: no bearer token is required or read. A registered identifier answers 302 to the document's RO-Crate read route, which then applies its own authorization, so this route reveals no document content. A withdrawn identifier answers a permanent 410 tombstone and never returns to 302. An unknown or malformed identifier answers 404, which deliberately does not distinguish a never-minted identifier from a document the caller may not see. The mapping is read from the document's single PID authority; when that node is unreachable the answer is 503 rather than 404, so a live identifier never reads as dead.",
+    description = "Public landing route for the ordinary identity https://w3id.org/aruna/{document_id}; a Profile's mapping uses /profile/{document_id}, so this ordinary path returns 404 for a Profile and never acts as a duplicate PID. No bearer token is required or read. An active public identifier answers 302 to the document's RO-Crate read route, which applies its own authorization. A terminal tombstone answers 410. Unknown, malformed, private, requested, processing and failed identifiers answer 404. When the single PID authority is unreachable the answer is 503 rather than a false 404.",
     params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID, for example 01JMETADATA0123456789ABCDE")),
     responses(
         (status = 302, description = "Registered identifier; the Location header points at /api/v1/metadata/{document_id}/rocrate and the body is empty"),
@@ -80,7 +87,46 @@ async fn resolve_pid(
         return StatusCode::NOT_FOUND.into_response();
     };
     let ctx = state.get_ctx();
-    let resolved = resolve_pid_routed(&ctx, state.get_realm_id(), document_id).await;
+    let resolved = resolve_pid_routed(
+        &ctx,
+        state.get_realm_id(),
+        document_id,
+        MetadataRegistryRecord::graph_iri_for(document_id),
+    )
+    .await;
+    landing_response(document_id, resolved)
+}
+
+#[utoipa::path(
+    get,
+    path = "/profile/{document_id}",
+    tag = "pid",
+    summary = "Resolve a Profile w3id persistent identifier",
+    description = "Public landing route for the Profile identity https://w3id.org/aruna/profile/{document_id}. It resolves only when that exact value is the document's stored automatic primary PID; ordinary Datasets return 404 here. Response privacy, 302/410 lifecycle behavior and 503 authority handling are identical to GET /pid/{document_id}.",
+    params(("document_id" = String, Path, description = "Profile document ULID")),
+    responses(
+        (status = 302, description = "Active public Profile identifier"),
+        (status = 404, description = "Unknown, private, non-Profile or non-active identifier"),
+        (status = 410, description = "The exact Profile identifier is terminally retired"),
+        (status = 503, description = "The PID authority is unreachable")
+    ),
+    security(())
+)]
+async fn resolve_profile_pid(
+    State(state): State<Arc<ServerState>>,
+    Path(document_id): Path<String>,
+) -> Response {
+    let Ok(document_id) = Ulid::from_string(&document_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let ctx = state.get_ctx();
+    let resolved = resolve_pid_routed(
+        &ctx,
+        state.get_realm_id(),
+        document_id,
+        PersistentIdMapping::profile_pid(document_id),
+    )
+    .await;
     landing_response(document_id, resolved)
 }
 
@@ -125,14 +171,214 @@ fn gone(pid: &str) -> Response {
         .into_response()
 }
 
-/// Register a w3id PID for a document. Idempotent by document id; requires WRITE
-/// on the document. Runs as a fenced job, so the response is 202 Accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+enum PersistentIdStateView {
+    Requested,
+    Processing,
+    Active,
+    Failed,
+    AdminWithdrawn,
+    Tombstoned,
+    LegacyUnminted,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct PersistentIdFailureView {
+    message: String,
+    retryable: bool,
+    recorded_at_ms: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct PersistentIdView {
+    kind: String,
+    provider: String,
+    value: Option<String>,
+    state: PersistentIdStateView,
+    document_id: String,
+    job_id: Option<String>,
+    failure: Option<PersistentIdFailureView>,
+    requested_at_ms: Option<u64>,
+    minted_at_ms: Option<u64>,
+    withdrawn_at_ms: Option<u64>,
+}
+
+fn status_view(mapping: &PersistentIdMapping) -> PersistentIdView {
+    let state = match mapping.status {
+        PersistentIdStatus::Requested => PersistentIdStateView::Requested,
+        PersistentIdStatus::Processing => PersistentIdStateView::Processing,
+        PersistentIdStatus::Active => PersistentIdStateView::Active,
+        PersistentIdStatus::Failed => PersistentIdStateView::Failed,
+        PersistentIdStatus::AdminWithdrawn => PersistentIdStateView::AdminWithdrawn,
+        PersistentIdStatus::Tombstoned => PersistentIdStateView::Tombstoned,
+        PersistentIdStatus::Withdrawn => PersistentIdStateView::Unknown,
+    };
+    PersistentIdView {
+        kind: match mapping.kind {
+            PersistentIdKind::Conceptual => "conceptual".to_string(),
+        },
+        provider: match mapping.provider {
+            PersistentIdProvider::W3id => "w3id".to_string(),
+        },
+        value: Some(mapping.pid.clone()),
+        state,
+        document_id: mapping.target.to_string(),
+        job_id: mapping.job_id.map(|job_id| job_id.to_string()),
+        failure: mapping.failure.as_ref().map(
+            |PersistentIdFailure {
+                 message,
+                 retryable,
+                 recorded_at_ms,
+             }| PersistentIdFailureView {
+                message: message.clone(),
+                retryable: *retryable,
+                recorded_at_ms: *recorded_at_ms,
+            },
+        ),
+        requested_at_ms: mapping.requested_at_ms,
+        minted_at_ms: mapping.minted_at_ms,
+        withdrawn_at_ms: mapping.withdrawn_at_ms,
+    }
+}
+
+fn synthetic_status_view(
+    document_id: Ulid,
+    value: Option<String>,
+    state: PersistentIdStateView,
+) -> PersistentIdView {
+    PersistentIdView {
+        kind: "conceptual".to_string(),
+        provider: "w3id".to_string(),
+        value,
+        state,
+        document_id: document_id.to_string(),
+        job_id: None,
+        failure: None,
+        requested_at_ms: None,
+        minted_at_ms: None,
+        withdrawn_at_ms: None,
+    }
+}
+
+async fn require_status_visibility(
+    state: &ServerState,
+    auth: Option<&AuthContext>,
+    mapping: Option<&PersistentIdMapping>,
+    record: Option<&MetadataRegistryRecord>,
+) -> ServerResult<()> {
+    let public = mapping
+        .and_then(|mapping| mapping.public)
+        .or_else(|| record.map(|record| record.public));
+    if public == Some(true) {
+        return Ok(());
+    }
+    let Some(auth) = auth else {
+        return Err(ServerError::NotFound);
+    };
+    let path = mapping
+        .and_then(|mapping| mapping.permission_path.clone())
+        .or_else(|| record.map(|record| record.permission_path.clone()))
+        .unwrap_or_else(|| format!("/{}/admin/pids/**", state.get_realm_id()));
+    ensure_permission(state, auth, path, Permission::READ).await
+}
+
+async fn expected_legacy_pid(
+    state: &ServerState,
+    record: &MetadataRegistryRecord,
+) -> Option<String> {
+    let ctx = state.get_ctx();
+    let handle = ctx.metadata_handle.as_ref()?;
+    let summary = handle
+        .export_rocrate_summary_jsonld(record.graph_iri.clone())
+        .await
+        .ok()?;
+    let profile =
+        aruna_operations::metadata::stats::summary_is_profile(&summary, &record.graph_iri).ok()?;
+    Some(PersistentIdMapping::automatic_pid(
+        record.document_id,
+        profile,
+    ))
+}
+
+/// Authenticated typed status is sourced only from the durable PID mapping.
+/// `requested`, `processing`, `active`, `failed`, `admin-withdrawn` and
+/// `tombstoned` are its stored lifecycle states; failure and job fields come
+/// from that same row, never from a possibly unreadable job endpoint.
+/// `legacy-unminted` means an authorized live registry row exists while the PID
+/// authority has no mapping and its projected root can be classified. `unknown`
+/// means the caller may read the document but the authority or classification
+/// cannot currently give a definitive record. Anonymous access to a private
+/// mapping or registry row remains 404 and is not an existence oracle.
+#[utoipa::path(
+    get,
+    path = "/metadata/{document_id}/pids",
+    tag = "pid",
+    summary = "List a document's typed persistent identifiers",
+    description = "Returns the one stored automatic w3id record as a typed list while storage remains keyed 1:1 by document. Stored mapping state is authoritative for requested, processing, active, failed, admin-withdrawn and tombstoned, including its job reference and failure/retry data; job-read failure is never interpreted as unminted. An authorized live legacy document with no authority mapping is legacy-unminted only after its projected root identifies the exact general or Profile identity. Authority or classification ambiguity is unknown. Public records may be read anonymously; a private record returns 404 anonymously and requires READ on its frozen document permission path when authenticated.",
+    params(("document_id" = String, Path, description = "Metadata document ULID")),
+    responses(
+        (status = 200, description = "Typed list containing the automatic w3id status", body = [PersistentIdView]),
+        (status = 400, description = "Malformed document id", body = ErrorResponse),
+        (status = 403, description = "Authenticated caller lacks READ", body = ErrorResponse),
+        (status = 404, description = "Unknown document or anonymous private status", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ())
+)]
+async fn list_persistent_ids(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(document_id): Path<String>,
+) -> ServerResult<Json<Vec<PersistentIdView>>> {
+    let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
+    let ctx = state.get_ctx();
+    let record = load_metadata_record_by_document(&ctx, document_id)
+        .await
+        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?;
+    let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
+    match routed {
+        Ok(Some(mapping)) => {
+            require_status_visibility(&state, auth.as_ref(), Some(&mapping), record.as_ref())
+                .await?;
+            Ok(Json(vec![status_view(&mapping)]))
+        }
+        Ok(None) => {
+            let record = record.as_ref().ok_or(ServerError::NotFound)?;
+            require_status_visibility(&state, auth.as_ref(), None, Some(record)).await?;
+            let value = expected_legacy_pid(&state, record).await;
+            let status = if value.is_some() {
+                PersistentIdStateView::LegacyUnminted
+            } else {
+                PersistentIdStateView::Unknown
+            };
+            Ok(Json(vec![synthetic_status_view(
+                document_id,
+                value,
+                status,
+            )]))
+        }
+        Err(_) => {
+            let record = record.as_ref().ok_or(ServerError::NotFound)?;
+            require_status_visibility(&state, auth.as_ref(), None, Some(record)).await?;
+            Ok(Json(vec![synthetic_status_view(
+                document_id,
+                None,
+                PersistentIdStateView::Unknown,
+            )]))
+        }
+    }
+}
+
+/// Compatibility trigger for legacy documents. New creates already carry their
+/// typed intent and fenced job; this route returns that same intent and never
+/// submits a second mint.
 #[utoipa::path(
     post,
     path = "/pid/{document_id}",
     tag = "pid",
     summary = "Mint a w3id persistent identifier for a document",
-    description = "Requires an unrestricted realm bearer token and WRITE on the document's permission path; a path-restricted delegated token is rejected. The request is submitted as a fenced job on the document's PID authority, so 202 means the mint was durably accepted there, not that the identifier already resolves; poll the returned job id for completion. Minting is idempotent per document: a repeated request returns created=false with the same identifier. Because the authority answers for the document, its verdicts are returned as they are, including 404 for an unknown document and 403 when the authority denies the write.",
+    description = "Compatibility route requiring an unrestricted realm bearer token and WRITE on the document. Metadata creation already records the automatic typed w3id intent and fenced job atomically. If that intent exists, this route returns its exact general-or-Profile value and stored job id with created=false without submitting another job. Only a live legacy document with no mapping submits the existing document-scoped deduplicated job; reconciliation supplies its typed mapping. If authority status is unavailable the route returns 503 instead of risking a duplicate.",
     params(("document_id" = String, Path, description = "Document ULID to mint a PID for, for example 01JMETADATA0123456789ABCDE")),
     responses(
         (
@@ -171,6 +417,21 @@ async fn mint_pid(
     )
     .await?;
 
+    match read_pid_routed(&ctx, state.get_realm_id(), document_id).await {
+        Ok(Some(mapping)) => {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "pid": mapping.pid,
+                    "job_id": mapping.job_id.map(|job_id| job_id.to_string()),
+                    "created": false,
+                })),
+            ));
+        }
+        Ok(None) => {}
+        Err(_) => return Err(ServerError::ServiceUnavailable),
+    }
+
     let result = submit_mint_pid(
         &ctx,
         MintPersistentIdSpec {
@@ -187,29 +448,48 @@ async fn mint_pid(
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
-            "pid": MetadataRegistryRecord::graph_iri_for(document_id),
+            "pid": expected_legacy_pid(&state, &record)
+                .await
+                .unwrap_or_else(|| MetadataRegistryRecord::graph_iri_for(document_id)),
             "job_id": result.job_id.to_string(),
             "created": result.created,
         })),
     ))
 }
 
-/// Explicit admin withdrawal: flip a document's PID to a permanent 410 tombstone,
-/// writing the tombstone even when nothing was ever minted so an accepted mint job
-/// cannot land after it. Deletion withdraws automatically; this is the manual
-/// path. Idempotent, and 204 only once the transition is durable on the authority.
+#[derive(Debug, Deserialize, ToSchema)]
+struct WithdrawPersistentIdRequest {
+    provider: String,
+    confirm_pid: String,
+    reason: String,
+}
+
+fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerResult<String> {
+    let reason = request.reason.trim();
+    if request.provider != "w3id"
+        || reason.is_empty()
+        || reason.len() > 1_024
+        || reason.chars().any(char::is_control)
+    {
+        return Err(ServerError::BadRequest);
+    }
+    Ok(reason.to_string())
+}
+
+/// Exceptional admin-only withdrawal. Normal deletion uses the distinct
+/// tombstone transition; owners with only document WRITE cannot call this path.
 #[utoipa::path(
     delete,
     path = "/pid/{document_id}",
     tag = "pid",
     summary = "Withdraw a document's w3id persistent identifier",
-    description = "Requires an unrestricted realm bearer token and WRITE on the document's permission path. Withdrawal is terminal: the identifier answers 410 from then on and cannot be minted again, and the tombstone is written even when nothing was minted yet so an in-flight mint job cannot land after it. Deleting a document withdraws its identifier automatically; this is the manual path. The call is idempotent and answers 204 only once the transition is durable on the document's PID authority, otherwise 503.",
+    description = "Exceptional administration route. It requires an unrestricted realm bearer token and WRITE on /{realm}/admin/pids/{document_id}; document WRITE alone is deliberately insufficient. The JSON body must name provider w3id, confirm the exact stored PID value and contain a non-empty reason. The authority stores admin-withdrawn, actor and reason and writes a WithdrawPersistentId metadata audit row in the same transaction. Normal document deletion instead stores tombstoned. The transition is terminal and idempotent.",
     params(("document_id" = String, Path, description = "Document ULID whose PID is withdrawn, for example 01JMETADATA0123456789ABCDE")),
     responses(
         (status = 204, description = "The withdrawal is durable on the PID authority; the response has no body"),
-        (status = 400, description = "Malformed document id", body = ErrorResponse),
+        (status = 400, description = "Malformed id, unsupported provider, wrong confirmation, or invalid reason", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Caller lacks WRITE on the document", body = ErrorResponse),
+        (status = 403, description = "Caller lacks realm PID administration WRITE", body = ErrorResponse),
         (status = 404, description = "Document not found", body = ErrorResponse),
         (status = 503, description = "PID authority unreachable, retry later", body = ErrorResponse)
     ),
@@ -220,31 +500,38 @@ async fn withdraw_pid(
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
+    Json(request): Json<WithdrawPersistentIdRequest>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
+    let reason = validated_withdrawal_reason(&request)?;
     let ctx = state.get_ctx();
-    let record = load_metadata_record_by_document(&ctx, document_id)
-        .await
-        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?
-        .ok_or(ServerError::NotFound)?;
     ensure_permission(
         &state,
         &auth,
-        record.permission_path.clone(),
+        format!("/{}/admin/pids/{document_id}", state.get_realm_id()),
         Permission::WRITE,
     )
     .await?;
+    let existing = read_pid_routed(&ctx, state.get_realm_id(), document_id)
+        .await
+        .map_err(map_metadata_api_error)?
+        .ok_or(ServerError::NotFound)?;
+    if request.confirm_pid != existing.pid {
+        return Err(ServerError::BadRequest);
+    }
     let mapping = withdraw_pid_routed(
         &ctx,
         state.get_realm_id(),
         document_id,
+        auth.user_id,
+        reason,
         unix_timestamp_millis(),
         forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_api_error)?;
-    if mapping.status != PersistentIdStatus::Withdrawn {
+    if mapping.status != PersistentIdStatus::AdminWithdrawn {
         return Err(ServerError::ServiceUnavailable);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -314,5 +601,51 @@ mod tests {
             mint_submit_error(SubmitJobError::InvalidWorkspace("bad".to_string())),
             ServerError::InternalError(_)
         ));
+    }
+
+    #[test]
+    fn stored_intent_does_not_depend_on_job_readability() {
+        let id = Ulid::from_bytes([3; 16]);
+        let mapping = PersistentIdMapping::requested(
+            id,
+            false,
+            aruna_core::UserId::local(
+                Ulid::from_bytes([4; 16]),
+                aruna_core::structs::RealmId([5; 32]),
+            ),
+            aruna_core::structs::JobId::from_bytes([6; 16]),
+            false,
+            "/private/document".to_string(),
+            aruna_core::structs::PersistentIdRevision {
+                event_id: Ulid::from_bytes([7; 16]),
+                actor: iroh::SecretKey::from_bytes(&[8; 32]).public(),
+                occurred_at_ms: 9,
+            },
+        );
+
+        let view = status_view(&mapping);
+        assert_eq!(view.state, PersistentIdStateView::Requested);
+        assert_eq!(view.job_id, mapping.job_id.map(|job_id| job_id.to_string()));
+        assert_eq!(view.value.as_deref(), Some(mapping.pid.as_str()));
+    }
+
+    #[test]
+    fn admin_withdrawal_requires_provider_confirmation_fields() {
+        let valid = WithdrawPersistentIdRequest {
+            provider: "w3id".to_string(),
+            confirm_pid: "https://w3id.org/aruna/example".to_string(),
+            reason: "  duplicate external registration  ".to_string(),
+        };
+        assert_eq!(
+            validated_withdrawal_reason(&valid).unwrap(),
+            "duplicate external registration"
+        );
+        assert!(
+            validated_withdrawal_reason(&WithdrawPersistentIdRequest {
+                provider: "doi".to_string(),
+                ..valid
+            })
+            .is_err()
+        );
     }
 }

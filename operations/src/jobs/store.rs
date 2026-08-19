@@ -1383,6 +1383,42 @@ pub async fn release_job(
     })
 }
 
+/// Requeue a dependency-blocked job without spending an attempt. Unlike a
+/// shutdown release, this records the reason and delays the next claim so a
+/// lagging projection is not hot-polled.
+pub async fn defer_job(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    retry_after_ms: u64,
+    error: JobError,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    let mut deferred = false;
+    let record = mutate_job(storage, job_id, |record| {
+        deferred = false;
+        guard_token(record, token)?;
+        if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        record.state = JobState::Queued;
+        record.claim = None;
+        record.due_at_ms = now_ms.saturating_add(retry_after_ms);
+        record.updated_at_ms = now_ms;
+        record.last_error = Some(error.clone());
+        record.progress = JobProgress::new(record.payload.progress_unit());
+        deferred = true;
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+
+    Ok(if deferred {
+        ReleaseOutcome::Released(record)
+    } else {
+        ReleaseOutcome::Skipped
+    })
+}
+
 /// Hand an external execution to reconciliation without re-queuing it.
 /// Rotating the token fences the old supervisor; the expired replacement claim keeps
 /// the unchanged state and attempt intent discoverable by the lease sweep.
@@ -2991,6 +3027,44 @@ mod tests {
         // queue_retry_after_ms(1) = 500ms.
         assert_eq!(record.due_at_ms, 6_500);
         assert!(record.claim.is_none());
+    }
+
+    #[tokio::test]
+    async fn deferred_dependency_does_not_spend_attempt() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0x44u8; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(record) = claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = record.claim.unwrap().claim_token;
+
+        let ReleaseOutcome::Released(deferred) = defer_job(
+            &storage,
+            job_id,
+            token,
+            6_000,
+            1_000,
+            JobError::retryable("metadata projection pending"),
+        )
+        .await
+        .unwrap() else {
+            panic!("job must be deferred")
+        };
+        assert_eq!(deferred.state, JobState::Queued);
+        assert_eq!(deferred.attempts, 0);
+        assert_eq!(deferred.due_at_ms, 7_000);
+        assert!(deferred.claim.is_none());
+        assert_eq!(
+            deferred
+                .last_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("metadata projection pending")
+        );
     }
 
     // Retried payload work starts over, so persisted progress must start over too.

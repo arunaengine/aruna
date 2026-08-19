@@ -5,6 +5,7 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
     METADATA_RAW_BYTES_LIMIT, MetadataCreateCrateRequest, MetadataCreateEventPayload,
@@ -17,8 +18,10 @@ use aruna_core::storage_entries::{
     metadata_profile_validation_status_write_entry, raw_budget_entry,
 };
 use aruna_core::structs::{
-    Actor, BindingError, DocumentClass, MetadataRegistryRecord, PlacementRef, PlacementScope,
-    PlacementStrategy, RealmConfigDocument, RealmId, shard_for_subject,
+    Actor, BindingError, DEFAULT_JOB_RETENTION_MS, DocumentClass, JobPayload, JobRecord,
+    MetadataRegistryRecord, MintPersistentIdSpec, PersistentIdMapping, PlacementRef,
+    PlacementScope, PlacementStrategy, RealmConfigDocument, RealmId, WorkspaceMode, pid_dedup_key,
+    shard_for_subject,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
 use aruna_core::types::{Effects, GroupId, TxnId, Value};
@@ -37,6 +40,7 @@ use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{
     metadata_create_event_and_pending_projection_write_entries, read_registry_by_document_effect,
 };
+use crate::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
 use crate::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
@@ -96,6 +100,9 @@ pub struct CreateMetadataDocumentOperation {
     record: Option<MetadataRegistryRecord>,
     create_event: Option<MetadataCreateEventRecord>,
     profile_validation_status: Option<MetadataProfileValidationStatus>,
+    pending_realm_config: Option<RealmConfigDocument>,
+    pending_placement: Option<PlacementRef>,
+    pending_holders: Vec<NodeId>,
     output: Option<Result<CreateMetadataDocumentResult, CreateMetadataDocumentError>>,
 }
 
@@ -106,6 +113,7 @@ enum CreateMetadataDocumentState {
     CheckExisting,
     StartTransaction,
     ReadCreateFence,
+    ReadPidFence,
     AppendCreateEvent,
     CommitTransaction,
     Finish,
@@ -143,6 +151,8 @@ pub enum CreateMetadataDocumentError {
     RawLimit,
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
+    #[error("persistent id mapping bucket is closing; retry the create")]
+    PlacementFenced,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -174,6 +184,9 @@ impl CreateMetadataDocumentOperation {
             record: None,
             create_event: None,
             profile_validation_status,
+            pending_realm_config: None,
+            pending_placement: None,
+            pending_holders: Vec::new(),
             output: None,
         }
     }
@@ -209,6 +222,9 @@ impl CreateMetadataDocumentOperation {
             record: None,
             create_event: None,
             profile_validation_status: self.profile_validation_status.clone(),
+            pending_realm_config: None,
+            pending_placement: None,
+            pending_holders: Vec::new(),
             output: None,
         }
     }
@@ -448,23 +464,67 @@ impl CreateMetadataDocumentOperation {
             return self.fail(StorageError::TransactionConflict.into());
         }
 
-        let config = match realm_config_value.as_ref() {
-            Some(bytes) => match RealmConfigDocument::from_bytes(bytes) {
-                Ok(config) => Some(config),
-                Err(error) => return self.fail(error.into()),
-            },
-            None => None,
+        let Some(config_bytes) = realm_config_value.as_ref() else {
+            return self.fail(CreateMetadataDocumentError::PlacementBindingUnavailable(
+                "realm config unavailable".to_string(),
+            ));
         };
-        match self.placement_from_id(config.as_ref()) {
-            Ok(placement) => match self.holder_node_ids(config.as_ref(), &placement) {
-                Ok(holders) => self.append_create_event(placement, holders),
+        let config = match RealmConfigDocument::from_bytes(config_bytes) {
+            Ok(config) => config,
+            Err(error) => return self.fail(error.into()),
+        };
+        match self.placement_from_id(Some(&config)) {
+            Ok(placement) => match self.holder_node_ids(Some(&config), &placement) {
+                Ok(holders) => self.read_pid_fence_or_append(config, placement, holders),
                 Err(error) => self.fail(error),
             },
             Err(error) => self.fail(error),
         }
     }
 
-    fn append_create_event(&mut self, placement: PlacementRef, holders: Vec<NodeId>) -> Effects {
+    fn read_pid_fence_or_append(
+        &mut self,
+        realm_config: RealmConfigDocument,
+        placement: PlacementRef,
+        holders: Vec<NodeId>,
+    ) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(CreateMetadataDocumentError::MissingTransaction);
+        };
+        let route = mapping_route_for(
+            &realm_config,
+            self.config.actor.realm_id,
+            self.config.document_id,
+            self.config.actor.node_id,
+        );
+        let Some(route) = route else {
+            return self.append_create_event(&realm_config, placement, holders);
+        };
+        if route.peers.first().copied() != Some(self.config.actor.node_id) {
+            return self.fail(CreateMetadataDocumentError::OriginHoldsNoBucket);
+        }
+        if route.generation == 0 {
+            return self.append_create_event(&realm_config, placement, holders);
+        }
+        let (key_space, key) =
+            crate::placement::fence::fence_read(&route.realm_id, &route.placement);
+        self.pending_realm_config = Some(realm_config);
+        self.pending_placement = Some(placement);
+        self.pending_holders = holders;
+        self.state = CreateMetadataDocumentState::ReadPidFence;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space,
+            key,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn append_create_event(
+        &mut self,
+        realm_config: &RealmConfigDocument,
+        placement: PlacementRef,
+        holders: Vec<NodeId>,
+    ) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(CreateMetadataDocumentError::MissingTransaction);
         };
@@ -516,7 +576,62 @@ impl CreateMetadataDocumentOperation {
                 writes.push(metadata_profile_validation_status_write_entry(&status)?);
                 Ok(writes)
             });
-        match writes {
+        match writes.and_then(|mut writes| {
+            let profile = match &self.config.payload {
+                CreateMetadataDocumentPayload::Scaffold { .. } => false,
+                CreateMetadataDocumentPayload::RoCrate { jsonld } => {
+                    crate::metadata::stats::rocrate_is_profile(
+                        jsonld,
+                        &create_event.record.graph_iri,
+                    )
+                    .map_err(|error| aruna_core::errors::ConversionError::FromStrError(error))?
+                }
+            };
+            let dedup_key = pid_dedup_key(create_event.record.document_id);
+            let job_id = crate::jobs::service::mint_local_job_from_config(
+                realm_config,
+                create_event.node_id,
+                &dedup_key,
+            )
+            .map_err(|error| {
+                aruna_core::errors::ConversionError::FromStrError(error.to_string())
+            })?;
+            let mut job = JobRecord::new(
+                job_id,
+                JobPayload::MintPersistentId(MintPersistentIdSpec {
+                    document_id: create_event.record.document_id,
+                    minted_by: create_event.user_id,
+                }),
+                create_event.user_id,
+                create_event.node_id,
+                create_event.occurred_at_ms,
+                create_event.occurred_at_ms,
+                Some(dedup_key),
+            );
+            job.workspace_mode = WorkspaceMode::None;
+            job.retention_ms = DEFAULT_JOB_RETENTION_MS;
+            writes.extend(crate::jobs::store::job_insert_entries(&job)?);
+
+            let route = mapping_route_for(
+                realm_config,
+                create_event.record.realm_id,
+                create_event.record.document_id,
+                create_event.node_id,
+            );
+            let mapping = PersistentIdMapping::requested(
+                create_event.record.document_id,
+                profile,
+                create_event.user_id,
+                job_id,
+                create_event.record.public,
+                create_event.record.permission_path.clone(),
+                mapping_revision(&route, create_event.occurred_at_ms),
+            );
+            writes.extend(transition_entries(&route, &mapping).map_err(|error| {
+                aruna_core::errors::ConversionError::FromStrError(error.to_string())
+            })?);
+            Ok(writes)
+        }) {
             Ok(writes) => {
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
                     writes,
@@ -665,6 +780,11 @@ pub async fn create_metadata_document(
     schedule_pending_metadata_projection_drain(context.as_ref(), std::time::Duration::ZERO)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    if let Some(task_handle) = context.task_handle.as_ref() {
+        task_handle
+            .send_effect(crate::jobs::submit::schedule_job_drain_effect())
+            .await;
+    }
     Ok(created)
 }
 
@@ -918,6 +1038,33 @@ impl Operation for CreateMetadataDocumentOperation {
                 }
                 other => self.unexpected_event("create fence read result", format!("{other:?}")),
             },
+            CreateMetadataDocumentState::ReadPidFence => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(config) = self.pending_realm_config.take() else {
+                        return self.fail(CreateMetadataDocumentError::PlacementFenced);
+                    };
+                    let Some(placement) = self.pending_placement.take() else {
+                        return self.fail(CreateMetadataDocumentError::PlacementFenced);
+                    };
+                    let holders = std::mem::take(&mut self.pending_holders);
+                    let Some(route) = mapping_route_for(
+                        &config,
+                        self.config.actor.realm_id,
+                        self.config.document_id,
+                        self.config.actor.node_id,
+                    ) else {
+                        return self.fail(CreateMetadataDocumentError::PlacementFenced);
+                    };
+                    if !crate::placement::fence::admits(value.as_ref(), route.generation) {
+                        return self.fail(CreateMetadataDocumentError::PlacementFenced);
+                    }
+                    self.append_create_event(&config, placement, holders)
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.fail_without_cleanup(error.into())
+                }
+                other => self.unexpected_event("persistent id fence read", format!("{other:?}")),
+            },
             CreateMetadataDocumentState::AppendCreateEvent => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     self.commit_transaction_effect()
@@ -953,6 +1100,9 @@ impl Operation for CreateMetadataDocumentOperation {
                     self.txn_id = None;
                     self.record = None;
                     self.create_event = None;
+                    self.pending_realm_config = None;
+                    self.pending_placement = None;
+                    self.pending_holders.clear();
                     self.conflict_recheck = true;
                     self.start_transaction_effect()
                 }
@@ -1002,9 +1152,10 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
+        JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
         METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
         METADATA_EVENT_LOG_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
-        METADATA_RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        METADATA_RAW_BUDGET_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::metadata::{
         MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataError,
@@ -1015,10 +1166,13 @@ mod tests {
         metadata_create_acceptance_key, metadata_event_log_prefix, metadata_pending_projection_key,
     };
     use aruna_core::structs::{
-        Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
+        Actor, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, JobPayload,
+        JobRecord, MetadataRegistryRecord, PersistentIdMapping, PersistentIdStatus,
+        PlacementBinding, PlacementRef, PlacementScope, RealmConfigDocument, RealmId,
+        RealmNodeKind,
     };
     use aruna_core::types::{Effects, GroupId, Key};
-    use aruna_core::{MetaResourceId, StructuredId};
+    use aruna_core::{MetaResourceId, PlacementHandle, StructuredId};
     use aruna_storage::storage::EffectReceiver;
     use aruna_storage::{FjallStorage, StorageHandle};
     use ulid::Ulid;
@@ -1035,11 +1189,12 @@ mod tests {
         }
     }
 
-    // Four servers at the default replication factor: no node holds every
-    // bucket, so a stamped bucket the origin holds is a real assertion.
+    // Four servers at replica one: no node holds every bucket, and the holder
+    // accepting this low-level create is also its PID authority.
     fn realm_config(actor: &Actor) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::default_for_realm(actor.realm_id, Vec::new());
         config.seed_default_placement();
+        config.strategies[0].replica_count = Some(1);
         config.ensure_node(actor.node_id, RealmNodeKind::Server);
         for seed in 20..23u8 {
             config.ensure_node(
@@ -1047,6 +1202,22 @@ mod tests {
                 RealmNodeKind::Server,
             );
         }
+        let range_id = Ulid::from_bytes([19; 16]);
+        config.placement_handle_ranges.push(HandleRange {
+            range_id,
+            owner: actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
+        });
+        config.placement_bindings.push(PlacementBinding {
+            handle: PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+            scope: PlacementScope::Realm(actor.realm_id),
+            document_class: DocumentClass::JobControl,
+            strategy_id: config.default_strategy_id.unwrap(),
+            allocator_range_id: Some(range_id),
+            allocated_by: Some(actor.node_id),
+            allocated_at_ms: Some(1),
+        });
         config
     }
 
@@ -1088,6 +1259,22 @@ mod tests {
                 ),
             ],
         })
+    }
+
+    fn apply_create_and_pid_fences(
+        operation: &mut CreateMetadataDocumentOperation,
+        actor: &Actor,
+        document_id: Ulid,
+        config: &RealmConfigDocument,
+    ) -> Effects {
+        let effects = operation.step(create_fence_read(actor, document_id, Some(config)));
+        let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
+            return effects;
+        };
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: key.clone(),
+            value: None,
+        }))
     }
 
     fn assert_fence_read(effects: &[Effect]) {
@@ -1152,7 +1339,8 @@ mod tests {
         };
         assert_eq!(*read_txn, txn_id);
 
-        let effects = operation.step(create_fence_read(&actor, document_id, Some(&realm_config)));
+        let effects =
+            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
         let [
             Effect::Storage(StorageEffect::BatchWrite {
                 writes,
@@ -1182,6 +1370,14 @@ mod tests {
             writes
                 .iter()
                 .any(|(key_space, _, _)| key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE)
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(key_space, _, _)| key_space == JOB_KEYSPACE)
+                .count(),
+            1,
+            "one create attempt carries one PID job"
         );
 
         let mut winner: MetadataCreateEventRecord = writes
@@ -1325,7 +1521,17 @@ mod tests {
             panic!("expected metadata create event append");
         };
         assert!(txn_id.is_some());
-        assert_eq!(writes.len(), 4);
+        for required in [
+            JOB_KEYSPACE,
+            JOB_SCHEDULE_INDEX_KEYSPACE,
+            JOB_DEDUP_INDEX_KEYSPACE,
+            PERSISTENT_ID_MAPPING_KEYSPACE,
+        ] {
+            assert!(
+                writes.iter().any(|(key_space, _, _)| key_space == required),
+                "atomic create write is missing {required}"
+            );
+        }
         let (_, key, value) = writes
             .iter()
             .find(|(key_space, _, _)| key_space == METADATA_EVENT_LOG_KEYSPACE)
@@ -1352,6 +1558,23 @@ mod tests {
             &event.payload,
             MetadataCreateEventPayload::Scaffold { .. }
         ));
+
+        let job: JobRecord = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == JOB_KEYSPACE)
+            .and_then(|(_, _, value)| JobRecord::from_bytes(value).ok())
+            .expect("atomic PID job decodes");
+        let mapping = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == PERSISTENT_ID_MAPPING_KEYSPACE)
+            .and_then(|(_, _, value)| PersistentIdMapping::from_bytes(value).ok())
+            .expect("atomic PID intent decodes");
+        assert!(matches!(
+            job.payload,
+            JobPayload::MintPersistentId(ref spec) if spec.document_id == document_id
+        ));
+        assert_eq!(mapping.job_id, Some(job.job_id));
+        assert_eq!(mapping.status, PersistentIdStatus::Requested);
 
         let (_, acceptance_key, acceptance_value) = writes
             .iter()
@@ -1423,8 +1646,63 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_fence_read(effects.as_slice());
-        let effects = operation.step(create_fence_read(&actor, document_id, Some(&realm_config)));
+        let effects =
+            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
         assert_create_event_append(effects.as_slice(), document_id, &actor);
+    }
+
+    #[test]
+    fn profile_create_records_only_profile_pid() {
+        let realm_id = RealmId([12u8; 32]);
+        let actor = actor(realm_id, 7);
+        let group_id = GroupId::generate();
+        let realm_config = realm_config(&actor);
+        let document_id = held_doc_id(&realm_config, &actor, group_id, "profiles/example");
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let mut config = config(actor.clone(), group_id, document_id);
+        config.document_path = "profiles/example".to_string();
+        config.payload = CreateMetadataDocumentPayload::RoCrate {
+            jsonld: serde_json::json!({
+                "@context": "https://w3id.org/ro/crate/1.2/context",
+                "@graph": [
+                    {
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "about": {"@id": graph_iri.clone()}
+                    },
+                    {
+                        "@id": graph_iri,
+                        "@type": ["Dataset", "http://www.w3.org/ns/dx/prof/Profile"]
+                    }
+                ]
+            })
+            .to_string(),
+        };
+        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config);
+
+        operation.start();
+        let effects = operation.step(validation_result(document_id));
+        let _ = begin_transaction(&mut operation, effects.as_slice());
+        let effects =
+            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected atomic create writes");
+        };
+        let mappings = writes
+            .iter()
+            .filter(|(key_space, _, _)| key_space == PERSISTENT_ID_MAPPING_KEYSPACE)
+            .map(|(_, _, value)| PersistentIdMapping::from_bytes(value).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[0].pid,
+            PersistentIdMapping::profile_pid(document_id)
+        );
+        assert_ne!(
+            mappings[0].pid,
+            MetadataRegistryRecord::graph_iri_for(document_id)
+        );
     }
 
     #[test]
@@ -1466,7 +1744,8 @@ mod tests {
         operation.start();
         let effects = operation.step(validation_result(document_id));
         begin_transaction(&mut operation, effects.as_slice());
-        let effects = operation.step(create_fence_read(&actor, document_id, Some(&realm_config)));
+        let effects =
+            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected transactional create append");
         };
@@ -1531,7 +1810,8 @@ mod tests {
         }));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_fence_read(effects.as_slice());
-        let effects = operation.step(create_fence_read(&actor, document_id, Some(&realm_config)));
+        let effects =
+            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         assert!(operation.record.as_ref().is_some_and(|record| {
             record.holder_node_ids.contains(&actor.node_id)
@@ -1573,7 +1853,8 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_fence_read(effects.as_slice());
-        let effects = operation.step(create_fence_read(&actor, document_id, Some(&realm_config)));
+        let effects =
+            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
@@ -1635,7 +1916,8 @@ mod tests {
         }));
         let fence_read = begin_transaction(&mut operation, existing_read.as_slice());
         assert_fence_read(fence_read.as_slice());
-        let append = operation.step(create_fence_read(&actor, document_id, Some(&realm_config)));
+        let append =
+            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
         assert_create_event_append(append.as_slice(), document_id, &actor);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {

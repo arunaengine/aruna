@@ -211,13 +211,13 @@ pub async fn count_group_documents_by_purpose(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocumentPurpose {
+pub(crate) enum DocumentPurpose {
     Profile,
     ProcessRun,
     Dataset,
 }
 
-fn classify_root_summary(
+pub(crate) fn classify_root_summary(
     summary: &str,
     graph_iri: &str,
 ) -> Result<DocumentPurpose, MetadataApiError> {
@@ -253,6 +253,51 @@ fn classify_root_summary(
     }
 
     Ok(DocumentPurpose::Dataset)
+}
+
+pub fn summary_is_profile(summary: &str, graph_iri: &str) -> Result<bool, MetadataApiError> {
+    classify_root_summary(summary, graph_iri)
+        .map(|purpose| matches!(purpose, DocumentPurpose::Profile))
+}
+
+/// Classifies the validated create payload before projection. Imported crates
+/// may still name their root as `./`, so fall back to the descriptor's `about`
+/// target when the final graph IRI is not present yet.
+pub(crate) fn rocrate_is_profile(jsonld: &str, graph_iri: &str) -> Result<bool, String> {
+    let document: Value = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
+    let graph = document
+        .get("@graph")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "RO-Crate has no @graph".to_string())?;
+    let descriptor_root = graph
+        .iter()
+        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some("ro-crate-metadata.json"))
+        .and_then(|descriptor| {
+            [
+                "about",
+                "http://schema.org/about",
+                "https://schema.org/about",
+            ]
+            .into_iter()
+            .find_map(|key| descriptor.get(key))
+        })
+        .and_then(|about| about.get("@id"))
+        .and_then(Value::as_str);
+    let root = graph
+        .iter()
+        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(graph_iri))
+        .or_else(|| {
+            descriptor_root.and_then(|root_id| {
+                graph
+                    .iter()
+                    .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(root_id))
+            })
+        })
+        .ok_or_else(|| "RO-Crate has no root entity".to_string())?;
+    Ok(jsonld_value_contains_iri(
+        root.get("@type"),
+        PROFILE_TYPE_IRI,
+    ))
 }
 
 fn collect_conforms_to_terms(value: Option<&Value>, terms: &mut HashSet<String>) {

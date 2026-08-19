@@ -73,6 +73,17 @@ pub(crate) async fn mint_local_job(
     let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
+    mint_local_job_from_config(&config, owner_node_id, subject)
+}
+
+/// Synchronous form used by producer transactions that already fenced and read
+/// the realm config. The resulting job id and dedup shard can therefore be
+/// written atomically with the producer's own records.
+pub(crate) fn mint_local_job_from_config(
+    config: &aruna_core::structs::RealmConfigDocument,
+    owner_node_id: NodeId,
+    subject: &[u8],
+) -> Result<JobId, SubmitJobError> {
     let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
         SubmitJobError::PlacementUnavailable(
             "serving node has no job-control binding yet".to_string(),

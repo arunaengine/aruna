@@ -39,7 +39,7 @@ use crate::metadata::repository::{
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
 use crate::persistent_id::{
-    MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, withdrawal_transition,
+    MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 
@@ -85,7 +85,7 @@ enum DeleteMetadataDocumentState {
     WriteGraphLifecycleOutbox,
     WriteDeleteOutbox,
     ReadPidMapping,
-    WritePidWithdrawal,
+    WritePidTombstone,
     CommitTransaction,
     ScheduleGraphPruneQueue,
     PruneGraph,
@@ -762,13 +762,9 @@ impl Operation for DeleteMetadataDocumentOperation {
                         )));
                     }
                 };
-                // A document that never minted a pid leaves no row: the
-                // registry-row fence in this transaction already blocks any
-                // later mint, and a tombstone would turn the landing 404 into
-                // an existence-leaking 410.
                 let transition = match existing.as_ref() {
                     None => Ok(None),
-                    Some(mapping) => withdrawal_transition(
+                    Some(mapping) => tombstone_transition(
                         Some(mapping),
                         &self.mapping_route,
                         self.document_id,
@@ -777,7 +773,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                 };
                 match transition {
                     Ok(Some((_, writes))) => {
-                        self.state = DeleteMetadataDocumentState::WritePidWithdrawal;
+                        self.state = DeleteMetadataDocumentState::WritePidTombstone;
                         smallvec![Effect::Storage(StorageEffect::BatchWrite {
                             writes,
                             txn_id: Some(txn_id),
@@ -788,11 +784,11 @@ impl Operation for DeleteMetadataDocumentOperation {
                         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                     }
                     Err(error) => self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
-                        "persistent id withdrawal encode failed: {error}"
+                        "persistent id tombstone encode failed: {error}"
                     ))),
                 }
             }
-            DeleteMetadataDocumentState::WritePidWithdrawal => match event {
+            DeleteMetadataDocumentState::WritePidTombstone => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
@@ -802,13 +798,11 @@ impl Operation for DeleteMetadataDocumentOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
-                        "persistent id withdrawal write failed: {error}"
+                        "persistent id tombstone write failed: {error}"
                     )))
                 }
-                other => self.unexpected_event(
-                    "persistent id withdrawal write result",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("persistent id tombstone write result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -1540,9 +1534,9 @@ mod tests {
     }
 
     #[test]
-    // A delete of a minted document withdraws the mapping in the same
+    // A delete of a minted document tombstones the mapping in the same
     // transaction that removes the registry row.
-    fn delete_withdraws_minted() {
+    fn delete_tombstones_minted() {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::generate();
@@ -1571,7 +1565,7 @@ mod tests {
             }),
         ] = effects.as_slice()
         else {
-            panic!("expected a persistent id withdrawal batch, got {effects:?}");
+            panic!("expected a persistent id tombstone batch, got {effects:?}");
         };
         assert_eq!(*write_txn_id, txn_id);
         let mapping = writes
@@ -1580,7 +1574,7 @@ mod tests {
             .map(|(_, _, value)| PersistentIdMapping::from_bytes(value).expect("mapping decodes"))
             .expect("the batch carries the mapping row");
         assert_eq!(mapping.target, record.document_id);
-        assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+        assert_eq!(mapping.status, PersistentIdStatus::Tombstoned);
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),

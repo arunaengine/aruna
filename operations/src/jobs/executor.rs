@@ -68,6 +68,9 @@ pub struct JobContext {
 pub enum JobRunOutcome {
     Succeeded(JobResultPayload),
     Failed(JobError),
+    /// A dependency such as metadata projection is not readable yet. The
+    /// runtime requeues without incrementing the bounded execution attempts.
+    Deferred(JobError),
     Cancelled,
     Interrupted,
 }

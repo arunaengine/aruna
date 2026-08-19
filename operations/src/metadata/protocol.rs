@@ -9,8 +9,9 @@ use aruna_core::metadata::{
     MetadataSearchHit,
 };
 use aruna_core::structs::{
-    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicy,
-    PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId, SyncRelationship,
+    MetadataRegistryRecord, PathClaimRecord, PersistentIdFailure, PersistentIdMapping,
+    PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId,
+    SyncRelationship,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -354,14 +355,19 @@ pub struct JobRecordPageReply {
     pub next: Option<FetchCursor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentIdRequest {
     Mint {
         minted_by: UserId,
         minted_at_ms: u64,
     },
     Withdraw {
+        withdrawn_by: UserId,
+        reason: String,
         withdrawn_at_ms: u64,
+    },
+    Fail {
+        failure: PersistentIdFailure,
     },
     /// Queue the mint job on the authority, so one document has one dedup row and
     /// one execution however many ingress nodes accept the request.
@@ -371,7 +377,11 @@ pub enum PersistentIdRequest {
     },
     /// Unauthenticated landing resolution: the authority applies the same
     /// per-record anonymous readability check a single-record OAI read applies.
-    Resolve,
+    Resolve {
+        pid: String,
+    },
+    /// Trusted realm-peer read used by the authenticated typed status route.
+    Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +392,7 @@ pub enum PersistentIdOutcome {
         changed: bool,
     },
     Resolution(PersistentIdResolution),
+    Status(Option<Box<PersistentIdMapping>>),
     /// The authority's mint job: its id is owned by the authority, and `created`
     /// is false for a caller that joined the job another submitter opened.
     Submission {

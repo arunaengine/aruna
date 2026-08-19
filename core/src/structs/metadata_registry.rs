@@ -58,6 +58,7 @@ pub enum MetadataAuditOperation {
     Delete,
     SetVisibility,
     PlaceReplicas,
+    WithdrawPersistentId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
