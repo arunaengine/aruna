@@ -11,7 +11,7 @@ use ulid::Ulid;
 const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const WORKFLOW_RUN_CONTEXT: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const CRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
-const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
+pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 
 use super::super::executor::{JobContext, JobRunOutcome};
