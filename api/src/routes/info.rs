@@ -413,6 +413,7 @@ impl RealmQuotaConfig {
 pub struct RealmPlacementConfigResponse {
     pub strategies: Vec<RealmPlacementStrategy>,
     pub default_strategy_id: Option<String>,
+    pub job_family_strategy_id: String,
     pub bindings: Vec<RealmPlacementBinding>,
     pub overrides: Vec<RealmPlacementOverride>,
     pub transitions: RealmTransitionHealthResponse,
@@ -548,6 +549,7 @@ impl RealmPlacementConfigResponse {
                 .map(RealmPlacementStrategy::from)
                 .collect(),
             default_strategy_id: document.default_strategy_id.map(|id| id.to_string()),
+            job_family_strategy_id: document.job_family_strategy_id.to_string(),
             bindings: document
                 .strategy_bindings
                 .iter()
@@ -1175,7 +1177,7 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     path = "/info/realm/placement",
     tag = "info",
     summary = "Read the realm's placement strategies, bindings and overrides",
-    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403 whatever the caller holds. Returns the placement policy as stored in this node's copy of the realm configuration: the defined strategies with their replica count, distinctness requirement, affinity rules and shard count; the default strategy; the bindings that map a scope, the realm, a group, a document class or a metadata path prefix, to a strategy; and the per-subject overrides that pin or exclude individual nodes. This is policy, not a placement result: it says how replicas are chosen, not where any particular document currently sits.",
+    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403 whatever the caller holds. Returns the placement policy as stored in this node's copy of the realm configuration: the defined strategies with their replica count, distinctness requirement, affinity rules and shard count; the default strategy; the immutable job-family strategy id; the bindings that map a scope, the realm, a group, a document class or a metadata path prefix, to a strategy; and the per-subject overrides that pin or exclude individual nodes. `job_family_strategy_id` names a strategy that cannot be removed or have its shard count reshaped: those mutations fail with `JobFamilyImmutable`; removing a strategy that is still referenced fails with `StrategyReferenced`. This is policy, not a placement result: it says how replicas are chosen, not where any particular document currently sits.",
     responses(
         (
             status = 200,
@@ -1193,6 +1195,7 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
                     }
                 ],
                 "default_strategy_id": "01JABCDEF0123456789ABCDEFG",
+                "job_family_strategy_id": "01JABCDEF0123456789ABCDEFG",
                 "bindings": [
                     {"scope": {"kind": "class", "document_class": "metadata"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
                 ],
@@ -1246,7 +1249,7 @@ pub async fn get_realm_placement(
     path = "/info/realm/placement",
     tag = "info",
     summary = "Apply one change to the realm's placement policy",
-    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403. The body carries exactly one change, selected by its `mutation` field: define or replace a strategy, remove one, set the default, set or remove a binding for a scope, set or remove a per-subject override, or provision a metadata binding for a strategy. Provisioning is idempotent, an existing binding for the same scope and strategy is returned unchanged instead of allocating a second one. The whole placement policy after the change is returned, so a client never has to re-read to learn the new state. The change is written to the replicated realm configuration, which means it is durable here when the response is sent and reaches the other realm nodes asynchronously; it does not move any data by itself, existing replicas are relocated by later placement work. Removing a strategy that a binding or override still points at is refused with 409 rather than leaving a dangling reference, and a concurrent update of the same configuration is also 409, where retrying the request is the expected response.",
+    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403. The body carries exactly one change, selected by its `mutation` field: define or replace a strategy, remove one, set the default, set or remove a binding for a scope, set or remove a per-subject override, or provision a metadata binding for a strategy. Provisioning is idempotent, an existing binding for the same scope and strategy is returned unchanged instead of allocating a second one. The whole placement policy after the change is returned, so a client never has to re-read to learn the new state. `job_family_strategy_id` identifies the job-family strategy, which cannot be removed or have its shard count reshaped; those mutations fail with `JobFamilyImmutable`. The change is written to the replicated realm configuration, which means it is durable here when the response is sent and reaches the other realm nodes asynchronously; it does not move any data by itself, existing replicas are relocated by later placement work. Removing a strategy that a binding or override still points at fails with `StrategyReferenced` and is refused with 409 rather than leaving a dangling reference, and a concurrent update of the same configuration is also 409, where retrying the request is the expected response.",
     request_body(
         content = RealmPlacementMutationRequest,
         description = "Exactly one placement change, discriminated by `mutation`. Ids are ULIDs, node ids are hex-encoded, an override `subject` is a hex-encoded key prefix",
@@ -1302,6 +1305,7 @@ pub async fn get_realm_placement(
                     }
                 ],
                 "default_strategy_id": "01JABCDEF0123456789ABCDEFG",
+                "job_family_strategy_id": "01JABCDEF0123456789ABCDEFG",
                 "bindings": [
                     {"scope": {"kind": "realm"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
                 ],
@@ -1402,6 +1406,9 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         MutateRealmPlacementError::Unauthorized { .. } => ServerError::Forbidden,
         MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
             format!("placement strategy {strategy_id} is currently referenced"),
+        ),
+        MutateRealmPlacementError::JobFamilyImmutable { strategy_id } => ServerError::Conflict(
+            format!("placement strategy {strategy_id} is the immutable job-family strategy"),
         ),
         error @ MutateRealmPlacementError::TransitionInFlight { .. } => {
             ServerError::Conflict(error.to_string())
@@ -2859,16 +2866,28 @@ mod tests {
     async fn realm_placement_strategy_default_binding_and_override_lifecycle() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = admin_auth(realm_id, admin);
+        let job_family_strategy_id = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap()
+        .job_family_strategy_id
+        .to_string();
         let (_, Json(initial)) =
             get_realm_placement(State(state.clone()), Extension(Some(auth.clone())))
                 .await
                 .unwrap();
+        assert_eq!(
+            serde_json::to_value(&initial).unwrap()["job_family_strategy_id"].as_str(),
+            Some(job_family_strategy_id.as_str())
+        );
         let initial_default = initial.default_strategy_id.unwrap();
         let strategy_id = Ulid::from_bytes([21; 16]);
         let scope = RealmPlacementBindingScope::Realm;
         let node_id = state.get_node_id().to_string();
 
-        let (_status, _body) = mutate_realm_placement(
+        let (_status, Json(after_upsert)) = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
             Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
@@ -2877,6 +2896,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            serde_json::to_value(after_upsert).unwrap()["job_family_strategy_id"].as_str(),
+            Some(job_family_strategy_id.as_str())
+        );
         let _ = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
