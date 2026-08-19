@@ -568,13 +568,49 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 _ => smallvec![],
             },
-            ReleaseState::Commit { .. } | ReleaseState::Cancel { .. } => {
-                self.state = match &self.outcome {
-                    Some(Ok(_)) => ReleaseState::Finish,
-                    _ => ReleaseState::Error,
-                };
-                smallvec![]
-            }
+            ReleaseState::Commit { .. } => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.state = ReleaseState::Finish;
+                    smallvec![]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.outcome = Some(Err(error.into()));
+                    self.state = ReleaseState::Error;
+                    smallvec![]
+                }
+                other => {
+                    self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
+                        state: format!("{:?}", self.state),
+                        expected: "transaction commit",
+                        got: format!("{other:?}"),
+                    }));
+                    self.state = ReleaseState::Error;
+                    smallvec![]
+                }
+            },
+            ReleaseState::Cancel { .. } => match event {
+                Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                    self.state = match &self.outcome {
+                        Some(Ok(_)) => ReleaseState::Finish,
+                        _ => ReleaseState::Error,
+                    };
+                    smallvec![]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.outcome = Some(Err(error.into()));
+                    self.state = ReleaseState::Error;
+                    smallvec![]
+                }
+                other => {
+                    self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
+                        state: format!("{:?}", self.state),
+                        expected: "transaction abort",
+                        got: format!("{other:?}"),
+                    }));
+                    self.state = ReleaseState::Error;
+                    smallvec![]
+                }
+            },
             ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => smallvec![],
         }
     }
@@ -589,5 +625,32 @@ impl Operation for ReleaseExecutionOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::errors::StorageError;
+
+    #[test]
+    fn rejects_commit_error() {
+        // A failed durable release must remain a retryable error.
+        let txn_id = TxnId::generate();
+        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        operation.state = ReleaseState::Commit { txn_id };
+        operation.outcome = Some(Ok(true));
+
+        assert!(
+            operation
+                .step(Event::Storage(StorageEvent::Error {
+                    error: StorageError::CommitFailed,
+                }))
+                .is_empty()
+        );
+        assert_eq!(
+            operation.finalize(),
+            Err(LifecycleError::Storage(StorageError::CommitFailed))
+        );
     }
 }
