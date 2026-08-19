@@ -2599,7 +2599,9 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn nested_deadline_cleanup() {
+        tokio::time::resume();
         let (_directory, context) = blob_context().await;
+        tokio::time::pause();
         let seen = Arc::new(Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2641,7 +2643,9 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn nested_commit_survives() {
+        tokio::time::resume();
         let (_directory, context) = blob_context().await;
+        tokio::time::pause();
         let seen = Arc::new(Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
