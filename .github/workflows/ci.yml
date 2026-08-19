@@ -22,6 +22,8 @@ env:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: 2
     # Hang cap, not a performance budget: a healthy cold-cache run measures
     # ~48 minutes, so only a deadlocked or unbounded-wait test trips this.
     timeout-minutes: 90
