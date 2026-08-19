@@ -1928,8 +1928,11 @@ pub enum PhysicalExecutionState {
     Preparing,
     Running,
     Succeeded,
+    /// Permanent job-specific failure that suppresses further execution.
     Failed,
     Cancelled,
+    /// Infrastructure or retryable execution error without a logical outcome.
+    Error,
 }
 
 impl PhysicalExecutionState {
@@ -1939,6 +1942,7 @@ impl PhysicalExecutionState {
             PhysicalExecutionState::Succeeded
                 | PhysicalExecutionState::Failed
                 | PhysicalExecutionState::Cancelled
+                | PhysicalExecutionState::Error
         )
     }
 
@@ -1951,6 +1955,7 @@ impl PhysicalExecutionState {
             PhysicalExecutionState::Succeeded => "succeeded",
             PhysicalExecutionState::Failed => "failed",
             PhysicalExecutionState::Cancelled => "cancelled",
+            PhysicalExecutionState::Error => "error",
         }
     }
 }
@@ -2960,9 +2965,8 @@ pub fn verify_update_chain(
     Ok(chain)
 }
 
-/// Replicated logical state of one request family. There is deliberately no
-/// `Failed`: realm-wide failure may never be inferred from local exhaustion or
-/// silence, so an unsuccessful family stays `Indeterminate`.
+/// Replicated logical state of one request family. `Failed` requires a signed
+/// permanent job failure; local exhaustion and silence stay `Indeterminate`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogicalJobState {
     Queued,
@@ -2970,6 +2974,7 @@ pub enum LogicalJobState {
     Indeterminate,
     Succeeded,
     Cancelled,
+    Failed,
 }
 
 impl LogicalJobState {
@@ -2981,12 +2986,13 @@ impl LogicalJobState {
             LogicalJobState::Indeterminate => "indeterminate",
             LogicalJobState::Succeeded => "succeeded",
             LogicalJobState::Cancelled => "cancelled",
+            LogicalJobState::Failed => "failed",
         }
     }
 }
 
-/// How one physical execution relates to the canonical success. Redundant
-/// executions stay visible instead of being erased.
+/// How one physical execution relates to the canonical terminal result.
+/// Redundant executions stay visible instead of being erased.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionRole {
     Canonical,
@@ -3015,6 +3021,7 @@ pub struct JobProjection {
     /// Every same-request alias in `SubmissionClaim::order_key` order.
     pub aliases: Vec<JobId>,
     pub state: LogicalJobState,
+    /// Canonical success, or canonical signed permanent failure when no success exists.
     pub canonical_execution_id: Option<Ulid>,
     pub executions: Vec<ProjectedExecution>,
     /// Outputs of the canonical execution, in their one canonical order.

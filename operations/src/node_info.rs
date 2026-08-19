@@ -258,7 +258,9 @@ async fn nonterminal_family(
                 request_digest: projection.request_digest,
             }))
         }
-        LogicalJobState::Succeeded | LogicalJobState::Cancelled => Ok(None),
+        LogicalJobState::Succeeded | LogicalJobState::Cancelled | LogicalJobState::Failed => {
+            Ok(None)
+        }
     }
 }
 

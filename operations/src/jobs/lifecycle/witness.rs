@@ -509,8 +509,8 @@ async fn record_decline(
     let _ = write_row(context, JOB_PLAN_EXPLAIN_KEYSPACE, &key, &explain).await;
 }
 
-/// Whether a launch by this node is suppressed: a success, a cancellation, or
-/// any execution that is not terminally failed already answers this request.
+/// Whether a launch is suppressed by a success, cancellation, permanent
+/// failure, or an execution that may still finish.
 pub(crate) fn suppressed(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
     let Ok(Some(projection)) = reduce_family(family, records) else {
         return false;
@@ -521,7 +521,7 @@ pub(crate) fn suppressed(family: JobFamilyId, records: &[JobRecordEnvelope]) -> 
     projection
         .executions
         .iter()
-        .any(|execution| execution.state != PhysicalExecutionState::Failed)
+        .any(|execution| execution.state != PhysicalExecutionState::Error)
 }
 
 /// The sealed spec of the family's canonical alias.

@@ -74,7 +74,7 @@ pub struct FamilyReport {
     pub partial: bool,
     /// Responder-local only: every known execution is terminal without success
     /// and no retry is armed here. Deliberately outside the projection digest,
-    /// and never a realm-wide failure.
+    /// and not evidence of a permanent failure.
     pub locally_exhausted: bool,
     pub plan: Option<PlanEstimate>,
 }

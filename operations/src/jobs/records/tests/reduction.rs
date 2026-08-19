@@ -96,13 +96,24 @@ fn merges_partitions() {
 
 #[test]
 fn keeps_state_indeterminate() {
-    // Every known execution is terminal without success, so the family must not
-    // manufacture a realm-wide failure.
+    // A terminal infrastructure error does not prove a realm-wide failure.
     let family = Family::new([4u8; 32]);
-    let records = family.run(1, 0, PhysicalExecutionState::Failed);
+    let records = family.run(1, 0, PhysicalExecutionState::Error);
     let projection = project(&family, &records);
     assert_eq!(projection.state, LogicalJobState::Indeterminate);
     assert!(projection.canonical_execution_id.is_none());
+    assert!(projection.outputs.as_slice().is_empty());
+}
+
+#[test]
+fn projects_permanent_failure() {
+    // A signed permanent job failure is terminal and suppresses retries.
+    let family = Family::new([8u8; 32]);
+    let records = family.run(1, 0, PhysicalExecutionState::Failed);
+    let projection = project(&family, &records);
+
+    assert_eq!(projection.state, LogicalJobState::Failed);
+    assert!(projection.canonical_execution_id.is_some());
     assert!(projection.outputs.as_slice().is_empty());
 }
 

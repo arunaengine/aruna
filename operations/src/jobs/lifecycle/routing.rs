@@ -8,9 +8,9 @@
 use aruna_core::jobs::{JobKind, JobStatusView};
 use aruna_core::keyspaces::JOB_FAMILY_ALIAS_KEYSPACE;
 use aruna_core::structs::{
-    AuthContext, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProgress, JobProjection,
-    JobResultPayload, JobState, LogicalJobSpec, LogicalJobState, PhysicalExecutionState,
-    WorkspaceMode,
+    AuthContext, ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobProgress,
+    JobProjection, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState,
+    PhysicalExecutionState, WorkspaceMode,
 };
 use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
@@ -107,8 +107,8 @@ pub async fn family_status(
     }))
 }
 
-/// The node that can serve bytes for this family: the canonical successful
-/// execution's executor, otherwise any execution's, otherwise none.
+/// The canonical execution's node, otherwise a successful execution's node,
+/// otherwise any execution's node.
 pub async fn family_responder(
     context: &DriverContext,
     job_id: JobId,
@@ -183,17 +183,24 @@ pub(crate) fn status_view(
             .then(|| terminal.and_then(|execution| execution.observed_at_ms))
             .flatten(),
         progress: JobProgress::new("phases"),
-        last_error: None,
+        last_error: terminal
+            .filter(|execution| execution.state == PhysicalExecutionState::Failed)
+            .and_then(|execution| execution.result.as_ref())
+            .and_then(|result| result.message.as_ref())
+            .map(|message| JobError::permanent(message.as_str())),
         result: result_view(projection, workspace_bucket.clone()),
         workspace_bucket,
         workspace_mode: mode,
     }
 }
 
-/// Outputs of the canonical success only. A family without one has no result,
-/// because a duplicate execution's outputs are not this job's answer.
+/// Result of the canonical success or proven permanent failure. Only a success
+/// supplies outputs.
 fn result_view(projection: &JobProjection, bucket: Option<String>) -> Option<serde_json::Value> {
-    if projection.state != LogicalJobState::Succeeded {
+    if !matches!(
+        projection.state,
+        LogicalJobState::Succeeded | LogicalJobState::Failed
+    ) {
         return None;
     }
     let result = projection.canonical_execution_id.and_then(|execution_id| {
@@ -207,7 +214,9 @@ fn result_view(projection: &JobProjection, bucket: Option<String>) -> Option<ser
         JobResultPayload::Execution {
             exit_code: result.and_then(|result| result.exit_code),
             workspace_bucket: bucket,
-            outputs: projection.outputs.as_slice().to_vec(),
+            outputs: (projection.state == LogicalJobState::Succeeded)
+                .then(|| projection.outputs.as_slice().to_vec())
+                .unwrap_or_default(),
             stdout: String::new(),
             stderr: String::new(),
             output_digest: result.and_then(|result| result.output_digest),
@@ -216,8 +225,7 @@ fn result_view(projection: &JobProjection, bucket: Option<String>) -> Option<ser
     )
 }
 
-/// There is deliberately no convergent failure: an unsuccessful family stays
-/// indeterminate until a success, a cancellation, or a new execution appears.
+/// Only a signed permanent execution failure becomes a logical failure.
 fn local_state(state: LogicalJobState) -> JobState {
     match state {
         LogicalJobState::Queued => JobState::Queued,
@@ -225,5 +233,6 @@ fn local_state(state: LogicalJobState) -> JobState {
         LogicalJobState::Indeterminate => JobState::Indeterminate,
         LogicalJobState::Succeeded => JobState::Succeeded,
         LogicalJobState::Cancelled => JobState::Cancelled,
+        LogicalJobState::Failed => JobState::Failed,
     }
 }

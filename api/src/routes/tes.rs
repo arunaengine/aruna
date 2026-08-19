@@ -1284,21 +1284,25 @@ fn family_record(report: &FamilyReport) -> JobRecord {
     record.workspace_bucket = report.job.workspace_bucket.clone();
     record.retention_ms = report.spec.retention_ms;
     record.finished_at_ms = report.job.finished_at_ms;
-    record.result =
-        (report.job.state == JobState::Succeeded).then(|| JobResultPayload::Execution {
+    record.last_error = report.job.last_error.clone();
+    record.result = matches!(report.job.state, JobState::Succeeded | JobState::Failed).then(|| {
+        JobResultPayload::Execution {
             exit_code: report
                 .canonical_result
                 .as_ref()
                 .and_then(|result| result.exit_code),
             workspace_bucket: report.job.workspace_bucket.clone(),
-            outputs: report.outputs.clone(),
+            outputs: (report.job.state == JobState::Succeeded)
+                .then(|| report.outputs.clone())
+                .unwrap_or_default(),
             stdout: String::new(),
             stderr: String::new(),
             output_digest: report
                 .canonical_result
                 .as_ref()
                 .and_then(|result| result.output_digest),
-        });
+        }
+    });
     record
 }
 

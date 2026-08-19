@@ -83,7 +83,7 @@ async fn marks_local_exhaustion() {
     // a responder-local diagnostic, never a converged failure.
     let family = Family::new([1u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
-    seed(&ctx, &family, PhysicalExecutionState::Failed).await;
+    seed(&ctx, &family, PhysicalExecutionState::Error).await;
 
     let report = family_report(&ctx, &auth(), family.job_id)
         .await

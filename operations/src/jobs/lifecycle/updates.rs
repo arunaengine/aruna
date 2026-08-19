@@ -7,7 +7,7 @@
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::{
-    ExecutionUpdate, JobFamilyId, JobFamilyRecord, JobId, JobRecord, JobRecordBody,
+    ExecutionUpdate, JobErrorKind, JobFamilyId, JobFamilyRecord, JobId, JobRecord, JobRecordBody,
     JobRecordEnvelope, JobResultPayload, JobState, PhysicalExecutionResult, PhysicalExecutionState,
     ResultMessage,
 };
@@ -183,7 +183,7 @@ pub async fn publish_progress(
 /// reservation. Success names the digest of the output record sealed before it,
 /// so a success can never be projected without its exact outputs.
 pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bool {
-    let Some(state) = terminal_state(record.state) else {
+    let Some(state) = terminal_state(record) else {
         return true;
     };
     let Some(chain) = execution_chain(context, record.job_id).await else {
@@ -227,10 +227,18 @@ pub async fn settle_terminals(context: &DriverContext) -> Result<(), String> {
     Ok(())
 }
 
-fn terminal_state(state: JobState) -> Option<PhysicalExecutionState> {
-    match state {
+fn terminal_state(record: &JobRecord) -> Option<PhysicalExecutionState> {
+    match record.state {
         JobState::Succeeded => Some(PhysicalExecutionState::Succeeded),
-        JobState::Failed => Some(PhysicalExecutionState::Failed),
+        JobState::Failed
+            if record
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error.kind == JobErrorKind::Permanent) =>
+        {
+            Some(PhysicalExecutionState::Failed)
+        }
+        JobState::Failed => Some(PhysicalExecutionState::Error),
         JobState::Cancelled => Some(PhysicalExecutionState::Cancelled),
         _ => None,
     }

@@ -45,12 +45,14 @@ Write jobs so that a second run is acceptable: use the exact output VersionIds
 the API returns rather than assuming one writer, and avoid side effects outside
 Aruna that cannot tolerate a repeat.
 
-## There is no distributed failure
+## Distributed failure needs proof
 
-The replicated logical state is one of `queued`, `running`, `indeterminate`,
-`succeeded` or `cancelled`. There is deliberately **no** `failed`: realm-wide
-failure cannot be inferred from silence, because a partitioned execution may
-still be running and may still succeed.
+The replicated logical state is `failed` only when an authenticated execution
+reports a permanent, job-specific failure such as an invalid task or command.
+That evidence suppresses retries. A later authenticated success still wins.
+
+Infrastructure errors, retry exhaustion, and silence remain `indeterminate`:
+none proves that a partitioned execution cannot still be running or succeed.
 
 When every execution a responder knows about ended without success and it has no
 retry armed, the status reports `family.locally_exhausted = true`. That flag is

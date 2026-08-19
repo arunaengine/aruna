@@ -63,6 +63,7 @@ pub fn reduce_family(
 
     let mut projected: Vec<ProjectedExecution> = Vec::with_capacity(executions.len());
     let mut successes: Vec<(Ulid, [u8; 32])> = Vec::new();
+    let mut failures: Vec<(Ulid, [u8; 32])> = Vec::new();
     let mut active = false;
     for (execution_id, facts) in &executions {
         let Some(receipt) = &facts.receipt else {
@@ -88,6 +89,11 @@ pub fn reduce_family(
                 *execution_id,
                 canonical_execution_key(family.submission_id, family.request_digest, *execution_id),
             ));
+        } else if state == PhysicalExecutionState::Failed {
+            failures.push((
+                *execution_id,
+                canonical_execution_key(family.submission_id, family.request_digest, *execution_id),
+            ));
         }
         projected.push(ProjectedExecution {
             execution_id: *execution_id,
@@ -100,7 +106,10 @@ pub fn reduce_family(
     }
 
     successes.sort_by_key(|(_, key)| *key);
-    let canonical = successes.first().map(|(execution_id, _)| *execution_id);
+    failures.sort_by_key(|(_, key)| *key);
+    let success = successes.first().map(|(execution_id, _)| *execution_id);
+    let failure = failures.first().map(|(execution_id, _)| *execution_id);
+    let canonical = success.or(failure);
     for execution in &mut projected {
         execution.role = match (canonical, execution.state) {
             (Some(id), _) if id == execution.execution_id => ExecutionRole::Canonical,
@@ -109,7 +118,7 @@ pub fn reduce_family(
         };
     }
 
-    let outputs = canonical
+    let outputs = success
         .and_then(|execution_id| executions.get(&execution_id))
         .and_then(|facts| facts.output.as_ref())
         .map(|output| output.outputs.clone())
@@ -121,7 +130,8 @@ pub fn reduce_family(
         canonical_job_id: canonical_claim.job_id,
         aliases,
         state: logical_state(
-            canonical.is_some(),
+            success.is_some(),
+            failure.is_some(),
             cancelled,
             active,
             !projected.is_empty(),
@@ -133,21 +143,22 @@ pub fn reduce_family(
     }))
 }
 
-/// There is deliberately no convergent `Failed`: a family whose known
-/// executions are all terminal without success stays `Indeterminate`, because
-/// realm-wide failure may never be inferred from absence.
+/// Failure needs a signed permanent execution result. Infrastructure errors and
+/// absence stay indeterminate because neither proves a realm-wide outcome.
 fn logical_state(
     succeeded: bool,
+    failed: bool,
     cancelled: bool,
     active: bool,
     executed: bool,
 ) -> LogicalJobState {
-    match (succeeded, cancelled, active, executed) {
-        (true, _, _, _) => LogicalJobState::Succeeded,
-        (false, true, false, _) => LogicalJobState::Cancelled,
-        (false, _, true, _) => LogicalJobState::Running,
-        (false, _, false, true) => LogicalJobState::Indeterminate,
-        (false, false, false, false) => LogicalJobState::Queued,
+    match (succeeded, failed, cancelled, active, executed) {
+        (true, _, _, _, _) => LogicalJobState::Succeeded,
+        (false, true, _, _, _) => LogicalJobState::Failed,
+        (false, false, true, false, _) => LogicalJobState::Cancelled,
+        (false, false, _, true, _) => LogicalJobState::Running,
+        (false, false, _, false, true) => LogicalJobState::Indeterminate,
+        (false, false, false, false, false) => LogicalJobState::Queued,
     }
 }
 

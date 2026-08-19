@@ -35,16 +35,17 @@ fn ranks_witnesses() {
 
 #[test]
 fn suppresses_after_receipt() {
-    // A receipted execution answers the request, so no witness starts another
-    // launch; a family that only failed stays launchable.
+    // Permanent failure stops retries; infrastructure error remains retryable.
     let family = Family::new([1u8; 32]);
     let running = family.run(1, 0, PhysicalExecutionState::Running);
     let succeeded = family.run(1, 0, PhysicalExecutionState::Succeeded);
     let failed = family.run(1, 0, PhysicalExecutionState::Failed);
+    let error = family.run(1, 0, PhysicalExecutionState::Error);
 
     assert!(suppressed(family.family(), &running));
     assert!(suppressed(family.family(), &succeeded));
-    assert!(!suppressed(family.family(), &failed));
+    assert!(suppressed(family.family(), &failed));
+    assert!(!suppressed(family.family(), &error));
 }
 
 #[test]
