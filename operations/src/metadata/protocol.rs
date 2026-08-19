@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
@@ -21,6 +22,7 @@ use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::MetadataRoCrateExportView;
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::search_buckets::BucketSearchHit;
+use crate::s3::search_objects::{ObjectKeyMatch, ObjectSearchNodePage};
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
@@ -287,8 +289,8 @@ pub enum MetadataTransportMessage {
     /// One complete external submission forwarded a single hop to an observed
     /// family holder, with the identity the ingress preassigned. The holder
     /// revalidates the caller and recomputes that identity before it commits,
-    /// and never forwards it again. Appended last so existing variant indices
-    /// stay stable.
+    /// and never forwards it again. Appended after the earlier variants so
+    /// their indices stay stable.
     ForwardJobSubmission {
         auth_token: MetadataAuthToken,
         submission_id: SubmissionId,
@@ -296,6 +298,20 @@ pub enum MetadataTransportMessage {
     },
     ForwardedJobSubmission {
         result: Result<SubmissionAck, SubmissionRefusal>,
+    },
+    /// Authenticated live-head object inventory search. These variants are
+    /// appended so every pre-existing transport discriminant remains stable.
+    SearchObjects {
+        auth_token: Option<MetadataAuthToken>,
+        query: String,
+        key_match: ObjectKeyMatch,
+        bucket: Option<String>,
+        limit: usize,
+        start_after: Option<Vec<u8>>,
+        as_of: SystemTime,
+    },
+    ObjectSearchResults {
+        result: Result<ObjectSearchNodePage, MetadataReadError>,
     },
 }
 
@@ -610,6 +626,15 @@ mod tests {
             query: "dataset".to_string(),
             limit: 10,
         });
+        assert_has_auth_token_field(MetadataTransportMessage::SearchObjects {
+            auth_token: Some(MetadataAuthToken::bearer("object-token").unwrap()),
+            query: "reads".to_string(),
+            key_match: ObjectKeyMatch::Substring,
+            bucket: Some("data".to_string()),
+            limit: 10,
+            start_after: None,
+            as_of: SystemTime::UNIX_EPOCH,
+        });
     }
 
     #[test]
@@ -751,8 +776,9 @@ mod tests {
             let query = MetadataTransportMessage::QueryResults { result: Err(error) };
             let search = MetadataTransportMessage::SearchResults { result: Err(error) };
             let buckets = MetadataTransportMessage::BucketSearchResults { result: Err(error) };
+            let objects = MetadataTransportMessage::ObjectSearchResults { result: Err(error) };
 
-            for message in [query, search, buckets] {
+            for message in [query, search, buckets, objects] {
                 let bytes = postcard::to_allocvec(&message).unwrap();
                 assert_eq!(
                     postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
@@ -78,6 +78,9 @@ use crate::request_policy::PolicyRequestExtras;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
+use crate::s3::search_objects::{
+    ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput, search_local_objects,
+};
 use crate::sync_mirror_repair::RECONCILE_GRACE;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
@@ -1483,6 +1486,60 @@ impl MetadataHandle {
                 })
                 .await
             }
+            MetadataTransportMessage::SearchObjects {
+                auth_token,
+                query,
+                key_match,
+                bucket,
+                limit,
+                start_after,
+                as_of,
+            } => {
+                Box::pin(async {
+                    match bucket_search_auth(
+                        &self.inner.auth_validation,
+                        &self.inner.storage_handle,
+                        peer,
+                        self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
+                        auth_token,
+                    )
+                    .await
+                    {
+                        Ok(auth) => match self.inner.net_handle.as_ref() {
+                            Some(net_handle) => match search_local_objects(
+                                context.as_ref(),
+                                SearchObjectsInput {
+                                    auth,
+                                    realm_id: *net_handle.realm_id(),
+                                    node_id: net_handle.node_id(),
+                                    query,
+                                    key_match,
+                                    bucket,
+                                    limit,
+                                    start_after,
+                                    as_of,
+                                },
+                            )
+                            .await
+                            {
+                                Ok(page) => MetadataTransportMessage::ObjectSearchResults {
+                                    result: Ok(page),
+                                },
+                                Err(_) => MetadataTransportMessage::ObjectSearchResults {
+                                    result: Err(MetadataReadError::Unavailable),
+                                },
+                            },
+                            None => MetadataTransportMessage::ObjectSearchResults {
+                                result: Err(MetadataReadError::Unavailable),
+                            },
+                        },
+                        Err(error) => {
+                            MetadataTransportMessage::ObjectSearchResults { result: Err(error) }
+                        }
+                    }
+                })
+                .await
+            }
             MetadataTransportMessage::CreateSyncMirror {
                 auth_token,
                 source_group_id,
@@ -1740,6 +1797,7 @@ impl MetadataHandle {
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
+            | MetadataTransportMessage::ObjectSearchResults { .. }
             | MetadataTransportMessage::SyncMirrorCreated
             | MetadataTransportMessage::SyncMirrorDeleted
             | MetadataTransportMessage::ForwardedRecord { .. }
@@ -2447,6 +2505,64 @@ impl MetadataHandle {
             Ok(hits) => {
                 span.record("result", "ok");
                 span.record("hit_count", hits.len() as u64);
+            }
+            Err(error) => record_error(&span, &format!("{error:?}")),
+        }
+        result
+    }
+
+    #[tracing::instrument(
+        name = "metadata.object_search.remote",
+        level = "debug",
+        skip(self, auth_token, query, start_after),
+        fields(
+            peer = ?node_id,
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_object_search(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        query: String,
+        key_match: ObjectKeyMatch,
+        bucket: Option<String>,
+        limit: usize,
+        start_after: Option<Vec<u8>>,
+        as_of: SystemTime,
+    ) -> Result<ObjectSearchNodePage, MetadataReadError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = match send_remote_metadata_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::SearchObjects {
+                auth_token,
+                query,
+                key_match,
+                bucket,
+                limit,
+                start_after,
+                as_of,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ObjectSearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        };
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        match &result {
+            Ok(page) => {
+                span.record("result", "ok");
+                span.record("hit_count", page.hits.len() as u64);
             }
             Err(error) => record_error(&span, &format!("{error:?}")),
         }
@@ -4449,6 +4565,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::SearchResults { .. } => "search_results",
         MetadataTransportMessage::SearchBuckets { .. } => "search_buckets",
         MetadataTransportMessage::BucketSearchResults { .. } => "bucket_search_results",
+        MetadataTransportMessage::SearchObjects { .. } => "search_objects",
+        MetadataTransportMessage::ObjectSearchResults { .. } => "object_search_results",
         MetadataTransportMessage::CreateSyncMirror { .. } => "create_sync_mirror",
         MetadataTransportMessage::DeleteSyncMirror { .. } => "delete_sync_mirror",
         MetadataTransportMessage::SyncMirrorCreated => "sync_mirror_created",

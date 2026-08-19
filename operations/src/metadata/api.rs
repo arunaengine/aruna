@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError};
@@ -21,13 +21,14 @@ use aruna_core::storage_entries::{
     metadata_pending_projection_target,
 };
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
+    AuthContext, BlobHeadKey, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
     RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, TxnId};
 use aruna_core::{MetaResourceId, NodeId, StructuredId};
 use aruna_storage::StorageHandle;
+use base64::Engine;
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream;
@@ -70,6 +71,10 @@ use crate::placement::{
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
 };
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
+use crate::s3::search_objects::{
+    ObjectInventoryHit, ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput,
+    search_local_objects,
+};
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
@@ -87,6 +92,10 @@ const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
 const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
 const METADATA_DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
+const OBJECT_SEARCH_CURSOR_VERSION: u8 = 1;
+const OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.object.search.cursor.v1";
+const OBJECT_SEARCH_CURSOR_MAX_BYTES: usize = 64 * 1024;
+const OBJECT_SEARCH_CURSOR_MAX_KEY_BYTES: usize = 2 * 1024;
 #[derive(Debug, Error)]
 pub enum MetadataApiError {
     #[error("bad request")]
@@ -275,6 +284,306 @@ pub struct BucketSearchRequest {
 pub struct BucketSearchExecution {
     pub hits: Vec<BucketSearchHit>,
     pub fanout_stats: MetadataFanoutStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectSearchQueryMode {
+    Local,
+    DistributedBestEffort,
+    DistributedStrict,
+}
+
+impl ObjectSearchQueryMode {
+    fn fanout_mode(self) -> MetadataApiQueryMode {
+        match self {
+            Self::Local => MetadataApiQueryMode::Local,
+            Self::DistributedBestEffort | Self::DistributedStrict => {
+                MetadataApiQueryMode::Distributed
+            }
+        }
+    }
+
+    fn allow_partial(self) -> bool {
+        !matches!(self, Self::DistributedStrict)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectSearchRequest {
+    pub auth: AuthContext,
+    pub bearer_token: Option<String>,
+    pub query: String,
+    pub key_match: ObjectKeyMatch,
+    pub bucket: Option<String>,
+    pub limit: usize,
+    pub cursor: Option<String>,
+    pub mode: ObjectSearchQueryMode,
+    pub target_nodes: Option<Vec<NodeId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectSearchPartitionCoverage {
+    pub node_id: NodeId,
+    pub observed_at: SystemTime,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectSearchExecution {
+    pub hits: Vec<ObjectInventoryHit>,
+    pub next_cursor: Option<String>,
+    pub as_of: SystemTime,
+    pub partitions: Vec<ObjectSearchPartitionCoverage>,
+    pub fanout_stats: MetadataFanoutStats,
+    pub omitted_partitions: usize,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectSearchPartitionState {
+    node_id: NodeId,
+    start_after: Option<Vec<u8>>,
+    exhausted: bool,
+    observed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectSearchCursorPartition {
+    node_id: [u8; 32],
+    start_after: Option<Vec<u8>>,
+    exhausted: bool,
+    observed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectSearchCursor {
+    version: u8,
+    signer: [u8; 32],
+    fingerprint: [u8; 32],
+    as_of: SystemTime,
+    partitions: Vec<ObjectSearchCursorPartition>,
+    failed_partitions: Vec<[u8; 32]>,
+    discovery_failed: bool,
+    omitted_partitions: usize,
+    signature: iroh::Signature,
+}
+
+#[derive(Serialize)]
+struct ObjectSearchCursorSignaturePayload<'a> {
+    version: u8,
+    signer: [u8; 32],
+    fingerprint: [u8; 32],
+    as_of: SystemTime,
+    partitions: &'a [ObjectSearchCursorPartition],
+    failed_partitions: &'a [[u8; 32]],
+    discovery_failed: bool,
+    omitted_partitions: usize,
+}
+
+impl ObjectSearchCursor {
+    fn encode(&self) -> Result<String, MetadataApiError> {
+        let bytes = postcard::to_allocvec(self)
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    fn decode(
+        raw: &str,
+        fingerprint: [u8; 32],
+        authorized_signer: NodeId,
+    ) -> Result<Self, MetadataApiError> {
+        if raw.len() > OBJECT_SEARCH_CURSOR_MAX_BYTES {
+            return Err(MetadataApiError::InvalidCursor(
+                "invalid object search cursor".to_string(),
+            ));
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| {
+                MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+            })?;
+        let cursor: Self = postcard::from_bytes(&bytes).map_err(|_| {
+            MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+        })?;
+        if cursor.version != OBJECT_SEARCH_CURSOR_VERSION || cursor.fingerprint != fingerprint {
+            return Err(MetadataApiError::InvalidCursor(
+                "object search cursor does not match query".to_string(),
+            ));
+        }
+        let signer = NodeId::from_bytes(&cursor.signer).map_err(|_| {
+            MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+        })?;
+        if signer != authorized_signer
+            || signer
+                .verify(&cursor.signing_bytes(), &cursor.signature)
+                .is_err()
+        {
+            return Err(MetadataApiError::InvalidCursor(
+                "invalid object search cursor".to_string(),
+            ));
+        }
+        if cursor.partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+            || cursor.failed_partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+        {
+            return Err(MetadataApiError::InvalidCursor(
+                "invalid object search cursor".to_string(),
+            ));
+        }
+        let mut nodes = HashSet::new();
+        for partition in &cursor.partitions {
+            NodeId::from_bytes(&partition.node_id).map_err(|_| {
+                MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+            })?;
+            if !nodes.insert(partition.node_id)
+                || partition.start_after.as_ref().is_some_and(|key| {
+                    key.len() > OBJECT_SEARCH_CURSOR_MAX_KEY_BYTES
+                        || BlobHeadKey::from_bytes(key).is_err()
+                })
+            {
+                return Err(MetadataApiError::InvalidCursor(
+                    "invalid object search cursor".to_string(),
+                ));
+            }
+        }
+        for node_id in &cursor.failed_partitions {
+            NodeId::from_bytes(node_id).map_err(|_| {
+                MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+            })?;
+            if !nodes.insert(*node_id) {
+                return Err(MetadataApiError::InvalidCursor(
+                    "invalid object search cursor".to_string(),
+                ));
+            }
+        }
+        if !cursor
+            .partitions
+            .iter()
+            .any(|partition| !partition.exhausted)
+        {
+            return Err(MetadataApiError::InvalidCursor(
+                "exhausted object search cursor".to_string(),
+            ));
+        }
+        Ok(cursor)
+    }
+
+    fn partition_states(&self) -> Result<Vec<ObjectSearchPartitionState>, MetadataApiError> {
+        self.partitions
+            .iter()
+            .map(|partition| {
+                Ok(ObjectSearchPartitionState {
+                    node_id: NodeId::from_bytes(&partition.node_id).map_err(|_| {
+                        MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+                    })?,
+                    start_after: partition.start_after.clone(),
+                    exhausted: partition.exhausted,
+                    observed_at: partition.observed_at,
+                })
+            })
+            .collect()
+    }
+
+    fn failed_nodes(&self) -> Result<Vec<NodeId>, MetadataApiError> {
+        self.failed_partitions
+            .iter()
+            .map(|node_id| {
+                NodeId::from_bytes(node_id).map_err(|_| {
+                    MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+                })
+            })
+            .collect()
+    }
+
+    fn new_signed(
+        fingerprint: [u8; 32],
+        as_of: SystemTime,
+        partitions: &[ObjectSearchPartitionState],
+        failed_partitions: &[NodeId],
+        discovery_failed: bool,
+        omitted_partitions: usize,
+        signer: NodeId,
+        sign: impl FnOnce(&[u8]) -> iroh::Signature,
+    ) -> Self {
+        let signer = *signer.as_bytes();
+        let partitions: Vec<ObjectSearchCursorPartition> = partitions
+            .iter()
+            .map(|partition| ObjectSearchCursorPartition {
+                node_id: *partition.node_id.as_bytes(),
+                start_after: partition.start_after.clone(),
+                exhausted: partition.exhausted,
+                observed_at: partition.observed_at,
+            })
+            .collect();
+        let failed_partitions: Vec<[u8; 32]> = failed_partitions
+            .iter()
+            .map(|node_id| *node_id.as_bytes())
+            .collect();
+        let signing_bytes = object_search_cursor_signing_bytes(
+            OBJECT_SEARCH_CURSOR_VERSION,
+            signer,
+            fingerprint,
+            as_of,
+            &partitions,
+            &failed_partitions,
+            discovery_failed,
+            omitted_partitions,
+        );
+        let signature = sign(&signing_bytes);
+        Self {
+            version: OBJECT_SEARCH_CURSOR_VERSION,
+            signer,
+            fingerprint,
+            as_of,
+            partitions,
+            failed_partitions,
+            discovery_failed,
+            omitted_partitions,
+            signature,
+        }
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        object_search_cursor_signing_bytes(
+            self.version,
+            self.signer,
+            self.fingerprint,
+            self.as_of,
+            &self.partitions,
+            &self.failed_partitions,
+            self.discovery_failed,
+            self.omitted_partitions,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn object_search_cursor_signing_bytes(
+    version: u8,
+    signer: [u8; 32],
+    fingerprint: [u8; 32],
+    as_of: SystemTime,
+    partitions: &[ObjectSearchCursorPartition],
+    failed_partitions: &[[u8; 32]],
+    discovery_failed: bool,
+    omitted_partitions: usize,
+) -> Vec<u8> {
+    let payload = ObjectSearchCursorSignaturePayload {
+        version,
+        signer,
+        fingerprint,
+        as_of,
+        partitions,
+        failed_partitions,
+        discovery_failed,
+        omitted_partitions,
+    };
+    let payload = postcard::to_allocvec(&payload).expect("object search cursor serializes");
+    let mut bytes =
+        Vec::with_capacity(OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT.len() + 1 + payload.len());
+    bytes.extend_from_slice(OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT);
+    bytes.push(0);
+    bytes.extend_from_slice(&payload);
+    bytes
 }
 
 #[derive(Debug, Clone)]
@@ -3100,6 +3409,7 @@ enum MetadataFanoutOperation {
     Query,
     Search,
     BucketSearch,
+    ObjectSearch,
 }
 
 impl MetadataFanoutOperation {
@@ -3108,6 +3418,7 @@ impl MetadataFanoutOperation {
             Self::Query => "query",
             Self::Search => "search",
             Self::BucketSearch => "bucket_search",
+            Self::ObjectSearch => "object_search",
         }
     }
 }
@@ -3135,6 +3446,14 @@ fn metadata_fanout_node_span(
         ),
         MetadataFanoutOperation::BucketSearch => debug_span!(
             "metadata.operation.bucket_search_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::ObjectSearch => debug_span!(
+            "metadata.operation.object_search_node",
             peer = ?node_id,
             local,
             elapsed_ms = field::Empty,
@@ -3503,6 +3822,354 @@ pub async fn search_buckets_distributed(
         .collect::<Vec<_>>();
     hits.truncate(limit);
     Ok(BucketSearchExecution { hits, fanout_stats })
+}
+
+pub async fn search_objects(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    request: ObjectSearchRequest,
+) -> Result<ObjectSearchExecution, MetadataApiError> {
+    if request.query.is_empty() || request.auth.realm_id != realm_id {
+        return Err(if request.query.is_empty() {
+            MetadataApiError::BadRequest
+        } else {
+            MetadataApiError::Forbidden
+        });
+    }
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let limit = request
+        .limit
+        .clamp(1, crate::s3::search_objects::OBJECT_SEARCH_MAX_LIMIT);
+    let fingerprint = object_search_fingerprint(
+        realm_id,
+        &request.query,
+        request.key_match,
+        request.bucket.as_deref(),
+        request.mode,
+    );
+
+    let (as_of, mut partitions, mut failed_partitions, discovery_failed, omitted_partitions) =
+        match request.cursor.as_deref() {
+            Some(raw) => {
+                let cursor = ObjectSearchCursor::decode(raw, fingerprint, local_node_id)?;
+                let partitions = cursor.partition_states()?;
+                if request.mode == ObjectSearchQueryMode::Local
+                    && (partitions.len() != 1 || partitions[0].node_id != local_node_id)
+                {
+                    return Err(MetadataApiError::InvalidCursor(
+                        "invalid local object search cursor".to_string(),
+                    ));
+                }
+                (
+                    cursor.as_of,
+                    partitions,
+                    cursor.failed_nodes()?,
+                    cursor.discovery_failed,
+                    cursor.omitted_partitions,
+                )
+            }
+            None => {
+                let as_of = SystemTime::now();
+                let (mut nodes, discovery_failed) =
+                    match request.mode {
+                        ObjectSearchQueryMode::Local => (vec![local_node_id], false),
+                        ObjectSearchQueryMode::DistributedBestEffort
+                        | ObjectSearchQueryMode::DistributedStrict => {
+                            match request.target_nodes.clone() {
+                                Some(nodes) => (deduplicate_fanout_nodes(nodes), false),
+                                None => {
+                                    let discovery = tokio::time::timeout_at(
+                                        deadline,
+                                        discover_realm_nodes(context, realm_id, local_node_id),
+                                    )
+                                    .await
+                                    .unwrap_or(MetadataRealmNodeDiscovery {
+                                        nodes: vec![local_node_id],
+                                        failed: true,
+                                    });
+                                    (discovery.nodes, discovery.failed)
+                                }
+                            }
+                        }
+                    };
+                if nodes.is_empty() {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                let omitted_partitions = if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+                    let selected = select_fanout_nodes(&nodes, local_node_id, &fingerprint);
+                    let omitted = nodes.len().saturating_sub(selected.len());
+                    nodes = selected;
+                    omitted
+                } else {
+                    0
+                };
+                if request.mode == ObjectSearchQueryMode::DistributedStrict
+                    && (discovery_failed || omitted_partitions > 0)
+                {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                (
+                    as_of,
+                    nodes
+                        .into_iter()
+                        .map(|node_id| ObjectSearchPartitionState {
+                            node_id,
+                            start_after: None,
+                            exhausted: false,
+                            observed_at: None,
+                        })
+                        .collect(),
+                    Vec::new(),
+                    discovery_failed,
+                    omitted_partitions,
+                )
+            }
+        };
+
+    if request.mode == ObjectSearchQueryMode::DistributedStrict
+        && (discovery_failed || omitted_partitions > 0 || !failed_partitions.is_empty())
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+
+    let active_nodes = partitions
+        .iter()
+        .filter(|partition| !partition.exhausted)
+        .map(|partition| partition.node_id)
+        .collect::<Vec<_>>();
+    if active_nodes.is_empty() {
+        return Err(MetadataApiError::InvalidCursor(
+            "exhausted object search cursor".to_string(),
+        ));
+    }
+    let start_positions = partitions
+        .iter()
+        .map(|partition| (partition.node_id, partition.start_after.clone()))
+        .collect::<HashMap<_, _>>();
+    let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
+    let handle = context.metadata_handle.clone();
+
+    let local_call: MetadataNodeCall<ObjectSearchNodePage> = metadata_node_call(
+        (
+            context.clone(),
+            request.auth,
+            realm_id,
+            request.query.clone(),
+            request.key_match,
+            request.bucket.clone(),
+            limit,
+            as_of,
+            start_positions.clone(),
+        ),
+        |(context, auth, realm_id, query, key_match, bucket, limit, as_of, starts), node_id| async move {
+            search_local_objects(
+                &context,
+                SearchObjectsInput {
+                    auth,
+                    realm_id,
+                    node_id,
+                    query,
+                    key_match,
+                    bucket,
+                    limit,
+                    start_after: starts.get(&node_id).cloned().flatten(),
+                    as_of,
+                },
+            )
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)
+        },
+    );
+    let remote_call: MetadataNodeCall<ObjectSearchNodePage> = metadata_node_call(
+        (
+            handle,
+            remote_auth_token,
+            request.query,
+            request.key_match,
+            request.bucket,
+            limit,
+            as_of,
+            start_positions,
+        ),
+        |(handle, auth_token, query, key_match, bucket, limit, as_of, starts), node_id| async move {
+            let Some(handle) = handle else {
+                return Err(MetadataReadError::Unavailable);
+            };
+            handle
+                .request_object_search(
+                    node_id,
+                    auth_token,
+                    query,
+                    key_match,
+                    bucket,
+                    limit,
+                    starts.get(&node_id).cloned().flatten(),
+                    as_of,
+                )
+                .await
+        },
+    );
+    let (parts, mut fanout_stats) = run_metadata_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        MetadataFanoutScope::new(
+            Some(request.mode.fanout_mode()),
+            Some(active_nodes),
+            request.mode.allow_partial(),
+        )
+        .with_subject(fingerprint)
+        .with_discovery_failed(discovery_failed)
+        .with_deadline(deadline),
+        MetadataFanoutOperation::ObjectSearch,
+        local_call,
+        remote_call,
+        record_object_result,
+        map_read_error,
+    )
+    .await?;
+
+    let newly_failed = fanout_stats.failed_partitions.clone();
+    failed_partitions.extend(newly_failed.iter().copied());
+    failed_partitions.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    failed_partitions.dedup();
+    partitions.retain(|partition| !newly_failed.contains(&partition.node_id));
+    partitions
+        .sort_unstable_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
+
+    let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
+    let mut hits = Vec::with_capacity(limit);
+    let mut remaining = limit;
+    for partition in &mut partitions {
+        if partition.exhausted {
+            continue;
+        }
+        let Some(page) = pages.remove(&partition.node_id) else {
+            continue;
+        };
+        partition.observed_at = Some(page.observed_at);
+        if remaining == 0 {
+            if page.hits.is_empty() && page.next_start_after.is_none() {
+                partition.exhausted = true;
+            }
+            continue;
+        }
+
+        let consumed = remaining.min(page.hits.len());
+        hits.extend(
+            page.hits
+                .iter()
+                .take(consumed)
+                .map(|candidate| candidate.hit.clone()),
+        );
+        remaining = remaining.saturating_sub(consumed);
+        if consumed < page.hits.len() {
+            partition.start_after = page
+                .hits
+                .get(consumed.saturating_sub(1))
+                .map(|candidate| candidate.cursor_key.clone());
+            partition.exhausted = false;
+        } else if consumed > 0 || page.hits.is_empty() {
+            partition.start_after = page.next_start_after;
+            partition.exhausted = partition.start_after.is_none();
+        }
+    }
+
+    let next_cursor = if partitions.iter().any(|partition| !partition.exhausted) {
+        let net = context.net_handle.as_ref().ok_or_else(|| {
+            MetadataApiError::Internal(
+                "net handle unavailable for object search cursor signing".to_string(),
+            )
+        })?;
+        Some(
+            ObjectSearchCursor::new_signed(
+                fingerprint,
+                as_of,
+                &partitions,
+                &failed_partitions,
+                discovery_failed,
+                omitted_partitions,
+                net.node_id(),
+                |bytes| net.sign(bytes),
+            )
+            .encode()?,
+        )
+    } else {
+        None
+    };
+    let coverage = partitions
+        .iter()
+        .filter_map(|partition| {
+            partition
+                .observed_at
+                .map(|observed_at| ObjectSearchPartitionCoverage {
+                    node_id: partition.node_id,
+                    observed_at,
+                    truncated: !partition.exhausted,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    fanout_stats.failed_partitions = failed_partitions;
+    fanout_stats.nodes_failed =
+        fanout_stats.failed_partitions.len() + omitted_partitions + usize::from(discovery_failed);
+    let complete = fanout_stats.nodes_failed == 0;
+    Ok(ObjectSearchExecution {
+        hits,
+        next_cursor,
+        as_of,
+        partitions: coverage,
+        fanout_stats,
+        omitted_partitions,
+        complete,
+    })
+}
+
+fn object_search_fingerprint(
+    realm_id: RealmId,
+    query: &str,
+    key_match: ObjectKeyMatch,
+    bucket: Option<&str>,
+    mode: ObjectSearchQueryMode,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna.object.search.v1\0");
+    hasher.update(realm_id.as_bytes());
+    hasher.update(query.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&[match key_match {
+        ObjectKeyMatch::Substring => 1,
+        ObjectKeyMatch::Prefix => 2,
+    }]);
+    match bucket {
+        Some(bucket) => {
+            hasher.update(&[1]);
+            hasher.update(bucket.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&[match mode {
+        ObjectSearchQueryMode::Local => 1,
+        ObjectSearchQueryMode::DistributedBestEffort => 2,
+        ObjectSearchQueryMode::DistributedStrict => 3,
+    }]);
+    *hasher.finalize().as_bytes()
+}
+
+fn record_object_result(span: &Span, result: &Result<ObjectSearchNodePage, MetadataReadError>) {
+    match result {
+        Ok(page) => {
+            span.record("result", "ok");
+            span.record("hit_count", page.hits.len() as u64);
+        }
+        Err(_) => {
+            span.record("result", "error");
+        }
+    }
 }
 
 fn record_bucket_result(span: &Span, result: &Result<Vec<BucketSearchHit>, MetadataReadError>) {
@@ -5899,6 +6566,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn object_cursor_rejects_tampered_coverage_state() {
+        let secret = iroh::SecretKey::from_bytes(&[34u8; 32]);
+        let signer = secret.public();
+        let fingerprint = [35u8; 32];
+        let mut cursor = ObjectSearchCursor::new_signed(
+            fingerprint,
+            SystemTime::UNIX_EPOCH,
+            &[ObjectSearchPartitionState {
+                node_id: signer,
+                start_after: None,
+                exhausted: false,
+                observed_at: Some(SystemTime::UNIX_EPOCH),
+            }],
+            &[],
+            false,
+            0,
+            signer,
+            |bytes| secret.sign(bytes),
+        );
+
+        assert!(ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, signer).is_ok());
+        cursor.omitted_partitions = 1;
+        assert!(matches!(
+            ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, signer),
+            Err(MetadataApiError::InvalidCursor(_))
+        ));
+    }
+
     #[tokio::test]
     async fn bucket_fanout_partial() {
         let directory = tempdir().unwrap();
@@ -5947,6 +6643,98 @@ mod tests {
         assert_eq!(stats.nodes_queried, 3);
         assert_eq!(stats.nodes_failed, 1);
         assert_eq!(stats.failed_partitions, vec![failed]);
+    }
+
+    #[tokio::test]
+    async fn object_fanout_reports_partial_partitions() {
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let local = iroh::SecretKey::from_bytes(&[81u8; 32]).public();
+        let healthy = iroh::SecretKey::from_bytes(&[82u8; 32]).public();
+        let failed = iroh::SecretKey::from_bytes(&[83u8; 32]).public();
+        let local_call: MetadataNodeCall<usize> =
+            metadata_node_call((), |(), _| async move { Ok(1) });
+        let remote_call: MetadataNodeCall<usize> =
+            metadata_node_call(failed, |failed, node_id| async move {
+                if node_id == failed {
+                    Err(MetadataReadError::Unavailable)
+                } else {
+                    Ok(2)
+                }
+            });
+
+        let (parts, stats) = run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([19u8; 32]),
+            local,
+            MetadataFanoutScope::new(
+                Some(MetadataApiQueryMode::Distributed),
+                Some(vec![local, healthy, failed]),
+                ObjectSearchQueryMode::DistributedBestEffort.allow_partial(),
+            ),
+            MetadataFanoutOperation::ObjectSearch,
+            local_call,
+            remote_call,
+            |_, _| {},
+            map_read_error,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parts, vec![(local, 1), (healthy, 2)]);
+        assert_eq!(stats.nodes_queried, 3);
+        assert_eq!(stats.nodes_failed, 1);
+        assert_eq!(stats.failed_partitions, vec![failed]);
+    }
+
+    #[tokio::test]
+    async fn object_fanout_strict_fails_instead_of_downgrading() {
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let local = iroh::SecretKey::from_bytes(&[84u8; 32]).public();
+        let failed = iroh::SecretKey::from_bytes(&[85u8; 32]).public();
+        let local_call: MetadataNodeCall<usize> =
+            metadata_node_call((), |(), _| async move { Ok(1) });
+        let remote_call: MetadataNodeCall<usize> =
+            metadata_node_call(
+                (),
+                |(), _| async move { Err(MetadataReadError::Unavailable) },
+            );
+
+        let result = run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([20u8; 32]),
+            local,
+            MetadataFanoutScope::new(
+                Some(MetadataApiQueryMode::Distributed),
+                Some(vec![local, failed]),
+                ObjectSearchQueryMode::DistributedStrict.allow_partial(),
+            ),
+            MetadataFanoutOperation::ObjectSearch,
+            local_call,
+            remote_call,
+            |_, _| {},
+            map_read_error,
+        )
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
     }
 
     #[tokio::test]

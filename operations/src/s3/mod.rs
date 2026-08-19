@@ -31,6 +31,7 @@ pub mod put_object;
 pub mod refresh_reference_metadata;
 pub mod revoke_user_access;
 pub mod search_buckets;
+pub mod search_objects;
 pub mod session;
 pub mod upload_part;
 pub mod upload_part_copy;
