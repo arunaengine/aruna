@@ -205,3 +205,8 @@ panic = "abort"
 # coverage fidelity.
 [profile.dev.package."*"]
 opt-level = 3
+
+# TODO: Temporary local patch until the rocrate13 Craqle branch lands on main;
+# then replace the workspace dependency with a rev-pinned git dependency.
+[patch."https://github.com/arunaengine/craqle"]
+craqle = { path = "/home/beavis/projects/craqle" }

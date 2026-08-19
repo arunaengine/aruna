@@ -1831,7 +1831,6 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.1"
-source = "git+https://github.com/arunaengine/craqle?branch=main#6412e699ac86648e4b02b19b8953ee4a78b3dce0"
 dependencies = [
  "blake3",
  "chrono",
@@ -5428,7 +5427,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "ryu-js",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5442,7 +5441,7 @@ dependencies = [
  "oxsdatatypes",
  "rand 0.8.7",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5455,7 +5454,7 @@ dependencies = [
  "oxrdf",
  "oxrdfxml",
  "oxttl",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5468,7 +5467,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "quick-xml 0.37.5",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5477,7 +5476,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06fa874d87eae638daae9b4e3198864fe2cce68589f227c0b2cf5b62b1530516"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5490,7 +5489,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxrdf",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6611,8 +6610,8 @@ dependencies = [
 
 [[package]]
 name = "ro-crate-rs"
-version = "0.5.1"
-source = "git+https://github.com/intbio-ncl/ro-crate-rs.git?branch=main#169aab72ae55773c327eb2d713fd503a36797539"
+version = "0.6.0"
+source = "git+https://github.com/intbio-ncl/ro-crate-rs.git?tag=v0.6.0#855b8038e7170028bd2c3f8a2425a3abc73e2b93"
 dependencies = [
  "chrono",
  "dirs",
@@ -7353,7 +7352,7 @@ dependencies = [
  "memchr",
  "oxrdf",
  "quick-xml 0.37.5",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7376,7 +7375,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparopt",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7390,7 +7389,7 @@ dependencies = [
  "oxrdf",
  "peg",
  "rand 0.8.7",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

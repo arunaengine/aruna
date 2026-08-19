@@ -6992,6 +6992,7 @@ mod tests {
     use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::metadata::MetadataApplyRoCrateRequest;
     use aruna_core::structs::{
         ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
         SyncMode, SyncState, SyncStatusSnapshot, TokenClaims, TokenRevocation,
@@ -7005,6 +7006,15 @@ mod tests {
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
     use tokio::io::AsyncWriteExt;
+
+    const ROCRATE_12: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/rocrate/roundtrip-1.2.json"
+    ));
+    const ROCRATE_13: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/rocrate/roundtrip-1.3.json"
+    ));
 
     #[test]
     fn maps_violations() {
@@ -7278,6 +7288,129 @@ mod tests {
         )
         .expect("metadata handle opens");
         (metadata_dir, metadata_handle)
+    }
+
+    #[tokio::test]
+    async fn versions_roundtrip() {
+        let (_storage_dir, storage) = auth_storage();
+        let (_metadata_dir, handle) = memory_handle(storage);
+        let cases = [
+            ("1.2", "urn:fixture:aruna:rocrate:1.2", ROCRATE_12),
+            ("1.3", "urn:fixture:aruna:rocrate:1.3", ROCRATE_13),
+        ];
+
+        // One handle stores both versions, covering a mixed-version realm.
+        for (version, graph_iri, jsonld) in cases {
+            let request = MetadataApplyRoCrateRequest {
+                graph_iri: graph_iri.to_string(),
+                jsonld: jsonld.to_string(),
+                policy: MetadataGraphPolicy {
+                    public: true,
+                    permission_paths: Vec::new(),
+                },
+                durability: MetadataRequestDurability::Durable,
+                deterministic_actor: None,
+            };
+            assert!(matches!(
+                handle
+                    .send_metadata_effect(MetadataEffect::ValidateRoCrate {
+                        request: request.clone(),
+                    })
+                    .await,
+                Event::Metadata(MetadataEvent::ValidationResult { graph_iri: validated })
+                    if validated == graph_iri
+            ));
+            assert!(matches!(
+                handle
+                    .send_metadata_effect(MetadataEffect::ApplyRoCrate { request })
+                    .await,
+                Event::Metadata(MetadataEvent::ApplyRoCrateResult { graph_iri: applied, .. })
+                    if applied == graph_iri
+            ));
+
+            let exported = handle
+                .export_rocrate_jsonld(graph_iri.to_string())
+                .await
+                .expect("RO-Crate exports");
+            let output = serde_json::from_str::<Value>(&exported).expect("export is JSON");
+            let input = serde_json::from_str::<Value>(jsonld).expect("fixture is JSON");
+            assert_eq!(output["@context"], input["@context"]);
+            let output_descriptor = output["@graph"]
+                .as_array()
+                .expect("export graph")
+                .iter()
+                .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+                .expect("export descriptor");
+            let input_descriptor = input["@graph"]
+                .as_array()
+                .expect("fixture graph")
+                .iter()
+                .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+                .expect("fixture descriptor");
+            assert_eq!(
+                output_descriptor["conformsTo"],
+                input_descriptor["conformsTo"]
+            );
+            if version == "1.2" {
+                assert_eq!(
+                    output, input,
+                    "RO-Crate 1.2 JSON-LD behavior changed during import/export"
+                );
+            }
+            assert_eq!(
+                craqle::validate_rocrate_jsonld(&exported)
+                    .expect("export validates")
+                    .nquads,
+                craqle::validate_rocrate_jsonld(jsonld)
+                    .expect("fixture validates")
+                    .nquads,
+                "RO-Crate {version} RDF changed during import/export"
+            );
+        }
+
+        let graph_iri = "urn:fixture:aruna:rocrate:created";
+        assert!(matches!(
+            handle
+                .send_metadata_effect(MetadataEffect::CreateCrate {
+                    request: MetadataCreateCrateRequest {
+                        graph_iri: graph_iri.to_string(),
+                        name: "RO-Crate 1.3 scaffold".to_string(),
+                        description: "Aruna scaffold version contract".to_string(),
+                        date_published: "2026-08-19".to_string(),
+                        license: None,
+                        policy: MetadataGraphPolicy {
+                            public: true,
+                            permission_paths: Vec::new(),
+                        },
+                        durability: MetadataRequestDurability::Durable,
+                        deterministic_actor: None,
+                    },
+                })
+                .await,
+            Event::Metadata(MetadataEvent::CreateCrateResult { graph_iri: created, .. })
+                if created == graph_iri
+        ));
+        let scaffold: Value = serde_json::from_str(
+            &handle
+                .export_rocrate_jsonld(graph_iri.to_string())
+                .await
+                .expect("scaffold exports"),
+        )
+        .expect("scaffold is JSON");
+        assert_eq!(
+            scaffold["@context"],
+            serde_json::json!("https://w3id.org/ro/crate/1.3/context")
+        );
+        let descriptor = scaffold["@graph"]
+            .as_array()
+            .expect("scaffold graph")
+            .iter()
+            .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+            .expect("scaffold descriptor");
+        assert_eq!(
+            descriptor["conformsTo"]["@id"],
+            serde_json::json!("https://w3id.org/ro/crate/1.3")
+        );
     }
 
     async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {

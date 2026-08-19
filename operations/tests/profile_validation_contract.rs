@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
@@ -23,7 +23,9 @@ use aruna_operations::metadata::profile_validation::{
     current_validation_status, load_validation_status, profile_public_iri, revalidate_current,
 };
 use aruna_operations::metadata::{
-    MetadataHandle, MetadataHandleOptions, projector::drain_pending_metadata_projection_queue,
+    MetadataHandle, MetadataHandleOptions,
+    materialization_queue::process_metadata_materialization_batch,
+    projector::drain_pending_metadata_projection_queue,
 };
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -36,7 +38,11 @@ use serde_json::json;
 use tempfile::TempDir;
 use ulid::Ulid;
 
+static PROFILE_TEST_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
 struct TestContext {
+    _test_lock: tokio::sync::OwnedMutexGuard<()>,
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
     actor: Actor,
@@ -378,6 +384,7 @@ async fn register_profile(
     )
     .await?;
     drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
+    process_metadata_materialization_batch(test.context.as_ref()).await?;
     Ok((profile_id, created.event_id))
 }
 
@@ -524,6 +531,7 @@ async fn event_count(
 async fn build_context(
     validator_disabled: bool,
 ) -> Result<TestContext, Box<dyn std::error::Error>> {
+    let test_lock = PROFILE_TEST_LOCK.clone().lock_owned().await;
     let storage_dir = tempfile::tempdir()?;
     let metadata_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
@@ -585,6 +593,7 @@ async fn build_context(
         compute_handle: None,
     });
     Ok(TestContext {
+        _test_lock: test_lock,
         _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         actor,

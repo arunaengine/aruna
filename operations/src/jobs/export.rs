@@ -3000,6 +3000,14 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     const FIXTURE_BYTES: &[u8] = b"duplicate fixture payload";
+    const ROCRATE_12: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/rocrate/roundtrip-1.2.json"
+    ));
+    const ROCRATE_13: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/rocrate/roundtrip-1.3.json"
+    ));
 
     struct SparseWriter {
         file: std::fs::File,
@@ -3250,6 +3258,52 @@ mod tests {
         let jsonld = serde_json::to_string(document).unwrap();
         let canonical = craqle::canonicalize_jsonld(&jsonld).unwrap();
         recognize_entities(document, &canonical.nquads, realm_id)
+    }
+
+    #[test]
+    fn versions_roundtrip() {
+        let realm_id = RealmId::from_bytes([96; 32]);
+        for (version, seed, jsonld) in [("1.2", 12, ROCRATE_12), ("1.3", 13, ROCRATE_13)] {
+            let validated = validate_document(jsonld).expect("fixture validates structurally");
+            assert!(validated.file_ids.is_empty());
+            let rewritten = rewrite_document(validated.value, &HashMap::new())
+                .expect("import rewrite succeeds");
+            assert!(rewritten.warnings.is_empty());
+            let input = serde_json::from_str::<JsonValue>(jsonld).expect("fixture is JSON");
+            let imported = serde_json::from_str::<JsonValue>(&rewritten.jsonld)
+                .expect("import output is JSON");
+            assert_eq!(imported, input, "RO-Crate {version} import changed JSON-LD");
+
+            let entities = recognized_entities(&imported, realm_id).expect("entities resolve");
+            assert!(entities.is_empty());
+            let spec = ExportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
+                    path_restrictions: None,
+                },
+                document_id: Ulid::from_bytes([seed; 16]),
+                limits: RoCrateLimits::default(),
+            };
+            let mut checkpoint = ExportCheckpoint {
+                raw_jsonld: Some(rewritten.jsonld),
+                entities,
+                ..ExportCheckpoint::default()
+            };
+            plan_export(&spec, &mut checkpoint, &[]).expect("export plans");
+            let exported = checkpoint.rewritten_jsonld.expect("export metadata exists");
+            let output = serde_json::from_slice::<JsonValue>(&exported).expect("export is JSON");
+            assert_eq!(output, input, "RO-Crate {version} export changed JSON-LD");
+            assert_eq!(
+                craqle::validate_rocrate_jsonld(std::str::from_utf8(&exported).unwrap())
+                    .expect("export validates")
+                    .nquads,
+                craqle::validate_rocrate_jsonld(jsonld)
+                    .expect("fixture validates")
+                    .nquads,
+                "RO-Crate {version} RDF changed during import/export"
+            );
+        }
     }
 
     fn fixture_stream(bytes: Vec<u8>) -> BackendStream<Result<Bytes, StreamError>> {

@@ -7,7 +7,7 @@ use aruna_core::keyspaces::METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
     MetadataProfileValidationSeverity, MetadataProfileValidationState,
-    MetadataProfileValidationStatus,
+    MetadataProfileValidationStatus, is_rocrate_specification,
 };
 use aruna_core::storage_entries::{
     metadata_profile_validation_status_key, metadata_profile_validation_status_write_entry,
@@ -632,7 +632,9 @@ fn profile_tags(dataset: &Dataset, root: &NamedOrBlankNode) -> Vec<String> {
         SCHEMA_HTTPS_CONFORMS_TO,
     ] {
         for object in objects(dataset, root, predicate) {
-            if let Term::NamedNode(iri) = object {
+            if let Term::NamedNode(iri) = object
+                && !is_rocrate_specification(iri.as_str())
+            {
                 tags.insert(iri.as_str().to_string());
             }
         }
@@ -1624,5 +1626,34 @@ mod tests {
             profile_id_from_iri(&MetadataRegistryRecord::graph_iri_for(id)),
             Some(id)
         );
+    }
+
+    #[test]
+    fn spec_tags_ignored() {
+        for version in ["1.2", "1.3"] {
+            let specification = format!("https://w3id.org/ro/crate/{version}");
+            let document = serde_json::json!({
+                "@context": format!("{specification}/context"),
+                "@graph": [
+                    {
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": {"@id": specification},
+                        "about": {"@id": "https://example.test/dataset"}
+                    },
+                    {
+                        "@id": "https://example.test/dataset",
+                        "@type": "Dataset",
+                        "name": "Versioned crate",
+                        "description": "Specification IRIs are not Profiles",
+                        "datePublished": "2026-08-19",
+                        "conformsTo": {"@id": specification}
+                    }
+                ]
+            })
+            .to_string();
+            let (data, root) = data_graph(&document).unwrap();
+            assert!(profile_tags(&data, &root).is_empty());
+        }
     }
 }

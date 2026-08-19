@@ -72,7 +72,7 @@ pub struct SearchParams {
     /// Documents-only: restrict metadata hits to a single group id.
     #[serde(default)]
     pub group_id: Option<String>,
-    /// Documents-only: exact RO-Crate conformsTo profile IRI.
+    /// Documents-only: exact RO-Crate conformsTo specification or Profile IRI.
     #[serde(default)]
     pub conforms_to: Option<String>,
     /// Documents-only: search mode (local or distributed).
@@ -554,7 +554,7 @@ fn format_system_time(time: std::time::SystemTime) -> String {
         ("limit" = Option<usize>, Query, description = "Per-section page size (default 10, clamped to 1..=100, and additionally capped at 50 for the buckets section)"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same section's next_cursor. Only accepted when exactly one type is requested; for documents it is a signed token bound to the exact query and filters, for groups the last returned group id as a ULID and for users the last returned user id in its ulid@realm form, and a malformed or unsupported cursor returns 400"),
         ("group_id" = Option<String>, Query, description = "Documents-only: restrict metadata hits to a single group id, given as a ULID; a malformed id returns 400"),
-        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo profile IRI, such as https://w3id.org/ro/crate/1.1"),
+        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo specification or Profile IRI, such as the https://w3id.org/ro/crate/1.3 specification or an https://w3id.org/aruna/profile/{id} Profile"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Documents-only: local restricts the document search to this node, distributed fans out over the realm; defaults to distributed")
     ),
     responses(

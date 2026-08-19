@@ -12,6 +12,14 @@ use crate::types::{GroupId, UserId};
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 
+/// Supported RO-Crate specification IRIs are version markers, not Profiles.
+pub fn is_rocrate_specification(iri: &str) -> bool {
+    matches!(
+        iri,
+        "https://w3id.org/ro/crate/1.2" | "https://w3id.org/ro/crate/1.3"
+    )
+}
+
 /// Credential a forwarded metadata or job-control request carries to the holder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataAuthToken {
