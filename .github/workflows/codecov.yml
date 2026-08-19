@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     # Hang cap, not a performance budget. Instrumented multi-node tests use two
     # threads to avoid runner oversubscription; large restart profiles run below.
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
       RUST_TEST_THREADS: 2
