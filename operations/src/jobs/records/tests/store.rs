@@ -128,7 +128,7 @@ async fn keeps_attempt_state() {
         1_000,
         None,
     );
-    logical.state = JobState::Running;
+    logical.state = JobState::Queued;
     context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
@@ -141,6 +141,7 @@ async fn keeps_attempt_state() {
     let physical_id = JobId::from_bytes([10u8; 16]);
     let mut physical = logical.clone();
     physical.job_id = physical_id;
+    physical.state = JobState::Running;
     crate::jobs::store::insert_job(&context.storage_handle, &physical)
         .await
         .expect("physical row inserted");

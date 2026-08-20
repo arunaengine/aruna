@@ -72,7 +72,7 @@ pub async fn run_execution_job(
     };
     let bucket = job_bucket(&record);
     if !bucket.is_empty() {
-        spec.resolve_outputs(&bucket);
+        spec.resolve_outputs(&bucket, record.owner_node_id);
     }
 
     // A fresh cancel before any attempt was submitted: no container exists, so
@@ -1896,7 +1896,8 @@ mod tests {
     use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
-        ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, RealmId,
+        ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination,
+        OutputSelection, RealmId,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
@@ -2234,8 +2235,8 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let ctx = context(storage.clone());
-        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let (ctx, _net) = net_context(storage.clone()).await;
+        let (record, token, _attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
         transition_external_to_running(&storage, job_id, token, None, 6)
             .await
@@ -2255,25 +2256,31 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
         let mut spec = execution_spec();
+        spec.file_outputs.push(OutputSelection {
+            container_path: "/out/result".to_string(),
+            path_prefix: None,
+            destination_node_id: Some(ctx.net_handle.as_ref().unwrap().node_id()),
+            destination: OutputDestination::S3 {
+                bucket: "dest".to_string(),
+                key: "result".to_string(),
+            },
+            name: None,
+            description: None,
+        });
         spec.output_prefixes = vec!["poison".to_string()];
-        Box::pin(finalize_attempt(
-            &ctx,
-            job_id,
-            token,
-            &backend,
-            &fence(&attempt),
-            &spec,
-            "ws-test",
-            Ok(AttemptStatus {
-                phase: AttemptPhase::Exited { code: 0 },
-                backend_ref: "c1".to_string(),
-                started_at_ms: Some(1),
-                finished_at_ms: Some(2),
-            }),
-        ))
-        .await;
+        let epoch = record.attempt_intent.as_ref().unwrap().attempt_epoch;
+        let control = read_attempt_control(&storage, job_id, epoch, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            Box::pin(collect_or_park(
+                &ctx, job_id, token, &spec, "ws-test", &control,
+            ))
+            .await
+            .is_none()
+        );
 
         let stored = read_job_record(&storage, job_id, None)
             .await

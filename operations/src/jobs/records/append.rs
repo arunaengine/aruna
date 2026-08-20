@@ -315,6 +315,8 @@ impl AppendRecordOperation {
                 Value::from(
                     to_bytes(&OutboxEntry {
                         queued_at_ms: self.config.now_ms,
+                        delivered: Vec::new(),
+                        next_holder: 0,
                     })?
                     .as_slice(),
                 ),

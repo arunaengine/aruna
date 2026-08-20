@@ -124,6 +124,34 @@ fn defers_without_view() {
 }
 
 #[test]
+fn retains_pending_conflict() {
+    // A same-key conflict must not replace the first record's pending retry row.
+    let family = Family::new([8u8; 32]);
+    let spec = family.spec();
+    let claim = family.claim(&spec);
+    let mut conflicting_claim = claim;
+    conflicting_claim.accepted_at_ms = 9_999;
+    let first = family.sign(&family.holder, JobFamilyRecord::Claim(claim));
+    let conflicting = family.sign(&family.holder, JobFamilyRecord::Claim(conflicting_claim));
+    let empty = Stored::new();
+    let (admission, first_plan) = plan_append(&state(None, &empty), &[], first.clone(), None);
+    assert_eq!(admission, Admission::Pending(PendingNeed::LocalView));
+    let mut retained = first_plan.pending;
+    retained[0].1.attempts = 7;
+
+    let (admission, plan) = plan_append(&state(None, &empty), &retained, conflicting, None);
+
+    assert_eq!(admission, Admission::Conflict);
+    assert!(plan.pending.is_empty());
+    assert_eq!(plan.conflicts.len(), 1);
+    assert_eq!(
+        plan.conflicts[0].1.retained,
+        first.digest().expect("first digest")
+    );
+    assert_eq!(retained[0].1.attempts, 7);
+}
+
+#[test]
 fn refuses_non_holder() {
     // A valid realm key is identity, never family-holder authority.
     let family = Family::new([5u8; 32]);

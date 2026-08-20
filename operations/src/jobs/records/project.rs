@@ -198,7 +198,8 @@ impl ProjectFamilyOperation {
             {
                 continue;
             }
-            if record.state != state
+            if !projection.aliases.contains(&record.job_id)
+                && record.state != state
                 && validate_transition(record.execution_class, record.state, state).is_err()
             {
                 continue;

@@ -7,8 +7,10 @@ use aruna_core::structs::{
 use tracing::{debug, warn};
 
 use super::lifecycle::updates::chain_for;
-use super::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError};
-use super::store::{persist_output_record, read_output_record};
+use super::records::{
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError,
+};
+use super::store::{JobMutationError, persist_output_record, read_output_record};
 use crate::driver::{DriverContext, drive};
 
 /// Build, sign, and make durable this execution's exact output record, then
@@ -138,7 +140,12 @@ async fn publish_output_record(
         .map_err(|error| JobError::permanent(format!("output record encoding failed: {error}")))?;
     persist_output_record(&context.storage_handle, job_id, control, digest, bytes)
         .await
-        .map_err(|error| JobError::retryable(format!("output record write failed: {error}")))?;
+        .map_err(|error| match error {
+            JobMutationError::OutputRecordConflict => {
+                JobError::permanent("execution output record digest is already sealed")
+            }
+            error => JobError::retryable(format!("output record write failed: {error}")),
+        })?;
     append_output_record(context, job_id, control, frame, receipted).await?;
     Ok(digest)
 }
@@ -176,20 +183,28 @@ async fn append_output_record(
         now_ms: aruna_core::util::unix_timestamp_millis(),
     };
     match drive(AppendRecordOperation::new(config), context).await {
-        Ok(outcome) if outcome.deferred => {
-            debug!(
-                job_id = %job_id,
-                "Output record deferred: the local job family view is unavailable"
-            );
-            Ok(())
-        }
-        Ok(_) => Ok(()),
-        // A realm this node has no config for cannot derive a family placement
-        // at all; the record stays durable locally instead of failing the run.
-        Err(RecordStoreError::RealmConfigMissing) => {
-            debug!(job_id = %job_id, "Output record deferred: realm config unavailable");
-            Ok(())
-        }
+        Ok(outcome) => match outcome.admission {
+            Admission::Authentic if receipted => Ok(()),
+            Admission::Local if !receipted => Ok(()),
+            Admission::Duplicate => Ok(()),
+            Admission::Pending(_) if outcome.deferred && !receipted => {
+                debug!(
+                    job_id = %job_id,
+                    "Output record deferred: the local job family view is unavailable"
+                );
+                Ok(())
+            }
+            Admission::Pending(_) | Admission::PendingFull => Err(JobError::retryable(
+                "output record admission is awaiting family evidence",
+            )),
+            Admission::Conflict | Admission::Rejected(_) => Err(JobError::permanent(
+                "output record admission rejected the sealed record",
+            )),
+            admission => Err(JobError::permanent(format!(
+                "output record admission invalid for execution mode: {admission:?}"
+            ))),
+        },
+        Err(RecordStoreError::RealmConfigMissing) if !receipted => Ok(()),
         Err(error) => Err(JobError::retryable(format!(
             "output record append failed: {error}"
         ))),
@@ -282,6 +297,7 @@ mod tests {
 
     fn output(execution_id: Ulid, version_id: Ulid) -> OutputObject {
         OutputObject {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
             bucket: "ws".to_string(),
             key: "reports/a.txt".to_string(),
             version_id,
@@ -313,7 +329,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let destinations = vec![("ws".to_string(), "reports/a.txt".to_string())];
+        let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
         let control = reserve_output_commits(&context.storage_handle, record.job_id, &destinations)
             .await
             .unwrap();

@@ -61,6 +61,8 @@ pub enum JobMutationError {
     ReportFrozen,
     #[error("attempt control epoch mismatch")]
     EpochMismatch,
+    #[error("execution output record digest conflicts with the sealed digest")]
+    OutputRecordConflict,
     #[error(transparent)]
     IllegalTransition(#[from] JobTransitionError),
     #[error("execution outputs are not proven durable: {0}")]
@@ -1128,6 +1130,13 @@ pub async fn persist_output_record(
         if stored.execution_id != control.execution_id {
             return Err(JobMutationError::EpochMismatch);
         }
+        if let Some(existing) = stored.output_record {
+            return if existing == digest {
+                Ok(JobMutation::Skip)
+            } else {
+                Err(JobMutationError::OutputRecordConflict)
+            };
+        }
         stored.output_record = Some(digest);
         Ok(JobMutation::Persist)
     })
@@ -1503,7 +1512,7 @@ pub async fn read_attempt_control(
 pub async fn reserve_output_commits(
     storage: &StorageHandle,
     job_id: JobId,
-    destinations: &[(String, String)],
+    destinations: &[(NodeId, String, String)],
 ) -> Result<AttemptControl, JobMutationError> {
     let (_, control) = mutate_attempt_control(storage, job_id, |_, control| {
         match control.reserve_outputs(destinations, Ulid::generate) {
@@ -4042,6 +4051,50 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn output_record_cas() {
+        // A replay may confirm the same digest, but a later seal cannot replace it.
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA8; 16]);
+        let token = Ulid::generate();
+        insert_job(
+            &storage,
+            &execution_record(job_id, token, JobState::Running),
+        )
+        .await
+        .unwrap();
+        let control = fence_attempt(&storage, job_id, token).await;
+        let first = vec![1, 2, 3];
+
+        persist_output_record(&storage, job_id, &control, [8u8; 32], first.clone())
+            .await
+            .unwrap();
+        persist_output_record(&storage, job_id, &control, [8u8; 32], vec![4, 5])
+            .await
+            .unwrap();
+        let conflict = persist_output_record(&storage, job_id, &control, [9u8; 32], vec![6]).await;
+        assert!(matches!(
+            conflict,
+            Err(JobMutationError::OutputRecordConflict)
+        ));
+
+        let raw = read_raw(
+            &storage,
+            JOB_OUTPUT_RECORD_KEYSPACE,
+            ByteView::from(attempt_control_key(job_id, control.attempt_epoch)),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw.as_ref(), first.as_slice());
+        let stored = read_attempt_control(&storage, job_id, control.attempt_epoch, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.output_record, Some([8u8; 32]));
     }
 
     #[tokio::test]

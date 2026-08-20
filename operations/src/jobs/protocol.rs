@@ -5,7 +5,7 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{AuthContext, JobId, JobPayload, RealmId};
+use aruna_core::structs::{AuthContext, JobFamilyId, JobId, JobPayload, RealmId};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
@@ -447,7 +447,13 @@ async fn prepare_cancel(
     auth_token: MetadataAuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
-    match holds_family(context, job_id).await {
+    let requested_family = match crate::jobs::lifecycle::routing::family_of_alias(context, job_id)
+        .await
+    {
+        Ok(family) => family,
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+    };
+    match holds_family(context, requested_family).await {
         Ok(false) => {
             let reservations =
                 match crate::jobs::lifecycle::reservation::held_reservations(context).await {
@@ -455,10 +461,23 @@ async fn prepare_cancel(
                     Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
                 };
             let mut stopped = None;
-            for reservation in reservations
-                .into_iter()
-                .filter(|reservation| reservation.logical_job_id == job_id)
-            {
+            for reservation in reservations {
+                let matches = match reservation_matches(
+                    context,
+                    job_id,
+                    requested_family,
+                    reservation.logical_job_id,
+                )
+                .await
+                {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+                    }
+                };
+                if !matches {
+                    continue;
+                }
                 match cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await {
                     Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
                         stopped = Some((record, true));
@@ -499,10 +518,23 @@ async fn prepare_cancel(
                         return PreparedResponse::new(JobResponse::Unavailable(error));
                     }
                 };
-            for reservation in reservations
-                .into_iter()
-                .filter(|reservation| reservation.logical_job_id == job_id)
-            {
+            for reservation in reservations {
+                let matches = match reservation_matches(
+                    context,
+                    job_id,
+                    requested_family,
+                    reservation.logical_job_id,
+                )
+                .await
+                {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+                    }
+                };
+                if !matches {
+                    continue;
+                }
                 if let Err(error) =
                     cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await
                 {
@@ -555,9 +587,11 @@ async fn prepare_cancel(
     PreparedResponse::new(response)
 }
 
-async fn holds_family(context: &DriverContext, job_id: JobId) -> Result<bool, JobRouteError> {
-    let Some(family) = crate::jobs::lifecycle::routing::family_of_alias(context, job_id).await?
-    else {
+async fn holds_family(
+    context: &DriverContext,
+    family: Option<JobFamilyId>,
+) -> Result<bool, JobRouteError> {
+    let Some(family) = family else {
         return Ok(false);
     };
     let net = context
@@ -572,6 +606,23 @@ async fn holds_family(context: &DriverContext, job_id: JobId) -> Result<bool, Jo
             JobRouteError::Unavailable("job family holder view unavailable".to_string())
         })?;
     Ok(view.holds(net.node_id()))
+}
+
+async fn reservation_matches(
+    context: &DriverContext,
+    requested_alias: JobId,
+    requested_family: Option<JobFamilyId>,
+    reservation_alias: JobId,
+) -> Result<bool, JobRouteError> {
+    match requested_family {
+        Some(family) => Ok(crate::jobs::lifecycle::routing::family_of_alias(
+            context,
+            reservation_alias,
+        )
+        .await?
+            == Some(family)),
+        None => Ok(requested_alias == reservation_alias),
+    }
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {

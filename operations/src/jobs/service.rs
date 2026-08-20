@@ -41,7 +41,7 @@ use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 
 use super::lifecycle::cancel::cancel_family;
-use super::lifecycle::routing::{family_responder, family_status};
+use super::lifecycle::routing::{family_of_alias, family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
 pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
@@ -126,6 +126,11 @@ pub(crate) fn validate_execution(
         return Err(SubmitJobError::TooManyOutputs {
             limit: MAX_EXECUTION_OUTPUTS,
         });
+    }
+    if spec.file_outputs.is_empty() && !spec.output_prefixes.is_empty() {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "output prefixes require declared file outputs".to_string(),
+        ));
     }
     match workspace_mode {
         WorkspaceMode::None if workspace_bucket.is_some() => {
@@ -1130,13 +1135,23 @@ pub async fn cancel_job_routed(
     // call; the local row of a receipted execution is stopped separately.
     if let Some(cancelled) = family_cancel(context, user_id, job_id, auth_token.clone()).await {
         if cancelled.is_ok() {
+            let family = match family_of_alias(context, job_id).await {
+                Ok(Some(family)) => family,
+                Ok(None) => {
+                    return Err(JobRouteError::Unavailable(
+                        "cancelled family alias is no longer resolvable".to_string(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
             for reservation in super::lifecycle::reservation::held_reservations(context)
                 .await
                 .map_err(JobRouteError::Unavailable)?
                 .into_iter()
-                .filter(|reservation| reservation.logical_job_id == job_id)
             {
-                runtime.request_cancel(reservation.job_id);
+                if family_of_alias(context, reservation.logical_job_id).await? == Some(family) {
+                    runtime.request_cancel(reservation.job_id);
+                }
             }
             kick_drain(context).await;
         }
@@ -1276,6 +1291,12 @@ mod tests {
         ));
 
         spec.workspace_outputs.pop();
+        spec.output_prefixes.push("out/".to_string());
+        assert!(matches!(
+            validate_execution(&mut spec, WorkspaceMode::Kept, None),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+        spec.output_prefixes.clear();
         assert!(!matches!(
             submit_execution_job(
                 &context,

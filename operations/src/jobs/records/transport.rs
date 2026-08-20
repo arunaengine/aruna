@@ -18,6 +18,7 @@ use aruna_core::structs::{
     JobFamilyId, JobRecordError, JobRecordKind, PlacementRef, RealmConfigDocument, RealmId,
     SubmissionId,
 };
+use futures_util::future::join_all;
 use tokio::time::timeout_at;
 use tracing::warn;
 
@@ -82,8 +83,8 @@ struct PageRequest {
     limit: PageLimit,
 }
 
-/// Asks each holder in turn. A holder that is not a holder of the family may
-/// simply be stale, so the next one is asked; a definitive refusal is returned.
+/// Asks every holder concurrently. A holder that is not a holder of the family
+/// may simply be stale, so the next drain can resolve the current set again.
 async fn publish_record(
     context: &DriverContext,
     holders: &[NodeId],
@@ -94,35 +95,38 @@ async fn publish_record(
         return JobRecordEvent::Unavailable("metadata transport unavailable".to_string());
     };
     let deadline = tokio::time::Instant::now() + deadline;
-    for holder in holders {
-        let reply = match timeout_at(
+    let replies = join_all(holders.iter().map(|holder| async {
+        let reply = timeout_at(
             deadline,
             metadata.request_forwarded_write(*holder, request.clone()),
         )
-        .await
-        {
+        .await;
+        (*holder, reply)
+    }))
+    .await;
+    let mut published = Vec::new();
+    let mut rejected = None;
+    for (holder, reply) in replies {
+        let reply = match reply {
             Ok(Ok(reply)) => reply,
             Ok(Err(error)) => {
                 warn!(peer = %holder, error = %error, "Job record publish failed");
                 continue;
             }
-            Err(_) => break,
+            Err(_) => continue,
         };
         match reply {
             MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) } => {
-                return JobRecordEvent::Published { holder: *holder };
+                published.push(holder);
             }
             MetadataTransportMessage::ForwardedJobRecord {
                 result: Err(JobRecordRejection::NotHolder),
             }
-            | MetadataTransportMessage::ForwardedWriteUnavailable => continue,
+            | MetadataTransportMessage::ForwardedWriteUnavailable => {}
             MetadataTransportMessage::ForwardedJobRecord {
                 result: Err(reason),
             } => {
-                return JobRecordEvent::Rejected {
-                    holder: *holder,
-                    reason,
-                };
+                rejected.get_or_insert((holder, reason));
             }
             other => warn!(
                 peer = %holder,
@@ -131,7 +135,14 @@ async fn publish_record(
             ),
         }
     }
-    JobRecordEvent::Unavailable("no job family holder accepted the record".to_string())
+    match published.as_slice() {
+        [holder] => JobRecordEvent::Published { holder: *holder },
+        [] => rejected.map_or_else(
+            || JobRecordEvent::Unavailable("no job family holder accepted the record".to_string()),
+            |(holder, reason)| JobRecordEvent::Rejected { holder, reason },
+        ),
+        _ => JobRecordEvent::PublishedMany { holders: published },
+    }
 }
 
 async fn fetch_records(
@@ -369,7 +380,14 @@ async fn serve_page(
     peer: NodeId,
     request: PageRequest,
 ) -> Result<JobRecordPageReply, ServeError> {
-    holder_view(context, peer, request.placement).await?;
+    let authority = holder_view(context, peer, request.placement).await?;
+    let derived = authority
+        .config
+        .family_placement(request.submission_id)
+        .map_err(|_| ServeError::Refused(JobRecordRejection::NotHolder))?;
+    if derived != request.placement {
+        return Err(ServeError::Refused(JobRecordRejection::Invalid));
+    }
     let scope = match request.request_digest {
         Some(request_digest) => AuditScope::Family(JobFamilyId {
             submission_id: request.submission_id,

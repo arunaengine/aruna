@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, StorageEffect};
+use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, PageLimit, StorageEffect};
 use aruna_core::events::{JobRecordRejection, LaunchDecline};
 use aruna_core::handle::Handle;
 use aruna_core::structs::{Actor, JobFamilyRecord, RealmConfigDocument, RealmId};
@@ -155,6 +155,35 @@ async fn refuses_unknown_offer() {
         serve_launch_offer(&context, super::fixture::node(2), offer).await,
         MetadataTransportMessage::ForwardedLaunchOffer {
             result: Err(LaunchDecline::Unauthorized),
+        }
+    );
+    net.shutdown().await;
+}
+
+#[tokio::test]
+async fn refuses_page_mismatch() {
+    // A peer cannot use a valid local placement to read another submission.
+    let (_dir, context, net, family) = fixture().await;
+    let placement = aruna_core::structs::PlacementRef {
+        strategy_id: family.placement.strategy_id,
+        shard: family.placement.shard + 1,
+    };
+    let response = serve_job_record(
+        &context,
+        super::fixture::node(2),
+        MetadataTransportMessage::ForwardJobRecordPage {
+            placement,
+            submission_id: family.submission_id,
+            request_digest: None,
+            cursor: None,
+            limit: PageLimit::new(1),
+        },
+    )
+    .await;
+    assert_eq!(
+        response,
+        MetadataTransportMessage::ForwardedJobRecordPage {
+            result: Err(JobRecordRejection::Invalid),
         }
     );
     net.shutdown().await;

@@ -98,7 +98,7 @@ impl ExternalReconciler for ComputeReconciler {
 
         let bucket = job_bucket(&adopted);
         if !bucket.is_empty() {
-            spec.resolve_outputs(&bucket);
+            spec.resolve_outputs(&bucket, adopted.owner_node_id);
         }
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
         let fence = FenceContext {

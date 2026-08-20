@@ -90,8 +90,24 @@ pub fn plan_append(
     let mut plan = AppendPlan::default();
     let mut visible: BTreeMap<JobRecordKey, [u8; 32]> = BTreeMap::new();
 
-    let outcome = admit_one(state, &evidence, &candidate);
     let key = candidate.key();
+    let outcome = admit_one(state, &evidence, &candidate);
+    let retained_digest = if matches!(&outcome, Admission::Pending(_)) {
+        retained
+            .iter()
+            .find(|(retained_key, _)| *retained_key == key)
+            .and_then(|(_, row)| row.envelope.digest().ok())
+    } else {
+        None
+    };
+    let outcome = match (outcome, retained_digest) {
+        (Admission::Pending(_), Some(retained_digest)) => match candidate.digest() {
+            Ok(digest) if digest == retained_digest => Admission::Duplicate,
+            Ok(_) => Admission::Conflict,
+            Err(error) => Admission::Rejected(error),
+        },
+        (outcome, _) => outcome,
+    };
     match &outcome {
         Admission::Authentic | Admission::Local => {
             evidence.insert(&candidate.record);
@@ -119,10 +135,13 @@ pub fn plan_append(
             ));
         }
         Admission::Conflict => {
-            let retained_digest = state
-                .stored
-                .get(&key)
-                .and_then(|stored| stored.digest().ok())
+            let retained_digest = retained_digest
+                .or_else(|| {
+                    state
+                        .stored
+                        .get(&key)
+                        .and_then(|stored| stored.digest().ok())
+                })
                 .unwrap_or_default();
             plan.conflicts.push((
                 key,
