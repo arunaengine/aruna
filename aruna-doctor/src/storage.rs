@@ -527,7 +527,6 @@ mod tests {
         CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
     };
     use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use aruna_operations::task_incoming::initialize_task_incoming;
     use aruna_tasks::TaskHandle;
     use fjall::Readable;
     use std::collections::BTreeMap;
@@ -639,13 +638,6 @@ mod tests {
                 compute_handle: None,
             });
             initialize_net_incoming(context.clone());
-            initialize_task_incoming(
-                context.clone(),
-                task_handle.clone(),
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
-            )
-            .await;
-
             let server_state = ServerState::new(
                 context.clone(),
                 config.realm_id,
