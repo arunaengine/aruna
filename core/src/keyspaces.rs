@@ -166,6 +166,8 @@ pub const JOB_ADMISSION_QUOTA_KEYSPACE: &str = "job_admission_quota";
 /// Persisted witness fallback deadlines, keyed by due time and family, so a
 /// later-ranked witness still plans after a restart.
 pub const JOB_WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
+/// Current witness deadline by family; the due-time rows are the scan index.
+pub const JOB_WITNESS_DEADLINE_INDEX_KEYSPACE: &str = "job_witness_deadline_index";
 /// Bounded explain record of the plan a witness sealed before it launched.
 pub const JOB_PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
 pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
