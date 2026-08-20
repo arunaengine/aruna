@@ -135,7 +135,7 @@ jobs:
           tool: cargo-deny@0.20.2
 
       - name: Run cargo-deny
-        run: cargo deny check
+        run: cargo deny --locked check
 
   shellcheck:
     runs-on: ubuntu-latest
