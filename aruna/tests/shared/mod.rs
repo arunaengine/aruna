@@ -920,6 +920,7 @@ async fn spawn_rest_server(
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    state.register_rest_interface(addr).await;
     let server = Server::new(
         state.clone(),
         ServerConfig {
