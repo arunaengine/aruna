@@ -11,9 +11,9 @@ use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
-    InputMode, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
-    OutputDestination, OutputObject, OutputSelection, PathRestriction, Permission,
-    PlacementPolicyRef, UserAccess, WorkspaceMode, blob_bucket_permission_path,
+    InputMode, InputSelection, InputSource, JobError, JobInputFact, JobRecord,
+    MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection, PathRestriction,
+    Permission, PlacementPolicyRef, UserAccess, WorkspaceMode, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
     workspace_credential_id,
 };
@@ -832,40 +832,38 @@ async fn remote_source(
     context: &DriverContext,
     record: &JobRecord,
     input: &InputSelection,
-    version: Option<Ulid>,
+    fact: &JobInputFact,
 ) -> Result<StagedSource, JobError> {
-    let InputSource::S3 {
-        bucket: src_bucket,
-        key: src_key,
-        ..
-    } = &input.source;
-    let head = Box::pin(drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: src_bucket.clone(),
-            key: src_key.clone(),
-            version_id: version,
-        }),
+    let version = match &input.source {
+        InputSource::S3 { version_id, .. } => version_id
+            .as_deref()
+            .map(Ulid::from_string)
+            .transpose()
+            .map_err(|_| JobError::permanent("input version is invalid".to_string()))?,
+    };
+    if version != Some(fact.version_id) || input.source_node_id != Some(fact.source_node_id) {
+        return Err(JobError::permanent(
+            "sealed remote input facts do not match the physical input".to_string(),
+        ));
+    }
+    let staged = crate::jobs::lifecycle::stage::stage_remote_input(
         context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| JobError::retryable(format!("input head failed: {error}")))?
-    .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
-    let resolved = head
-        .resolved_version_id
-        .or(head.version_id)
-        .ok_or_else(|| JobError::permanent("input version is unresolved".to_string()))?;
-    let blake3 = crate::jobs::lifecycle::plan::version_hash(context, src_bucket, src_key, resolved)
-        .await
-        .ok_or_else(|| JobError::retryable("input version is not materialized".to_string()))?;
-    let staged =
-        crate::jobs::lifecycle::stage::stage_remote_input(context, record, input, resolved, blake3)
-            .await?;
+        record,
+        input,
+        fact.version_id,
+        fact.blake3,
+    )
+    .await?;
+    if staged.size != fact.bytes {
+        return Err(JobError::permanent(
+            "staged input size differs from the sealed fact".to_string(),
+        ));
+    }
     Ok(StagedSource {
         blob: staged.blob,
         location: None,
-        size: Some(staged.size),
-        source_policies: head.source_policies,
+        size: Some(fact.bytes),
+        source_policies: fact.policies.clone(),
     })
 }
 
@@ -891,62 +889,91 @@ async fn stage_one_input(
                 "invalid input version_id for {src_bucket}/{src_key}"
             ))
         })?;
-    let bucket_info = Box::pin(drive(
-        GetBucketInfoOperation::new(src_bucket.clone()),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| bucket_lookup_error("input", error))?
-    .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
-    let allowed = Box::pin(drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: record.created_by,
-                realm_id: record.created_by.realm_id,
-                path_restrictions: None,
-            },
-            path: blob_object_permission_path(
-                record.created_by.realm_id,
-                bucket_info.group_id,
+    let staged = if input.source_node_id.is_some_and(|source| source != node_id) {
+        // A forwarded plan has already validated the source at its ingress
+        // endpoint; only the explicit exact-version staging path is local here.
+        let fact = record
+            .input_facts
+            .iter()
+            .find(|fact| fact.destination_key == input.dest_key)
+            .ok_or_else(|| JobError::permanent("sealed input facts are missing".to_string()))?;
+        Box::pin(remote_source(context, record, input, fact)).await?
+    } else {
+        let bucket_info = Box::pin(drive(
+            GetBucketInfoOperation::new(src_bucket.clone()),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| bucket_lookup_error("input", error))?
+        .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
+        let allowed = Box::pin(drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id: record.created_by.realm_id,
+                    path_restrictions: None,
+                },
+                path: blob_object_permission_path(
+                    record.created_by.realm_id,
+                    bucket_info.group_id,
+                    node_id,
+                    src_bucket,
+                    src_key,
+                ),
+                required_permission: Permission::READ,
+            }),
+            context,
+        ))
+        .await
+        .map_err(|error| authorization_error("input", error))?;
+        if !allowed {
+            return Err(JobError::permanent(format!(
+                "input {src_bucket}/{src_key} access denied"
+            )));
+        }
+        let local = Box::pin(drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: src_bucket.clone(),
+                key: src_key.clone(),
+                version_id: version,
+                range: None,
+                group_id: bucket_info.group_id,
+                user_identity: record.created_by,
                 node_id,
-                src_bucket,
-                src_key,
-            ),
-            required_permission: Permission::READ,
-        }),
-        context,
-    ))
-    .await
-    .map_err(|error| authorization_error("input", error))?;
-    if !allowed {
-        return Err(JobError::permanent(format!(
-            "input {src_bucket}/{src_key} access denied"
-        )));
-    }
-    let local = Box::pin(drive(
-        GetObjectOperation::new(GetObjectInput {
-            bucket: src_bucket.clone(),
-            key: src_key.clone(),
-            version_id: version,
-            range: None,
-            group_id: bucket_info.group_id,
-            user_identity: record.created_by,
-            node_id,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose());
-    // A target that holds no copy stages the exact sealed version from a legal
-    // holder through the managed-copy handshake instead of failing the launch.
-    let staged = match local {
-        Ok(Some(get)) => StagedSource::from_local(get),
-        Ok(None) => Box::pin(remote_source(context, record, input, version)).await?,
-        Err(error) => match Box::pin(remote_source(context, record, input, version)).await {
-            Ok(staged) => staged,
-            Err(_) => return Err(source_input_error(error)),
-        },
+            }),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose());
+        // A target that holds no copy stages the exact sealed version from a legal
+        // holder through the managed-copy handshake instead of failing the launch.
+        match local {
+            Ok(Some(get)) => StagedSource::from_local(get),
+            Ok(None) => {
+                let fact = record
+                    .input_facts
+                    .iter()
+                    .find(|fact| fact.destination_key == input.dest_key)
+                    .ok_or_else(|| {
+                        JobError::permanent("sealed input facts are missing".to_string())
+                    })?;
+                Box::pin(remote_source(context, record, input, fact)).await?
+            }
+            Err(error) => {
+                let Some(fact) = record
+                    .input_facts
+                    .iter()
+                    .find(|fact| fact.destination_key == input.dest_key)
+                else {
+                    return Err(source_input_error(error));
+                };
+                match Box::pin(remote_source(context, record, input, fact)).await {
+                    Ok(staged) => staged,
+                    Err(_) => return Err(source_input_error(error)),
+                }
+            }
+        }
     };
     let get = staged;
 
