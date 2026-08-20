@@ -534,6 +534,7 @@ mod tests {
                     key: "in.txt".to_string(),
                     version_id: None,
                 },
+                source_node_id: None,
                 dest_key: "inputs/in.txt".to_string(),
                 mode: InputMode::Snapshot,
                 container_path: None,
@@ -570,6 +571,7 @@ mod tests {
             exit_code: Some(0),
             workspace_bucket: Some("workspace-sample-one".to_string()),
             outputs: vec![OutputObject {
+                node_id: node,
                 bucket: "src".to_string(),
                 key: "out.txt".to_string(),
                 version_id: Ulid::from_bytes([11; 16]),

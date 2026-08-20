@@ -6,9 +6,10 @@
 
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
-    EffectiveResources, ExecutionSpec, JobFamilyId, LabelMatch, MAX_SELECTOR_LABELS, SubmissionId,
-    WorkspaceMode,
+    EffectiveResources, ExecutionSpec, JobFamilyId, JobInputFact, LabelMatch, MAX_SELECTOR_LABELS,
+    PlacementPolicyRef, SubmissionId, WorkspaceMode,
 };
+use aruna_core::types::NodeId;
 use aruna_core::types::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -62,6 +63,10 @@ pub struct SubmissionRequest {
     pub spec: ExecutionSpec,
     pub scope: SubmissionScope,
     pub retention_ms: u64,
+    /// The first node that resolved node-local object names for this request.
+    pub ingress_node_id: NodeId,
+    pub input_facts: Vec<JobInputFact>,
+    pub output_policies: Vec<PlacementPolicyRef>,
 }
 
 /// The replicated identity of one request.
@@ -90,21 +95,31 @@ impl SubmissionRequest {
         };
         Ok(RequestIdentity {
             submission_id,
-            request_digest: request_digest(self.created_by, &self.spec)?,
+            request_digest: request_digest(
+                self.created_by,
+                &self.spec,
+                self.ingress_node_id,
+                &self.input_facts,
+                &self.output_policies,
+            )?,
         })
     }
 }
 
-/// Digest of the normalized caller plan. The caller is part of it, so a
-/// forwarded request can never be re-attributed to another submitter.
-pub fn request_digest(
+fn request_digest(
     created_by: UserId,
     spec: &ExecutionSpec,
+    ingress_node_id: NodeId,
+    input_facts: &[JobInputFact],
+    output_policies: &[PlacementPolicyRef],
 ) -> Result<[u8; 32], ConversionError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(REQUEST_DIGEST_DOMAIN);
     hasher.update(&created_by.to_storage_key());
     hasher.update(&postcard::to_allocvec(spec)?);
+    hasher.update(ingress_node_id.as_bytes());
+    hasher.update(&postcard::to_allocvec(input_facts)?);
+    hasher.update(&postcard::to_allocvec(output_policies)?);
     Ok(*hasher.finalize().as_bytes())
 }
 

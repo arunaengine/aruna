@@ -6,7 +6,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE};
 use aruna_core::structs::{
-    AuthContext, JobFamilyRecord, JobId, JobState, LogicalJobSpec, SubmissionClaim, WorkspaceMode,
+    AuthContext, JobFamilyRecord, JobId, JobInputFact, JobState, LogicalJobSpec, SubmissionClaim,
+    WorkspaceMode,
 };
 use ulid::Ulid;
 
@@ -260,6 +261,9 @@ fn identity_is_deterministic() {
         spec: spec.clone(),
         scope: SubmissionScope::Keyed("idempotency".to_string()),
         retention_ms: 60_000,
+        ingress_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        input_facts: Vec::new(),
+        output_policies: Vec::new(),
     };
     let identity = request.identity().expect("identity derives");
 
@@ -276,6 +280,21 @@ fn identity_is_deterministic() {
     .expect("identity derives");
     assert_eq!(changed.submission_id, identity.submission_id);
     assert_ne!(changed.request_digest, identity.request_digest);
+
+    let mut moved = request.clone();
+    moved.ingress_node_id = iroh::SecretKey::from_bytes(&[10u8; 32]).public();
+    assert_ne!(moved.identity().expect("identity derives"), identity);
+
+    let mut pinned = request;
+    pinned.input_facts.push(JobInputFact {
+        destination_key: "reads.fastq".to_string(),
+        source_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        version_id: Ulid::from_bytes([1u8; 16]),
+        blake3: [2u8; 32],
+        bytes: 3,
+        policies: Vec::new(),
+    });
+    assert_ne!(pinned.identity().expect("identity derives"), identity);
 }
 
 #[test]

@@ -248,6 +248,8 @@ pub enum InputSource {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSelection {
     pub source: InputSource,
+    /// Node-local endpoint that owns the source object once the job is sealed.
+    pub source_node_id: Option<crate::NodeId>,
     /// Destination key inside the workspace bucket (16.4 non-overlapping).
     pub dest_key: String,
     pub mode: InputMode,
@@ -269,6 +271,8 @@ pub struct OutputSelection {
     /// Literal ancestor stripped from every matched path to build the
     /// destination key. Required with wildcards, absent otherwise.
     pub path_prefix: Option<String>,
+    /// Node-local endpoint that owns the destination once the job is sealed.
+    pub destination_node_id: Option<crate::NodeId>,
     pub destination: OutputDestination,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -319,6 +323,18 @@ pub struct ExecutionSpec {
     pub output_prefixes: Vec<String>,
     /// How a claimed destination key is resolved while composing the workspace.
     pub collision_policy: CollisionPolicy,
+}
+
+/// Exact source facts resolved at ingress and carried into the sealed job
+/// spec, so a forwarded planner never reinterprets a bucket on its own node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobInputFact {
+    pub destination_key: String,
+    pub source_node_id: crate::NodeId,
+    pub version_id: Ulid,
+    pub blake3: [u8; 32],
+    pub bytes: u64,
+    pub policies: Vec<PlacementPolicyRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,11 +635,12 @@ pub struct ExportRoCrateResult {
 impl ExecutionSpec {
     /// Materialize workspace output intents against the resolved bucket.
     /// Deterministic across retries: the bucket name derives from the `JobId`.
-    pub fn resolve_outputs(&mut self, bucket: &str) {
+    pub fn resolve_outputs(&mut self, bucket: &str, node_id: crate::NodeId) {
         for output in std::mem::take(&mut self.workspace_outputs) {
             self.file_outputs.push(OutputSelection {
                 container_path: output.container_path,
                 path_prefix: None,
+                destination_node_id: Some(node_id),
                 destination: OutputDestination::S3 {
                     bucket: bucket.to_string(),
                     key: output.dest_key,
@@ -828,19 +845,24 @@ impl AttemptControl {
     /// Reserve one VersionId per destination this execution has not committed
     /// yet, keeping every existing reservation so a replayed capture reuses it
     /// instead of creating a second version. Reports whether anything was added.
-    pub fn reserve_outputs<F>(&mut self, destinations: &[(String, String)], mut mint: F) -> bool
+    pub fn reserve_outputs<F>(
+        &mut self,
+        destinations: &[(crate::NodeId, String, String)],
+        mut mint: F,
+    ) -> bool
     where
         F: FnMut() -> Ulid,
     {
-        let mut reserved: BTreeSet<(String, String)> = self
+        let mut reserved: BTreeSet<(crate::NodeId, String, String)> = self
             .output_commits
             .iter()
-            .map(|commit| (commit.bucket.clone(), commit.key.clone()))
+            .map(|commit| (commit.node_id, commit.bucket.clone(), commit.key.clone()))
             .collect();
         let mut changed = false;
-        for (bucket, key) in destinations {
-            if reserved.insert((bucket.clone(), key.clone())) {
+        for (node_id, bucket, key) in destinations {
+            if reserved.insert((*node_id, bucket.clone(), key.clone())) {
                 self.output_commits.push(OutputCommitIntent {
+                    node_id: *node_id,
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: mint(),
@@ -856,6 +878,7 @@ impl AttemptControl {
 /// replayed capture reuses this VersionId instead of creating a second version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputCommitIntent {
+    pub node_id: crate::NodeId,
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
@@ -898,6 +921,8 @@ pub fn parse_job_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), Conversi
 /// One output object captured at completion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputObject {
+    /// Node-local endpoint that owns this exact version.
+    pub node_id: crate::NodeId,
     pub bucket: String,
     pub key: String,
     /// Exact version this write created. Two executions writing one key keep two
@@ -981,7 +1006,12 @@ impl JobResultPayload {
             if output.version_id.is_nil() || output.execution_id != execution_id {
                 return Err(JobRecordError::OutputIdentity);
             }
-            if !seen.insert((&output.bucket, &output.key, output.version_id)) {
+            if !seen.insert((
+                output.node_id,
+                &output.bucket,
+                &output.key,
+                output.version_id,
+            )) {
                 return Err(JobRecordError::OutputIdentity);
             }
         }
@@ -1001,11 +1031,12 @@ impl JobResultPayload {
             return Err(JobRecordError::OutputIdentity);
         };
         self.check_outputs(control.execution_id)?;
-        let reserved: BTreeSet<(&str, &str, Ulid)> = control
+        let reserved: BTreeSet<(crate::NodeId, &str, &str, Ulid)> = control
             .output_commits
             .iter()
             .map(|commit| {
                 (
+                    commit.node_id,
                     commit.bucket.as_str(),
                     commit.key.as_str(),
                     commit.version_id,
@@ -1014,6 +1045,7 @@ impl JobResultPayload {
             .collect();
         if outputs.iter().any(|output| {
             !reserved.contains(&(
+                output.node_id,
                 output.bucket.as_str(),
                 output.key.as_str(),
                 output.version_id,
@@ -1269,6 +1301,8 @@ pub struct JobRecord {
     /// Durable workspace/run bucket name (`ws-{jobid}`) for execution jobs.
     pub workspace_bucket: Option<String>,
     pub workspace_mode: WorkspaceMode,
+    /// Resolved source facts copied from the sealed family for physical staging.
+    pub input_facts: Vec<JobInputFact>,
     pub report_digest: Option<[u8; 32]>,
     pub retention_ms: u64,
 }
@@ -1312,6 +1346,7 @@ impl JobRecord {
             attempt_intent: None,
             workspace_bucket: None,
             workspace_mode: WorkspaceMode::default(),
+            input_facts: Vec::new(),
             report_digest: None,
             retention_ms: DEFAULT_JOB_RETENTION_MS,
         }
@@ -1776,6 +1811,8 @@ pub struct LogicalJobSpec {
     pub submission_id: SubmissionId,
     pub job_id: JobId,
     pub origin_node_id: NodeId,
+    /// Ingress node whose node-local object names were resolved at submission.
+    pub ingress_node_id: NodeId,
     pub realm_id: RealmId,
     pub group_id: GroupId,
     pub created_by: UserId,
@@ -1787,6 +1824,8 @@ pub struct LogicalJobSpec {
     pub retention_ms: u64,
     pub retry: JobRetryPolicy,
     pub admission: JobAdmissionRecord,
+    pub input_facts: Vec<JobInputFact>,
+    pub output_policies: Vec<PlacementPolicyRef>,
     /// Family placement derived from `submission_id`, never from the alias bucket.
     pub placement: PlacementRef,
 }
@@ -1987,8 +2026,13 @@ impl TryFrom<String> for ResultMessage {
 }
 
 /// Ordering of one output inside a canonical set.
-fn output_order(object: &OutputObject) -> (&str, &str, Ulid) {
-    (&object.bucket, &object.key, object.version_id)
+fn output_order(object: &OutputObject) -> (crate::NodeId, &str, &str, Ulid) {
+    (
+        object.node_id,
+        &object.bucket,
+        &object.key,
+        object.version_id,
+    )
 }
 
 /// The exact output objects of one execution, in one canonical order. Decoding
@@ -3232,6 +3276,7 @@ mod tests {
                 key: key.to_string(),
                 version_id: version.map(str::to_string),
             },
+            source_node_id: None,
             dest_key: format!("in/{key}"),
             mode,
             container_path: Some(format!("/inputs/{key}")),
@@ -3301,6 +3346,7 @@ mod tests {
     #[test]
     fn resolves_workspace_outputs() {
         // Intents materialize against the derived bucket and drain once.
+        let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
         let mut spec = ExecutionSpec {
             group_id: Ulid::from_bytes([2u8; 16]),
             name: None,
@@ -3323,7 +3369,7 @@ mod tests {
             collision_policy: Default::default(),
         };
 
-        spec.resolve_outputs("ws-job");
+        spec.resolve_outputs("ws-job", node_id);
 
         assert!(spec.workspace_outputs.is_empty());
         assert_eq!(
@@ -3331,6 +3377,7 @@ mod tests {
             vec![OutputSelection {
                 container_path: "/out/report.txt".to_string(),
                 path_prefix: None,
+                destination_node_id: Some(node_id),
                 destination: OutputDestination::S3 {
                     bucket: "ws-job".to_string(),
                     key: "outputs/report.txt".to_string(),
@@ -3340,7 +3387,7 @@ mod tests {
             }]
         );
 
-        spec.resolve_outputs("ws-job");
+        spec.resolve_outputs("ws-job", node_id);
         assert_eq!(spec.file_outputs.len(), 1);
     }
 
@@ -3545,6 +3592,7 @@ mod tests {
 
     fn sample_output() -> OutputObject {
         OutputObject {
+            node_id: node_id(1),
             bucket: "dest".to_string(),
             key: "out/report.txt".to_string(),
             version_id: Ulid::from_bytes([4u8; 16]),
@@ -3583,6 +3631,7 @@ mod tests {
             submission_id: submission(),
             job_id: JobId::from_bytes([6u8; 16]),
             origin_node_id: node_id(1),
+            ingress_node_id: node_id(1),
             realm_id: RealmId([8u8; 32]),
             group_id: Ulid::from_bytes([7u8; 16]),
             created_by: user(8, 2),
@@ -3613,6 +3662,8 @@ mod tests {
                 max_launches_per_witness: 3,
             },
             admission: sample_admission(),
+            input_facts: Vec::new(),
+            output_policies: Vec::new(),
             placement: placement(),
         }
         .seal()
@@ -3808,17 +3859,17 @@ mod tests {
         assert_eq!(
             digests,
             [
-                "6574d19e7b5a36c99e21fbd21b129e3ca457ba55474809f7c7ac5b7dd7544c6d",
-                "f5a4aa462e41daa9d02c1d52332dea2622e34bf1615ee00d963231171239b7ca",
+                "2e3adfb3440145e2f0acf7dcac006c00cdbccb0fa8df37b935fc0ba4055993d2",
+                "77468e0780d1ea7a34f8191e280a3b6102255a5bdb05b9890cc0f03b40695979",
                 "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
-                "1179ae7aa095437c8e423dafec06b766e393d20eb294e17d8ced40b4acc01258",
-                "d817501141f3a64cb3d6106b207368122ef2f6fbf48762f7d56876a757910aab",
-                "8ed5a1d9603df92b66d56e0fe8660eb891be06961ce6a69da913b913651091c6",
-                "52bb4f72f8434c170fabebf20f462af3a3bd9ac7ee887a2911cab18261a2451d",
-                "ae3c0df5824a69b067256bb4a3c8aea720f76a51c4adcc449e9349f454776dc4",
-                "eefb4bd7c589f63396401be6699cfee72e9bfaa4db6ca04086d09419911d0498",
-                "b8139069d6bd0d8740708a4c789c49bb464b2928c59f4eeb2d9ed07a53ab4a55",
-                "ccf917fadca6ca2bf8c6ccec353cf7c59504a2176f1831ec00f1efe78491d0c3",
+                "1ca48ad6fc1652c190e1808e565f7794fe08f32ac87b4d9e440447d87e2c3b93",
+                "db3657f9c0d342c3291b32f42bbadf757a7356030786a173cf8c569f38695c86",
+                "ded9dc94e1d65f2502e30dbcf8a5c4d2e588922d39790e451b6849f6f14ecd62",
+                "ec4c067595ea40647f1d6b293f7f9daf60fa8113be1885825360294271df4c6e",
+                "15a1c2404110cfc66720b7a7bb8f77f33d199665e2c028229efa3c708b66917a",
+                "6a2c88bab322eae973d142690b0a2fb0ba7a5bf5c417df9cc515de498b26635d",
+                "f69a68ef56b007a54533ebdb696b806e43b4cf04a75fdb453449d22190853310",
+                "f2f6b9fb023ed033aade2c1af131943e1243b82a3ca58469b5fad70a52c013f6",
             ]
         );
         assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);
@@ -4646,6 +4697,7 @@ mod tests {
         );
 
         control.output_commits.push(OutputCommitIntent {
+            node_id: output.node_id,
             bucket: output.bucket.clone(),
             key: output.key.clone(),
             version_id: output.version_id,
@@ -4675,6 +4727,7 @@ mod tests {
         let mut control = sample_control();
         let output = sample_output();
         control.output_commits.push(OutputCommitIntent {
+            node_id: output.node_id,
             bucket: output.bucket.clone(),
             key: output.key.clone(),
             version_id: Ulid::from_bytes([9u8; 16]),
@@ -4711,9 +4764,10 @@ mod tests {
     fn reservation_is_stable() {
         // A replayed capture must reuse the reserved VersionId, never mint a second.
         let mut control = sample_control();
+        let output_node = node_id(1);
         let destinations = vec![
-            ("dest".to_string(), "out/a.txt".to_string()),
-            ("dest".to_string(), "out/b.txt".to_string()),
+            (output_node, "dest".to_string(), "out/a.txt".to_string()),
+            (output_node, "dest".to_string(), "out/b.txt".to_string()),
         ];
         assert!(control.reserve_outputs(&destinations, Ulid::generate));
         let reserved = control.output_commits.clone();
@@ -4721,9 +4775,11 @@ mod tests {
         assert!(!control.reserve_outputs(&destinations, Ulid::generate));
         assert_eq!(control.output_commits, reserved);
 
-        let grown = vec![("dest".to_string(), "out/c.txt".to_string())];
+        let grown = vec![(output_node, "dest".to_string(), "out/c.txt".to_string())];
         assert!(control.reserve_outputs(&grown, Ulid::generate));
         assert_eq!(control.output_commits[..2], reserved[..]);
+        let remote = vec![(node_id(2), "dest".to_string(), "out/a.txt".to_string())];
+        assert!(control.reserve_outputs(&remote, Ulid::generate));
     }
 
     #[test]

@@ -8,10 +8,11 @@
 //! error instead.
 
 use aruna_core::effects::JobRecordFrame;
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    AuthContext, ExecutionSpec, JobAdmissionRecord, JobFamilyRecord, JobId, JobRecordEnvelope,
-    JobRetryPolicy, LogicalJobSpec, Permission, RealmConfigDocument, SubmissionClaim, SubmissionId,
-    WorkspaceMode, blob_group_permission_path,
+    AuthContext, ExecutionSpec, JobAdmissionRecord, JobFamilyRecord, JobId, JobInputFact,
+    JobRecordEnvelope, JobRetryPolicy, LogicalJobSpec, OutputDestination, Permission,
+    RealmConfigDocument, SubmissionClaim, SubmissionId, WorkspaceMode, blob_group_permission_path,
 };
 use aruna_core::types::{NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -35,6 +36,8 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
+use crate::s3::get_bucket_info::GetBucketInfoOperation;
+use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// sealed into the immutable spec, so a later config change cannot widen it.
@@ -86,10 +89,21 @@ pub async fn submit_external_job(
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
-    seal_workspace(&mut spec, workspace_mode, workspace_bucket)
+    seal_workspace(&mut spec, workspace_mode, workspace_bucket.clone())
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     ids::required_labels(&spec)
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+    let (config, local) = local_view(context).await?;
+    for output in &mut spec.file_outputs {
+        output.destination_node_id = Some(local);
+    }
+    if workspace_mode == WorkspaceMode::Existing {
+        let bucket = workspace_bucket.as_deref().ok_or_else(|| {
+            SubmitJobError::InvalidWorkspace("existing workspace requires a bucket".to_string())
+        })?;
+        spec.resolve_outputs(bucket, local);
+    }
+    let (input_facts, output_policies) = resolve_facts(context, &spec, local).await?;
     let scope = match idempotency_key {
         Some(key) => SubmissionScope::Keyed(key),
         None => SubmissionScope::Unkeyed(Ulid::generate()),
@@ -99,9 +113,11 @@ pub async fn submit_external_job(
         spec,
         scope,
         retention_ms,
+        ingress_node_id: local,
+        input_facts,
+        output_policies,
     };
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
-    let (config, local) = local_view(context).await?;
     let view = family_view(&config, &identity)?;
     if view.holds(local) {
         let admitted = admit_here(context, &request, &identity, &config, local).await?;
@@ -112,6 +128,121 @@ pub async fn submit_external_job(
         });
     }
     forward_once(context, &request, &identity, &view, local, auth_token).await
+}
+
+/// Resolve node-local names once at ingress. The resulting facts are sealed in
+/// the family spec and remain valid when admission or planning is forwarded.
+async fn resolve_facts(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    local: NodeId,
+) -> Result<
+    (
+        Vec<JobInputFact>,
+        Vec<aruna_core::structs::PlacementPolicyRef>,
+    ),
+    SubmitJobError,
+> {
+    let mut input_facts = Vec::with_capacity(spec.inputs.len());
+    for input in &spec.inputs {
+        let aruna_core::structs::InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } = &input.source;
+        let requested = version_id
+            .as_deref()
+            .map(Ulid::from_string)
+            .transpose()
+            .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+        let head = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: requested,
+            }),
+            context,
+        )
+        .await
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?
+        .transpose()
+        .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?
+        .ok_or_else(|| SubmitJobError::InvalidWorkspace("input object not found".to_string()))?;
+        let version = head
+            .resolved_version_id
+            .or(head.version_id)
+            .ok_or_else(|| SubmitJobError::InvalidWorkspace("input has no version".to_string()))?;
+        let blake3 = head
+            .location
+            .as_ref()
+            .and_then(|location| location.hashes.get(HASH_BLAKE3))
+            .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
+        let blake3 = match blake3 {
+            Some(hash) => hash,
+            None => crate::jobs::lifecycle::plan::version_hash(context, bucket, key, version)
+                .await
+                .ok_or_else(|| {
+                    SubmitJobError::InvalidWorkspace("input is not materialized".to_string())
+                })?,
+        };
+        let bytes = head
+            .location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .or_else(|| {
+                head.source_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.content_length)
+            })
+            .unwrap_or_default();
+        let policies =
+            aruna_core::structs::PlacementPolicyRef::canonical_set(&head.source_policies)
+                .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+        input_facts.push(JobInputFact {
+            destination_key: input.dest_key.clone(),
+            source_node_id: local,
+            version_id: version,
+            blake3,
+            bytes,
+            policies,
+        });
+    }
+    let mut buckets = std::collections::BTreeSet::new();
+    for output in &spec.file_outputs {
+        if output.destination_node_id != Some(local) {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "output destination endpoint is invalid".to_string(),
+            ));
+        }
+        let OutputDestination::S3 { bucket, .. } = &output.destination;
+        buckets.insert(bucket.clone());
+    }
+    let (mode, workspace) = ids::workspace_of(spec);
+    if mode == WorkspaceMode::Existing
+        && let Some(bucket) = workspace
+    {
+        buckets.insert(bucket);
+    }
+    let mut output_policies = Vec::new();
+    for bucket in buckets {
+        let info = drive(GetBucketInfoOperation::new(bucket), context)
+            .await
+            .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?
+            .transpose()
+            .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?
+            .ok_or_else(|| {
+                SubmitJobError::InvalidWorkspace("output bucket not found".to_string())
+            })?;
+        if info.group_id != spec.group_id {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "output bucket is outside the execution group".to_string(),
+            ));
+        }
+        output_policies.extend(info.placement_policies);
+    }
+    output_policies = aruna_core::structs::PlacementPolicyRef::canonical_set(&output_policies)
+        .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+    Ok((input_facts, output_policies))
 }
 
 /// The realm config this node synchronized plus its own identity.
@@ -162,6 +293,7 @@ async fn admit_here(
         submission_id: identity.submission_id,
         job_id,
         origin_node_id: local,
+        ingress_node_id: request.ingress_node_id,
         realm_id: config.realm_id,
         group_id: request.spec.group_id,
         created_by: request.created_by,
@@ -186,6 +318,8 @@ async fn admit_here(
             resources: effective_resources(&request.spec),
             admitted_at_ms: now_ms,
         },
+        input_facts: request.input_facts.clone(),
+        output_policies: request.output_policies.clone(),
         placement,
     }
     .seal()
@@ -361,6 +495,29 @@ async fn admit_forwarded(
     // a plan to another caller, and the identity is recomputed from that caller.
     if auth.user_id != request.created_by || auth.realm_id != request.created_by.realm_id {
         return Err(SubmissionRefusal::Unauthorized);
+    }
+    if request.input_facts.len() != request.spec.inputs.len()
+        || request.input_facts.iter().any(|fact| {
+            !request
+                .spec
+                .inputs
+                .iter()
+                .any(|input| input.dest_key == fact.destination_key)
+        })
+        || request.ingress_node_id != peer
+        || request
+            .input_facts
+            .iter()
+            .any(|fact| fact.source_node_id != request.ingress_node_id)
+        || request
+            .spec
+            .file_outputs
+            .iter()
+            .any(|output| output.destination_node_id != Some(request.ingress_node_id))
+        || (ids::workspace_of(&request.spec).0 == WorkspaceMode::Existing
+            && !request.spec.workspace_outputs.is_empty())
+    {
+        return Err(SubmissionRefusal::IdentityMismatch);
     }
     let identity = request.identity().map_err(|_| SubmissionRefusal::Invalid)?;
     if identity.submission_id != submission_id {

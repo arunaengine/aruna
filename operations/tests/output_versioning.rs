@@ -262,7 +262,7 @@ async fn replay_reuses_version() {
     // A capture interrupted after its reservation must replay into the same version.
     let harness = setup().await;
     let (job_id, control) = seed_execution(&harness).await;
-    let destinations = vec![(BUCKET.to_string(), KEY.to_string())];
+    let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
 
     let reserved = reserve_output_commits(&harness.driver.storage_handle, job_id, &destinations)
         .await
@@ -290,7 +290,7 @@ async fn replay_reuses_version() {
 async fn executions_keep_versions() {
     // Two physical executions writing one key keep two independent exact versions.
     let harness = setup().await;
-    let destinations = vec![(BUCKET.to_string(), KEY.to_string())];
+    let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
     let (first_job, _) = seed_execution(&harness).await;
     let (second_job, _) = seed_execution(&harness).await;
 
@@ -336,7 +336,7 @@ async fn exact_version_survives() {
     // A later unrelated write may take S3 latest; the output stays exact-retrievable.
     let harness = setup().await;
     let (job_id, _) = seed_execution(&harness).await;
-    let destinations = vec![(BUCKET.to_string(), KEY.to_string())];
+    let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
 
     let reserved = reserve_output_commits(&harness.driver.storage_handle, job_id, &destinations)
         .await

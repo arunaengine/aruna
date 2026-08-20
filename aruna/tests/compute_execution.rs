@@ -157,6 +157,7 @@ fn execution_spec(
                 key: "data.txt".to_string(),
                 version_id: None,
             },
+            source_node_id: None,
             dest_key: "inputs/data.txt".to_string(),
             mode: InputMode::Snapshot,
             container_path: None,
@@ -165,7 +166,7 @@ fn execution_spec(
         }],
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
-        output_prefixes: vec!["outputs/".to_string()],
+        output_prefixes: Vec::new(),
         collision_policy: Default::default(),
     }
 }
@@ -295,6 +296,7 @@ async fn execution_end_to_end() -> TestResult<()> {
     spec.file_outputs = vec![OutputSelection {
         container_path: "/output/result.txt".to_string(),
         path_prefix: None,
+        destination_node_id: Some(fixture.compute_ctx.net_handle.as_ref().unwrap().node_id()),
         destination: OutputDestination::S3 {
             bucket: fixture.source_bucket.clone(),
             key: "outputs/result.txt".to_string(),

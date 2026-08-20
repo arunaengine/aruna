@@ -1134,6 +1134,7 @@ fn map_input(input: &TesInput, s3_mounts: bool) -> Result<InputSelection, TesErr
             key,
             version_id: None,
         },
+        source_node_id: None,
         dest_key: input.path[1..].to_string(),
         mode: if s3_mounts {
             InputMode::Mount
@@ -1160,6 +1161,7 @@ fn map_output(output: &TesOutput) -> Result<OutputSelection, TesError> {
     Ok(OutputSelection {
         container_path: output.path.clone(),
         path_prefix,
+        destination_node_id: None,
         destination: OutputDestination::S3 { bucket, key },
         name: output.name.clone(),
         description: output.description.clone(),
@@ -2451,6 +2453,7 @@ mod tests {
                 key: "workspace-only".to_string(),
                 version_id: None,
             },
+            source_node_id: None,
             dest_key: "native/input".to_string(),
             mode: InputMode::Snapshot,
             container_path: None,
@@ -2463,6 +2466,7 @@ mod tests {
             exit_code: Some(0),
             workspace_bucket: Some("ws-x".to_string()),
             outputs: vec![OutputObject {
+                node_id: record.owner_node_id,
                 bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),
                 version_id: Ulid::from_bytes([21u8; 16]),
@@ -2568,6 +2572,7 @@ mod tests {
             submission_id,
             job_id,
             origin_node_id: node_id,
+            ingress_node_id: node_id,
             realm_id,
             group_id: payload.group_id,
             created_by,
@@ -2590,6 +2595,8 @@ mod tests {
                 resources,
                 admitted_at_ms: 10,
             },
+            input_facts: Vec::new(),
+            output_policies: Vec::new(),
             placement: PlacementRef::NIL,
         };
         let version_id = Ulid::from_bytes([9u8; 16]);
@@ -2627,6 +2634,7 @@ mod tests {
             executions: 2,
             duplicate_successes: 1,
             outputs: vec![OutputObject {
+                node_id,
                 bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),
                 version_id,
@@ -2635,6 +2643,7 @@ mod tests {
                 size: 12,
                 digest: None,
             }],
+            output_endpoints: std::collections::BTreeMap::new(),
             revision: 3,
             digest: [11u8; 32],
             cancel_requested: false,

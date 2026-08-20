@@ -1331,6 +1331,7 @@ mod tests {
             submission_id: family.submission_id,
             job_id,
             origin_node_id: origin,
+            ingress_node_id: origin,
             realm_id,
             group_id,
             created_by: aruna_core::types::UserId::nil(realm_id),
@@ -1370,6 +1371,8 @@ mod tests {
                 resources,
                 admitted_at_ms: 1_000,
             },
+            input_facts: Vec::new(),
+            output_policies: Vec::new(),
             placement: PlacementRef::NIL,
         }
         .seal()

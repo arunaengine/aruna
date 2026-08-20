@@ -107,6 +107,7 @@ impl Family {
             submission_id: self.submission_id,
             job_id,
             origin_node_id: origin,
+            ingress_node_id: origin,
             realm_id: REALM,
             group_id: Ulid::from_bytes([2u8; 16]),
             created_by: user(),
@@ -129,6 +130,8 @@ impl Family {
                 resources,
                 admitted_at_ms: 1_000,
             },
+            input_facts: Vec::new(),
+            output_policies: Vec::new(),
             placement: self.placement,
         }
         .seal()
@@ -235,6 +238,7 @@ impl Family {
             spec_digest: receipt.spec_digest,
             receipt_digest: receipt.digest().expect("receipt digest"),
             outputs: OutputSet::canonical(vec![OutputObject {
+                node_id: receipt.executor_node_id,
                 bucket: "ws".to_string(),
                 key: "out.txt".to_string(),
                 version_id: Ulid::from_bytes([7u8; 16]),
