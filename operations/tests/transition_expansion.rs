@@ -52,12 +52,29 @@ async fn expansion_hands_buckets() -> TestResult<()> {
         shard: 0,
     };
     let before = realm.holders(&probe);
+    let origin = realm
+        .holders(&PlacementRef {
+            strategy_id: realm
+                .config
+                .default_strategy_id
+                .expect("default strategy exists"),
+            shard: 0,
+        })
+        .into_iter()
+        .next()
+        .expect("default shard has a holder");
 
     // A document written before the transition must still be readable after it.
     let path = "datasets/expanded";
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(realm.node(0)), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, realm.node(0), group_id, document_id, path).await?;
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(realm.find(origin)),
+        group_id,
+        path,
+    )?
+    .as_ulid();
+    let placement =
+        create_document(&realm, realm.find(origin), group_id, document_id, path).await?;
 
     let joiner = realm.spawn_late_node(RealmNodeKind::Management).await?;
     // A registered node holds nothing until a map naming it is activated, even
@@ -150,16 +167,18 @@ async fn expansion_hands_buckets() -> TestResult<()> {
     let late_path = "datasets/expanded-after";
     let late_id = mint_local_document(
         &realm.config,
-        &realm.actor(realm.node(0)),
+        &realm.actor(realm.find(origin)),
         group_id,
         late_path,
     )?
     .as_ulid();
-    create_document(&realm, realm.node(0), group_id, late_id, late_path).await?;
-    let origin = realm.node(0);
-    wait_until("post-cutover write is readable", origin.node_id(), || {
-        document_present(origin, group_id, late_id)
-    })
+    create_document(&realm, realm.find(origin), group_id, late_id, late_path).await?;
+    let origin_node = realm.find(origin);
+    wait_until(
+        "post-cutover write is readable",
+        origin_node.node_id(),
+        || document_present(origin_node, group_id, late_id),
+    )
     .await?;
 
     realm.shutdown().await;
