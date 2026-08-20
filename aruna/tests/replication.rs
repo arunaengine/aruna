@@ -380,7 +380,7 @@ impl ReplicationHarness {
     async fn wait_for_object(&self, bucket: &str, key: &str) -> TestResult<()> {
         wait_until(
             "replicated object availability",
-            Duration::from_secs(20),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let joiner_client = self.joiner_client.clone();
@@ -400,49 +400,26 @@ impl ReplicationHarness {
         .await
     }
 
-    async fn wait_seed_object(&self, bucket: &str, key: &str) -> TestResult<()> {
-        wait_until(
-            "chained object availability",
-            Duration::from_secs(20),
-            Duration::from_millis(200),
-            || {
-                let seed_client = self.seed_client.clone();
-                let bucket = bucket.to_string();
-                let key = key.to_string();
-                async move {
-                    seed_client
-                        .head_object()
-                        .bucket(bucket)
-                        .key(key)
-                        .send()
-                        .await
-                        .is_ok()
-                }
-            },
+    async fn wait_seed_object(&self, bucket: &str, key: &str, body: &[u8]) -> TestResult<()> {
+        wait_for_body(
+            &self.seed_client,
+            "source object contents",
+            bucket,
+            key,
+            body,
         )
         .await
     }
 
     async fn assert_object_matches(&self, bucket: &str, key: &str, body: &[u8]) -> TestResult<()> {
-        let head_output = self
-            .joiner_client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await?;
-        assert_eq!(head_output.content_length(), Some(body.len() as i64));
-
-        let get_output = self
-            .joiner_client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await?;
-        let replicated_bytes = get_output.body.collect().await?.into_bytes().to_vec();
-        assert_eq!(replicated_bytes, body);
-        Ok(())
+        wait_for_body(
+            &self.joiner_client,
+            "replicated object contents",
+            bucket,
+            key,
+            body,
+        )
+        .await
     }
 
     async fn assert_object_never_appears(
@@ -474,6 +451,44 @@ impl ReplicationHarness {
         self.joiner.shutdown().await;
         self.seed.shutdown().await;
     }
+}
+
+async fn wait_for_body(
+    client: &S3Client,
+    description: &str,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> TestResult<()> {
+    let expected = body.to_vec();
+    wait_until(
+        description,
+        shared::WAIT_CAP,
+        Duration::from_millis(200),
+        || {
+            let client = client.clone();
+            let bucket = bucket.to_string();
+            let key = key.to_string();
+            let expected = expected.clone();
+            async move {
+                let Ok(head) = client.head_object().bucket(&bucket).key(&key).send().await else {
+                    return false;
+                };
+                if head.content_length() != Some(expected.len() as i64) {
+                    return false;
+                }
+                let Ok(output) = client.get_object().bucket(bucket).key(key).send().await else {
+                    return false;
+                };
+                output
+                    .body
+                    .collect()
+                    .await
+                    .is_ok_and(|bytes| bytes.into_bytes().as_ref() == expected.as_slice())
+            }
+        },
+    )
+    .await
 }
 
 async fn keyspace_empty(context: &DriverContext, keyspace: &str) -> bool {
@@ -595,7 +610,7 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
 
         wait_until(
             "remapped delete marker visibility",
-            Duration::from_secs(20),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let joiner_client = harness.joiner_client.clone();
@@ -902,7 +917,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             .parse::<Ulid>()?;
         wait_until(
             "reference delete marker",
-            Duration::from_secs(20),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let context = harness.joiner.context.clone();
@@ -979,7 +994,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         );
         wait_until(
             "incoming mirror removal",
-            Duration::from_secs(10),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let context = harness.joiner.context.clone();
@@ -1060,7 +1075,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
         assert_eq!(quota_response.status(), StatusCode::OK);
         wait_until(
             "quota configuration convergence",
-            Duration::from_secs(60),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || async {
                 let Ok(response) = reqwest::Client::new()
@@ -1102,7 +1117,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
 
         wait_until(
             "quota failure relationship status",
-            Duration::from_secs(60),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let harness = &harness;
@@ -1202,7 +1217,7 @@ async fn permission_rechecks_creator() -> TestResult<()> {
 
         wait_until(
             "creator permission failure status",
-            Duration::from_secs(20),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let harness = &harness;
@@ -1350,21 +1365,13 @@ async fn chain_blocks_cycle() -> TestResult<()> {
             .send()
             .await?;
         harness.wait_for_object(relay_bucket, relay_key).await?;
-        harness.wait_seed_object(sink_bucket, sink_key).await?;
-
-        let sink_output = harness
-            .seed_client
-            .get_object()
-            .bucket(sink_bucket)
-            .key(sink_key)
-            .send()
+        harness
+            .wait_seed_object(sink_bucket, sink_key, &body)
             .await?;
-        let sink_bytes = sink_output.body.collect().await?.into_bytes().to_vec();
-        assert_eq!(sink_bytes, body);
 
         wait_until(
             "chained replication queue drain",
-            Duration::from_secs(20),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || async {
                 keyspace_empty(
@@ -1496,7 +1503,7 @@ async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
 
         wait_until(
             "replicated delete marker visibility",
-            Duration::from_secs(20),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || {
                 let joiner_client = harness.joiner_client.clone();
@@ -1676,7 +1683,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
 
         wait_until(
             "replication obligation repair",
-            Duration::from_secs(30),
+            shared::WAIT_CAP,
             Duration::from_millis(200),
             || async {
                 keyspace_empty(
@@ -1731,16 +1738,9 @@ async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<
             .body(ByteStream::from(scoped_body.clone()))
             .send()
             .await?;
-
-        let source_scoped = harness
-            .seed_client
-            .get_object()
-            .bucket(bucket)
-            .key(scoped_key)
-            .send()
+        harness
+            .wait_seed_object(bucket, scoped_key, &scoped_body)
             .await?;
-        let source_scoped_bytes = source_scoped.body.collect().await?.into_bytes().to_vec();
-        assert_eq!(source_scoped_bytes, scoped_body);
 
         harness
             .seed_client

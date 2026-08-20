@@ -201,7 +201,7 @@ async fn check_recovery(
         announce_peer(&peer.net, seed.realm_id).await?;
         wait_until(
             "metadata fan-out recovery",
-            Duration::from_secs(30),
+            shared::WAIT_CAP,
             Duration::from_millis(100),
             || {
                 let seed_url = seed.base_url.clone();

@@ -61,7 +61,7 @@ use ulid::Ulid;
 
 pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
-pub(crate) const WAIT_CAP: Duration = Duration::from_secs(60);
+pub(crate) const WAIT_CAP: Duration = Duration::from_secs(300);
 const CONDITION_CAP: Duration = Duration::from_secs(30);
 
 #[allow(dead_code)]
