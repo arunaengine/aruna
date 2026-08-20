@@ -934,9 +934,17 @@ impl Topology {
     }
 
     pub async fn shutdown(self) {
-        for node in self.nodes {
+        join_all(self.nodes.iter().filter_map(|node| {
+            node.context
+                .task_handle
+                .as_ref()
+                .map(|handle| handle.shutdown(std::time::Duration::ZERO))
+        }))
+        .await;
+        join_all(self.nodes.into_iter().map(|node| async move {
             hang_cap("node shutdown", node.net.shutdown()).await;
-        }
+        }))
+        .await;
     }
 }
 
