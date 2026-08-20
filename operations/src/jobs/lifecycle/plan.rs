@@ -9,13 +9,12 @@ use std::collections::BTreeMap;
 
 use aruna_core::compute::{ExecutionTargetId, NetworkAccess, StagingMode};
 use aruna_core::scheduling::{
-    ExecutionPlan, InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_CANDIDATES, PlanRequest, ResolvedInput,
-    TargetCandidate, plan_execution,
+    ExecutionPlan, InputHolder, MAX_PLAN_CANDIDATES, PlanRequest, ResolvedInput, TargetCandidate,
+    plan_execution,
 };
-use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, InputMode, InputSource, LogicalJobSpec,
-    NodeInfoDocument, OutputDestination, Permission, PlacementPolicyRef, PlacementSubject,
+    AuthContext, BlobVersion, BlobVersionState, InputMode, InputSource, JobInputFact,
+    LogicalJobSpec, NodeInfoDocument, Permission, PlacementPolicyRef, PlacementSubject,
     PolicyResolution, RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn,
     WorkspaceMode, blob_group_permission_path, storage_subject,
 };
@@ -25,14 +24,11 @@ use tracing::debug;
 use ulid::Ulid;
 
 use super::ids;
-use crate::blob_holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::node_info::read_node_info_document;
 use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::request_authorization::authorize;
 use crate::request_policy::PolicyRequestExtras;
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 
 /// Tag that pins the container network mode, shared with the executor path.
 const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
@@ -64,12 +60,12 @@ pub async fn build_plan(
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
     let documents = advertisements(context, config).await;
-    let inputs = resolve_inputs(context, config, spec, local).await?;
+    let inputs = resolve_inputs(config, spec)?;
     let mut output_policies = inputs
         .iter()
         .flat_map(|input| input.policies.clone())
         .collect::<Vec<_>>();
-    output_policies.extend(destination_policies(context, spec).await?);
+    output_policies.extend(spec.output_policies.clone());
     output_policies.sort_unstable();
     output_policies.dedup();
     let policies = resolve_policies(context, spec, &inputs, &output_policies, now_ms, local).await;
@@ -121,6 +117,11 @@ async fn candidates(
 ) -> Vec<TargetCandidate> {
     let mut candidates = Vec::new();
     for (node_id, document) in documents {
+        if ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
+            && *node_id != spec.ingress_node_id
+        {
+            continue;
+        }
         let Some(kind) = node_kind(config, *node_id) else {
             continue;
         };
@@ -175,14 +176,16 @@ fn node_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeK
         .map(|node| node.kind.clone())
 }
 
-/// Pins every declared input to one exact version plus the holders currently
-/// known for its bytes.
-async fn resolve_inputs(
-    context: &DriverContext,
+/// Pins every declared input to one exact version at its sealed source.
+fn resolve_inputs(
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
-    local: NodeId,
 ) -> Result<Vec<ResolvedInput>, PlanBuildError> {
+    if spec.input_facts.len() != spec.payload.inputs.len() {
+        return Err(PlanBuildError::Unavailable(
+            "sealed input facts are incomplete".to_string(),
+        ));
+    }
     let mut inputs = Vec::new();
     for input in &spec.payload.inputs {
         let InputSource::S3 {
@@ -190,79 +193,49 @@ async fn resolve_inputs(
             key,
             version_id,
         } = &input.source;
-        let requested = version_id
+        let fact: &JobInputFact = spec
+            .input_facts
+            .iter()
+            .find(|fact| fact.destination_key == input.dest_key)
+            .ok_or_else(|| PlanBuildError::Input {
+                key: input.dest_key.clone(),
+                reason: "sealed input facts are unavailable".to_string(),
+            })?;
+        if fact.source_node_id != spec.ingress_node_id {
+            return Err(PlanBuildError::Input {
+                key: input.dest_key.clone(),
+                reason: "sealed input endpoint changed".to_string(),
+            });
+        }
+        if version_id
             .as_deref()
             .map(Ulid::from_string)
             .transpose()
             .map_err(|_| PlanBuildError::Input {
                 key: input.dest_key.clone(),
                 reason: "version id is not a ulid".to_string(),
-            })?;
-        let head = drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: requested,
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?
-        .transpose()
-        .map_err(|error| PlanBuildError::Input {
-            key: input.dest_key.clone(),
-            reason: error.to_string(),
-        })?
-        .ok_or_else(|| PlanBuildError::Input {
-            key: input.dest_key.clone(),
-            reason: "object not found".to_string(),
-        })?;
-        let version = head
-            .resolved_version_id
-            .or(head.version_id)
-            .ok_or_else(|| PlanBuildError::Input {
-                key: input.dest_key.clone(),
-                reason: "object has no version".to_string(),
-            })?;
-        let blake3 = match head
-            .location
-            .as_ref()
-            .and_then(|location| location.hashes.get(HASH_BLAKE3))
-            .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+            })?
+            .is_some_and(|requested| requested != fact.version_id)
         {
-            Some(hash) => hash,
-            None => version_hash(context, bucket, key, version)
-                .await
-                .ok_or_else(|| PlanBuildError::Input {
-                    key: input.dest_key.clone(),
-                    reason: "version is not materialized".to_string(),
-                })?,
-        };
-        // An unknown size only ranks a route worse; it never grants capacity.
-        let bytes = head
-            .location
-            .as_ref()
-            .map(|location| location.blob_size)
-            .or_else(|| {
-                head.source_metadata
-                    .as_ref()
-                    .map(|metadata| metadata.content_length)
-            })
-            .unwrap_or_default();
-        let holders = input_holders(context, config, blake3, local, head.location.is_some()).await;
+            return Err(PlanBuildError::Input {
+                key: input.dest_key.clone(),
+                reason: "sealed input version changed".to_string(),
+            });
+        }
+        let holders = input_holders(config, fact.source_node_id);
         inputs.push(ResolvedInput {
             destination_key: input.dest_key.clone(),
             source: VersionedObjectArn {
                 realm_id: spec.realm_id,
-                node_id: local,
+                node_id: fact.source_node_id,
                 bucket: bucket.clone(),
                 key: key.clone(),
-                version,
+                version: fact.version_id,
             },
-            version_id: version,
-            blake3,
-            bytes,
-            policies: head.source_policies.clone(),
+            version_id: fact.version_id,
+            blake3: fact.blake3,
+            bytes: fact.bytes,
+            policies: fact.policies.clone(),
             holders,
         });
     }
@@ -299,37 +272,13 @@ pub async fn version_hash(
     }
 }
 
-/// Known holders of one input's bytes, with the storage subject each sits on.
-/// Discovery is locality evidence only: compliance is decided by the planner.
-async fn input_holders(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    blake3: [u8; 32],
-    local: NodeId,
-    held_locally: bool,
-) -> Vec<InputHolder> {
-    let mut nodes: Vec<NodeId> = match context.net_handle.as_ref() {
-        Some(net) => drive(
-            GetBlobHoldersOperation::new(blake3, *net.realm_id(), local),
-            context,
-        )
-        .await
-        .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    if held_locally {
-        nodes.push(local);
-    }
-    nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    nodes.dedup();
-    nodes.truncate(MAX_INPUT_HOLDERS);
-    nodes
-        .into_iter()
-        .map(|node_id| InputHolder {
-            subject: holder_subject(config, node_id),
-            node_id,
-        })
-        .collect()
+/// The source endpoint owns the sealed bucket/key/version. A same-hash blob on
+/// another node is not evidence that the node owns that S3 object identity.
+fn input_holders(config: &RealmConfigDocument, source_node: NodeId) -> Vec<InputHolder> {
+    vec![InputHolder {
+        subject: holder_subject(config, source_node),
+        node_id: source_node,
+    }]
 }
 
 /// A holder's storage subject comes from its realm placement entry, never an
@@ -347,36 +296,6 @@ fn holder_subject(config: &RealmConfigDocument, node_id: NodeId) -> PlacementSub
         executor_kind: None,
         local_to_controller: false,
     }
-}
-
-async fn destination_policies(
-    context: &DriverContext,
-    spec: &LogicalJobSpec,
-) -> Result<Vec<PlacementPolicyRef>, PlanBuildError> {
-    let mut buckets = std::collections::BTreeSet::new();
-    for output in &spec.payload.file_outputs {
-        let OutputDestination::S3 { bucket, .. } = &output.destination;
-        buckets.insert(bucket.clone());
-    }
-    let (mode, workspace) = ids::workspace_of(&spec.payload);
-    if mode == WorkspaceMode::Existing
-        && let Some(bucket) = workspace
-    {
-        buckets.insert(bucket);
-    }
-    let mut policies = Vec::new();
-    for bucket in buckets {
-        let info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
-            .await
-            .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?
-            .transpose()
-            .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?
-            .ok_or_else(|| {
-                PlanBuildError::Unavailable(format!("output bucket {bucket} is unavailable"))
-            })?;
-        policies.extend(info.placement_policies);
-    }
-    Ok(policies)
 }
 
 /// Every distinct policy ref of the request, resolved through the ordinary

@@ -40,40 +40,45 @@ pub async fn stage_remote_input(
         .as_ref()
         .ok_or_else(|| JobError::permanent("remote staging needs a net handle"))?;
     let realm_id = *net.realm_id();
-    let holders = drive(
+    let mut holders = drive(
         GetBlobHoldersOperation::new(blake3, realm_id, net.node_id()),
         context,
     )
     .await
     .map_err(|error| JobError::retryable(format!("input holder lookup failed: {error}")))?;
+    if let Some(source) = input.source_node_id {
+        holders.push(source);
+        holders.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        holders.dedup();
+    }
     if holders.is_empty() {
         return Err(JobError::retryable(format!(
             "no known holder for input {bucket}/{key}"
         )));
     }
-    let request = BaoReadRequest {
-        auth_context: AuthContext {
-            user_id: record.created_by,
-            realm_id,
-            path_restrictions: None,
-        },
-        realm_id,
-        target: BaoReadTarget::ExactVersion(VersionedObjectArn {
-            realm_id,
-            node_id: net.node_id(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version,
-        }),
-        expected_blake3: Some(blake3),
-        metadata_only: false,
-        // The managed read fills in this node's own destination subject, so the
-        // source evaluates placement against where the bytes would land.
-        destination: None,
-        known_refs: Vec::new(),
-    };
     let mut last: Option<BaoReadError> = None;
     for holder in holders {
+        let request = BaoReadRequest {
+            auth_context: AuthContext {
+                user_id: record.created_by,
+                realm_id,
+                path_restrictions: None,
+            },
+            realm_id,
+            target: BaoReadTarget::ExactVersion(VersionedObjectArn {
+                realm_id,
+                node_id: holder,
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version,
+            }),
+            expected_blake3: Some(blake3),
+            metadata_only: false,
+            // The managed read fills in this node's own destination subject, so the
+            // source evaluates placement against where the bytes would land.
+            destination: None,
+            known_refs: Vec::new(),
+        };
         match managed_read(context, holder, request.clone()).await {
             Ok(BaoReadOutput::Stream { blob, size, .. }) => {
                 debug!(peer = %holder, "Input staged from a remote holder");

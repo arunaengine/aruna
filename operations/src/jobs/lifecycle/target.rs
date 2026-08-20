@@ -19,9 +19,9 @@ use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, N
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
-    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, OutputDestination, Permission,
-    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument,
-    RealmNodeKind, WorkspaceMode, blob_group_permission_path, evaluate_placement,
+    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, Permission, PlacementDecision,
+    PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument, RealmNodeKind,
+    WorkspaceMode, blob_group_permission_path, evaluate_placement,
 };
 use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
@@ -33,7 +33,7 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::ids::{self, workspace_of};
-use super::plan::{network_access, staging_mode, version_hash};
+use super::plan::{network_access, staging_mode};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use super::witness::load_family;
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
@@ -46,9 +46,6 @@ use crate::placement::resolve_shard_holders;
 use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::request_authorization::authorize;
 use crate::request_policy::PolicyRequestExtras;
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
-use aruna_core::structs::checksum::HASH_BLAKE3;
 
 /// Wall-clock budget of the record fetch that pulls a missing sealed spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -80,7 +77,7 @@ pub async fn admit_launch(
     }
     let mut records = load_family(context.as_ref(), family).await;
     if spec_of(&records, &intent).is_none() {
-        fetch_family(context, &config, realm_id, family).await;
+        fetch_family(context, &config, realm_id, family, intent.scheduler_node_id).await;
         records = load_family(context.as_ref(), family).await;
     }
     let spec = spec_of(&records, &intent)?;
@@ -271,6 +268,12 @@ fn materialize_local(
         };
         let InputSource::S3 { version_id, .. } = &mut input.source;
         *version_id = Some(pin.version_id.to_string());
+        input.source_node_id = spec
+            .input_facts
+            .iter()
+            .find(|fact| fact.destination_key == input.dest_key)
+            .map(|fact| fact.source_node_id)
+            .or(Some(spec.ingress_node_id));
     }
     payload.resources.cpu_cores = Some(spec.resources.cpu_cores);
     payload.resources.ram_bytes = Some(spec.resources.ram_bytes);
@@ -279,6 +282,16 @@ fn materialize_local(
     payload.resources.preemptible = spec.resources.preemptible;
     payload.executor_constraint = Some(intent.target.executor_kind.clone());
     let (mode, bucket) = workspace_of(&spec.payload);
+    let (physical_mode, physical_bucket) = match mode {
+        WorkspaceMode::Existing if local != spec.ingress_node_id => {
+            return Err(LaunchDecline::Unauthorized);
+        }
+        WorkspaceMode::Existing => (mode, bucket),
+        WorkspaceMode::Temporary | WorkspaceMode::Kept => {
+            (mode, Some(JobRecord::workspace_bucket_name(spec.job_id)))
+        }
+        WorkspaceMode::None => (mode, None),
+    };
     let mut record = JobRecord::new(
         job_id,
         JobPayload::Execution(payload),
@@ -289,14 +302,9 @@ fn materialize_local(
         None,
     );
     record.retention_ms = spec.retention_ms;
-    record.workspace_mode = mode;
-    record.workspace_bucket = match mode {
-        WorkspaceMode::Existing => bucket,
-        WorkspaceMode::Temporary | WorkspaceMode::Kept => {
-            Some(JobRecord::workspace_bucket_name(spec.job_id))
-        }
-        WorkspaceMode::None => None,
-    };
+    record.workspace_mode = physical_mode;
+    record.workspace_bucket = physical_bucket;
+    record.input_facts = spec.input_facts.clone();
     Ok(record)
 }
 
@@ -461,13 +469,12 @@ async fn placement_verdict(
     if intent.inputs.len() != spec.payload.inputs.len() {
         return Err(LaunchDecline::Unauthorized);
     }
+    if spec.input_facts.len() != spec.payload.inputs.len() {
+        return Err(LaunchDecline::Unauthorized);
+    }
     let mut inputs: Vec<Vec<PlacementPolicyRef>> = Vec::new();
     for input in &spec.payload.inputs {
-        let InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &input.source;
+        let InputSource::S3 { version_id, .. } = &input.source;
         let pin = intent
             .inputs
             .iter()
@@ -481,32 +488,23 @@ async fn placement_verdict(
         if requested.is_some_and(|requested| requested != pin.version_id) {
             return Err(LaunchDecline::Unauthorized);
         }
-        let head = drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: Some(pin.version_id),
-            }),
-            context,
-        )
-        .await
-        .map_err(|_| LaunchDecline::Draining)?
-        .transpose()
-        .map_err(|_| LaunchDecline::Draining)?
-        .ok_or(LaunchDecline::Draining)?;
-        let version = head.resolved_version_id.or(head.version_id);
-        let hash = head
-            .location
-            .as_ref()
-            .and_then(|location| location.hashes.get(HASH_BLAKE3))
-            .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
-        let hash = match hash {
-            Some(hash) => hash,
-            None => version_hash(context, bucket, key, pin.version_id)
-                .await
-                .ok_or(LaunchDecline::Draining)?,
-        };
-        let mut policies = head.source_policies;
+        let fact = spec
+            .input_facts
+            .iter()
+            .find(|fact| fact.destination_key == input.dest_key)
+            .ok_or(LaunchDecline::Unauthorized)?;
+        if fact.source_node_id != spec.ingress_node_id
+            || fact.version_id != pin.version_id
+            || fact.blake3 != pin.blake3
+            || fact.bytes != pin.bytes
+            || pin.source_node_id
+                != (fact.source_node_id != subject.node_id).then_some(fact.source_node_id)
+        {
+            return Err(LaunchDecline::Unauthorized);
+        }
+        let version = Some(fact.version_id);
+        let hash = fact.blake3;
+        let mut policies = fact.policies.clone();
         policies.sort_unstable();
         policies.dedup();
         if version != Some(pin.version_id) || hash != pin.blake3 || policies != pin.policies {
@@ -515,7 +513,7 @@ async fn placement_verdict(
         inputs.push(policies);
     }
     let mut output_policies = inputs.iter().flatten().copied().collect::<Vec<_>>();
-    output_policies.extend(current_destinations(context, spec).await?);
+    output_policies.extend(spec.output_policies.clone());
     output_policies.sort_unstable();
     output_policies.dedup();
     if output_policies != intent.output_policies {
@@ -556,34 +554,6 @@ async fn placement_verdict(
     Ok(None)
 }
 
-async fn current_destinations(
-    context: &DriverContext,
-    spec: &LogicalJobSpec,
-) -> Result<Vec<PlacementPolicyRef>, LaunchDecline> {
-    let mut buckets = std::collections::BTreeSet::new();
-    for output in &spec.payload.file_outputs {
-        let OutputDestination::S3 { bucket, .. } = &output.destination;
-        buckets.insert(bucket.clone());
-    }
-    let (mode, workspace) = workspace_of(&spec.payload);
-    if mode == WorkspaceMode::Existing
-        && let Some(bucket) = workspace
-    {
-        buckets.insert(bucket);
-    }
-    let mut policies = Vec::new();
-    for bucket in buckets {
-        let info = drive(GetBucketInfoOperation::new(bucket), context)
-            .await
-            .map_err(|_| LaunchDecline::Draining)?
-            .transpose()
-            .map_err(|_| LaunchDecline::Draining)?
-            .ok_or(LaunchDecline::Draining)?;
-        policies.extend(info.placement_policies);
-    }
-    Ok(policies)
-}
-
 async fn append_record(
     context: &Arc<DriverContext>,
     realm_id: aruna_core::structs::RealmId,
@@ -621,14 +591,15 @@ async fn fetch_family(
     config: &RealmConfigDocument,
     realm_id: aruna_core::structs::RealmId,
     family: JobFamilyId,
+    scheduler: NodeId,
 ) {
     let Ok(placement) = config.family_placement(family.submission_id) else {
         return;
     };
-    let holders: Vec<NodeId> = resolve_shard_holders(config, &placement)
-        .into_iter()
-        .take(MAX_JOB_RECORD_HOLDERS)
-        .collect();
+    let mut holders = resolve_shard_holders(config, &placement);
+    holders.retain(|holder| *holder != scheduler);
+    holders.truncate(MAX_JOB_RECORD_HOLDERS.saturating_sub(1));
+    holders.insert(0, scheduler);
     let Ok(holders) = HolderList::new(holders) else {
         return;
     };
@@ -722,7 +693,7 @@ impl Operation for FetchFamilyOperation {
 #[cfg(test)]
 mod tests {
     use aruna_core::scheduling::PlannedInput;
-    use aruna_core::structs::{InputMode, InputSelection, JobId};
+    use aruna_core::structs::{InputMode, InputSelection, JobId, WorkspaceOutput};
 
     use super::*;
     use crate::jobs::records::tests::fixture::Family;
@@ -738,6 +709,7 @@ mod tests {
                 key: "reads.fastq".to_string(),
                 version_id: None,
             },
+            source_node_id: None,
             dest_key: "reads.fastq".to_string(),
             mode: InputMode::Snapshot,
             container_path: None,
@@ -781,5 +753,32 @@ mod tests {
         );
         assert_eq!(payload.executor_constraint, Some("docker".to_string()));
         assert_eq!(record.retention_ms, spec.retention_ms);
+    }
+
+    #[test]
+    fn remote_existing_rejected() {
+        // Existing workspace contents are node-local until whole-bucket staging exists.
+        let family = Family::new([8u8; 32]);
+        let mut spec = family.spec();
+        let ingress = family.holder.public();
+        spec.ingress_node_id = ingress;
+        spec.payload.workspace_outputs.push(WorkspaceOutput {
+            container_path: "/out/result.txt".to_string(),
+            dest_key: "results/result.txt".to_string(),
+        });
+        ids::seal_workspace(
+            &mut spec.payload,
+            WorkspaceMode::Existing,
+            Some("existing".to_string()),
+        )
+        .expect("workspace seals");
+        spec.payload.resolve_outputs("existing", ingress);
+        let launch = family.launch(&spec, family.holder.public(), 0);
+        let physical_id = JobId::from_bytes([10u8; 16]);
+
+        assert_eq!(
+            materialize_local(&spec, &launch, physical_id, family.target.public(), 4_000),
+            Err(LaunchDecline::Unauthorized)
+        );
     }
 }
