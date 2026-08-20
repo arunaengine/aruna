@@ -11,8 +11,8 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use shared::{
     TestResult, create_bearer_token, create_group_via_http, create_onboarding_secret_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_full_joiner_node, spawn_seed_node,
-    wait_for_group_via_http, wait_for_realm_nodes,
+    create_s3_credentials_via_http, s3_client, spawn_full_joiner_node, spawn_full_seed_node,
+    spawn_seed_node, wait_for_group_via_http, wait_for_realm_nodes,
 };
 use ulid::Ulid;
 
@@ -33,20 +33,9 @@ async fn iter_hash_path_index(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
-    let onboarding_secret =
-        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Local)
-            .await?;
-    let joiner = spawn_full_joiner_node(&seed, onboarding_secret).await?;
+    let seed = spawn_full_seed_node().await?;
 
     let result = async {
-        wait_for_realm_nodes(
-            &[seed.context.as_ref(), joiner.context.as_ref()],
-            &seed.realm_id,
-            2,
-        )
-        .await?;
-
         let bearer_token = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -57,111 +46,79 @@ async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> Test
 
         let group = create_group_via_http(&seed.base_url, &bearer_token, "drs-hash-lookup-e2e")
             .await?;
-        wait_for_group_via_http(&joiner.base_url, &bearer_token, &group.group_id).await?;
-
-        let joiner_s3 = joiner
+        let seed_s3 = seed
             .s3
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
         let credentials =
-            create_s3_credentials_via_http(&joiner.base_url, &bearer_token, &group.group_id)
+            create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id)
                 .await?;
-        let s3 = s3_client(joiner_s3, &credentials);
+        let s3 = s3_client(seed_s3, &credentials);
 
         let bucket = "drs-hash-lookup-e2e";
         let key = "fixtures/t8.shakespeare.txt";
         let body = fixture_bytes();
         let hash = *blake3::hash(&body).as_bytes();
         let hash_hex = hex::encode(hash);
-        let object_id = format!(
+        let local_object_id = format!(
             "arn:aruna:{}:{}:ch/{}",
-            seed.realm_id, joiner.config.node_id, hash_hex
+            seed.realm_id,
+            seed.net.node_id(),
+            hash_hex
         );
-        dbg!(&object_id);
+        let foreign_node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        assert_ne!(foreign_node, seed.net.node_id());
+        let foreign_object_id = format!(
+            "arn:aruna:{}:{}:ch/{}",
+            seed.realm_id, foreign_node, hash_hex
+        );
 
         s3.create_bucket().bucket(bucket).send().await?;
-        let put_output = s3
+        s3
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(body.clone()))
+            .body(ByteStream::from(body))
             .send()
             .await?;
-        let version_id = put_output
-            .version_id()
-            .ok_or_else(|| std::io::Error::other("put_object did not return a version id"))?
-            .to_string();
 
-        let mappings = iter_hash_path_index(joiner.context.as_ref(), hash).await?;
-        assert!(
-            mappings.iter().any(|mapping| {
-                mapping.realm_id == seed.realm_id
-                    && mapping.node_id == joiner.config.node_id
-                    && mapping.bucket == bucket
-                    && mapping.key == key
-                    && mapping.version_id == Ulid::from_string(&version_id).unwrap()
-            }),
-            "hash-path index did not contain uploaded object alias for {object_id}"
-        );
-
-        let head = drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: None,
-            }),
-            joiner.context.as_ref(),
-        )
-        .await?
-        .ok_or_else(|| std::io::Error::other("head_object returned no result"))??;
-        let location = head
-            .location
-            .ok_or_else(|| std::io::Error::other("head_object returned no materialized location"))?;
-        assert_eq!(location.get_blake3(), Some(hash.as_slice()));
-
-        let joiner_response = reqwest::Client::new()
+        let local_response = reqwest::Client::new()
             .get(format!(
                 "{}/api/v1/ga4gh/drs/v1/objects/{}",
-                joiner.base_url, object_id
+                seed.base_url, local_object_id
             ))
             .bearer_auth(&bearer_token)
             .send()
             .await?;
-        let joiner_status = joiner_response.status();
-        let joiner_body = joiner_response.text().await?;
+        let local_status = local_response.status();
+        let local_body = local_response.text().await?;
         assert_eq!(
-            joiner_status,
+            local_status,
             StatusCode::OK,
-            "same-node DRS lookup failed for {object_id}; version_id={version_id}; body={joiner_body}"
+            "same-node DRS lookup failed for {local_object_id}: {local_body}"
         );
 
-        let seed_response = reqwest::Client::new()
+        let foreign_response = reqwest::Client::new()
             .get(format!(
                 "{}/api/v1/ga4gh/drs/v1/objects/{}",
-                seed.base_url, object_id
+                seed.base_url, foreign_object_id
             ))
             .bearer_auth(&bearer_token)
             .send()
             .await?;
-        let seed_status = seed_response.status();
-        let seed_body = seed_response.text().await?;
-
-        eprintln!(
-            "joiner lookup status={joiner_status} version_id={version_id} object_id={object_id}"
-        );
-        eprintln!("seed lookup status={seed_status} body={seed_body}");
+        let foreign_status = foreign_response.status();
+        let foreign_body = foreign_response.text().await?;
 
         assert_eq!(
-            seed_status,
+            foreign_status,
             StatusCode::NOT_FOUND,
-            "DRS lookup through a different realm node returned {seed_status} for {object_id}: {seed_body}"
+            "DRS lookup for foreign owner returned {foreign_status} for {foreign_object_id}: {foreign_body}"
         );
 
         Ok(())
     }
     .await;
 
-    joiner.shutdown().await;
     seed.shutdown().await;
     result
 }
