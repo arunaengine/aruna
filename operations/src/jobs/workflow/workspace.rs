@@ -26,12 +26,19 @@ use super::DEFAULT_WALLTIME;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
-    routing_snapshot,
+    quota_marked_routing, routing_snapshot,
 };
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::store::reserve_output_commits;
+use crate::replication::protocol::ReplicationMode;
+use crate::replication::version_replication::{
+    ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
+    SourceAuthorizationError,
+};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
+use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::delete_object::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
@@ -494,7 +501,10 @@ pub async fn capture_outputs(
             "output manifest exceeds {MAX_EXECUTION_OUTPUTS} objects"
         )));
     }
-    let destinations: Vec<(String, String)> = selections.iter().map(destination_of).collect();
+    let destinations: Vec<(NodeId, String, String)> = selections
+        .iter()
+        .map(destination_of)
+        .collect::<Result<_, _>>()?;
     let control = reserve_output_commits(&context.storage_handle, record.job_id, &destinations)
         .await
         .map_err(|error| {
@@ -505,12 +515,12 @@ pub async fn capture_outputs(
             "attempt fence moved during output capture",
         ));
     }
-    let reserved: HashMap<(&str, &str), Ulid> = control
+    let reserved: HashMap<(NodeId, &str, &str), Ulid> = control
         .output_commits
         .iter()
         .map(|commit| {
             (
-                (commit.bucket.as_str(), commit.key.as_str()),
+                (commit.node_id, commit.bucket.as_str(), commit.key.as_str()),
                 commit.version_id,
             )
         })
@@ -520,8 +530,11 @@ pub async fn capture_outputs(
     // produced it.
     let inherited = Box::pin(staged_input_policies(context, spec, record)).await?;
     let mut outputs = Vec::with_capacity(selections.len());
-    for (selection, (bucket, key)) in selections.iter().zip(&destinations) {
-        let Some(version_id) = reserved.get(&(bucket.as_str(), key.as_str())).copied() else {
+    for (selection, (destination_node_id, bucket, key)) in selections.iter().zip(&destinations) {
+        let Some(version_id) = reserved
+            .get(&(*destination_node_id, bucket.as_str(), key.as_str()))
+            .copied()
+        else {
             return Err(JobError::retryable("output commit reservation lost"));
         };
         outputs.push(
@@ -585,9 +598,12 @@ async fn staged_input_policies(
         .map_err(|error| JobError::permanent(format!("input policy refs invalid: {error}")))
 }
 
-fn destination_of(selection: &OutputSelection) -> (String, String) {
+fn destination_of(selection: &OutputSelection) -> Result<(NodeId, String, String), JobError> {
     let OutputDestination::S3 { bucket, key } = &selection.destination;
-    (bucket.clone(), key.clone())
+    let node_id = selection
+        .destination_node_id
+        .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
+    Ok((node_id, bucket.clone(), key.clone()))
 }
 
 /// Resolve one declared output into the concrete files to upload. A wildcard
@@ -643,6 +659,7 @@ fn expand_selection(
             Ok(OutputSelection {
                 container_path: path,
                 path_prefix: None,
+                destination_node_id: output.destination_node_id,
                 destination: OutputDestination::S3 {
                     bucket: bucket.clone(),
                     key: format!("{}/{suffix}", key.trim_end_matches('/')),
@@ -671,41 +688,52 @@ async fn put_file_output(
     inherited: &[PlacementPolicyRef],
 ) -> Result<OutputObject, JobError> {
     let OutputDestination::S3 { bucket, key } = &output.destination;
-    let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
+    let destination_node_id = output
+        .destination_node_id
+        .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
+    let remote = destination_node_id != node_id;
+    let (write_bucket, write_key) = if remote {
+        let stage_bucket = output_stage_bucket(record);
+        Box::pin(ensure_output_stage(context, spec, record, &stage_bucket)).await?;
+        (stage_bucket, version_id.to_string())
+    } else {
+        let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(|error| bucket_lookup_error("output", error))?
+            .ok_or_else(|| JobError::permanent(format!("output bucket {bucket} not found")))?;
+        if bucket_info.group_id != spec.group_id {
+            return Err(JobError::permanent(
+                "output bucket is outside the execution group",
+            ));
+        }
+        let allowed = Box::pin(drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id: record.created_by.realm_id,
+                    path_restrictions: None,
+                },
+                path: blob_object_permission_path(
+                    record.created_by.realm_id,
+                    spec.group_id,
+                    node_id,
+                    bucket,
+                    key,
+                ),
+                required_permission: Permission::WRITE,
+            }),
+            context,
+        ))
         .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| bucket_lookup_error("output", error))?
-        .ok_or_else(|| JobError::permanent(format!("output bucket {bucket} not found")))?;
-    if bucket_info.group_id != spec.group_id {
-        return Err(JobError::permanent(
-            "output bucket is outside the execution group",
-        ));
-    }
-    let allowed = Box::pin(drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: record.created_by,
-                realm_id: record.created_by.realm_id,
-                path_restrictions: None,
-            },
-            path: blob_object_permission_path(
-                record.created_by.realm_id,
-                spec.group_id,
-                node_id,
-                bucket,
-                key,
-            ),
-            required_permission: Permission::WRITE,
-        }),
-        context,
-    ))
-    .await
-    .map_err(|error| authorization_error("output", error))?;
-    if !allowed {
-        return Err(JobError::permanent(format!(
-            "output {bucket}/{key} access denied"
-        )));
-    }
+        .map_err(|error| authorization_error("output", error))?;
+        if !allowed {
+            return Err(JobError::permanent(format!(
+                "output {bucket}/{key} access denied"
+            )));
+        }
+        (bucket.clone(), key.clone())
+    };
 
     let realm_config = Box::pin(drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
@@ -730,7 +758,7 @@ async fn put_file_output(
             std::io::Error::other(error)
         })
     }));
-    let routing = routing_snapshot(context, spec.group_id, bucket)
+    let routing = routing_snapshot(context, spec.group_id, &write_bucket)
         .await
         .map_err(|error| routing_error("output write", error))?;
     let gate = gate_context(context, record.created_by.realm_id, now_ms())
@@ -742,8 +770,8 @@ async fn put_file_output(
         realm_id: record.created_by.realm_id,
         node_id,
         request: PutObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
+            bucket: write_bucket.clone(),
+            key: write_key.clone(),
             content_length: Some(size),
             body: Some(body),
         },
@@ -771,7 +799,188 @@ async fn put_file_output(
             },
         )?
         .ok_or_else(|| JobError::retryable("output write returned no version"))?;
-    Ok(output_object(output, bucket, key, &result, execution_id))
+    if remote {
+        Box::pin(replicate_output(
+            context,
+            spec,
+            record,
+            &write_bucket,
+            &write_key,
+            result.version_id,
+            output,
+        ))
+        .await?;
+        Box::pin(cleanup_output_stage(
+            context,
+            spec,
+            record,
+            &write_bucket,
+            &write_key,
+            result.version_id,
+        ))
+        .await?;
+    }
+    Ok(output_object(
+        output,
+        destination_node_id,
+        bucket,
+        key,
+        &result,
+        execution_id,
+    ))
+}
+
+fn output_stage_bucket(record: &JobRecord) -> String {
+    format!("out-{}", record.job_id.to_string().to_lowercase())
+}
+
+async fn ensure_output_stage(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    bucket: &str,
+) -> Result<(), JobError> {
+    let info = BucketInfo {
+        group_id: spec.group_id,
+        created_at: SystemTime::now(),
+        created_by: record.created_by,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+    };
+    match Box::pin(drive(
+        CreateBucketOperation::new(bucket.to_string(), info),
+        context,
+    ))
+    .await
+    {
+        Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => Ok(()),
+        Err(error) => Err(JobError::retryable(format!(
+            "output staging bucket create failed: {error}"
+        ))),
+    }
+}
+
+async fn replicate_output(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    source_bucket: &str,
+    source_key: &str,
+    version_id: Ulid,
+    output: &OutputSelection,
+) -> Result<(), JobError> {
+    let destination_node_id = output
+        .destination_node_id
+        .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
+    let OutputDestination::S3 { bucket, key } = &output.destination;
+    let auth = AuthContext {
+        user_id: record.created_by,
+        realm_id: record.created_by.realm_id,
+        path_restrictions: None,
+    };
+    let source =
+        SourceAuthorization::load(context, auth.clone(), spec.group_id, record.owner_node_id)
+            .await
+            .map_err(|error| match error {
+                SourceAuthorizationError::Denied => {
+                    JobError::permanent("output staging read access denied")
+                }
+                SourceAuthorizationError::Unavailable(error) => {
+                    JobError::retryable(format!("output staging authorization failed: {error}"))
+                }
+            })?;
+    let routing = quota_marked_routing(context)
+        .await
+        .map_err(|error| routing_error("output copy", error))?;
+    let operation = ReplicateScopeOperation::new(ReplicateScopeInput {
+        bucket: source_bucket.to_string(),
+        target: ReplicateScopeTarget::Version {
+            key: source_key.to_string(),
+            version_id,
+        },
+        target_node_id: destination_node_id,
+        auth_context: auth.clone(),
+        replicate_delete_markers: false,
+        mode: ReplicationMode::OnDemand,
+    })
+    .with_routing(routing)
+    .with_source_authorization(source)
+    .with_destination(bucket.clone(), key.clone(), record.owner_node_id, auth);
+    let result = Box::pin(drive(operation, context))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| output_replication_error(error.to_string()))?
+        .ok_or_else(|| JobError::retryable("output copy returned no result"))?;
+    if result.failed > 0 || result.replicated == 0 && result.skipped == 0 {
+        return Err(output_replication_error(
+            result
+                .last_error
+                .unwrap_or_else(|| "output copy made no progress".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+async fn cleanup_output_stage(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) -> Result<(), JobError> {
+    match Box::pin(drive(
+        DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: Some(version_id),
+            group_id: spec.group_id,
+            realm_id: record.created_by.realm_id,
+            node_id: record.owner_node_id,
+            deleted_by: record.created_by,
+        }),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(_)) | Err(DeleteObjectError::NoSuchVersion) => {}
+        Ok(None) => {
+            return Err(JobError::retryable(
+                "output staging delete returned no result",
+            ));
+        }
+        Err(error) => {
+            return Err(JobError::retryable(format!(
+                "output staging delete failed: {error}"
+            )));
+        }
+    }
+    match Box::pin(drive(
+        DeleteBucketOperation::new(bucket.to_string()),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(())) | Err(DeleteBucketError::NotFound) => Ok(()),
+        Ok(None) => Err(JobError::retryable(
+            "output staging bucket delete returned no result",
+        )),
+        Err(error) => Err(JobError::retryable(format!(
+            "output staging bucket delete failed: {error}"
+        ))),
+    }
+}
+
+fn output_replication_error(message: String) -> JobError {
+    if message.contains("access denied") || message.contains("writer_access_denied") {
+        JobError::permanent(format!("output copy failed: {message}"))
+    } else {
+        JobError::retryable(format!("output copy failed: {message}"))
+    }
 }
 
 fn output_read_error(error: &BackendError) -> JobError {
@@ -787,12 +996,14 @@ fn output_read_error(error: &BackendError) -> JobError {
 /// physical execution that produced it, both read back from the stored version.
 fn output_object(
     output: &OutputSelection,
+    node_id: NodeId,
     bucket: &str,
     key: &str,
     result: &PutObjectResult,
     execution_id: Ulid,
 ) -> OutputObject {
     OutputObject {
+        node_id,
         bucket: bucket.to_string(),
         key: key.to_string(),
         version_id: result.version_id,
@@ -1184,9 +1395,19 @@ pub async fn collect_outputs(
     bucket: &str,
     control: &AttemptControl,
 ) -> Result<Vec<OutputObject>, JobError> {
+    if spec.file_outputs.is_empty() && !spec.output_prefixes.is_empty() {
+        return Err(JobError::permanent(
+            "output prefixes require declared file outputs",
+        ));
+    }
     if spec.output_prefixes.is_empty() {
         return Ok(Vec::new());
     }
+    let node_id = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or_else(|| JobError::retryable("output inventory needs a node identity"))?;
     let mut outputs = Vec::new();
     let mut keys = HashSet::new();
     let mut foreign = 0usize;
@@ -1211,7 +1432,7 @@ pub async fn collect_outputs(
             let Some(result) = result else { break };
             for object in result.objects {
                 let key = object.head.key;
-                let Some(version_id) = reserved_version(control, bucket, &key) else {
+                let Some(version_id) = reserved_version(control, node_id, bucket, &key) else {
                     foreign += 1;
                     continue;
                 };
@@ -1230,6 +1451,7 @@ pub async fn collect_outputs(
                     &mut outputs,
                     &mut keys,
                     OutputObject {
+                        node_id,
                         bucket: bucket.to_string(),
                         key,
                         version_id,
@@ -1247,12 +1469,9 @@ pub async fn collect_outputs(
         }
     }
     if foreign > 0 {
-        tracing::debug!(
-            bucket = %bucket,
-            execution_id = %control.execution_id,
-            foreign,
-            "Skipped prefix objects this execution did not write"
-        );
+        return Err(JobError::permanent(format!(
+            "output prefix inventory contains {foreign} unreserved objects"
+        )));
     }
     Ok(outputs)
 }
@@ -1260,11 +1479,16 @@ pub async fn collect_outputs(
 /// Version this execution reserved for `bucket`/`key` before writing, or `None`
 /// when the object under that key was produced by another writer. This is the
 /// only thing that attributes a workspace object to an execution.
-fn reserved_version(control: &AttemptControl, bucket: &str, key: &str) -> Option<Ulid> {
+fn reserved_version(
+    control: &AttemptControl,
+    node_id: NodeId,
+    bucket: &str,
+    key: &str,
+) -> Option<Ulid> {
     control
         .output_commits
         .iter()
-        .find(|commit| commit.bucket == bucket && commit.key == key)
+        .find(|commit| commit.node_id == node_id && commit.bucket == bucket && commit.key == key)
         .map(|commit| commit.version_id)
 }
 
@@ -1313,13 +1537,15 @@ pub(super) fn merge_outputs(
     inventoried: Vec<OutputObject>,
     captured: Vec<OutputObject>,
 ) -> Result<Vec<OutputObject>, JobError> {
-    let exported: HashSet<(&str, &str)> = captured
+    let exported: HashSet<(NodeId, &str, &str)> = captured
         .iter()
-        .map(|output| (output.bucket.as_str(), output.key.as_str()))
+        .map(|output| (output.node_id, output.bucket.as_str(), output.key.as_str()))
         .collect();
     let retained: Vec<OutputObject> = inventoried
         .into_iter()
-        .filter(|output| !exported.contains(&(output.bucket.as_str(), output.key.as_str())))
+        .filter(|output| {
+            !exported.contains(&(output.node_id, output.bucket.as_str(), output.key.as_str()))
+        })
         .collect();
 
     let mut outputs = Vec::new();
@@ -1332,10 +1558,10 @@ pub(super) fn merge_outputs(
 
 fn insert_output(
     outputs: &mut Vec<OutputObject>,
-    keys: &mut HashSet<(String, String)>,
+    keys: &mut HashSet<(NodeId, String, String)>,
     output: OutputObject,
 ) -> Result<(), JobError> {
-    if !keys.insert((output.bucket.clone(), output.key.clone())) {
+    if !keys.insert((output.node_id, output.bucket.clone(), output.key.clone())) {
         return Ok(());
     }
     if outputs.len() >= MAX_EXECUTION_OUTPUTS {
@@ -1397,6 +1623,7 @@ mod tests {
 
     fn output(key: &str) -> OutputObject {
         OutputObject {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
             bucket: "workspace".to_string(),
             key: key.to_string(),
             version_id: Ulid::generate(),
@@ -1485,6 +1712,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prefix_only_rejected() {
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let error = collect_outputs(
+            &context,
+            &spec(vec!["reports/".to_string()]),
+            "workspace",
+            &control(Vec::new()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, JobErrorKind::Permanent);
+        assert_eq!(
+            error.message,
+            "output prefixes require declared file outputs"
+        );
+    }
+
     fn control(output_commits: Vec<OutputCommitIntent>) -> AttemptControl {
         AttemptControl {
             attempt_epoch: 1,
@@ -1502,23 +1756,28 @@ mod tests {
         // A duplicate execution's head under the same key, an unrelated later
         // write, and another bucket all stay unattributed.
         let version = Ulid::from_bytes([5; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
         let reserved = control(vec![OutputCommitIntent {
+            node_id,
             bucket: "workspace".to_string(),
             key: "reports/a.txt".to_string(),
             version_id: version,
         }]);
 
         assert_eq!(
-            reserved_version(&reserved, "workspace", "reports/a.txt"),
+            reserved_version(&reserved, node_id, "workspace", "reports/a.txt"),
             Some(version)
         );
         assert_eq!(
-            reserved_version(&reserved, "workspace", "reports/b.txt"),
+            reserved_version(&reserved, node_id, "workspace", "reports/b.txt"),
             None
         );
-        assert_eq!(reserved_version(&reserved, "other", "reports/a.txt"), None);
         assert_eq!(
-            reserved_version(&control(Vec::new()), "workspace", "reports/a.txt"),
+            reserved_version(&reserved, node_id, "other", "reports/a.txt"),
+            None
+        );
+        assert_eq!(
+            reserved_version(&control(Vec::new()), node_id, "workspace", "reports/a.txt"),
             None
         );
     }
@@ -1527,15 +1786,20 @@ mod tests {
     fn duplicates_keep_versions() {
         // Two executions writing one key reserve two versions, so neither can
         // be attributed to the other.
-        let destinations = vec![("workspace".to_string(), "reports/a.txt".to_string())];
+        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let destinations = vec![(
+            node_id,
+            "workspace".to_string(),
+            "reports/a.txt".to_string(),
+        )];
         let mut first = control(Vec::new());
         let mut second = control(Vec::new());
         second.execution_id = Ulid::from_bytes([10; 16]);
         first.reserve_outputs(&destinations, Ulid::generate);
         second.reserve_outputs(&destinations, Ulid::generate);
 
-        let left = reserved_version(&first, "workspace", "reports/a.txt").unwrap();
-        let right = reserved_version(&second, "workspace", "reports/a.txt").unwrap();
+        let left = reserved_version(&first, node_id, "workspace", "reports/a.txt").unwrap();
+        let right = reserved_version(&second, node_id, "workspace", "reports/a.txt").unwrap();
         assert_ne!(left, right);
     }
 
@@ -1877,6 +2141,7 @@ mod tests {
         OutputSelection {
             container_path: pattern.to_string(),
             path_prefix: Some("/out".to_string()),
+            destination_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
             destination: OutputDestination::S3 {
                 bucket: "dest".to_string(),
                 key: "results/".to_string(),

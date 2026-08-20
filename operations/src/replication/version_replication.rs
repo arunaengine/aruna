@@ -50,14 +50,14 @@ const ITER_PAGE_SIZE: usize = 512;
 const MAX_SCOPE_VERSIONS: usize = 1024;
 
 #[derive(Debug, Error, PartialEq)]
-pub(super) enum SourceAuthorizationError {
+pub(crate) enum SourceAuthorizationError {
     #[error("source access denied")]
     Denied,
     #[error("source authorization unavailable: {0}")]
     Unavailable(String),
 }
 
-pub(super) struct SourceAuthorization {
+pub(crate) struct SourceAuthorization {
     group_id: GroupId,
     source_node_id: NodeId,
     auth_context: AuthContext,
@@ -86,7 +86,7 @@ impl std::fmt::Debug for SourceAuthorization {
 }
 
 impl SourceAuthorization {
-    pub(super) async fn load(
+    pub(crate) async fn load(
         context: &DriverContext,
         auth_context: AuthContext,
         group_id: GroupId,
@@ -113,7 +113,7 @@ impl SourceAuthorization {
         })
     }
 
-    pub(super) fn group_id(&self) -> GroupId {
+    pub(crate) fn group_id(&self) -> GroupId {
         self.group_id
     }
 
@@ -355,7 +355,7 @@ impl ReplicateScopeOperation {
         self
     }
 
-    pub(super) fn with_source_authorization(mut self, authorization: SourceAuthorization) -> Self {
+    pub(crate) fn with_source_authorization(mut self, authorization: SourceAuthorization) -> Self {
         self.source_authorization = Some(authorization);
         self
     }
@@ -398,6 +398,34 @@ impl ReplicateScopeOperation {
             })),
             upstream_sources,
             writer_auth_context,
+        });
+        self
+    }
+
+    /// Maps one exact source version to an unrelated node-local destination.
+    pub(crate) fn with_destination(
+        mut self,
+        target_bucket: String,
+        target_key: String,
+        source_node_id: NodeId,
+        writer_auth_context: AuthContext,
+    ) -> Self {
+        let (source_prefix, relationship_id) = match &self.input.target {
+            ReplicateScopeTarget::Version { key, version_id } => (Some(key.clone()), *version_id),
+            _ => (None, Ulid::nil()),
+        };
+        self.writer_auth_context = Some(writer_auth_context.clone());
+        self.sync = Some(SyncTransferContext {
+            target_bucket,
+            source_prefix,
+            target_prefix: Some(target_key),
+            source_node_id,
+            relationship_id,
+            reference_intent: false,
+            reference_handling: ReferenceHandling::Materialize,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: Some(writer_auth_context),
         });
         self
     }
@@ -2801,6 +2829,32 @@ mod tests {
             upstream_sources: Vec::new(),
             writer_auth_context: None,
         }
+    }
+
+    #[test]
+    fn destination_maps_exact() {
+        let version_id = Ulid::generate();
+        let source_node_id = iroh::SecretKey::generate().public();
+        let writer = auth_context();
+        let operation = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Version {
+            key: "stage-version".to_string(),
+            version_id,
+        }))
+        .with_destination(
+            "final-bucket".to_string(),
+            "results/output.txt".to_string(),
+            source_node_id,
+            writer.clone(),
+        );
+        let sync = operation.sync.expect("destination mapping");
+
+        assert_eq!(sync.target_bucket, "final-bucket");
+        assert_eq!(sync.source_prefix.as_deref(), Some("stage-version"));
+        assert_eq!(sync.target_prefix.as_deref(), Some("results/output.txt"));
+        assert_eq!(sync.source_node_id, source_node_id);
+        assert_eq!(sync.relationship_id, version_id);
+        assert_eq!(sync.origin, None);
+        assert_eq!(sync.writer_auth_context, Some(writer));
     }
 
     fn multipart_part_entry(
