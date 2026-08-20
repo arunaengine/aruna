@@ -9,18 +9,18 @@
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};
 use aruna_core::jobs::JobStatusView;
-use aruna_core::keyspaces::{
-    JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE,
-};
+use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::structs::{
-    AuthContext, ExecutionRole, JobFamilyId, JobId, JobProjection, LogicalJobSpec, LogicalJobState,
-    OutputObject, PhysicalExecutionResult, PhysicalExecutionState, SubmissionId,
+    AuthContext, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
+    JobRecordEnvelope, JobRecordKey, LogicalJobSpec, LogicalJobState, OutputObject,
+    PhysicalExecutionResult, PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::types::{Key, NodeId};
+use std::collections::BTreeMap;
 use tracing::debug;
 
 use super::routing::{family_projection, status_view};
-use super::witness::WitnessExplain;
+use super::witness::{WitnessExplain, has_deadline};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::submission_prefix;
@@ -65,6 +65,8 @@ pub struct FamilyReport {
     pub executions: u32,
     pub duplicate_successes: u32,
     pub outputs: Vec<OutputObject>,
+    /// Public storage endpoint for each output-owning node.
+    pub output_endpoints: BTreeMap<NodeId, String>,
     pub revision: u64,
     pub digest: [u8; 32],
     pub cancel_requested: bool,
@@ -105,6 +107,18 @@ pub async fn family_report(
         Err(error) => return Some(Err(JobRouteError::Internal(error.to_string()))),
     };
     let exhausted = locally_exhausted(context, &projection, family).await;
+    let mut output_endpoints = BTreeMap::new();
+    for output in projection.outputs.as_slice() {
+        if output_endpoints.contains_key(&output.node_id) {
+            continue;
+        }
+        if let Ok(Some(document)) =
+            crate::node_info::read_node_info_document(&context.storage_handle, output.node_id).await
+            && let Some(endpoint) = document.urls.s3
+        {
+            output_endpoints.insert(output.node_id, endpoint);
+        }
+    }
     Some(Ok(FamilyReport {
         job: status_view(job_id, &projection, &spec),
         submission_id: projection.submission_id,
@@ -128,6 +142,7 @@ pub async fn family_report(
             .filter(|execution| execution.role == ExecutionRole::DuplicateSuccess)
             .count() as u32,
         outputs: projection.outputs.as_slice().to_vec(),
+        output_endpoints,
         revision: projected.revision,
         digest,
         cancel_requested: projection.cancel_requested,
@@ -184,19 +199,7 @@ async fn locally_exhausted(
     {
         return false;
     }
-    let Ok((rows, _)) = iter_prefix_page(
-        &context.storage_handle,
-        JOB_WITNESS_DEADLINE_KEYSPACE,
-        Some(Key::from(family.to_bytes().as_slice())),
-        None,
-        1,
-        None,
-    )
-    .await
-    else {
-        return false;
-    };
-    rows.is_empty()
+    !has_deadline(context, family).await
 }
 
 fn terminal(state: PhysicalExecutionState) -> bool {
@@ -262,14 +265,33 @@ impl AuditPaging {
     /// the maximum page. Anything out of bounds is refused, never clamped.
     pub fn new(cursor: Option<Vec<u8>>, limit: Option<usize>) -> Result<Self, PagingError> {
         let cursor = cursor
-            .map(FetchCursor::new)
-            .transpose()
-            .map_err(|_| PagingError::Cursor)?;
+            .map(|cursor| {
+                JobRecordKey::from_bytes(&cursor).map_err(|_| PagingError::Cursor)?;
+                FetchCursor::new(cursor).map_err(|_| PagingError::Cursor)
+            })
+            .transpose()?;
         let limit = match limit {
             None => PageLimit::default(),
             Some(limit) => PageLimit::try_from(limit).map_err(|_| PagingError::Limit)?,
         };
         Ok(Self { cursor, limit })
+    }
+
+    /// Reject a cursor minted for a different family or submission scope.
+    pub fn validate_scope(
+        &self,
+        range: AuditRange,
+        family: JobFamilyId,
+    ) -> Result<(), PagingError> {
+        let Some(cursor) = self.cursor.as_ref() else {
+            return Ok(());
+        };
+        let key = JobRecordKey::from_bytes(cursor.as_slice()).map_err(|_| PagingError::Cursor)?;
+        let valid = match range {
+            AuditRange::Family => key.family == family,
+            AuditRange::Submission => key.family.submission_id == family.submission_id,
+        };
+        valid.then_some(()).ok_or(PagingError::Cursor)
     }
 }
 
@@ -316,4 +338,29 @@ pub async fn family_audit(
         .await
         .map_err(|error| JobRouteError::Internal(error.to_string())),
     )
+}
+
+pub async fn audit_endpoints(
+    context: &DriverContext,
+    records: &[JobRecordEnvelope],
+    mut endpoints: BTreeMap<NodeId, String>,
+) -> BTreeMap<NodeId, String> {
+    for envelope in records {
+        let JobFamilyRecord::Output(output) = &envelope.record else {
+            continue;
+        };
+        for object in output.outputs.as_slice() {
+            if endpoints.contains_key(&object.node_id) {
+                continue;
+            }
+            if let Ok(Some(document)) =
+                crate::node_info::read_node_info_document(&context.storage_handle, object.node_id)
+                    .await
+                && let Some(endpoint) = document.urls.s3
+            {
+                endpoints.insert(object.node_id, endpoint);
+            }
+        }
+    }
+    endpoints
 }

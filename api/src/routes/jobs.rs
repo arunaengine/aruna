@@ -190,6 +190,10 @@ pub struct JobOutputResponse {
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// Node-local S3 endpoint owning this exact version. Use it with the
+    /// bucket, key, and version_id above; the responder is not necessarily the
+    /// execution node.
+    pub endpoint_url: String,
 }
 
 /// The plan this responder sealed when it planned the request itself. Absent
@@ -394,7 +398,10 @@ fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn output_response(output: &aruna_core::structs::OutputObject) -> JobOutputResponse {
+pub(crate) fn output_response(
+    output: &aruna_core::structs::OutputObject,
+    endpoint_url: &str,
+) -> JobOutputResponse {
     JobOutputResponse {
         bucket: output.bucket.clone(),
         key: output.key.clone(),
@@ -403,13 +410,26 @@ pub(crate) fn output_response(output: &aruna_core::structs::OutputObject) -> Job
         container_path: output.container_path.clone(),
         size: output.size,
         digest: output.digest.clone(),
+        endpoint_url: endpoint_url.to_string(),
     }
 }
 
-/// Projects the reduced family onto the response. Node identities of other
-/// nodes are never disclosed here: only the responder names itself.
-pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
-    JobFamilyResponse {
+/// Projects the reduced family without disclosing node identities.
+pub(crate) fn family_response(report: &FamilyReport) -> Result<JobFamilyResponse, JobRouteError> {
+    let outputs = report
+        .outputs
+        .iter()
+        .map(|output| {
+            let endpoint = report
+                .output_endpoints
+                .get(&output.node_id)
+                .ok_or_else(|| {
+                    JobRouteError::Unavailable("output storage endpoint is unavailable".to_string())
+                })?;
+            Ok(output_response(output, endpoint))
+        })
+        .collect::<Result<Vec<_>, JobRouteError>>()?;
+    Ok(JobFamilyResponse {
         submission_id: hex32(&report.submission_id.0),
         request_digest: hex32(&report.request_digest),
         canonical_job_id: report.canonical_job_id.to_string(),
@@ -422,7 +442,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
             .map(|execution| execution.to_string()),
         executions: report.executions,
         duplicate_successes: report.duplicate_successes,
-        outputs: report.outputs.iter().map(output_response).collect(),
+        outputs,
         revision: report.revision,
         projection_digest: hex32(&report.digest),
         eventually_consistent: true,
@@ -442,7 +462,20 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
             omitted: plan.omitted,
             sealed_at_ms: plan.sealed_at_ms,
         }),
-    }
+    })
+}
+
+fn bind_output_routes(
+    result: &mut Option<serde_json::Value>,
+    outputs: &[JobOutputResponse],
+) -> Result<(), JobRouteError> {
+    let Some(serde_json::Value::Object(result)) = result else {
+        return Ok(());
+    };
+    let outputs = serde_json::to_value(outputs)
+        .map_err(|error| JobRouteError::Internal(error.to_string()))?;
+    result.insert("outputs".to_string(), outputs);
+    Ok(())
 }
 
 fn parse_state(value: &str) -> ServerResult<JobState> {
@@ -637,6 +670,7 @@ fn native_input(input: ExecutionInputRequest) -> ServerResult<InputSelection> {
             key: input.key,
             version_id: input.version_id,
         },
+        source_node_id: None,
         dest_key: input.dest_key,
         mode: match input.mode {
             InputModeRequest::Snapshot => InputMode::Snapshot,
@@ -966,6 +1000,9 @@ pub async fn submit_job(
                         {
                             "bucket": "ws-01jjrstvwxyz0123456789abcd",
                             "key": "reports/reads_fastqc.html",
+                            "version_id": "01JJRSVERSION0123456789ABC",
+                            "execution_id": "01JJRSEXEC0123456789ABCDEF",
+                            "endpoint_url": "https://s3.example",
                             "container_path": "/outputs/reads_fastqc.html",
                             "size": 20480,
                             "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8"
@@ -991,6 +1028,7 @@ pub async fn submit_job(
                         "key": "reports/reads_fastqc.html",
                         "version_id": "01JJRSVERSION0123456789ABC",
                         "execution_id": "01JJRSEXEC0123456789ABCDEF",
+                        "endpoint_url": "https://s3.example",
                         "container_path": "/outputs/reads_fastqc.html",
                         "size": 20480,
                         "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8"
@@ -1035,7 +1073,9 @@ pub async fn get_job(
     if let Some(report) = family_report(&state.get_ctx(), &auth, job_id).await {
         let report = report.map_err(map_job_route)?;
         let mut response = job_view_response(&report.job);
-        response.family = Some(family_response(&report));
+        let family = family_response(&report).map_err(map_job_route)?;
+        bind_output_routes(&mut response.result, &family.outputs).map_err(map_job_route)?;
+        response.family = Some(family);
         return Ok((StatusCode::OK, Json(response)));
     }
     let routed = read_job_routed(&state.get_ctx(), &auth, job_id, forwarded_job_auth(bearer)?)
@@ -1681,6 +1721,7 @@ mod tests {
                 submission_id,
                 job_id,
                 origin_node_id: node_id(),
+                ingress_node_id: node_id(),
                 realm_id: realm(),
                 group_id: payload.group_id,
                 created_by,
@@ -1703,6 +1744,8 @@ mod tests {
                     resources,
                     admitted_at_ms: 10,
                 },
+                input_facts: Vec::new(),
+                output_policies: Vec::new(),
                 placement: PlacementRef::NIL,
             },
             submission_id,
@@ -1716,6 +1759,7 @@ mod tests {
             executions: 2,
             duplicate_successes: 1,
             outputs: vec![OutputObject {
+                node_id: node_id(),
                 bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),
                 version_id: Ulid::from_bytes([9u8; 16]),
@@ -1724,6 +1768,7 @@ mod tests {
                 size: 3,
                 digest: None,
             }],
+            output_endpoints: BTreeMap::from([(node_id(), "https://s3.example".to_string())]),
             revision: 4,
             digest: [11u8; 32],
             cancel_requested: false,
@@ -1738,7 +1783,7 @@ mod tests {
     fn partitioned_view_is_marked() {
         // A partitioned read must name its responder and say that it is local
         // and exhausted here, without ever reading as a converged failure.
-        let response = family_response(&family_report_fixture());
+        let response = family_response(&family_report_fixture()).expect("response projects");
 
         assert_eq!(response.logical_state, "indeterminate");
         assert!(response.locally_exhausted);
@@ -1760,7 +1805,9 @@ mod tests {
     fn outputs_keep_exact_versions() {
         // The exact VersionId and its producing execution are the identity of a
         // job output; the object's current version is a different question.
-        let response = family_response(&family_report_fixture());
+        let response = family_response(&family_report_fixture()).expect("response projects");
+        let mut result = Some(serde_json::json!({ "outputs": [] }));
+        bind_output_routes(&mut result, &response.outputs).expect("routes bind");
 
         assert_eq!(response.outputs.len(), 1);
         assert_eq!(
@@ -1772,6 +1819,10 @@ mod tests {
             Ulid::from_bytes([10u8; 16]).to_string()
         );
         assert_eq!(response.outputs[0].bucket, "dest");
+        assert_eq!(
+            result.as_ref().unwrap()["outputs"][0]["endpoint_url"],
+            "https://s3.example"
+        );
     }
 
     fn realm() -> RealmId {

@@ -70,8 +70,9 @@ by the `execution_id` that produced it. That identity never changes.
 This is not the same as the object's S3 latest version:
 
 - **Job canonical output** is what the canonical execution wrote. Retrieve it
-  with the exact VersionId (`GET /object?versionId=…`), which is also what the
-  TES task log URLs carry.
+  from the `endpoint_url` returned for that output, with the exact VersionId
+  (`GET /object?versionId=…`). The endpoint is the node-local S3 owner and may
+  differ from the node that answered the job status request.
 - **S3 latest** is the node-local last-write-wins head of that key. A duplicate
   execution, a later unrelated upload, or a copy from another node can all make
   a different version the latest one.

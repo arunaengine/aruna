@@ -7,10 +7,14 @@
 //! and a caller that did not submit the job is answered 404 like any other
 //! unknown id.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::structs::{AuthContext, JobFamilyRecord, JobId, JobRecordEnvelope};
-use aruna_operations::jobs::lifecycle::{AuditPaging, AuditRange, family_audit, family_report};
+use aruna_core::structs::{AuthContext, JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
+use aruna_core::types::NodeId;
+use aruna_operations::jobs::lifecycle::{
+    AuditPaging, AuditRange, audit_endpoints, family_audit, family_report,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -135,8 +139,11 @@ fn audit_record(
     envelope: &JobRecordEnvelope,
     family_digest: &[u8; 32],
     canonical: JobId,
-) -> Option<JobAuditRecord> {
-    let digest = hex32(&envelope.record.digest().ok()?);
+    output_endpoints: &BTreeMap<NodeId, String>,
+) -> ServerResult<Option<JobAuditRecord>> {
+    let Some(digest) = envelope.record.digest().ok().map(|digest| hex32(&digest)) else {
+        return Ok(None);
+    };
     let record_family = envelope.family();
     let mut record = JobAuditRecord {
         kind: kind_name(&envelope.record).to_string(),
@@ -195,8 +202,15 @@ fn audit_record(
                 .outputs
                 .as_slice()
                 .iter()
-                .map(output_response)
-                .collect();
+                .map(|output| {
+                    let endpoint = output_endpoints.get(&output.node_id).ok_or_else(|| {
+                        ServerError::ServiceUnavailableReason(
+                            "output storage endpoint is unavailable".to_string(),
+                        )
+                    })?;
+                    Ok(output_response(output, endpoint))
+                })
+                .collect::<ServerResult<Vec<_>>>()?;
             record.at_ms = output.committed_at_ms;
         }
         JobFamilyRecord::Cancel(cancel) => {
@@ -205,7 +219,7 @@ fn audit_record(
             record.at_ms = cancel.requested_at_ms;
         }
     }
-    Some(record)
+    Ok(Some(record))
 }
 
 fn kind_name(record: &JobFamilyRecord) -> &'static str {
@@ -268,7 +282,8 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
                             "execution_id": "01JJRSEXEC0123456789ABCDEF",
                             "container_path": "/outputs/reads_fastqc.html",
                             "size": 20480,
-                            "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8"
+                            "digest": "fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8",
+                            "endpoint_url": "https://s3.example"
                         }],
                         "at_ms": 1755500009000u64
                     }
@@ -303,18 +318,33 @@ pub async fn get_job_audit(
         .await
         .ok_or(ServerError::NotFound)?
         .map_err(map_job_route)?;
+    paging
+        .validate_scope(
+            range,
+            JobFamilyId {
+                submission_id: report.submission_id,
+                request_digest: report.request_digest,
+            },
+        )
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     let page = family_audit(&context, &auth, job_id, range, paging)
         .await
         .ok_or(ServerError::NotFound)?
         .map_err(map_job_route)?;
 
-    let records = page
-        .records
-        .iter()
-        .filter_map(|envelope| {
-            audit_record(envelope, &report.request_digest, report.canonical_job_id)
-        })
-        .collect();
+    let output_endpoints =
+        audit_endpoints(&context, &page.records, report.output_endpoints.clone()).await;
+    let mut records = Vec::new();
+    for envelope in &page.records {
+        if let Some(record) = audit_record(
+            envelope,
+            &report.request_digest,
+            report.canonical_job_id,
+            &output_endpoints,
+        )? {
+            records.push(record);
+        }
+    }
     let conflicts = page
         .conflicts
         .iter()
@@ -364,7 +394,10 @@ mod tests {
         // A cursor must be a bounded record key and a limit must fit the page.
         assert!(parse_paging(&query(Some("not base64 !"), None)).is_err());
         assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 200])), None)).is_err());
-        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 32])), None)).is_ok());
+        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 32])), None)).is_err());
+        let mut key = [0u8; aruna_core::structs::JOB_RECORD_KEY_BYTES];
+        key[64] = aruna_core::structs::JobRecordKind::Spec.as_byte();
+        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode(key)), None)).is_ok());
         assert!(parse_paging(&query(None, Some(0))).is_err());
         assert!(parse_paging(&query(None, Some(MAX_AUDIT_PAGE + 1))).is_err());
         assert!(parse_paging(&query(None, None)).is_ok());

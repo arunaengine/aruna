@@ -48,8 +48,8 @@ pub use admit::{AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmiss
 pub use ids::{RequestIdentity, SubmissionRequest};
 pub use ingress::{AcceptedSubmission, submit_external_job};
 pub use report::{
-    AuditPaging, AuditRange, FamilyReport, MAX_AUDIT_PAGE, PagingError, PlanEstimate, family_audit,
-    family_report,
+    AuditPaging, AuditRange, FamilyReport, MAX_AUDIT_PAGE, PagingError, PlanEstimate,
+    audit_endpoints, family_audit, family_report,
 };
 
 /// Records of one submission an admission decision scans before it commits.

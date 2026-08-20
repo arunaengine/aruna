@@ -3,7 +3,8 @@
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::{
-    AuthContext, JobRecordEnvelope, LogicalJobState, PhysicalExecutionState,
+    AuthContext, JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobState,
+    PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::types::UserId;
 use ulid::Ulid;
@@ -167,4 +168,43 @@ async fn audit_pages_records() {
         .await,
         Some(Err(crate::jobs::JobRouteError::NotFound))
     ));
+}
+
+#[test]
+fn rejects_scope_mismatch() {
+    let family = JobFamilyId {
+        submission_id: SubmissionId([1u8; 32]),
+        request_digest: [2u8; 32],
+    };
+    let cursor = JobRecordKey {
+        family,
+        kind: JobRecordKind::Spec,
+        subject: [3u8; 32],
+        sequence: 0,
+    };
+    let paging = AuditPaging::new(Some(cursor.to_bytes().to_vec()), None).expect("valid cursor");
+
+    assert!(paging.validate_scope(AuditRange::Family, family).is_ok());
+    assert!(
+        paging
+            .validate_scope(
+                AuditRange::Family,
+                JobFamilyId {
+                    submission_id: family.submission_id,
+                    request_digest: [4u8; 32],
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        paging
+            .validate_scope(
+                AuditRange::Submission,
+                JobFamilyId {
+                    submission_id: family.submission_id,
+                    request_digest: [4u8; 32],
+                },
+            )
+            .is_ok()
+    );
 }
