@@ -272,14 +272,19 @@ impl TryFrom<Vec<JobRecordFrame>> for JobRecordPage {
     }
 }
 
-/// Reply to a [`crate::effects::JobRecordEffect`]. `holder` is the authenticated
-/// peer that answered; each record keeps its own publisher inside its envelope,
-/// so relaying a record never makes the holder its author.
+/// Reply to a [`crate::effects::JobRecordEffect`]. Each holder is authenticated
+/// by the transport peer; records keep their own publisher inside the envelope,
+/// so relaying a record never makes a holder its author.
 #[derive(Debug, PartialEq)]
 pub enum JobRecordEvent {
     /// One current holder durably accepted the immutable record.
     Published {
         holder: NodeId,
+    },
+    /// Several current holders durably accepted the immutable record in one
+    /// fan-out. The publisher keeps any holders absent from this list queued.
+    PublishedMany {
+        holders: Vec<NodeId>,
     },
     Rejected {
         holder: NodeId,

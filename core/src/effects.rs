@@ -662,6 +662,7 @@ pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvel
     let execution_id = Ulid::from_bytes([7u8; 16]);
     let outputs = (0..objects)
         .map(|index| OutputObject {
+            node_id: secret.public(),
             bucket: "bucket".to_string(),
             key: format!("{index:08}-{}", "k".repeat(key_bytes)),
             version_id: Ulid::from_bytes([9u8; 16]),

@@ -69,10 +69,15 @@ impl ProjectionCache {
     }
 }
 
-/// Marker for a locally published authentic record awaiting family replication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A locally published authentic record and its per-holder replication state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxEntry {
     pub queued_at_ms: u64,
+    /// Holders that durably accepted this record. A row remains until every
+    /// current holder is accounted for, so one acknowledgement is not quorum.
+    pub delivered: Vec<NodeId>,
+    /// Index at which the next bounded holder fan-out starts.
+    pub next_holder: u32,
 }
 
 pub fn to_bytes<T: Serialize>(row: &T) -> Result<Vec<u8>, ConversionError> {

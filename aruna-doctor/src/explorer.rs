@@ -14,14 +14,14 @@ use aruna_core::keyspaces::{
     HASH_PATHS_INDEX_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE,
     JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
     JOB_FAMILY_RECORD_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE,
-    JOB_RESERVATION_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
-    PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-    SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
-    USER_ACCESS_OWNER_KEYSPACE,
+    JOB_RESERVATION_KEYSPACE, JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE,
+    MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    ONBOARDING_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+    USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
@@ -1184,7 +1184,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 51] {
+fn defined_keyspaces() -> [&'static str; 52] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -1213,6 +1213,7 @@ fn defined_keyspaces() -> [&'static str; 51] {
         JOB_OUTPUT_RECORD_KEYSPACE,
         JOB_PLAN_EXPLAIN_KEYSPACE,
         JOB_RESERVATION_KEYSPACE,
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE,
         JOB_WITNESS_DEADLINE_KEYSPACE,
         MANAGED_COPY_KEYSPACE,
         METADATA_AUDIT_KEYSPACE,
@@ -1475,7 +1476,9 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         }
         JOB_FAMILY_CONFLICT_KEYSPACE => decode_conflict_key(key),
         JOB_FAMILY_ALIAS_KEYSPACE => decode_alias_key(key),
-        JOB_FAMILY_PROJECTION_KEYSPACE | JOB_WITNESS_DEADLINE_KEYSPACE => decode_family_key(key),
+        JOB_FAMILY_PROJECTION_KEYSPACE => decode_family_key(key),
+        JOB_WITNESS_DEADLINE_KEYSPACE => decode_deadline_key(key),
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE => decode_family_key(key),
         JOB_PLAN_EXPLAIN_KEYSPACE => decode_explain_key(key),
         JOB_RESERVATION_KEYSPACE => decode_ulid_key(key),
         PLACEMENT_POLICY_KEYSPACE | POLICY_MUTATION_KEYSPACE | POLICY_BULK_RUN_KEYSPACE => {
@@ -1617,7 +1620,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 data: JsonJobReservation(data),
             },
         ),
-        JOB_WITNESS_DEADLINE_KEYSPACE => decode_value_with(
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE | JOB_WITNESS_DEADLINE_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<WitnessDeadline>(bytes),
             |data| DecodedValue::JobWitnessDeadline { data },
@@ -1792,6 +1795,18 @@ fn decode_alias_key(key: &[u8]) -> DecodedField {
 
 fn decode_family_key(key: &[u8]) -> DecodedField {
     match family_from_key(key) {
+        Some(family) => DecodedField::JobFamilyKey {
+            family: family_id_string(&family),
+        },
+        None => raw_field(key),
+    }
+}
+
+fn decode_deadline_key(key: &[u8]) -> DecodedField {
+    if key.len() != 72 {
+        return raw_field(key);
+    }
+    match key.get(8..).and_then(family_from_key) {
         Some(family) => DecodedField::JobFamilyKey {
             family: family_id_string(&family),
         },
@@ -1991,9 +2006,9 @@ mod tests {
         JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
         JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
         JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
-        JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
+        METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+        METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
         PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
@@ -2177,6 +2192,7 @@ mod tests {
             JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
             JOB_PLAN_EXPLAIN_KEYSPACE.to_string(),
             JOB_RESERVATION_KEYSPACE.to_string(),
+            JOB_WITNESS_DEADLINE_INDEX_KEYSPACE.to_string(),
             JOB_WITNESS_DEADLINE_KEYSPACE.to_string(),
             MANAGED_COPY_KEYSPACE.to_string(),
             METADATA_AUDIT_KEYSPACE.to_string(),
@@ -2349,7 +2365,11 @@ mod tests {
             }
         );
 
-        let outbox = OutboxEntry { queued_at_ms: 14 };
+        let outbox = OutboxEntry {
+            queued_at_ms: 14,
+            delivered: Vec::new(),
+            next_holder: 0,
+        };
         let decoded = decode_entry(
             JOB_FAMILY_OUTBOX_KEYSPACE,
             &key_bytes,
@@ -2395,9 +2415,11 @@ mod tests {
             due_at_ms: 22,
             rank: 1,
         };
+        let mut deadline_key = 22u64.to_be_bytes().to_vec();
+        deadline_key.extend_from_slice(&test_family().to_bytes());
         let decoded = decode_entry(
             JOB_WITNESS_DEADLINE_KEYSPACE,
-            &test_family().to_bytes(),
+            &deadline_key,
             &postcard::to_allocvec(&deadline).unwrap(),
         );
         assert!(matches!(decoded.key, DecodedField::JobFamilyKey { .. }));
