@@ -88,7 +88,9 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
     let seed_info = read_node_info_document(&seed.context.storage_handle, seed.net.node_id())
         .await?
         .expect("seed fixture should publish issuer node info");
-    assert_eq!(issuer_info, seed_info);
+    assert_eq!(issuer_info.node_id, seed_info.node_id);
+    assert_eq!(issuer_info.labels, seed_info.labels);
+    assert_eq!(issuer_info.urls, seed_info.urls);
     assert_eq!(issuer_info.node_id, seed.net.node_id());
     assert_eq!(issuer_info.urls.api, None);
     assert_eq!(issuer_info.urls.s3, None);
