@@ -297,16 +297,46 @@ and is re-offered at least once inside that window before the next plan excludes
 it.
 
 A decline says only as much as it can prove. `Capacity` is reported when the
-target's own reservation found no free capacity for the sealed request. Every
-other local refusal answers `Draining`, including a failed reservation that was
-not a capacity verdict, because that is this node refusing work rather than the
-plan misjudging its free resources. A node with the operator drain flag set
-declines every launch offer, even when its own advertisement is stale.
+target's own reservation found no free capacity for the sealed request.
+`Draining` is reported only for an operator drain, a membership or gate
+refusal, or an unavailable backend. A reservation that fails on a storage
+commit conflict is a lost race between two admissions of the same launch, not a
+drain: the target reloads the family, answers with the receipt the winner
+committed when launch id and digest match, answers `LaunchConflict` when the
+same launch id carries a different digest, retries the reservation up to three
+times otherwise, and finally leaves the offer undecided so the witness asks
+again. A node with the operator drain flag set declines every launch offer,
+even when its own advertisement is stale.
+
+Every scheduling round screens up to 1024 advertisements, evaluates eligibility
+and score for all of them, and ranks the best 128 eligible targets (8
+alternatives and 32 rejection explanations are kept for the audit). A round that
+hits the scan bound with advertisements left over is reported as retryable and
+repeated, never as "no eligible target".
+
+Scheduling, target admission, state publication and routing act only on a
+family read that is proven complete. A page error, an undecodable row, or the
+4096-record bound with records remaining leaves the round undecided: the witness
+retries without creating a budget or launch, the target answers undecidable
+without reserving resources or appending a receipt, publication appends no
+update, and routing answers unavailable. A state update is appended only onto a
+receipt whose existing updates form a contiguous chain (no duplicate or missing
+sequence, no broken predecessor), and its sequence is the chain's maximum plus
+one.
 
 ## Record admission
 
 A family record a peer offers is admitted, retained, or refused; it is never
-half-accepted. Holder authority moves with membership, so a record whose
+half-accepted. Its predecessors (the spec for a claim, cancellation or budget;
+the spec and scheduler budget for a launch; the exact launch for a receipt; the
+exact receipt for an update or output; the preceding update for a later update)
+are read by exact key or by a complete record-kind scan, never from a fixed
+prefix of the family, so a valid record never stays pending merely because its
+family grew large; a storage error or an incomplete scan keeps the record
+retained rather than admitting it from partial evidence. A family projection
+that exceeds 4096 records is reported truncated: it is never cached as fresh,
+never bridged into local job rows, and answers `indeterminate` where a state is
+asked. Holder authority moves with membership, so a record whose
 publisher this node's current view does not rank as a holder is retained and
 judged again later rather than rejected. While a record is retained, a
 re-arrival of it is answered as unavailable, which keeps the publisher retrying
