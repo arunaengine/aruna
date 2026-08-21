@@ -1,3 +1,4 @@
+use aruna_api::s3::s3_server::S3ServerTimeouts;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -47,7 +48,13 @@ const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
 /// Prometheus scrape exist out of the box without being publicly reachable.
 const DEFAULT_OPS_SOCKET_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002);
 const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The seed answers a bootstrap with realm-config upsert, placement expansion
+/// and topic reconciliation inline, so the client budget has to cover that work
+/// on a busy seed.
+const DEFAULT_ONBOARDING_BOOTSTRAP_TIMEOUT_SECS: u64 = 120;
+/// Budget for one onboarding document-sync round trip and for the placement
+/// wait that repeats it until the seed has granted this node its placement.
+const DEFAULT_ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS: u64 = 60;
 
 pub struct Config {
     pub storage_path: String,
@@ -63,6 +70,11 @@ pub struct Config {
     pub blob_control_plane_connect_timeout_secs: u64,
     pub blob_control_plane_io_timeout_secs: u64,
     pub blob_transfer_idle_timeout_secs: u64,
+    pub onboarding_bootstrap_timeout_secs: u64,
+    pub onboarding_document_sync_timeout_secs: u64,
+    pub s3_initial_request_timeout_secs: u64,
+    pub s3_connection_idle_timeout_secs: u64,
+    pub s3_stream_lifetime_timeout_secs: u64,
     pub http_socket_addr: SocketAddr,
     pub ops_socket_addr: SocketAddr,
     pub max_http_body_size: usize,
@@ -258,6 +270,20 @@ impl Config {
             ),
         }
     }
+
+    /// Budget for the onboarding document sync and the placement wait built on
+    /// it, both driven from `main.rs` and the integration harness.
+    pub fn onboarding_sync_timeout(&self) -> Duration {
+        Duration::from_secs(self.onboarding_document_sync_timeout_secs)
+    }
+
+    pub fn s3_timeouts(&self) -> S3ServerTimeouts {
+        S3ServerTimeouts {
+            initial_request: Duration::from_secs(self.s3_initial_request_timeout_secs),
+            connection_idle: Duration::from_secs(self.s3_connection_idle_timeout_secs),
+            stream_lifetime: Duration::from_secs(self.s3_stream_lifetime_timeout_secs),
+        }
+    }
 }
 
 /// Environment token a backend name maps to. The mapping is lossy, so callers
@@ -315,7 +341,56 @@ fn load_backends_config(
     Ok(file.resolve(&backend_credentials, timeouts)?)
 }
 
-pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
+/// Environment-derived configuration. Reading it performs no network or storage
+/// I/O, so a caller that has to serialize access to the process environment can
+/// scope that serialization to this step alone.
+pub struct Settings {
+    pub storage_path: String,
+    pub metadata_storage_path: String,
+    pub metadata_search_storage: MetadataSearchStorage,
+    pub fjall_persist_policy: FjallPersistPolicy,
+    pub document_sync_storage_path: PathBuf,
+    pub blob_root: String,
+    pub blob_backends: NodeBackendsConfig,
+    pub blob_bucket_prefix: Option<String>,
+    pub blob_max_bucket_size: Option<u64>,
+    pub blob_multipart_bucket: Option<String>,
+    pub blob_control_plane_connect_timeout_secs: u64,
+    pub blob_control_plane_io_timeout_secs: u64,
+    pub blob_transfer_idle_timeout_secs: u64,
+    pub onboarding_bootstrap_timeout_secs: u64,
+    pub onboarding_document_sync_timeout_secs: u64,
+    pub s3_initial_request_timeout_secs: u64,
+    pub s3_connection_idle_timeout_secs: u64,
+    pub s3_stream_lifetime_timeout_secs: u64,
+    pub http_socket_addr: SocketAddr,
+    pub ops_socket_addr: SocketAddr,
+    pub max_http_body_size: usize,
+    pub cors_allowed_origins: Vec<String>,
+    pub portal_csp_extra_origins: Vec<String>,
+    pub p2p_socket_addr: SocketAddr,
+    pub additional_relay_urls: Vec<String>,
+    pub max_concurrent_uni_streams: Option<u64>,
+    pub max_concurrent_bidi_streams: Option<u64>,
+    pub document_sync_runtime: IrohRuntimeConfig,
+    pub default_metadata_replication_factor: u32,
+    pub s3_host: String,
+    pub api_public_url: Option<String>,
+    pub s3_public_url: Option<String>,
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+    pub rocrate_limits: RoCrateLimits,
+    pub rate_limits: RateLimitSettings,
+    pub s3_address: String,
+    pub onboarding_secret: Option<String>,
+    pub oidc_providers: Vec<OidcProviderConfig>,
+    pub realm_description: String,
+    pub portal: PortalConfig,
+    pub node_labels: BTreeMap<String, String>,
+    pub node_location: Option<String>,
+    pub node_weight: Option<u32>,
+}
+
+pub fn read_settings() -> Result<Settings, SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
     let metadata_storage_path =
         dotenvy::var("CRAQLE_STORAGE_PATH").unwrap_or_else(|_| format!("{storage_path}/craqle"));
@@ -363,6 +438,27 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(30 * 60);
+    let onboarding_bootstrap_timeout_secs = positive_u64_env(
+        "ONBOARDING_BOOTSTRAP_TIMEOUT_SECS",
+        DEFAULT_ONBOARDING_BOOTSTRAP_TIMEOUT_SECS,
+    )?;
+    let onboarding_document_sync_timeout_secs = positive_u64_env(
+        "ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS",
+        DEFAULT_ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS,
+    )?;
+    let s3_timeouts = S3ServerTimeouts::default();
+    let s3_initial_request_timeout_secs = positive_u64_env(
+        "S3_INITIAL_REQUEST_TIMEOUT_SECS",
+        s3_timeouts.initial_request.as_secs(),
+    )?;
+    let s3_connection_idle_timeout_secs = positive_u64_env(
+        "S3_CONNECTION_IDLE_TIMEOUT_SECS",
+        s3_timeouts.connection_idle.as_secs(),
+    )?;
+    let s3_stream_lifetime_timeout_secs = positive_u64_env(
+        "S3_STREAM_LIFETIME_TIMEOUT_SECS",
+        s3_timeouts.stream_lifetime.as_secs(),
+    )?;
     let blob_timeouts = BlobTimeoutConfig {
         control_plane_connect_timeout: Duration::from_secs(blob_control_plane_connect_timeout_secs),
         control_plane_io_timeout: Duration::from_secs(blob_control_plane_io_timeout_secs),
@@ -438,6 +534,102 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         return Err(SetupError::MissingConfigValue("API_PUBLIC_URL"));
     }
 
+    Ok(Settings {
+        storage_path,
+        metadata_storage_path,
+        metadata_search_storage,
+        fjall_persist_policy,
+        document_sync_storage_path,
+        blob_root,
+        blob_backends,
+        blob_bucket_prefix,
+        blob_max_bucket_size,
+        blob_multipart_bucket,
+        blob_control_plane_connect_timeout_secs,
+        blob_control_plane_io_timeout_secs,
+        blob_transfer_idle_timeout_secs,
+        onboarding_bootstrap_timeout_secs,
+        onboarding_document_sync_timeout_secs,
+        s3_initial_request_timeout_secs,
+        s3_connection_idle_timeout_secs,
+        s3_stream_lifetime_timeout_secs,
+        http_socket_addr,
+        ops_socket_addr,
+        max_http_body_size,
+        cors_allowed_origins,
+        portal_csp_extra_origins,
+        p2p_socket_addr,
+        additional_relay_urls,
+        max_concurrent_uni_streams,
+        max_concurrent_bidi_streams,
+        document_sync_runtime,
+        default_metadata_replication_factor,
+        s3_host,
+        api_public_url,
+        s3_public_url,
+        trusted_proxies,
+        rocrate_limits,
+        rate_limits,
+        s3_address,
+        onboarding_secret,
+        oidc_providers,
+        realm_description,
+        portal,
+        node_labels,
+        node_location,
+        node_weight,
+    })
+}
+
+/// Opens local storage, resolves or bootstraps the persisted node state and
+/// derives the realm network configuration from it.
+pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHandle), SetupError> {
+    let Settings {
+        storage_path,
+        metadata_storage_path,
+        metadata_search_storage,
+        fjall_persist_policy,
+        document_sync_storage_path,
+        blob_root,
+        blob_backends,
+        blob_bucket_prefix,
+        blob_max_bucket_size,
+        blob_multipart_bucket,
+        blob_control_plane_connect_timeout_secs,
+        blob_control_plane_io_timeout_secs,
+        blob_transfer_idle_timeout_secs,
+        onboarding_bootstrap_timeout_secs,
+        onboarding_document_sync_timeout_secs,
+        s3_initial_request_timeout_secs,
+        s3_connection_idle_timeout_secs,
+        s3_stream_lifetime_timeout_secs,
+        http_socket_addr,
+        ops_socket_addr,
+        max_http_body_size,
+        cors_allowed_origins,
+        portal_csp_extra_origins,
+        p2p_socket_addr,
+        additional_relay_urls,
+        max_concurrent_uni_streams,
+        max_concurrent_bidi_streams,
+        document_sync_runtime,
+        default_metadata_replication_factor,
+        s3_host,
+        api_public_url,
+        s3_public_url,
+        trusted_proxies,
+        rocrate_limits,
+        rate_limits,
+        s3_address,
+        onboarding_secret,
+        oidc_providers,
+        realm_description,
+        portal,
+        node_labels,
+        node_location,
+        node_weight,
+    } = settings;
+    let bootstrap_timeout = Duration::from_secs(onboarding_bootstrap_timeout_secs);
     let storage_handle =
         FjallStorage::open_with_persist_policy(&storage_path, fjall_persist_policy)?;
     let mut temporary_bootstrap_endpoint = None;
@@ -451,6 +643,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
                         node_location.clone(),
                         node_weight,
                         node_labels.clone(),
+                        bootstrap_timeout,
                     )
                     .await?;
                     temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
@@ -488,6 +681,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
                 node_location.clone(),
                 node_weight,
                 node_labels.clone(),
+                bootstrap_timeout,
             )
             .await?;
             temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
@@ -532,6 +726,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             blob_control_plane_connect_timeout_secs,
             blob_control_plane_io_timeout_secs,
             blob_transfer_idle_timeout_secs,
+            onboarding_bootstrap_timeout_secs,
+            onboarding_document_sync_timeout_secs,
+            s3_initial_request_timeout_secs,
+            s3_connection_idle_timeout_secs,
+            s3_stream_lifetime_timeout_secs,
             http_socket_addr,
             ops_socket_addr,
             max_http_body_size,
@@ -570,6 +769,10 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         },
         storage_handle,
     ))
+}
+
+pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
+    resolve_settings(read_settings()?).await
 }
 
 fn normalize_env_value(value: &str) -> String {
@@ -1035,6 +1238,7 @@ async fn bootstrap_onboarded_node_state(
     node_location: Option<String>,
     node_weight: Option<u32>,
     node_labels: BTreeMap<String, String>,
+    timeout: Duration,
 ) -> Result<BootstrappedNodeState, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let node_signing_key = generate_signing_key();
@@ -1080,7 +1284,7 @@ async fn bootstrap_onboarded_node_state(
                 .to_string()
         });
 
-    let response = onboarding_bootstrap_client()?
+    let response = onboarding_bootstrap_client(timeout)?
         .post(format!(
             "{}/api/v1/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
@@ -1192,6 +1396,7 @@ async fn refresh_onboarding_bootstrap(
     node_location: Option<String>,
     node_weight: Option<u32>,
     node_labels: BTreeMap<String, String>,
+    timeout: Duration,
 ) -> Result<BootstrapOnboardingResponse, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let node_signing_key = SigningKey::from_bytes(&node_state.net_secret_key);
@@ -1248,7 +1453,7 @@ async fn refresh_onboarding_bootstrap(
                 .to_string()
         });
 
-    let response = onboarding_bootstrap_client()?
+    let response = onboarding_bootstrap_client(timeout)?
         .post(format!(
             "{}/api/v1/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
@@ -1290,10 +1495,10 @@ async fn refresh_onboarding_bootstrap(
     Ok(response)
 }
 
-fn onboarding_bootstrap_client() -> Result<reqwest::Client, SetupError> {
+fn onboarding_bootstrap_client(timeout: Duration) -> Result<reqwest::Client, SetupError> {
     Ok(reqwest::Client::builder()
         .connect_timeout(ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT)
-        .timeout(ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT)
+        .timeout(timeout)
         .build()?)
 }
 
@@ -1561,8 +1766,9 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        fjall_persist_policy_env, load, load_oidc_providers_from_env, parse_node_labels_env,
-        persist_node_state, portal_config_env, rocrate_limits_env, validate_public_url,
+        S3ServerTimeouts, fjall_persist_policy_env, load, load_oidc_providers_from_env,
+        parse_node_labels_env, persist_node_state, portal_config_env, read_settings,
+        rocrate_limits_env, validate_public_url,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
@@ -1716,6 +1922,61 @@ mod tests {
                 ..
             })
         ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn timeout_settings_env() {
+        // The joinable bootstrap budget and the S3 listener deadlines are
+        // operator input; unset keys must keep the shipped defaults.
+        let _guard = env_lock().lock().await;
+        let dir = tempdir().unwrap();
+        let vars = [
+            ("STORAGE_PATH", dir.path().to_str().unwrap().to_string()),
+            ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
+            ("S3_HOST", "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:0".to_string()),
+            ("ONBOARDING_BOOTSTRAP_TIMEOUT_SECS", "240".to_string()),
+            ("ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS", "300".to_string()),
+            ("S3_INITIAL_REQUEST_TIMEOUT_SECS", "45".to_string()),
+            ("S3_CONNECTION_IDLE_TIMEOUT_SECS", "90".to_string()),
+            ("S3_STREAM_LIFETIME_TIMEOUT_SECS", "600".to_string()),
+        ];
+        let previous = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in &vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let settings = read_settings().unwrap();
+        assert_eq!(settings.onboarding_bootstrap_timeout_secs, 240);
+        assert_eq!(settings.onboarding_document_sync_timeout_secs, 300);
+        assert_eq!(settings.s3_initial_request_timeout_secs, 45);
+        assert_eq!(settings.s3_connection_idle_timeout_secs, 90);
+        assert_eq!(settings.s3_stream_lifetime_timeout_secs, 600);
+
+        for (key, _) in &vars[4..] {
+            unsafe { std::env::remove_var(key) };
+        }
+        let settings = read_settings().unwrap();
+        let defaults = S3ServerTimeouts::default();
+        assert_eq!(settings.onboarding_bootstrap_timeout_secs, 120);
+        assert_eq!(settings.onboarding_document_sync_timeout_secs, 60);
+        assert_eq!(
+            settings.s3_initial_request_timeout_secs,
+            defaults.initial_request.as_secs()
+        );
+        assert_eq!(
+            settings.s3_connection_idle_timeout_secs,
+            defaults.connection_idle.as_secs()
+        );
+        assert_eq!(
+            settings.s3_stream_lifetime_timeout_secs,
+            defaults.stream_lifetime.as_secs()
+        );
 
         restore_env(previous);
     }

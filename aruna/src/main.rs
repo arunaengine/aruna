@@ -454,6 +454,7 @@ async fn join_realm(
             &config.node_state,
             &config.realm_id,
             bootstrap_peer,
+            config.onboarding_sync_timeout(),
         )
         .await?;
     }
@@ -462,6 +463,7 @@ async fn join_realm(
         config.realm_id,
         config.node_id,
         bootstrap_peer,
+        config.onboarding_sync_timeout(),
     )
     .await?;
     if matches!(phase, OnboardingPhase::Bootstrapped) {
@@ -476,9 +478,9 @@ async fn join_realm(
         }
     }
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
         config.node_id,
         config.realm_id,
         false,
@@ -520,9 +522,9 @@ async fn provision_realm(
     }
 
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let allow_genesis = config.is_initial_node();
     let documents = prepare_core_documents(
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
         driver_ctx.as_ref(),
         config.node_id,
         config.realm_id,
@@ -555,6 +557,7 @@ async fn bind_servers(
 ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
+    let s3_timeouts = config.s3_timeouts();
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
@@ -615,6 +618,7 @@ async fn bind_servers(
         config.rate_limits.s3_max_connections as usize,
         config.rate_limits.s3_max_requests as usize,
     )
+    .with_timeouts(s3_timeouts)
     .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
         config.rate_limits.ip_per_minute,
@@ -1163,10 +1167,6 @@ fn env_number<T: std::str::FromStr + Default + PartialEq>(name: &str) -> Result<
         .transpose()
 }
 
-/// Parses a bounded `key=value,key2=value2` label or selector list.
-#[cfg(feature = "kubernetes")]
-fn env_labels(name: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let Ok(value) = dotenvy::var(name) else {
 /// Zero is rejected rather than silently making this node ineligible: leaving
 /// the variable unset is how a dimension stays unmeasured.
 #[cfg(any(
@@ -1188,6 +1188,10 @@ fn parse_positive<T: std::str::FromStr + Default + PartialEq>(
     }
 }
 
+/// Parses a bounded `key=value,key2=value2` label or selector list.
+#[cfg(feature = "kubernetes")]
+fn env_labels(name: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Ok(value) = dotenvy::var(name) else {
         return Ok(std::collections::BTreeMap::new());
     };
     value
@@ -1373,10 +1377,6 @@ mod tests {
         assert!(parse_disk_limit(Some("0")).is_err());
     }
 
-    #[tokio::test]
-    async fn portal_exit_reports() {
-        // A dead portal is a node failure, and a panic must not lose its error.
-        let mut stopped = tokio::spawn(async {});
     #[test]
     fn rejects_zero_ceiling() {
         // A zero ceiling would silently make this node ineligible for every
@@ -1389,6 +1389,10 @@ mod tests {
         assert!(parse_positive::<u64>("ARUNA_COMPUTE_MAX_RAM_BYTES", "-1").is_err());
     }
 
+    #[tokio::test]
+    async fn portal_exit_reports() {
+        // A dead portal is a node failure, and a panic must not lose its error.
+        let mut stopped = tokio::spawn(async {});
         assert_eq!(
             portal_exit(Some(&mut stopped)).await,
             "Portal server stopped unexpectedly"

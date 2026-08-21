@@ -34,7 +34,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
 
-const ONBOARDING_DOCUMENT_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const ONBOARDING_PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn realm_bootstrap_exists(
@@ -181,6 +180,7 @@ pub async fn fetch_core_onboarding_documents(
     node_state: &PersistedNodeState,
     realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<NodeId>,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
     let onboarding_sync_ticket = node_state
@@ -203,7 +203,7 @@ pub async fn fetch_core_onboarding_documents(
             continue;
         }
         let topic = document.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
-        sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document).await?;
+        sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await?;
     }
 
     if !user_documents.is_empty() {
@@ -223,7 +223,7 @@ pub async fn fetch_core_onboarding_documents(
             else {
                 continue;
             };
-            sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document).await?;
+            sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await?;
         }
     }
 
@@ -235,11 +235,12 @@ pub async fn wait_for_onboarding_placement(
     realm_id: aruna_core::structs::RealmId,
     node_id: NodeId,
     bootstrap_peer: Option<NodeId>,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
     let target = DocumentSyncTarget::RealmConfig { realm_id };
 
-    tokio::time::timeout(ONBOARDING_DOCUMENT_SYNC_TIMEOUT, async {
+    tokio::time::timeout(timeout, async {
         loop {
             let config = drive(GetRealmConfigOperation::new(realm_id), driver_ctx).await?;
             if node_is_ready(&config, node_id) {
@@ -254,6 +255,7 @@ pub async fn wait_for_onboarding_placement(
                 target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
                 bootstrap_peer,
                 &target,
+                timeout,
             )
             .await?;
             tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
@@ -261,10 +263,7 @@ pub async fn wait_for_onboarding_placement(
     })
     .await
     .map_err(|_| {
-        format!(
-            "timed out after {:?} waiting for onboarding placement for node {}",
-            ONBOARDING_DOCUMENT_SYNC_TIMEOUT, node_id
-        )
+        format!("timed out after {timeout:?} waiting for onboarding placement for node {node_id}")
     })?
 }
 
@@ -314,6 +313,7 @@ async fn sync_topic_from_peer(
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
     document_for_error: &DocumentSyncTarget,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let document_for_error = document_for_error.clone();
     let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
@@ -322,12 +322,11 @@ async fn sync_topic_from_peer(
             peers: vec![bootstrap_peer],
         },
     )));
-    let event = tokio::time::timeout(ONBOARDING_DOCUMENT_SYNC_TIMEOUT, sync)
+    let event = tokio::time::timeout(timeout, sync)
         .await
         .map_err(|_| {
             format!(
-                "timed out after {:?} fetching onboarding document {:?} from bootstrap peer {}",
-                ONBOARDING_DOCUMENT_SYNC_TIMEOUT, document_for_error, bootstrap_peer
+                "timed out after {timeout:?} fetching onboarding document {document_for_error:?} from bootstrap peer {bootstrap_peer}"
             )
         })?;
 
@@ -444,6 +443,7 @@ mod tests {
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -809,9 +809,15 @@ mod tests {
             joiner_id,
         )
         .await;
-        sync_topic_from_peer(&joiner_net, topic, bootstrap_id, &bootstrap_target)
-            .await
-            .unwrap();
+        sync_topic_from_peer(
+            &joiner_net,
+            topic,
+            bootstrap_id,
+            &bootstrap_target,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
         assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
 
         let target = DocumentSyncTarget::WatchInterest {
