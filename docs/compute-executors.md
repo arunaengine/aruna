@@ -58,7 +58,9 @@ path. No task or helper S3 credential is created.
 
 Direct-S3 mode supplies one least-privilege attempt credential to the task only.
 It does not stage container paths. Kubernetes stores the credential in the task
-Secret; stage and fetch Pods do not mount or reference that Secret.
+Secret; stage and fetch Pods do not mount or reference that Secret. The endpoint
+the task is handed is `ARUNA_COMPUTE_S3_URL`, or `S3_PUBLIC_URL` when that is
+unset; every backend resolves it the same way.
 
 Input files may share a directory with outputs. Exact input/output collisions,
 input-file ancestors, duplicate paths, and root output parents are rejected.
@@ -73,7 +75,12 @@ nothing. A declared path without wildcards must still exist when the task ends.
 
 Required configuration:
 
-- `S3_PUBLIC_URL`: reachable from a container when task-side S3 is used.
+- `ARUNA_COMPUTE_S3_URL` or `S3_PUBLIC_URL`: the S3 endpoint a container is
+  handed. `ARUNA_COMPUTE_S3_URL` wins when both are set and exists because
+  containers may need a different address than browsers do: it keeps the
+  portal-facing URL on loopback while workloads get a host-reachable one. Docker
+  refuses to start when the resolved endpoint is `localhost`, a loopback address,
+  or an unspecified address, because no container could reach it.
 - `S3_ADDRESS`: non-loopback listener address.
 
 Optional configuration:
@@ -91,6 +98,12 @@ The backend uses non-root containers, drops all capabilities, sets
 `no-new-privileges`, uses runtime-default seccomp, and defaults to
 `network_mode=none`. File outputs remain in the container writable layer; named
 volumes are not used. Read-only root filesystems with file outputs are rejected.
+
+Docker cannot restrict egress to S3, so an S3-only network request is refused as
+an invalid spec: only Kubernetes enforces that mode. The container manifest
+independently maps S3-only to `network_mode=none`, so even a spec that reached
+the manifest by another path fails closed rather than opening the network.
+Direct-S3 on Docker therefore requires open networking.
 
 When a disk ceiling is configured, startup health creates and removes an unstarted
 probe container. The ceiling requires overlay2 over XFS with `pquota`; unsupported
@@ -165,6 +178,18 @@ node selector are configured. Without them the backend advertises no location
 and no labels at all, so it stays eligible for unplaced work and never claims
 the controller's site. It then also reports no network-policy enforcement.
 
+`ARUNA_COMPUTE_K8S_EXECUTION_LOCATION` and `ARUNA_COMPUTE_K8S_EXECUTION_LABELS`
+are what this backend advertises as the placement site of its workers: they
+replace the node's own `ARUNA_NODE_LOCATION` and `ARUNA_NODE_LABELS` in the
+compute subject that placement policies are evaluated against, because workers do
+not run on the controller and the controller's site would be the wrong answer.
+
+`ARUNA_COMPUTE_K8S_EXECUTION_LABELS` and `ARUNA_COMPUTE_K8S_NODE_SELECTOR` each
+accept at most 16 entries and every key must be non-empty; a list that breaks
+either rule is a configuration error and the backend does not start, whatever
+`ARUNA_COMPUTE_OPTIONAL` is set to. Entries are keyed, so repeating a key keeps
+its last value.
+
 ## Execution envelope
 
 Every backend advertises static ceilings and refuses an attempt it cannot bound:
@@ -178,6 +203,22 @@ Every backend advertises static ceilings and refuses an attempt it cannot bound:
 An unset ceiling is unmeasured, never zero, so it filters nothing. CPU and
 memory of one attempt always carry a bound: the sealed request's own, else the
 backend default. An attempt neither of them bounds is refused.
+
+Those per-attempt defaults are compiled in, not configuration. All three
+backends apply 2 CPU cores and 2 GiB of memory when the sealed request declares
+none, and no environment variable overrides either value:
+
+| Default | Docker | Apptainer | Kubernetes |
+| --- | --- | --- | --- |
+| CPU cores | 2 | 2 | 2 |
+| Memory | 2 GiB | 2 GiB | 2 GiB |
+| Disk | unset; `ARUNA_COMPUTE_DOCKER_DISK_BYTES` sets it | not supported; a request naming one is rejected | unset, and not configurable |
+| Walltime | 24 h | none; only the request's own | none; only the request's own (`activeDeadlineSeconds`) |
+| PID limit | 2048 | 2048 | not set |
+
+Raising a node's throughput is therefore a matter of the static ceilings above,
+not of these defaults; a workload that needs more than 2 cores or 2 GiB must
+declare it in the request.
 
 The Kubernetes executor supports Kubernetes 1.32 or newer. Files mode requires a
 CSI driver that enforces `ReadWriteOncePod`. Each attempt creates a suspended Job

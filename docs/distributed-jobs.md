@@ -54,6 +54,20 @@ That evidence suppresses retries. A later authenticated success still wins.
 Infrastructure errors, retry exhaustion, and silence remain `indeterminate`:
 none proves that a partitioned execution cannot still be running or succeed.
 
+The backend decides which class an ended attempt belongs to, and the class
+decides the replicated execution state:
+
+| Class | Attempt evidence | Execution state | TES state | Retry |
+| --- | --- | --- | --- | --- |
+| Job-specific | Non-zero exit, OOM kill, walltime exceeded, log limit exceeded, invalid declared outputs | `failed` | `EXECUTOR_ERROR` | Suppressed |
+| Infrastructure | Lost evidence after a recorded start, a pod stuck past the image-pull deadline, a container that died without an exit code, a daemon or API failure, no compute backend configured, a remote input that could not be staged, a record that could not be signed | `error` | `SYSTEM_ERROR` | Re-planned |
+
+Only the first class is proof about the work. An `error` decides nothing: the
+logical job stays `indeterminate`, and the execution that ended re-arms the
+family's witness deadline on the node that published it and on every holder that
+replicates that update, so the family is planned again instead of waiting for a
+timeout.
+
 When every execution a responder knows about ended without success and it has no
 retry armed, the status reports `family.locally_exhausted = true`. That flag is
 explicitly responder-local, is excluded from the projection digest, and must not
@@ -81,10 +95,11 @@ Reading the job's outputs without a version id therefore answers "whatever is
 current", not "what this job produced". Use the VersionId when you mean the
 result of the job.
 
-Concurrent writers in different partitions can each claim the same head
-generation. `GET /blobs/contenders` lists every VersionId this node observed
-claiming one generation, which is how a caller learns an object had concurrent
-versions; S3 `GET` and `HEAD` never expose a second head.
+`endpoint_url` is nullable in both `GET /jobs/{job_id}` and
+`GET /jobs/{job_id}/audit`. An output whose owning node has no advertisement
+here is returned without an address rather than failing the whole read; the
+VersionId and the owning execution are still exact. Retry, or ask a node that
+holds that advertisement, for the address.
 
 ## Audit
 
@@ -120,10 +135,55 @@ Standing compute quotas are configured per realm with an optional per-group
 override that replaces the realm default wholesale. An unset dimension is
 unbounded, never zero.
 
-- `PUT /admin/compute/config` replaces links and quotas wholesale.
+Three realm-admin routes carry this surface. All three need a bearer token
+issued for this realm; the two reads need READ on the realm configuration path
+and `PUT` needs WRITE. Only a genuinely absent realm-configuration document is
+`404`. A read that failed in storage or could not decode is `500`, so absence is
+never inferred from a failed read.
+
+- `GET /admin/compute/config` reads the configuration this node holds. It is a
+  node-local read of a replicated document, so a change written elsewhere can be
+  missing here until it arrives.
+- `PUT /admin/compute/config` replaces that configuration wholesale. Links and
+  group quotas absent from the body are dropped, so send the complete intended
+  configuration. `400` covers a malformed group id, a duplicate directed link or
+  group entry, an empty or oversized location, a zero bandwidth and a zero
+  witness delay; `409` means another update won the race and the same body may
+  be retried.
 - `GET /admin/compute/snapshots` reports the observed demand and reservation
   snapshots, each stamped with its publisher's membership and publisher
-  generations and its observation time.
+  generations and its observation time. `?group_id=` adds that group's merged
+  demand next to the standing quota it is judged against; a value that is not a
+  ULID is `400`.
+
+The configuration document carries operator knowledge no node can measure for
+itself:
+
+| Field | Meaning |
+| --- | --- |
+| `links[].from`, `links[].to` | One directed transfer estimate between two placement locations. Direction matters; both directions are separate entries. |
+| `links[].bandwidth_bytes_per_sec` | Bandwidth of that directed link. Zero is refused rather than clamped, because it would make one transfer estimate infinite. |
+| `pessimistic_bandwidth_bytes_per_sec` | Assumed for any link nobody configured. Default 12500000 (100 Mbit/s). |
+| `availability_stale_after_ms` | Age above which an availability sample only counts as unknown for ranking. Default 300000. |
+| `witness_base_delay_ms` | Per-rank fallback delay of the leaderless witness schedule. With replication factor RF, `witness_base_delay_ms * (RF - 1)` is the worst-case wait before any witness launches while higher ranks are down. Must be greater than zero. Default 30000. |
+| `default_group_quota` | Standing quota of every group without its own entry. |
+| `group_quotas[]` | One `{group_id, quota}` entry per group that has its own. It replaces the default wholesale, so an explicitly unlimited group is an entry whose dimensions are all unset. |
+
+A quota has eight independent dimensions, all optional:
+
+| Dimension | Scope | Counts |
+| --- | --- | --- |
+| `max_jobs` | Group | Nonterminal admitted request families |
+| `max_cpu_cores` | Group | Sealed CPU ceilings of those families |
+| `max_ram_bytes` | Group | Sealed RAM ceilings of those families |
+| `max_disk_bytes` | Group | Sealed disk ceilings of those families |
+| `max_job_cpu_cores` | Job | What one request may ask for |
+| `max_job_ram_bytes` | Job | What one request may ask for |
+| `max_job_disk_bytes` | Job | What one request may ask for |
+| `max_job_walltime_ms` | Job | Walltime sealed into one request |
+
+Per-job ceilings are decided without reading the demand view at all. A quota
+that sets only per-job ceilings therefore never depends on replicated state.
 
 Two different controls are reported and never summed:
 
@@ -140,6 +200,25 @@ scope, dimension, observed total, request and limit. Because the demand view is
 replicated, concurrent partitions may overshoot a cap before converging. That is
 the accepted bound, not a bug.
 
+A snapshot is bounded, so a busy realm can understate itself. Truncation is
+tracked per group: one busy group never marks a quiet one, and a snapshot that
+had to drop whole groups only understates a group it does not name. A group
+whose merged view is understated cannot be shown to be under its cap, so a new
+admission for it is refused with the same `409` quota body, reporting `observed`
+at the limit because no smaller number stands behind an understated view. A
+quota with only per-job ceilings never reads that view and is never refused for
+truncation. A peer advertisement this node cannot decode is skipped with a
+warning and counts as an unobserved publisher, exactly like a partition.
+
+`503 job_placement_unavailable` on submission is availability, never a quota
+verdict. It means the request's family placement or a family holder could not be
+reached, the group's demand view could not be read, the group's admission
+revision moved under three consecutive reads, admission lost three transactions
+in a row to concurrent submissions of the same group, or the id clock is
+unhealthy. It is retryable with the same idempotency key. An idempotent replay is
+settled from records this node already holds, before any quota read, so a replay
+is never quota-refused.
+
 ## Departure, drain and rejoin
 
 `POST /admin/compute/drain` drains this node's compute plane: no planner selects
@@ -147,6 +226,21 @@ it for new executions and it declines launch offers, while everything holding a
 receipt keeps running. The operator drain is stored separately from the
 departure state a placement change causes, so returning to the placement map
 never silently undrains a node an operator drained; undrain it explicitly.
+
+The flag is durable and is the only authority. Every republication of this
+node's advertisement, including the ordinary heartbeat, re-derives
+`compute_draining` from that flag inside its own write transaction, so a
+concurrent heartbeat cannot carry a stale copy forward and undrain the node. A
+launch offer reads the same durable flag directly, so a node whose advertisement
+is stale still declines. A node that is leaving the realm stays draining
+whatever the flag says.
+
+`changed` in the response reports that the durable flag moved, not that the
+advertisement was already republished; the advertisement follows, and a node
+that has not advertised yet logs a warning and republishes when it does.
+`GET /admin/compute/snapshots` reports the current value as `operator_draining`.
+`503` on the drain route means the advertisement could not be republished and is
+retryable.
 
 On graceful departure a node stops admitting immediately, publishes its final
 snapshots, and records every execution it still holds capacity for as
@@ -166,6 +260,12 @@ admits no new governed work, including new execution targets. This is the safe
 state, not an error, and it is sticky on purpose: it ends only when an operator
 decides what happens to those copies.
 
+Only governed work stops. A write carrying no placement refs never consults the
+gate at all, so an ungoverned `PutObject`, `CopyObject`, multipart part-copy,
+staging snapshot or inbound replication still succeeds on a blocked or draining
+node. What is refused is exactly a write whose refs would have to be evaluated
+against a subject this node cannot currently stand behind.
+
 1. List them with `GET /admin/placement-diagnostics`; each violation names the
    exact bucket, key and version.
 2. Resolve them with `POST /admin/placement-quarantine`:
@@ -176,6 +276,46 @@ decides what happens to those copies.
      unavailable rather than serveable and never deletes data on another node.
 3. `cleared: true` in the response means nothing quarantined is left and
    governed admission is open again.
+
+A release drops registrations only. The bytes stay on the local backend,
+unserveable but present, and nothing in this flow deletes them; reclaiming that
+space is a separate operator decision. Sending `bucket`, `key` or `version_id`
+together with `revalidate` is refused, so an accidental release is impossible,
+and a release without all three is `400`.
+
+The rules that decide what "compliant" means, and the rest of the realm-admin
+placement surface, are described in [Placement policies](placement-policies.md).
+
+## Launch offers and declines
+
+A witness offers a planned launch to one target and waits 30 seconds for the
+answer. One unanswered offer never retires the target: a target that accepts
+slowly would otherwise be replaced by a second launch while it is already
+running the work. A target keeps its launch for two full offer deadlines plus
+one `witness_base_delay_ms`, which is 90 seconds at the default 30 second base,
+and is re-offered at least once inside that window before the next plan excludes
+it.
+
+A decline says only as much as it can prove. `Capacity` is reported when the
+target's own reservation found no free capacity for the sealed request. Every
+other local refusal answers `Draining`, including a failed reservation that was
+not a capacity verdict, because that is this node refusing work rather than the
+plan misjudging its free resources. A node with the operator drain flag set
+declines every launch offer, even when its own advertisement is stale.
+
+## Record admission
+
+A family record a peer offers is admitted, retained, or refused; it is never
+half-accepted. Holder authority moves with membership, so a record whose
+publisher this node's current view does not rank as a holder is retained and
+judged again later rather than rejected. While a record is retained, a
+re-arrival of it is answered as unavailable, which keeps the publisher retrying
+instead of treating a deferral as acceptance.
+
+A publisher gives up on delivery only against evidence. Unreachable holders
+never count; a record that holders definitively refuse 16 times is dropped from
+the publishing node's outbox so it stops consuming the queue. The record itself
+stays durable and addressable, and both sides of a key conflict are retained.
 
 ## Execution-site fencing
 
@@ -191,4 +331,17 @@ The TES facade projects the same logical view as the native REST status: the
 same state mapping (`indeterminate` becomes `UNKNOWN`), the canonical
 execution's outputs, and task-log URLs that carry the exact `versionId`. A task
 with no canonical success has no outputs, rather than the object's current
-version.
+version. A job-specific failure surfaces as `EXECUTOR_ERROR` and an
+infrastructure error as `SYSTEM_ERROR`, so the two classes stay distinguishable
+through the facade.
+
+`POST /ga4gh/tes/v1/tasks` refuses with the same admission mapping as the native
+submit, not with a generic server error:
+
+| Status | Cause |
+| --- | --- |
+| `400` | Malformed task, an unsupported TES feature, an input that is not a readable object, or more outputs than a task may declare |
+| `401` | Missing or invalid bearer token or basic credential |
+| `403` | No WRITE on the target group, a group tag contradicting the credential, a path-restricted credential, or a routed authority refusing the submission |
+| `409` | The idempotency key tag already names a different task, the group's standing compute quota refuses the admission, or the composition conflicts on a staged key |
+| `503` | The availability causes listed under quota semantics; the body carries the fixed text `job_placement_unavailable` and the caller may create the task again with the same idempotency key |
