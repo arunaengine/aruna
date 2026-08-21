@@ -646,10 +646,12 @@ async fn fetch_family(
 
 /// Reads one bounded page of a family from its current holders, with the holder
 /// that answered, so the records keep their real relay in the audit.
+type FetchedFamily = (Option<NodeId>, Vec<JobRecordFrame>);
+
 #[derive(Debug, PartialEq)]
 struct FetchFamilyOperation {
     effect: Option<JobRecordEffect>,
-    outcome: Option<Result<(Option<NodeId>, Vec<JobRecordFrame>), LifecycleError>>,
+    outcome: Option<Result<FetchedFamily, LifecycleError>>,
 }
 
 impl FetchFamilyOperation {
@@ -662,7 +664,7 @@ impl FetchFamilyOperation {
 }
 
 impl Operation for FetchFamilyOperation {
-    type Output = (Option<NodeId>, Vec<JobRecordFrame>);
+    type Output = FetchedFamily;
     type Error = LifecycleError;
 
     fn start(&mut self) -> Effects {
