@@ -22,7 +22,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 
 use smallvec::smallvec;
-use tracing::debug;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
@@ -306,6 +306,7 @@ impl ReserveExecutionOperation {
                         queued_at_ms: self.config.now_ms,
                         delivered: Vec::new(),
                         next_holder: 0,
+                        rejections: 0,
                     })?
                     .as_slice(),
                 ),
@@ -417,9 +418,13 @@ impl Operation for ReserveExecutionOperation {
             },
             ReserveState::ReadCache { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.cache = value
-                        .as_ref()
-                        .and_then(|value| from_bytes::<ProjectionCache>(value).ok());
+                    self.cache = value.as_ref().and_then(|value| {
+                        from_bytes::<ProjectionCache>(value)
+                            .inspect_err(
+                                |error| warn!(error = %error, "Job projection cache is undecodable"),
+                            )
+                            .ok()
+                    });
                     self.write(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -505,6 +510,38 @@ impl ReleaseExecutionOperation {
             outcome: None,
         }
     }
+
+    fn txn(&self) -> Option<TxnId> {
+        match self.state {
+            ReleaseState::Read { txn_id }
+            | ReleaseState::Delete { txn_id }
+            | ReleaseState::Commit { txn_id }
+            | ReleaseState::Cancel { txn_id } => Some(txn_id),
+            _ => None,
+        }
+    }
+
+    /// Settles the operation as failed and closes its open transaction, so no
+    /// write txn is ever leaked by an event this state cannot accept.
+    fn cancel(&mut self, txn_id: TxnId, error: LifecycleError) -> Effects {
+        self.outcome = Some(Err(error));
+        self.state = ReleaseState::Cancel { txn_id };
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    }
+
+    fn fail(&mut self, error: LifecycleError) -> Effects {
+        self.outcome = Some(Err(error));
+        self.state = ReleaseState::Error;
+        smallvec![]
+    }
+
+    fn unexpected(&self, expected: &'static str, got: String) -> LifecycleError {
+        LifecycleError::UnexpectedEvent {
+            state: format!("{:?}", self.state),
+            expected,
+            got,
+        }
+    }
 }
 
 impl Operation for ReleaseExecutionOperation {
@@ -529,12 +566,11 @@ impl Operation for ReleaseExecutionOperation {
                         txn_id: Some(txn_id),
                     })]
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.outcome = Some(Err(error.into()));
-                    self.state = ReleaseState::Error;
-                    smallvec![]
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    let error = self.unexpected("transaction start", format!("{other:?}"));
+                    self.fail(error)
                 }
-                _ => smallvec![],
             },
             ReleaseState::Read { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
@@ -550,12 +586,11 @@ impl Operation for ReleaseExecutionOperation {
                         txn_id: Some(txn_id),
                     })]
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.outcome = Some(Err(error.into()));
-                    self.state = ReleaseState::Cancel { txn_id };
-                    smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+                Event::Storage(StorageEvent::Error { error }) => self.cancel(txn_id, error.into()),
+                other => {
+                    let error = self.unexpected("reservation read result", format!("{other:?}"));
+                    self.cancel(txn_id, error)
                 }
-                _ => smallvec![],
             },
             ReleaseState::Delete { txn_id } => match event {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {
@@ -563,31 +598,21 @@ impl Operation for ReleaseExecutionOperation {
                     self.state = ReleaseState::Commit { txn_id };
                     smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.outcome = Some(Err(error.into()));
-                    self.state = ReleaseState::Cancel { txn_id };
-                    smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+                Event::Storage(StorageEvent::Error { error }) => self.cancel(txn_id, error.into()),
+                other => {
+                    let error = self.unexpected("reservation delete result", format!("{other:?}"));
+                    self.cancel(txn_id, error)
                 }
-                _ => smallvec![],
             },
             ReleaseState::Commit { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.state = ReleaseState::Finish;
                     smallvec![]
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.outcome = Some(Err(error.into()));
-                    self.state = ReleaseState::Error;
-                    smallvec![]
-                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
-                        state: format!("{:?}", self.state),
-                        expected: "transaction commit",
-                        got: format!("{other:?}"),
-                    }));
-                    self.state = ReleaseState::Error;
-                    smallvec![]
+                    let error = self.unexpected("transaction commit", format!("{other:?}"));
+                    self.fail(error)
                 }
             },
             ReleaseState::Cancel { .. } => match event {
@@ -598,19 +623,10 @@ impl Operation for ReleaseExecutionOperation {
                     };
                     smallvec![]
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.outcome = Some(Err(error.into()));
-                    self.state = ReleaseState::Error;
-                    smallvec![]
-                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
-                        state: format!("{:?}", self.state),
-                        expected: "transaction abort",
-                        got: format!("{other:?}"),
-                    }));
-                    self.state = ReleaseState::Error;
-                    smallvec![]
+                    let error = self.unexpected("transaction abort", format!("{other:?}"));
+                    self.fail(error)
                 }
             },
             ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => smallvec![],
@@ -626,7 +642,13 @@ impl Operation for ReleaseExecutionOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        match self.txn() {
+            Some(txn_id) => {
+                self.state = ReleaseState::Error;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => smallvec![],
+        }
     }
 }
 
@@ -634,6 +656,48 @@ impl Operation for ReleaseExecutionOperation {
 mod tests {
     use super::*;
     use aruna_core::errors::StorageError;
+
+    #[test]
+    fn release_rejects_event() {
+        // An event this state cannot accept must fail the release and close its
+        // transaction instead of being ignored.
+        let txn_id = TxnId::generate();
+        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        operation.state = ReleaseState::Read { txn_id };
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ));
+        assert!(matches!(
+            operation.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn release_aborts_txn() {
+        // A dropped release must never leak the write transaction it opened.
+        let txn_id = TxnId::generate();
+        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        operation.state = ReleaseState::Delete { txn_id };
+
+        assert!(matches!(
+            operation.abort().as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ));
+        assert!(
+            ReleaseExecutionOperation::new(Ulid::generate())
+                .abort()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn rejects_commit_error() {
