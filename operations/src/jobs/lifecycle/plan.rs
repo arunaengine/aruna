@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use aruna_core::compute::{ExecutionTargetId, NetworkAccess, StagingMode};
 use aruna_core::scheduling::{
-    ExecutionPlan, InputHolder, MAX_PLAN_CANDIDATES, PlanRequest, ResolvedInput, TargetCandidate,
+    ExecutionPlan, InputHolder, MAX_TARGET_SCAN, PlanRequest, ResolvedInput, TargetCandidate,
     plan_execution,
 };
 use aruna_core::structs::{
@@ -20,7 +20,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::NodeId;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::ids;
@@ -69,6 +69,7 @@ pub async fn build_plan(
     output_policies.sort_unstable();
     output_policies.dedup();
     let policies = resolve_policies(context, spec, &inputs, &output_policies, now_ms, local).await;
+    let scan = candidates(context, config, spec, &documents, excluded).await;
     let request = PlanRequest {
         submission_id: spec.submission_id,
         request_digest: spec.request_digest,
@@ -82,7 +83,8 @@ pub async fn build_plan(
         inputs,
         output_policies,
         policies,
-        candidates: candidates(context, config, spec, &documents, excluded).await,
+        candidates: scan.candidates,
+        scan_incomplete: scan.incomplete,
         now_ms,
     };
     Ok(plan_execution(&request, &config.compute)?)
@@ -106,16 +108,40 @@ async fn advertisements(
     documents
 }
 
+/// The advertisements one round scanned, and whether the scan bound stopped it
+/// with advertisements still unseen.
+struct Scan {
+    candidates: Vec<TargetCandidate>,
+    incomplete: bool,
+}
+
+impl Scan {
+    /// Takes one advertisement while the scan bound allows. The first one it
+    /// refuses makes the round a continuation rather than a full answer.
+    fn take(&mut self, candidate: TargetCandidate) -> bool {
+        if self.candidates.len() >= MAX_TARGET_SCAN {
+            self.incomplete = true;
+            return false;
+        }
+        self.candidates.push(candidate);
+        true
+    }
+}
+
 /// One candidate per advertised backend. `node_kind` and `active` come from the
 /// realm config; a document may only describe a backend, never its own standing.
+/// Eligibility is decided by the planner over the whole scan, never here.
 async fn candidates(
     context: &DriverContext,
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
     documents: &BTreeMap<NodeId, NodeInfoDocument>,
     excluded: &[ExecutionTargetId],
-) -> Vec<TargetCandidate> {
-    let mut candidates = Vec::new();
+) -> Scan {
+    let mut scan = Scan {
+        candidates: Vec::new(),
+        incomplete: false,
+    };
     for (node_id, document) in documents {
         if ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
             && *node_id != spec.ingress_node_id
@@ -132,7 +158,7 @@ async fn candidates(
             if excluded.contains(&target) {
                 continue;
             }
-            candidates.push(TargetCandidate {
+            let taken = scan.take(TargetCandidate {
                 node_id: *node_id,
                 node_kind: kind.clone(),
                 active: !document.leaving,
@@ -142,12 +168,16 @@ async fn candidates(
                 capability: capability.clone(),
                 load_permille: document.utilization.load_permille,
             });
-            if candidates.len() >= MAX_PLAN_CANDIDATES {
-                return candidates;
+            if !taken {
+                warn!(
+                    scanned = MAX_TARGET_SCAN,
+                    "Advertisement scan bound reached before every target was seen"
+                );
+                return scan;
             }
         }
     }
-    candidates
+    scan
 }
 
 async fn target_allowed(context: &DriverContext, spec: &LogicalJobSpec, target: NodeId) -> bool {
@@ -359,5 +389,52 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
     match spec.payload.tags.get(NETWORK_TAG_KEY).map(String::as_str) {
         Some("open") => NetworkAccess::Open,
         _ => NetworkAccess::Isolated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::records::tests::fixture::node;
+    use aruna_core::compute::ExecutorCapability;
+
+    fn advertised() -> TargetCandidate {
+        let subject = PlacementSubject {
+            node_id: node(1),
+            generation: 1,
+            location: "eu".to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        };
+        TargetCandidate {
+            node_id: node(1),
+            node_kind: RealmNodeKind::Server,
+            active: true,
+            compute_draining: false,
+            group_allowed: true,
+            capability: ExecutorCapability::new("docker".to_string(), subject)
+                .expect("subject is valid"),
+            load_permille: None,
+        }
+    }
+
+    #[test]
+    fn scan_bound_stops() {
+        // Filling the scan is not a continuation; only an advertisement the
+        // bound refused proves that more of them remain unseen.
+        let advertisement = advertised();
+        let mut scan = Scan {
+            candidates: Vec::new(),
+            incomplete: false,
+        };
+        for _ in 0..MAX_TARGET_SCAN {
+            assert!(scan.take(advertisement.clone()));
+        }
+
+        assert!(!scan.incomplete);
+        assert!(!scan.take(advertisement));
+        assert!(scan.incomplete);
+        assert_eq!(scan.candidates.len(), MAX_TARGET_SCAN);
     }
 }

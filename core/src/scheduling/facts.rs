@@ -18,7 +18,10 @@ use ulid::Ulid;
 pub const MAX_PLAN_INPUTS: usize = 512;
 /// Maximum registered holders considered per input.
 pub const MAX_INPUT_HOLDERS: usize = 32;
-/// Maximum advertised targets one plan ranks.
+/// Maximum advertisements one round screens before it must continue in a later
+/// round. Every one of them is screened; only the ranked set is bounded lower.
+pub const MAX_TARGET_SCAN: usize = 1_024;
+/// Maximum eligible targets one plan ranks, after screening the whole scan.
 pub const MAX_PLAN_CANDIDATES: usize = 128;
 /// Maximum ranked alternatives kept for audit.
 pub const MAX_PLAN_ALTERNATIVES: usize = 8;
@@ -33,8 +36,8 @@ pub enum PlanError {
     InputCount,
     #[error("an input resolves at most {MAX_INPUT_HOLDERS} holders")]
     HolderCount,
-    #[error("a plan ranks at most {MAX_PLAN_CANDIDATES} targets")]
-    CandidateCount,
+    #[error("a planning round scans at most {MAX_TARGET_SCAN} advertised targets")]
+    ScanCount,
     #[error("a request declares at most {MAX_SELECTOR_LABELS} required labels")]
     LabelCount,
     #[error("destination key {key} is claimed by two inputs")]
@@ -106,7 +109,11 @@ pub struct PlanRequest {
     pub output_policies: Vec<PlacementPolicyRef>,
     /// Locally verified policy documents; a missing entry blocks, never allows.
     pub policies: BTreeMap<Ulid, PolicyResolution>,
+    /// Every advertisement this round scanned, eligible or not.
     pub candidates: Vec<TargetCandidate>,
+    /// The scan bound left advertisements unseen, so a round that selects
+    /// nothing is a continuation rather than a conclusive refusal.
+    pub scan_incomplete: bool,
     pub now_ms: u64,
 }
 
@@ -120,8 +127,8 @@ impl PlanRequest {
         if self.inputs.len() > MAX_PLAN_INPUTS {
             return Err(PlanError::InputCount);
         }
-        if self.candidates.len() > MAX_PLAN_CANDIDATES {
-            return Err(PlanError::CandidateCount);
+        if self.candidates.len() > MAX_TARGET_SCAN {
+            return Err(PlanError::ScanCount);
         }
         if self.required_labels.len() > MAX_SELECTOR_LABELS {
             return Err(PlanError::LabelCount);

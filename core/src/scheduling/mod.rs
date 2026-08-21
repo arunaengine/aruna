@@ -1,22 +1,24 @@
 //! The pure execution planner.
 //!
-//! It hard-filters advertised targets against authenticated membership,
-//! placement policy, and static capability, then ranks whatever survives by
-//! directed transfer cost and stale ranking hints. It performs no I/O, decides
-//! nothing about capacity the target owns, and seals every fact it used into a
-//! plan digest.
+//! It hard-filters every scanned advertisement against authenticated
+//! membership, placement policy, and static capability, then ranks whatever
+//! survives by directed transfer cost and stale ranking hints and keeps the
+//! best of them. It performs no I/O, decides nothing about capacity the target
+//! owns, and seals every fact it used into a plan digest.
 
 mod cost;
 mod digest;
 mod eligibility;
 mod facts;
+mod rank;
 
 pub use cost::{InputRoute, UNKNOWN_PERMILLE};
 pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
 pub use eligibility::{PolicyVerdict, RejectionVerdict};
 pub use facts::{
     InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES, MAX_PLAN_INPUTS,
-    MAX_PLAN_REJECTIONS, PlanError, PlanRequest, ResolvedInput, TargetCandidate, TargetScore,
+    MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
+    TargetScore,
 };
 
 use crate::compute::ExecutionTargetId;
@@ -66,10 +68,11 @@ pub struct Selection {
 /// bound dropped so an audit never mistakes truncation for completeness.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
-    /// `None` when no advertised target is currently eligible.
+    /// `None` when no scanned target is currently eligible.
     pub selected: Option<Selection>,
     /// A later round may still find a target once missing policy documents or
-    /// holders are observed. Always false once a target was selected.
+    /// holders are observed, or once the scan continues past its bound. Always
+    /// false once a target was selected.
     pub retryable: bool,
     pub alternatives: Vec<RankedTarget>,
     pub rejected: Vec<RejectedTarget>,
@@ -77,8 +80,9 @@ pub struct ExecutionPlan {
 }
 
 /// Plans one execution over already resolved facts. Returns an error only when
-/// the request itself is unusable; an empty or fully rejected candidate set is
-/// a plan without a selection, not a failure.
+/// the request itself is unusable; an empty or fully rejected scan is a plan
+/// without a selection, not a failure, and stays retryable while the scan was
+/// cut short or a rejection may still resolve itself.
 pub fn plan_execution(
     request: &PlanRequest,
     compute: &RealmComputeConfig,
@@ -86,58 +90,38 @@ pub fn plan_execution(
     compute.validate()?;
     let request = request.canonical()?;
     let links = cost::LinkIndex::new(compute);
-    let mut ranked = Vec::new();
-    let mut rejected = Vec::new();
+    let ranking = rank::rank(&request, &links);
 
-    for candidate in &request.candidates {
-        let target = candidate.capability.target(candidate.node_id);
-        if let Some(verdict) = eligibility::screen(&request, candidate) {
-            rejected.push(RejectedTarget { target, verdict });
-            continue;
-        }
-        match routes(&request, candidate, &links) {
-            Ok(routes) => {
-                let score = cost::score(&routes, candidate, &links, request.now_ms);
-                ranked.push((target, candidate, routes, score));
-            }
-            Err(verdict) => rejected.push(RejectedTarget { target, verdict }),
-        }
-    }
-    // Score first, then node id bytes and executor kind: the total order of
-    // plan section 8.4, so equal facts always choose the same target.
-    ranked.sort_by(|left, right| {
-        left.3
-            .cmp(&right.3)
-            .then_with(|| left.0.node_id.as_bytes().cmp(right.0.node_id.as_bytes()))
-            .then_with(|| left.0.executor_kind.cmp(&right.0.executor_kind))
-    });
-
-    let retryable = ranked.is_empty()
-        && rejected
-            .iter()
-            .any(|rejection| rejection.verdict.retryable());
-    let omitted = rejected.len().saturating_sub(MAX_PLAN_REJECTIONS) as u32;
+    // An unfinished scan may still hold the only legal target, so a round
+    // without a selection is a continuation and never a conclusive refusal.
+    let retryable = ranking.ranked.is_empty()
+        && (request.scan_incomplete
+            || ranking
+                .rejected
+                .iter()
+                .any(|rejection| rejection.verdict.retryable()));
+    let omitted = ranking.rejected.len().saturating_sub(MAX_PLAN_REJECTIONS) as u32;
+    let mut rejected = ranking.rejected;
     rejected.truncate(MAX_PLAN_REJECTIONS);
-    let alternatives = ranked
+    let alternatives = ranking
+        .ranked
         .iter()
         .skip(1)
         .take(MAX_PLAN_ALTERNATIVES)
-        .map(|(target, _, _, score)| RankedTarget {
-            target: target.clone(),
-            score: *score,
+        .map(|scored| RankedTarget {
+            target: scored.target.clone(),
+            score: scored.score,
         })
         .collect();
-    let selected = ranked
-        .first()
-        .map(|(target, candidate, routes, score)| Selection {
-            target: target.clone(),
-            subject_digest: candidate.capability.subject_digest,
-            subject_generation: candidate.capability.subject.generation,
-            score: *score,
-            inputs: planned_inputs(&request, routes),
-            output_policies: request.output_policies.clone(),
-            plan_digest: digest::plan_digest(&request, candidate, routes, score),
-        });
+    let selected = ranking.ranked.first().map(|scored| Selection {
+        target: scored.target.clone(),
+        subject_digest: scored.candidate.capability.subject_digest,
+        subject_generation: scored.candidate.capability.subject.generation,
+        score: scored.score,
+        inputs: planned_inputs(&request, &scored.routes),
+        output_policies: request.output_policies.clone(),
+        plan_digest: digest::plan_digest(&request, scored.candidate, &scored.routes, &scored.score),
+    });
     Ok(ExecutionPlan {
         selected,
         retryable,
@@ -145,25 +129,6 @@ pub fn plan_execution(
         rejected,
         omitted,
     })
-}
-
-/// Cheapest legal route of every pinned input, or the input that has none.
-fn routes(
-    request: &PlanRequest,
-    candidate: &TargetCandidate,
-    links: &cost::LinkIndex<'_>,
-) -> Result<Vec<InputRoute>, RejectionVerdict> {
-    request
-        .inputs
-        .iter()
-        .map(|input| {
-            cost::route(input, request, candidate, links).ok_or_else(|| {
-                RejectionVerdict::NoLegalSource {
-                    destination_key: input.destination_key.clone(),
-                }
-            })
-        })
-        .collect()
 }
 
 fn planned_inputs(request: &PlanRequest, routes: &[InputRoute]) -> Vec<PlannedInput> {

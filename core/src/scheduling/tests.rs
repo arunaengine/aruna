@@ -103,6 +103,7 @@ pub(crate) fn request(inputs: Vec<ResolvedInput>) -> PlanRequest {
         output_policies: Vec::new(),
         policies: BTreeMap::new(),
         candidates: Vec::new(),
+        scan_incomplete: false,
         now_ms: NOW_MS,
     }
 }
@@ -150,6 +151,15 @@ pub(crate) fn link(from: &str, to: &str, bandwidth: u64) -> LocationLink {
         to: to.to_string(),
         bandwidth_bytes_per_sec: bandwidth,
     }
+}
+
+/// `count` advertisements, in the canonical order the planner ranks them in.
+fn scanned(count: u8) -> Vec<TargetCandidate> {
+    let mut targets: Vec<_> = (1..=count)
+        .map(|seed| candidate(node(seed), "docker"))
+        .collect();
+    targets.sort_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
+    targets
 }
 
 fn plan(request: &PlanRequest, compute: &RealmComputeConfig) -> ExecutionPlan {
@@ -683,4 +693,105 @@ fn rejects_invalid_config() {
     let mut plan_request = request(Vec::new());
     plan_request.candidates = vec![candidate(node(2), "docker")];
     assert!(plan_execution(&plan_request, &config(vec![link("eu", "us", 0)])).is_err());
+}
+
+#[test]
+fn beyond_bound_selected() {
+    // A drained prefix as long as the ranking bound must not hide the one
+    // legal target the scan found behind it.
+    let mut targets = scanned(129);
+    let legal = targets.last().expect("the scan is not empty").node_id;
+    for target in targets.iter_mut().take(MAX_PLAN_CANDIDATES) {
+        target.compute_draining = true;
+    }
+    let mut plan_request = request(Vec::new());
+    plan_request.candidates = targets;
+
+    let outcome = plan(&plan_request, &config(Vec::new()));
+
+    assert_eq!(
+        outcome.selected.expect("a target is legal").target.node_id,
+        legal
+    );
+    assert_eq!(outcome.rejected.len(), MAX_PLAN_REJECTIONS);
+    assert_eq!(
+        outcome.omitted,
+        (MAX_PLAN_CANDIDATES - MAX_PLAN_REJECTIONS) as u32
+    );
+}
+
+#[test]
+fn best_beyond_bound() {
+    // Ranking keeps the best of the whole scan, not the first bound worth of
+    // it, so the cheapest target past that bound still wins.
+    let mut targets = scanned(129);
+    let last = targets.len() - 1;
+    targets[last].load_permille = Some(1);
+    let best = targets[last].node_id;
+    let mut plan_request = request(Vec::new());
+    plan_request.candidates = targets;
+
+    let outcome = plan(&plan_request, &config(Vec::new()));
+    let selection = outcome.selected.expect("a target is legal");
+
+    assert_eq!(selection.target.node_id, best);
+    assert_eq!(selection.score.node_load_permille, 1);
+    assert_eq!(outcome.alternatives.len(), MAX_PLAN_ALTERNATIVES);
+}
+
+#[test]
+fn shuffled_scan_agrees() {
+    // One scan in either order must seal the same selection, alternatives, and
+    // digest, including which targets the ranking bound drops.
+    let mut targets = scanned(130);
+    for (index, target) in targets.iter_mut().enumerate() {
+        target.load_permille = Some((index as u32 * 37) % 11);
+    }
+    let mut forward = request(Vec::new());
+    forward.candidates = targets.clone();
+    let mut reverse = request(Vec::new());
+    reverse.candidates = targets.into_iter().rev().collect();
+    let compute = config(Vec::new());
+
+    let first = plan(&forward, &compute);
+    let second = plan(&reverse, &compute);
+
+    assert_eq!(first.selected, second.selected);
+    assert_eq!(first.alternatives, second.alternatives);
+    assert_eq!(first.rejected, second.rejected);
+}
+
+#[test]
+fn incomplete_scan_retries() {
+    // A scan the bound cut short may still hold a legal target, so a round
+    // without a selection stays retryable instead of reading conclusive.
+    let mut drained = candidate(node(2), "docker");
+    drained.compute_draining = true;
+    let mut plan_request = request(Vec::new());
+    plan_request.candidates = vec![drained];
+    let compute = config(Vec::new());
+
+    let conclusive = plan(&plan_request, &compute);
+    assert!(conclusive.selected.is_none() && !conclusive.retryable);
+
+    plan_request.scan_incomplete = true;
+    let continued = plan(&plan_request, &compute);
+    assert!(continued.selected.is_none() && continued.retryable);
+
+    // A selection ends the round whatever the scan left unseen.
+    plan_request.candidates.push(candidate(node(3), "docker"));
+    let launched = plan(&plan_request, &compute);
+    assert!(launched.selected.is_some() && !launched.retryable);
+}
+
+#[test]
+fn rejects_scan_bound() {
+    // The scan bound is separate from the ranked set it feeds: a scan larger
+    // than the ranking bound is ordinary, one past the scan bound is refused.
+    let mut plan_request = request(Vec::new());
+    plan_request.candidates = vec![candidate(node(2), "docker"); MAX_TARGET_SCAN + 1];
+    assert_eq!(plan_request.canonical(), Err(PlanError::ScanCount));
+
+    plan_request.candidates = scanned((MAX_PLAN_CANDIDATES + 1) as u8);
+    assert!(plan_request.canonical().is_ok());
 }
