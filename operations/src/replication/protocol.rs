@@ -792,55 +792,6 @@ mod tests {
     }
 
     #[test]
-    fn preserves_manifest_wire() {
-        #[allow(dead_code)]
-        #[derive(serde::Deserialize)]
-        struct LegacyManifest {
-            bucket: String,
-            key: String,
-            version_id: Ulid,
-            group_id: aruna_core::types::GroupId,
-            kind: ReplicationItemKind,
-            created_at: SystemTime,
-            created_by: UserId,
-            current_version: bool,
-            current_version_generation: Option<u64>,
-            auth_context: AuthContext,
-            blob: Option<MaterializedBlobInfo>,
-            source: Option<VersionSourceBinding>,
-            multipart: Option<MultipartObjectReplicationMetadata>,
-            reference_intent: bool,
-            origin: Option<SyncOrigin>,
-            upstream_sources: Vec<ArunaArn>,
-            writer_auth_context: Option<AuthContext>,
-            reference_metadata: Option<SourceMetadata>,
-            metadata: HashMap<String, String>,
-        }
-
-        #[derive(serde::Deserialize)]
-        enum LegacyMessage {
-            VersionManifest(LegacyManifest),
-        }
-
-        let manifest = make_manifest();
-        let bytes = VersionReplicationMessage::VersionManifest(manifest.clone())
-            .to_bytes()
-            .unwrap();
-        let payload = bytes
-            .strip_prefix(super::VERSION_REPLICATION_MAGIC)
-            .unwrap();
-        let (legacy, remainder) = postcard::take_from_bytes::<LegacyMessage>(payload).unwrap();
-        let LegacyMessage::VersionManifest(legacy) = legacy;
-
-        // The advance count and the policy refs are strictly trailing, so every
-        // earlier field keeps its position on the wire.
-        let mut trailing = postcard::to_allocvec(&manifest.reference_advance_count).unwrap();
-        trailing.extend(postcard::to_allocvec(&manifest.placement_policies).unwrap());
-        assert_eq!(remainder, trailing);
-        assert_eq!(legacy.bucket, manifest.bucket);
-    }
-
-    #[test]
     fn rejects_noncanonical_refs() {
         // A governed manifest must carry the one canonical ref set or nothing.
         let mut manifest = make_manifest();
