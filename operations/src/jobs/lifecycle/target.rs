@@ -28,6 +28,7 @@ use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
@@ -52,8 +53,9 @@ use crate::request_policy::PolicyRequestExtras;
 
 /// Wall-clock budget of the record fetch that pulls a missing sealed spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
-/// Reservation attempts one offer makes while it keeps losing the commit race.
-const RESERVE_ATTEMPTS: u32 = 3;
+/// Reservation attempts one offer makes while no commit of its own became
+/// durable: a lost race or a write storage never accepted.
+pub(crate) const RESERVE_ATTEMPTS: u32 = 3;
 
 /// Admits one offered launch, or answers why it was refused. `None` means the
 /// target could not decide at all, which is an availability answer and never a
@@ -97,10 +99,10 @@ pub async fn admit_launch(
         }
     }
     records = family_records(context, family).await?;
-    match existing_receipt(&records, &intent) {
-        Some(Ok(receipt)) => return Some(Ok(receipt)),
-        Some(Err(decline)) => return Some(Err(decline)),
-        None => {}
+    // A replayed offer re-arms the wakeups the first acceptance may have lost,
+    // so the receipt still replicates and the execution still starts.
+    if let Some(decision) = existing_receipt(&records, &intent) {
+        return Some(accepted(context.as_ref(), decision).await);
     }
     if cancelled(family, &records) {
         return Some(Err(LaunchDecline::Cancelled));
@@ -200,8 +202,6 @@ async fn reserve_and_run(
         subject_generation = round.capability.subject.generation,
         "Target admitted a launch and sealed its receipt"
     );
-    super::outbox::kick(context.as_ref()).await;
-    schedule_local(context.as_ref()).await;
     Some(Ok(frame))
 }
 
@@ -289,49 +289,120 @@ pub(crate) async fn commit_receipt(
     config: ReserveExecutionConfig,
     intent: &LaunchIntent,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let ctx: &DriverContext = context.as_ref();
+    commit_with(context, config, intent, move |config| {
+        drive(ReserveExecutionOperation::new(config), ctx)
+    })
+    .await
+}
+
+/// What one reservation attempt decided, and what it proves about the writes it
+/// tried to commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitVerdict {
+    /// Exact local capacity refused the execution.
+    Capacity,
+    /// Another admission committed first; its receipt answers this offer.
+    Raced,
+    /// Storage never accepted the write, so the reservation may be reattempted.
+    Retry,
+    /// The commit neither succeeded nor was refused; its writes may exist.
+    Uncertain,
+    /// This node cannot establish that it may admit here at all.
+    Drained,
+    /// A local fault that decides nothing about the offer.
+    Faulted,
+}
+
+/// Classifies one reservation failure by what it means, never by convenience:
+/// only a real capacity verdict may be reported as capacity, and only a lost
+/// membership or missing realm config as a drain.
+pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
+    match error {
+        LifecycleError::Capacity => CommitVerdict::Capacity,
+        LifecycleError::Storage(StorageError::TransactionConflict) => CommitVerdict::Raced,
+        LifecycleError::Storage(storage) if storage.proves_no_commit() => CommitVerdict::Retry,
+        LifecycleError::Storage(_) => CommitVerdict::Uncertain,
+        LifecycleError::NotHolder | LifecycleError::RealmConfigMissing => CommitVerdict::Drained,
+        LifecycleError::Conversion(_)
+        | LifecycleError::Record(_)
+        | LifecycleError::Family(_)
+        | LifecycleError::Store(_)
+        | LifecycleError::IdempotencyConflict { .. }
+        | LifecycleError::QuotaDenied(_)
+        | LifecycleError::NotFinished
+        | LifecycleError::UnexpectedEvent { .. } => CommitVerdict::Faulted,
+    }
+}
+
+/// Commits one sealed receipt through `reserve`, which is the reservation
+/// transaction in production and the injected outcome under test.
+pub(crate) async fn commit_with<F, Fut>(
+    context: &Arc<DriverContext>,
+    config: ReserveExecutionConfig,
+    intent: &LaunchIntent,
+    mut reserve: F,
+) -> Option<Result<ReceiptFrame, LaunchDecline>>
+where
+    F: FnMut(ReserveExecutionConfig) -> Fut,
+    Fut: Future<Output = Result<Ulid, LifecycleError>>,
+{
     let family = config.receipt.envelope().family();
     for attempt in 1..=RESERVE_ATTEMPTS {
-        match drive(
-            ReserveExecutionOperation::new(config.clone()),
-            context.as_ref(),
-        )
-        .await
-        {
+        let error = match reserve(config.clone()).await {
             Ok(_) => {
-                return Some(
-                    ReceiptFrame::new(config.receipt.envelope().clone())
-                        .map_err(|_| LaunchDecline::Unauthorized),
-                );
+                let sealed = ReceiptFrame::new(config.receipt.envelope().clone())
+                    .map_err(|_| LaunchDecline::Unauthorized);
+                return Some(accepted(context.as_ref(), sealed).await);
             }
-            Err(LifecycleError::Capacity) => return Some(Err(LaunchDecline::Capacity)),
+            Err(error) => error,
+        };
+        match classify(&error) {
+            CommitVerdict::Capacity => return Some(Err(LaunchDecline::Capacity)),
             // A commit conflict is two admissions racing one launch, never this
             // node refusing work. The winner's receipt answers the offer, so it
             // is searched for before the reservation is attempted again.
-            Err(error) if raced(&error) => {
+            CommitVerdict::Raced => {
                 if let Some(committed) = committed_receipt(context, family, intent).await {
-                    return Some(committed);
+                    return Some(accepted(context.as_ref(), committed).await);
                 }
                 debug!(attempt, "Execution reservation lost a race and retries");
                 tokio::task::yield_now().await;
             }
-            // Only a capacity verdict may be reported as one: any other failure
-            // is this node refusing work, not the plan misjudging its resources.
-            Err(error) => {
-                warn!(error = %error, "Execution reservation failed");
-                return Some(Err(LaunchDecline::Draining));
+            CommitVerdict::Retry => {
+                debug!(attempt, "Storage refused the reservation write; retrying");
+                tokio::task::yield_now().await;
+            }
+            // An unknown commit outcome may already be durable, so the receipt
+            // is reconciled from the store exactly once and never reserved
+            // again: the writes may exist and must not be redone.
+            CommitVerdict::Uncertain => {
+                warn!(error = %error, "Execution commit outcome is unknown; reconciling");
+                let committed = committed_receipt(context, family, intent).await?;
+                return Some(accepted(context.as_ref(), committed).await);
+            }
+            CommitVerdict::Drained => return Some(Err(LaunchDecline::Draining)),
+            CommitVerdict::Faulted => {
+                warn!(error = %error, "Execution reservation failed locally");
+                return None;
             }
         }
     }
     None
 }
 
-/// Whether a reservation failure is a lost race rather than a refusal. A
-/// storage conflict proves nothing about this node's willingness to run work.
-fn raced(error: &LifecycleError) -> bool {
-    matches!(
-        error,
-        LifecycleError::Storage(StorageError::TransactionConflict)
-    )
+/// Answers one decided offer and, when it was admitted, re-arms the runtime the
+/// acceptance owes: the receipt still has to replicate and the execution still
+/// has to start. A decline wakes nothing.
+async fn accepted(
+    context: &DriverContext,
+    decision: Result<ReceiptFrame, LaunchDecline>,
+) -> Result<ReceiptFrame, LaunchDecline> {
+    if decision.is_ok() {
+        super::outbox::kick(context).await;
+        schedule_local(context).await;
+    }
+    decision
 }
 
 /// The receipt already committed for this exact launch, whoever won the race.
@@ -453,7 +524,7 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
 }
 
 /// This node's own advertisement for the offered executor kind.
-async fn local_capability(
+pub(crate) async fn local_capability(
     context: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -804,17 +875,6 @@ mod tests {
 
     use super::*;
     use crate::jobs::records::tests::fixture::Family;
-
-    #[test]
-    fn conflict_never_drains() {
-        // A lost commit race must be retried, never reported as this node being
-        // drained, and no other storage failure may be mistaken for a race.
-        assert!(raced(&LifecycleError::Storage(
-            StorageError::TransactionConflict
-        )));
-        assert!(!raced(&LifecycleError::Storage(StorageError::WriteError)));
-        assert!(!raced(&LifecycleError::Capacity));
-    }
 
     #[test]
     fn materializes_sealed_facts() {
