@@ -92,17 +92,17 @@ pub fn plan_append(
 
     let key = candidate.key();
     let outcome = admit_one(state, &evidence, &candidate);
-    let retained_digest = if matches!(&outcome, Admission::Pending(_)) {
-        retained
+    let retained_row = match &outcome {
+        Admission::Pending(_) => retained
             .iter()
-            .find(|(retained_key, _)| *retained_key == key)
-            .and_then(|(_, row)| row.envelope.digest().ok())
-    } else {
-        None
+            .find(|(retained_key, _)| *retained_key == key),
+        _ => None,
     };
-    let outcome = match (outcome, retained_digest) {
-        (Admission::Pending(_), Some(retained_digest)) => match candidate.digest() {
-            Ok(digest) if digest == retained_digest => Admission::Duplicate,
+    let outcome = match (outcome, retained_row) {
+        // A re-arrival of the record already retained here is still pending, and
+        // never an acknowledgement: the publisher must keep offering it.
+        (Admission::Pending(need), Some((_, row))) => match candidate.digest() {
+            Ok(digest) if row.envelope.digest().ok() == Some(digest) => Admission::Pending(need),
             Ok(_) => Admission::Conflict,
             Err(error) => Admission::Rejected(error),
         },
@@ -120,7 +120,7 @@ pub fn plan_append(
             });
         }
         Admission::Pending(need) => {
-            if retained.len() >= MAX_PENDING_RECORDS {
+            if retained_row.is_none() && retained.len() >= MAX_PENDING_RECORDS {
                 warn!(kind = ?key.kind, "Dropping a job record: the family pending store is full");
                 return (Admission::PendingFull, plan);
             }
@@ -129,13 +129,14 @@ pub fn plan_append(
                 PendingRecord {
                     envelope: candidate,
                     need: *need,
-                    first_seen_ms: state.now_ms,
-                    attempts: 1,
+                    first_seen_ms: retained_row.map_or(state.now_ms, |(_, row)| row.first_seen_ms),
+                    attempts: retained_row.map_or(1, |(_, row)| row.attempts),
                 },
             ));
         }
         Admission::Conflict => {
-            let retained_digest = retained_digest
+            let retained_digest = retained_row
+                .and_then(|(_, row)| row.envelope.digest().ok())
                 .or_else(|| {
                     state
                         .stored
@@ -282,6 +283,9 @@ fn admit_one(
         Ok(RecordVerdict::Authentic) => Admission::Authentic,
         Ok(RecordVerdict::LocalEvidence) => Admission::Local,
         Ok(RecordVerdict::MissingEvidence(kind)) => Admission::Pending(PendingNeed::Evidence(kind)),
+        // Holder authority is relative to a view that moves with membership, so
+        // an author this view does not rank is retained and judged again.
+        Err(JobRecordError::NotHolder(_)) => Admission::Pending(PendingNeed::HolderView),
         Err(error) => Admission::Rejected(error),
     }
 }

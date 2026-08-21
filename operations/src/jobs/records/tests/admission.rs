@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::structs::{
-    JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKey, JobRecordKind, LocalExecution,
+    JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
 
 use super::fixture::{Family, secret};
@@ -152,8 +152,9 @@ fn retains_pending_conflict() {
 }
 
 #[test]
-fn refuses_non_holder() {
-    // A valid realm key is identity, never family-holder authority.
+fn retains_non_holder() {
+    // Holder authority is view-relative: an author this view does not rank is
+    // retained and judged again, never projected and never dropped.
     let family = Family::new([5u8; 32]);
     let view = family.view();
     let outsider = secret(9);
@@ -162,13 +163,34 @@ fn refuses_non_holder() {
     let empty = Stored::new();
 
     let (admission, plan) = plan_append(&state(Some(&view), &empty), &[], candidate, None);
+    assert_eq!(admission, Admission::Pending(PendingNeed::HolderView));
+    assert!(plan.admitted.is_empty());
+    assert_eq!(plan.pending.len(), 1);
+    assert!(plan.conflicts.is_empty());
+}
+
+#[test]
+fn replays_stay_pending() {
+    // A retained record that arrives again is not acknowledged as stored: the
+    // publisher must keep offering it, and its attempt budget is not reset.
+    let family = Family::new([9u8; 32]);
+    let view = family.view();
+    let spec = family.spec();
+    let claim = family.sign(&family.holder, JobFamilyRecord::Claim(family.claim(&spec)));
+    let empty = Stored::new();
+    let (_, first) = plan_append(&state(Some(&view), &empty), &[], claim.clone(), None);
+    let mut retained: Vec<(JobRecordKey, PendingRecord)> = first.pending;
+    retained[0].1.attempts = 5;
+
+    let (admission, plan) = plan_append(&state(Some(&view), &empty), &retained, claim, None);
+
     assert_eq!(
         admission,
-        Admission::Rejected(JobRecordError::NotHolder(JobRecordKind::Spec))
+        Admission::Pending(PendingNeed::Evidence(JobRecordKind::Spec))
     );
+    assert_eq!(plan.pending.len(), 1);
+    assert_eq!(plan.pending[0].1.attempts, 5);
     assert!(plan.admitted.is_empty());
-    assert!(plan.pending.is_empty());
-    assert!(plan.conflicts.is_empty());
 }
 
 #[test]

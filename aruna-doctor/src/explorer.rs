@@ -630,13 +630,16 @@ impl Serialize for JsonJobReservation {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("JobReservationRecord", 6)?;
+        let mut state = serializer.serialize_struct("JobReservationRecord", 8)?;
         state.serialize_field("execution_id", &self.0.execution_id.to_string())?;
         state.serialize_field("job_id", &self.0.job_id.to_string())?;
         state.serialize_field("cpu_cores", &self.0.resources.cpu_cores)?;
         state.serialize_field("ram_bytes", &self.0.resources.ram_bytes)?;
         state.serialize_field("disk_bytes", &self.0.resources.disk_bytes)?;
         state.serialize_field("created_at_ms", &self.0.created_at_ms)?;
+        // The sealed site fence: a refusal to start is diagnosed from these two.
+        state.serialize_field("subject_generation", &self.0.subject_generation)?;
+        state.serialize_field("subject_digest", &hex::encode(self.0.subject_digest))?;
         state.end()
     }
 }
@@ -1836,6 +1839,7 @@ fn pending_need_string(need: PendingNeed) -> String {
     match need {
         PendingNeed::Evidence(kind) => format!("evidence:{kind:?}"),
         PendingNeed::LocalView => "local_view".to_string(),
+        PendingNeed::HolderView => "holder_view".to_string(),
     }
 }
 
@@ -2369,6 +2373,7 @@ mod tests {
             queued_at_ms: 14,
             delivered: Vec::new(),
             next_holder: 0,
+            rejections: 0,
         };
         let decoded = decode_entry(
             JOB_FAMILY_OUTBOX_KEYSPACE,

@@ -2751,6 +2751,11 @@ impl JobRecordEnvelope {
         if spec.realm_id != context.realm_id {
             return Err(JobRecordError::RealmMismatch);
         }
+        // The sealed submitter is the authority every later round re-checks, so
+        // it must belong to the realm the record was published in.
+        if spec.created_by.realm_id != spec.realm_id {
+            return Err(JobRecordError::Unauthorized);
+        }
         if spec.placement != context.placement {
             return Err(JobRecordError::PlacementMismatch);
         }
@@ -2815,6 +2820,11 @@ impl JobRecordEnvelope {
         });
         if !receipted {
             self.holder(JobRecordKind::Launch, context)?;
+            // The witness must have planned under the placement this family is
+            // judged in; a receipt is its own historical authority.
+            if launch.witness_placement != context.placement {
+                return Err(JobRecordError::PlacementMismatch);
+            }
         }
         let Some(spec) = context.spec else {
             return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Spec));

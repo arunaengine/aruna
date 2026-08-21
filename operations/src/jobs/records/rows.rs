@@ -15,6 +15,9 @@ pub enum PendingNeed {
     /// The local holder view is missing or conflicted, so no author rule can be
     /// judged. Verifying against an empty view would reject instead of retry.
     LocalView,
+    /// The local view does not rank the publisher as a holder. Holder authority
+    /// moves with membership, so the record waits for a view that grants it.
+    HolderView,
 }
 
 /// One record retained until its evidence or the local view arrives.
@@ -78,6 +81,9 @@ pub struct OutboxEntry {
     pub delivered: Vec<NodeId>,
     /// Index at which the next bounded holder fan-out starts.
     pub next_holder: u32,
+    /// Definitive refusals this record collected. A record every holder refuses
+    /// is dropped instead of being offered forever.
+    pub rejections: u32,
 }
 
 pub fn to_bytes<T: Serialize>(row: &T) -> Result<Vec<u8>, ConversionError> {
