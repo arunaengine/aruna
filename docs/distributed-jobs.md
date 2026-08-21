@@ -305,13 +305,36 @@ drain: the target reloads the family, answers with the receipt the winner
 committed when launch id and digest match, answers `LaunchConflict` when the
 same launch id carries a different digest, retries the reservation up to three
 times otherwise, and finally leaves the offer undecided so the witness asks
-again. A node with the operator drain flag set declines every launch offer,
-even when its own advertisement is stale.
+again. Any other storage failure is classified by what it proves about the
+commit. A refused write (`QueueFull`) proves nothing was committed, so the
+reservation is retried inside the same three-attempt bound and the offer is
+left undecided when the bound is reached; it is never a drain. Every other
+storage failure, `CommitFailed` first among them, leaves the outcome unknown:
+the reservation, the receipt, the outbox entry, and the local execution row may
+already be durable. The target then reconciles exactly once and writes nothing:
+it reads the family's receipts, answers with the committed receipt when launch
+id and digest match, answers `LaunchConflict` when the same launch id carries a
+different digest, and leaves the offer undecided when no receipt is visible or
+the read is incomplete. A recovered or replayed acceptance re-arms the same
+wakeups a fresh acceptance does, so the receipt replicates and the execution
+starts at once instead of waiting for an unrelated timer. An unknown storage
+outcome is never reported as `Draining`. A node with the operator drain flag set
+declines every launch offer, even when its own advertisement is stale.
 
-Every scheduling round screens up to 1024 advertisements, evaluates eligibility
-and score for all of them, and ranks the best 128 eligible targets (8
-alternatives and 32 rejection explanations are kept for the audit). A round that
-hits the scan bound with advertisements left over is reported as retryable and
+One scheduling round screens every advertisement the realm publishes. Discovery
+walks the members in node id order and each member's backends by executor kind,
+buffering them into pages of at most 1024 advertisements; each full page is
+screened, routed, and ranked immediately, and the round remembers a cursor on
+the last target of the page so the next page must continue strictly past it (a
+repeated or out-of-order entry is refused). The realm total is therefore bounded
+by membership times the eight backends a node may advertise, not by the page
+bound. Across all pages the round keeps the best 128 eligible targets by a total
+order, 8 ranked alternatives, and 32 rejection explanations, counting whatever
+the audit bound dropped in `omitted`. Selection and the plan digest are sealed
+only after the last page, so a lower-ranked target in an early page is never
+launched while a better one waits in a later page, and the same advertisement
+set produces the same plan whatever the page boundaries or insertion order were.
+A round that could not read every advertisement is reported as retryable and
 repeated, never as "no eligible target".
 
 Scheduling, target admission, state publication and routing act only on a
