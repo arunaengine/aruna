@@ -269,7 +269,7 @@ async fn resubmit_after_removal() {
 
     let resubmitted = backend.submit(&spec, &cancel).await.unwrap();
     assert!(
-        matches!(resubmitted.phase, AttemptPhase::Failed { ref reason } if reason.contains("lost evidence")),
+        matches!(resubmitted.phase, AttemptPhase::SystemError { ref reason } if reason.contains("lost evidence")),
         "a started attempt with no container is lost, not restartable"
     );
     assert_eq!(

@@ -65,6 +65,17 @@ pub fn enforced_limit(
     }
 }
 
+/// Wall-clock milliseconds every backend stamps its attempt evidence with.
+#[cfg(any(feature = "apptainer", feature = "docker"))]
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 #[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]
 pub(crate) fn digest_pinned(image: &str) -> bool {
     image

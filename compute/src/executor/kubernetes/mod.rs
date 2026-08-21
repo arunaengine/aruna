@@ -652,7 +652,7 @@ impl KubernetesBackend {
                     %reason,
                     "failing attempt whose container cannot start"
                 );
-                status.phase = AttemptPhase::Failed { reason };
+                status.phase = AttemptPhase::SystemError { reason };
                 return Ok(status);
             }
         }
@@ -1556,7 +1556,9 @@ fn job_status(job: &Job) -> AttemptStatus {
                 .find(|condition| condition.type_ == "Failed" && condition.status == "True")
         })
     {
-        AttemptPhase::Failed {
+        // A Job-level failure with no terminated container carries no evidence
+        // about the payload itself; a terminated one overrides this phase.
+        AttemptPhase::SystemError {
             reason: condition
                 .message
                 .clone()
@@ -2791,7 +2793,7 @@ mod tests {
         let status = backend.status(&context()).await.unwrap();
 
         match status.phase {
-            AttemptPhase::Failed { reason } => {
+            AttemptPhase::SystemError { reason } => {
                 assert!(reason.contains("ImagePullBackOff"), "{reason}");
             }
             other => panic!("unexpected phase: {other:?}"),

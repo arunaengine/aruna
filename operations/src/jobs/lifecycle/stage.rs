@@ -38,7 +38,7 @@ pub async fn stage_remote_input(
     let net = context
         .net_handle
         .as_ref()
-        .ok_or_else(|| JobError::permanent("remote staging needs a net handle"))?;
+        .ok_or_else(|| JobError::retryable("remote staging needs a net handle"))?;
     let realm_id = *net.realm_id();
     let mut holders = drive(
         GetBlobHoldersOperation::new(blake3, realm_id, net.node_id()),

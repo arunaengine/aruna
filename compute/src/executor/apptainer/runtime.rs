@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use aruna_core::compute::{AttemptPhase, BackendError};
 use nix::unistd::{Pid as NixPid, setpgid, setsid};
@@ -12,6 +12,7 @@ use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use super::state::{
     ControlRecord, LaunchRecord, PayloadRecord, ProcessRecord, StatusRecord, read_json, write_json,
 };
+use crate::executor::now_ms;
 
 const LOG_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -388,15 +389,6 @@ fn remove_socket(path: &Path) -> Result<(), BackendError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error(error)),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn runtime_error(error: nix::Error) -> BackendError {

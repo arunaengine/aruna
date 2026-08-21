@@ -359,8 +359,9 @@ pub async fn resolve_backend(
     spec: &ExecutionSpec,
     job_id: JobId,
 ) -> Result<Arc<dyn ExecutorBackend>, JobError> {
+    // A node without compute is a local gap, never a verdict on the job.
     let Some(registry) = context.compute_handle.as_ref() else {
-        return Err(JobError::permanent("no compute backend configured"));
+        return Err(JobError::retryable("no compute backend configured"));
     };
     let constraint = spec
         .executor_constraint
@@ -1242,6 +1243,25 @@ pub(crate) async fn finalize_attempt(
             .await;
             Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
+        // Infrastructure evidence proves nothing about the job, so this stays
+        // retryable and the family may still run it elsewhere.
+        AttemptPhase::SystemError { reason } => {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
+                return;
+            };
+            let result = execution_result_for(bucket, None, Vec::new(), logs);
+            let record = Box::pin(terminal_fail(
+                storage,
+                job_id,
+                token,
+                JobError::retryable(format!("backend infrastructure failure: {reason}")),
+                result,
+            ))
+            .await;
+            Box::pin(cleanup_and_crate(context, job_id, record)).await;
+        }
         AttemptPhase::Cancelled => {
             Box::pin(finalize_cancel(
                 context, job_id, token, backend, fence, spec, bucket,
@@ -1360,6 +1380,18 @@ async fn finalize_cancel(
                         job_id,
                         token,
                         JobError::permanent(format!("backend failure: {reason}")),
+                        result,
+                    ))
+                    .await;
+                    Box::pin(cleanup_and_crate(context, job_id, record)).await;
+                }
+                AttemptPhase::SystemError { reason } => {
+                    let result = execution_result_for(bucket, None, Vec::new(), logs);
+                    let record = Box::pin(terminal_fail(
+                        storage,
+                        job_id,
+                        token,
+                        JobError::retryable(format!("backend infrastructure failure: {reason}")),
                         result,
                     ))
                     .await;

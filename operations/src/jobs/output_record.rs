@@ -25,7 +25,7 @@ pub async fn seal_outputs(
     let net = context
         .net_handle
         .as_ref()
-        .ok_or_else(|| JobError::permanent("output record needs a net handle"))?;
+        .ok_or_else(|| JobError::retryable("output record needs a net handle"))?;
     let request_digest = record
         .plan_digest
         .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
@@ -75,7 +75,7 @@ pub async fn seal_outputs(
         net.node_id(),
         |message| net.sign(message),
     )
-    .map_err(|error| JobError::permanent(format!("output record signing failed: {error}")))?;
+    .map_err(|error| JobError::retryable(format!("output record signing failed: {error}")))?;
     let frame = JobRecordFrame::new(envelope)
         .map_err(|error| JobError::permanent(format!("output record is unpublishable: {error}")))?;
     publish_output_record(context, record.job_id, control, frame, receipted).await
@@ -161,7 +161,7 @@ async fn append_output_record(
     receipted: bool,
 ) -> Result<(), JobError> {
     let Some(net) = context.net_handle.as_ref() else {
-        return Err(JobError::permanent("output record needs a net handle"));
+        return Err(JobError::retryable("output record needs a net handle"));
     };
     let envelope = frame.envelope();
     let JobFamilyRecord::Output(output) = &envelope.record else {

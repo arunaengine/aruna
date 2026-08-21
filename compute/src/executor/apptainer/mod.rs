@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::ApptainerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::{StageLayout, StagePlan};
-use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit};
+use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
 
 mod runtime;
 mod state;
@@ -335,8 +335,7 @@ impl ExecutorBackend for ApptainerBackend {
             return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
         }
         if let Some(status) = self.existing_status(context)? {
-            if matches!(status.phase, AttemptPhase::Failed { ref reason } if reason.contains("lost evidence"))
-            {
+            if matches!(status.phase, AttemptPhase::SystemError { .. }) {
                 return Ok(status);
             }
             let payload = self.state.attempt_dir(context).join("payload.json");
@@ -390,8 +389,7 @@ impl ExecutorBackend for ApptainerBackend {
     async fn cancel(&self, context: &FenceContext) -> Result<CancelEvidence, BackendError> {
         let mut guard = self.state.control(context)?;
         let status = match self.existing_status(context)? {
-            Some(status) if matches!(status.phase, AttemptPhase::Failed { ref reason } if reason.contains("lost evidence")) =>
-            {
+            Some(status) if matches!(status.phase, AttemptPhase::SystemError { .. }) => {
                 guard.mark_cancel()?;
                 return Ok(CancelEvidence::Stopped(AttemptStatus {
                     phase: AttemptPhase::Cancelled,
@@ -1051,7 +1049,7 @@ fn running_status(directory: &Path, started_at_ms: Option<u64>) -> AttemptStatus
 
 fn lost_status(directory: &Path) -> AttemptStatus {
     AttemptStatus {
-        phase: AttemptPhase::Failed {
+        phase: AttemptPhase::SystemError {
             reason: "lost evidence after recorded launch".to_string(),
         },
         backend_ref: directory.display().to_string(),
@@ -1132,15 +1130,6 @@ fn remove_cgroup(path: &Path) -> Result<(), BackendError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error(error)),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn io_error(error: std::io::Error) -> BackendError {
@@ -1449,7 +1438,7 @@ mod tests {
 
         let status = backend.attempt_status(&context).unwrap();
 
-        assert!(matches!(status.phase, AttemptPhase::Failed { .. }));
+        assert!(matches!(status.phase, AttemptPhase::SystemError { .. }));
     }
 
     #[test]

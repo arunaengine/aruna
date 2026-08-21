@@ -718,8 +718,19 @@ impl OutputMatcher {
 pub enum AttemptPhase {
     Submitted,
     Running,
-    Exited { code: i32 },
-    Failed { reason: String },
+    Exited {
+        code: i32,
+    },
+    /// The payload itself is why the attempt ended: job-specific evidence that
+    /// is permanent wherever the same work runs.
+    Failed {
+        reason: String,
+    },
+    /// The attempt ended without job-specific evidence, so only this node's
+    /// infrastructure failed and the same work may still succeed elsewhere.
+    SystemError {
+        reason: String,
+    },
     Cancelled,
 }
 
@@ -727,7 +738,10 @@ impl AttemptPhase {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            AttemptPhase::Exited { .. } | AttemptPhase::Failed { .. } | AttemptPhase::Cancelled
+            AttemptPhase::Exited { .. }
+                | AttemptPhase::Failed { .. }
+                | AttemptPhase::SystemError { .. }
+                | AttemptPhase::Cancelled
         )
     }
 
@@ -736,8 +750,8 @@ impl AttemptPhase {
             AttemptPhase::Submitted => TesState::Initializing,
             AttemptPhase::Running => TesState::Running,
             AttemptPhase::Exited { code: 0 } => TesState::Complete,
-            AttemptPhase::Exited { .. } => TesState::ExecutorError,
-            AttemptPhase::Failed { .. } => TesState::SystemError,
+            AttemptPhase::Exited { .. } | AttemptPhase::Failed { .. } => TesState::ExecutorError,
+            AttemptPhase::SystemError { .. } => TesState::SystemError,
             AttemptPhase::Cancelled => TesState::Canceled,
         }
     }
@@ -1064,6 +1078,22 @@ mod tests {
             }
             .fits(&resources())
         );
+    }
+
+    #[test]
+    fn classifies_failures() {
+        // Job-specific evidence is an executor error; infrastructure evidence is
+        // a system error, which is what keeps it retryable elsewhere.
+        let failed = AttemptPhase::Failed {
+            reason: "oom-killed".to_string(),
+        };
+        let lost = AttemptPhase::SystemError {
+            reason: "lost evidence after recorded start".to_string(),
+        };
+        assert_eq!(failed.tes_state(), TesState::ExecutorError);
+        assert_eq!(lost.tes_state(), TesState::SystemError);
+        assert!(failed.is_terminal());
+        assert!(lost.is_terminal());
     }
 
     #[test]

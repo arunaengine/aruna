@@ -128,9 +128,12 @@ pub fn job_manifest(
     } else if spec.staging_mode == StagingMode::DirectS3 {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
+    // The credential Secret rides `envFrom`, which any inline entry of the same
+    // name would shadow, so the sealed secret always wins here too.
     let mut env = spec
         .env
         .iter()
+        .filter(|(name, _)| !spec.secret_env.contains_key(*name))
         .map(|(name, value)| json!({"name":name,"value":value}))
         .collect::<Vec<_>>();
     env.push(json!({"name":"ARUNA_JOB_ID","value":spec.attempt.job_id}));

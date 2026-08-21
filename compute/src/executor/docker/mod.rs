@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::DockerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit};
+use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
@@ -1728,22 +1728,13 @@ fn control_started(record: Option<&ControlRecord>) -> bool {
 /// have run: terminal evidence, never a licence to create a second container.
 fn lost_status(name: &str) -> AttemptStatus {
     AttemptStatus {
-        phase: AttemptPhase::Failed {
+        phase: AttemptPhase::SystemError {
             reason: "lost evidence after recorded start".to_string(),
         },
         backend_ref: name.to_string(),
         started_at_ms: None,
         finished_at_ms: Some(now_ms()),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 /// A container created by a partial submit that never started a run: only such a
@@ -1779,9 +1770,11 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
                 reason: "oom-killed".to_string(),
             }
         }
+        // No exit code is no evidence about the payload itself, so the daemon,
+        // not the job, is what failed here.
         ContainerStateStatusEnum::EXITED => match exit_code {
             Some(code) => AttemptPhase::Exited { code },
-            None => AttemptPhase::Failed {
+            None => AttemptPhase::SystemError {
                 reason: state
                     .error
                     .unwrap_or_else(|| "container exited without an exit code".to_string()),
@@ -1789,7 +1782,7 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
         },
         ContainerStateStatusEnum::DEAD => match exit_code {
             Some(code) => AttemptPhase::Exited { code },
-            None => AttemptPhase::Failed {
+            None => AttemptPhase::SystemError {
                 reason: state
                     .error
                     .unwrap_or_else(|| "container died without an exit code".to_string()),
@@ -2622,7 +2615,8 @@ mod tests {
         }
     }
 
-    // A container that died without an exit code is NOT a clean success.
+    // A container that died without an exit code is NOT a clean success, and it
+    // says nothing about the payload, so it is infrastructure evidence.
     #[test]
     fn dead_without_code() {
         let status = inspect_to_status(inspect_with(bollard::models::ContainerState {
@@ -2631,8 +2625,8 @@ mod tests {
             ..Default::default()
         }));
         assert!(
-            matches!(status.phase, AttemptPhase::Failed { .. }),
-            "dead-without-exit-code must be Failed, got {:?}",
+            matches!(status.phase, AttemptPhase::SystemError { .. }),
+            "dead-without-exit-code must be a system error, got {:?}",
             status.phase
         );
 
