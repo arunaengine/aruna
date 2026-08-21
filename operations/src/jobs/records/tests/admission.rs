@@ -6,7 +6,7 @@ use aruna_core::structs::{
     JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
 
-use super::fixture::{Family, secret};
+use super::fixture::{Family, node, secret};
 use crate::jobs::records::admit::{Admission, FamilyState, plan_append, relayable};
 use crate::jobs::records::rows::{PendingNeed, PendingRecord};
 use crate::jobs::records::verify::FamilyView;
@@ -153,13 +153,17 @@ fn retains_pending_conflict() {
 
 #[test]
 fn retains_non_holder() {
-    // Holder authority is view-relative: an author this view does not rank is
+    // Holder authority is view-relative: a member this view does not rank is
     // retained and judged again, never projected and never dropped.
-    let family = Family::new([5u8; 32]);
+    let mut family = Family::new([5u8; 32]);
+    family
+        .config
+        .ensure_node(node(7), aruna_core::structs::RealmNodeKind::Server);
     let view = family.view();
-    let outsider = secret(9);
-    let spec = family.spec_for(family.job_id, outsider.public());
-    let candidate = family.sign(&outsider, JobFamilyRecord::Spec(Box::new(spec)));
+    assert!(view.is_member(node(7)) && !view.holds(node(7)));
+    let member = secret(7);
+    let spec = family.spec_for(family.job_id, member.public());
+    let candidate = family.sign(&member, JobFamilyRecord::Spec(Box::new(spec)));
     let empty = Stored::new();
 
     let (admission, plan) = plan_append(&state(Some(&view), &empty), &[], candidate, None);
@@ -167,6 +171,23 @@ fn retains_non_holder() {
     assert!(plan.admitted.is_empty());
     assert_eq!(plan.pending.len(), 1);
     assert!(plan.conflicts.is_empty());
+}
+
+#[test]
+fn rejects_outsider() {
+    // A key outside the realm can never become a holder, so no later view
+    // could admit it: the record is refused, not retained.
+    let family = Family::new([6u8; 32]);
+    let view = family.view();
+    let outsider = secret(9);
+    let spec = family.spec_for(family.job_id, outsider.public());
+    let candidate = family.sign(&outsider, JobFamilyRecord::Spec(Box::new(spec)));
+    let empty = Stored::new();
+
+    let (admission, plan) = plan_append(&state(Some(&view), &empty), &[], candidate, None);
+    assert!(matches!(admission, Admission::Rejected(_)));
+    assert!(plan.admitted.is_empty());
+    assert!(plan.pending.is_empty());
 }
 
 #[test]

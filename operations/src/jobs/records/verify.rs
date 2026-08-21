@@ -58,6 +58,10 @@ impl FamilyView {
         self.holders.contains(&node_id) && self.members.contains(&node_id)
     }
 
+    pub fn is_member(&self, node_id: NodeId) -> bool {
+        self.members.contains(&node_id)
+    }
+
     pub fn context<'a>(
         &'a self,
         evidence: Evidence<'a>,

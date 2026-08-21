@@ -283,9 +283,12 @@ fn admit_one(
         Ok(RecordVerdict::Authentic) => Admission::Authentic,
         Ok(RecordVerdict::LocalEvidence) => Admission::Local,
         Ok(RecordVerdict::MissingEvidence(kind)) => Admission::Pending(PendingNeed::Evidence(kind)),
-        // Holder authority is relative to a view that moves with membership, so
-        // an author this view does not rank is retained and judged again.
-        Err(JobRecordError::NotHolder(_)) => Admission::Pending(PendingNeed::HolderView),
+        // Holder authority is relative to a view that moves with membership: a
+        // member this view does not rank is retained and judged again, while a
+        // non-member can never become a holder and is refused outright.
+        Err(JobRecordError::NotHolder(_)) if view.is_member(candidate.published_by) => {
+            Admission::Pending(PendingNeed::HolderView)
+        }
         Err(error) => Admission::Rejected(error),
     }
 }
