@@ -11,16 +11,17 @@ use crate::blob::managed_copy::{
     COPY_PAGE_LIMIT, CopyRequest, ManagedCopyError, ManagedCopyPage, register_entry, scan_effect,
     validate_registration, version_scope,
 };
+use crate::placement_policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketIdentity, BucketInfo,
+    AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketIdentity,
     CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
     POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
     PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
@@ -112,6 +113,8 @@ pub enum SuccessorError {
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
     #[error(transparent)]
+    Gate(#[from] PolicyGateError),
+    #[error(transparent)]
     ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -123,6 +126,10 @@ pub enum SuccessorError {
     },
     #[error("the bucket record is missing or changed identity")]
     BucketChanged,
+    /// This node's subject moved between the plan and this transaction, so the
+    /// evaluation the plan carries no longer describes the destination.
+    #[error("the destination subject changed during this mutation")]
+    SubjectDrift,
     /// The bucket default moved on, so this run's target is stale.
     #[error("the bucket default changed to generation {current}")]
     DefaultChanged { current: u64 },
@@ -303,24 +310,38 @@ impl SuccessorMint {
             });
         }
         self.state = MintState::ReadBucket;
-        Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.plan.context.bucket.as_bytes().to_vec().into(),
-            txn_id,
-        })]))
+        Ok(Some(smallvec![drift_reads(
+            &self.plan.context.bucket,
+            txn_id
+        )]))
     }
 
+    /// Re-reads the destination facts inside the commit boundary: the bucket
+    /// the run sealed, and the subject the plan was evaluated against.
     fn handle_bucket(
         &mut self,
         event: Event,
         txn_id: Option<TxnId>,
     ) -> Result<Option<Effects>, SuccessorError> {
-        let Some(value) = read_value(event)? else {
+        let values = match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            _ => return Err(SuccessorError::InvalidEvent),
+        };
+        let (bucket, subject) = split_drift_reads(values)?;
+        let Some(bucket) = bucket else {
             return Err(SuccessorError::BucketChanged);
         };
-        let bucket = BucketInfo::from_bytes(value.as_ref())?;
         if bucket.identity() != self.plan.bucket_identity {
             return Err(SuccessorError::BucketChanged);
+        }
+        let admitted = subject.is_some_and(|record| {
+            record.subject.generation == self.plan.subject.generation
+                && !record.serving_blocked
+                && !record.policy_draining
+        });
+        if !admitted {
+            return Err(SuccessorError::SubjectDrift);
         }
         if let Some(sealed) = self.plan.sealed_default.as_ref()
             && (sealed.generation != bucket.placement_policy_generation
@@ -604,7 +625,8 @@ fn reusable_copy(
     };
     let bytes = record.to_bytes().ok()?;
     let validated = validate_registration(Some(bytes.as_slice()), &request).ok()?;
-    (validated.location.blob_size > 0).then_some(validated.location)
+    // The hash binds the content, so a zero-length object is reusable too.
+    Some(validated.location)
 }
 
 /// The successor carries the predecessor's content and metadata under a new
@@ -782,10 +804,11 @@ mod tests {
     };
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        ManagedCopyRecord, ManagedCopyState, POLICY_BULK_INTENT_KEYSPACE, PlacementPolicy,
-        PlacementPolicyRef, PlacementSelector, PlacementSubject, PolicyBlockedReason,
-        PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationRecord, PolicyRefMode,
-        PolicyResolution, RealmId, VerifiedPolicy, VersionKey, checksum::HASH_BLAKE3,
+        ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
+        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
+        PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationRecord,
+        PolicyRefMode, PolicyResolution, RealmId, VerifiedPolicy, VersionKey,
+        checksum::HASH_BLAKE3,
     };
     use aruna_core::types::{Key, NodeId, UserId, Value};
     use std::collections::{BTreeMap, HashMap};
@@ -954,6 +977,23 @@ mod tests {
         })
     }
 
+    /// The bucket and the live subject the exposing transaction re-reads.
+    fn drift(bucket: Option<Vec<u8>>, record: NodeSubjectRecord) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(Vec::<u8>::new()), bucket.map(Into::into)),
+                (
+                    Key::from(Vec::<u8>::new()),
+                    Some(Value::from(record.to_bytes().expect("record encodes"))),
+                ),
+            ],
+        })
+    }
+
+    fn advertised() -> NodeSubjectRecord {
+        NodeSubjectRecord::seed(subject()).expect("subject is valid")
+    }
+
     fn copies(rows: Vec<(Key, Value)>) -> Event {
         Event::Storage(StorageEvent::IterResult {
             values: rows,
@@ -971,8 +1011,11 @@ mod tests {
         }
         mint.step(read(Some(head().to_bytes().unwrap())), None)
             .expect("head matches");
-        mint.step(read(Some(bucket().to_bytes().unwrap())), None)
-            .expect("bucket matches");
+        mint.step(
+            drift(Some(bucket().to_bytes().unwrap()), advertised()),
+            None,
+        )
+        .expect("bucket matches");
         let effects = mint
             .step(read(Some(version.to_bytes().unwrap())), None)
             .expect("version decodes");
@@ -1081,8 +1124,69 @@ mod tests {
         recreated.created_at = UNIX_EPOCH + std::time::Duration::from_secs(9);
 
         assert_eq!(
-            mint.step(read(Some(recreated.to_bytes().unwrap())), None),
+            mint.step(
+                drift(Some(recreated.to_bytes().unwrap()), advertised()),
+                None
+            ),
             Err(SuccessorError::BucketChanged)
+        );
+    }
+
+    #[test]
+    fn reuses_empty_object() {
+        // A zero-length governed object still gets a successor: the hash, not
+        // the size, proves the registered bytes are the predecessor's.
+        let policy = verified(1, Some(node_id()));
+        let refs = vec![policy.policy_ref()];
+        let version = VersionKey::new(BUCKET, OBJECT, head().version_id);
+        let mut empty = location();
+        empty.blob_size = 0;
+        let record = ManagedCopyRecord::new(
+            version.clone(),
+            node_id(),
+            empty,
+            refs.clone(),
+            7,
+            ManagedCopyState::Registered,
+        )
+        .expect("record builds")
+        .sealed_under(subject().generation);
+
+        assert!(
+            super::reusable_copy(&record.key(), &record, &version, &subject(), CONTENT, &refs)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rejects_moved_subject() {
+        // The plan was evaluated against the subject this node advertised then;
+        // a drift before the commit must not expose bytes nothing evaluated.
+        let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Union));
+        mint.start(None).expect("start builds");
+        mint.step(read(None), None).expect("mutation absent");
+        mint.step(read(Some(head().to_bytes().unwrap())), None)
+            .expect("head matches");
+        let mut moved = advertised();
+        moved.subject.generation = 9;
+
+        assert_eq!(
+            mint.step(drift(Some(bucket().to_bytes().unwrap()), moved), None),
+            Err(SuccessorError::SubjectDrift)
+        );
+
+        // A node that stopped serving is refused under the same generation.
+        let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Union));
+        mint.start(None).expect("start builds");
+        mint.step(read(None), None).expect("mutation absent");
+        mint.step(read(Some(head().to_bytes().unwrap())), None)
+            .expect("head matches");
+        let mut blocked = advertised();
+        blocked.serving_blocked = true;
+
+        assert_eq!(
+            mint.step(drift(Some(bucket().to_bytes().unwrap()), blocked), None),
+            Err(SuccessorError::SubjectDrift)
         );
     }
 
@@ -1101,7 +1205,10 @@ mod tests {
             .expect("head matches");
 
         assert_eq!(
-            mint.step(read(Some(bucket().to_bytes().unwrap())), None),
+            mint.step(
+                drift(Some(bucket().to_bytes().unwrap()), advertised()),
+                None
+            ),
             Err(SuccessorError::DefaultChanged { current: 3 })
         );
     }
@@ -1117,8 +1224,11 @@ mod tests {
         mint.step(read(None), None).expect("mutation absent");
         mint.step(read(Some(head().to_bytes().unwrap())), None)
             .expect("head matches");
-        mint.step(read(Some(bucket().to_bytes().unwrap())), None)
-            .expect("bucket matches");
+        mint.step(
+            drift(Some(bucket().to_bytes().unwrap()), advertised()),
+            None,
+        )
+        .expect("bucket matches");
         mint.step(
             read(Some(materialized(Vec::new()).to_bytes().unwrap())),
             None,

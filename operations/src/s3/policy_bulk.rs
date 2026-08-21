@@ -116,6 +116,24 @@ enum BulkState {
     Error,
 }
 
+/// Only the resolutions one object's mint may evaluate. A pass accumulates every
+/// page's resolutions, while one evaluation is bounded to the refs of that
+/// object and the sealed target.
+fn mint_resolutions(
+    resolved: &BTreeMap<Ulid, PolicyResolution>,
+    refs: &[PlacementPolicyRef],
+    target: &[PlacementPolicyRef],
+) -> BTreeMap<Ulid, PolicyResolution> {
+    refs.iter()
+        .chain(target)
+        .filter_map(|policy_ref| {
+            resolved
+                .get(&policy_ref.policy_id)
+                .map(|resolution| (policy_ref.policy_id, resolution.clone()))
+        })
+        .collect()
+}
+
 /// One head this pass observed, with the durable intent it is minted under.
 #[derive(Clone, Debug, PartialEq)]
 struct Candidate {
@@ -587,7 +605,7 @@ impl PolicyBulkOperation {
             created_at: self.config.created_at,
             auth_context: self.config.auth_context.clone(),
             subject: self.config.subject.clone(),
-            resolved: self.resolved.clone(),
+            resolved: mint_resolutions(&self.resolved, &candidate.refs, &run.target_refs),
             sealed_default: Some(SealedDefault {
                 generation: run.generation,
                 refs: run.target_refs.clone(),
@@ -619,6 +637,9 @@ impl PolicyBulkOperation {
             Err(SuccessorError::DefaultChanged { .. }) => {
                 return self.close_run(PolicyBulkStatus::Superseded);
             }
+            // This node is mid-transition, so every evaluation this pass made is
+            // stale. The run stays active and a later pass resumes it.
+            Err(SuccessorError::SubjectDrift) => return self.finish(),
             // A head that moved, an id another mutation took, an intent a
             // concurrent pass owns, and a lost commit race are all replanned by
             // the next pass.
@@ -1696,6 +1717,44 @@ mod tests {
         assert_eq!(report.minted, 0);
         assert_eq!(read_head(&context, OBJECT).await.version_id, version_id);
         assert_eq!(report.status, PolicyBulkStatus::Completed);
+    }
+
+    #[test]
+    fn mint_slices_resolutions() {
+        // A bucket whose heads reference more policies than one evaluation may
+        // resolve must still mint: each object only carries its own refs.
+        use aruna_core::structs::{
+            MAX_POLICY_REF_INPUT, PlacementDecision, PolicyResolution, evaluate_placement,
+        };
+        use std::collections::BTreeMap;
+
+        let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let refs = (1..=MAX_POLICY_REF_INPUT as u8 + 5)
+            .map(|seed| PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([seed; 16]),
+                digest: [seed; 32],
+            })
+            .collect::<Vec<_>>();
+        let resolved = refs
+            .iter()
+            .map(|policy_ref| (policy_ref.policy_id, PolicyResolution::Unresolved))
+            .collect::<BTreeMap<_, _>>();
+        let object = vec![refs[0], refs[1]];
+        let target = vec![refs[9]];
+
+        let sliced = super::mint_resolutions(&resolved, &object, &target);
+
+        assert_eq!(sliced.len(), 3);
+        let mut sealed = object.clone();
+        sealed.extend(target);
+        assert!(!matches!(
+            evaluate_placement(&sealed, &sliced, &subject(node_id, "eu-west")),
+            PlacementDecision::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            evaluate_placement(&sealed, &resolved, &subject(node_id, "eu-west")),
+            PlacementDecision::InvalidInput { .. }
+        ));
     }
 
     #[tokio::test]

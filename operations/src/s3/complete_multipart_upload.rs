@@ -3076,6 +3076,7 @@ mod gate_tests {
                 local_to_controller: true,
             },
             now_ms: 1_000,
+            admitting: true,
         }
     }
 
