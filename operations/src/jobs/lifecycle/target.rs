@@ -15,13 +15,14 @@ use aruna_core::effects::{
     Effect, HolderList, JobRecordEffect, JobRecordFrame, LaunchFrame, MAX_JOB_RECORD_HOLDERS,
     NetEffect, PageLimit, ReceiptFrame,
 };
+use aruna_core::errors::StorageError;
 use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, NetEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
-    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, Permission, PlacementDecision,
-    PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument, RealmNodeKind,
-    WorkspaceMode, blob_group_permission_path, evaluate_placement,
+    JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, Permission,
+    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmConfigDocument,
+    RealmNodeKind, WorkspaceMode, blob_group_permission_path, evaluate_placement,
 };
 use aruna_core::types::{Effects, NodeId};
 use aruna_core::util::unix_timestamp_millis;
@@ -35,10 +36,12 @@ use super::LifecycleError;
 use super::ids::{self, workspace_of};
 use super::plan::{network_access, staging_mode};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
-use super::witness::load_family;
 use crate::driver::{DriverContext, drive, gate_context, now_ms};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::{
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
+    load_kind_complete,
+};
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
 use crate::node_info::{read_node_info_document, read_operator_drain};
@@ -49,6 +52,8 @@ use crate::request_policy::PolicyRequestExtras;
 
 /// Wall-clock budget of the record fetch that pulls a missing sealed spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
+/// Reservation attempts one offer makes while it keeps losing the commit race.
+const RESERVE_ATTEMPTS: u32 = 3;
 
 /// Admits one offered launch, or answers why it was refused. `None` means the
 /// target could not decide at all, which is an availability answer and never a
@@ -75,10 +80,10 @@ pub async fn admit_launch(
     if !view.holds(intent.scheduler_node_id) {
         return Some(Err(LaunchDecline::NotHolder));
     }
-    let mut records = load_family(context.as_ref(), family).await;
+    let mut records = family_records(context, family).await?;
     if spec_of(&records, &intent).is_none() {
         fetch_family(context, &config, realm_id, family, intent.scheduler_node_id).await;
-        records = load_family(context.as_ref(), family).await;
+        records = family_records(context, family).await?;
     }
     let spec = spec_of(&records, &intent)?;
     // The launch itself becomes a retained record before it can be receipted.
@@ -91,7 +96,7 @@ pub async fn admit_launch(
             return None;
         }
     }
-    records = load_family(context.as_ref(), family).await;
+    records = family_records(context, family).await?;
     match existing_receipt(&records, &intent) {
         Some(Ok(receipt)) => return Some(Ok(receipt)),
         Some(Err(decline)) => return Some(Err(decline)),
@@ -132,20 +137,33 @@ pub async fn admit_launch(
     if !limits.fits(&spec.resources) {
         return Some(Err(LaunchDecline::Capacity));
     }
-    Some(
-        reserve_and_run(
-            context,
-            ReceiptRound {
-                realm_id,
-                local,
-                spec,
-                intent,
-                capability,
-                limits,
-            },
-        )
-        .await,
+    reserve_and_run(
+        context,
+        ReceiptRound {
+            realm_id,
+            local,
+            spec,
+            intent,
+            capability,
+            limits,
+        },
     )
+    .await
+}
+
+/// Every record of one family, or nothing at all. An incomplete read leaves the
+/// offer undecided: a receipt, a cancellation, or the sealed spec may be in the
+/// part that did not load, so nothing here may be reserved or minted.
+async fn family_records(
+    context: &Arc<DriverContext>,
+    family: JobFamilyId,
+) -> Option<Vec<JobRecordEnvelope>> {
+    load_family_complete(context.as_ref(), family)
+        .await
+        .inspect_err(|error| {
+            warn!(error = %error, "Job family read is incomplete; launch stays undecided");
+        })
+        .ok()
 }
 
 /// Everything one receipt round decides over, resolved before it starts.
@@ -163,7 +181,36 @@ struct ReceiptRound {
 async fn reserve_and_run(
     context: &Arc<DriverContext>,
     round: ReceiptRound,
-) -> Result<ReceiptFrame, LaunchDecline> {
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let config = match seal_receipt(context, &round).await {
+        Ok(config) => config,
+        Err(decline) => return Some(Err(decline)),
+    };
+    let job_id = config.job_id;
+    let execution_id = config.execution_id;
+    let frame = match commit_receipt(context, config, &round.intent).await? {
+        Ok(frame) => frame,
+        Err(decline) => return Some(Err(decline)),
+    };
+    info!(
+        job_id = %round.spec.job_id,
+        physical_job_id = %job_id,
+        execution_id = %execution_id,
+        executor_kind = %round.intent.target.executor_kind,
+        subject_generation = round.capability.subject.generation,
+        "Target admitted a launch and sealed its receipt"
+    );
+    super::outbox::kick(context.as_ref()).await;
+    schedule_local(context.as_ref()).await;
+    Some(Ok(frame))
+}
+
+/// Mints the local execution identity and signs the receipt that authorizes it,
+/// leaving the reservation transaction as the only thing still to commit.
+async fn seal_receipt(
+    context: &Arc<DriverContext>,
+    round: &ReceiptRound,
+) -> Result<ReserveExecutionConfig, LaunchDecline> {
     let now = unix_timestamp_millis();
     let execution_id = Ulid::generate();
     let physical_job_id = mint_local_job(
@@ -217,47 +264,89 @@ async fn reserve_and_run(
         |message| net.sign(message),
     )
     .map_err(|_| LaunchDecline::Unauthorized)?;
-    let frame = JobRecordFrame::new(envelope.clone()).map_err(|_| LaunchDecline::Unauthorized)?;
-    let reserved = drive(
-        ReserveExecutionOperation::new(ReserveExecutionConfig {
-            realm_id: round.realm_id,
-            local_node_id: round.local,
-            envelope: round.limits,
-            receipt: frame,
-            launch: Box::new(round.intent.clone()),
-            job_id: physical_job_id,
-            logical_job_id: round.spec.job_id,
-            execution_id,
-            resources: round.spec.resources,
-            subject_generation: sealed_subject.0,
-            subject_digest: sealed_subject.1,
-            record: Box::new(record),
-            now_ms: now,
-        }),
-        context.as_ref(),
-    )
-    .await;
-    match reserved {
-        Ok(_) => {}
-        Err(LifecycleError::Capacity) => return Err(LaunchDecline::Capacity),
-        // Only a capacity verdict may be reported as one: any other failure is
-        // this node refusing work, not the plan misjudging its free resources.
-        Err(error) => {
-            warn!(error = %error, "Execution reservation failed");
-            return Err(LaunchDecline::Draining);
+    let frame = JobRecordFrame::new(envelope).map_err(|_| LaunchDecline::Unauthorized)?;
+    Ok(ReserveExecutionConfig {
+        realm_id: round.realm_id,
+        local_node_id: round.local,
+        envelope: round.limits,
+        receipt: frame,
+        launch: Box::new(round.intent.clone()),
+        job_id: physical_job_id,
+        logical_job_id: round.spec.job_id,
+        execution_id,
+        resources: round.spec.resources,
+        subject_generation: sealed_subject.0,
+        subject_digest: sealed_subject.1,
+        record: Box::new(record),
+        now_ms: now,
+    })
+}
+
+/// Commits one sealed receipt with its reservation. `None` is undecidable: the
+/// offer was neither admitted nor refused and the scheduler may ask again.
+pub(crate) async fn commit_receipt(
+    context: &Arc<DriverContext>,
+    config: ReserveExecutionConfig,
+    intent: &LaunchIntent,
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let family = config.receipt.envelope().family();
+    for attempt in 1..=RESERVE_ATTEMPTS {
+        match drive(
+            ReserveExecutionOperation::new(config.clone()),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(_) => {
+                return Some(
+                    ReceiptFrame::new(config.receipt.envelope().clone())
+                        .map_err(|_| LaunchDecline::Unauthorized),
+                );
+            }
+            Err(LifecycleError::Capacity) => return Some(Err(LaunchDecline::Capacity)),
+            // A commit conflict is two admissions racing one launch, never this
+            // node refusing work. The winner's receipt answers the offer, so it
+            // is searched for before the reservation is attempted again.
+            Err(error) if raced(&error) => {
+                if let Some(committed) = committed_receipt(context, family, intent).await {
+                    return Some(committed);
+                }
+                debug!(attempt, "Execution reservation lost a race and retries");
+                tokio::task::yield_now().await;
+            }
+            // Only a capacity verdict may be reported as one: any other failure
+            // is this node refusing work, not the plan misjudging its resources.
+            Err(error) => {
+                warn!(error = %error, "Execution reservation failed");
+                return Some(Err(LaunchDecline::Draining));
+            }
         }
     }
-    info!(
-        job_id = %round.spec.job_id,
-        physical_job_id = %physical_job_id,
-        execution_id = %execution_id,
-        executor_kind = %round.intent.target.executor_kind,
-        subject_generation = sealed_subject.0,
-        "Target admitted a launch and sealed its receipt"
-    );
-    super::outbox::kick(context.as_ref()).await;
-    schedule_local(context.as_ref()).await;
-    ReceiptFrame::new(envelope).map_err(|_| LaunchDecline::Unauthorized)
+    None
+}
+
+/// Whether a reservation failure is a lost race rather than a refusal. A
+/// storage conflict proves nothing about this node's willingness to run work.
+fn raced(error: &LifecycleError) -> bool {
+    matches!(
+        error,
+        LifecycleError::Storage(StorageError::TransactionConflict)
+    )
+}
+
+/// The receipt already committed for this exact launch, whoever won the race.
+async fn committed_receipt(
+    context: &Arc<DriverContext>,
+    family: JobFamilyId,
+    intent: &LaunchIntent,
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let records = load_kind_complete(context.as_ref(), family, JobRecordKind::Receipt)
+        .await
+        .inspect_err(|error| {
+            warn!(error = %error, "Receipt read is incomplete after a reservation race");
+        })
+        .ok()?;
+    existing_receipt(&records, intent)
 }
 
 fn materialize_local(
@@ -715,6 +804,17 @@ mod tests {
 
     use super::*;
     use crate::jobs::records::tests::fixture::Family;
+
+    #[test]
+    fn conflict_never_drains() {
+        // A lost commit race must be retried, never reported as this node being
+        // drained, and no other storage failure may be mistaken for a race.
+        assert!(raced(&LifecycleError::Storage(
+            StorageError::TransactionConflict
+        )));
+        assert!(!raced(&LifecycleError::Storage(StorageError::WriteError)));
+        assert!(!raced(&LifecycleError::Capacity));
+    }
 
     #[test]
     fn materializes_sealed_facts() {
