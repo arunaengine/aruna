@@ -21,7 +21,7 @@ use crate::jobs::records::tests::fixture::{Family, REALM, context};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::{iter_prefix_page, read_job_record};
 
-fn envelope(max_concurrent: u32) -> ResourceEnvelope {
+pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
         max_cpu_cores: Some(8),
         max_ram_bytes: Some(8_192),
@@ -47,7 +47,7 @@ fn physical(execution: u8) -> JobId {
 }
 
 /// Stores the spec, claim, budget, and two launches a receipt may chain to.
-async fn seed(ctx: &DriverContext, family: &Family) -> (LaunchIntent, LaunchIntent) {
+pub(super) async fn seed(ctx: &DriverContext, family: &Family) -> (LaunchIntent, LaunchIntent) {
     let spec = family.spec();
     let first = family.launch(&spec, family.holder.public(), 0);
     let second = family.launch(&spec, family.holder.public(), 1);
@@ -77,7 +77,7 @@ async fn seed(ctx: &DriverContext, family: &Family) -> (LaunchIntent, LaunchInte
     (first, second)
 }
 
-fn config(
+pub(super) fn config(
     family: &Family,
     launch: &LaunchIntent,
     execution: u8,
@@ -127,7 +127,7 @@ async fn admit(
     commit_receipt(ctx, config, launch).await
 }
 
-async fn rows(ctx: &DriverContext, key_space: &str, prefix: Option<Key>) -> usize {
+pub(super) async fn rows(ctx: &DriverContext, key_space: &str, prefix: Option<Key>) -> usize {
     iter_prefix_page(&ctx.storage_handle, key_space, prefix, None, 64, None)
         .await
         .expect("row scan")
@@ -135,13 +135,13 @@ async fn rows(ctx: &DriverContext, key_space: &str, prefix: Option<Key>) -> usiz
         .len()
 }
 
-async fn receipts(ctx: &DriverContext, family: &Family) -> usize {
+pub(super) async fn receipts(ctx: &DriverContext, family: &Family) -> usize {
     let prefix = kind_prefix(&family.family(), JobRecordKind::Receipt);
     rows(ctx, JOB_FAMILY_RECORD_KEYSPACE, Some(prefix)).await
 }
 
 /// Whether exactly one of the two minted physical jobs became durable.
-async fn minted(ctx: &DriverContext) -> usize {
+pub(super) async fn minted(ctx: &DriverContext) -> usize {
     let mut count = 0;
     for execution in [1u8, 2u8] {
         if read_job_record(&ctx.storage_handle, physical(execution), None)
