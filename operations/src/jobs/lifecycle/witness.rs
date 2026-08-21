@@ -50,8 +50,10 @@ pub const WITNESS_DRAIN_BATCH: usize = 64;
 pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Wall-clock budget of one launch offer.
 pub const OFFER_DEADLINE: Duration = Duration::from_secs(30);
-/// A target that stays unavailable this long is excluded from the next plan.
-pub const LOST_TARGET_RETRY_WINDOW: Duration = OFFER_DEADLINE;
+/// Offers a target must leave unanswered before it is excluded from the next
+/// plan. One is never enough: a target that accepts slowly would be replaced by
+/// a second launch while it is already running the work.
+pub const LOST_TARGET_OFFERS: u32 = 2;
 /// Declined targets one explain row retains.
 pub const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
 
@@ -326,11 +328,16 @@ mod tests {
 
     #[test]
     fn lost_target_expires() {
-        let window = LOST_TARGET_RETRY_WINDOW.as_millis() as u64;
-        assert!(!lost_target_expired(10, 9 + window));
-        assert!(lost_target_expired(10, 10 + window));
-        assert_eq!(lost_retry_ms(10, 10, window * 2), window);
-        assert_eq!(lost_retry_ms(10, 9 + window, window), 1);
+        // One timed-out offer must never be enough to declare a target lost.
+        let base = 5_000;
+        let offer = OFFER_DEADLINE.as_millis() as u64;
+        let window = lost_window_ms(base);
+        assert!(window >= offer + base);
+        assert!(!lost_target_expired(10, 10 + offer + base, base));
+        assert!(!lost_target_expired(10, 9 + window, base));
+        assert!(lost_target_expired(10, 10 + window, base));
+        assert_eq!(lost_retry_ms(10, 10, base), base);
+        assert_eq!(lost_retry_ms(10, 9 + window, base), 1);
     }
 }
 
@@ -398,7 +405,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     }) && let JobFamilyRecord::Launch(launch) = &envelope.record
         && !explain.declined.contains(&launch.target)
     {
-        if lost_target_expired(launch.created_at_ms, now_ms) {
+        if lost_target_expired(launch.created_at_ms, now_ms, base) {
             record_decline(context, &family, local, launch.target.clone()).await;
             return RoundOutcome::Retry { after_ms: 0 };
         }
@@ -499,7 +506,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         frame,
         target: selection.target,
         now_ms,
-        retry_after_ms: base.min(LOST_TARGET_RETRY_WINDOW.as_millis() as u64),
+        retry_after_ms: lost_retry_ms(now_ms, now_ms, base),
     };
     offer(context, offered).await
 }
@@ -916,13 +923,21 @@ pub(super) async fn has_deadline(context: &DriverContext, family: JobFamilyId) -
     }
 }
 
-fn lost_target_expired(created_at_ms: u64, now_ms: u64) -> bool {
-    now_ms.saturating_sub(created_at_ms) >= LOST_TARGET_RETRY_WINDOW.as_millis() as u64
+/// How long a target keeps its launch: every offer's own deadline plus the
+/// spacing of the rounds that make them.
+fn lost_window_ms(base_delay_ms: u64) -> u64 {
+    (OFFER_DEADLINE.as_millis() as u64)
+        .saturating_mul(u64::from(LOST_TARGET_OFFERS))
+        .saturating_add(base_delay_ms)
+}
+
+fn lost_target_expired(created_at_ms: u64, now_ms: u64, base_delay_ms: u64) -> bool {
+    now_ms.saturating_sub(created_at_ms) >= lost_window_ms(base_delay_ms)
 }
 
 fn lost_retry_ms(created_at_ms: u64, now_ms: u64, base_delay_ms: u64) -> u64 {
     let elapsed = now_ms.saturating_sub(created_at_ms);
-    let remaining = (LOST_TARGET_RETRY_WINDOW.as_millis() as u64).saturating_sub(elapsed);
+    let remaining = lost_window_ms(base_delay_ms).saturating_sub(elapsed);
     base_delay_ms.min(remaining)
 }
 
@@ -1097,6 +1112,11 @@ impl Operation for OfferLaunchOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if !self.sent {
+            self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
+                state: "Settled".to_string(),
+                expected: "no further event",
+                got: format!("{event:?}"),
+            }));
             return smallvec![];
         }
         self.outcome = Some(match event {

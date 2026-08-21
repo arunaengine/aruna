@@ -36,6 +36,9 @@ pub const OUTBOX_DRAIN_BATCH: usize = 32;
 pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 /// Spacing between drain passes while entries remain undeliverable.
 pub const OUTBOX_RETRY_AFTER: Duration = Duration::from_secs(5);
+/// Definitive refusals one record is offered through before it is dropped.
+/// Unreachable holders never count: only a holder's own refusal does.
+pub const MAX_PUBLISH_REJECTIONS: u32 = 16;
 const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 
 /// Kicks the outbox drain without persisting a timer of its own.
@@ -74,6 +77,7 @@ pub struct PublishRecordOperation {
     queued_at_ms: u64,
     delivered: Vec<NodeId>,
     next_holder: u32,
+    rejections: u32,
     state: PublishState,
     outcome: Option<Result<bool, LifecycleError>>,
 }
@@ -96,6 +100,7 @@ impl PublishRecordOperation {
             queued_at_ms: 0,
             delivered: Vec::new(),
             next_holder: 0,
+            rejections: 0,
             state: PublishState::Init,
             outcome: None,
         }
@@ -153,6 +158,7 @@ impl PublishRecordOperation {
             queued_at_ms: self.queued_at_ms,
             delivered: self.delivered.clone(),
             next_holder: self.next_holder,
+            rejections: self.rejections,
         })?;
         self.state = PublishState::Store;
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
@@ -205,6 +211,7 @@ impl Operation for PublishRecordOperation {
                                 .filter(|holder| self.config.holders.contains(holder))
                                 .collect();
                             self.next_holder = entry.next_holder;
+                            self.rejections = entry.rejections;
                             self.offer()
                         }
                         Err(error) => self.fail(error.into()),
@@ -260,6 +267,17 @@ impl Operation for PublishRecordOperation {
                 }
                 Event::Net(NetEvent::JobRecord(JobRecordEvent::Rejected { holder, reason })) => {
                     warn!(peer = %holder, reason = ?reason, "Family holder refused a record");
+                    self.rejections = self.rejections.saturating_add(1);
+                    // A record every holder stands behind refusing will never be
+                    // accepted, so it stops consuming the queue.
+                    if self.rejections >= MAX_PUBLISH_REJECTIONS {
+                        warn!(
+                            kind = ?self.config.key.kind,
+                            rejections = self.rejections,
+                            "Dropping a job record the family holders refuse"
+                        );
+                        return self.clear();
+                    }
                     match self.store() {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
@@ -492,6 +510,49 @@ mod tests {
     use aruna_core::types::Value;
 
     #[test]
+    fn drops_refused_record() {
+        // Holders that stand behind refusing a record must not keep it queued
+        // for every drain pass forever.
+        let fixture = Family::new([12u8; 32]);
+        let envelope = fixture.sign(
+            &fixture.holder,
+            aruna_core::structs::JobFamilyRecord::Spec(Box::new(fixture.spec())),
+        );
+        let key = envelope.key();
+        let frame = JobRecordFrame::new(envelope).expect("record frame");
+        let mut operation = PublishRecordOperation::new(PublishRecordConfig {
+            realm_id: fixture.config.realm_id,
+            placement: fixture.placement,
+            holders: vec![node(10)],
+            record: Box::new(frame),
+            key,
+        });
+        let _ = operation.start();
+        let _ = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: record_key(&key),
+            value: Some(Value::from(
+                to_bytes(&OutboxEntry {
+                    queued_at_ms: 1,
+                    delivered: Vec::new(),
+                    next_holder: 0,
+                    rejections: MAX_PUBLISH_REJECTIONS - 1,
+                })
+                .expect("outbox entry"),
+            )),
+        }));
+
+        let effects = operation.step(Event::Net(NetEvent::JobRecord(JobRecordEvent::Rejected {
+            holder: node(10),
+            reason: aruna_core::events::JobRecordRejection::Invalid,
+        })));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { .. })]
+        ));
+    }
+
+    #[test]
     fn batches_all_holders() {
         // Delivery state must advance beyond one bounded network fan-out.
         let fixture = Family::new([7u8; 32]);
@@ -520,6 +581,7 @@ mod tests {
                     queued_at_ms: 1,
                     delivered: Vec::new(),
                     next_holder: 0,
+                    rejections: 0,
                 })
                 .expect("outbox entry"),
             )),

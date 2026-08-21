@@ -453,52 +453,63 @@ async fn prepare_cancel(
         Ok(family) => family,
         Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
     };
-    match holds_family(context, requested_family).await {
-        Ok(false) => {
-            let reservations =
-                match crate::jobs::lifecycle::reservation::held_reservations(context).await {
-                    Ok(reservations) => reservations,
-                    Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-                };
-            let mut stopped = None;
-            for reservation in reservations {
-                let matches = match reservation_matches(
-                    context,
-                    job_id,
-                    requested_family,
-                    reservation.logical_job_id,
-                )
-                .await
-                {
-                    Ok(matches) => matches,
-                    Err(error) => {
-                        return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-                    }
-                };
-                if !matches {
-                    continue;
+    let holds = match holds_family(context, requested_family).await {
+        Ok(holds) => holds,
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+    };
+    // A cancel that already reached this node is never forwarded again: two
+    // divergent holder views would bounce it between the same two nodes. A
+    // non-holder answers for its own executions only.
+    if !holds {
+        let reservations =
+            match crate::jobs::lifecycle::reservation::held_reservations(context).await {
+                Ok(reservations) => reservations,
+                Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+            };
+        let mut stopped = None;
+        for reservation in reservations {
+            let matches = match reservation_matches(
+                context,
+                job_id,
+                requested_family,
+                reservation.logical_job_id,
+            )
+            .await
+            {
+                Ok(matches) => matches,
+                Err(error) => {
+                    return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
                 }
-                match cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await {
-                    Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
-                        stopped = Some((record, true));
-                    }
-                    Ok(CancelJobOutcome::Requested(record)) => {
-                        stopped = Some((record, false));
-                    }
-                    Ok(CancelJobOutcome::NotFound) => {}
-                    Err(error) => {
-                        return PreparedResponse::new(JobResponse::Unavailable(error));
-                    }
-                }
+            };
+            if !matches {
+                continue;
             }
-            if let Some((record, terminal)) = stopped {
-                let mut job = JobStatusView::from(&record);
-                job.job_id = job_id;
-                return PreparedResponse::new(JobResponse::Cancelled { job, terminal });
+            match cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await {
+                Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
+                    stopped = Some((record, true));
+                }
+                Ok(CancelJobOutcome::Requested(record)) => {
+                    stopped = Some((record, false));
+                }
+                Ok(CancelJobOutcome::NotFound) => {}
+                Err(error) => {
+                    return PreparedResponse::new(JobResponse::Unavailable(error));
+                }
             }
         }
-        Ok(true) => {}
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+        if let Some((record, terminal)) = stopped {
+            let mut job = JobStatusView::from(&record);
+            job.job_id = job_id;
+            return PreparedResponse::new(JobResponse::Cancelled { job, terminal });
+        }
+        if requested_family.is_some() {
+            // Availability, never a verdict: the caller keeps asking the holders
+            // its own view names instead of this node forwarding a second hop.
+            return PreparedResponse::new(JobResponse::Unavailable(
+                "this node does not hold the job family".to_string(),
+            ));
+        }
+        return local_cancel(context, runtime, auth.user_id, job_id).await;
     }
     // A forwarded cancel reaches a family holder here: it publishes the record
     // and then still stops its own local execution row if it has one.
@@ -571,7 +582,16 @@ async fn prepare_cancel(
         }
         None => {}
     }
-    let user_id = auth.user_id;
+    local_cancel(context, runtime, auth.user_id, job_id).await
+}
+
+/// Stops the local execution row of one job, whatever the family decided.
+async fn local_cancel(
+    context: &DriverContext,
+    runtime: &Arc<JobsRuntime>,
+    user_id: UserId,
+    job_id: JobId,
+) -> PreparedResponse {
     let response = match cancel_owned_job(context, runtime, user_id, job_id).await {
         Ok(CancelJobOutcome::NotFound) => JobResponse::NotFound,
         Ok(CancelJobOutcome::AlreadyTerminal(record)) => JobResponse::Cancelled {
