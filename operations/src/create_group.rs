@@ -41,6 +41,10 @@ pub struct CreateGroupConfig {
     pub owner_cap: Option<u32>,
 }
 
+/// Presence refreshes, node-info heartbeats and placement timers write while a
+/// create is in flight; a caller must not see their SSI conflict as a 409.
+const CONFLICT_RETRIES: u8 = 5;
+
 #[derive(PartialEq)]
 pub struct CreateGroupOperation {
     config: CreateGroupConfig,
@@ -52,6 +56,7 @@ pub struct CreateGroupOperation {
     fence: crate::placement::fence::WriteFence,
     state: CreateGroupState,
     txn_id: Option<Ulid>,
+    conflicts: u8,
     output: Option<Result<(Group, GroupAuthorizationDocument), CreateGroupError>>,
 }
 
@@ -78,6 +83,7 @@ impl CreateGroupOperation {
             fence: Default::default(),
             state: CreateGroupState::Init,
             txn_id: None,
+            conflicts: 0,
             output: None,
         }
     }
@@ -310,10 +316,28 @@ impl CreateGroupOperation {
     #[tracing::instrument(name = "group.create.fail_on_storage_error", level = "trace", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
+            if matches!(error, StorageError::TransactionConflict)
+                && self.conflicts < CONFLICT_RETRIES
+            {
+                return Err(self.restart_after_conflict());
+            }
             return Err(self.fail(error.into()));
         }
 
         Ok(event)
+    }
+
+    /// A conflicting transaction is already rolled back, so the retry opens a
+    /// fresh one and rebuilds every value that was read inside the old one.
+    #[tracing::instrument(name = "group.create.restart", level = "debug", skip(self), fields(state = ?self.state, conflicts = self.conflicts))]
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.txn_id = None;
+        self.group = None;
+        self.auth_doc = None;
+        self.realm_config = None;
+        self.fence = Default::default();
+        self.start()
     }
 
     #[tracing::instrument(name = "group.create.handle_start_transaction", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
@@ -708,6 +732,41 @@ mod test {
             .filter(|(candidate, _, _)| candidate == keyspace)
             .map(|(_, _, value)| value)
             .collect()
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        // A background writer's SSI conflict reopens the transaction; only an
+        // exhausted budget surfaces the conflict to the caller.
+        let realm_id = RealmId([3; 32]);
+        let actor = actor(realm_id, 1, 2);
+        let txn_id = Ulid::from_bytes([4; 16]);
+        let mut operation = operation_ready_to_schedule(actor, txn_id);
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: aruna_core::errors::StorageError::TransactionConflict,
+            })
+        };
+
+        for _ in 0..super::CONFLICT_RETRIES {
+            let effects = operation.step(conflict());
+            assert!(matches!(
+                effects.first(),
+                Some(Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                }))
+            ));
+            assert!(operation.txn_id.is_none());
+        }
+
+        let effects = operation.step(conflict());
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(super::CreateGroupError::StorageError(
+                aruna_core::errors::StorageError::TransactionConflict
+            ))
+        ));
     }
 
     fn operation_ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateGroupOperation {
