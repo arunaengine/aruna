@@ -2032,6 +2032,7 @@ mod tests {
         placement_policy_key,
     };
     use aruna_net::dht::storage::StoredEntry;
+    use aruna_operations::jobs::records::rows::PROJECTION_CACHE_VERSION;
     use aruna_operations::placement_policy::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
@@ -2350,6 +2351,7 @@ mod tests {
         assert!(matches!(decoded.value, DecodedValue::JobAliasTarget { .. }));
 
         let cache = ProjectionCache {
+            version: PROJECTION_CACHE_VERSION,
             revision: 4,
             stale: true,
             projection: None,

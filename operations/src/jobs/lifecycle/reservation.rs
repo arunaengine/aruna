@@ -418,13 +418,12 @@ impl Operation for ReserveExecutionOperation {
             },
             ReserveState::ReadCache { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.cache = value.as_ref().and_then(|value| {
-                        from_bytes::<ProjectionCache>(value)
-                            .inspect_err(
-                                |error| warn!(error = %error, "Job projection cache is undecodable"),
-                            )
-                            .ok()
-                    });
+                    self.cache = value
+                        .as_ref()
+                        .and_then(|value| ProjectionCache::decode(value));
+                    if value.is_some() && self.cache.is_none() {
+                        warn!("Job projection cache is unreadable");
+                    }
                     self.write(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),

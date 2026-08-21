@@ -34,7 +34,7 @@ use super::witness::arm_family;
 use super::{LifecycleError, ids};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};
-use crate::jobs::records::rows::{ProjectionCache, from_bytes};
+use crate::jobs::records::rows::ProjectionCache;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::service::{mint_local_job, validate_execution};
@@ -374,8 +374,8 @@ async fn admit_here(
 
 /// The state this holder currently reduces for `family`. The cached projection
 /// answers when it is current; otherwise the family is reduced once from its own
-/// records. A family this node cannot reduce is reported as indeterminate rather
-/// than as freshly queued work.
+/// records. A family this node cannot fully reduce, including one too large to
+/// project at once, is reported as indeterminate rather than as queued work.
 async fn observed_state(context: &DriverContext, family: JobFamilyId) -> LogicalJobState {
     let cached = match cached_projection(context, &family).await {
         Ok(cached) => cached,
@@ -396,6 +396,10 @@ async fn observed_state(context: &DriverContext, family: JobFamilyId) -> Logical
         )
         .await
         {
+            Ok(projected) if projected.truncated => {
+                warn!("Replayed submission reduced only part of its family");
+                None
+            }
             Ok(projected) => projected.projection,
             Err(error) => {
                 warn!(error = %error, "Replayed submission could not reduce its family");
@@ -423,7 +427,7 @@ async fn cached_projection(
     .await?;
     Ok(page
         .first()
-        .and_then(|(_, value)| from_bytes::<ProjectionCache>(value).ok()))
+        .and_then(|(_, value)| ProjectionCache::decode(value)))
 }
 
 /// Admission transactions one submission runs before it reports the group as
@@ -757,6 +761,7 @@ mod tests {
         state: LogicalJobState,
     ) {
         let cache = ProjectionCache {
+            version: crate::jobs::records::rows::PROJECTION_CACHE_VERSION,
             revision: 1,
             stale: false,
             projection: Some(aruna_core::structs::JobProjection {

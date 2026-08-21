@@ -242,11 +242,11 @@ async fn nonterminal_family(
     value: &Value,
 ) -> Result<Option<JobFamilyId>, String> {
     let family = projection_family(key)?;
-    let cache = from_bytes::<ProjectionCache>(value.as_ref()).ok();
+    let cache = ProjectionCache::decode(value.as_ref());
     let projection = match cache {
         Some(cache) if !cache.stale => cache.projection,
         _ => {
-            drive(
+            let projected = drive(
                 ProjectFamilyOperation::new(ProjectFamilyConfig {
                     family: FamilyRef::Family(family),
                     now_ms: unix_timestamp_millis(),
@@ -255,8 +255,13 @@ async fn nonterminal_family(
                 ctx,
             )
             .await
-            .map_err(|error| error.to_string())?
-            .projection
+            .map_err(|error| error.to_string())?;
+            // A truncated projection proves nothing about the terminal state, so
+            // the family keeps counting as demand (overshoot is the safe side).
+            if projected.truncated {
+                return Ok(Some(family));
+            }
+            projected.projection
         }
     };
     let Some(projection) = projection else {
@@ -1562,6 +1567,7 @@ mod tests {
         state: LogicalJobState,
     ) {
         let cache = ProjectionCache {
+            version: crate::jobs::records::rows::PROJECTION_CACHE_VERSION,
             revision: 1,
             stale: false,
             projection: Some(aruna_core::structs::JobProjection {

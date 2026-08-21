@@ -52,6 +52,8 @@ pub struct ProjectedFamily {
     /// `None` while the family has no accepted alias yet.
     pub projection: Option<JobProjection>,
     /// True when the family holds more records than one projection may reduce.
+    /// Such a projection is partial: it is never bridged and never cached, so a
+    /// caller may inspect it but must not decide scheduling or admission on it.
     pub truncated: bool,
     pub cached: bool,
 }
@@ -130,21 +132,20 @@ impl ProjectFamilyOperation {
         })]
     }
 
-    fn keep_page(&mut self, values: Vec<(Key, Value)>) -> bool {
+    /// Keeps one page of records. A key or envelope this node cannot read is a
+    /// corrupt row, never a record to skip: projecting without it would reduce
+    /// a set that is silently short.
+    fn keep_page(&mut self, values: Vec<(Key, Value)>) -> Result<bool, RecordStoreError> {
         let full = values.len() >= RECORD_PAGE_SIZE;
         for (key, value) in values {
-            if let Ok(record_key) = JobRecordKey::from_bytes(&key) {
-                self.cursor = Some(record_key);
-            }
-            if let Ok(envelope) = from_bytes::<JobRecordEnvelope>(&value) {
-                self.records.push(envelope);
-            }
+            self.cursor = Some(JobRecordKey::from_bytes(&key)?);
+            self.records.push(from_bytes::<JobRecordEnvelope>(&value)?);
         }
         if self.records.len() >= MAX_PROJECTION_RECORDS {
             self.truncated = true;
-            return false;
+            return Ok(false);
         }
-        full
+        Ok(full)
     }
 
     /// Reduces the loaded records, then reads the local rows of every alias the
@@ -157,6 +158,11 @@ impl ProjectFamilyOperation {
             Ok(projection) => projection,
             Err(error) => return self.fail(error.into()),
         };
+        // A truncated projection is partial: it is neither bridged into the
+        // mutable rows nor cached, so a later read reduces the family again.
+        if self.truncated {
+            return self.commit(txn_id);
+        }
         let reads: Vec<(String, Key)> = self
             .projection
             .iter()
@@ -230,11 +236,7 @@ impl ProjectFamilyOperation {
         let cache = self
             .cache
             .clone()
-            .unwrap_or(ProjectionCache {
-                revision: 0,
-                stale: true,
-                projection: None,
-            })
+            .unwrap_or_else(|| ProjectionCache::invalidated(None))
             .updated(self.projection.clone());
         let bytes = match to_bytes(&cache) {
             Ok(bytes) => bytes,
@@ -315,10 +317,16 @@ impl ProjectFamilyOperation {
         smallvec![]
     }
 
+    /// Fails the projection, rolling back an open transaction so a partial
+    /// rebuild never replaces the cached projection or the local job rows.
     fn fail(&mut self, error: RecordStoreError) -> Effects {
         self.outcome = Some(Err(error));
+        let open = self.txn();
         self.state = ProjectState::Error;
-        smallvec![]
+        match open {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
     }
 
     fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
@@ -381,7 +389,7 @@ impl Operation for ProjectFamilyOperation {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.cache = value
                         .as_ref()
-                        .and_then(|value| from_bytes::<ProjectionCache>(value).ok());
+                        .and_then(|value| ProjectionCache::decode(value));
                     let fresh = self
                         .cache
                         .as_ref()
@@ -409,8 +417,9 @@ impl Operation for ProjectFamilyOperation {
             ProjectState::Page { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     match self.keep_page(values) {
-                        true => self.page(txn_id),
-                        false => self.reduce(txn_id),
+                        Ok(true) => self.page(txn_id),
+                        Ok(false) => self.reduce(txn_id),
+                        Err(error) => self.fail(error),
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),

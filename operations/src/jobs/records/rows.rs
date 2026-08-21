@@ -43,10 +43,16 @@ pub struct ConflictRecord {
     pub relayed_by: Option<NodeId>,
 }
 
+/// Row format this build writes and reads. A row tagged otherwise is a row this
+/// build cannot read, which only forces a rebuild.
+pub const PROJECTION_CACHE_VERSION: u16 = 1;
+
 /// Derived per-family projection with its bounded revision. It is a cache: a
 /// missing, stale, or undecodable row only forces a rebuild from the records.
+/// A truncated projection is never stored, so a fresh row is always complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionCache {
+    pub version: u16,
     pub revision: u64,
     pub stale: bool,
     pub projection: Option<JobProjection>,
@@ -57,6 +63,7 @@ impl ProjectionCache {
     /// revision, so a client can still tell that its view changed.
     pub fn invalidated(previous: Option<&Self>) -> Self {
         Self {
+            version: PROJECTION_CACHE_VERSION,
             revision: previous.map_or(0, |cache| cache.revision),
             stale: true,
             projection: previous.and_then(|cache| cache.projection.clone()),
@@ -65,10 +72,18 @@ impl ProjectionCache {
 
     pub fn updated(&self, projection: Option<JobProjection>) -> Self {
         Self {
+            version: PROJECTION_CACHE_VERSION,
             revision: self.revision.saturating_add(1),
             stale: false,
             projection,
         }
+    }
+
+    /// Reads a stored row, discarding one this build did not write.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        from_bytes::<Self>(bytes)
+            .ok()
+            .filter(|cache| cache.version == PROJECTION_CACHE_VERSION)
     }
 }
 
