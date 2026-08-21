@@ -80,8 +80,9 @@ impl DemandFamily {
 pub struct DemandGroup {
     pub group_id: GroupId,
     pub families: Vec<DemandFamily>,
-    /// The publisher holds more nonterminal families than one snapshot reports,
-    /// so the merged view understates this group instead of guessing.
+    /// This group holds more nonterminal families than the snapshot names, so
+    /// the merged view understates it instead of guessing. It is set per group:
+    /// a busy group never marks a quiet one.
     pub truncated: bool,
 }
 
@@ -92,6 +93,8 @@ pub struct DemandGroup {
 pub struct ComputeDemandSnapshot {
     pub epoch: AdvertisementEpoch,
     pub groups: Vec<DemandGroup>,
+    /// Whole groups this snapshot could not name. A group it does name is
+    /// complete unless that group carries its own truncation.
     pub truncated: bool,
 }
 
@@ -176,8 +179,9 @@ pub fn merge_demand<'a>(
     let mut totals = ResourceTotals::default();
     let mut truncated = false;
     for snapshot in snapshots {
-        truncated |= snapshot.truncated;
         let Some(group) = snapshot.group(group_id) else {
+            // Only a snapshot that dropped whole groups may be hiding this one.
+            truncated |= snapshot.truncated;
             continue;
         };
         truncated |= group.truncated;
@@ -188,6 +192,47 @@ pub fn merge_demand<'a>(
         }
     }
     (totals, truncated)
+}
+
+/// Bounds one publisher's own demand to what a snapshot may report: at most
+/// [`MAX_DEMAND_GROUPS`] groups sharing [`MAX_DEMAND_FAMILIES`] families. The
+/// budget is handed out one family per group per round, so a busy group cannot
+/// truncate a quiet one, and only a group whose own families were cut is
+/// flagged. The returned bool reports groups the snapshot names nowhere.
+pub fn bound_demand(groups: &mut Vec<DemandGroup>) -> bool {
+    let dropped = groups.len() > MAX_DEMAND_GROUPS;
+    groups.truncate(MAX_DEMAND_GROUPS);
+    let counts: Vec<usize> = groups.iter().map(|group| group.families.len()).collect();
+    for (group, share) in groups
+        .iter_mut()
+        .zip(fair_shares(&counts, MAX_DEMAND_FAMILIES))
+    {
+        group.truncated |= group.families.len() > share;
+        group.families.truncate(share);
+    }
+    dropped
+}
+
+/// Water-fills `budget` over `counts`: every round hands one unit to each entry
+/// that still wants one.
+fn fair_shares(counts: &[usize], budget: usize) -> Vec<usize> {
+    let mut shares = vec![0usize; counts.len()];
+    let mut left = budget;
+    let mut filling = true;
+    while left > 0 && filling {
+        filling = false;
+        for (share, count) in shares.iter_mut().zip(counts) {
+            if left == 0 {
+                break;
+            }
+            if *share < *count {
+                *share += 1;
+                left -= 1;
+                filling = true;
+            }
+        }
+    }
+    shares
 }
 
 /// Ranking-only availability of one backend: its static ceilings minus what this
@@ -320,6 +365,47 @@ pub fn admits(
     )
 }
 
+/// Refusal of a new admission whose group demand view is understated: nothing
+/// below the cap can be shown, so the group is treated as standing at its first
+/// configured group cap. `None` when the quota caps nothing group-scoped, since
+/// such a quota never reads the demand view at all.
+pub fn understated_denial(
+    quota: &ComputeQuota,
+    request: &EffectiveResources,
+) -> Option<QuotaDenied> {
+    let (dimension, limit, requested) = quota
+        .max_jobs
+        .map(|limit| (QuotaDimension::Jobs, u64::from(limit), 1))
+        .or_else(|| {
+            quota.max_cpu_cores.map(|limit| {
+                (
+                    QuotaDimension::CpuCores,
+                    limit,
+                    u64::from(request.cpu_cores),
+                )
+            })
+        })
+        .or_else(|| {
+            quota
+                .max_ram_bytes
+                .map(|limit| (QuotaDimension::RamBytes, limit, request.ram_bytes))
+        })
+        .or_else(|| {
+            quota
+                .max_disk_bytes
+                .map(|limit| (QuotaDimension::DiskBytes, limit, request.disk_bytes))
+        })?;
+    // `observed` is reported at the cap: an understated view stands behind no
+    // smaller number.
+    Some(QuotaDenied {
+        scope: QuotaScope::Group,
+        dimension,
+        observed: limit,
+        requested,
+        limit,
+    })
+}
+
 fn per_job(
     limit: Option<u64>,
     requested: u64,
@@ -421,6 +507,105 @@ mod tests {
         snapshot.groups.clear();
         snapshot.truncated = true;
         assert!(merge_demand([&snapshot], &group_id).1);
+    }
+
+    #[test]
+    fn truncation_stays_local() {
+        // One busy group may not understate an unrelated group's merged view.
+        let busy = Ulid::from_bytes([1; 16]);
+        let quiet = Ulid::from_bytes([2; 16]);
+        let mut published = ComputeDemandSnapshot {
+            epoch: AdvertisementEpoch::default(),
+            truncated: false,
+            groups: vec![
+                DemandGroup {
+                    group_id: busy,
+                    families: vec![family(1, 2)],
+                    truncated: true,
+                },
+                DemandGroup {
+                    group_id: quiet,
+                    families: vec![family(2, 2)],
+                    truncated: false,
+                },
+            ],
+        };
+
+        assert!(merge_demand([&published], &busy).1);
+        assert!(!merge_demand([&published], &quiet).1);
+
+        // Dropped groups only understate a group the snapshot never names.
+        published.truncated = true;
+        assert!(!merge_demand([&published], &quiet).1);
+        assert!(merge_demand([&published], &Ulid::from_bytes([9; 16])).1);
+    }
+
+    #[test]
+    fn shares_family_budget() {
+        // A group that overflows the shared budget is flagged alone, and the
+        // quiet group keeps the family it reported.
+        let mut groups = vec![
+            DemandGroup {
+                group_id: Ulid::from_bytes([1; 16]),
+                families: (0..=MAX_DEMAND_FAMILIES)
+                    .map(|index| DemandFamily {
+                        submission_id: SubmissionId([1; 32]),
+                        request_digest: [(index % 256) as u8; 32],
+                        resources: resources(1, 0),
+                    })
+                    .collect(),
+                truncated: false,
+            },
+            DemandGroup {
+                group_id: Ulid::from_bytes([2; 16]),
+                families: vec![family(3, 1)],
+                truncated: false,
+            },
+        ];
+
+        assert!(!bound_demand(&mut groups));
+
+        assert!(groups[0].truncated);
+        assert!(!groups[1].truncated);
+        assert_eq!(groups[1].families.len(), 1);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.families.len())
+                .sum::<usize>(),
+            MAX_DEMAND_FAMILIES
+        );
+    }
+
+    #[test]
+    fn drops_extra_groups() {
+        let mut groups: Vec<DemandGroup> = (0..=MAX_DEMAND_GROUPS)
+            .map(|index| DemandGroup {
+                group_id: Ulid::from_bytes([index as u8; 16]),
+                families: Vec::new(),
+                truncated: false,
+            })
+            .collect();
+
+        assert!(bound_demand(&mut groups));
+        assert_eq!(groups.len(), MAX_DEMAND_GROUPS);
+    }
+
+    #[test]
+    fn understated_denies_group() {
+        // A view that cannot show the cap holds refuses at the cap itself.
+        let denied = understated_denial(&quota(), &resources(2, 0)).expect("group cap denies");
+        assert_eq!(denied.scope, QuotaScope::Group);
+        assert_eq!(denied.dimension, QuotaDimension::Jobs);
+        assert_eq!(denied.observed, 2);
+        assert_eq!(denied.limit, 2);
+        assert_eq!(denied.requested, 1);
+
+        let per_job_only = ComputeQuota {
+            max_job_cpu_cores: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(understated_denial(&per_job_only, &resources(2, 0)), None);
     }
 
     #[test]
