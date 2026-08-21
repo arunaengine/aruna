@@ -8,11 +8,14 @@
 //! error instead.
 
 use aruna_core::effects::JobRecordFrame;
+use aruna_core::errors::StorageError;
+use aruna_core::keyspaces::{JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    AuthContext, ExecutionSpec, JobAdmissionRecord, JobFamilyRecord, JobId, JobInputFact,
-    JobRecordEnvelope, JobRetryPolicy, LogicalJobSpec, OutputDestination, Permission,
-    RealmConfigDocument, SubmissionClaim, SubmissionId, WorkspaceMode, blob_group_permission_path,
+    AuthContext, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
+    JobInputFact, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec,
+    LogicalJobState, OutputDestination, Permission, RealmConfigDocument, SubmissionClaim,
+    SubmissionId, WorkspaceMode, blob_group_permission_path,
 };
 use aruna_core::types::{NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -21,14 +24,19 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::admit::{AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation};
+use super::admit::{
+    AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission,
+};
 use super::ids::{
     RequestIdentity, SubmissionRequest, SubmissionScope, effective_resources, seal_workspace,
 };
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
 use crate::driver::{DriverContext, drive};
+use crate::jobs::records::keys::{family_prefix, kind_prefix};
+use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::verify::FamilyView;
+use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
@@ -51,6 +59,10 @@ pub struct AcceptedSubmission {
     /// False when a matching claim already existed.
     pub created: bool,
     pub submission_id: SubmissionId,
+    /// The family's state at this accept: `Queued` for a fresh admission, and
+    /// what this holder currently reduces for a replay of a request that may
+    /// already be running or finished.
+    pub state: LogicalJobState,
 }
 
 /// The holder's answer to a forwarded submission.
@@ -58,6 +70,7 @@ pub struct AcceptedSubmission {
 pub struct SubmissionAck {
     pub job_id: JobId,
     pub created: bool,
+    pub state: LogicalJobState,
 }
 
 /// Why a holder did not accept a forwarded submission. Only a definitive
@@ -120,12 +133,7 @@ pub async fn submit_external_job(
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
     let view = family_view(&config, &identity)?;
     if view.holds(local) {
-        let admitted = admit_here(context, &request, &identity, &config, local).await?;
-        return Ok(AcceptedSubmission {
-            job_id: admitted.0,
-            created: admitted.1,
-            submission_id: identity.submission_id,
-        });
+        return admit_here(context, &request, &identity, &config, local).await;
     }
     forward_once(context, &request, &identity, &view, local, auth_token).await
 }
@@ -271,13 +279,16 @@ fn family_view(
 }
 
 /// Mints the alias, signs the immutable spec and its claim, and commits them.
+/// The alias it answers with is the canonical one at this accept: a fresh
+/// admission holds the only claim, and a replay settles on the claim the family
+/// already reduces as canonical.
 async fn admit_here(
     context: &DriverContext,
     request: &SubmissionRequest,
     identity: &RequestIdentity,
     config: &RealmConfigDocument,
     local: NodeId,
-) -> Result<(JobId, bool), SubmitJobError> {
+) -> Result<AcceptedSubmission, SubmitJobError> {
     let now_ms = unix_timestamp_millis();
     let placement = config
         .family_placement(identity.submission_id)
@@ -338,39 +349,156 @@ async fn admit_here(
         JobFamilyRecord::Spec(Box::new(spec)),
     )?;
     let claim_frame = sign_frame(context, config.realm_id, JobFamilyRecord::Claim(claim))?;
-    let (quota_refusal, quota_revision) = crate::jobs::quota::quota_refusal(
-        context,
-        config,
-        local,
-        request.spec.group_id,
-        &effective_resources(&request.spec),
-    )
-    .await
-    .map_err(SubmitJobError::PlacementUnavailable)?;
-    let admitted = drive(
-        AdmitSubmissionOperation::new(AdmitSubmissionConfig {
-            realm_id: config.realm_id,
-            local_node_id: local,
-            submission_id: identity.submission_id,
-            request_digest: identity.request_digest,
-            candidate: Box::new(AdmissionCandidate {
-                job_id,
-                spec: spec_frame,
-                claim: claim_frame,
-            }),
-            now_ms,
-            quota_refusal,
-            quota_revision,
-        }),
-        context,
-    )
-    .await
-    .map_err(admission_error)?;
+    let candidate = AdmissionCandidate {
+        job_id,
+        spec: spec_frame,
+        claim: claim_frame,
+    };
+    let admitted =
+        admit_with_quota(context, config, local, request, identity, candidate, now_ms).await?;
+    let state = match admitted.created {
+        true => LogicalJobState::Queued,
+        false => observed_state(context, admitted.family).await,
+    };
     // Scheduling and replication are armed only after the claim is durable, so
     // a failed commit never leaves a round pointing at a family that is absent.
     arm_family(context, identity.family(), now_ms).await;
     super::outbox::kick(context).await;
-    Ok((admitted.job_id, admitted.created))
+    Ok(AcceptedSubmission {
+        job_id: admitted.job_id,
+        created: admitted.created,
+        submission_id: identity.submission_id,
+        state,
+    })
+}
+
+/// The state this holder currently reduces for `family`. The cached projection
+/// answers when it is current; otherwise the family is reduced once from its own
+/// records. A family this node cannot reduce is reported as indeterminate rather
+/// than as freshly queued work.
+async fn observed_state(context: &DriverContext, family: JobFamilyId) -> LogicalJobState {
+    let cached = match cached_projection(context, &family).await {
+        Ok(cached) => cached,
+        Err(error) => {
+            warn!(error = %error, "Replayed submission could not read its projection cache");
+            None
+        }
+    };
+    let projection = match cached {
+        Some(cache) if !cache.stale => cache.projection,
+        _ => match drive(
+            ProjectFamilyOperation::new(ProjectFamilyConfig {
+                family: FamilyRef::Family(family),
+                now_ms: unix_timestamp_millis(),
+                rebuild: false,
+            }),
+            context,
+        )
+        .await
+        {
+            Ok(projected) => projected.projection,
+            Err(error) => {
+                warn!(error = %error, "Replayed submission could not reduce its family");
+                None
+            }
+        },
+    };
+    projection.map_or(LogicalJobState::Indeterminate, |projection| {
+        projection.state
+    })
+}
+
+async fn cached_projection(
+    context: &DriverContext,
+    family: &JobFamilyId,
+) -> Result<Option<ProjectionCache>, String> {
+    let (page, _) = crate::jobs::store::iter_prefix_page(
+        &context.storage_handle,
+        JOB_FAMILY_PROJECTION_KEYSPACE,
+        Some(family_prefix(family)),
+        None,
+        1,
+        None,
+    )
+    .await?;
+    Ok(page
+        .first()
+        .and_then(|(_, value)| from_bytes::<ProjectionCache>(value).ok()))
+}
+
+/// Admission transactions one submission runs before it reports the group as
+/// unavailable. Only a conflict with a concurrent admission is retried.
+const ADMISSION_ATTEMPTS: usize = 3;
+
+/// Decides the standing quota and commits the admission. A replay is settled
+/// from records this node already holds, so it never reads the quota view, and
+/// a transaction a concurrent submission of the same group won is retried
+/// instead of surfacing as an availability failure.
+async fn admit_with_quota(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    request: &SubmissionRequest,
+    identity: &RequestIdentity,
+    candidate: AdmissionCandidate,
+    now_ms: u64,
+) -> Result<AdmittedSubmission, SubmitJobError> {
+    for attempt in 0..ADMISSION_ATTEMPTS {
+        let (quota_refusal, quota_revision) = match has_claim(context, &identity.family()).await? {
+            true => (None, None),
+            false => crate::jobs::quota::quota_refusal(
+                context,
+                config,
+                local,
+                request.spec.group_id,
+                &effective_resources(&request.spec),
+            )
+            .await
+            .map_err(SubmitJobError::PlacementUnavailable)?,
+        };
+        let admitted = drive(
+            AdmitSubmissionOperation::new(AdmitSubmissionConfig {
+                realm_id: config.realm_id,
+                local_node_id: local,
+                submission_id: identity.submission_id,
+                request_digest: identity.request_digest,
+                candidate: Box::new(candidate.clone()),
+                now_ms,
+                quota_refusal,
+                quota_revision,
+            }),
+            context,
+        )
+        .await;
+        match admitted {
+            Ok(admitted) => return Ok(admitted),
+            Err(LifecycleError::Storage(StorageError::TransactionConflict))
+                if attempt + 1 < ADMISSION_ATTEMPTS =>
+            {
+                debug!(group_id = %request.spec.group_id, "Retrying an admission a concurrent one won");
+            }
+            Err(error) => return Err(admission_error(error)),
+        }
+    }
+    Err(SubmitJobError::PlacementUnavailable(
+        "admission exhausted conflict retries".to_string(),
+    ))
+}
+
+/// Whether this node already holds a claim for `family`, which makes the
+/// admission a replay that settles inside its own transaction.
+async fn has_claim(context: &DriverContext, family: &JobFamilyId) -> Result<bool, SubmitJobError> {
+    let (page, _) = crate::jobs::store::iter_prefix_page(
+        &context.storage_handle,
+        JOB_FAMILY_RECORD_KEYSPACE,
+        Some(kind_prefix(family, JobRecordKind::Claim)),
+        None,
+        1,
+        None,
+    )
+    .await
+    .map_err(SubmitJobError::PlacementUnavailable)?;
+    Ok(!page.is_empty())
 }
 
 fn sign_frame(
@@ -434,6 +562,7 @@ async fn forward_once(
                     job_id: ack.job_id,
                     created: ack.created,
                     submission_id: identity.submission_id,
+                    state: ack.state,
                 });
             }
             MetadataTransportMessage::ForwardedJobSubmission {
@@ -535,7 +664,11 @@ async fn admit_forwarded(
         return Err(SubmissionRefusal::NotHolder);
     }
     match admit_here(context, &request, &identity, &config, local).await {
-        Ok((job_id, created)) => Ok(SubmissionAck { job_id, created }),
+        Ok(accepted) => Ok(SubmissionAck {
+            job_id: accepted.job_id,
+            created: accepted.created,
+            state: accepted.state,
+        }),
         Err(SubmitJobError::JobPlanConflict { existing_job_id }) => {
             Err(SubmissionRefusal::Conflict { existing_job_id })
         }
@@ -561,4 +694,149 @@ async fn authorize_group(
         PolicyRequestExtras::rest(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::structs::RealmId;
+    use aruna_core::types::Key;
+    use aruna_storage::FjallStorage;
+    use tempfile::tempdir;
+
+    fn family(seed: u8) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: SubmissionId([seed; 32]),
+            request_digest: [seed; 32],
+        }
+    }
+
+    fn test_ctx(root: &str) -> DriverContext {
+        DriverContext {
+            storage_handle: FjallStorage::open(root).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    async fn write_claim(context: &DriverContext, realm_id: RealmId, family: JobFamilyId) {
+        let job_id = JobId::from_bytes([7u8; 16]);
+        let claim = SubmissionClaim {
+            submission_id: family.submission_id,
+            job_id,
+            request_digest: family.request_digest,
+            spec_digest: [0u8; 32],
+            committing_node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            accepted_at_ms: 1,
+        };
+        let envelope = JobRecordEnvelope::sign(
+            realm_id,
+            JobFamilyRecord::Claim(claim),
+            &iroh::SecretKey::from_bytes(&[1u8; 32]),
+        )
+        .expect("record signs");
+        let mut key = kind_prefix(&family, JobRecordKind::Claim).to_vec();
+        key.extend_from_slice(&[0u8; 40]);
+        write_row(
+            context,
+            JOB_FAMILY_RECORD_KEYSPACE,
+            Key::from(key.as_slice()),
+            postcard::to_allocvec(&envelope).unwrap(),
+        )
+        .await;
+    }
+
+    async fn write_projection(
+        context: &DriverContext,
+        family: JobFamilyId,
+        state: LogicalJobState,
+    ) {
+        let cache = ProjectionCache {
+            revision: 1,
+            stale: false,
+            projection: Some(aruna_core::structs::JobProjection {
+                submission_id: family.submission_id,
+                request_digest: family.request_digest,
+                canonical_job_id: JobId::from_bytes([7u8; 16]),
+                aliases: Vec::new(),
+                state,
+                canonical_execution_id: None,
+                executions: Vec::new(),
+                outputs: aruna_core::structs::OutputSet::new(Vec::new()).expect("empty outputs"),
+                cancel_requested: false,
+            }),
+        };
+        write_row(
+            context,
+            JOB_FAMILY_PROJECTION_KEYSPACE,
+            family_prefix(&family),
+            postcard::to_allocvec(&cache).unwrap(),
+        )
+        .await;
+    }
+
+    async fn write_row(context: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_skips_quota() {
+        // A family this node already claimed is a replay: the admission settles
+        // from its own records, so no quota view is read for it.
+        let dir = tempdir().unwrap();
+        let context = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+
+        assert!(!has_claim(&context, &family(1)).await.unwrap());
+
+        write_claim(&context, realm_id, family(1)).await;
+
+        assert!(has_claim(&context, &family(1)).await.unwrap());
+        assert!(!has_claim(&context, &family(2)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn replay_reports_state() {
+        // A replay answers with the family's observed state, so a request that
+        // is already running or finished is never reported as freshly queued.
+        let dir = tempdir().unwrap();
+        let context = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        write_claim(&context, realm_id, family(1)).await;
+
+        write_projection(&context, family(1), LogicalJobState::Running).await;
+        assert_eq!(
+            observed_state(&context, family(1)).await,
+            LogicalJobState::Running
+        );
+
+        write_projection(&context, family(1), LogicalJobState::Succeeded).await;
+        assert_eq!(
+            observed_state(&context, family(1)).await,
+            LogicalJobState::Succeeded
+        );
+
+        // A family this node cannot reduce is indeterminate, never queued.
+        assert_eq!(
+            observed_state(&context, family(2)).await,
+            LogicalJobState::Indeterminate
+        );
+    }
 }
