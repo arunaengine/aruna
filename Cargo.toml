@@ -199,3 +199,9 @@ zip = { version = "8.6.0", default-features = false }
 
 [profile.release]
 panic = "abort"
+
+# Tests spin up real multi-node clusters, so unoptimized dependencies dominate
+# their runtime; workspace crates stay at opt-level 0 for compile speed and
+# coverage fidelity.
+[profile.dev.package."*"]
+opt-level = 3
