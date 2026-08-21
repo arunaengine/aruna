@@ -254,7 +254,7 @@ pub async fn upload_rocrate(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is a path-restricted delegated token, names another user's upload, or lacks READ on the source or WRITE on the target bucket or metadata path", body = ErrorResponse),
         (status = 404, description = "The upload, source object or version, connector source, or target bucket does not exist", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is already bound to a different plan, the upload is already claimed by another job, or the caller's active-job cap is reached", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is already bound to a different plan, the upload is already claimed by another job, the caller's active-job cap is reached, or the group's standing compute quota refuses this admission; a quota refusal carries the exact scope, dimension and numbers in `quota`", body = ErrorResponse),
         (status = 503, description = "The job could not be placed right now; the response carries Retry-After and the caller may retry the unchanged request", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

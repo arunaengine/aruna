@@ -300,7 +300,7 @@ impl IntoResponse for ServerError {
 }
 
 impl ServerError {
-    fn status_code(&self) -> StatusCode {
+    pub(crate) fn status_code(&self) -> StatusCode {
         match self {
             ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,
             ServerError::NotFound => StatusCode::NOT_FOUND,
@@ -344,7 +344,7 @@ impl ServerError {
         }
     }
 
-    fn public_message(&self) -> String {
+    pub(crate) fn public_message(&self) -> String {
         match self {
             ServerError::InternalError(_) => "Internal server error".to_string(),
             ServerError::BadGateway => "Bad gateway".to_string(),

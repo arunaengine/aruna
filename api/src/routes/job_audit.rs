@@ -25,7 +25,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::jobs::{JobOutputResponse, map_job_route, output_response, parse_job_id};
+use super::jobs::{JobOutputResponse, hex32, map_job_route, output_response, parse_job_id};
 use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
@@ -109,10 +109,6 @@ pub struct JobAuditResponse {
     pub partial: bool,
 }
 
-fn hex32(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn parse_range(scope: Option<&str>) -> ServerResult<(AuditRange, &'static str)> {
     match scope {
         None | Some("family") => Ok((AuditRange::Family, "family")),
@@ -140,10 +136,8 @@ fn audit_record(
     family_digest: &[u8; 32],
     canonical: JobId,
     output_endpoints: &BTreeMap<NodeId, String>,
-) -> ServerResult<Option<JobAuditRecord>> {
-    let Some(digest) = envelope.record.digest().ok().map(|digest| hex32(&digest)) else {
-        return Ok(None);
-    };
+) -> Option<JobAuditRecord> {
+    let digest = envelope.record.digest().ok().map(|digest| hex32(&digest))?;
     let record_family = envelope.family();
     let mut record = JobAuditRecord {
         kind: kind_name(&envelope.record).to_string(),
@@ -198,19 +192,13 @@ fn audit_record(
         JobFamilyRecord::Output(output) => {
             record.job_id = Some(output.job_id.to_string());
             record.execution_id = Some(output.execution_id.to_string());
+            // An unknown endpoint must not withhold the audited record itself.
             record.outputs = output
                 .outputs
                 .as_slice()
                 .iter()
-                .map(|output| {
-                    let endpoint = output_endpoints.get(&output.node_id).ok_or_else(|| {
-                        ServerError::ServiceUnavailableReason(
-                            "output storage endpoint is unavailable".to_string(),
-                        )
-                    })?;
-                    Ok(output_response(output, endpoint))
-                })
-                .collect::<ServerResult<Vec<_>>>()?;
+                .map(|output| output_response(output, output_endpoints.get(&output.node_id)))
+                .collect();
             record.at_ms = output.committed_at_ms;
         }
         JobFamilyRecord::Cancel(cancel) => {
@@ -219,7 +207,7 @@ fn audit_record(
             record.at_ms = cancel.requested_at_ms;
         }
     }
-    Ok(Some(record))
+    Some(record)
 }
 
 fn kind_name(record: &JobFamilyRecord) -> &'static str {
@@ -240,7 +228,7 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
     path = "/jobs/{job_id}/audit",
     tag = "jobs",
     summary = "Page the immutable records of one external job",
-    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Reads are self-scoped: only the submitter of the request may audit it, and any other id answers 404, so the surface never confirms that somebody else's job exists. The page is ordered by stable record key, never by arrival, and it exposes every alternative execution and every output that any partition produced, not only the canonical one: at-least-once execution means duplicates are normal and stay auditable forever. `scope=family` pages the request family the alias resolves to; `scope=submission` also pages the idempotency conflicts of the same submission, each record marked with `conflicting_family`. Records are projected, never returned raw: signatures, envelopes and the node identities of publishers, schedulers and executors are omitted. `conflicts` lists records refused under a key another record already held and is reported with the first page only. `partial` means this responder holds more records than one projection reduces, and the answer is this node's local view of a replicated log, so a later page may reveal records an earlier one could not.",
+    description = "Requires a realm bearer token; a path-restricted (delegated) token is refused. Reads are self-scoped: only the submitter of the request may audit it, and any other id answers 404, so the surface never confirms that somebody else's job exists. The page is ordered by stable record key, never by arrival, and it exposes every alternative execution and every output that any partition produced, not only the canonical one: at-least-once execution means duplicates are normal and stay auditable forever. `scope=family` pages the request family the alias resolves to; `scope=submission` also pages the idempotency conflicts of the same submission, each record marked with `conflicting_family`. Records are projected, never returned raw: signatures, envelopes and the node identities of publishers, schedulers and executors are omitted. `conflicts` lists records refused under a key another record already held and is reported with the first page only. `partial` means this responder holds more records than one projection reduces, and the answer is this node's local view of a replicated log, so a later page may reveal records an earlier one could not. An output whose owning node's S3 endpoint is not known here carries `endpoint_url: null` instead of withholding the record.",
     params(
         ("job_id" = String, Path, description = "Job identifier as returned by submission, or any accepted alias of the same request: a 26-character ULID-shaped id. An unparseable id is 404"),
         ("scope" = Option<String>, Query, description = "`family` (the default) pages the request family only; `submission` also pages other request families of the same submission. Any other value is 400"),
@@ -298,7 +286,8 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
         (status = 400, description = "Unknown `scope`, a cursor that is not a record key of this log, or a `limit` outside 1..=64", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
-        (status = 404, description = "No external job with that id is known at this responder, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable, and a responder that never held the family answers the same way, so page the node that accepted the submission", body = ErrorResponse)
+        (status = 404, description = "No external job with that id is known at this responder, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable, and a responder that never held the family answers the same way, so page the node that accepted the submission", body = ErrorResponse),
+        (status = 503, description = "The log could not be reduced here; retryable, the caller may page again", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -341,7 +330,7 @@ pub async fn get_job_audit(
             &report.request_digest,
             report.canonical_job_id,
             &output_endpoints,
-        )? {
+        ) {
             records.push(record);
         }
     }

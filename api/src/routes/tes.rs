@@ -463,7 +463,7 @@ pub async fn service_info(
     path = "/ga4gh/tes/v1/tasks",
     tag = "tes",
     summary = "Create a TES task",
-    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound the immutable output record carries; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id.",
+    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound the immutable output record carries; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id. Admission refusals carry the same status semantics as the native submit surface: a quota or composition refusal is a 409, an unusable input or workspace a 400, a refused routed authority a 403, and the retryable 503 is reserved for an unreachable family holder, a demand view that could not be read or did not settle, admission losing three transactions in a row to concurrent submissions of the same group, and an unhealthy id clock. A standing quota decided on an understated demand view is a 409 like an exceeded cap, and a replay of a known idempotency key is settled before any quota is read and is never quota-refused.",
     request_body(
         content = TesTask,
         description = "Task definition: one executor, s3:// inputs and outputs, and optional resources and tags",
@@ -502,10 +502,11 @@ pub async fn service_info(
             body = TesCreateTaskResponse,
             example = json!({"id": "01JABCDEF0123456789ABCDEFG"})
         ),
-        (status = 400, description = "Malformed task, or a TES feature this facade does not support", body = TesErrorPayload),
+        (status = 400, description = "Malformed task, a TES feature this facade does not support, an input that is not a readable object, or more outputs than a task may declare", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
-        (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, or a path restricted credential", body = TesErrorPayload),
-        (status = 409, description = "The idempotency key tag is already bound to a different task", body = TesErrorPayload)
+        (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, a path restricted credential, or a routed authority refusing the submission", body = TesErrorPayload),
+        (status = 409, description = "The idempotency key tag is already bound to a different task, the group's standing compute quota refuses this admission, or the composition conflicts on a staged key", body = TesErrorPayload),
+        (status = 503, description = "No family holder could admit the task, the group's demand view could not be read or did not settle, admission lost three transactions in a row to concurrent submissions, or the id clock is unhealthy; retryable, the caller may create the task again with the same idempotency key", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
@@ -571,20 +572,7 @@ pub async fn create_task(
                 id: result.job_id.to_string(),
             },
         ),
-        Err(aruna_operations::jobs::submit::SubmitJobError::JobPlanConflict {
-            existing_job_id,
-        }) => TesError::conflict(format!(
-            "idempotency key already bound to task {existing_job_id}"
-        ))
-        .into_response(),
-        Err(aruna_operations::jobs::submit::SubmitJobError::PlacementUnavailable(reason)) => {
-            TesError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!("task admission is unavailable: {reason}"),
-            }
-            .into_response()
-        }
-        Err(error) => TesError::internal(error.to_string()).into_response(),
+        Err(error) => TesError::from_submit(error).into_response(),
     }
 }
 
@@ -1683,13 +1671,6 @@ impl TesError {
         }
     }
 
-    fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-        }
-    }
-
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1702,8 +1683,17 @@ impl TesError {
             ServerError::Unauthorized => Self::unauthorized(),
             ServerError::Forbidden => Self::forbidden("forbidden"),
             ServerError::NotFound => Self::not_found("TES task not found"),
-            other => Self::internal(other.to_string()),
+            other => Self {
+                status: other.status_code(),
+                message: other.public_message(),
+            },
         }
+    }
+
+    /// Task creation shares the REST submit mapping, so a refusal a TES client
+    /// must not retry never reaches it as a retryable 500.
+    fn from_submit(error: aruna_operations::jobs::submit::SubmitJobError) -> Self {
+        Self::from_server(super::jobs::map_submit_error(error))
     }
 
     fn from_job_route(error: JobRouteError) -> Self {
@@ -2005,6 +1995,72 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["msg"], "visible reason");
+    }
+
+    #[test]
+    fn maps_submit_errors() {
+        // A TES client retries 500, so every non-retryable admission refusal
+        // must keep the status the native submit surface answers with.
+        use aruna_core::ClockHealthError;
+        use aruna_core::compute_quota::{QuotaDenied, QuotaDimension, QuotaScope};
+        use aruna_core::structs::CompositionError;
+        use aruna_operations::jobs::submit::SubmitJobError;
+
+        let cases = [
+            (
+                SubmitJobError::JobPlanConflict {
+                    existing_job_id: JobId::from_bytes([7u8; 16]),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::QuotaDenied(QuotaDenied {
+                    scope: QuotaScope::Group,
+                    dimension: QuotaDimension::CpuCores,
+                    observed: 30,
+                    requested: 8,
+                    limit: 32,
+                }),
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::ActiveJobLimit { limit: 4 },
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::Composition(CompositionError::KeyConflict("reads".to_string())),
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::Composition(CompositionError::MissingVersion("reads".to_string())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SubmitJobError::TooManyOutputs { limit: 1024 },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SubmitJobError::InvalidWorkspace("no bucket".to_string()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (SubmitJobError::AuthorityDenied, StatusCode::FORBIDDEN),
+            (
+                SubmitJobError::ClockHealth(ClockHealthError::TimestampOverflow {
+                    timestamp_ms: u64::MAX,
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(TesError::from_submit(error).status, expected);
+        }
+
+        // The 503 body carries the fixed reason, never a holder identity.
+        let unavailable = TesError::from_submit(SubmitJobError::PlacementUnavailable(
+            "node 7 idle".to_string(),
+        ));
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.message, "job_placement_unavailable");
     }
 
     #[test]
@@ -2741,8 +2797,9 @@ mod tests {
 
     #[tokio::test]
     async fn creates_tagless_basic() {
-        // Tagless basic auth infers the group and reaches admission; a fixture
-        // without the family substrate answers 503, never an auth failure.
+        // Tagless basic auth infers the group and reaches admission; the
+        // fixture has no network handle, so no family holder exists and the
+        // honest single-node answer is the fixed-text 503, not an auth failure.
         let (_dir, state) = build_state(true).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = sealed(&state, group);
@@ -2764,6 +2821,11 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["msg"], "job_placement_unavailable");
     }
 
     #[test]
@@ -2779,7 +2841,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_when_disabled() {
         // Without S3 mounts the mapping falls back to snapshot inputs, and the
-        // create call reaches admission (503 in the substrate-less fixture).
+        // create call reaches admission; the handle-less fixture has no family
+        // holder, so 503 is the honest outcome.
         let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = sealed(&state, group);
