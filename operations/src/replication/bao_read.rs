@@ -12,8 +12,9 @@ use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFuncti
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-    HashPathIndexKey, ManagedCopyKey, Permission, PlacementPolicyRef, RealmConfigDocument, RealmId,
-    VersionKey, VersionedObjectArn, blob_object_permission_path,
+    HashPathIndexKey, ManagedCopyKey, NodePlacementEntry, Permission, PlacementPolicyRef,
+    PlacementSubject, RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn,
+    blob_object_permission_path, storage_subject,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use bytes::Bytes;
@@ -309,11 +310,10 @@ pub async fn managed_read(
     node_id: NodeId,
     mut request: BaoReadRequest,
 ) -> Result<BaoReadOutput, BaoReadError> {
+    // An admission stop is not decided here: `write_gate` below refuses once
+    // the source has taught the refs that make this read a governed one.
     let destination = match gate_context(context, request.realm_id, now_ms()).await {
         Ok(destination) => destination,
-        Err(GateContextError::AdmissionStopped) => {
-            return Err(PolicyGateError::AdmissionStopped.into());
-        }
         Err(GateContextError::Routing(_)) => return Err(BaoReadError::NoDestination),
     };
     request.destination = destination.as_ref().map(|gate| gate.subject.clone());
@@ -408,6 +408,9 @@ pub struct IncomingBaoReadOperation {
     version_refs: Vec<PlacementPolicyRef>,
     pending_location: Option<BackendLocation>,
     gate: Option<PolicyGateOperation>,
+    /// The requesting peer's placement as this realm records it. The challenge
+    /// is decided against it, never against the subject the peer asserts.
+    peer_placement: Option<NodePlacementEntry>,
     now_ms: u64,
 }
 
@@ -447,6 +450,7 @@ impl IncomingBaoReadOperation {
             version_refs: Vec::new(),
             pending_location: None,
             gate: None,
+            peer_placement: None,
             now_ms: 0,
         }
     }
@@ -814,6 +818,7 @@ impl IncomingBaoReadOperation {
         if ensure_realm_peer(&document, self.peer, self.request.realm_id, true).is_err() {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         }
+        self.peer_placement = document.placement_entry(self.peer).cloned();
         match &self.request.target {
             BaoReadTarget::ExactVersion(target) => {
                 if target.realm_id != self.request.realm_id || target.node_id != self.local_node {
@@ -991,6 +996,15 @@ impl IncomingBaoReadOperation {
         self.challenge_destination(location)
     }
 
+    /// The subject this realm places the authenticated peer at. The generation
+    /// is node-local, so it is carried over from the claim; every other
+    /// attribute must match, or the claim is not this peer's subject.
+    fn expected_subject(&self, claimed: &PlacementSubject) -> Option<PlacementSubject> {
+        let entry = self.peer_placement.as_ref()?;
+        let expected = storage_subject(entry, claimed.generation);
+        (*claimed == expected).then_some(expected)
+    }
+
     /// Teaches the requester every rule it has not resolved, then evaluates the
     /// authenticated destination independently. Authorization has already
     /// passed here, so the refs may be disclosed; echoing one is never
@@ -1005,13 +1019,19 @@ impl IncomingBaoReadOperation {
         if !missing.is_empty() {
             return self.send_required(missing);
         }
-        let Some(destination) = self.request.destination.clone() else {
+        let Some(claimed) = self.request.destination.as_ref() else {
+            return self.send_denied(Vec::new());
+        };
+        // The requester asserts its own subject, so it is only ever a claim: the
+        // realm's own placement of the authenticated peer decides.
+        let Some(destination) = self.expected_subject(claimed) else {
             return self.send_denied(Vec::new());
         };
         let context = GateContext {
             realm_id: self.local_realm,
             subject: destination,
             now_ms: self.now_ms,
+            admitting: true,
         };
         match write_gate(Some(&context), &self.version_refs) {
             Ok(None) => self.send_accepted(location),
@@ -1469,6 +1489,64 @@ mod tests {
         assert!(matches!(
             VersionReplicationMessage::from_bytes(payload).unwrap(),
             VersionReplicationMessage::PlacementPolicyDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn spoofed_subject_denied() {
+        // The requester may assert any subject; only the realm's placement of
+        // the authenticated peer decides where governed bytes may go.
+        use aruna_core::structs::{
+            DEFAULT_NODE_WEIGHT, NodePlacementEntry, PlacementSubject, storage_subject,
+        };
+
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(3u128),
+            digest: [2u8; 32],
+        };
+        let entry = NodePlacementEntry {
+            node_id: peer,
+            location: "us-east".to_string(),
+            weight: DEFAULT_NODE_WEIGHT,
+            full: false,
+            draining: false,
+            labels: std::collections::BTreeMap::new(),
+        };
+        let claimed = PlacementSubject {
+            location: "eu-west".to_string(),
+            ..storage_subject(&entry, 4)
+        };
+        let mut request = read_request(local_node, [4u8; 32]);
+        request.known_refs = vec![policy_ref];
+        request.destination = Some(claimed);
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            request,
+        );
+        operation.version_refs = vec![policy_ref];
+        operation.peer_placement = Some(entry.clone());
+
+        let (location, _) = location_value([4u8; 32]);
+        let effects = operation.challenge_destination(location.clone());
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected a policy frame")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::PlacementPolicyDenied { .. }
+        ));
+
+        // The honest claim resolves the rule instead of being refused outright.
+        operation.request.destination = Some(storage_subject(&entry, 4));
+        let effects = operation.challenge_destination(location);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
         ));
     }
 

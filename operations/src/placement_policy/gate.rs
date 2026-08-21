@@ -170,6 +170,9 @@ pub struct GateContext {
     pub realm_id: RealmId,
     pub subject: PlacementSubject,
     pub now_ms: u64,
+    /// False while this node revalidates its inventory. Only a governed write
+    /// is stopped by it; an ungoverned one never consults the gate.
+    pub admitting: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -205,6 +208,7 @@ pub enum PolicyGateError {
 
 /// Builds the gate for one governed destination. `Ok(None)` means the ref set
 /// is empty, so the ungoverned path runs unchanged and performs no extra I/O.
+/// A node that stopped admitting governed data refuses only a governed write.
 pub fn write_gate(
     context: Option<&GateContext>,
     refs: &[PlacementPolicyRef],
@@ -216,6 +220,9 @@ pub fn write_gate(
     let Some(context) = context else {
         return Err(PolicyGateError::NoSubject);
     };
+    if !context.admitting {
+        return Err(PolicyGateError::AdmissionStopped);
+    }
     Ok(Some(PolicyGateOperation::new(PolicyGateConfig {
         realm_id: context.realm_id,
         local_node_id: context.subject.node_id,
@@ -447,6 +454,15 @@ mod tests {
         }
     }
 
+    fn context(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: subject(location),
+            now_ms: 0,
+            admitting: true,
+        }
+    }
+
     fn operation(refs: Vec<PlacementPolicyRef>, location: &str) -> PolicyGateOperation {
         PolicyGateOperation::new(PolicyGateConfig {
             realm_id: realm(),
@@ -538,14 +554,7 @@ mod tests {
     fn sealed_subject_must_hold() {
         // The subject that admitted the write must still be the one advertised
         // when the exposing transaction runs.
-        let gated = GatedBucket::observe(None).sealed_under(
-            Some(&GateContext {
-                realm_id: realm(),
-                subject: subject("eu-west"),
-                now_ms: 0,
-            }),
-            true,
-        );
+        let gated = GatedBucket::observe(None).sealed_under(Some(&context("eu-west")), true);
         let record =
             aruna_core::structs::NodeSubjectRecord::seed(subject("eu-west")).expect("subject");
         assert_eq!(gated.check_subject(Some(&record)), Ok(()));
@@ -564,6 +573,22 @@ mod tests {
             gated.check_subject(Some(&draining)),
             Err(PolicyGateError::Drift)
         );
+    }
+
+    #[test]
+    fn blocked_admits_ungoverned() {
+        // A node that stopped admitting governed data still writes ungoverned
+        // objects; only a write carrying refs is refused.
+        let mut blocked = context("eu-west");
+        blocked.admitting = false;
+        let governed = vec![policy(1, "eu-west").policy_ref()];
+
+        assert_eq!(write_gate(Some(&blocked), &[]), Ok(None));
+        assert_eq!(
+            write_gate(Some(&blocked), &governed).err(),
+            Some(PolicyGateError::AdmissionStopped)
+        );
+        assert!(write_gate(Some(&context("eu-west")), &governed).is_ok());
     }
 
     #[test]

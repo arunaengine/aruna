@@ -127,12 +127,11 @@ pub(crate) fn routing_inputs_error(error: RoutingInputsError) -> S3Error {
     s3_error!(InternalError, "Storage routing inputs are unavailable")
 }
 
-/// A node mid-transition admits nothing governed. The refusal is retryable and
-/// says nothing about which rule or subject is being revalidated.
+/// A destination gate that could not be built at all. An admission stop is not
+/// one: `policy_gate_error` reports that, and only for a write carrying refs.
 pub(crate) fn gate_context_error(error: GateContextError) -> S3Error {
     match error {
         GateContextError::Routing(error) => routing_inputs_error(error),
-        GateContextError::AdmissionStopped => placement_unavailable_error(),
     }
 }
 
@@ -290,6 +289,7 @@ impl IntoS3Error for UploadPartError {
             }
             UploadPartError::IncompleteBody => incomplete_body_error(),
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
+            UploadPartError::PolicyGateError(ref error) => policy_gate_error(error, "UploadPart"),
             err => internal_error(err),
         }
     }
@@ -304,7 +304,10 @@ impl IntoS3Error for UploadPartCopyError {
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."
             ),
-            UploadPartCopyError::Policy(err) => internal_error(err),
+            // A policy error names the ids it conflicts on, which a client must
+            // never learn: the refusal is reported without them.
+            UploadPartCopyError::Policy(_) => placement_denied_error("UploadPartCopy"),
+            UploadPartCopyError::Gate(err) => gate_context_error(err),
         }
     }
 }

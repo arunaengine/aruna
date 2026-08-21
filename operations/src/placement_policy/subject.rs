@@ -113,10 +113,13 @@ impl SubjectScanOperation {
     }
 
     fn gate_context(&self) -> Option<GateContext> {
+        // This walk is the revalidation the block waits for, so it evaluates
+        // under the new subject instead of refusing itself.
         self.record.as_ref().map(|record| GateContext {
             realm_id: self.config.realm_id,
             subject: record.subject.clone(),
             now_ms: self.config.now_ms,
+            admitting: true,
         })
     }
 
@@ -192,9 +195,11 @@ impl SubjectScanOperation {
         record: ManagedCopyRecord,
         decision: Result<(), PolicyGateError>,
     ) -> Effects {
+        // Departure records every row unresolved without deciding it, so a
+        // decision taken in that mode is a state error, not a quarantine.
         let quarantine = match self.config.mode {
             SubjectScanMode::Revalidate(reason) => reason,
-            SubjectScanMode::Depart => ManagedCopyQuarantine::SubjectTransition,
+            SubjectScanMode::Depart => return self.fail(SubjectScanError::InvalidEvent("Decide")),
         };
         let state = match decision {
             Ok(()) => ManagedCopyState::Registered,

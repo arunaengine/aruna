@@ -62,6 +62,8 @@ pub enum RoutingInputsError {
     /// Not `#[from]`: `BucketRules` already owns the conversion from a read.
     #[error("backend usage counters unavailable: {0}")]
     BackendUsage(#[source] RecordReadError),
+    #[error("node placement subject unavailable: {0}")]
+    NodeSubject(#[source] RecordReadError),
 }
 
 impl RoutingInputsError {
@@ -70,7 +72,7 @@ impl RoutingInputsError {
     pub fn storage(&self) -> Option<&aruna_core::errors::StorageError> {
         let read = match self {
             Self::GroupInputs(GroupRoutingInputsError::Read(read)) => read,
-            Self::BucketRules(read) | Self::BackendUsage(read) => read,
+            Self::BucketRules(read) | Self::BackendUsage(read) | Self::NodeSubject(read) => read,
             Self::GroupInputs(GroupRoutingInputsError::Incomplete) => return None,
         };
         match read {
@@ -121,8 +123,8 @@ pub fn now_ms() -> u64 {
 /// `None` means it has never advertised a subject, which fails every governed
 /// operation closed; an ungoverned one never consults it.
 ///
-/// A node whose inventory is being revalidated refuses instead: new governed
-/// admissions stop the moment a transition, rejoin or departure is observed.
+/// A node whose inventory is being revalidated reports `admitting: false`, so
+/// `write_gate` stops its governed writes while ungoverned ones keep working.
 pub async fn gate_context(
     context: &DriverContext,
     realm_id: RealmId,
@@ -137,28 +139,25 @@ pub async fn gate_context(
         })
         .await;
     let Some(record) = parse_read(event, NodeSubjectRecord::from_bytes)
-        .map_err(RoutingInputsError::BucketRules)?
+        .map_err(RoutingInputsError::NodeSubject)?
     else {
         return Ok(None);
     };
-    if record.serving_blocked || record.policy_draining {
-        return Err(GateContextError::AdmissionStopped);
-    }
+    let admitting = !record.serving_blocked && !record.policy_draining;
     Ok(Some(GateContext {
         realm_id,
         subject: record.subject,
         now_ms,
+        admitting,
     }))
 }
 
-/// Why a caller could not build a destination gate. Kept apart from routing so
-/// a refusing node is never mistaken for an unreadable record.
+/// Why a caller could not build a destination gate. An admission stop is not
+/// one: the gate is built either way and `write_gate` refuses a governed write.
 #[derive(Debug, Error, PartialEq)]
 pub enum GateContextError {
     #[error(transparent)]
     Routing(#[from] RoutingInputsError),
-    #[error("this node is not admitting governed data right now")]
-    AdmissionStopped,
 }
 
 /// Routing inputs for one bucket write, assembled before the operation starts.
@@ -1476,6 +1475,54 @@ mod test {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_subject_reads() {
+        // A blocked node still reports its subject: only a write carrying refs
+        // is stopped, and that decision belongs to the gate.
+        use crate::driver::gate_context;
+        use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
+        use aruna_core::structs::{NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject, RealmId};
+
+        let dir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let subject = PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        };
+        // A node that never advertised a subject has no gate at all.
+        assert_eq!(gate_context(&context, realm_id, 0).await.unwrap(), None);
+
+        let mut record = NodeSubjectRecord::seed(subject).unwrap();
+        record.serving_blocked = true;
+        record.policy_draining = true;
+        write_value(
+            &context,
+            NODE_SUBJECT_KEYSPACE,
+            NODE_SUBJECT_KEY.to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+
+        let gate = gate_context(&context, realm_id, 0)
+            .await
+            .unwrap()
+            .expect("subject is advertised");
+        assert!(!gate.admitting);
     }
 
     #[tokio::test]

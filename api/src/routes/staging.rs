@@ -1363,7 +1363,9 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
             ServerError::InternalError(error.to_string())
         }
         MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.to_string()),
-        MaterializeReferenceError::Policy(error) => ServerError::InternalError(error.to_string()),
+        // A policy error names the ids it conflicts on, which a client must
+        // never learn: the refusal is reported without them.
+        MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
     }
 }
 
