@@ -764,6 +764,9 @@ async fn put_file_output(
     let gate = gate_context(context, record.created_by.realm_id, now_ms())
         .await
         .map_err(|error| gate_error("output write", error))?;
+    if gate.as_ref().is_some_and(|gate| !gate.admitting) {
+        return Err(gate_stopped("output write"));
+    }
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: record.created_by,
         group_id: spec.group_id,
@@ -1249,6 +1252,9 @@ async fn stage_one_input(
     let gate = gate_context(context, record.created_by.realm_id, now_ms())
         .await
         .map_err(|error| gate_error("input stage", error))?;
+    if gate.as_ref().is_some_and(|gate| !gate.admitting) {
+        return Err(gate_stopped("input stage"));
+    }
     // The staged copy carries the source version's refs: staging can only
     // tighten what the workspace bucket already requires.
     let mut operation = PutObjectOperation::new(PutObjectConfig {
@@ -1342,6 +1348,12 @@ fn put_object_error(scope: &str, error: PutObjectError) -> JobError {
 /// attempt parks and retries instead of failing the job.
 fn gate_error(scope: &str, error: GateContextError) -> JobError {
     JobError::retryable(format!("{scope} destination unavailable: {error}"))
+}
+
+fn gate_stopped(scope: &str) -> JobError {
+    JobError::retryable(format!(
+        "{scope} destination is not admitting governed data"
+    ))
 }
 
 fn routing_error(scope: &str, error: RoutingInputsError) -> JobError {

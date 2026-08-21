@@ -36,12 +36,12 @@ use super::ids::{self, workspace_of};
 use super::plan::{network_access, staging_mode};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use super::witness::load_family;
-use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
+use crate::driver::{DriverContext, drive, gate_context, now_ms};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
-use crate::node_info::read_node_info_document;
+use crate::node_info::{read_node_info_document, read_operator_drain};
 use crate::placement::resolve_shard_holders;
 use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::request_authorization::authorize;
@@ -82,8 +82,14 @@ pub async fn admit_launch(
     }
     let spec = spec_of(&records, &intent)?;
     // The launch itself becomes a retained record before it can be receipted.
-    if !append_record(context, realm_id, local, launch.envelope().clone()).await {
-        return None;
+    // Missing family evidence is fetchable, so the family is pulled once more
+    // before the offer is answered as undecidable.
+    let origin = RecordOrigin::Peer(intent.scheduler_node_id);
+    if !append_record(context, realm_id, local, launch.envelope().clone(), origin).await {
+        fetch_family(context, &config, realm_id, family, intent.scheduler_node_id).await;
+        if !append_record(context, realm_id, local, launch.envelope().clone(), origin).await {
+            return None;
+        }
     }
     records = load_family(context.as_ref(), family).await;
     match existing_receipt(&records, &intent) {
@@ -99,9 +105,11 @@ pub async fn admit_launch(
         Ok(capability) => capability,
         Err(decline) => return Some(Err(decline)),
     };
+    // A node that stopped admitting governed data declines every new execution
+    // target categorically, whatever the offered work references.
     match gate_context(context.as_ref(), realm_id, now_ms()).await {
-        Err(GateContextError::AdmissionStopped) => return Some(Err(LaunchDecline::Draining)),
-        Err(GateContextError::Routing(_)) => return None,
+        Ok(Some(gate)) if !gate.admitting => return Some(Err(LaunchDecline::Draining)),
+        Err(_) => return None,
         Ok(_) => {}
     }
     if let Err(decline) = authorize_submitter(context.as_ref(), &spec, local).await {
@@ -232,9 +240,11 @@ async fn reserve_and_run(
     match reserved {
         Ok(_) => {}
         Err(LifecycleError::Capacity) => return Err(LaunchDecline::Capacity),
+        // Only a capacity verdict may be reported as one: any other failure is
+        // this node refusing work, not the plan misjudging its free resources.
         Err(error) => {
             warn!(error = %error, "Execution reservation failed");
-            return Err(LaunchDecline::Capacity);
+            return Err(LaunchDecline::Draining);
         }
     }
     info!(
@@ -380,8 +390,11 @@ async fn local_capability(
     if matches!(kind, RealmNodeKind::Local | RealmNodeKind::User) {
         return Err(LaunchDecline::Unauthorized);
     }
+    // The durable operator flag is checked directly: a stale heartbeat document
+    // must never re-enable offers this node was drained out of.
     if document.leaving
         || document.compute_draining
+        || read_operator_drain(context).await.unwrap_or(true)
         || config
             .placement_entry(local)
             .is_some_and(|entry| entry.draining)
@@ -559,6 +572,7 @@ async fn append_record(
     realm_id: aruna_core::structs::RealmId,
     local: NodeId,
     envelope: JobRecordEnvelope,
+    origin: RecordOrigin,
 ) -> bool {
     let Ok(frame) = JobRecordFrame::new(envelope) else {
         return false;
@@ -569,7 +583,7 @@ async fn append_record(
             local_node_id: local,
             record: frame,
             local: None,
-            origin: RecordOrigin::Local,
+            origin,
             now_ms: unix_timestamp_millis(),
         }),
         context.as_ref(),
@@ -617,23 +631,25 @@ async fn fetch_family(
         context.as_ref(),
     )
     .await;
-    let Ok(records) = fetched else {
+    let Ok((source, records)) = fetched else {
         return;
     };
     let Some(net) = context.net_handle.as_ref() else {
         return;
     };
     let local = net.node_id();
+    let origin = source.map_or(RecordOrigin::Local, RecordOrigin::Peer);
     for frame in records {
-        let _ = append_record(context, realm_id, local, frame.into_inner()).await;
+        let _ = append_record(context, realm_id, local, frame.into_inner(), origin).await;
     }
 }
 
-/// Reads one bounded page of a family from its current holders.
+/// Reads one bounded page of a family from its current holders, with the holder
+/// that answered, so the records keep their real relay in the audit.
 #[derive(Debug, PartialEq)]
 struct FetchFamilyOperation {
     effect: Option<JobRecordEffect>,
-    outcome: Option<Result<Vec<JobRecordFrame>, LifecycleError>>,
+    outcome: Option<Result<(Option<NodeId>, Vec<JobRecordFrame>), LifecycleError>>,
 }
 
 impl FetchFamilyOperation {
@@ -646,7 +662,7 @@ impl FetchFamilyOperation {
 }
 
 impl Operation for FetchFamilyOperation {
-    type Output = Vec<JobRecordFrame>;
+    type Output = (Option<NodeId>, Vec<JobRecordFrame>);
     type Error = LifecycleError;
 
     fn start(&mut self) -> Effects {
@@ -661,12 +677,12 @@ impl Operation for FetchFamilyOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         self.outcome = Some(match event {
-            Event::Net(NetEvent::JobRecord(JobRecordEvent::Fetched { records, .. })) => {
-                Ok(records.into_inner())
-            }
+            Event::Net(NetEvent::JobRecord(JobRecordEvent::Fetched {
+                holder, records, ..
+            })) => Ok((Some(holder), records.into_inner())),
             Event::Net(NetEvent::JobRecord(JobRecordEvent::Unavailable(message))) => {
                 debug!(message, "No family holder answered the record fetch");
-                Ok(Vec::new())
+                Ok((None, Vec::new()))
             }
             other => Err(LifecycleError::UnexpectedEvent {
                 state: "Fetch".to_string(),

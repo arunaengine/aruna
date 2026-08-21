@@ -856,6 +856,13 @@ async fn write_next(
     let gate = gate_context(&ctx.driver, spec.auth_context.realm_id, now_ms())
         .await
         .map_err(classify_gate)?;
+    // A node that stopped admitting governed data imports nothing until the
+    // transition it is in ends; the import resumes from its checkpoint.
+    if gate.as_ref().is_some_and(|gate| !gate.admitting) {
+        return Err(ImportFailure::Retryable(
+            "this node is not admitting governed data right now".to_string(),
+        ));
+    }
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: spec.auth_context.user_id,
         group_id: bucket_info.group_id,

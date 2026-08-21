@@ -23,7 +23,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 use smallvec::smallvec;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::LifecycleError;
 use super::ids::workspace_of;
@@ -284,6 +284,7 @@ impl AdmitSubmissionOperation {
                         queued_at_ms: self.config.now_ms,
                         delivered: Vec::new(),
                         next_holder: 0,
+                        rejections: 0,
                     })?
                     .as_slice(),
                 ),
@@ -437,9 +438,13 @@ impl Operation for AdmitSubmissionOperation {
             },
             AdmitState::ReadCache { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.cache = value
-                        .as_ref()
-                        .and_then(|value| from_bytes::<ProjectionCache>(value).ok());
+                    self.cache = value.as_ref().and_then(|value| {
+                        from_bytes::<ProjectionCache>(value)
+                            .inspect_err(
+                                |error| warn!(error = %error, "Job projection cache is undecodable"),
+                            )
+                            .ok()
+                    });
                     self.write(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
