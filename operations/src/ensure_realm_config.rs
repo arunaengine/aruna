@@ -652,7 +652,7 @@ fn apply_realm_config_node_ensure(
     Ok(event)
 }
 
-fn overlay_realm_config_reducer_materialization(
+pub(crate) fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now_ms: u64,
