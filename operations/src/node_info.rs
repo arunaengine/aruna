@@ -6,10 +6,11 @@ use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute_quota::{
     ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot, DemandFamily,
     DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES, MAX_DEMAND_GROUPS,
-    MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
+    MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability, bound_demand,
 };
 use aruna_core::document::{DocumentSyncChange, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -25,7 +26,7 @@ use aruna_core::structs::{
     STORAGE_CLASS_LABEL_PREFIX, SubmissionId, node_info_storage_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -70,6 +71,10 @@ pub async fn seed_node_info_document(
     let stored = read_node_info_document(&ctx.storage_handle, node_id).await?;
     let epoch = next_epoch(ctx, realm_id, stored.as_ref(), now).await?;
     let reservation = reservation_snapshot(ctx, epoch).await?;
+    // The published drain is the operator's durable flag or a departure, never
+    // a value carried forward from the previous document.
+    let leaving = stored.as_ref().is_some_and(|old| old.leaving);
+    let compute_draining = leaving || read_operator_drain(ctx).await?;
     let document = NodeInfoDocument {
         node_id,
         executors: advertised_executors(ctx, &reservation.reserved, now).await?,
@@ -83,9 +88,8 @@ pub async fn seed_node_info_document(
         },
         updated_at_ms: now,
         epoch,
-        compute_draining: stored.as_ref().is_some_and(|old| old.compute_draining)
-            || read_operator_drain(ctx).await?,
-        leaving: stored.as_ref().is_some_and(|old| old.leaving),
+        compute_draining,
+        leaving,
         demand: demand_snapshot(ctx, epoch).await?,
         reservation,
     };
@@ -169,13 +173,16 @@ async fn read_reservations(ctx: &DriverContext) -> Result<Vec<JobReservationReco
 /// holds records for that is admitted and not terminal, with the group and
 /// resources its immutable spec sealed. Replicas deduplicate by family, so a
 /// family several holders observe still counts once.
+///
+/// Truncation is per group: a group that overflows the shared family budget is
+/// flagged alone, so one busy group never understates another group's view.
 async fn demand_snapshot(
     ctx: &DriverContext,
     epoch: AdvertisementEpoch,
 ) -> Result<ComputeDemandSnapshot, String> {
-    let mut groups: BTreeMap<aruna_core::types::GroupId, Vec<DemandFamily>> = BTreeMap::new();
-    let mut families = 0usize;
-    let mut truncated = false;
+    let mut collected: BTreeMap<aruna_core::types::GroupId, (Vec<DemandFamily>, bool)> =
+        BTreeMap::new();
+    let mut unnamed = false;
     let mut start: Option<Key> = None;
     loop {
         let (page, next) = iter_page(ctx, JOB_FAMILY_PROJECTION_KEYSPACE, None, start).await?;
@@ -183,31 +190,34 @@ async fn demand_snapshot(
             let Some(family) = nonterminal_family(ctx, key, value).await? else {
                 continue;
             };
-            if families >= MAX_DEMAND_FAMILIES {
-                truncated = true;
-                break;
-            }
             let Some(spec) = read_family_spec(ctx, &family).await? else {
                 continue;
             };
-            let entry = groups.entry(spec.0).or_default();
-            entry.push(DemandFamily {
+            let demand = DemandFamily {
                 submission_id: family.submission_id,
                 request_digest: family.request_digest,
                 resources: spec.1,
-            });
-            families += 1;
+            };
+            let full = collected.len() >= MAX_DEMAND_GROUPS;
+            match collected.get_mut(&spec.0) {
+                Some((families, truncated)) => match families.len() >= MAX_DEMAND_FAMILIES {
+                    true => *truncated = true,
+                    false => families.push(demand),
+                },
+                None if full => unnamed = true,
+                None => {
+                    collected.insert(spec.0, (vec![demand], false));
+                }
+            }
         }
         match next {
-            Some(cursor) if !truncated => start = Some(cursor),
-            _ => break,
+            Some(cursor) => start = Some(cursor),
+            None => break,
         }
     }
-    truncated |= groups.len() > MAX_DEMAND_GROUPS;
-    let groups = groups
+    let mut groups: Vec<DemandGroup> = collected
         .into_iter()
-        .take(MAX_DEMAND_GROUPS)
-        .map(|(group_id, mut families)| {
+        .map(|(group_id, (mut families, truncated))| {
             families.sort_unstable_by_key(|family| (family.submission_id.0, family.request_digest));
             DemandGroup {
                 group_id,
@@ -216,6 +226,7 @@ async fn demand_snapshot(
             }
         })
         .collect();
+    let truncated = bound_demand(&mut groups) || unnamed;
     Ok(ComputeDemandSnapshot {
         epoch,
         groups,
@@ -392,28 +403,144 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
 /// labels, utilization, and timestamps, then republishes it. URLs remain the
 /// startup-seeded values. A missing document is a no-op: the startup seed always
 /// runs first.
+///
+/// The scans run outside the revision, so a drain or departure published while
+/// they ran is read again by [`revise_node_info`] and never carried backwards.
 pub async fn refresh_node_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
 ) -> Result<(), String> {
-    let Some(mut document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(());
     };
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
-    document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
-    document.reservation = reservation_snapshot(ctx, document.epoch).await?;
-    document.demand = demand_snapshot(ctx, document.epoch).await?;
-    document.executors = advertised_executors(ctx, &document.reservation.reserved, now).await?;
-    document.labels = node_labels(ctx, &config, node_id)?;
-    document.utilization.storage_bytes_used = local_storage_bytes(ctx).await?;
-    document.utilization.documents_held = held_documents(ctx, node_id, &config).await;
-    document.utilization.load_permille = read_load_permille();
-    document.utilization.heartbeat_at_ms = now;
+    let epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
+    let reservation = reservation_snapshot(ctx, epoch).await?;
+    let demand = demand_snapshot(ctx, epoch).await?;
+    let executors = advertised_executors(ctx, &reservation.reserved, now).await?;
+    let labels = node_labels(ctx, &config, node_id)?;
+    let storage_bytes_used = local_storage_bytes(ctx).await?;
+    let documents_held = held_documents(ctx, node_id, &config).await;
+    let load_permille = read_load_permille();
+    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
+        document.executors = executors.clone();
+        document.labels = labels.clone();
+        document.reservation = reservation;
+        document.demand = demand.clone();
+        document.utilization = NodeUtilization {
+            storage_bytes_used,
+            documents_held,
+            load_permille,
+            heartbeat_at_ms: now,
+        };
+    })
+    .await?;
+    match revised {
+        true => replicate_node_info(ctx, node_id, realm_id).await,
+        false => Ok(()),
+    }
+}
+
+/// Node-info revisions one publisher retries after another committed first.
+const NODE_INFO_ATTEMPTS: usize = 3;
+
+/// Applies `revise` to the current node-info row inside one write transaction,
+/// which also stamps the next epoch and re-reads the drain and departure state
+/// the row publishes. Every publisher goes through this, so no round can
+/// overwrite a change another one committed while it worked.
+/// `Ok(false)` means no row exists yet, so there was nothing to revise.
+async fn revise_node_info(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    realm_id: RealmId,
+    mut revise: impl FnMut(&mut NodeInfoDocument),
+) -> Result<bool, String> {
+    let generation = membership_generation(ctx, realm_id).await?;
+    for attempt in 0..NODE_INFO_ATTEMPTS {
+        let txn_id = begin_write(&ctx.storage_handle).await?;
+        match write_revision(ctx, node_id, txn_id, generation, &mut revise).await {
+            Ok(false) => {
+                abort_txn(&ctx.storage_handle, txn_id).await;
+                return Ok(false);
+            }
+            Ok(true) => match commit_txn(&ctx.storage_handle, txn_id).await? {
+                true => return Ok(true),
+                false if attempt + 1 < NODE_INFO_ATTEMPTS => continue,
+                false => break,
+            },
+            Err(error) => {
+                abort_txn(&ctx.storage_handle, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err("node info revision exhausted conflict retries".to_string())
+}
+
+/// Reads, revises, and writes the node-info row inside `txn_id`.
+async fn write_revision(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    txn_id: TxnId,
+    generation: u64,
+    revise: &mut impl FnMut(&mut NodeInfoDocument),
+) -> Result<bool, String> {
+    let Some(mut document) = node_info_row(&ctx.storage_handle, node_id, Some(txn_id)).await?
+    else {
+        return Ok(false);
+    };
+    revise(&mut document);
+    let now = unix_timestamp_millis();
+    document.epoch = AdvertisementEpoch {
+        membership_generation: generation,
+        publisher_generation: document.epoch.publisher_generation.saturating_add(1),
+        observed_at_ms: now,
+    };
+    document.demand.epoch = document.epoch;
+    document.reservation.epoch = document.epoch;
+    // The published drain is exactly the operator's durable flag or a departure,
+    // both read here, so no publisher carries a stale copy of them forward.
+    document.compute_draining = operator_drain(ctx, Some(txn_id)).await? || document.leaving;
     document.updated_at_ms = now;
-    write_node_info_document(&ctx.storage_handle, &document).await?;
-    replicate_node_info(ctx, node_id, realm_id).await
+    write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await?;
+    Ok(true)
+}
+
+async fn begin_write(storage: &StorageHandle) -> Result<TxnId, String> {
+    match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("node info transaction start failed: {other:?}")),
+    }
+}
+
+/// `Ok(false)` reports a commit conflict, which the caller retries.
+async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<bool, String> {
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("node info commit failed: {other:?}")),
+    }
+}
+
+async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
+    if let Event::Storage(StorageEvent::Error { error }) = storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await
+    {
+        warn!(%error, "Failed to abort a node info revision");
+    }
 }
 
 /// The locally observed nonterminal admitted demand of one group: this node's
@@ -424,7 +551,8 @@ pub async fn refresh_node_info_heartbeat(
 /// this node's own admissions, which is what makes a local cap race exact, and
 /// approximate across partitions, which is the accepted overshoot bound. A node
 /// the realm no longer places is skipped: its usage stays in audit but is no
-/// longer capacity of the remaining realm.
+/// longer capacity of the remaining realm. An advertisement that does not decode
+/// is skipped the same way a currently unobservable publisher is.
 pub async fn group_demand(
     ctx: &DriverContext,
     realm_id: RealmId,
@@ -450,7 +578,11 @@ pub async fn group_demand(
                     snapshots.push(document.demand)
                 }
                 Ok(_) => {}
-                Err(error) => return Err(error.to_string()),
+                // An unreadable advertisement is an unobserved publisher, the
+                // same approximation a partition already leaves in this view.
+                Err(error) => {
+                    warn!(%error, "Skipping an undecodable node info row in the demand view")
+                }
             }
         }
         match next {
@@ -484,7 +616,7 @@ pub async fn set_departure_state(
     realm_id: RealmId,
     departing: bool,
 ) -> Result<bool, String> {
-    let Some(mut document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(false);
     };
     // An operator drain outlives a placement observation: returning to the
@@ -494,23 +626,28 @@ pub async fn set_departure_state(
         return Ok(false);
     }
     let now = unix_timestamp_millis();
-    document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
-    document.leaving = departing;
-    document.compute_draining = draining;
-    document.reservation = reservation_snapshot(ctx, document.epoch).await?;
-    document.demand = demand_snapshot(ctx, document.epoch).await?;
-    document.updated_at_ms = now;
+    let epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
+    let reservation = reservation_snapshot(ctx, epoch).await?;
+    let demand = demand_snapshot(ctx, epoch).await?;
     if departing {
-        write_departure_report(ctx, document.epoch.membership_generation, now).await?;
+        write_departure_report(ctx, epoch.membership_generation, now).await?;
     }
+    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
+        document.leaving = departing;
+        document.reservation = reservation;
+        document.demand = demand.clone();
+    })
+    .await?;
     info!(
         leaving = departing,
         compute_draining = draining,
-        membership_generation = document.epoch.membership_generation,
-        reserved = document.reservation.reserved.count,
+        membership_generation = epoch.membership_generation,
+        reserved = reservation.reserved.count,
         "Compute departure state published"
     );
-    write_node_info_document(&ctx.storage_handle, &document).await?;
+    if !revised {
+        return Ok(false);
+    }
     replicate_node_info(ctx, node_id, realm_id).await?;
     Ok(true)
 }
@@ -518,7 +655,9 @@ pub async fn set_departure_state(
 /// Sets or clears the operator's own compute drain and republishes the
 /// advertisement. A drained node plans no new execution here; work that already
 /// holds a receipt is never cancelled by it, and departure state is untouched.
-/// `Ok(false)` means the state already matched, so nothing was republished.
+/// `Ok(false)` means the durable flag already had this value, so nothing
+/// changed; `Ok(true)` means the flag moved, and the advertisement follows it
+/// as soon as this node has one to republish.
 pub async fn set_operator_drain(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -529,35 +668,49 @@ pub async fn set_operator_drain(
         return Ok(false);
     }
     write_operator_drain(ctx, draining).await?;
-    let Some(mut document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+        warn!(
+            operator_draining = draining,
+            "Operator compute drain recorded before this node advertises"
+        );
         return Ok(true);
     };
     let now = unix_timestamp_millis();
-    document.epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
-    // A departing node stays draining whatever the operator flag says.
-    document.compute_draining = draining || document.leaving;
-    document.reservation = reservation_snapshot(ctx, document.epoch).await?;
-    document.demand = demand_snapshot(ctx, document.epoch).await?;
-    document.updated_at_ms = now;
+    let epoch = next_epoch(ctx, realm_id, Some(&document), now).await?;
+    let reservation = reservation_snapshot(ctx, epoch).await?;
+    let demand = demand_snapshot(ctx, epoch).await?;
+    // The revision derives the published drain from the flag written above; a
+    // departing node stays draining whatever that flag says.
+    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
+        document.reservation = reservation;
+        document.demand = demand.clone();
+    })
+    .await?;
     info!(
         operator_draining = draining,
         leaving = document.leaving,
-        reserved = document.reservation.reserved.count,
+        reserved = reservation.reserved.count,
+        republished = revised,
         "Operator compute drain published"
     );
-    write_node_info_document(&ctx.storage_handle, &document).await?;
-    replicate_node_info(ctx, node_id, realm_id).await?;
+    if revised {
+        replicate_node_info(ctx, node_id, realm_id).await?;
+    }
     Ok(true)
 }
 
 /// Whether an operator currently drains this node's compute plane.
 pub async fn read_operator_drain(ctx: &DriverContext) -> Result<bool, String> {
+    operator_drain(ctx, None).await
+}
+
+async fn operator_drain(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<bool, String> {
     match ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
             key: Key::from(OPERATOR_DRAIN_KEY.to_vec()),
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -830,6 +983,14 @@ async fn write_node_info_document(
     storage: &StorageHandle,
     document: &NodeInfoDocument,
 ) -> Result<(), String> {
+    write_info_row(storage, document, None).await
+}
+
+async fn write_info_row(
+    storage: &StorageHandle,
+    document: &NodeInfoDocument,
+    txn_id: Option<TxnId>,
+) -> Result<(), String> {
     // `to_bytes` validates, so a locally built advertisement that broke its own
     // bounds never reaches storage or the shared realm topic.
     let value = Value::from(document.to_bytes().map_err(|error| error.to_string())?);
@@ -838,7 +999,7 @@ async fn write_node_info_document(
             key_space: NODE_INFO_KEYSPACE.to_string(),
             key: Key::from(node_info_storage_key(document.node_id)),
             value,
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -853,11 +1014,19 @@ pub async fn read_node_info_document(
     storage: &StorageHandle,
     node_id: NodeId,
 ) -> Result<Option<NodeInfoDocument>, String> {
+    node_info_row(storage, node_id, None).await
+}
+
+async fn node_info_row(
+    storage: &StorageHandle,
+    node_id: NodeId,
+    txn_id: Option<TxnId>,
+) -> Result<Option<NodeInfoDocument>, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: NODE_INFO_KEYSPACE.to_string(),
             key: Key::from(node_info_storage_key(node_id)),
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -1818,6 +1987,155 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!released.compute_draining);
+    }
+
+    fn indexed_family(index: usize) -> JobFamilyId {
+        let mut request_digest = [0u8; 32];
+        request_digest[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        JobFamilyId {
+            submission_id: aruna_core::structs::SubmissionId([1u8; 32]),
+            request_digest,
+        }
+    }
+
+    #[tokio::test]
+    async fn truncates_busy_group() {
+        // A group that overflows the shared family budget is flagged alone: a
+        // quiet group keeps a complete view and admits normally.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([14u8; 32]);
+        let busy = Ulid::from_bytes([1u8; 16]);
+        let quiet = Ulid::from_bytes([2u8; 16]);
+        for index in 0..=MAX_DEMAND_FAMILIES {
+            write_family(
+                &ctx,
+                realm_id,
+                indexed_family(index),
+                busy,
+                LogicalJobState::Queued,
+            )
+            .await;
+        }
+        write_family(&ctx, realm_id, family(200), quiet, LogicalJobState::Queued).await;
+
+        let snapshot = demand_snapshot(&ctx, AdvertisementEpoch::default())
+            .await
+            .unwrap();
+
+        assert!(!snapshot.truncated);
+        assert!(snapshot.validate().is_ok());
+        let busy_group = snapshot.group(&busy).expect("busy group");
+        assert!(busy_group.truncated);
+        assert_eq!(busy_group.families.len(), MAX_DEMAND_FAMILIES - 1);
+        let quiet_group = snapshot.group(&quiet).expect("quiet group");
+        assert!(!quiet_group.truncated);
+        assert_eq!(quiet_group.families.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skips_unreadable_row() {
+        // An advertisement that does not decode is an unobserved publisher, not
+        // a reason to refuse every admission on this node.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([15u8; 32]);
+        let local = node(1);
+        let peer = node(2);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local, peer])).await;
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
+        write_row(
+            &ctx,
+            NODE_INFO_KEYSPACE,
+            Key::from(node_info_storage_key(peer)),
+            vec![0xFFu8; 4],
+        )
+        .await;
+
+        let (totals, truncated) = group_demand(&ctx, realm_id, local, &group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(totals.count, 1);
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_drain() {
+        // A drain recorded while the heartbeat scans must survive its write, and
+        // the heartbeat must never undrain a node on its own.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([16u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        write_operator_drain(&ctx, true).await.unwrap();
+        refresh_node_info_heartbeat(&ctx, local, realm_id)
+            .await
+            .unwrap();
+        let drained = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(drained.compute_draining && !drained.leaving);
+
+        write_operator_drain(&ctx, false).await.unwrap();
+        refresh_node_info_heartbeat(&ctx, local, realm_id)
+            .await
+            .unwrap();
+        let released = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!released.compute_draining);
+        assert!(released.supersedes(&drained));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_departure() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([17u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+        set_departure_state(&ctx, local, realm_id, true)
+            .await
+            .unwrap();
+
+        refresh_node_info_heartbeat(&ctx, local, realm_id)
+            .await
+            .unwrap();
+
+        let stored = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.leaving && stored.compute_draining);
+        assert!(!stored.offers_compute(true));
     }
 
     #[tokio::test]
