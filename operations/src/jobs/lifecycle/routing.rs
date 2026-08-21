@@ -16,12 +16,12 @@ use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
 
 use super::ids::workspace_of;
-use super::witness::load_family;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::{alias_family, alias_prefix};
 use crate::jobs::records::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
+    load_family_complete,
 };
 use crate::jobs::service::RoutedJobStatus;
 use crate::jobs::store::iter_prefix_page;
@@ -29,6 +29,19 @@ use crate::jobs::store::iter_prefix_page;
 /// Families one alias may resolve to. Two families claiming one id is an
 /// anomaly that stays visible instead of rebinding the first one.
 const MAX_ALIAS_FAMILIES: usize = 8;
+
+/// Why a partial projection answers nothing: it reduced only part of its
+/// family, so its state, executions, and outputs are unknown, never absent.
+const TRUNCATED: &str = "job family projection is truncated";
+
+/// Whether a projection may be decided on. An audit read may inspect a
+/// truncated one; a status answer or a routing choice may not.
+pub(crate) fn decidable(projected: &ProjectedFamily) -> Result<(), JobRouteError> {
+    match projected.truncated {
+        true => Err(JobRouteError::Unavailable(TRUNCATED.to_string())),
+        false => Ok(()),
+    }
+}
 
 /// The request family one accepted alias belongs to. Ordered by key, so two
 /// families claiming one alias resolve identically on every replica.
@@ -73,7 +86,9 @@ pub async fn family_projection(
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?
         .canonical_job_id;
-    let records = load_family(context, projected.family).await;
+    let records = load_family_complete(context, projected.family)
+        .await
+        .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
     let spec = records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Spec(spec) if spec.job_id == canonical => Some(spec.as_ref().clone()),
         _ => None,
@@ -100,6 +115,9 @@ pub async fn family_status(
     if spec.created_by != auth.user_id {
         return Some(Err(JobRouteError::NotFound));
     }
+    if let Err(error) = decidable(&projected) {
+        return Some(Err(error));
+    }
     let projection = projected.projection?;
     Some(Ok(RoutedJobStatus {
         job: status_view(job_id, &projection, &spec),
@@ -116,6 +134,7 @@ pub async fn family_responder(
     let Some((projected, _)) = family_projection(context, job_id).await? else {
         return Ok(None);
     };
+    decidable(&projected)?;
     let projection = projected
         .projection
         .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?;
@@ -236,5 +255,36 @@ fn local_state(state: LogicalJobState) -> JobState {
         LogicalJobState::Succeeded => JobState::Succeeded,
         LogicalJobState::Cancelled => JobState::Cancelled,
         LogicalJobState::Failed => JobState::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::structs::SubmissionId;
+
+    use super::*;
+
+    fn projected(truncated: bool) -> ProjectedFamily {
+        ProjectedFamily {
+            family: JobFamilyId {
+                submission_id: SubmissionId([1u8; 32]),
+                request_digest: [2u8; 32],
+            },
+            revision: 0,
+            projection: None,
+            truncated,
+            cached: false,
+        }
+    }
+
+    #[test]
+    fn partial_is_unavailable() {
+        // A truncated projection reduced only part of its family, so a status
+        // answer or a routing choice must not be decided from it.
+        assert!(decidable(&projected(false)).is_ok());
+        assert_eq!(
+            decidable(&projected(true)),
+            Err(JobRouteError::Unavailable(TRUNCATED.to_string()))
+        );
     }
 }

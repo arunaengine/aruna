@@ -31,13 +31,11 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::plan::build_plan;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::records::keys::family_prefix;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE,
-    RecordOrigin,
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
@@ -367,7 +365,16 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     if !view.holds(local) {
         return RoundOutcome::Done;
     }
-    let records = load_family(context, family).await;
+    // An incomplete family read is undecided evidence: a suppression, a
+    // cancellation, or an earlier launch may be in the part that did not load,
+    // so this round seals no budget and offers no launch.
+    let records = match load_family_complete(context, family).await {
+        Ok(records) => records,
+        Err(error) => {
+            warn!(error = %error, "Job family read is incomplete; witness round deferred");
+            return RoundOutcome::Retry { after_ms: base };
+        }
+    };
     if suppressed(family, &records) {
         return RoundOutcome::Done;
     }
@@ -703,36 +710,6 @@ async fn append_local(
         Err(error) => {
             warn!(error = %error, "Witness record append failed");
             false
-        }
-    }
-}
-
-/// Every record of one family, in key order and bounded like a projection.
-pub async fn load_family(context: &DriverContext, family: JobFamilyId) -> Vec<JobRecordEnvelope> {
-    let mut records = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let page = iter_prefix_page(
-            &context.storage_handle,
-            aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE,
-            Some(family_prefix(&family)),
-            cursor.clone(),
-            RECORD_PAGE_SIZE,
-            None,
-        )
-        .await;
-        let Ok((values, next)) = page else {
-            return records;
-        };
-        let full = values.len() >= RECORD_PAGE_SIZE;
-        for (_, value) in values {
-            if let Ok(envelope) = from_bytes::<JobRecordEnvelope>(&value) {
-                records.push(envelope);
-            }
-        }
-        cursor = next;
-        if !full || cursor.is_none() || records.len() >= MAX_PROJECTION_RECORDS {
-            return records;
         }
     }
 }

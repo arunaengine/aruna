@@ -45,6 +45,10 @@ pub async fn cancel_family(
         Ok(None) => return None,
         Err(error) => return Some(Err(error)),
     };
+    // Cancel authority is a decision: a truncated projection proves nothing.
+    if let Err(error) = super::routing::decidable(&projected) {
+        return Some(Err(error));
+    }
     let Some(projection) = projected.projection else {
         return Some(Err(JobRouteError::Unavailable(
             "job family has no projection".to_string(),

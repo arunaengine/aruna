@@ -22,6 +22,7 @@ use thiserror::Error;
 pub mod admit;
 pub mod append;
 pub mod audit;
+pub mod family;
 pub mod keys;
 pub mod project;
 pub mod reduce;
@@ -32,12 +33,14 @@ pub mod verify;
 pub use admit::Admission;
 pub use append::{AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 pub use audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
+pub use family::{FamilyReadError, load_family_complete, load_kind_complete};
 pub use project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily};
 pub use transport::{dispatch_offer, dispatch_record, serve_job_record, serve_launch_offer};
 pub use verify::FamilyView;
 
-/// Evidence-bearing records one bounded family scan loads before an append.
-pub const MAX_FAMILY_EVIDENCE: usize = 256;
+/// Rows one append may read while completing its evidence scans. Reaching it
+/// with pages left is a corrupt or pathological family, never proof of absence.
+pub const MAX_EVIDENCE_ROWS: usize = 4096;
 /// Records one bounded page of the immutable log returns.
 pub const RECORD_PAGE_SIZE: usize = 64;
 /// Records one projection may reduce. A family beyond this bound is projected
@@ -68,6 +71,10 @@ pub enum RecordStoreError {
     NotHolder,
     #[error("no job family is bound to that alias")]
     UnknownAlias,
+    /// The family's evidence could not be read completely, so no candidate may
+    /// be judged from what was loaded. The caller retries.
+    #[error("job family evidence could not be read completely")]
+    EvidenceIncomplete,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]

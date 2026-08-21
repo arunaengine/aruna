@@ -7,9 +7,9 @@
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::{
-    ExecutionUpdate, JobErrorKind, JobFamilyId, JobFamilyRecord, JobId, JobRecord, JobRecordBody,
-    JobRecordEnvelope, JobResultPayload, JobState, PhysicalExecutionResult, PhysicalExecutionState,
-    ResultMessage,
+    ExecutionReceipt, ExecutionUpdate, JobErrorKind, JobFamilyId, JobFamilyRecord, JobId,
+    JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
+    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
 };
 use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
@@ -18,9 +18,11 @@ use ulid::Ulid;
 
 use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
 use super::routing::family_of_alias;
-use super::witness::{arm_family, load_family};
+use super::witness::arm_family;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::{
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
+};
 use crate::jobs::store::read_job_record;
 
 /// The replicated identity of one physical execution, read back from the
@@ -55,20 +57,53 @@ pub async fn chain_for(
     execution_id: Ulid,
 ) -> Option<ExecutionChain> {
     let family = family_of_alias(context, job_id).await.ok()??;
-    let records = load_family(context, family).await;
+    let receipt = receipt_of(context, family, execution_id).await?;
+    Some(ExecutionChain {
+        family,
+        execution_id,
+        executor_node_id: receipt.executor_node_id,
+        spec_digest: receipt.spec_digest,
+        receipt_digest: receipt.digest().ok()?,
+        job_id: receipt.job_id,
+    })
+}
+
+/// The receipt one execution was admitted under, read from the receipt kind
+/// alone so unrelated family history can never hide it behind the read bound.
+async fn receipt_of(
+    context: &DriverContext,
+    family: JobFamilyId,
+    execution_id: Ulid,
+) -> Option<ExecutionReceipt> {
+    let records = load_kind_complete(context, family, JobRecordKind::Receipt)
+        .await
+        .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
+        .ok()?;
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Receipt(receipt) if receipt.execution_id == execution_id => {
-            Some(ExecutionChain {
-                family,
-                execution_id,
-                executor_node_id: receipt.executor_node_id,
-                spec_digest: receipt.spec_digest,
-                receipt_digest: receipt.digest().ok()?,
-                job_id: receipt.job_id,
-            })
+            Some(receipt.as_ref().clone())
         }
         _ => None,
     })
+}
+
+/// The next sequence and predecessor digest of a chain proven contiguous from
+/// `root`. `None` is a gap, a duplicate sequence, or a broken predecessor: the
+/// chain cannot be extended without forging one of them.
+fn chain_tip(updates: &[&ExecutionUpdate], root: [u8; 32]) -> Option<(u64, [u8; 32])> {
+    let mut ordered: Vec<&ExecutionUpdate> = updates.to_vec();
+    ordered.sort_by_key(|update| update.sequence);
+    let mut previous = root;
+    for (index, update) in ordered.iter().enumerate() {
+        if update.sequence != index as u64 || update.previous_digest != previous {
+            return None;
+        }
+        previous = update.digest().ok()?;
+    }
+    let next = ordered
+        .last()
+        .map_or(0, |update| update.sequence.saturating_add(1));
+    Some((next, previous))
 }
 
 /// Publishes one state of the local execution. The sequence and the previous
@@ -88,7 +123,21 @@ pub async fn publish_state(
     if chain.executor_node_id != local {
         return false;
     }
-    let records = load_family(context, chain.family).await;
+    // The chain is extended only from evidence proven complete: the receipt
+    // that authorized it, plus every stored update of this execution.
+    let Some(receipt) = receipt_of(context, chain.family, chain.execution_id).await else {
+        return false;
+    };
+    let Ok(root) = receipt.digest() else {
+        return false;
+    };
+    let records = match load_kind_complete(context, chain.family, JobRecordKind::Update).await {
+        Ok(records) => records,
+        Err(error) => {
+            warn!(error = %error, "Execution update read is incomplete; publication deferred");
+            return false;
+        }
+    };
     let mine: Vec<&ExecutionUpdate> = records
         .iter()
         .filter_map(|envelope| match &envelope.record {
@@ -101,17 +150,16 @@ pub async fn publish_state(
     if mine.iter().any(|update| update.state == state) {
         return true;
     }
-    let previous = mine
-        .iter()
-        .max_by_key(|update| update.sequence)
-        .map(|update| update.digest().unwrap_or_default())
-        .unwrap_or(chain.receipt_digest);
+    let Some((sequence, previous)) = chain_tip(&mine, root) else {
+        warn!(execution_id = %chain.execution_id, "Execution update chain is not contiguous");
+        return false;
+    };
     let update = ExecutionUpdate {
         execution_id: chain.execution_id,
         submission_id: chain.family.submission_id,
         request_digest: chain.family.request_digest,
         executor_node_id: local,
-        sequence: mine.len() as u64,
+        sequence,
         previous_digest: previous,
         state,
         observed_at_ms,
@@ -266,8 +314,13 @@ fn output_digest(result: Option<&JobResultPayload>) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{node, payload, user};
+    use crate::jobs::records::tests::fixture::{Family, node, payload, user};
     use aruna_core::structs::{JobError, JobPayload};
+
+    fn receipt(family: &Family) -> ExecutionReceipt {
+        let spec = family.spec();
+        family.receipt(&family.launch(&spec, family.holder.public(), 0), 1)
+    }
 
     fn terminal(error: JobError) -> JobRecord {
         let mut record = JobRecord::new(
@@ -300,5 +353,65 @@ mod tests {
             ))),
             Some(PhysicalExecutionState::Error)
         );
+    }
+
+    #[test]
+    fn extends_valid_chain() {
+        let family = Family::new([3u8; 32]);
+        let receipt = receipt(&family);
+        let root = receipt.digest().expect("receipt digest");
+        let first = family.update(&receipt, 0, root, PhysicalExecutionState::Running, None);
+        let tip = first.digest().expect("update digest");
+
+        assert_eq!(chain_tip(&[], root), Some((0, root)));
+        assert_eq!(chain_tip(&[&first], root), Some((1, tip)));
+    }
+
+    #[test]
+    fn rejects_sequence_gap() {
+        // The next sequence must come from the proven chain, never from how many
+        // updates happened to load.
+        let family = Family::new([3u8; 32]);
+        let receipt = receipt(&family);
+        let root = receipt.digest().expect("receipt digest");
+        let first = family.update(&receipt, 0, root, PhysicalExecutionState::Running, None);
+        let third = family.update(
+            &receipt,
+            2,
+            first.digest().expect("update digest"),
+            PhysicalExecutionState::Succeeded,
+            None,
+        );
+
+        assert_eq!(chain_tip(&[&first, &third], root), None);
+    }
+
+    #[test]
+    fn rejects_duplicate_sequence() {
+        let family = Family::new([3u8; 32]);
+        let receipt = receipt(&family);
+        let root = receipt.digest().expect("receipt digest");
+        let first = family.update(&receipt, 0, root, PhysicalExecutionState::Running, None);
+        let twin = family.update(&receipt, 0, root, PhysicalExecutionState::Cancelled, None);
+
+        assert_eq!(chain_tip(&[&first, &twin], root), None);
+    }
+
+    #[test]
+    fn rejects_broken_predecessor() {
+        let family = Family::new([3u8; 32]);
+        let receipt = receipt(&family);
+        let root = receipt.digest().expect("receipt digest");
+        let first = family.update(&receipt, 0, root, PhysicalExecutionState::Running, None);
+        let second = family.update(
+            &receipt,
+            1,
+            [9u8; 32],
+            PhysicalExecutionState::Succeeded,
+            None,
+        );
+
+        assert_eq!(chain_tip(&[&first, &second], root), None);
+        assert_eq!(chain_tip(&[&first], [9u8; 32]), None);
     }
 }
