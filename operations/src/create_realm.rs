@@ -1,6 +1,6 @@
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
-    AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -243,44 +243,11 @@ impl CreateRealmOperation {
                 description: config_doc.description.clone(),
             },
         )?);
-        for strategy in &config_doc.strategies {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
-                    strategy: strategy.clone(),
-                },
-            )?);
-        }
-        for binding in &config_doc.placement_bindings {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigPlacementBindingAppended {
-                    binding: binding.clone(),
-                },
-            )?);
-        }
-        if let Some(default_strategy_id) = config_doc.default_strategy_id {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigDefaultStrategySet {
-                    strategy_id: default_strategy_id,
-                },
-            )?);
-        }
-        config_events.push(config_state.apply_operation(
+        config_events.extend(seed_placement_events(
+            &mut config_state,
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigJobFamilySet {
-                strategy_id: config_doc.job_family_strategy_id,
-            },
+            config_doc,
         )?);
-        for binding in &config_doc.strategy_bindings {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                    binding: binding.clone(),
-                },
-            )?);
-        }
         config_events.push(config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigNodePlacementSet {
@@ -570,6 +537,55 @@ impl Operation for CreateRealmOperation {
 
 fn seed_placement_defaults(config: &mut RealmConfigDocument) {
     config.seed_default_placement();
+}
+
+/// Reducer events that seed one fresh realm config's placement identity: its
+/// strategies, seeded placement bindings, default and job-family strategies,
+/// and class strategy bindings. Every bootstrap path applies them, so a
+/// reducer-only rebuild materializes the same document whichever path ran.
+pub(crate) fn seed_placement_events(
+    state: &mut AdminDocumentReducerState,
+    actor: &Actor,
+    document: &RealmConfigDocument,
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+    let mut events = Vec::new();
+    for strategy in &document.strategies {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+        )?);
+    }
+    for binding in &document.placement_bindings {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: binding.clone(),
+            },
+        )?);
+    }
+    if let Some(strategy_id) = document.default_strategy_id {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+        )?);
+    }
+    events.push(state.apply_operation(
+        actor,
+        AdminDocumentOperation::RealmConfigJobFamilySet {
+            strategy_id: document.job_family_strategy_id,
+        },
+    )?);
+    for binding in &document.strategy_bindings {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: binding.clone(),
+            },
+        )?);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
