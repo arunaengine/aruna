@@ -19,6 +19,10 @@ use ulid::Ulid;
 
 const POLICY_PUBLICATION_DOMAIN: &[u8] = b"aruna-placement-policy-publication-v1";
 
+/// A policy id names one immutable definition, so its row has exactly one
+/// generation and only its provenance can still be folded in.
+const POLICY_DOCUMENT_GENERATION: u64 = 1;
+
 /// Why a publication is not authentic realm-admin provenance. Every variant is
 /// fail-closed: an unauthenticated rule is never reinterpreted as a grant.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -261,10 +265,9 @@ impl PlacementPolicyDocument {
             && self.policy.canonical_bytes() == other.policy.canonical_bytes()
     }
 
-    /// Folds a replicated publication into the local document. A different
-    /// definition under a known id fails closed; for byte-identical definitions
-    /// the canonical provenance is the authentic publication with the smaller
-    /// claim digest, so an earlier untrusted timestamp cannot replace it.
+    /// Folds a replicated publication into the local document. The caller
+    /// verifies realm-admin authority first; here a different definition under a
+    /// known id fails closed and the smaller claim digest is canonical.
     pub fn merge(&mut self, incoming: &Self) -> Result<bool, PolicyAuthorityError> {
         if self.policy.policy_id != incoming.policy.policy_id {
             return Ok(false);
@@ -305,7 +308,9 @@ pub fn placement_policy_target(policy_id: Ulid) -> DocumentSyncTarget {
 }
 
 /// Sync change a policy row publishes and records. Derived purely from the row,
-/// so two holders of one document write byte-identical manifest entries.
+/// so two holders of one document write byte-identical manifest entries. The
+/// definition is immutable, so the generation is fixed: a provenance merge must
+/// not look like a regression to a peer that already holds the rule.
 pub fn placement_policy_change(
     document: &PlacementPolicyDocument,
     placement: PlacementRef,
@@ -313,7 +318,7 @@ pub fn placement_policy_change(
     DocumentSyncChange {
         base: None,
         current: DocumentSyncRevision {
-            generation: document.publication.created_at_ms,
+            generation: POLICY_DOCUMENT_GENERATION,
             event_id: document.publication.event_id,
             actor: document.publication.publisher,
             updated_at_ms: document.publication.created_at_ms,
@@ -548,14 +553,17 @@ mod tests {
 
     #[test]
     fn change_follows_row() {
-        let document = document(7, "eu-west", 42);
+        // The generation is fixed: folding in an earlier publication changes the
+        // provenance a holder records, never the revision peers order by.
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([3; 16]),
             shard: 4,
         };
-        let change = placement_policy_change(&document, placement);
+        let change = placement_policy_change(&document(7, "eu-west", 42), placement);
+        let earlier = placement_policy_change(&document(7, "eu-west", 1), placement);
 
-        assert_eq!(change.current.generation, 42);
+        assert_eq!(change.current.generation, POLICY_DOCUMENT_GENERATION);
+        assert_eq!(earlier.current.generation, change.current.generation);
         assert_eq!(change.current.event_id, Ulid::from_bytes([7; 16]));
         assert_eq!(change.current.actor, node(7));
         assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);

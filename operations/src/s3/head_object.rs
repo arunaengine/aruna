@@ -370,7 +370,7 @@ impl HeadObjectOperation {
             copy.as_deref(),
             &CopyRequest {
                 key: &copy_key,
-                node_id: None,
+                node_id: Some(subject.subject.node_id),
                 blake3: Some(key.blake3_hash),
                 refs: &self.source_policies,
                 subject_generation: Some(subject.subject.generation),

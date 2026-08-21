@@ -9,6 +9,7 @@ use crate::structs::{
     VersionedObjectArn,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use thiserror::Error;
 use ulid::Ulid;
@@ -168,6 +169,29 @@ fn target_order(candidate: &TargetCandidate) -> (&[u8; 32], &str) {
     )
 }
 
+/// One holder's ascending order: node, then newest subject, then the rest of
+/// the subject. Deduplication keeps the first of each node, so two nodes given
+/// the same duplicate rows keep the same one and plan identically.
+type HolderOrder<'a> = (
+    &'a [u8; 32],
+    Reverse<u64>,
+    &'a str,
+    &'a Option<String>,
+    &'a BTreeMap<String, String>,
+    bool,
+);
+
+fn holder_order(holder: &InputHolder) -> HolderOrder<'_> {
+    (
+        holder.node_id.as_bytes(),
+        Reverse(holder.subject.generation),
+        holder.subject.location.as_str(),
+        &holder.subject.executor_kind,
+        &holder.subject.labels,
+        holder.subject.local_to_controller,
+    )
+}
+
 impl ResolvedInput {
     fn canonical(&self) -> Result<Self, PlanError> {
         if self.holders.len() > MAX_INPUT_HOLDERS {
@@ -182,7 +206,7 @@ impl ResolvedInput {
         input.policies = PlacementPolicyRef::canonical_set(&self.policies)?;
         input
             .holders
-            .sort_unstable_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
+            .sort_unstable_by(|left, right| holder_order(left).cmp(&holder_order(right)));
         input
             .holders
             .dedup_by(|left, right| left.node_id == right.node_id);
@@ -216,6 +240,36 @@ mod tests {
 
         assert_eq!(canonical.inputs[0].destination_key, "a");
         assert_eq!(canonical.candidates[0].node_id, node(2));
+    }
+
+    #[test]
+    fn dedups_holders_alike() {
+        // Two nodes handed the same duplicate rows in any order must keep the
+        // same holder, or their plan and route digests diverge.
+        let holder = |generation: u64, location: &str| InputHolder {
+            node_id: node(4),
+            subject: PlacementSubject {
+                node_id: node(4),
+                generation,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+        };
+        let rows = vec![holder(1, "eu-west"), holder(3, "us-east"), holder(3, "ap")];
+        let mut input = resolved_input("a", 1);
+        input.holders = rows.clone();
+        let first = input.canonical().expect("input is bounded");
+
+        let mut input = resolved_input("a", 1);
+        input.holders = rows.into_iter().rev().collect();
+        let second = input.canonical().expect("input is bounded");
+
+        assert_eq!(first.holders, second.holders);
+        assert_eq!(first.holders.len(), 1);
+        assert_eq!(first.holders[0].subject.generation, 3);
+        assert_eq!(first.holders[0].subject.location, "ap");
     }
 
     #[test]

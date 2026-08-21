@@ -4252,8 +4252,9 @@ impl DocumentSyncService {
                 .await?
             {
                 MetadataPlacementOutcome::Accepted(_) => Ok(()),
-                // The authority evidence has not replicated in yet. Deferring
-                // keeps the event unapplied and retryable instead of failing it.
+                // The live loop handles this target itself and registers the
+                // dependency; here the error aborts the batch, so the topic
+                // cursor stays put and the event is redelivered.
                 MetadataPlacementOutcome::Deferred(dependency) => {
                     warn!(
                         %policy_id,
@@ -4303,6 +4304,8 @@ impl DocumentSyncService {
             // persist an unvalidated node info document.
             let incoming =
                 validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+            // Read-then-write without a transaction: only safe because the
+            // reconcile loop applies one event at a time per topic.
             let stored = self
                 .storage_read(target.storage_keyspace().to_string(), target.storage_key())
                 .await?;

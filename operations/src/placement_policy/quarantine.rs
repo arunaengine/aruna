@@ -125,7 +125,8 @@ impl ResolveQuarantineOperation {
     }
 
     /// Drops every local registration of the released version, so the copy stops
-    /// being inventory this node has to decide about.
+    /// being inventory this node has to decide about. The bytes stay on the
+    /// backend: releasing makes them unserveable, it never deletes them.
     fn release(&mut self, version: &VersionKey) -> Effects {
         let mut removal = match ManagedCopyRemoval::for_version(version) {
             Ok(removal) => removal,
