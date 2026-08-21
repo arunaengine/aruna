@@ -22,10 +22,8 @@ env:
 jobs:
   tests:
     runs-on: ubuntu-latest
-    env:
-      RUST_TEST_THREADS: 2
-    # Hang cap, not a performance budget: a healthy cold-cache run measures
-    # ~48 minutes, so only a deadlocked or unbounded-wait test trips this.
+    # Job-level hang cap, not a performance budget. Per-test concurrency and the
+    # 15 minute per-test hang cap live in .config/nextest.toml.
     timeout-minutes: 90
 
     steps:
@@ -39,8 +37,26 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
       - name: Run workspace tests
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
+
+      # nextest never runs doctests; this keeps them in the gate.
+      - name: Run doctests
+        run: cargo test --workspace --all-features --locked --doc
+
+      - name: Upload JUnit report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-tests
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
 
   s3-backend:
     runs-on: ubuntu-latest
