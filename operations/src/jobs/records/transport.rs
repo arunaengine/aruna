@@ -15,8 +15,8 @@ use aruna_core::events::{
     JobRecordEvent, JobRecordPage, JobRecordRejection, LaunchDecline, LaunchOfferEvent,
 };
 use aruna_core::structs::{
-    JobFamilyId, JobRecordError, JobRecordKind, PlacementRef, RealmConfigDocument, RealmId,
-    SubmissionId,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, PhysicalExecutionState,
+    PlacementRef, RealmConfigDocument, RealmId, SubmissionId,
 };
 use futures_util::future::join_all;
 use tokio::time::timeout_at;
@@ -334,7 +334,7 @@ async fn accept_record(
     if derived != placement {
         return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
-    let kind = record.envelope().kind();
+    let rearms = rearms_witness(record.envelope());
     let now_ms = aruna_core::util::unix_timestamp_millis();
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
@@ -352,17 +352,15 @@ async fn accept_record(
         warn!(error = %error, "Job record append failed");
         ServeError::Unavailable
     })?;
-    // Learning a claim makes this holder a witness of that family, and learning
-    // a cancellation must stop the round it already armed.
-    if matches!(outcome.admission, Admission::Authentic)
-        && matches!(kind, JobRecordKind::Claim | JobRecordKind::Cancel)
-    {
+    if matches!(outcome.admission, Admission::Authentic) && rearms {
         crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
     }
     match outcome.admission {
         Admission::Authentic | Admission::Duplicate => Ok(()),
         Admission::Local
-        | Admission::Pending(PendingNeed::Evidence(_) | PendingNeed::LocalView)
+        | Admission::Pending(
+            PendingNeed::Evidence(_) | PendingNeed::LocalView | PendingNeed::HolderView,
+        )
         | Admission::PendingFull => Err(ServeError::Unavailable),
         Admission::Conflict => Err(ServeError::Refused(JobRecordRejection::Conflict)),
         Admission::Rejected(
@@ -372,6 +370,17 @@ async fn accept_record(
             | JobRecordError::Unauthorized,
         ) => Err(ServeError::Refused(JobRecordRejection::Unauthorized)),
         Admission::Rejected(_) => Err(ServeError::Refused(JobRecordRejection::Invalid)),
+    }
+}
+
+/// Records that must schedule a witness round here: a claim makes this holder a
+/// witness, a cancellation stops the round it armed, and an execution that ended
+/// in an infrastructure error leaves the family to be planned again.
+fn rearms_witness(envelope: &JobRecordEnvelope) -> bool {
+    match &envelope.record {
+        JobFamilyRecord::Claim(_) | JobFamilyRecord::Cancel(_) => true,
+        JobFamilyRecord::Update(update) => update.state == PhysicalExecutionState::Error,
+        _ => false,
     }
 }
 
@@ -455,5 +464,38 @@ pub async fn serve_launch_offer(
             result: Err(reason),
         },
         None => MetadataTransportMessage::ForwardedWriteUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::records::tests::fixture::Family;
+    use aruna_core::structs::JobRecordBody;
+
+    #[test]
+    fn error_rearms_family() {
+        // An execution that ended in an infrastructure error decides nothing, so
+        // learning it must schedule a witness round again.
+        let family = Family::new([13u8; 32]);
+        let spec = family.spec();
+        let launch = family.launch(&spec, family.holder.public(), 0);
+        let receipt = family.receipt(&launch, 1);
+        let previous = receipt.digest().expect("receipt digest");
+        let running = family.update(&receipt, 0, previous, PhysicalExecutionState::Running, None);
+        let errored = family.update(&receipt, 1, previous, PhysicalExecutionState::Error, None);
+
+        assert!(rearms_witness(&family.sign(
+            &family.target,
+            JobFamilyRecord::Update(Box::new(errored))
+        )));
+        assert!(!rearms_witness(&family.sign(
+            &family.target,
+            JobFamilyRecord::Update(Box::new(running))
+        )));
+        assert!(rearms_witness(&family.sign(
+            &family.holder,
+            JobFamilyRecord::Claim(family.claim(&spec))
+        )));
     }
 }

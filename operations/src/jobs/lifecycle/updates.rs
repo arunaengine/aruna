@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
 use super::routing::family_of_alias;
-use super::witness::load_family;
+use super::witness::{arm_family, load_family};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::read_job_record;
@@ -152,6 +152,11 @@ pub async fn publish_state(
             ) =>
         {
             debug!(state = state.name(), "Execution update published");
+            // An infrastructure error ends this execution without deciding the
+            // job, so the family must be planned again from here too.
+            if state == PhysicalExecutionState::Error {
+                arm_family(context, chain.family, unix_timestamp_millis()).await;
+            }
             super::outbox::kick(context).await;
             true
         }
@@ -255,5 +260,45 @@ fn output_digest(result: Option<&JobResultPayload>) -> Option<[u8; 32]> {
     match result {
         Some(JobResultPayload::Execution { output_digest, .. }) => *output_digest,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::records::tests::fixture::{node, payload, user};
+    use aruna_core::structs::{JobError, JobPayload};
+
+    fn terminal(error: JobError) -> JobRecord {
+        let mut record = JobRecord::new(
+            JobId::from_bytes([4u8; 16]),
+            JobPayload::Execution(payload()),
+            user(),
+            node(1),
+            1_000,
+            1_000,
+            None,
+        );
+        record.state = JobState::Failed;
+        record.last_error = Some(error);
+        record
+    }
+
+    #[test]
+    fn infra_failure_is_error() {
+        // Only an authenticated permanent, job-specific failure may replicate as
+        // `failed`; a retryable one stays an infrastructure `error`.
+        assert_eq!(
+            terminal_state(&terminal(JobError::permanent(
+                "container exited with code 1"
+            ))),
+            Some(PhysicalExecutionState::Failed)
+        );
+        assert_eq!(
+            terminal_state(&terminal(JobError::retryable(
+                "backend infrastructure failure"
+            ))),
+            Some(PhysicalExecutionState::Error)
+        );
     }
 }
