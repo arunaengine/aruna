@@ -224,23 +224,8 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "placement.rs",
-        "mint_object_placement",
-        "realm-admin WRITE checked inside PolicyMutationOperation",
-    ),
-    (
-        "placement.rs",
-        "put_bucket_placement",
-        "realm-admin WRITE checked inside PutBucketPlacementOperation",
-    ),
-    (
-        "placement.rs",
         "resolve_placement_quarantine",
         "realm-admin WRITE checked inside ResolveQuarantineOperation",
-    ),
-    (
-        "placement.rs",
-        "run_bucket_placement",
-        "realm-admin WRITE checked inside PolicyBulkOperation",
     ),
     (
         "rocrate_import.rs",

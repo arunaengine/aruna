@@ -232,6 +232,14 @@ mod tests {
         ("/admin/compute/drain", "post"),
         ("/admin/compute/snapshots", "get"),
         ("/admin/placement-quarantine", "post"),
+        ("/admin/placement-policies", "post"),
+        ("/admin/placement-policies/{policy_id}", "get"),
+        ("/admin/placement-diagnostics", "get"),
+        ("/buckets/{bucket}/placement", "get"),
+        ("/buckets/{bucket}/placement", "put"),
+        ("/buckets/{bucket}/placement/objects", "post"),
+        ("/buckets/{bucket}/placement/runs", "post"),
+        ("/buckets/{bucket}/placement/coverage", "get"),
         ("/jobs/{job_id}/audit", "get"),
     ];
 

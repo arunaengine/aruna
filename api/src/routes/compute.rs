@@ -14,7 +14,7 @@ use aruna_core::structs::{
     policy_admin_path,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_operations::node_info::{
     departure_report, group_demand, read_node_info_documents, read_operator_drain,
     set_operator_drain,
@@ -261,6 +261,15 @@ fn compute_config(body: ComputeConfigBody) -> ServerResult<RealmComputeConfig> {
     })
 }
 
+/// Only a genuinely absent document is a 404; a storage or decode failure must
+/// not read as "this realm has no configuration".
+fn map_config_error(error: GetRealmConfigError) -> ServerError {
+    match error {
+        GetRealmConfigError::DocumentNotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
 async fn require_config_admin(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
@@ -291,7 +300,8 @@ async fn require_config_admin(
         })),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
-        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
+        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
+        (status = 500, description = "The stored realm configuration could not be read or decoded here; absence was never established", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -305,7 +315,7 @@ pub async fn get_compute_config(
         &state.get_ctx(),
     )
     .await
-    .map_err(|_| ServerError::NotFound)?;
+    .map_err(map_config_error)?;
     Ok(Json(config_body(&config.compute)))
 }
 
@@ -398,7 +408,7 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
     path = "/admin/compute/snapshots",
     tag = "compute",
     summary = "Read the observed compute demand and reservation snapshots",
-    description = "Requires a bearer token issued for this realm and READ on the realm configuration path. Two different controls are reported side by side and are never summed: logical admitted demand, which is what the standing group quota is decided against, and exact physical reservations, which is capacity a target actually holds for accepted executions. Every publisher stamps its snapshot with its membership and publisher generations plus the time it observed them, so a stale or superseded advertisement is recognisable rather than silently averaged in. All totals are approximate: they merge what this node has replicated, so a partition may overshoot a cap before convergence, and `demand_truncated` marks a publisher that holds more nonterminal families than one snapshot reports. Passing `group_id` adds that group's merged demand next to the standing quota it is judged against; a family that several holders admitted still counts once. `departure` is present only when this node itself departed and reports the executions it could not resolve, which are unresolved rather than finished: a departing node never declares a remotely observed execution terminal, and removal is never blocked because those copies or executions exist.",
+    description = "Requires a bearer token issued for this realm and READ on the realm configuration path. Two different controls are reported side by side and are never summed: logical admitted demand, which is what the standing group quota is decided against, and exact physical reservations, which is capacity a target actually holds for accepted executions. Every publisher stamps its snapshot with its membership and publisher generations plus the time it observed them, so a stale or superseded advertisement is recognisable rather than silently averaged in. All totals are approximate: they merge what this node has replicated, so a partition may overshoot a cap before convergence, and `demand_truncated` marks a publisher whose snapshot understates it, either because a group holds more nonterminal families than the snapshot names or because whole groups could not be named at all. Passing `group_id` adds that group's merged demand next to the standing quota it is judged against; a family that several holders admitted still counts once. `departure` is present only when this node itself departed and reports the executions it could not resolve, which are unresolved rather than finished: a departing node never declares a remotely observed execution terminal, and removal is never blocked because those copies or executions exist.",
     params(
         ("group_id" = Option<String>, Query, description = "Merge the demand of one group and report the standing quota it is judged against; a value that is not a ULID is 400")
     ),
@@ -427,7 +437,8 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
         (status = 400, description = "`group_id` is not a ULID", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
-        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
+        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
+        (status = 500, description = "The stored realm configuration could not be read or decoded here; absence was never established", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -446,7 +457,7 @@ pub async fn get_compute_snapshots(
     let context = state.get_ctx();
     let config = drive(GetRealmConfigOperation::new(auth.realm_id), &context)
         .await
-        .map_err(|_| ServerError::NotFound)?;
+        .map_err(map_config_error)?;
     let members = config
         .node_ids()
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
@@ -465,7 +476,10 @@ pub async fn get_compute_snapshots(
             leaving: document.leaving,
             reserved: document.reservation.reserved.into(),
             demand_groups: document.demand.groups.len(),
-            demand_truncated: document.demand.groups.iter().any(|group| group.truncated),
+            // Whole groups the snapshot could not name understate it just as a
+            // truncated group does.
+            demand_truncated: document.demand.truncated
+                || document.demand.groups.iter().any(|group| group.truncated),
         })
         .collect();
 

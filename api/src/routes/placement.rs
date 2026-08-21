@@ -15,7 +15,7 @@ use aruna_core::structs::{
     PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
     PolicyBlockedReason, PolicyBulkStatus, VersionKey,
 };
-use aruna_operations::driver::{drive, gate_context};
+use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::metadata::forward::MetadataWriteError;
 use aruna_operations::placement_policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement_policy::diagnostics::{
@@ -25,8 +25,8 @@ use aruna_operations::placement_policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
 use aruna_operations::placement_policy::{
-    PolicyForwardError, QuarantineError, ResolveQuarantineConfig, ResolveQuarantineOperation,
-    create_policy_routed,
+    PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
+    ResolveQuarantineOperation, create_policy_routed,
 };
 use aruna_operations::s3::bucket_placement::{
     PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation,
@@ -352,13 +352,6 @@ fn refs_from(policies: Vec<PolicyRefBody>) -> ServerResult<Vec<PlacementPolicyRe
     policies.into_iter().map(TryInto::try_into).collect()
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or_default()
-}
-
 fn decode_cursor(cursor: Option<String>) -> ServerResult<Option<aruna_core::types::Key>> {
     cursor
         .map(|cursor| {
@@ -431,9 +424,7 @@ fn map_default_error(error: PutBucketPlacementError) -> ServerError {
         PutBucketPlacementError::PolicyUnavailable { .. } => {
             ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
         }
-        PutBucketPlacementError::Policy(reason) => {
-            ServerError::BadRequestReason(reason.to_string())
-        }
+        PutBucketPlacementError::Policy(_) => policy_denied(),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -448,7 +439,36 @@ fn map_successor_error(error: SuccessorError) -> ServerError {
         | SuccessorError::IntentConflict
         | SuccessorError::HeadDeleted => ServerError::Conflict(error.to_string()),
         SuccessorError::VersionMissing => ServerError::NotFound,
-        SuccessorError::Policy(reason) => ServerError::BadRequestReason(reason.to_string()),
+        SuccessorError::Policy(_) => policy_denied(),
+        // The subject moved under the plan, so the evaluation it carries is
+        // stale rather than wrong; nothing was written.
+        SuccessorError::SubjectDrift => {
+            ServerError::ServiceUnavailableReason("placement_subject_drift".to_string())
+        }
+        SuccessorError::Gate(error) => map_gate_error(error),
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+/// A refusal never names a policy, a ref or a node; only its retryability is
+/// disclosed.
+fn policy_denied() -> ServerError {
+    ServerError::BadRequestReason("placement_policy_denied".to_string())
+}
+
+fn map_gate_error(error: PolicyGateError) -> ServerError {
+    match error {
+        PolicyGateError::Denied { .. }
+        | PolicyGateError::NoSubject
+        | PolicyGateError::Invalid
+        | PolicyGateError::Policy(_) => policy_denied(),
+        PolicyGateError::Unavailable { .. }
+        | PolicyGateError::Required { .. }
+        | PolicyGateError::Drift
+        | PolicyGateError::AdmissionStopped
+        | PolicyGateError::Read(_) => {
+            ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -491,17 +511,35 @@ fn bulk_status(status: PolicyBulkStatus) -> String {
     .to_string()
 }
 
+/// Runs the operation's own realm-admin check first, so a bucket name or this
+/// node's subject state is never an oracle for a caller the operation refuses.
+async fn ensure_config_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<()> {
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        aruna_core::structs::policy_admin_path(auth.realm_id),
+        aruna_core::structs::Permission::WRITE,
+    )
+    .await
+}
+
 /// This node's advertised placement subject, without which nothing governed may
-/// be minted here.
+/// be minted here. A node that is blocked or draining is refused up front, so a
+/// run is never started where the first mint would immediately stop it.
 async fn local_subject(
     state: &ServerState,
     realm_id: aruna_core::structs::RealmId,
 ) -> ServerResult<aruna_core::structs::PlacementSubject> {
-    gate_context(&state.get_ctx(), realm_id, now_ms())
+    let gate = gate_context(&state.get_ctx(), realm_id, now_ms())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?
-        .map(|gate| gate.subject)
-        .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))
+        .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
+    if !gate.admitting {
+        return Err(ServerError::ServiceUnavailableReason(
+            "placement_admission_stopped".to_string(),
+        ));
+    }
+    Ok(gate.subject)
 }
 
 async fn bucket_info(
@@ -720,7 +758,7 @@ pub async fn get_bucket_placement(
             }],
             "generation": 4
         })),
-        (status = 400, description = "A ref could not be parsed, or the set is not a valid ref set", body = ErrorResponse),
+        (status = 400, description = "A ref could not be parsed, the set is not a valid ref set, or a placement rule refuses it; a rule refusal is reported with a fixed reason that never names a policy, a ref or a node", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
@@ -736,6 +774,7 @@ pub async fn put_bucket_placement(
     Json(request): Json<BucketPlacementRequest>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    ensure_config_admin(&state, &auth).await?;
     let info = bucket_info(&state, &bucket).await?;
     let policies = refs_from(request.policies)?;
     let stored = drive(
@@ -786,12 +825,12 @@ pub async fn put_bucket_placement(
                 "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
             }]
         })),
-        (status = 400, description = "An id, version id or ref could not be parsed", body = ErrorResponse),
+        (status = 400, description = "An id, version id or ref could not be parsed, or a placement rule refuses the destination; a rule refusal is reported with a fixed reason that never names a policy, a ref or a node", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
         (status = 404, description = "No such bucket, or the expected head version no longer exists", body = ErrorResponse),
         (status = 409, description = "The head moved, the bucket changed, the mutation id was reused with other parameters, or the assigned version id is taken", body = ErrorResponse),
-        (status = 503, description = "A referenced policy could not be authenticated, or this node advertises no placement subject; nothing was written", body = ErrorResponse)
+        (status = 503, description = "A referenced policy could not be authenticated, this node advertises no placement subject or is not admitting governed data, or its subject moved during the mutation; nothing was written and the caller may retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -802,6 +841,7 @@ pub async fn mint_object_placement(
     Json(request): Json<ObjectPlacementRequest>,
 ) -> ServerResult<Json<ObjectPlacementResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    ensure_config_admin(&state, &auth).await?;
     let info = bucket_info(&state, &bucket).await?;
     let subject = local_subject(&state, auth.realm_id).await?;
     let mutation_id =
@@ -903,7 +943,7 @@ fn mutation_response(outcome: SuccessorOutcome) -> ObjectPlacementResponse {
         (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The run was sealed against a different bucket record", body = ErrorResponse),
-        (status = 503, description = "This node advertises no placement subject, so nothing governed can be minted here", body = ErrorResponse)
+        (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -914,6 +954,7 @@ pub async fn run_bucket_placement(
     Json(request): Json<BulkRunRequest>,
 ) -> ServerResult<Json<BulkRunResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    ensure_config_admin(&state, &auth).await?;
     let subject = local_subject(&state, auth.realm_id).await?;
     let operation_id =
         Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
@@ -991,11 +1032,11 @@ const SCAN_DEFAULT_LIMIT: usize = 128;
             "absent": 1,
             "reference_only": 2,
             "complete": true,
-            "limits": ["responder-local", "current-heads-only"]
+            "limits": ["responder_local", "historical_excluded"]
         })),
         (status = 400, description = "The scope, cursor or limit could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1125,7 +1166,7 @@ fn coverage_response(
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse)
+        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
