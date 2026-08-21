@@ -37,8 +37,9 @@ use reqwest::StatusCode;
 use shared::{
     JoinerNode, SeedNode, TestResult, bucket_arn, create_bearer_token, create_group_via_http,
     create_onboarding_secret_via_http, create_s3_credentials_via_http,
-    create_s3_credentials_with_restrictions_via_http, s3_client, spawn_full_joiner_node,
-    spawn_full_seed_node, wait_for_group_via_http, wait_for_realm_nodes, wait_until,
+    create_s3_credentials_with_restrictions_via_http, s3_client, shutdown_pair,
+    spawn_full_joiner_node, spawn_full_seed_node, wait_for_group_via_http, wait_for_realm_nodes,
+    wait_until,
 };
 use std::time::Duration;
 use ulid::Ulid;
@@ -448,8 +449,7 @@ impl ReplicationHarness {
     }
 
     async fn shutdown(self) {
-        self.joiner.shutdown().await;
-        self.seed.shutdown().await;
+        shutdown_pair(self.joiner, self.seed).await;
     }
 }
 

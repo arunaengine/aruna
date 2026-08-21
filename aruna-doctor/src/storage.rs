@@ -521,7 +521,6 @@ mod tests {
     use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
-    use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::s3::create_bucket::CreateBucketOperation;
     use aruna_operations::s3::create_user_access::{
         CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
@@ -637,7 +636,8 @@ mod tests {
                 task_handle: Some(task_handle.clone()),
                 compute_handle: None,
             });
-            initialize_net_incoming(context.clone());
+            // No incoming loops are started: snapshot and restore are the
+            // subject, and a background writer would conflict the fixture.
             let server_state = ServerState::new(
                 context.clone(),
                 config.realm_id,

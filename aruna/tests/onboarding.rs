@@ -18,10 +18,9 @@ use aruna_operations::register_or_get_oidc_user::{
 };
 use byteview::ByteView;
 use shared::{
-    TestResult, create_onboarding_secret_via_http, spawn_joiner_node, spawn_seed_node,
-    wait_for_realm_nodes,
+    TestResult, create_onboarding_secret_via_http, shutdown_pair, spawn_joiner_node,
+    spawn_seed_node, wait_for_realm_nodes,
 };
-use tokio::time::{Duration, sleep};
 
 async fn read_user(
     context: &aruna_operations::driver::DriverContext,
@@ -47,7 +46,6 @@ async fn read_user(
 #[tokio::test(flavor = "multi_thread")]
 async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
-    sleep(Duration::from_millis(50)).await;
     let _user = drive(
         RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: Actor {
@@ -132,15 +130,13 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
     )
     .await?;
 
-    joiner.shutdown().await;
-    seed.shutdown().await;
+    shutdown_pair(joiner, seed).await;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn server_onboarding_bootstraps_joiner_over_http_and_completes() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
-    sleep(Duration::from_millis(50)).await;
     let onboarding_secret =
         create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
 
@@ -164,7 +160,6 @@ async fn server_onboarding_bootstraps_joiner_over_http_and_completes() -> TestRe
     )
     .await?;
 
-    joiner.shutdown().await;
-    seed.shutdown().await;
+    shutdown_pair(joiner, seed).await;
     Ok(())
 }

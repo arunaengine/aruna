@@ -11,8 +11,8 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use shared::{
     TestResult, create_bearer_token, create_group_via_http, create_onboarding_secret_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_full_joiner_node, spawn_full_seed_node,
-    spawn_seed_node, wait_for_group_via_http, wait_for_realm_nodes,
+    create_s3_credentials_via_http, s3_client, shutdown_pair, spawn_full_joiner_node,
+    spawn_full_seed_node, spawn_seed_node, wait_for_group_via_http, wait_for_realm_nodes,
 };
 use ulid::Ulid;
 
@@ -282,7 +282,6 @@ async fn drs_historical_materialized_hash_resolves_non_current_version() -> Test
     }
     .await;
 
-    joiner.shutdown().await;
-    seed.shutdown().await;
+    shutdown_pair(joiner, seed).await;
     result
 }

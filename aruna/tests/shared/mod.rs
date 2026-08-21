@@ -4,14 +4,16 @@ use aruna::bootstrap::{
     fetch_core_onboarding_documents, prepare_core_documents, publish_core_documents,
     realm_bootstrap_exists, wait_for_onboarding_placement,
 };
-use aruna::config::{Config, load, mark_node_state_complete, mark_onboarding_phase};
+use aruna::config::{
+    Config, mark_node_state_complete, mark_onboarding_phase, read_settings, resolve_settings,
+};
 use aruna_api::cors::CorsConfig;
 use aruna_api::ops::{OpsState, Readiness, serve_ops};
 use aruna_api::routes::credentials::{
     CreateS3CredentialsRequest, CreateS3CredentialsResponse, CreateS3PathRestriction,
 };
 use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
-use aruna_api::s3::s3_server::S3Server;
+use aruna_api::s3::s3_server::{S3Server, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
@@ -63,6 +65,17 @@ pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
 pub(crate) const WAIT_CAP: Duration = Duration::from_secs(300);
 const CONDITION_CAP: Duration = Duration::from_secs(30);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Deadlock cap for one shutdown phase: far above any honest shutdown, so a
+/// stuck child is reported by name instead of hanging until the job timeout.
+const SHUTDOWN_CAP: Duration = Duration::from_secs(120);
+/// Generous S3 listener deadlines: a loaded or instrumented run must not have
+/// its bodies cancelled for slowness, only for a genuine stall.
+const TEST_S3_TIMEOUTS: S3ServerTimeouts = S3ServerTimeouts {
+    initial_request: Duration::from_secs(120),
+    connection_idle: Duration::from_secs(300),
+    stream_lifetime: Duration::from_secs(60 * 60),
+};
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -156,18 +169,18 @@ pub(crate) struct SeedNode {
 
 impl SeedNode {
     pub(crate) async fn shutdown(self) {
+        stop_timers(self.context.as_ref()).await;
         self.server_task.abort();
-        let _ = self.server_task.await;
-
-        if let Some(s3_task) = self.s3_task {
+        self.ops_task.abort();
+        if let Some(s3_task) = &self.s3_task {
             s3_task.abort();
+        }
+        let _ = self.server_task.await;
+        let _ = self.ops_task.await;
+        if let Some(s3_task) = self.s3_task {
             let _ = s3_task.await;
         }
-
-        self.ops_task.abort();
-        let _ = self.ops_task.await;
-
-        self.net.shutdown().await;
+        hang_cap("seed net shutdown", self.net.shutdown()).await;
     }
 }
 
@@ -185,16 +198,43 @@ pub(crate) struct JoinerNode {
 
 impl JoinerNode {
     pub(crate) async fn shutdown(self) {
+        stop_timers(self.context.as_ref()).await;
         self.server_task.abort();
-        let _ = self.server_task.await;
-
-        if let Some(s3_task) = self.s3_task {
+        if let Some(s3_task) = &self.s3_task {
             s3_task.abort();
+        }
+        let _ = self.server_task.await;
+        if let Some(s3_task) = self.s3_task {
             let _ = s3_task.await;
         }
-
-        self.net.shutdown().await;
+        hang_cap("joiner net shutdown", self.net.shutdown()).await;
     }
+}
+
+/// Stops the node's timer runtime before its network, so no refresh timer
+/// outlives the node it announces for.
+async fn stop_timers(context: &DriverContext) {
+    if let Some(task_handle) = &context.task_handle {
+        hang_cap("task shutdown", task_handle.shutdown(Duration::ZERO)).await;
+    }
+}
+
+/// Bounds one shutdown phase and names it on elapse; this detects a deadlock,
+/// it is not a deadline for a slow machine.
+async fn hang_cap<F, T>(phase: &str, op: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match time_limit(SHUTDOWN_CAP, op).await {
+        Ok(value) => value,
+        Err(_) => panic!("shutdown phase `{phase}` did not finish within {SHUTDOWN_CAP:?}"),
+    }
+}
+
+/// Shuts both nodes down at once: a test that owns both should not pay two
+/// sequential network shutdowns.
+pub(crate) async fn shutdown_pair(joiner: JoinerNode, seed: SeedNode) {
+    tokio::join!(joiner.shutdown(), seed.shutdown());
 }
 
 struct EnvVarGuard {
@@ -220,7 +260,7 @@ pub(crate) fn env_lock() -> &'static Mutex<()> {
 pub(crate) async fn wait_until<F, Fut>(
     description: &str,
     timeout: Duration,
-    interval: Duration,
+    mut interval: Duration,
     mut condition: F,
 ) -> TestResult<()>
 where
@@ -241,6 +281,9 @@ where
             );
         }
         sleep(interval).await;
+        // Heavy predicates (HTTP plus S3 round trips) must not busy-poll a
+        // loaded node for the whole cap.
+        interval = interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
     }
 }
 
@@ -337,33 +380,24 @@ pub(crate) async fn create_group_via_http(
     bearer_token: &str,
     name: &str,
 ) -> TestResult<CreateGroupResponse> {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + WAIT_CAP;
-    loop {
-        let response = client
-            .post(format!("{base_url}/api/v1/groups"))
-            .bearer_auth(bearer_token)
-            .json(&CreateGroupRequest {
-                name: name.to_string(),
-            })
-            .send()
-            .await?;
-        if response.status() == StatusCode::CREATED {
-            return Ok(response.json().await?);
-        }
+    // One request must succeed: the operation retries storage conflicts itself.
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/api/v1/groups"))
+        .bearer_auth(bearer_token)
+        .json(&CreateGroupRequest {
+            name: name.to_string(),
+        })
+        .send()
+        .await?;
+    if response.status() != StatusCode::CREATED {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        if status != StatusCode::CONFLICT
-            || !body.contains("concurrent group creation conflict; retry")
-            || Instant::now() >= deadline
-        {
-            return Err(std::io::Error::other(format!(
-                "unexpected create group status: {status} body={body}"
-            ))
-            .into());
-        }
-        sleep(Duration::from_millis(100)).await;
+        return Err(std::io::Error::other(format!(
+            "unexpected create group status: {status} body={body}"
+        ))
+        .into());
     }
+    Ok(response.json().await?)
 }
 
 pub(crate) async fn get_group_via_http(
@@ -739,6 +773,7 @@ async fn spawn_joiner_node_with_mode(
         &config.node_state,
         &config.realm_id,
         config.peer_endpoints.first().map(|endpoint| endpoint.id),
+        config.onboarding_sync_timeout(),
     )
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
@@ -747,6 +782,7 @@ async fn spawn_joiner_node_with_mode(
         config.realm_id,
         config.node_id,
         config.peer_endpoints.first().map(|endpoint| endpoint.id),
+        config.onboarding_sync_timeout(),
     )
     .await?;
     mark_onboarding_phase(
@@ -886,7 +922,7 @@ async fn announce_realm_presence(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
             realm_id: *realm_id,
             node_id,
-            schedule_refresh: false,
+            schedule_refresh: true,
         }),
         context,
     )
@@ -997,8 +1033,9 @@ async fn spawn_s3_server(
         metrics,
     )
     .await?;
-    let (_addr, task) =
-        s3_server.run_with_listener(listener, tokio_util::sync::CancellationToken::new())?;
+    let (_addr, task) = s3_server
+        .with_timeouts(TEST_S3_TIMEOUTS)
+        .run_with_listener(listener, tokio_util::sync::CancellationToken::new())?;
     Ok((
         S3Endpoint {
             endpoint_url: format!("http://{host}"),
@@ -1031,11 +1068,18 @@ async fn load_config_with_env(
         ("S3_ADDRESS", "127.0.0.1:0".to_string()),
         ("ONBOARDING_SECRET", onboarding_secret),
         ("ARUNA_NODE_LABELS", "fixture=joiner".to_string()),
+        ("ONBOARDING_BOOTSTRAP_TIMEOUT_SECS", "600".to_string()),
+        ("ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS", "600".to_string()),
     ];
 
-    let _lock = env_lock().lock().await;
-    let _guard = set_env_vars(&vars);
-    Ok(load().await?)
+    // The lock covers the env read only: opening storage and the bootstrap
+    // round trip must not serialize every joiner spawn in the binary.
+    let settings = {
+        let _lock = env_lock().lock().await;
+        let _guard = set_env_vars(&vars);
+        read_settings()?
+    };
+    Ok(resolve_settings(settings).await?)
 }
 
 fn set_env_vars(vars: &[(&str, String)]) -> EnvVarGuard {
