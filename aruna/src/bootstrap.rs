@@ -116,17 +116,16 @@ pub async fn prepare_core_documents(
     let mut documents = vec![
         DocumentSyncTarget::RealmAuthorization { realm_id },
         DocumentSyncTarget::RealmConfig { realm_id },
-        // Announce the shared realm-scoped node-usage topic so every realm node
-        // subscribes to it and receives all peers' usage snapshots.
-        DocumentSyncTarget::NodeUsage {
+    ];
+    if include_node_info {
+        // Initial and joining nodes announce their node documents before the
+        // first heartbeat and usage publish; a provisioned restart restores the
+        // shared topics instead and leaves republication to the timers.
+        documents.push(DocumentSyncTarget::NodeUsage {
             realm_id,
             node_id,
             group_id: None,
-        },
-    ];
-    if include_node_info {
-        // Initial and joining nodes announce before their first heartbeat;
-        // provisioned restarts leave refresh publication to the timer.
+        });
         documents.push(DocumentSyncTarget::NodeInfo { realm_id, node_id });
     }
     let watch_target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
