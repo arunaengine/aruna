@@ -4822,6 +4822,7 @@ fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
+    now_ms: u64,
     revocation_index: Option<&RevocationIndex>,
 ) {
     if !reducer_state
@@ -4916,19 +4917,17 @@ fn overlay_realm_config_reducer_materialization(
         }
     }
 
-    // The revocation clock is in seconds; the transition grace is in
-    // milliseconds, and a second of granularity is nothing against it.
-    overlay_realm_config_placement_reducer_materialization(
-        config,
-        reducer_state,
-        now.saturating_mul(1_000),
-    );
+    // Revocations run on the seconds clock; transition release needs the
+    // millisecond clock, or a report reduced within the completion's second
+    // leaves the record unreleased with nothing to re-materialize it.
+    overlay_realm_config_placement_reducer_materialization(config, reducer_state, now_ms);
 }
 
 fn realm_config_from_reducer_materialization(
     realm_id: RealmId,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
+    now_ms: u64,
     revocation_index: Option<&RevocationIndex>,
 ) -> Option<RealmConfigDocument> {
     let metadata_replication = reducer_state.materialized_realm_config_metadata_replication()?;
@@ -4966,7 +4965,13 @@ fn realm_config_from_reducer_materialization(
         revoked_tokens: Vec::new(),
         revocation_floor: reducer_state.revocation_floor,
     };
-    overlay_realm_config_reducer_materialization(&mut config, reducer_state, now, revocation_index);
+    overlay_realm_config_reducer_materialization(
+        &mut config,
+        reducer_state,
+        now,
+        now_ms,
+        revocation_index,
+    );
     Some(config)
 }
 
@@ -6503,6 +6508,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     &mut config,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config != before;
@@ -6513,6 +6519,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     realm_id,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config.is_some();
@@ -6770,6 +6777,7 @@ async fn apply_config_events(
                     &mut config,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config != before;
@@ -6780,6 +6788,7 @@ async fn apply_config_events(
                     realm_id,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config.is_some();
@@ -11587,7 +11596,13 @@ mod tests {
 
         let now = unix_timestamp_secs();
         let index = state.revocation_index(now);
-        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
+        overlay_realm_config_reducer_materialization(
+            &mut config,
+            &state,
+            now,
+            unix_timestamp_millis(),
+            Some(&index),
+        );
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -11621,7 +11636,13 @@ mod tests {
         assert_eq!(state.materialized_realm_config_default_strategy(), None);
 
         let index = state.revocation_index(now);
-        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
+        overlay_realm_config_reducer_materialization(
+            &mut config,
+            &state,
+            now,
+            unix_timestamp_millis(),
+            Some(&index),
+        );
         assert_eq!(config.default_strategy_id, None);
     }
 
@@ -12394,6 +12415,7 @@ mod tests {
             &mut future_config,
             &state,
             future,
+            unix_timestamp_millis(),
             Some(&index),
         );
         assert_eq!(future_config.revoked_tokens.len(), 1);
