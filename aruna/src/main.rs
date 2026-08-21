@@ -399,8 +399,10 @@ async fn init_realm(
         )
         .await?;
     }
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    // The subject comes first: the advertisement built from it carries no
+    // execution target while this node has no placement subject yet.
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
         config.node_id,
@@ -473,10 +475,10 @@ async fn join_realm(
             warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
         }
     }
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
         config.node_id,
         config.realm_id,
         false,
@@ -517,10 +519,10 @@ async fn provision_realm(
         .await?;
     }
 
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
     let allow_genesis = config.is_initial_node();
     let documents = prepare_core_documents(
+    seed_local_node_info(driver_ctx.as_ref(), config).await?;
         driver_ctx.as_ref(),
         config.node_id,
         config.realm_id,
@@ -1154,15 +1156,10 @@ fn compute_envelope() -> Result<aruna_core::compute::ResourceEnvelope, String> {
 }
 
 #[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
-fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+fn env_number<T: std::str::FromStr + Default + PartialEq>(name: &str) -> Result<Option<T>, String> {
     dotenvy::var(name)
         .ok()
-        .map(|value| {
-            value
-                .trim()
-                .parse::<T>()
-                .map_err(|_| format!("{name} must be a positive integer"))
-        })
+        .map(|value| parse_positive(name, value.trim()))
         .transpose()
 }
 
@@ -1170,6 +1167,27 @@ fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
 #[cfg(feature = "kubernetes")]
 fn env_labels(name: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
     let Ok(value) = dotenvy::var(name) else {
+/// Zero is rejected rather than silently making this node ineligible: leaving
+/// the variable unset is how a dimension stays unmeasured.
+#[cfg(any(
+    feature = "docker",
+    feature = "apptainer",
+    feature = "kubernetes",
+    test
+))]
+fn parse_positive<T: std::str::FromStr + Default + PartialEq>(
+    name: &str,
+    value: &str,
+) -> Result<T, String> {
+    let parsed = value
+        .parse::<T>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    match parsed == T::default() {
+        true => Err(format!("{name} must be greater than zero")),
+        false => Ok(parsed),
+    }
+}
+
         return Ok(std::collections::BTreeMap::new());
     };
     value
@@ -1359,6 +1377,18 @@ mod tests {
     async fn portal_exit_reports() {
         // A dead portal is a node failure, and a panic must not lose its error.
         let mut stopped = tokio::spawn(async {});
+    #[test]
+    fn rejects_zero_ceiling() {
+        // A zero ceiling would silently make this node ineligible for every
+        // execution instead of leaving the dimension unmeasured.
+        assert_eq!(
+            parse_positive::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT", "4"),
+            Ok(4)
+        );
+        assert!(parse_positive::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT", "0").is_err());
+        assert!(parse_positive::<u64>("ARUNA_COMPUTE_MAX_RAM_BYTES", "-1").is_err());
+    }
+
         assert_eq!(
             portal_exit(Some(&mut stopped)).await,
             "Portal server stopped unexpectedly"
