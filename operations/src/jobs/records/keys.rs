@@ -2,6 +2,7 @@
 //! the record's own signed identity, so a relay can never place a record under
 //! another family, kind, or subject.
 
+use aruna_core::NodeId;
 use aruna_core::effects::{FetchCursor, FrameBoundsError};
 use aruna_core::structs::{
     JOB_RECORD_KEY_BYTES, JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind,
@@ -31,6 +32,34 @@ pub fn kind_prefix(family: &JobFamilyId, kind: JobRecordKind) -> Key {
     let mut bytes = family.to_bytes().to_vec();
     bytes.push(kind.as_byte());
     Key::from(bytes.as_slice())
+}
+
+/// Key of a predecessor addressed by a 16-byte identity, zero-extended exactly
+/// as that record kind derives its own subject.
+pub fn id_key(
+    family: &JobFamilyId,
+    kind: JobRecordKind,
+    id: [u8; 16],
+    sequence: u64,
+) -> JobRecordKey {
+    let mut subject = [0u8; 32];
+    subject[..16].copy_from_slice(&id);
+    JobRecordKey {
+        family: *family,
+        kind,
+        subject,
+        sequence,
+    }
+}
+
+/// Key of the budget one scheduler published; that kind is keyed by the node.
+pub fn budget_key(family: &JobFamilyId, scheduler: NodeId) -> JobRecordKey {
+    JobRecordKey {
+        family: *family,
+        kind: JobRecordKind::Budget,
+        subject: *scheduler.as_bytes(),
+        sequence: 0,
+    }
 }
 
 /// Conflict rows keep the rejected digest in the key, so two different bytes
@@ -111,12 +140,28 @@ mod tests {
     }
 
     #[test]
-    fn kinds_sort_before_updates() {
-        // Evidence kinds must page before updates and outputs, so one bounded
-        // scan from the family prefix always yields the evidence first.
-        let evidence = kind_prefix(&family(), JobRecordKind::Receipt);
+    fn orders_by_kind() {
+        // Kind prefixes must sort in declaration order, so a per-kind scan and
+        // an audit page over the family agree on where one kind ends.
+        let receipt = kind_prefix(&family(), JobRecordKind::Receipt);
         let update = kind_prefix(&family(), JobRecordKind::Update);
-        assert!(evidence < update);
+        assert!(receipt < update);
+        assert!(record_key(&id_key(&family(), JobRecordKind::Receipt, [1u8; 16], 0)) < update);
+    }
+
+    #[test]
+    fn derives_predecessor_keys() {
+        // A predecessor key must be derivable from the successor alone: the
+        // subject is zero-extended and the sequence addresses one update.
+        let key = id_key(&family(), JobRecordKind::Update, [7u8; 16], 3);
+        assert_eq!(key.subject[..16], [7u8; 16]);
+        assert_eq!(key.subject[16..], [0u8; 16]);
+        assert_eq!(key.sequence, 3);
+
+        let scheduler = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let budget = budget_key(&family(), scheduler);
+        assert_eq!(budget.subject, *scheduler.as_bytes());
+        assert!(record_key(&budget).starts_with(kind_prefix(&family(), JobRecordKind::Budget)));
     }
 
     #[test]

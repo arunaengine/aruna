@@ -4,14 +4,17 @@
 //! config it synchronized and the records it already stored as authentic. A
 //! relaying peer supplies bytes, never authority and never evidence.
 
+use std::collections::BTreeSet;
+
 use aruna_core::NodeId;
 use aruna_core::structs::{
     ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordContext, LaunchIntent, LocalExecution, LogicalJobSpec, PlacementRef,
-    RealmConfigDocument, RealmId, WitnessBudgetRecord,
+    JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec,
+    PlacementRef, RealmConfigDocument, RealmId, WitnessBudgetRecord,
 };
 use ulid::Ulid;
 
+use super::keys::{budget_key, id_key};
 use crate::placement::transition::activation_holders;
 
 /// The authenticated local view records of one family are judged against.
@@ -94,6 +97,89 @@ pub struct Evidence<'a> {
     pub launch: Option<&'a LaunchIntent>,
     pub receipt: Option<&'a ExecutionReceipt>,
     pub previous_update: Option<&'a ExecutionUpdate>,
+}
+
+/// The predecessor rows one set of candidates must be judged against.
+///
+/// A key is derived wherever the successor's own signed identity addresses its
+/// predecessor exactly. A whole kind is scanned only where selection is by a
+/// digest or an id no record key carries, and that scan must run to completion:
+/// a truncated one proves nothing absent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EvidencePlan {
+    pub keys: BTreeSet<JobRecordKey>,
+    pub kinds: BTreeSet<JobRecordKind>,
+}
+
+impl EvidencePlan {
+    /// Adds what one candidate needs. This mirrors [`EvidenceSet::select`]:
+    /// every predecessor selection may consult must be loadable from here.
+    pub fn extend(&mut self, record: &JobFamilyRecord) {
+        let family = record.family();
+        match record {
+            JobFamilyRecord::Spec(_) => {}
+            JobFamilyRecord::Claim(claim) => {
+                self.keys.insert(id_key(
+                    &family,
+                    JobRecordKind::Spec,
+                    claim.job_id.to_bytes(),
+                    0,
+                ));
+            }
+            JobFamilyRecord::Cancel(cancel) => {
+                self.keys.insert(id_key(
+                    &family,
+                    JobRecordKind::Spec,
+                    cancel.job_id.to_bytes(),
+                    0,
+                ));
+            }
+            // The spec is selected by its digest, which no record key carries.
+            JobFamilyRecord::Budget(_) => {
+                self.kinds.insert(JobRecordKind::Spec);
+            }
+            // A receipt is keyed by its execution, so the one that seals this
+            // launch is found only by reading every receipt of the family.
+            JobFamilyRecord::Launch(launch) => {
+                self.kinds.insert(JobRecordKind::Spec);
+                self.kinds.insert(JobRecordKind::Receipt);
+                self.keys
+                    .insert(budget_key(&family, launch.scheduler_node_id));
+            }
+            JobFamilyRecord::Receipt(receipt) => {
+                self.keys.insert(id_key(
+                    &family,
+                    JobRecordKind::Launch,
+                    receipt.launch_id.to_bytes(),
+                    0,
+                ));
+            }
+            JobFamilyRecord::Update(update) => {
+                self.keys.insert(id_key(
+                    &family,
+                    JobRecordKind::Receipt,
+                    update.execution_id.to_bytes(),
+                    0,
+                ));
+                if let Some(sequence) = update.sequence.checked_sub(1) {
+                    self.keys.insert(id_key(
+                        &family,
+                        JobRecordKind::Update,
+                        update.execution_id.to_bytes(),
+                        sequence,
+                    ));
+                }
+            }
+            JobFamilyRecord::Output(output) => {
+                self.keys.insert(id_key(
+                    &family,
+                    JobRecordKind::Receipt,
+                    output.execution_id.to_bytes(),
+                    0,
+                ));
+            }
+        }
+    }
 }
 
 /// The authentic predecessor records of one family, indexed for selection.

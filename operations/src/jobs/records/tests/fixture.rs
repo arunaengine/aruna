@@ -336,7 +336,7 @@ pub fn payload() -> ExecutionSpec {
     }
 }
 
-fn actor(node_id: NodeId) -> Actor {
+pub fn actor(node_id: NodeId) -> Actor {
     Actor {
         node_id,
         user_id: user(),

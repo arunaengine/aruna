@@ -48,8 +48,9 @@ pub struct FamilyState<'a> {
     /// `None` when the local holder view cannot be resolved: every candidate
     /// defers instead of being judged against an empty view.
     pub view: Option<&'a FamilyView>,
-    /// Records already stored under their own key, for the candidate keys and
-    /// every evidence-bearing kind of the family.
+    /// Records already stored under their own key: the candidate keys plus the
+    /// predecessors every record judged here needs, read exactly or by paging
+    /// one whole kind to its end.
     pub stored: &'a BTreeMap<JobRecordKey, JobRecordEnvelope>,
     /// This node's own fenced execution, if it is the one publishing.
     pub local: Option<&'a LocalExecution>,

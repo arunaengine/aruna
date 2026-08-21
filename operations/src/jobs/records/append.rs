@@ -6,11 +6,11 @@
 //! dependency evidence already stored here, and the canonical digest. The
 //! writes of one append commit in a single transaction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
@@ -29,10 +29,17 @@ use super::admit::{
     Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_append,
     relayable,
 };
-use super::keys::{alias_key, conflict_key, family_prefix, record_key};
+use super::keys::{alias_key, conflict_key, family_prefix, kind_prefix, record_key};
 use super::rows::{OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes};
-use super::verify::FamilyView;
-use super::{MAX_FAMILY_EVIDENCE, RecordStoreError};
+use super::verify::{EvidencePlan, FamilyView};
+use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
+
+/// The rows a batch read found, dropping the keys that hold nothing.
+fn stored_rows(values: Vec<(Key, Option<Value>)>) -> impl Iterator<Item = (Key, Value)> {
+    values
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+}
 
 /// Where one candidate record came from. The transport peer is authenticated
 /// separately from the envelope's publisher and is audit data only.
@@ -76,6 +83,10 @@ pub struct AppendRecordOperation {
     retained: Vec<(JobRecordKey, PendingRecord)>,
     cache: Option<ProjectionCache>,
     plan: Option<AppendPlan>,
+    /// Record kinds still to be paged whole, in key order.
+    scans: VecDeque<JobRecordKind>,
+    cursor: Option<Key>,
+    scanned: usize,
     state: AppendState,
     outcome: Option<Result<AppendOutcome, RecordStoreError>>,
 }
@@ -86,9 +97,10 @@ enum AppendState {
     ReadConfig,
     Begin,
     ReadRow { txn_id: TxnId },
-    ScanEvidence { txn_id: TxnId },
     ScanPending { txn_id: TxnId },
     ReadPending { txn_id: TxnId },
+    ReadEvidence { txn_id: TxnId },
+    ScanKind { txn_id: TxnId },
     Write { txn_id: TxnId },
     Clear { txn_id: TxnId },
     Commit { txn_id: TxnId },
@@ -106,6 +118,9 @@ impl AppendRecordOperation {
             retained: Vec::new(),
             cache: None,
             plan: None,
+            scans: VecDeque::new(),
+            cursor: None,
+            scanned: 0,
             state: AppendState::Init,
             outcome: None,
         }
@@ -122,9 +137,10 @@ impl AppendRecordOperation {
     fn txn(&self) -> Option<TxnId> {
         match self.state {
             AppendState::ReadRow { txn_id }
-            | AppendState::ScanEvidence { txn_id }
             | AppendState::ScanPending { txn_id }
             | AppendState::ReadPending { txn_id }
+            | AppendState::ReadEvidence { txn_id }
+            | AppendState::ScanKind { txn_id }
             | AppendState::Write { txn_id }
             | AppendState::Clear { txn_id }
             | AppendState::Commit { txn_id }
@@ -158,7 +174,7 @@ impl AppendRecordOperation {
 
     fn read_row(&mut self, txn_id: TxnId) -> Effects {
         self.state = AppendState::ReadRow { txn_id };
-        let mut reads = vec![
+        let reads = vec![
             (
                 JOB_FAMILY_RECORD_KEYSPACE.to_string(),
                 record_key(&self.envelope().key()),
@@ -168,28 +184,8 @@ impl AppendRecordOperation {
                 family_prefix(&self.family()),
             ),
         ];
-        if let aruna_core::structs::JobFamilyRecord::Update(update) = &self.envelope().record
-            && let Some(sequence) = update.sequence.checked_sub(1)
-        {
-            let mut key = self.envelope().key();
-            key.sequence = sequence;
-            reads.push((JOB_FAMILY_RECORD_KEYSPACE.to_string(), record_key(&key)));
-        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    /// Evidence kinds sort before updates and outputs, so one bounded scan from
-    /// the family prefix always yields the predecessors first.
-    fn scan_evidence(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AppendState::ScanEvidence { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
-            prefix: Some(family_prefix(&self.family())),
-            start: None,
-            limit: MAX_FAMILY_EVIDENCE,
             txn_id: Some(txn_id),
         })]
     }
@@ -215,7 +211,7 @@ impl AppendRecordOperation {
             .map(|(key, _)| (JOB_FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
             .collect();
         if reads.is_empty() {
-            return self.plan_writes(txn_id);
+            return self.read_evidence(txn_id);
         }
         self.state = AppendState::ReadPending { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -224,26 +220,81 @@ impl AppendRecordOperation {
         })]
     }
 
-    fn keep_records(&mut self, values: Vec<(Key, Value)>) {
-        for (key, value) in values {
-            let Ok(record_key) = JobRecordKey::from_bytes(&key) else {
-                continue;
-            };
-            if let Ok(envelope) = from_bytes::<JobRecordEnvelope>(&value) {
-                self.stored.insert(record_key, envelope);
+    /// The exact predecessors of every record this append judges: the candidate
+    /// and each retained one. Retained records are re-judged here, so their
+    /// evidence is read on every attempt, not only on first arrival.
+    fn read_evidence(&mut self, txn_id: TxnId) -> Effects {
+        let mut plan = EvidencePlan::default();
+        plan.extend(&self.envelope().record);
+        for (_, row) in &self.retained {
+            plan.extend(&row.envelope.record);
+        }
+        self.scans = plan.kinds.into_iter().collect();
+        let reads: Vec<(String, Key)> = plan
+            .keys
+            .iter()
+            .filter(|key| !self.stored.contains_key(key))
+            .map(|key| (JOB_FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
+            .collect();
+        if reads.is_empty() {
+            return self.scan_kind(txn_id);
+        }
+        self.state = AppendState::ReadEvidence { txn_id };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Pages one whole record kind. A predecessor selected by digest or by an
+    /// id no key carries is absent only once its kind has been read to the end,
+    /// so this follows the continuation instead of stopping at one page.
+    fn scan_kind(&mut self, txn_id: TxnId) -> Effects {
+        let Some(kind) = self.scans.front().copied() else {
+            return self.plan_writes(txn_id);
+        };
+        self.state = AppendState::ScanKind { txn_id };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            prefix: Some(kind_prefix(&self.family(), kind)),
+            start: self.cursor.clone().map(IterStart::After),
+            limit: RECORD_PAGE_SIZE,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Continues the current kind, moves to the next one, or plans the writes.
+    /// Reaching the row budget with pages left fails closed: a partial evidence
+    /// set would read as a missing predecessor.
+    fn next_page(&mut self, txn_id: TxnId, next: Option<Key>) -> Effects {
+        match next {
+            Some(_) if self.scanned >= MAX_EVIDENCE_ROWS => {
+                self.fail(RecordStoreError::EvidenceIncomplete)
+            }
+            Some(cursor) => {
+                self.cursor = Some(cursor);
+                self.scan_kind(txn_id)
+            }
+            None => {
+                self.cursor = None;
+                self.scans.pop_front();
+                self.scan_kind(txn_id)
             }
         }
     }
 
-    /// The bounded family scan stops at the evidence kinds: updates, outputs,
-    /// and cancels prove nothing for another record.
-    fn evidence_rows(values: Vec<(Key, Value)>) -> Vec<(Key, Value)> {
-        values
-            .into_iter()
-            .filter(|(key, _)| {
-                JobRecordKey::from_bytes(key).is_ok_and(|key| key.kind <= JobRecordKind::Receipt)
-            })
-            .collect()
+    /// Every loaded row is authority for this admission, so an undecodable key
+    /// or value fails the append instead of silently shrinking the evidence.
+    fn keep_records(
+        &mut self,
+        values: impl IntoIterator<Item = (Key, Value)>,
+    ) -> Result<(), RecordStoreError> {
+        for (key, value) in values {
+            let record_key = JobRecordKey::from_bytes(&key)?;
+            self.stored
+                .insert(record_key, from_bytes::<JobRecordEnvelope>(&value)?);
+        }
+        Ok(())
     }
 
     fn keep_pending(&mut self, values: Vec<(Key, Value)>) {
@@ -457,35 +508,20 @@ impl Operation for AppendRecordOperation {
             },
             AppendState::ReadRow { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let key = self.envelope().key();
                     let mut values = values.into_iter();
-                    if let Some((_, Some(value))) = values.next()
-                        && let Ok(envelope) = from_bytes::<JobRecordEnvelope>(&value)
-                    {
-                        self.stored.insert(key, envelope);
-                    }
+                    let row = values
+                        .next()
+                        .and_then(|(key, value)| value.map(|value| (key, value)));
                     if let Some((_, Some(value))) = values.next() {
-                        self.cache = from_bytes::<ProjectionCache>(&value).ok();
+                        self.cache = ProjectionCache::decode(&value);
                     }
-                    if let Some((key, Some(value))) = values.next()
-                        && let Ok(record_key) = JobRecordKey::from_bytes(&key)
-                        && let Ok(envelope) = from_bytes::<JobRecordEnvelope>(&value)
-                    {
-                        self.stored.insert(record_key, envelope);
+                    if let Err(error) = self.keep_records(row) {
+                        return self.fail(error);
                     }
-                    self.scan_evidence(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record row read", format!("{other:?}")),
-            },
-            AppendState::ScanEvidence { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    let evidence = Self::evidence_rows(values);
-                    self.keep_records(evidence);
                     self.scan_pending(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("evidence scan", format!("{other:?}")),
+                other => self.unexpected("record row read", format!("{other:?}")),
             },
             AppendState::ScanPending { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -497,15 +533,37 @@ impl Operation for AppendRecordOperation {
             },
             AppendState::ReadPending { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let rows: Vec<(Key, Value)> = values
-                        .into_iter()
-                        .filter_map(|(key, value)| value.map(|value| (key, value)))
-                        .collect();
-                    self.keep_records(rows);
-                    self.plan_writes(txn_id)
+                    if let Err(error) = self.keep_records(stored_rows(values)) {
+                        return self.fail(error);
+                    }
+                    self.read_evidence(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("pending row read", format!("{other:?}")),
+            },
+            AppendState::ReadEvidence { txn_id } => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    if let Err(error) = self.keep_records(stored_rows(values)) {
+                        return self.fail(error);
+                    }
+                    self.scan_kind(txn_id)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected("evidence row read", format!("{other:?}")),
+            },
+            AppendState::ScanKind { txn_id } => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    self.scanned = self.scanned.saturating_add(values.len());
+                    if let Err(error) = self.keep_records(values) {
+                        return self.fail(error);
+                    }
+                    self.next_page(txn_id, next_start_after)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected("evidence scan", format!("{other:?}")),
             },
             AppendState::Write { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.clear_pending(txn_id),
