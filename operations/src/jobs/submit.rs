@@ -83,6 +83,13 @@ pub enum SubmitJobError {
     JobPlanConflict { existing_job_id: JobId },
     #[error("invalid workspace: {0}")]
     InvalidWorkspace(String),
+    #[error("a job may declare at most {limit} outputs")]
+    TooManyOutputs { limit: usize },
+    /// Standing compute quota refused the new logical admission.
+    #[error("compute quota denied: {0}")]
+    QuotaDenied(#[from] aruna_core::compute_quota::QuotaDenied),
+    #[error(transparent)]
+    Composition(#[from] aruna_core::structs::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]
     ActiveJobLimit { limit: u32 },
     #[error("unexpected event while submitting job: {0}")]
@@ -522,6 +529,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         })
     }
 

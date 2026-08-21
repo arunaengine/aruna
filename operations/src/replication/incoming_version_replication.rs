@@ -2,8 +2,13 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read,
     build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
 };
+use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
+use crate::placement_policy::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
+};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,
@@ -29,10 +34,10 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
-    RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey, ReplicationItemKind,
-    ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits, RoutingError, StorageRoutingRule,
-    UsageDelta, VersionKey, WriteOwner, blob_bucket_permission_path, blob_object_permission_path,
-    resolve_backend,
+    PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey,
+    ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits,
+    RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
+    blob_bucket_permission_path, blob_object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
@@ -56,9 +61,11 @@ enum IncomingVersionReplicationState {
     EnforceQuota,
     FinishQuotaCheck,
     ReadExistingBlob,
+    PolicyGate,
     SendNegotiation,
     ReceiveBlob,
     StartTransaction,
+    CheckDrift,
     VerifyReplaced,
     ReadReplacedMetadata,
     DeleteReplacedMetadata,
@@ -91,6 +98,14 @@ enum IncomingVersionReplicationState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum IncomingVersionReplicationError {
+    #[error(transparent)]
+    Policy(#[from] aruna_core::structs::PlacementPolicyError),
+    #[error(transparent)]
+    PolicyGate(#[from] PolicyGateError),
+    #[error(transparent)]
+    ManagedCopy(#[from] ManagedCopyError),
+    #[error("the placement gate finished without a pending negotiation")]
+    GateNotPending,
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
@@ -207,6 +222,17 @@ pub struct IncomingVersionReplicationOperation {
     destination_full: Option<RoutingError>,
     manifest_policy: Option<String>,
     writer_policy: Option<String>,
+    /// Destination facts of this node. Absent means no governed replica may be
+    /// materialized or registered here.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
+    /// Refs the gate admitted: the manifest's set unioned with what the local
+    /// version already carried, so a sender cannot drop an inherited ref.
+    gated_refs: Vec<PlacementPolicyRef>,
+    /// Destination facts the gate decided on, re-read inside the apply
+    /// transaction so a default or subject change cannot expose a stale replica.
+    gated_bucket: Option<GatedBucket>,
+    pending_negotiation: Option<ReplicationNegotiationResult>,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -257,7 +283,19 @@ impl IncomingVersionReplicationOperation {
             destination_full: None,
             manifest_policy: None,
             writer_policy: None,
+            gate_context: None,
+            gate: None,
+            gated_refs: Vec::new(),
+            gated_bucket: None,
+            pending_negotiation: None,
         }
+    }
+
+    /// The destination this replica is evaluated against. Omitting it leaves
+    /// ungoverned replication unchanged and fails every governed one closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
+        self
     }
 
     /// Node-local routing, so this receiver picks its own backend.
@@ -301,9 +339,11 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::EnforceQuota => "EnforceQuota",
             IncomingVersionReplicationState::FinishQuotaCheck => "FinishQuotaCheck",
             IncomingVersionReplicationState::ReadExistingBlob => "ReadExistingBlob",
+            IncomingVersionReplicationState::PolicyGate => "PolicyGate",
             IncomingVersionReplicationState::SendNegotiation => "SendNegotiation",
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
+            IncomingVersionReplicationState::CheckDrift => "CheckDrift",
             IncomingVersionReplicationState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
             IncomingVersionReplicationState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
@@ -545,7 +585,8 @@ impl IncomingVersionReplicationOperation {
         )
         .with_metadata(self.manifest.metadata.clone())
         .with_advance_count(advance_count)
-        .with_publisher(self.publisher_node_id))
+        .with_publisher(self.publisher_node_id)
+        .with_policies(self.manifest.placement_policies.clone())?)
     }
 
     fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionReplicationError> {
@@ -608,8 +649,9 @@ impl IncomingVersionReplicationOperation {
             created_at: self.manifest.created_at,
             created_by: self.manifest.created_by,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 
@@ -777,7 +819,84 @@ impl IncomingVersionReplicationOperation {
             .map_err(IncomingVersionReplicationError::RoutingFailed)
     }
 
+    /// Nothing is admitted before the destination is evaluated: the reply that
+    /// invites bytes is itself behind the gate.
     fn send_negotiation(&mut self, result: ReplicationNegotiationResult) -> Effects {
+        // A rejection invites no bytes, so it is not gated. Gating it would
+        // re-enter the gate from its own denial and never terminate.
+        if matches!(
+            result,
+            ReplicationNegotiationResult::AlreadyReplicatedVersion
+                | ReplicationNegotiationResult::Rejected(_)
+        ) {
+            return self.reply_negotiation(result);
+        }
+        let mut inherited = self
+            .replaced_version
+            .as_ref()
+            .map(|version| version.placement_policies.clone())
+            .unwrap_or_default();
+        // The local default governs this copy too: a sender's manifest can only
+        // add refs to what this destination already requires.
+        if let Some(gated) = self.gated_bucket.as_ref() {
+            inherited.extend(gated.policies.iter().copied());
+        }
+        let refs = match union_refs(&self.manifest.placement_policies, &inherited) {
+            Ok(refs) => refs,
+            Err(error) => return self.reject_negotiation(error.into()),
+        };
+        self.gated_refs = refs.clone();
+        self.gated_bucket = self
+            .gated_bucket
+            .take()
+            .map(|gated| gated.sealed_under(self.gate_context.as_ref(), !refs.is_empty()));
+        match write_gate(self.gate_context.as_ref(), &refs) {
+            Ok(None) => self.reply_negotiation(result),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.pending_negotiation = Some(result);
+                self.state = IncomingVersionReplicationState::PolicyGate;
+                match complete {
+                    true => self.finish_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.reject_negotiation(error.into()),
+        }
+    }
+
+    fn handle_policy_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "an active placement gate",
+                received: event,
+            });
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_gate(&mut self) -> Effects {
+        let (Some(gate), Some(result)) = (self.gate.take(), self.pending_negotiation.take()) else {
+            return self.fail(IncomingVersionReplicationError::GateNotPending);
+        };
+        let outcome = match gate.finalize() {
+            Ok(outcome) => outcome,
+            Err(error) => return self.reject_negotiation(PolicyGateError::from(error).into()),
+        };
+        match gate_decision(outcome.decision) {
+            Ok(()) => self.reply_negotiation(result),
+            Err(error) => self.reject_negotiation(error.into()),
+        }
+    }
+
+    fn reply_negotiation(&mut self, result: ReplicationNegotiationResult) -> Effects {
         self.negotiation_result = Some(result.clone());
         self.state = IncomingVersionReplicationState::SendNegotiation;
         let payload = match VersionReplicationMessage::VersionNegotiationResponse(result).to_bytes()
@@ -830,6 +949,22 @@ impl IncomingVersionReplicationOperation {
             limit: 10_000,
             txn_id: self.txn_id,
         })]
+    }
+
+    /// Re-reads the facts the negotiation gate decided on, inside the very
+    /// transaction that exposes the replica.
+    fn check_drift(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::CheckDrift;
+        smallvec![drift_reads(&self.manifest.bucket, self.txn_id)]
+    }
+
+    /// Subject generation the gate admitted this replica under; zero when the
+    /// version is ungoverned.
+    fn sealed_subject(&self) -> u64 {
+        self.gated_bucket
+            .as_ref()
+            .and_then(|gated| gated.subject_generation)
+            .unwrap_or_default()
     }
 
     fn verify_replaced(&mut self) -> Effects {
@@ -1090,10 +1225,12 @@ impl IncomingVersionReplicationOperation {
             if incoming_generation != advance.generation {
                 return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
             }
+            let advanced = CurrentVersionPointer::new_with_generation(
+                self.manifest.version_id,
+                advance.generation,
+            );
             if self.advance_version_exists
-                && ((pointer.generation == advance.generation
-                    && pointer.version_id == self.manifest.version_id)
-                    || pointer.generation > advance.generation)
+                && (advanced == pointer || pointer.generation > advance.generation)
             {
                 self.existing_current_pointer = Some(pointer);
                 self.object_delta = 0;
@@ -1101,52 +1238,44 @@ impl IncomingVersionReplicationOperation {
                 self.pending_new_current_hash = None;
                 return self.write_live_obligation();
             }
+            // Lineage validation stands, and the accepted head order still has
+            // the final word: an advance may never regress the observed head.
             if pointer.generation != previous_generation
                 || pointer.version_id != advance.predecessor
+                || !advanced.supersedes(Some(&pointer))
             {
                 return self.fail(IncomingVersionReplicationError::InvalidReferenceAdvance);
             }
 
             self.existing_current_pointer = Some(pointer.clone());
-            self.pending_new_pointer = Some(CurrentVersionPointer::new_with_generation(
-                self.manifest.version_id,
-                advance.generation,
-            ));
+            self.pending_new_pointer = Some(advanced);
             self.pending_new_current_hash = None;
             return self.read_current(pointer.version_id);
         }
-        let should_write = match existing_pointer.as_ref() {
-            Some(pointer)
-                if (incoming_generation, self.manifest.version_id)
-                    > (pointer.generation, pointer.version_id) =>
-            {
-                true
-            }
-            Some(pointer)
-                if (incoming_generation, self.manifest.version_id)
-                    == (pointer.generation, pointer.version_id) =>
-            {
-                true
-            }
-            Some(_) => false,
-            None => true,
-        };
-
-        self.existing_current_pointer = existing_pointer.clone();
-
-        if !should_write {
-            self.pending_new_pointer = None;
-            self.pending_new_current_hash = None;
-            return self.write_version();
-        }
-
-        self.pending_new_pointer = Some(CurrentVersionPointer::new_with_generation(
+        let candidate = CurrentVersionPointer::new_with_generation(
             self.manifest.version_id,
             incoming_generation,
-        ));
-        self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
+        );
+        let should_write = candidate.supersedes(existing_pointer.as_ref());
 
-        match existing_pointer {
+        self.existing_current_pointer = existing_pointer.clone();
+        if should_write {
+            self.pending_new_pointer = Some(candidate.clone());
+            self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
+        } else {
+            self.pending_new_pointer = None;
+            self.pending_new_current_hash = None;
+        }
+        self.resume_head_transition()
+    }
+
+    /// Continues exactly where `write_object_lookup_after_compare` left off; the
+    /// stored pointers carry the decision, so no continuation state is needed.
+    fn resume_head_transition(&mut self) -> Effects {
+        if self.pending_new_pointer.is_none() {
+            return self.write_version();
+        }
+        match self.existing_current_pointer.clone() {
             Some(pointer) => self.read_current(pointer.version_id),
             None => self.apply_liveness(false),
         }
@@ -1166,7 +1295,10 @@ impl IncomingVersionReplicationOperation {
         let (version, materialized_hash) = match self.manifest.kind {
             ReplicationItemKind::Materialized => {
                 if self.is_reference_item() {
-                    let version = match self.reference_version() {
+                    let version = match self
+                        .reference_version()
+                        .and_then(|version| Ok(version.with_policies(self.gated_refs.clone())?))
+                    {
                         Ok(version) => version,
                         Err(error) => return self.fail(error),
                     };
@@ -1182,18 +1314,21 @@ impl IncomingVersionReplicationOperation {
                         Ok(hash) => hash,
                         Err(err) => return self.fail(ConversionError::from(err).into()),
                     };
-                    (
-                        BlobVersion::materialized(
-                            hash,
-                            location.backend.clone(),
-                            self.manifest.created_at,
-                            self.manifest.created_by,
-                            self.manifest.source.clone(),
-                        )
-                        .with_metadata(self.manifest.metadata.clone())
-                        .with_publisher(self.publisher_node_id),
-                        Some(hash),
+                    let materialized = match BlobVersion::materialized(
+                        hash,
+                        location.backend.clone(),
+                        self.manifest.created_at,
+                        self.manifest.created_by,
+                        self.manifest.source.clone(),
                     )
+                    .with_metadata(self.manifest.metadata.clone())
+                    .with_publisher(self.publisher_node_id)
+                    .with_policies(self.gated_refs.clone())
+                    {
+                        Ok(materialized) => materialized,
+                        Err(err) => return self.fail(err.into()),
+                    };
+                    (materialized, Some(hash))
                 }
             }
             ReplicationItemKind::DeleteMarker => (
@@ -1215,6 +1350,24 @@ impl IncomingVersionReplicationOperation {
             match add_hash_path_index_effect(&context, hash, self.manifest.version_id, self.txn_id)
             {
                 Ok(index_effect) => self.pending_version_effects.push_back(index_effect),
+                Err(err) => return self.fail(err.into()),
+            }
+            // The replica becomes serveable exactly when its version commits.
+            // A reference item materializes nothing and registers nothing.
+            let location = match self.effective_materialized_location() {
+                Ok(location) => location,
+                Err(err) => return self.fail(err),
+            };
+            match register_effect(
+                version_key,
+                self.local_node_id,
+                &location,
+                &self.gated_refs,
+                self.sealed_subject(),
+                self.manifest.version_id.timestamp_ms(),
+                self.txn_id,
+            ) {
+                Ok(register) => self.pending_version_effects.push_back(register),
                 Err(err) => return self.fail(err.into()),
             }
         }
@@ -1709,6 +1862,7 @@ impl Operation for IncomingVersionReplicationOperation {
                 );
 
                 self.destination_group_id = Some(bucket_info.group_id);
+                self.gated_bucket = Some(GatedBucket::observe(Some(&bucket_info)));
                 self.destination_rules = bucket_info.storage_routing;
                 self.load_destination_routing()
             }
@@ -2008,6 +2162,7 @@ impl Operation for IncomingVersionReplicationOperation {
                     self.request_blob_version()
                 }
             }
+            IncomingVersionReplicationState::PolicyGate => self.handle_policy_gate(event),
             IncomingVersionReplicationState::SendNegotiation => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
@@ -2100,6 +2255,29 @@ impl Operation for IncomingVersionReplicationOperation {
                     txn_id = %txn_id,
                     "Started incoming replication transaction"
                 );
+                self.check_drift()
+            }
+            IncomingVersionReplicationState::CheckDrift => {
+                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                        received: event,
+                    });
+                };
+                let (bucket, subject) = match split_drift_reads(values) {
+                    Ok(split) => split,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let observed = GatedBucket::observe(bucket.as_ref());
+                if let Some(gated) = self.gated_bucket.as_ref() {
+                    if !gated.matches(&observed) {
+                        return self.fail(PolicyGateError::Drift.into());
+                    }
+                    if let Err(error) = gated.check_subject(subject.as_ref()) {
+                        return self.fail(error.into());
+                    }
+                }
                 self.verify_replaced()
             }
             IncomingVersionReplicationState::VerifyReplaced => {
@@ -2218,14 +2396,10 @@ impl Operation for IncomingVersionReplicationOperation {
                     .as_ref()
                     .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
                 let incoming_generation = self.manifest.current_version_generation;
-                let pointer_will_update = match (incoming_generation, existing_pointer.as_ref()) {
-                    (Some(incoming_generation), Some(pointer)) => {
-                        (incoming_generation, self.manifest.version_id)
-                            >= (pointer.generation, pointer.version_id)
-                    }
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
+                let pointer_will_update = incoming_generation.is_some_and(|generation| {
+                    CurrentVersionPointer::new_with_generation(self.manifest.version_id, generation)
+                        .supersedes(existing_pointer.as_ref())
+                });
                 debug!(
                     bucket = %self.manifest.bucket,
                     key = %self.manifest.key,
@@ -2605,15 +2779,16 @@ mod tests {
     fn make_bucket_info(group_id: Ulid) -> BucketInfo {
         BucketInfo {
             group_id,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH,
             created_by: test_user_id(),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 
-    fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationManifest {
+    pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationManifest {
         let blob = match kind {
             ReplicationItemKind::Materialized => {
                 let location = make_location();
@@ -2658,6 +2833,7 @@ mod tests {
             metadata: HashMap::new(),
             reference_advance: None,
             reference_advance_count: None,
+            placement_policies: Vec::new(),
         }
     }
 
@@ -2679,7 +2855,7 @@ mod tests {
         }
     }
 
-    fn make_reference_manifest() -> VersionReplicationManifest {
+    pub(super) fn make_reference_manifest() -> VersionReplicationManifest {
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut source = make_source_binding();
         source.descriptor.kind = SourceConnectorKind::ArunaNative;
@@ -2858,13 +3034,36 @@ mod tests {
         effects
     }
 
+    /// The apply transaction's drift re-check answered with an absent bucket
+    /// and an absent subject, which an ungoverned replica passes.
+    fn no_drift() -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(vec![0u8; 4].into(), None), (vec![1u8; 4].into(), None)],
+        })
+    }
+
     fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
+        start_apply_with(op, None)
+    }
+
+    /// `bucket` must echo what negotiation sealed, or None when no bucket was
+    /// read; the drift re-check compares the two.
+    fn start_apply_with(
+        op: &mut IncomingVersionReplicationOperation,
+        bucket: Option<aruna_core::types::Value>,
+    ) -> Ulid {
         let txn_id = Ulid::generate();
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
         op.destination_group_id = Some(Ulid::generate());
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let _effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CheckDrift);
+        // The apply transaction re-reads the destination default and the local
+        // subject before it exposes anything.
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(vec![0u8; 4].into(), bucket), (vec![1u8; 4].into(), None)],
+        }));
         assert_eq!(op.state, IncomingVersionReplicationState::VerifyReplaced);
         assert!(matches!(
             effects.as_slice(),
@@ -3066,7 +3265,10 @@ mod tests {
                 ReplicationNegotiationResult::NeedVersionOnly
             )
         ));
-        let txn_id = start_apply_transaction(&mut op);
+        let txn_id = start_apply_with(
+            &mut op,
+            Some(make_bucket_info(test_group_id()).to_bytes().unwrap().into()),
+        );
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(
@@ -3319,7 +3521,10 @@ mod tests {
                 ReplicationNegotiationResult::NeedVersionOnly
             )
         ));
-        let txn_id = start_apply_transaction(&mut op);
+        let txn_id = start_apply_with(
+            &mut op,
+            Some(make_bucket_info(test_group_id()).to_bytes().unwrap().into()),
+        );
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(
@@ -3494,9 +3699,10 @@ mod tests {
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
         op.destination_group_id = Some(Ulid::generate());
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
         }));
+        let effects = op.step(no_drift());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -3904,7 +4110,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-
         assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
@@ -3929,7 +4134,8 @@ mod tests {
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = op.step(no_drift());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -3997,7 +4203,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected blob version write")
         };
@@ -4073,6 +4278,30 @@ mod tests {
         assert_eq!(index_key.bucket, manifest.bucket);
         assert_eq!(index_key.key, manifest.key);
 
+        // The replica registers its managed copy in the same transaction.
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the managed-copy registration")
+        };
+        assert_eq!(key_space, aruna_core::keyspaces::MANAGED_COPY_KEYSPACE);
+        assert_eq!(
+            aruna_core::structs::ManagedCopyRecord::from_bytes(value.as_ref())
+                .unwrap()
+                .version,
+            aruna_core::structs::VersionKey::new(
+                &manifest.bucket,
+                &manifest.key,
+                manifest.version_id
+            )
+        );
+
         let effects = op.step(Event::Storage(StorageEvent::WriteResult {
             key: vec![0u8; 4].into(),
         }));
@@ -4132,7 +4361,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::ReadCurrentVersion
@@ -4225,7 +4453,8 @@ mod tests {
     }
 
     #[test]
-    fn same_generation_higher_ulid_overwrites_current_pointer() {
+    fn higher_ulid_skips() {
+        // A same-generation incoming version cannot replace the node-local head.
         let existing_version_id = Ulid::from_bytes([1u8; 16]);
         let incoming_version_id = Ulid::from_bytes([9u8; 16]);
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
@@ -4235,7 +4464,7 @@ mod tests {
             Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
-            manifest.clone(),
+            manifest,
         );
         start_apply_transaction(&mut op);
         let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
@@ -4244,45 +4473,12 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-
-        assert_eq!(
-            op.state,
-            IncomingVersionReplicationState::ReadCurrentVersion
-        );
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
                 if key_space == BLOB_VERSIONS_KEYSPACE
         ));
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: Some(
-                BlobVersion::materialized(
-                    [2u8; 32],
-                    BackendRef::node_default(),
-                    SystemTime::now(),
-                    test_user_id(),
-                    None,
-                )
-                .to_bytes()
-                .unwrap()
-                .into(),
-            ),
-        }));
-
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, value, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected blob head write")
-        };
-        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
-        assert_eq!(
-            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
-            CurrentVersionPointer::new_with_generation(incoming_version_id, 7)
-        );
     }
 
     #[test]
@@ -4305,7 +4501,6 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
-
         assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
@@ -5276,5 +5471,130 @@ mod tests {
             txn_id: Ulid::generate(),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::Error);
+    }
+}
+
+/// Gate acceptance for an incoming replica: nothing governed is admitted
+/// without a compliant local destination, and a reference registers nothing.
+#[cfg(test)]
+mod gate_tests {
+    use super::tests::{make_manifest, make_reference_manifest};
+    use super::*;
+    use crate::placement_policy::PolicyCacheEntry;
+    use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+    use aruna_core::structs::{
+        PlacementPolicy, PlacementSelector, PlacementSubject, ReplicationItemKind, VerifiedPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    fn policy(location: &str) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn gate(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: PlacementSubject {
+                node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+                generation: 1,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+            now_ms: 1_000,
+            admitting: true,
+        }
+    }
+
+    fn governed(rule: &VerifiedPolicy) -> IncomingVersionReplicationOperation {
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        manifest.placement_policies = vec![rule.policy_ref()];
+        IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            realm(),
+            manifest,
+        )
+    }
+
+    fn rejected(operation: &IncomingVersionReplicationOperation) -> bool {
+        matches!(
+            operation.negotiation_result,
+            Some(ReplicationNegotiationResult::Rejected(_))
+        )
+    }
+
+    #[test]
+    fn denies_incoming_replica() {
+        // The manifest's rule admits another location, so the negotiation that
+        // would invite bytes is refused instead.
+        let rule = policy("us-east");
+        let mut operation = governed(&rule).with_gate(gate("eu-west"));
+        operation.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion);
+
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(cached.into()),
+        }));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
+
+        assert!(rejected(&operation));
+    }
+
+    #[test]
+    fn no_subject_refuses_replica() {
+        // A node that advertises no subject may hold nothing governed, so it
+        // never invites the bytes.
+        let rule = policy("eu-west");
+        let mut operation = governed(&rule);
+        operation.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion);
+        assert!(rejected(&operation));
+    }
+
+    #[test]
+    fn reference_registers_nothing() {
+        // A reference materializes no bytes here, so no managed copy may claim
+        // this node holds one.
+        let manifest = make_reference_manifest();
+        let mut operation = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            realm(),
+            manifest,
+        );
+        operation.txn_id = Some(Ulid::generate());
+        operation.destination_group_id = Some(Ulid::generate());
+
+        operation.write_version();
+        assert!(
+            operation
+                .pending_version_effects
+                .iter()
+                .all(|effect| !matches!(
+                    effect,
+                    Effect::Storage(StorageEffect::Write { key_space, .. })
+                        if key_space == MANAGED_COPY_KEYSPACE
+                ))
+        );
     }
 }

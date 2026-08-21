@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
+use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
+use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{
-    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, SyncRelationship,
+    MetadataRegistryRecord, PathClaimRecord, PersistentIdMapping, PlacementPolicy,
+    PlacementPolicyDocument, PlacementPolicyRef, PlacementRef, SubmissionId, SyncRelationship,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
@@ -13,6 +16,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::jobs::lifecycle::ids::SubmissionRequest;
+use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::MetadataRoCrateExportView;
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::search_buckets::BucketSearchHit;
@@ -225,6 +230,80 @@ pub enum MetadataTransportMessage {
     ForwardedPersistentId {
         result: Result<PersistentIdOutcome, MetadataReadError>,
     },
+    /// One immutable policy document asked of a holder the requester resolved
+    /// from the policy id. Appended last so existing variant indices stay stable.
+    ForwardPlacementPolicy {
+        policy_ref: PlacementPolicyRef,
+    },
+    /// `Ok(None)` means this holder has no such document; it never means the
+    /// policy does not exist.
+    ForwardedPlacementPolicy {
+        result: Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError>,
+    },
+    /// A realm-admin publication routed to a holder of the policy's bucket,
+    /// because only a holder may commit the immutable document. Appended last so
+    /// existing variant indices stay stable.
+    ForwardCreatePlacementPolicy {
+        auth_token: Option<MetadataAuthToken>,
+        policy: Box<PlacementPolicy>,
+        created_at_ms: u64,
+    },
+    /// The document the holder committed, or the identical one it already had.
+    ForwardedPlacementPolicyCreated {
+        document: Box<PlacementPolicyDocument>,
+    },
+    /// One immutable job-family record offered to a holder of the family
+    /// placement. The frame is bounded at decode and the envelope keeps its own
+    /// publisher, so the authenticated peer is only the relay. Appended last so
+    /// existing variant indices stay stable.
+    ForwardJobRecord {
+        placement: PlacementRef,
+        record: Box<JobRecordFrame>,
+    },
+    /// `Ok` means the holder durably accepted or already had the record.
+    ForwardedJobRecord {
+        result: Result<(), JobRecordRejection>,
+    },
+    /// A bounded page of one submission's immutable records read from a holder.
+    ForwardJobRecordPage {
+        placement: PlacementRef,
+        submission_id: SubmissionId,
+        /// `None` reads every request family of the submission.
+        request_digest: Option<[u8; 32]>,
+        cursor: Option<FetchCursor>,
+        limit: PageLimit,
+    },
+    ForwardedJobRecordPage {
+        result: Result<JobRecordPageReply, JobRecordRejection>,
+    },
+    /// One scheduler's launch offer to an execution target. It carries no
+    /// caller token: the target verifies the signed launch itself.
+    ForwardLaunchOffer {
+        launch: Box<LaunchFrame>,
+    },
+    ForwardedLaunchOffer {
+        result: Result<Box<ReceiptFrame>, LaunchDecline>,
+    },
+    /// One complete external submission forwarded a single hop to an observed
+    /// family holder, with the identity the ingress preassigned. The holder
+    /// revalidates the caller and recomputes that identity before it commits,
+    /// and never forwards it again. Appended last so existing variant indices
+    /// stay stable.
+    ForwardJobSubmission {
+        auth_token: MetadataAuthToken,
+        submission_id: SubmissionId,
+        request: Box<SubmissionRequest>,
+    },
+    ForwardedJobSubmission {
+        result: Result<SubmissionAck, SubmissionRefusal>,
+    },
+}
+
+/// One page of immutable records plus the cursor of the next one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecordPageReply {
+    pub page: JobRecordPage,
+    pub next: Option<FetchCursor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

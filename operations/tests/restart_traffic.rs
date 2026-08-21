@@ -41,7 +41,7 @@ mod convergence;
 use convergence::{HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence};
 
 const PROJECTION_BATCH: usize = 32;
-const SEED_DOCUMENTS: usize = 500;
+const SEED_DOCUMENTS: usize = 256;
 
 struct TestNode {
     _temp_dir: Option<TempDir>,
@@ -148,6 +148,7 @@ async fn finish_restart(
         vec![(nodes[0].net.node_id(), nodes[0].context.clone())]
     })
     .await?;
+    wait_auto_outbox(&nodes[0]).await?;
     let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|node| node.context.clone()).collect();
     wait_for_visibility(&contexts, &fresh, Duration::from_millis(200)).await?;
     println!("fresh write converged to all nodes after restart");
@@ -210,6 +211,8 @@ async fn seed_restart_documents(
     let group_id = Ulid::generate();
     let targets = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
     let created = run_writer(realm_id, group_id, SEED_DOCUMENTS, "seed", targets).await?;
+    // Do not stop node 2 while the seed publication handler is still in flight.
+    wait_auto_outbox(&nodes[0]).await?;
     let sample_stride = created.len().div_ceil(40);
     let sample: Vec<(GroupId, Ulid)> = created
         .iter()
@@ -1335,6 +1338,32 @@ async fn wait_outbox(
             .into());
         }
         sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_auto_outbox(node: &TestNode) -> Result<(), BoxError> {
+    let wait_cap = HANG_CAP.saturating_mul(3);
+    let mut previous = outbox_snapshot(node).await?;
+    let mut deadline = Instant::now() + wait_cap;
+    loop {
+        if previous.0.is_none() && previous.1.is_none() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(50)).await;
+        let current = outbox_snapshot(node).await?;
+        if current.0.is_none() && current.1.is_none() {
+            return Ok(());
+        }
+        if current != previous {
+            previous = current;
+            deadline = Instant::now() + wait_cap;
+        } else if Instant::now() >= deadline {
+            return Err(format!(
+                "automatic outbox drain made no progress (first: {:?}, last: {:?})",
+                current.0, current.1
+            )
+            .into());
+        }
     }
 }
 

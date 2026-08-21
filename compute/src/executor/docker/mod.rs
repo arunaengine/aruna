@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::DockerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
@@ -372,6 +372,7 @@ impl DockerBackend {
         plan: Option<&ArchivePlan<'_>>,
         inspect: ContainerInspectResponse,
         cancel: &CancellationToken,
+        guard: &mut ControlGuard,
     ) -> Result<AttemptStatus, BackendError> {
         self.cancel_submission(attempt, cancel).await?;
         let status = inspect_to_status(inspect.clone());
@@ -393,6 +394,7 @@ impl DockerBackend {
             self.verify_layout(container_id, plan).await?;
         }
         self.cancel_submission(attempt, cancel).await?;
+        guard.mark_start()?;
         let started = self.start_by_name(container_id).await;
         self.cancel_submission(attempt, cancel).await?;
         started?;
@@ -633,6 +635,22 @@ fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendEr
             "resource ceilings must be greater than zero".to_string(),
         ));
     }
+    // The container is created with these two ceilings, so an attempt neither
+    // the sealed spec nor the backend bounds must never start.
+    enforced_limit(
+        spec.resources.ram_bytes,
+        config
+            .default_mem_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok()),
+        "memory",
+    )?;
+    enforced_limit(
+        spec.resources.cpu_cores.map(u64::from),
+        config
+            .default_nano_cpus
+            .and_then(|cpus| u64::try_from(cpus).ok()),
+        "cpu",
+    )?;
     Ok(())
 }
 
@@ -1040,7 +1058,9 @@ fn build_config(
         network_mode: match spec.security.network {
             NetworkAccess::Isolated => Some("none".to_string()),
             NetworkAccess::Open => None,
-            NetworkAccess::S3Only => None,
+            // Docker enforces no S3-only egress, so the mode fails closed here
+            // as well as in validation instead of opening the network.
+            NetworkAccess::S3Only => Some("none".to_string()),
         },
         readonly_rootfs: Some(spec.security.read_only_rootfs),
         auto_remove: Some(false),
@@ -1095,6 +1115,9 @@ impl ExecutorBackend for DockerBackend {
         BackendCaps {
             file_staging: true,
             direct_s3: true,
+            local_site: true,
+            limits: self.config.envelope,
+            ..BackendCaps::default()
         }
     }
 
@@ -1159,7 +1182,7 @@ impl ExecutorBackend for DockerBackend {
             ));
         }
         validate_spec(&self.config, spec)?;
-        let guard = self.control_guard(context).await?;
+        let mut guard = self.control_guard(context).await?;
         if guard.tombstone().is_some() {
             return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
         }
@@ -1175,6 +1198,18 @@ impl ExecutorBackend for DockerBackend {
             .then(|| ArchivePlan::new(spec))
             .transpose()?;
         let name = spec.attempt.external_name();
+        // Once a start is durably recorded, an absent container is lost evidence:
+        // creating a second one would run the same attempt twice.
+        if guard.started() {
+            return match self.inspect_matching_attempt(&spec.attempt).await {
+                Ok(inspect) => {
+                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect, cancel, &mut guard)
+                        .await
+                }
+                Err(BackendError::NotFound(_)) => Ok(lost_status(&name)),
+                Err(other) => Err(other),
+            };
+        }
         self.ensure_image(&spec.image, cancel).await?;
 
         let create_opts = CreateContainerOptionsBuilder::new().name(&name).build();
@@ -1190,7 +1225,7 @@ impl ExecutorBackend for DockerBackend {
                 }
                 let inspect = self.inspect_matching_attempt(&spec.attempt).await;
                 self.cancel_submission(&spec.attempt, cancel).await?;
-                self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel)
+                self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel, &mut guard)
                     .await
             }
             // Name collision: adopt the existing attempt, never start a second run.
@@ -1198,7 +1233,7 @@ impl ExecutorBackend for DockerBackend {
                 BackendError::Conflict(_) => {
                     let inspect = self.inspect_matching_attempt(&spec.attempt).await;
                     self.cancel_submission(&spec.attempt, cancel).await?;
-                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel)
+                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel, &mut guard)
                         .await
                 }
                 other => {
@@ -1231,8 +1266,15 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn status(&self, context: &FenceContext) -> Result<AttemptStatus, BackendError> {
-        validate_control(self.daemon_lock.read(context)?, context)?;
-        let inspect = self.inspect_matching_attempt(&context.attempt).await?;
+        let control = self.daemon_lock.read(context)?;
+        validate_control(control.clone(), context)?;
+        let inspect = match self.inspect_matching_attempt(&context.attempt).await {
+            Ok(inspect) => inspect,
+            Err(BackendError::NotFound(_)) if control_started(control.as_ref()) => {
+                return Ok(lost_status(&context.attempt.external_name()));
+            }
+            Err(other) => return Err(other),
+        };
         validate_labels(&inspect, context)?;
         Ok(inspect_to_status(inspect))
     }
@@ -1251,8 +1293,15 @@ impl ExecutorBackend for DockerBackend {
         // non-terminal status and break the wait contract. Poll inspect to
         // terminal evidence or the cancel token, like the trait default.
         loop {
-            validate_control(self.daemon_lock.read(context)?, context)?;
-            let inspect = self.inspect_matching_attempt(&context.attempt).await?;
+            let control = self.daemon_lock.read(context)?;
+            validate_control(control.clone(), context)?;
+            let inspect = match self.inspect_matching_attempt(&context.attempt).await {
+                Ok(inspect) => inspect,
+                Err(BackendError::NotFound(_)) if control_started(control.as_ref()) => {
+                    return Ok(lost_status(&context.attempt.external_name()));
+                }
+                Err(other) => return Err(other),
+            };
             validate_labels(&inspect, context)?;
             let status = inspect_to_status(inspect);
             if status.is_terminal() {
@@ -1671,6 +1720,23 @@ fn validate_control(
     Ok(())
 }
 
+fn control_started(record: Option<&ControlRecord>) -> bool {
+    record.is_some_and(|record| record.started)
+}
+
+/// A start was durably recorded but the container is gone, so the attempt may
+/// have run: terminal evidence, never a licence to create a second container.
+fn lost_status(name: &str) -> AttemptStatus {
+    AttemptStatus {
+        phase: AttemptPhase::SystemError {
+            reason: "lost evidence after recorded start".to_string(),
+        },
+        backend_ref: name.to_string(),
+        started_at_ms: None,
+        finished_at_ms: Some(now_ms()),
+    }
+}
+
 /// A container created by a partial submit that never started a run: only such a
 /// fresh attempt may be started when adopting a name collision.
 fn is_fresh_created(status: &AttemptStatus) -> bool {
@@ -1704,9 +1770,11 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
                 reason: "oom-killed".to_string(),
             }
         }
+        // No exit code is no evidence about the payload itself, so the daemon,
+        // not the job, is what failed here.
         ContainerStateStatusEnum::EXITED => match exit_code {
             Some(code) => AttemptPhase::Exited { code },
-            None => AttemptPhase::Failed {
+            None => AttemptPhase::SystemError {
                 reason: state
                     .error
                     .unwrap_or_else(|| "container exited without an exit code".to_string()),
@@ -1714,7 +1782,7 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
         },
         ContainerStateStatusEnum::DEAD => match exit_code {
             Some(code) => AttemptPhase::Exited { code },
-            None => AttemptPhase::Failed {
+            None => AttemptPhase::SystemError {
                 reason: state
                     .error
                     .unwrap_or_else(|| "container died without an exit code".to_string()),
@@ -1992,6 +2060,37 @@ mod tests {
             Err(BackendError::InvalidSpec(_))
         ));
         assert!(validate_image_volumes(&DockerConfig::default(), &inspect).is_ok());
+    }
+
+    #[test]
+    fn refuses_unbounded_attempt() {
+        // With no sealed ceiling and no backend default, the container would run
+        // against the whole host, so it must never be created.
+        let unbounded = DockerConfig {
+            default_mem_bytes: None,
+            default_nano_cpus: None,
+            ..DockerConfig::default()
+        };
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        assert!(validate_spec(&unbounded, &spec).is_err());
+
+        spec.resources.ram_bytes = Some(64 * 1024 * 1024);
+        assert!(validate_spec(&unbounded, &spec).is_err());
+        spec.resources.cpu_cores = Some(1);
+        assert!(validate_spec(&unbounded, &spec).is_ok());
+    }
+
+    #[test]
+    fn network_fails_closed() {
+        // Docker enforces no S3-only egress, so that mode must not open the
+        // network even if it ever reached the container body.
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.security.network = NetworkAccess::S3Only;
+        let host = build_config(&DockerConfig::default(), &fence(), &spec)
+            .host_config
+            .unwrap();
+        assert_eq!(host.network_mode.as_deref(), Some("none"));
+        assert!(validate_spec(&DockerConfig::default(), &spec).is_err());
     }
 
     #[test]
@@ -2516,7 +2615,8 @@ mod tests {
         }
     }
 
-    // A container that died without an exit code is NOT a clean success.
+    // A container that died without an exit code is NOT a clean success, and it
+    // says nothing about the payload, so it is infrastructure evidence.
     #[test]
     fn dead_without_code() {
         let status = inspect_to_status(inspect_with(bollard::models::ContainerState {
@@ -2525,8 +2625,8 @@ mod tests {
             ..Default::default()
         }));
         assert!(
-            matches!(status.phase, AttemptPhase::Failed { .. }),
-            "dead-without-exit-code must be Failed, got {:?}",
+            matches!(status.phase, AttemptPhase::SystemError { .. }),
+            "dead-without-exit-code must be a system error, got {:?}",
             status.phase
         );
 

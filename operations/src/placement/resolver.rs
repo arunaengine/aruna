@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashSet};
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
-    AffinityEffect, BindingScope, CandidateMapNode, CandidatePlacementMap, DocumentClass,
-    LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy, RealmConfigDocument,
-    RealmId,
+    AffinityEffect, BindingScope, CandidateMapNode, CandidatePlacementMap, ClassStrategyError,
+    DocumentClass, LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy,
+    RealmConfigDocument, RealmId,
 };
 use aruna_core::types::GroupId;
 
@@ -150,7 +150,7 @@ pub fn strategy_for_target<'a>(
     let strategy = match resolve_strategy(config, target, context, override_) {
         Ok(Some(strategy)) => strategy,
         Ok(None) => config.strategies.first()?,
-        Err(()) => return None,
+        Err(_) => return None,
     };
     Some((strategy, override_))
 }
@@ -163,7 +163,7 @@ pub(super) fn strategy_for_class(
     let strategy = match resolve_class_strategy(config, class) {
         Ok(Some(strategy)) => strategy,
         Ok(None) => config.strategies.first()?,
-        Err(()) => return None,
+        Err(_) => return None,
     };
     Some(strategy)
 }
@@ -180,6 +180,7 @@ pub fn document_class(target: &DocumentSyncTarget) -> DocumentClass {
         | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
         | DocumentSyncTarget::MetadataGraphLifecycle { .. }
         | DocumentSyncTarget::PersistentIdMapping { .. } => DocumentClass::Metadata,
+        DocumentSyncTarget::PlacementPolicy { .. } => DocumentClass::PlacementPolicy,
         DocumentSyncTarget::RealmAuthorization { .. }
         | DocumentSyncTarget::RealmConfig { .. }
         | DocumentSyncTarget::NodeUsage { .. }
@@ -204,6 +205,9 @@ pub fn subject_bytes(target: &DocumentSyncTarget) -> Vec<u8> {
             document_id.to_bytes().to_vec()
         }
         DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => graph_iri.as_bytes().to_vec(),
+        // The policy id alone; the document's holders are unrelated to the
+        // subjects its selectors allow.
+        DocumentSyncTarget::PlacementPolicy { policy_id } => policy_id.to_bytes().to_vec(),
         _ => target.storage_key().as_ref().to_vec(),
     }
 }
@@ -387,17 +391,10 @@ fn resolve_strategy<'a>(
 fn resolve_class_strategy(
     config: &RealmConfigDocument,
     class: DocumentClass,
-) -> Result<Option<&PlacementStrategy>, ()> {
-    if let Some(strategy) = binding_strategy(config, &BindingScope::Class(class))? {
-        return Ok(Some(strategy));
-    }
-    if let Some(strategy) = binding_strategy(config, &BindingScope::Realm)? {
-        return Ok(Some(strategy));
-    }
-    if let Some(id) = config.default_strategy_id {
-        return config.strategy(&id).map(Some).ok_or(());
-    }
-    Ok(None)
+) -> Result<Option<&PlacementStrategy>, ClassStrategyError> {
+    // One implementation, so an adapter deriving a class bucket without this
+    // resolver cannot disagree with it.
+    config.class_strategy(class)
 }
 
 fn metadata_path_prefix_match_len(normalized_path: &str, prefix: &str) -> Option<usize> {
@@ -1105,6 +1102,17 @@ mod tests {
     }
 
     #[test]
+    fn subject_is_id() {
+        // The rule's own selectors are deliberately absent from the subject: a
+        // policy is placed by its id alone.
+        let policy_id = sid(9);
+        assert_eq!(
+            subject_bytes(&DocumentSyncTarget::PlacementPolicy { policy_id }),
+            policy_id.to_bytes().to_vec()
+        );
+    }
+
+    #[test]
     fn meta_bucket_subject_vector() {
         // Portable 6.3.6 vector: fixed-width realm_id ‖ group_id, then the path.
         let subject = meta_bucket_subject(
@@ -1209,6 +1217,10 @@ mod tests {
                     watch_id: sid(4),
                 },
                 DocumentClass::Admin,
+            ),
+            (
+                DocumentSyncTarget::PlacementPolicy { policy_id: sid(5) },
+                DocumentClass::PlacementPolicy,
             ),
             (
                 DocumentSyncTarget::NodeInfo {

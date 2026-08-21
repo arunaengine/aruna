@@ -1,4 +1,7 @@
-use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
+use crate::driver::{
+    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
+    routing_snapshot,
+};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
@@ -56,6 +59,8 @@ pub enum CopyObjectError {
     Put(#[from] PutObjectError),
     #[error(transparent)]
     Routing(#[from] RoutingInputsError),
+    #[error(transparent)]
+    Gate(#[from] GateContextError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
 }
@@ -187,32 +192,35 @@ pub async fn copy_object(
     let metadata = input.metadata.unwrap_or(source.metadata);
 
     let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
-    let put_result = drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: input.user_id,
-            group_id: input.group_id,
-            realm_id: input.realm_id,
-            node_id: input.node_id,
-            request: PutObjectInput {
-                bucket: input.dest_bucket,
-                key: input.dest_key,
-                content_length,
-                body: Some(source.blob),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source,
-            preassigned_version_id: None,
-            quota_ceiling: input.quota_ceiling,
-            routing,
-        })
-        .with_metadata(metadata)
-        .with_restrictions(input.restrictions.clone()),
-        context,
-    )
-    .await
-    .and_then(|result| result.transpose())?;
+    let gate = gate_context(context, input.realm_id, now_ms()).await?;
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: input.user_id,
+        group_id: input.group_id,
+        realm_id: input.realm_id,
+        node_id: input.node_id,
+        request: PutObjectInput {
+            bucket: input.dest_bucket,
+            key: input.dest_key,
+            content_length,
+            body: Some(source.blob),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source,
+        preassigned_version_id: None,
+        quota_ceiling: input.quota_ceiling,
+        routing,
+    })
+    .with_metadata(metadata)
+    .with_inherited_policies(source.source_policies.clone())
+    .with_restrictions(input.restrictions.clone());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let put_result = drive(operation, context)
+        .await
+        .and_then(|result| result.transpose())?;
     let put_result = put_result.ok_or(PutObjectError::PutObjectFailed)?;
 
     // Dedup can point the copy at the source's BackendLocation, so its
@@ -232,6 +240,7 @@ pub async fn copy_object(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::placement_policy::fixtures::{seed_gate, subject};
     use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
@@ -404,6 +413,119 @@ mod test {
             panic!("missing blob version entry");
         };
         BlobVersion::from_bytes(value.expect("missing blob version").as_ref()).unwrap()
+    }
+
+    /// A rule that admits exactly this node, so a governed write is allowed.
+    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::VerifiedPolicy {
+        let policy = aruna_core::structs::PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "residency".to_string(),
+            vec![aruna_core::structs::PlacementSelector {
+                node_id: Some(node_id),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        aruna_core::structs::VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    async fn seed_bucket(
+        context: &DriverContext,
+        bucket: &str,
+        group_id: GroupId,
+        user_id: UserId,
+        policies: Vec<aruna_core::structs::PlacementPolicyRef>,
+    ) {
+        let info = aruna_core::structs::BucketInfo {
+            group_id,
+            created_at: std::time::UNIX_EPOCH,
+            created_by: user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: policies,
+            placement_policy_generation: 1,
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                value: info.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn copy_unions_refs() {
+        // Union tightens: the copy carries both its source's and its
+        // destination's refs.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let source = admits(node_id, 1);
+        let dest = admits(node_id, 2);
+        let (source_ref, dest_ref) = (source.policy_ref(), dest.policy_ref());
+        seed_gate(
+            &context,
+            realm_id,
+            user_id,
+            subject(node_id, "eu-west"),
+            &[source.clone(), dest.clone()],
+        )
+        .await;
+        seed_bucket(&context, "source", group_id, user_id, vec![source_ref]).await;
+        seed_bucket(&context, "dest", group_id, user_id, vec![dest_ref]).await;
+        let gate = gate_context(&context, realm_id, 1_000)
+            .await
+            .expect("subject reads")
+            .expect("the fixture advertises a subject");
+        drive(
+            PutObjectOperation::new(put_config(
+                realm_id,
+                group_id,
+                node_id,
+                "source",
+                "object.txt",
+                b"payload",
+            ))
+            .with_gate(gate),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "source".to_string(),
+                source_key: "object.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "dest".to_string(),
+                dest_key: "copy.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let copied = read_dest_version(&context, "dest", "copy.txt", result.version_id).await;
+        assert_eq!(copied.placement_policies, vec![source_ref, dest_ref]);
     }
 
     #[tokio::test]

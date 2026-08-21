@@ -18,8 +18,8 @@ use aruna_core::compute::{
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
-    AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload,
-    OutputObject, WorkspaceMode,
+    AttemptControl, AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord,
+    JobRecordError, JobResultPayload, OutputObject, PhysicalExecutionState, WorkspaceMode,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::NodeId;
@@ -28,15 +28,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::JOB_HEARTBEAT_MS;
+use super::output_record::seal_outputs;
 use super::store::{
     ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
-    complete_execution, complete_job, fail_execution, mark_indeterminate, read_job_record,
-    record_attempt_intent, record_attempt_started, record_attempt_tombstone, renew_lease,
-    requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
-    transition_to_cancelling, transition_to_preparing, transition_to_ready,
+    complete_cancelled, complete_execution, fail_execution, mark_indeterminate,
+    read_attempt_control, read_job_record, record_attempt_intent, record_attempt_started,
+    record_attempt_tombstone, renew_lease, requeue_before_attempt, set_workspace_bucket,
+    transition_external_to_running, transition_to_cancelling, transition_to_preparing,
+    transition_to_ready,
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
+use crate::jobs::lifecycle::reservation::job_reservation;
+use crate::jobs::lifecycle::updates::{publish_progress, publish_terminal};
+use crate::placement_policy::subject::read_local_subject;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
@@ -67,7 +72,7 @@ pub async fn run_execution_job(
     };
     let bucket = job_bucket(&record);
     if !bucket.is_empty() {
-        spec.resolve_outputs(&bucket);
+        spec.resolve_outputs(&bucket, record.owner_node_id);
     }
 
     // A fresh cancel before any attempt was submitted: no container exists, so
@@ -94,10 +99,16 @@ pub async fn run_execution_job(
         return;
     };
 
-    let backend = match resolve_backend(&context, &spec) {
+    // A fenced refusal is retryable: the job returns to the queue instead of
+    // failing, because the site may still come back or another target may take
+    // it.
+    let backend = match resolve_backend(&context, &spec, job_id).await {
         Ok(backend) => backend,
         Err(error) => {
-            Box::pin(fail_and_crate(&context, job_id, token, &record, error)).await;
+            Box::pin(requeue_or_fail_pre_submit(
+                &context, job_id, token, &record, error, false,
+            ))
+            .await;
             return;
         }
     };
@@ -110,6 +121,7 @@ pub async fn run_execution_job(
         warn!(job_id = %job_id, "Lost claim before preparing; aborting");
         return;
     }
+    publish_progress(&context, job_id, PhysicalExecutionState::Preparing).await;
 
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(
@@ -173,6 +185,15 @@ pub async fn run_execution_job(
             backend.run_identity(),
         );
 
+        // A receipted execution already has its identity: the fenced attempt
+        // binds that exact ExecutionId so its outputs chain to the receipt.
+        let receipted = match job_reservation(&context, job_id).await {
+            Ok(reservation) => reservation.map(|reservation| reservation.execution_id),
+            Err(error) => {
+                warn!(job_id = %job_id, %error, "Execution reservation lookup failed");
+                return None;
+            }
+        };
         // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
         let intent = AttemptIntent {
             attempt_no,
@@ -186,6 +207,7 @@ pub async fn run_execution_job(
             job_id,
             token,
             intent,
+            receipted,
             unix_timestamp_millis(),
         ))
         .await
@@ -258,6 +280,7 @@ pub async fn run_execution_job(
             Ok(record) => record,
             Err(_) => return None,
         };
+        publish_progress(&context, job_id, PhysicalExecutionState::Running).await;
         if running.cancel_requested {
             Box::pin(finalize_cancel(
                 &context, job_id, token, &backend, &fence, &spec, &bucket,
@@ -326,21 +349,77 @@ pub async fn run_execution_job(
 }
 
 /// Resolve the backend for a spec, or a permanent error when none is eligible.
-pub fn resolve_backend(
+///
+/// A receipted execution is fenced to the exact execution site its receipt
+/// sealed: subject drift refuses the start instead of running accepted work
+/// somewhere nobody authorized. A local job without a receipt keeps the
+/// unfenced selection.
+pub async fn resolve_backend(
     context: &DriverContext,
     spec: &ExecutionSpec,
+    job_id: JobId,
 ) -> Result<Arc<dyn ExecutorBackend>, JobError> {
+    // A node without compute is a local gap, never a verdict on the job.
     let Some(registry) = context.compute_handle.as_ref() else {
-        return Err(JobError::permanent("no compute backend configured"));
+        return Err(JobError::retryable("no compute backend configured"));
     };
     let constraint = spec
         .executor_constraint
         .as_deref()
         .map(ExecutorKind::from_wire);
-    registry
+    let selected = registry
         .select(constraint.as_ref())
         .cloned()
-        .ok_or_else(|| JobError::permanent("no eligible executor for job"))
+        .ok_or_else(|| JobError::permanent("no eligible executor for job"))?;
+    let Some(sealed) = sealed_site(context, job_id)
+        .await
+        .map_err(JobError::retryable)?
+    else {
+        return Ok(selected);
+    };
+    let Some(subject) = read_local_subject(context)
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.subject)
+    else {
+        return Err(JobError::retryable(
+            "receipted execution cannot start without a local placement subject",
+        ));
+    };
+    match registry.fenced(&selected.kind(), &subject, sealed.0, &sealed.1) {
+        Ok(backend) => Ok(backend.clone()),
+        Err(BackendError::Fenced) => {
+            warn!(
+                job_id = %job_id,
+                sealed_generation = sealed.0,
+                current_generation = subject.generation,
+                "Receipted execution refused: the execution site drifted from its receipt"
+            );
+            Err(JobError::retryable(format!(
+                "execution site drifted from its receipt: sealed subject generation {}, current {}",
+                sealed.0, subject.generation
+            )))
+        }
+        Err(error) => Err(JobError::permanent(format!(
+            "no eligible executor for job: {error}"
+        ))),
+    }
+}
+
+/// Subject generation and digest one receipted execution was accepted under.
+/// `None` for a local job that never reserved capacity: the unfenced path.
+async fn sealed_site(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<(u64, [u8; 32])>, String> {
+    let Some(reservation) = job_reservation(context, job_id).await? else {
+        return Ok(None);
+    };
+    Ok(match reservation.subject_generation {
+        0 => None,
+        generation => Some((generation, reservation.subject_digest)),
+    })
 }
 
 async fn prepare_workspace(
@@ -1055,13 +1134,22 @@ pub(crate) async fn finalize_attempt(
 
     match status.phase {
         AttemptPhase::Exited { code: 0 } => {
-            let Some(inventoried) =
-                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            // Export first: inventory attributes only versions this execution
+            // already reserved, so the reservations must be durable before it.
+            let Some(captured) = Box::pin(export_or_park(
+                context, job_id, token, backend, fence, spec, bucket,
+            ))
+            .await
             else {
                 return;
             };
-            let Some(captured) = Box::pin(export_or_park(
-                context, job_id, token, backend, fence, spec, bucket,
+            let Some(control) = Box::pin(control_or_park(context, job_id, token, fence)).await
+            else {
+                return;
+            };
+            let execution_id = control.execution_id;
+            let Some(inventoried) = Box::pin(collect_or_park(
+                context, job_id, token, spec, bucket, &control,
             ))
             .await
             else {
@@ -1084,7 +1172,19 @@ pub(crate) async fn finalize_attempt(
             else {
                 return;
             };
-            let result = execution_result_for(bucket, Some(0), outputs, logs);
+            let mut result = execution_result_for(bucket, Some(0), outputs, logs);
+            if let Err(error) = result.check_outputs(execution_id) {
+                Box::pin(fail_bad_outputs(context, job_id, token, bucket, error)).await;
+                return;
+            }
+            let Some(digest) = Box::pin(seal_or_fail(
+                context, job_id, token, bucket, &control, &result,
+            ))
+            .await
+            else {
+                return;
+            };
+            name_output_record(&mut result, digest);
             match Box::pin(terminal_execution(storage, job_id, token, result)).await {
                 Some(ExecutionCompleteOutcome::Completed(record)) => {
                     Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
@@ -1099,8 +1199,14 @@ pub(crate) async fn finalize_attempt(
             }
         }
         AttemptPhase::Exited { code } => {
-            let Some(outputs) =
-                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            let Some(control) = Box::pin(control_or_park(context, job_id, token, fence)).await
+            else {
+                return;
+            };
+            let Some(outputs) = Box::pin(collect_or_park(
+                context, job_id, token, spec, bucket, &control,
+            ))
+            .await
             else {
                 return;
             };
@@ -1137,6 +1243,25 @@ pub(crate) async fn finalize_attempt(
             .await;
             Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
+        // Infrastructure evidence proves nothing about the job, so this stays
+        // retryable and the family may still run it elsewhere.
+        AttemptPhase::SystemError { reason } => {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
+                return;
+            };
+            let result = execution_result_for(bucket, None, Vec::new(), logs);
+            let record = Box::pin(terminal_fail(
+                storage,
+                job_id,
+                token,
+                JobError::retryable(format!("backend infrastructure failure: {reason}")),
+                result,
+            ))
+            .await;
+            Box::pin(cleanup_and_crate(context, job_id, record)).await;
+        }
         AttemptPhase::Cancelled => {
             Box::pin(finalize_cancel(
                 context, job_id, token, backend, fence, spec, bucket,
@@ -1167,7 +1292,12 @@ async fn finalize_cancel(
     let storage = &context.storage_handle;
     // Running -> Cancelling (idempotent: a re-entry may already be Cancelling).
     let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    // Stop the container first: the identity is only needed to record outputs.
     let evidence = backend.cancel(fence).await;
+    let Some(control) = Box::pin(control_or_park(context, job_id, token, fence)).await else {
+        return;
+    };
+    let execution_id = control.execution_id;
     match evidence {
         Ok(CancelEvidence::Stopped(status)) => {
             let Some(logs) =
@@ -1177,13 +1307,20 @@ async fn finalize_cancel(
             };
             match status.phase {
                 AttemptPhase::Exited { code: 0 } => {
-                    let Some(inventoried) =
-                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+                    let Some(captured) = Box::pin(export_or_park(
+                        context, job_id, token, backend, fence, spec, bucket,
+                    ))
+                    .await
                     else {
                         return;
                     };
-                    let Some(captured) = Box::pin(export_or_park(
-                        context, job_id, token, backend, fence, spec, bucket,
+                    let Some(control) =
+                        Box::pin(control_or_park(context, job_id, token, fence)).await
+                    else {
+                        return;
+                    };
+                    let Some(inventoried) = Box::pin(collect_or_park(
+                        context, job_id, token, spec, bucket, &control,
                     ))
                     .await
                     else {
@@ -1201,13 +1338,27 @@ async fn finalize_cancel(
                     else {
                         return;
                     };
-                    let result = execution_result_for(bucket, Some(0), outputs, logs);
+                    let mut result = execution_result_for(bucket, Some(0), outputs, logs);
+                    if let Err(error) = result.check_outputs(execution_id) {
+                        Box::pin(fail_bad_outputs(context, job_id, token, bucket, error)).await;
+                        return;
+                    }
+                    let Some(digest) = Box::pin(seal_or_fail(
+                        context, job_id, token, bucket, &control, &result,
+                    ))
+                    .await
+                    else {
+                        return;
+                    };
+                    name_output_record(&mut result, digest);
                     let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Exited { code } => {
-                    let Some(outputs) =
-                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+                    let Some(outputs) = Box::pin(collect_or_park(
+                        context, job_id, token, spec, bucket, &control,
+                    ))
+                    .await
                     else {
                         return;
                     };
@@ -1234,9 +1385,23 @@ async fn finalize_cancel(
                     .await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
+                AttemptPhase::SystemError { reason } => {
+                    let result = execution_result_for(bucket, None, Vec::new(), logs);
+                    let record = Box::pin(terminal_fail(
+                        storage,
+                        job_id,
+                        token,
+                        JobError::retryable(format!("backend infrastructure failure: {reason}")),
+                        result,
+                    ))
+                    .await;
+                    Box::pin(cleanup_and_crate(context, job_id, record)).await;
+                }
                 AttemptPhase::Cancelled | AttemptPhase::Submitted | AttemptPhase::Running => {
-                    let Some(outputs) =
-                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+                    let Some(outputs) = Box::pin(collect_or_park(
+                        context, job_id, token, spec, bucket, &control,
+                    ))
+                    .await
                     else {
                         return;
                     };
@@ -1247,8 +1412,10 @@ async fn finalize_cancel(
             }
         }
         Ok(CancelEvidence::AlreadyGone) => {
-            let Some(outputs) =
-                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            let Some(outputs) = Box::pin(collect_or_park(
+                context, job_id, token, spec, bucket, &control,
+            ))
+            .await
             else {
                 return;
             };
@@ -1281,7 +1448,7 @@ async fn terminal_complete(
         .flatten()
         .map(|record| record.progress)
         .unwrap_or_else(|| aruna_core::structs::JobProgress::new("phases"));
-    match complete_job(
+    match complete_cancelled(
         storage,
         job_id,
         token,
@@ -1294,6 +1461,54 @@ async fn terminal_complete(
         Ok(record) => Some(record),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Execution complete write failed");
+            None
+        }
+    }
+}
+
+/// Name the durable output record on a terminal success result.
+fn name_output_record(result: &mut JobResultPayload, digest: [u8; 32]) {
+    if let JobResultPayload::Execution { output_digest, .. } = result {
+        *output_digest = Some(digest);
+    }
+}
+
+/// Seal this execution's exact output set before success is attempted. A
+/// permanent failure terminalizes the job: a success whose immutable output
+/// record is not durable must never be published.
+async fn seal_or_fail(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    bucket: &str,
+    control: &AttemptControl,
+    result: &JobResultPayload,
+) -> Option<[u8; 32]> {
+    let JobResultPayload::Execution { outputs, .. } = result else {
+        return None;
+    };
+    let record = match read_job_record(&context.storage_handle, job_id, None).await {
+        Ok(Some(record)) => record,
+        _ => {
+            Box::pin(park_attempt(
+                context,
+                job_id,
+                token,
+                JobError::retryable("output record job lookup failed"),
+            ))
+            .await;
+            return None;
+        }
+    };
+    match Box::pin(seal_outputs(context, &record, control, outputs)).await {
+        Ok(digest) => Some(digest),
+        Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
+            warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output record seal failed; failing");
+            Box::pin(fail_and_crate(context, job_id, token, &record, error)).await;
+            None
+        }
+        Err(error) => {
+            Box::pin(park_attempt(context, job_id, token, error)).await;
             None
         }
     }
@@ -1374,6 +1589,9 @@ async fn cleanup_and_crate(context: &DriverContext, job_id: JobId, record: Optio
     // Only act on a terminal record WE wrote (a lost race returns None).
     let Some(record) = record else { return };
     log_compute_summary(&record);
+    // A receipted execution publishes its terminal state and frees its exact
+    // reservation here; a purely local job publishes nothing.
+    Box::pin(publish_terminal(context, &record)).await;
     finalize_followups(context, job_id).await;
 }
 
@@ -1471,6 +1689,47 @@ async fn requeue_or_fail_pre_submit(
     }
 }
 
+/// Physical execution identity of the fenced attempt. Without it no output can
+/// be named exactly, so the attempt is parked instead of terminalized.
+async fn control_or_park(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    fence: &FenceContext,
+) -> Option<AttemptControl> {
+    let control =
+        read_attempt_control(&context.storage_handle, job_id, fence.attempt_epoch, None).await;
+    let error = match control {
+        Ok(Some(control)) if !control.execution_id.is_nil() => return Some(control),
+        Ok(_) => JobError::retryable("attempt control carries no execution identity"),
+        Err(error) => JobError::retryable(format!("attempt control lookup failed: {error}")),
+    };
+    Box::pin(park_attempt(context, job_id, token, error)).await;
+    None
+}
+
+/// Terminal success is refused when an output cannot be named exactly: the job
+/// fails instead of claiming a success whose outputs nobody can retrieve.
+async fn fail_bad_outputs(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    bucket: &str,
+    error: JobRecordError,
+) {
+    warn!(job_id = %job_id, error = %error, "Output identity incomplete; failing");
+    let result = execution_result_for(bucket, None, Vec::new(), LogTails::default());
+    let terminal = Box::pin(terminal_fail(
+        &context.storage_handle,
+        job_id,
+        token,
+        JobError::permanent(format!("output identity incomplete: {error}")),
+        result,
+    ))
+    .await;
+    Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
+}
+
 /// Inventory the declared outputs. A permanent inventory failure terminalizes
 /// the job so cleanup runs; a transient one parks it `Indeterminate` instead of
 /// terminalizing with a false-empty output manifest.
@@ -1480,8 +1739,9 @@ async fn collect_or_park(
     token: ulid::Ulid,
     spec: &ExecutionSpec,
     bucket: &str,
+    control: &AttemptControl,
 ) -> Option<Vec<OutputObject>> {
-    match Box::pin(collect_outputs(context, spec, bucket)).await {
+    match Box::pin(collect_outputs(context, spec, bucket, control)).await {
         Ok(outputs) => Some(outputs),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed permanently; failing");
@@ -1613,6 +1873,7 @@ fn execution_result_for(
         outputs,
         stdout: log_tail(logs.stdout, logs.stdout_truncated),
         stderr: log_tail(logs.stderr, logs.stderr_truncated),
+        output_digest: None,
     }
 }
 
@@ -1667,7 +1928,8 @@ mod tests {
     use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
-        ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, RealmId,
+        ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination,
+        OutputSelection, RealmId,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
@@ -1855,6 +2117,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         }
     }
 
@@ -1953,7 +2216,7 @@ mod tests {
                     .to_string(),
             attempt_epoch: 0,
         };
-        let record = record_attempt_intent(storage, job_id, token, intent, 5)
+        let record = record_attempt_intent(storage, job_id, token, intent, None, 5)
             .await
             .unwrap();
         (record.record, token, attempt)
@@ -2004,8 +2267,8 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let ctx = context(storage.clone());
-        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let (ctx, _net) = net_context(storage.clone()).await;
+        let (record, token, _attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
         transition_external_to_running(&storage, job_id, token, None, 6)
             .await
@@ -2025,25 +2288,31 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
         let mut spec = execution_spec();
+        spec.file_outputs.push(OutputSelection {
+            container_path: "/out/result".to_string(),
+            path_prefix: None,
+            destination_node_id: Some(ctx.net_handle.as_ref().unwrap().node_id()),
+            destination: OutputDestination::S3 {
+                bucket: "dest".to_string(),
+                key: "result".to_string(),
+            },
+            name: None,
+            description: None,
+        });
         spec.output_prefixes = vec!["poison".to_string()];
-        Box::pin(finalize_attempt(
-            &ctx,
-            job_id,
-            token,
-            &backend,
-            &fence(&attempt),
-            &spec,
-            "ws-test",
-            Ok(AttemptStatus {
-                phase: AttemptPhase::Exited { code: 0 },
-                backend_ref: "c1".to_string(),
-                started_at_ms: Some(1),
-                finished_at_ms: Some(2),
-            }),
-        ))
-        .await;
+        let epoch = record.attempt_intent.as_ref().unwrap().attempt_epoch;
+        let control = read_attempt_control(&storage, job_id, epoch, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            Box::pin(collect_or_park(
+                &ctx, job_id, token, &spec, "ws-test", &control,
+            ))
+            .await
+            .is_none()
+        );
 
         let stored = read_job_record(&storage, job_id, None)
             .await
@@ -2160,12 +2429,37 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// A context that can sign: terminal success seals an output record, which
+    /// needs this node's key.
+    async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::NetHandle) {
+        let net = aruna_net::NetHandle::new(
+            aruna_net::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id: aruna_core::structs::RealmId([1; 32]),
+                discovery_method: aruna_net::DiscoveryMethod::None,
+                relay_method: aruna_net::RelayMethod::None,
+                ..aruna_net::NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        (context, net)
+    }
+
     #[tokio::test]
     async fn cancel_beats_success() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let mut ctx = context(storage.clone());
-        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (ctx, net) = net_context(storage.clone()).await;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
         transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
@@ -2193,6 +2487,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
+        net.shutdown().await;
     }
 
     #[tokio::test]
@@ -2471,5 +2766,171 @@ mod tests {
         );
 
         assert_eq!(spec.security.network, NetworkAccess::Open);
+    }
+
+    /// Writes the receipted reservation and the node subject a fenced start
+    /// compares against.
+    async fn seal_site(storage: &StorageHandle, job_id: JobId, generation: u64, digest: [u8; 32]) {
+        use aruna_core::compute_quota::JobReservationRecord;
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+        use aruna_core::structs::{NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject};
+
+        let reservation = JobReservationRecord {
+            execution_id: Ulid::from_bytes([0xA1; 16]),
+            job_id,
+            logical_job_id: job_id,
+            resources: aruna_core::structs::EffectiveResources {
+                cpu_cores: 1,
+                ram_bytes: 1,
+                disk_bytes: 0,
+                max_walltime_ms: 1_000,
+                preemptible: false,
+            },
+            created_at_ms: 1,
+            subject_generation: generation,
+            subject_digest: digest,
+        };
+        let _ = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: JOB_RESERVATION_KEYSPACE.to_string(),
+                key: reservation.execution_id.to_bytes().as_slice().into(),
+                value: postcard::to_allocvec(&reservation).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node_id(7),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .unwrap();
+        let _ = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+                key: NODE_SUBJECT_KEY.to_vec().into(),
+                value: record.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
+        let mut registry = aruna_compute::ExecutorRegistry::new();
+        registry.register(StubBackend::new(StubReconcile::NotFound));
+        Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: Some(Arc::new(registry)),
+        })
+    }
+
+    #[tokio::test]
+    async fn unreceipted_start_unfenced() {
+        // A local job never reserved capacity, so no receipt fences its start.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+
+        assert!(
+            resolve_backend(&ctx, &execution_spec(), job_id())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn drifted_site_refuses() {
+        // The receipt sealed one execution site; a node advertising another one
+        // must refuse to start the accepted work, retryably.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+        let job_id = job_id();
+        seal_site(&storage, job_id, 99, [7u8; 32]).await;
+
+        let Err(error) = resolve_backend(&ctx, &execution_spec(), job_id).await else {
+            panic!("a drifted subject must refuse the start");
+        };
+        assert_eq!(error.kind, JobErrorKind::Retryable);
+        assert!(error.message.contains("drifted"));
+    }
+
+    #[tokio::test]
+    async fn drift_requeues_attempt() {
+        // A fenced refusal must return the job to the queue, not terminalize it:
+        // the site may return, or another target may take the work.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+        let (record, token, _) = ready_with_intent(&storage).await;
+        seal_site(&storage, record.job_id, 99, [7u8; 32]).await;
+        let Err(error) = resolve_backend(&ctx, &execution_spec(), record.job_id).await else {
+            panic!("a drifted subject must refuse the start");
+        };
+
+        requeue_or_fail_pre_submit(&ctx, record.job_id, token, &record, error, false).await;
+
+        let stored = read_job_record(&storage, record.job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Queued);
+        assert!(
+            stored
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("drifted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_site_starts() {
+        // The exact sealed generation and digest still admit the start.
+        use aruna_compute::ExecutorRegistry;
+        use aruna_core::compute::ExecutorCapability;
+        use aruna_core::structs::{NodeSubjectRecord, PlacementSubject};
+
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = compute_context(storage.clone());
+        let job_id = job_id();
+        let subject = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node_id(7),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .unwrap()
+        .subject;
+        let registry =
+            ExecutorRegistry::new().with_backend(StubBackend::new(StubReconcile::NotFound));
+        let capability: ExecutorCapability = registry
+            .capabilities(&subject, false)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        seal_site(
+            &storage,
+            job_id,
+            capability.subject.generation,
+            capability.subject_digest,
+        )
+        .await;
+
+        assert!(
+            resolve_backend(&ctx, &execution_spec(), job_id)
+                .await
+                .is_ok()
+        );
     }
 }

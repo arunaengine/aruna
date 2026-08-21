@@ -534,6 +534,7 @@ mod tests {
                     key: "in.txt".to_string(),
                     version_id: None,
                 },
+                source_node_id: None,
                 dest_key: "inputs/in.txt".to_string(),
                 mode: InputMode::Snapshot,
                 container_path: None,
@@ -543,6 +544,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         };
         let job_id = JobId::from_bytes([5; 16]);
         let mut record = JobRecord::new(
@@ -569,14 +571,18 @@ mod tests {
             exit_code: Some(0),
             workspace_bucket: Some("workspace-sample-one".to_string()),
             outputs: vec![OutputObject {
+                node_id: node,
                 bucket: "src".to_string(),
                 key: "out.txt".to_string(),
+                version_id: Ulid::from_bytes([11; 16]),
+                execution_id: Ulid::from_bytes([12; 16]),
                 container_path: "/work/out.txt".to_string(),
                 size: 7,
                 digest: None,
             }],
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         });
         (record, spec)
     }

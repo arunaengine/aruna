@@ -1,6 +1,6 @@
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
-    AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -243,38 +243,11 @@ impl CreateRealmOperation {
                 description: config_doc.description.clone(),
             },
         )?);
-        for strategy in &config_doc.strategies {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
-                    strategy: strategy.clone(),
-                },
-            )?);
-        }
-        for binding in &config_doc.placement_bindings {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigPlacementBindingAppended {
-                    binding: binding.clone(),
-                },
-            )?);
-        }
-        if let Some(default_strategy_id) = config_doc.default_strategy_id {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigDefaultStrategySet {
-                    strategy_id: default_strategy_id,
-                },
-            )?);
-        }
-        for binding in &config_doc.strategy_bindings {
-            config_events.push(config_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                    binding: binding.clone(),
-                },
-            )?);
-        }
+        config_events.extend(seed_placement_events(
+            &mut config_state,
+            &self.config.actor,
+            config_doc,
+        )?);
         config_events.push(config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigNodePlacementSet {
@@ -566,6 +539,55 @@ fn seed_placement_defaults(config: &mut RealmConfigDocument) {
     config.seed_default_placement();
 }
 
+/// Reducer events that seed one fresh realm config's placement identity: its
+/// strategies, seeded placement bindings, default and job-family strategies,
+/// and class strategy bindings. Every bootstrap path applies them, so a
+/// reducer-only rebuild materializes the same document whichever path ran.
+pub(crate) fn seed_placement_events(
+    state: &mut AdminDocumentReducerState,
+    actor: &Actor,
+    document: &RealmConfigDocument,
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+    let mut events = Vec::new();
+    for strategy in &document.strategies {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+        )?);
+    }
+    for binding in &document.placement_bindings {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: binding.clone(),
+            },
+        )?);
+    }
+    if let Some(strategy_id) = document.default_strategy_id {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+        )?);
+    }
+    events.push(state.apply_operation(
+        actor,
+        AdminDocumentOperation::RealmConfigJobFamilySet {
+            strategy_id: document.job_family_strategy_id,
+        },
+    )?);
+    for binding in &document.strategy_bindings {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: binding.clone(),
+            },
+        )?);
+    }
+    Ok(events)
+}
+
 #[cfg(test)]
 mod test {
     use aruna_core::keys::generate_signing_key;
@@ -769,18 +791,21 @@ mod test {
 
         let seeded_strategies = config_doc.strategies.clone();
         let seeded_default_strategy_id = config_doc.default_strategy_id.unwrap();
+        let seeded_family_strategy_id = config_doc.job_family_strategy_id;
         let seeded_bindings = config_doc.strategy_bindings.clone();
         let seeded_placements = config_doc.placement_bindings.clone();
-        assert_eq!(seeded_strategies.len(), 2);
+        assert_eq!(seeded_strategies.len(), 3);
         assert_eq!(seeded_strategies[0].name, "default");
         assert_eq!(seeded_strategies[0].replica_count, Some(3));
         assert_eq!(seeded_strategies[1].name, "everywhere");
         assert_eq!(seeded_strategies[1].replica_count, None);
+        assert_eq!(seeded_strategies[2].name, "job-family");
         assert_eq!(
             config_doc.default_strategy_id,
             Some(seeded_strategies[0].strategy_id)
         );
-        assert_eq!(seeded_bindings.len(), 4);
+        assert_eq!(seeded_family_strategy_id, seeded_strategies[2].strategy_id);
+        assert_eq!(seeded_bindings.len(), 5);
         assert_eq!(seeded_placements.len(), 2);
         assert_eq!(
             config_state.materialized_realm_config_default_strategy(),
@@ -790,13 +815,17 @@ mod test {
             config_state
                 .materialized_realm_config_placement_strategies()
                 .len(),
-            2
+            3
+        );
+        assert_eq!(
+            config_state.materialized_family_strategy(),
+            Some(seeded_family_strategy_id)
         );
         assert_eq!(
             config_state
                 .materialized_realm_config_strategy_bindings()
                 .len(),
-            4
+            5
         );
         assert_eq!(config_state.materialized_placement_bindings().len(), 2);
 
@@ -804,7 +833,7 @@ mod test {
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 21);
+        assert_eq!(outbox_records.len(), 25);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -897,48 +926,66 @@ mod test {
                 ),
                 (
                     10,
-                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
-                        binding: seeded_placements[0].clone(),
+                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                        strategy: seeded_strategies[2].clone(),
                     },
                 ),
                 (
                     11,
                     AdminDocumentOperation::RealmConfigPlacementBindingAppended {
-                        binding: seeded_placements[1].clone(),
+                        binding: seeded_placements[0].clone(),
                     },
                 ),
                 (
                     12,
+                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                        binding: seeded_placements[1].clone(),
+                    },
+                ),
+                (
+                    13,
                     AdminDocumentOperation::RealmConfigDefaultStrategySet {
                         strategy_id: seeded_default_strategy_id,
                     },
                 ),
                 (
-                    13,
-                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                        binding: seeded_bindings[0].clone(),
-                    },
-                ),
-                (
                     14,
-                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                        binding: seeded_bindings[1].clone(),
+                    AdminDocumentOperation::RealmConfigJobFamilySet {
+                        strategy_id: seeded_family_strategy_id,
                     },
                 ),
                 (
                     15,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                        binding: seeded_bindings[2].clone(),
+                        binding: seeded_bindings[0].clone(),
                     },
                 ),
                 (
                     16,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                        binding: seeded_bindings[3].clone(),
+                        binding: seeded_bindings[1].clone(),
                     },
                 ),
                 (
                     17,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[2].clone(),
+                    },
+                ),
+                (
+                    18,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[3].clone(),
+                    },
+                ),
+                (
+                    19,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[4].clone(),
+                    },
+                ),
+                (
+                    20,
                     AdminDocumentOperation::RealmConfigNodePlacementSet {
                         entry: NodePlacementEntry {
                             node_id: actor.node_id,
@@ -951,22 +998,29 @@ mod test {
                     },
                 ),
                 (
-                    18,
+                    21,
                     AdminDocumentOperation::RealmConfigCandidateMapPublished {
                         map: config_doc.candidate_maps[0].clone(),
                     },
                 ),
                 (
-                    19,
+                    22,
                     AdminDocumentOperation::RealmConfigActivationsInitialized {
                         strategy_id: seeded_strategies[0].strategy_id,
                         candidate_map_epoch: 1,
                     },
                 ),
                 (
-                    20,
+                    23,
                     AdminDocumentOperation::RealmConfigActivationsInitialized {
                         strategy_id: seeded_strategies[1].strategy_id,
+                        candidate_map_epoch: 1,
+                    },
+                ),
+                (
+                    24,
+                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                        strategy_id: seeded_strategies[2].strategy_id,
                         candidate_map_epoch: 1,
                     },
                 ),
@@ -1058,13 +1112,22 @@ mod test {
             .filter(|binding| binding.strategy_id == everywhere.strategy_id)
             .map(|binding| binding.scope.clone())
             .collect::<Vec<_>>();
-        assert_eq!(config_doc.strategy_bindings.len(), 4);
+        assert_eq!(config_doc.strategy_bindings.len(), 5);
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::MetadataRegistry)));
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Admin)));
         // Group (which covers group authorization documents) and user documents
         // must reach every node: the permission check reads them locally.
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Group)));
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::User)));
+        // Policy documents bind to the replica-capped default, never everywhere:
+        // non-holders must exist for resolution by id to mean anything.
+        assert!(!bound_scopes.contains(&BindingScope::Class(DocumentClass::PlacementPolicy)));
+        let policy_binding = config_doc
+            .strategy_bindings
+            .iter()
+            .find(|binding| binding.scope == BindingScope::Class(DocumentClass::PlacementPolicy))
+            .expect("policy class is bound");
+        assert_eq!(policy_binding.strategy_id, default.strategy_id);
     }
 
     #[test]

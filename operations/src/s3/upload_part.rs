@@ -1,17 +1,20 @@
 use crate::blob::cleanup::PendingCleanup;
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
+use crate::placement_policy::PolicyGateError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
+use aruna_core::keyspaces::{
+    NODE_SUBJECT_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     BackendLocation, BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, ResolvedBackend, WriteOwner,
+    MultipartUploadStatus, NODE_SUBJECT_KEY, NodeSubjectRecord, ResolvedBackend, WriteOwner,
 };
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::types::{Effects, Key, TxnId, UserId};
 use bytes::Bytes;
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -69,6 +72,8 @@ pub enum UploadPartError {
     WriteFailed(String),
     #[error("blob backend write failed: {0}")]
     BlobWriteFailed(String),
+    #[error(transparent)]
+    PolicyGateError(#[from] PolicyGateError),
     #[error("UploadPart failed")]
     UploadPartFailed,
 }
@@ -131,11 +136,21 @@ impl UploadPartOperation {
         self.abort()
     }
 
+    /// One round trip answers both "does this upload exist" and "does the
+    /// subject that admitted it still hold".
     fn handle_init(&mut self) -> Effects {
         self.state = UploadPartState::ReadUpload;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                    self.input.upload_id.to_bytes().to_vec().into(),
+                ),
+                (
+                    NODE_SUBJECT_KEYSPACE.to_string(),
+                    Key::from(NODE_SUBJECT_KEY.to_vec()),
+                ),
+            ],
             txn_id: None,
         })]
     }
@@ -151,8 +166,20 @@ impl UploadPartOperation {
     }
 
     fn handle_upload_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(UploadPartError::InvalidOperationState);
+        };
+        let mut values = values.into_iter();
+        let Some((_, value)) = values.next() else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
+        };
+        let subject = match values.next() {
+            Some((_, Some(value))) => match NodeSubjectRecord::from_bytes(value.as_ref()) {
+                Ok(record) => Some(record),
+                Err(err) => return self.emit_error(err.into()),
+            },
+            Some((_, None)) => None,
+            None => return self.emit_error(UploadPartError::InvalidOperationState),
         };
 
         let Some(value) = value else {
@@ -164,6 +191,11 @@ impl UploadPartOperation {
         };
         if let Err(err) = self.validate_upload_record(&record) {
             return self.emit_error(err);
+        }
+        // Cheap re-check of the create-time seal: no ref is resolved again, but
+        // a subject that moved since then stops the part before any byte moves.
+        if !record.admits_part(subject.as_ref()) {
+            return self.emit_error(PolicyGateError::Drift.into());
         }
 
         let Some(blob) = self.input.body.take() else {
@@ -743,11 +775,18 @@ mod test {
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
             metadata: std::collections::HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
         };
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            value: Some(record.to_bytes().unwrap().into()),
-            key: upload_id.to_bytes().to_vec().into(),
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    upload_id.to_bytes().to_vec().into(),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
+                (NODE_SUBJECT_KEY.to_vec().into(), None),
+            ],
         }));
 
         let [Effect::Blob(BlobEffect::WritePart { resolved, .. })] = effects.as_slice() else {

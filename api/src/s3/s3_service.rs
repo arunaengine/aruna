@@ -8,7 +8,7 @@ use crate::s3::checksum::{
     verify_trailer_stream,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
-use crate::s3::error::{IntoS3Error, routing_inputs_error};
+use crate::s3::error::{IntoS3Error, gate_context_error, routing_inputs_error};
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
@@ -30,7 +30,9 @@ use aruna_core::structs::{
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::{DriverContext, bucket_snapshot, drive, routing_snapshot};
+use aruna_operations::driver::{
+    DriverContext, bucket_snapshot, drive, gate_context, now_ms, routing_snapshot,
+};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
@@ -83,9 +85,6 @@ use aruna_operations::s3::list_objects_v2::{
 };
 use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
 use aruna_operations::s3::listing::common_prefix_of;
-use aruna_operations::s3::put_bucket_replication::{
-    DeleteBucketReplicationOperation, GetBucketReplicationOperation,
-};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
 use aruna_operations::s3::refresh_reference_metadata::{
     QueueReferenceMetadataRefreshOperation, ReferenceMetadataRefresh,
@@ -333,7 +332,7 @@ impl ArunaS3Service {
         &self,
         bucket: &str,
         configuration: &ReplicationConfiguration,
-    ) -> S3Result<Vec<aruna_core::structs::BucketReplicationTarget>> {
+    ) -> S3Result<Vec<(ArunaArn, bool)>> {
         if bucket.starts_with("ws-") {
             return Err(s3_error!(
                 InvalidArgument,
@@ -360,7 +359,7 @@ impl ArunaS3Service {
             if rule.status.as_str() != ReplicationRuleStatus::ENABLED {
                 continue;
             }
-            let arn = aruna_core::structs::ArunaArn::parse(&rule.destination.bucket)
+            let arn = ArunaArn::parse(&rule.destination.bucket)
                 .map_err(|err| s3_error!(InvalidArgument, "{}", err.to_string()))?;
             if arn.resource_type != aruna_core::structs::ArunaArnType::S3 {
                 return Err(s3_error!(
@@ -409,13 +408,7 @@ impl ArunaS3Service {
             )) {
                 continue;
             }
-            targets.push(aruna_core::structs::BucketReplicationTarget {
-                node_id: arn.node_id,
-                realm_id: arn.realm_id,
-                bucket: target_bucket,
-                arn: arn.to_string(),
-                replicate_delete_markers,
-            });
+            targets.push((arn, replicate_delete_markers));
         }
 
         if targets.is_empty() {
@@ -428,18 +421,19 @@ impl ArunaS3Service {
         Ok(targets)
     }
 
+    /// Renders the outgoing sync relationships of one bucket as the S3
+    /// replication document. Relationship target ARNs are the only source.
     fn build_replication_configuration(
         &self,
-        config: &aruna_core::structs::BucketReplicationConfig,
+        relationships: &[SyncRelationship],
     ) -> ReplicationConfiguration {
-        let rules = config
-            .targets
+        let rules = relationships
             .iter()
             .enumerate()
-            .map(|(index, target)| ReplicationRule {
+            .map(|(index, relationship)| ReplicationRule {
                 delete_marker_replication: Some(DeleteMarkerReplication {
                     status: Some(DeleteMarkerReplicationStatus::from_static(
-                        if target.replicate_delete_markers {
+                        if relationship.replicate_deletes {
                             DeleteMarkerReplicationStatus::ENABLED
                         } else {
                             DeleteMarkerReplicationStatus::DISABLED
@@ -449,13 +443,7 @@ impl ArunaS3Service {
                 destination: Destination {
                     access_control_translation: None,
                     account: None,
-                    bucket: aruna_core::structs::ArunaArn::s3_bucket(
-                        target.realm_id,
-                        target.node_id,
-                        target.bucket.clone(),
-                    )
-                    .expect("bucket replication targets have valid bucket names")
-                    .to_string(),
+                    bucket: relationship.target.to_string(),
                     encryption_configuration: None,
                     metrics: None,
                     replication_time: None,
@@ -474,30 +462,6 @@ impl ArunaS3Service {
         ReplicationConfiguration {
             role: "arn:aruna:replication-role".to_string(),
             rules,
-        }
-    }
-
-    fn relationships_config(
-        &self,
-        relationships: &[SyncRelationship],
-    ) -> aruna_core::structs::BucketReplicationConfig {
-        aruna_core::structs::BucketReplicationConfig {
-            targets: relationships
-                .iter()
-                .map(
-                    |relationship| aruna_core::structs::BucketReplicationTarget {
-                        node_id: relationship.target.node_id,
-                        realm_id: relationship.target.realm_id,
-                        bucket: relationship
-                            .target
-                            .bucket()
-                            .expect("XML-visible sync targets are bucket ARNs")
-                            .to_string(),
-                        arn: relationship.target.to_string(),
-                        replicate_delete_markers: relationship.replicate_deletes,
-                    },
-                )
-                .collect(),
         }
     }
 
@@ -1138,8 +1102,9 @@ impl S3 for ArunaS3Service {
                 created_at: SystemTime::now(),
                 created_by: user_access.user_identity,
                 cors_configuration: None,
-                replication: None,
                 storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
             },
         );
 
@@ -1647,7 +1612,10 @@ impl S3 for ArunaS3Service {
         }
         .map_err(routing_inputs_error)?;
         let input = convert_input(req.input)?;
-        let operation = PutObjectOperation::new(PutObjectConfig {
+        let gate = gate_context(&self.state, self.realm_id, now_ms())
+            .await
+            .map_err(gate_context_error)?;
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
             group_id,
             realm_id: self.realm_id,
@@ -1664,6 +1632,9 @@ impl S3 for ArunaS3Service {
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_metadata(metadata)
         .with_restrictions(replication_auth.path_restrictions.clone());
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
 
         let result = drive(operation, &self.state)
             .await
@@ -1904,7 +1875,10 @@ impl S3 for ArunaS3Service {
             None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
         }
         .map_err(routing_inputs_error)?;
-        let operation = CreateMultipartUploadOperation::new(CMPI {
+        let gate = gate_context(&self.state, self.realm_id, now_ms())
+            .await
+            .map_err(gate_context_error)?;
+        let mut operation = CreateMultipartUploadOperation::new(CMPI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             group_id,
@@ -1916,6 +1890,9 @@ impl S3 for ArunaS3Service {
             req.input.metadata.clone().unwrap_or_default(),
             req.input.content_type.as_deref(),
         ));
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
 
         let result = drive(operation, &self.state)
             .await
@@ -2209,7 +2186,10 @@ impl S3 for ArunaS3Service {
             .unwrap_or_default();
         validate_composite_part_count(&checksum_request, completed_parts.len())?;
 
-        let operation = CompleteMultipartUploadOperation::new(CMUI {
+        let gate = gate_context(&self.state, self.realm_id, now_ms())
+            .await
+            .map_err(gate_context_error)?;
+        let mut operation = CompleteMultipartUploadOperation::new(CMUI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             upload_id,
@@ -2226,6 +2206,9 @@ impl S3 for ArunaS3Service {
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_restrictions(replication_auth.path_restrictions.clone());
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
 
         let result = drive(operation, &self.state)
             .await
@@ -3301,24 +3284,21 @@ impl S3 for ArunaS3Service {
             .map_err(|error| s3_error!(InvalidArgument, "{}", error.to_string()))?;
         let created_at = SystemTime::now();
         let relationships = targets
-            .iter()
-            .map(|target| {
-                Ok(SyncRelationship {
-                    id: ulid::Ulid::generate(),
-                    source: source.clone(),
-                    target: ArunaArn::parse(&target.arn)
-                        .map_err(|error| s3_error!(InvalidArgument, "{}", error.to_string()))?,
-                    mode: SyncMode::Continuous,
-                    reference_handling: Default::default(),
-                    reference_serving: false,
-                    replicate_deletes: target.replicate_delete_markers,
-                    created_by: user_access.user_identity,
-                    created_at,
-                    state: SyncState::Enabled,
-                    status: SyncStatusSnapshot::default(),
-                })
+            .into_iter()
+            .map(|(target, replicate_deletes)| SyncRelationship {
+                id: ulid::Ulid::generate(),
+                source: source.clone(),
+                target,
+                mode: SyncMode::Continuous,
+                reference_handling: Default::default(),
+                reference_serving: false,
+                replicate_deletes,
+                created_by: user_access.user_identity,
+                created_at,
+                state: SyncState::Enabled,
+                status: SyncStatusSnapshot::default(),
             })
-            .collect::<S3Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
         let mut stored = Vec::new();
         for relationship in &relationships {
@@ -3391,12 +3371,6 @@ impl S3 for ArunaS3Service {
             }
         }
 
-        drive(DeleteBucketReplicationOperation::new(bucket), &self.state)
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to clear legacy replication config"))?;
-
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
@@ -3411,21 +3385,15 @@ impl S3 for ArunaS3Service {
         })?;
 
         let relationships = self.list_xml_relationships(&req.input.bucket).await?;
-        let config = if relationships.is_empty() {
-            drive(
-                GetBucketReplicationOperation::new(req.input.bucket),
-                &self.state,
-            )
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to load bucket replication config"))?
-        } else {
-            self.relationships_config(&relationships)
-        };
+        if relationships.is_empty() {
+            return Err(s3_error!(
+                ReplicationConfigurationNotFoundError,
+                "Replication configuration not found"
+            ));
+        }
 
         Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration: Some(self.build_replication_configuration(&config)),
+            replication_configuration: Some(self.build_replication_configuration(&relationships)),
         }))
     }
 
@@ -3455,15 +3423,6 @@ impl S3 for ArunaS3Service {
                     .await;
             }
         }
-
-        drive(
-            DeleteBucketReplicationOperation::new(req.input.bucket),
-            &self.state,
-        )
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket replication config"))?;
 
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
@@ -3598,8 +3557,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].bucket, "target-bucket");
-        assert_eq!(parsed[0].arn, target.to_string());
+        assert_eq!(parsed[0].0.bucket(), Some("target-bucket"));
+        assert_eq!(parsed[0].0.to_string(), target.to_string());
     }
 
     #[test]
@@ -3643,8 +3602,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(parsed.len(), 2);
-        assert!(!parsed[0].replicate_delete_markers);
-        assert!(parsed[1].replicate_delete_markers);
+        assert!(!parsed[0].1);
+        assert!(parsed[1].1);
     }
 
     #[test]
@@ -4607,8 +4566,9 @@ mod tests {
             created_at: UNIX_EPOCH,
             created_by,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 

@@ -234,6 +234,16 @@ pub enum ConversionError {
     InvalidOperationConversion(String),
     #[error("RO-Crate conversion error: {0}")]
     RoCrateError(String),
+    #[error(transparent)]
+    PlacementPolicyError(#[from] crate::structs::PlacementPolicyError),
+    #[error(transparent)]
+    AdvertisementError(#[from] crate::compute::AdvertisementError),
+    #[error("policy refs must be sorted and deduplicated")]
+    NonCanonicalPolicyRefs,
+    /// A monotonic head generation must never wrap: a wrapped pointer would
+    /// compare equal to an older one and silently win the convergent order.
+    #[error("object head generation is exhausted")]
+    HeadGenerationExhausted,
 }
 
 impl PartialEq for ConversionError {

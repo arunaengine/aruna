@@ -3,7 +3,12 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::{PendingCleanup, schedule_blob_cleanup_effect};
+use crate::blob::managed_copy::{ManagedCopyError, register_effect};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
+use crate::placement_policy::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
+};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -14,7 +19,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
@@ -22,10 +27,11 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, PathRestriction, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta,
-    VersionKey, WriteOwner,
+    BucketInfo, CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
+    MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
+    MultipartUploadPartKey, MultipartUploadStatus, PathRestriction, PlacementPolicyError,
+    PlacementPolicyRef, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
+    WriteOwner,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -43,8 +49,11 @@ pub enum CompleteMultipartUploadState {
     WriteUploadCompleting,
     CommitMarkTransaction,
     ReadUploadParts,
+    ReadGateBucket,
+    PolicyGate,
     ComposeBlob,
     StartFinalizeTransaction,
+    ReadBucketDefault,
     FenceBackend,
     CheckHashLookup,
     WriteBlobLocation,
@@ -53,6 +62,7 @@ pub enum CompleteMultipartUploadState {
     WriteBlobHead,
     WriteHashPathIndex,
     WriteBlobVersionRecord,
+    RegisterManagedCopy,
     WriteObjectMetadata,
     DeleteUploadRecords,
     WriteCleanupRecords,
@@ -116,6 +126,12 @@ pub enum CompleteMultipartUploadError {
     UsageUpdateError(#[from] UsageUpdateError),
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
+    #[error(transparent)]
+    PolicyGate(#[from] PolicyGateError),
+    #[error(transparent)]
+    PolicyError(#[from] PlacementPolicyError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
@@ -189,6 +205,16 @@ pub struct CompleteMultipartUploadOperation {
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
+    /// Refs sealed on the version record, reused verbatim by its registration.
+    sealed_policies: Vec<PlacementPolicyRef>,
+    /// Destination default, read inside the finalize transaction.
+    bucket_policies: Vec<PlacementPolicyRef>,
+    /// Destination facts of this node. Absent means no governed object may be
+    /// composed or registered here.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
+    /// What the gate decided on, re-read inside the finalize transaction.
+    gated_bucket: Option<GatedBucket>,
 }
 
 impl CompleteMultipartUploadOperation {
@@ -220,6 +246,11 @@ impl CompleteMultipartUploadOperation {
             output: None,
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
+            sealed_policies: Vec::new(),
+            bucket_policies: Vec::new(),
+            gate_context: None,
+            gate: None,
+            gated_bucket: None,
         }
     }
 
@@ -231,9 +262,25 @@ impl CompleteMultipartUploadOperation {
     /// The uploader's credential restrictions. They are persisted on the durable
     /// replication obligation, so a scoped upload cannot escalate to unscoped
     /// when the obligation repair path enqueues replication instead.
+    /// The destination this completion is evaluated against. Omitting it leaves
+    /// the ungoverned path untouched and fails every governed one closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
+        self
+    }
+
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
         self.restrictions = restrictions;
         self
+    }
+
+    /// Subject generation the gate admitted this completion under; zero for an
+    /// ungoverned object, which no subject ever evaluated.
+    fn sealed_subject(&self) -> u64 {
+        self.gated_bucket
+            .as_ref()
+            .and_then(|gated| gated.subject_generation)
+            .unwrap_or_default()
     }
 
     /// The terminal state is complete, so the driver never calls `abort` for us;
@@ -674,19 +721,101 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err),
         };
         self.upload_parts = upload_parts;
-        self.resolved_parts = resolved.clone();
+        self.resolved_parts = resolved;
 
+        // The destination default is read before the compose, so the gate that
+        // admits the object sees the refs the version would actually carry.
+        self.state = CompleteMultipartUploadState::ReadGateBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let bucket = match value
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(error) => return self.schedule_error(error.into()),
+        };
+        let inherited = self
+            .upload_record
+            .as_ref()
+            .map(|upload| upload.placement_policies.clone())
+            .unwrap_or_default();
+        let refs = match union_refs(&GatedBucket::observe(bucket.as_ref()).policies, &inherited) {
+            Ok(refs) => refs,
+            Err(error) => return self.schedule_error(error.into()),
+        };
+        self.gated_bucket = Some(
+            GatedBucket::observe(bucket.as_ref())
+                .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
+        );
+        match write_gate(self.gate_context.as_ref(), &refs) {
+            Ok(None) => self.compose_blob(),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = CompleteMultipartUploadState::PolicyGate;
+                match complete {
+                    true => self.finish_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn handle_policy_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_gate(&mut self) -> Effects {
+        let Some(gate) = self.gate.take() else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let outcome = match gate.finalize() {
+            Ok(outcome) => outcome,
+            Err(error) => return self.schedule_error(PolicyGateError::from(error).into()),
+        };
+        match gate_decision(outcome.decision) {
+            Ok(()) => self.compose_blob(),
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn compose_blob(&mut self) -> Effects {
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
+        let parts = self
+            .resolved_parts
+            .iter()
+            .map(|part| part.location.clone())
+            .collect();
         self.state = CompleteMultipartUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             resolved: pinned,
             created_by: self.input.created_by,
-            parts: resolved.into_iter().map(|part| part.location).collect(),
+            parts,
         })]
     }
 
@@ -733,6 +862,32 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
+        // The version snapshots the default this transaction observes, not one
+        // read while the parts were still being uploaded.
+        self.state = CompleteMultipartUploadState::ReadBucketDefault;
+        smallvec![drift_reads(&self.input.bucket, self.txn_id)]
+    }
+
+    fn handle_default_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let (bucket, subject) = match split_drift_reads(values) {
+            Ok(split) => split,
+            Err(error) => return self.schedule_error(error.into()),
+        };
+        // The refs the version commits must be the refs the gate admitted: a
+        // default or subject changed during the compose was never evaluated.
+        let observed = GatedBucket::observe(bucket.as_ref());
+        if let Some(gated) = self.gated_bucket.as_ref() {
+            if !gated.matches(&observed) {
+                return self.schedule_error(PolicyGateError::Drift.into());
+            }
+            if let Err(error) = gated.check_subject(subject.as_ref()) {
+                return self.schedule_error(error.into());
+            }
+        }
+        self.bucket_policies = observed.policies;
 
         let Some(location) = self.composed_location.clone() else {
             return self
@@ -894,7 +1049,10 @@ impl CompleteMultipartUploadOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
-        let pointer = CurrentVersionPointer::next_for(existing, version_id);
+        let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => pointer,
+            Err(err) => return self.schedule_error(err.into()),
+        };
         let alias_context = match self.alias_context() {
             Ok(context) => context,
             Err(err) => return self.schedule_error(err),
@@ -997,7 +1155,16 @@ impl CompleteMultipartUploadOperation {
             None,
         )
         .with_metadata(upload_record.metadata.clone());
+        // Union with what part copies inherited: a part-wise copy of a governed
+        // source can only add refs to the composed object.
+        let mut policies = self.bucket_policies.clone();
+        policies.extend(upload_record.placement_policies.iter().copied());
+        let version = match version.with_policies(policies) {
+            Ok(version) => version,
+            Err(err) => return self.schedule_error(err.into()),
+        };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        self.sealed_policies = version.placement_policies.clone();
         let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -1008,6 +1175,38 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn handle_blob_version_record_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
+        self.register_managed_copy()
+    }
+
+    /// Joins the finalize transaction, so the composed copy becomes serveable
+    /// exactly when the logical version does and never before.
+    fn register_managed_copy(&mut self) -> Effects {
+        let (Some(version_id), Some(location)) = (self.version_id, self.final_location.clone())
+        else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        let effect = match register_effect(
+            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
+            self.input.node_id,
+            &location,
+            &self.sealed_policies,
+            self.sealed_subject(),
+            version_id.timestamp_ms(),
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        self.state = CompleteMultipartUploadState::RegisterManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_copy_registered(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1539,10 +1738,13 @@ impl Operation for CompleteMultipartUploadOperation {
                 self.handle_mark_committed(event)
             }
             CompleteMultipartUploadState::ReadUploadParts => self.handle_upload_parts_read(event),
+            CompleteMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
+            CompleteMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
             CompleteMultipartUploadState::ComposeBlob => self.handle_blob_composed(event),
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)
             }
+            CompleteMultipartUploadState::ReadBucketDefault => self.handle_default_read(event),
             CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteMultipartUploadState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             CompleteMultipartUploadState::WriteBlobLocation => {
@@ -1559,6 +1761,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::WriteBlobVersionRecord => {
                 self.handle_blob_version_record_written(event)
             }
+            CompleteMultipartUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteMultipartUploadState::WriteObjectMetadata => {
                 self.handle_object_metadata_written(event)
             }
@@ -1798,6 +2001,8 @@ mod tests {
             status: MultipartUploadStatus::Completing,
             checksum_hint: None,
             metadata: HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
         }
     }
 
@@ -1878,6 +2083,18 @@ mod tests {
         let txn_id = TxnId::generate();
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, CompleteMultipartUploadState::ReadBucketDefault);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"bucket".to_vec().into(), None),
+                (b"subject".to_vec().into(), None),
+            ],
+        }));
         assert_eq!(op.state, CompleteMultipartUploadState::FenceBackend);
         assert!(matches!(
             effects.as_slice(),
@@ -2810,5 +3027,254 @@ mod tests {
             CompleteMultipartUploadState::ReadUploadParts
         );
         assert_eq!(operation.txn_id, None);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::placement_policy::PolicyCacheEntry;
+    use aruna_core::structs::{
+        BackendRef, MultipartUploadChecksumHint, PlacementPolicy, PlacementSelector,
+        PlacementSubject, VerifiedPolicy,
+    };
+    use aruna_core::types::Value;
+    use std::collections::BTreeMap;
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    fn node() -> aruna_core::types::NodeId {
+        iroh::SecretKey::from_bytes(&[9u8; 32]).public()
+    }
+
+    fn policy(location: &str) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn gate(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: PlacementSubject {
+                node_id: node(),
+                generation: 1,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+            now_ms: 1_000,
+            admitting: true,
+        }
+    }
+
+    fn input() -> CompleteMultipartUploadInput {
+        let realm_id = realm();
+        CompleteMultipartUploadInput {
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            upload_id: Ulid::generate(),
+            realm_id,
+            node_id: node(),
+            completed_parts: vec![],
+            expected_checksums: vec![],
+            checksum_algorithm: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
+            object_size: Some(10),
+            created_by: UserId::local(Ulid::generate(), realm_id),
+            quota_ceiling: Some(30),
+        }
+    }
+
+    fn upload(input: &CompleteMultipartUploadInput) -> MultipartUpload {
+        MultipartUpload {
+            upload_id: input.upload_id,
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            bucket: input.bucket.clone(),
+            key: input.key.clone(),
+            group_id: Ulid::generate(),
+            created_by: input.created_by,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None::<MultipartUploadChecksumHint>,
+            metadata: HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
+        }
+    }
+
+    fn bucket(refs: Vec<PlacementPolicyRef>, generation: u64) -> Value {
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: refs,
+            placement_policy_generation: generation,
+        };
+        info.to_bytes().expect("bucket encodes").into()
+    }
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value,
+        })
+    }
+
+    /// `location` of `None` leaves the node without a subject, which fails
+    /// every governed completion closed.
+    fn at_gate(location: Option<&str>) -> CompleteMultipartUploadOperation {
+        let input = input();
+        let record = upload(&input);
+        let mut operation = CompleteMultipartUploadOperation::new(input);
+        if let Some(location) = location {
+            operation = operation.with_gate(gate(location));
+        }
+        operation.upload_record = Some(record);
+        operation.state = CompleteMultipartUploadState::ReadGateBucket;
+        operation
+    }
+
+    fn composes(effects: &Effects) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Compose { .. })))
+    }
+
+    #[test]
+    fn denies_before_compose() {
+        // The rule admits another location, so no part may be composed at all.
+        let rule = policy("us-east");
+        let mut operation = at_gate(Some("eu-west"));
+        let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        assert!(!composes(&effects));
+
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(read(Some(cached.into())));
+        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
+
+        assert!(!composes(&effects));
+        assert_eq!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGate(
+                PolicyGateError::Denied {
+                    policy_ids: vec![rule.policy().policy_id]
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn no_policy_blocks_compose() {
+        // A rule that cannot be obtained blocks; it is never read as a grant.
+        let rule = policy("eu-west");
+        let mut operation = at_gate(Some("eu-west"));
+        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        let hint = PolicyCacheEntry::unavailable(1_000)
+            .to_bytes()
+            .expect("entry encodes");
+        let effects = operation.step(read(Some(hint.into())));
+
+        assert!(!composes(&effects));
+        assert!(matches!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGate(
+                PolicyGateError::Unavailable { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn missing_subject_blocks_compose() {
+        let mut operation = at_gate(None);
+        let effects = operation.step(read(Some(bucket(
+            vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([1u8; 16]),
+                digest: [4u8; 32],
+            }],
+            1,
+        ))));
+
+        assert!(!composes(&effects));
+        assert_eq!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGate(
+                PolicyGateError::NoSubject
+            ))
+        );
+    }
+
+    #[test]
+    fn ungoverned_composes() {
+        // An object with no refs reaches the compose with no policy round trip.
+        let mut operation = at_gate(Some("eu-west"));
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(composes(&effects));
+    }
+
+    #[test]
+    fn drift_aborts_finalize() {
+        // The default changed while the parts composed, so the object must not
+        // commit refs nothing evaluated.
+        let mut operation = at_gate(Some("eu-west"));
+        operation.step(read(Some(bucket(Vec::new(), 0))));
+        operation.composed_location = Some(composed());
+        operation.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+        operation.state = CompleteMultipartUploadState::ReadBucketDefault;
+
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    Vec::new().into(),
+                    Some(bucket(vec![policy("us-east").policy_ref()], 1)),
+                ),
+                (Vec::new().into(), None),
+            ],
+        }));
+
+        assert_eq!(
+            operation.pending_error,
+            Some(CompleteMultipartUploadError::PolicyGate(
+                PolicyGateError::Drift
+            ))
+        );
+    }
+
+    fn composed() -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "aruna".to_string(),
+            backend_path: "objects/one".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::from([("blake3".to_string(), vec![6u8; 32])]),
+        }
     }
 }

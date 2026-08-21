@@ -1186,6 +1186,23 @@ mod tests {
     }
 
     #[test]
+    fn policy_bucket_agrees() {
+        // The adapter derives a policy bucket from the config alone, so that
+        // derivation and this resolver must never disagree.
+        let (mut config, _) = config_and_placement();
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::PlacementPolicy),
+            strategy_id: config.default_strategy_id.expect("default strategy"),
+        }];
+        let policy_id = Ulid::from_bytes([8u8; 16]);
+        let target = aruna_core::structs::placement_policy_target(policy_id);
+        let planned = plan_target_placement(&config, &target, Default::default())
+            .expect("resolves")
+            .expect("governed");
+        assert_eq!(config.policy_placement(policy_id), Some(planned.placement));
+    }
+
+    #[test]
     fn planner_pins_activation() {
         // A published-but-unactivated newer map must not move the planner:
         // selected peers stay on the activated holder set.

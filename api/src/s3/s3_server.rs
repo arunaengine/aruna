@@ -61,6 +61,26 @@ pub const DEFAULT_S3_MAX_CONNECTIONS: usize = 1_024;
 /// s3s parse/body/storage work.
 pub const DEFAULT_S3_MAX_CONCURRENT_REQUESTS: usize = 512;
 
+/// Listener deadlines of the S3 plane: how long a connection may stay silent
+/// before its first request, how long a request or response may make no I/O
+/// progress, and the total lifetime of one streamed request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct S3ServerTimeouts {
+    pub initial_request: Duration,
+    pub connection_idle: Duration,
+    pub stream_lifetime: Duration,
+}
+
+impl Default for S3ServerTimeouts {
+    fn default() -> Self {
+        Self {
+            initial_request: INITIAL_REQUEST_TIMEOUT,
+            connection_idle: CONNECTION_IDLE_TIMEOUT,
+            stream_lifetime: STREAM_LIFETIME_TIMEOUT,
+        }
+    }
+}
+
 fn touch_frame(activity: &ConnectionActivity, frame: &hyper::body::Frame<hyper::body::Bytes>) {
     if let Some(data) = frame.data_ref().filter(|data| !data.is_empty()) {
         activity.record_progress(data.len());
@@ -438,6 +458,7 @@ pub struct S3Server {
     mutation_limit: Arc<Semaphore>,
     capture_limit: Arc<Semaphore>,
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+    timeouts: S3ServerTimeouts,
 }
 
 #[derive(Default)]
@@ -449,9 +470,18 @@ struct ConnectionActivity {
     requested: AtomicBool,
     active: AtomicUsize,
     notify: Notify,
+    // `None` keeps the built-in idle bound; the listener installs the configured one.
+    idle_timeout: Option<Duration>,
 }
 
 impl ConnectionActivity {
+    fn with_idle(idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout: Some(idle_timeout),
+            ..Self::default()
+        }
+    }
+
     fn touch(&self) {
         if !self.cancelled.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire) {
             self.generation.fetch_add(1, Ordering::AcqRel);
@@ -562,7 +592,7 @@ impl ConnectionActivity {
             }
             tokio::select! {
                 _ = notified => {}
-                _ = tokio::time::sleep(CONNECTION_IDLE_TIMEOUT) => {
+                _ = tokio::time::sleep(self.idle_timeout.unwrap_or(CONNECTION_IDLE_TIMEOUT)) => {
                     if generation == self.generation.load(Ordering::Acquire)
                         && !self.is_cancelled()
                         && !self.stopped.load(Ordering::Acquire)
@@ -755,6 +785,7 @@ pub struct WrappingService {
     activity: Option<Arc<ConnectionActivity>>,
     // Proxies whose forwarded client address may be charged instead of the peer.
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+    timeouts: S3ServerTimeouts,
 }
 
 fn build_s3_service(
@@ -832,7 +863,15 @@ impl S3Server {
             )),
             capture_limit: Arc::new(Semaphore::new(DELETE_CAPTURE_LIMIT)),
             trusted_proxies: Arc::new(Vec::new()),
+            timeouts: S3ServerTimeouts::default(),
         })
+    }
+
+    /// Installs operator-configured listener deadlines; the defaults apply when
+    /// this is not called.
+    pub fn with_timeouts(mut self, timeouts: S3ServerTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Installs operator-configured concurrency ceilings; the control lane
@@ -891,6 +930,7 @@ impl S3Server {
     ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let connection_limit = self.connection_limit.clone();
+        let timeouts = self.timeouts;
         let service = WrappingService {
             shared: self.s3service,
             cors: self.cors,
@@ -906,12 +946,13 @@ impl S3Server {
             capture_limit: self.capture_limit,
             activity: None,
             trusted_proxies: self.trusted_proxies,
+            timeouts,
         };
         let mut connection = ConnBuilder::new(TokioExecutor::new()).http1_only();
         connection
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(INITIAL_REQUEST_TIMEOUT);
+            .header_read_timeout(timeouts.initial_request);
         let connections = TaskTracker::new();
         let abort_connections = CancellationToken::new();
 
@@ -939,7 +980,7 @@ impl S3Server {
                 };
                 let mut service = service.clone();
                 service.peer_ip = Some(peer.ip());
-                let activity = Arc::new(ConnectionActivity::default());
+                let activity = Arc::new(ConnectionActivity::with_idle(timeouts.connection_idle));
                 service.activity = Some(activity.clone());
                 let builder = connection.clone();
                 let connection_shutdown = shutdown.clone();
@@ -951,7 +992,7 @@ impl S3Server {
                     tokio::select! {
                         biased;
                         _ = connection_abort.cancelled() => {}
-                        _ = run_connection(activity.clone(), conn.as_mut()) => {}
+                        _ = run_connection(activity.clone(), conn.as_mut(), timeouts.initial_request) => {}
                         _ = connection_shutdown.cancelled() => {
                             // Finish the request being served, then close the
                             // connection instead of waiting out its keep-alive.
@@ -959,7 +1000,7 @@ impl S3Server {
                             tokio::select! {
                                 biased;
                                 _ = connection_abort.cancelled() => {}
-                                _ = run_connection(activity, conn.as_mut()) => {}
+                                _ = run_connection(activity, conn.as_mut(), timeouts.initial_request) => {}
                             }
                         }
                     }
@@ -1059,11 +1100,12 @@ impl Service<Request<Incoming>> for WrappingService {
             &parts.headers,
         );
         let captured = (!oversized_delete && delete_objects).then(DeleteObjectsBody::default);
-        let stream_activity = Arc::new(ConnectionActivity::default());
+        let timeouts = self.timeouts;
+        let stream_activity = Arc::new(ConnectionActivity::with_idle(timeouts.connection_idle));
         let connection_activity = self
             .activity
             .clone()
-            .unwrap_or_else(|| Arc::new(ConnectionActivity::default()));
+            .unwrap_or_else(|| Arc::new(ConnectionActivity::with_idle(timeouts.connection_idle)));
         connection_activity.mark_request();
         parts.extensions.insert(connection_activity.clone());
         parts.extensions.insert(stream_activity.clone());
@@ -1185,7 +1227,7 @@ impl Service<Request<Incoming>> for WrappingService {
             s3s_request.extensions_mut().insert(local_lease.clone());
             activity.begin_request();
             let deadline_activity = Arc::new(ConnectionActivity::default());
-            let deadline = tokio::time::Instant::now() + STREAM_LIFETIME_TIMEOUT;
+            let deadline = tokio::time::Instant::now() + timeouts.stream_lifetime;
             let deadline_task_activity = deadline_activity.clone();
             tokio::spawn(async move {
                 tokio::select! {
@@ -1386,7 +1428,8 @@ impl Service<Request<Incoming>> for WrappingService {
                     drop(capture_permit.take());
                     stream_activity.stop();
                     activity.touch();
-                    let response_activity = Arc::new(ConnectionActivity::default());
+                    let response_activity =
+                        Arc::new(ConnectionActivity::with_idle(timeouts.connection_idle));
                     response_activity.touch();
                     let idle_task_activity = response_activity.clone();
                     let response_connection = activity.clone();
@@ -1468,12 +1511,12 @@ impl Service<Request<Incoming>> for WrappingService {
     }
 }
 
-async fn run_connection<F>(activity: Arc<ConnectionActivity>, connection: F)
+async fn run_connection<F>(activity: Arc<ConnectionActivity>, connection: F, initial: Duration)
 where
     F: Future + Send,
 {
     let mut connection = Box::pin(connection);
-    let initial = tokio::time::sleep(INITIAL_REQUEST_TIMEOUT);
+    let initial = tokio::time::sleep(initial);
     tokio::pin!(initial);
 
     tokio::select! {
@@ -1601,9 +1644,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_connection_closes() {
         let activity = Arc::new(ConnectionActivity::default());
-        let task = tokio::spawn(run_connection(activity, async {
-            std::future::pending::<hyper::Result<()>>().await
-        }));
+        let task = tokio::spawn(run_connection(
+            activity,
+            async { std::future::pending::<hyper::Result<()>>().await },
+            INITIAL_REQUEST_TIMEOUT,
+        ));
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
         tokio::time::advance(CONNECTION_IDLE_TIMEOUT).await;
@@ -1612,12 +1657,43 @@ mod tests {
         task.await.expect("idle task joins");
     }
 
+    #[test]
+    fn default_timeouts_unchanged() {
+        // Making the deadlines configurable must not move the shipped defaults.
+        let timeouts = S3ServerTimeouts::default();
+        assert_eq!(timeouts.initial_request, Duration::from_secs(10));
+        assert_eq!(timeouts.connection_idle, Duration::from_secs(20));
+        assert_eq!(timeouts.stream_lifetime, Duration::from_secs(30 * 60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_idle_applies() {
+        // A connection given a longer idle budget must outlive the default one.
+        let idle = CONNECTION_IDLE_TIMEOUT * 3;
+        let activity = Arc::new(ConnectionActivity::with_idle(idle));
+        let task = tokio::spawn(run_connection(
+            activity,
+            async { std::future::pending::<hyper::Result<()>>().await },
+            INITIAL_REQUEST_TIMEOUT * 3,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(idle).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        task.await.expect("idle task joins");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unrequested_closes() {
         let activity = Arc::new(ConnectionActivity::default());
-        let task = tokio::spawn(run_connection(activity, async {
-            std::future::pending::<hyper::Result<()>>().await
-        }));
+        let task = tokio::spawn(run_connection(
+            activity,
+            async { std::future::pending::<hyper::Result<()>>().await },
+            INITIAL_REQUEST_TIMEOUT,
+        ));
         tokio::task::yield_now().await;
         tokio::time::advance(INITIAL_REQUEST_TIMEOUT).await;
         tokio::task::yield_now().await;
@@ -1630,12 +1706,16 @@ mod tests {
         let activity = Arc::new(ConnectionActivity::default());
         activity.mark_request();
         let marker = activity.clone();
-        let task = tokio::spawn(run_connection(activity, async move {
-            tokio::time::sleep(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
-            marker.touch();
-            tokio::time::sleep(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
-            Ok::<(), hyper::Error>(())
-        }));
+        let task = tokio::spawn(run_connection(
+            activity,
+            async move {
+                tokio::time::sleep(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+                marker.touch();
+                tokio::time::sleep(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+                Ok::<(), hyper::Error>(())
+            },
+            INITIAL_REQUEST_TIMEOUT,
+        ));
         tokio::task::yield_now().await;
         tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
         tokio::task::yield_now().await;

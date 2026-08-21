@@ -26,14 +26,17 @@ enum RouteState {
     Done,
 }
 
-/// Loads the realm config, derives the immutable owner from the JobId, then
-/// resolves locally or emits a request. A remote request requires a token.
+/// Routes one job-control request to the node that can answer it. An external
+/// job names its responder from the family projection; every other job still
+/// derives the immutable owner from its JobId. A remote request needs a token.
 #[derive(Debug, PartialEq)]
 pub(crate) struct JobRouteOperation {
     realm_id: RealmId,
     local_node: NodeId,
     job_id: JobId,
     request: Option<JobRequest>,
+    /// Responder the caller resolved from the family projection, if any.
+    responder: Option<NodeId>,
     state: RouteState,
     output: Option<Result<JobRouteOutcome, JobRouteError>>,
 }
@@ -50,8 +53,33 @@ impl JobRouteOperation {
             local_node,
             job_id,
             request,
+            responder: None,
             state: RouteState::LoadConfig,
             output: None,
+        }
+    }
+
+    /// Answers through the family's responder instead of the id-derived owner.
+    pub(crate) fn with_responder(mut self, responder: Option<NodeId>) -> Self {
+        self.responder = responder;
+        self
+    }
+
+    fn send(&mut self, node: NodeId) -> Effects {
+        if node == self.local_node {
+            return self.finish(Ok(JobRouteOutcome::Local));
+        }
+        match self.request.take() {
+            Some(request) => {
+                self.state = RouteState::AwaitResponse;
+                smallvec![Effect::Net(NetEffect::JobControl(Box::new(
+                    JobControlEffect {
+                        owner: node,
+                        request
+                    }
+                )))]
+            }
+            None => self.finish(Err(JobRouteError::Unauthorized)),
         }
     }
 
@@ -68,16 +96,7 @@ impl JobRouteOperation {
             Err(JobOwnerError::Unavailable(message)) => {
                 self.finish(Err(JobRouteError::Unavailable(message)))
             }
-            Ok(owner) if owner == self.local_node => self.finish(Ok(JobRouteOutcome::Local)),
-            Ok(owner) => match self.request.take() {
-                Some(request) => {
-                    self.state = RouteState::AwaitResponse;
-                    smallvec![Effect::Net(NetEffect::JobControl(Box::new(
-                        JobControlEffect { owner, request }
-                    )))]
-                }
-                None => self.finish(Err(JobRouteError::Unauthorized)),
-            },
+            Ok(owner) => self.send(owner),
         }
     }
 }
@@ -87,6 +106,9 @@ impl Operation for JobRouteOperation {
     type Error = JobRouteError;
 
     fn start(&mut self) -> Effects {
+        if let Some(responder) = self.responder {
+            return self.send(responder);
+        }
         smallvec![read_effect(
             &DocumentSyncTarget::RealmConfig {
                 realm_id: self.realm_id,

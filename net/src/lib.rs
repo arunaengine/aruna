@@ -2576,6 +2576,10 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
         Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
+        Effect::Net(NetEffect::PolicyFetch(_)) => "policy_fetch",
+        Effect::Net(NetEffect::JobRecord(_)) => "job_record",
+        Effect::Net(NetEffect::LaunchOffer(_)) => "launch_offer",
+        Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
@@ -3403,6 +3407,37 @@ mod tests {
         );
 
         handle.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_predecessor_alpn() -> Result<()> {
+        // An old peer must fail negotiation. It may never reach a handler and
+        // decode current frames as if they were its own.
+        let (accepting, _dir) = test_net_handle().await?;
+        let dialer = Endpoint::builder(presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[77u8; 32]))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .expect("bind addr configures")
+            .bind()
+            .await
+            .expect("dialer endpoint binds");
+
+        assert!(
+            dialer
+                .connect(accepting.endpoint_addr(), b"aruna/bao/1")
+                .await
+                .is_err()
+        );
+        assert!(
+            dialer
+                .connect(accepting.endpoint_addr(), Alpn::Bao.as_bytes())
+                .await
+                .is_ok()
+        );
+
+        accepting.shutdown().await;
         Ok(())
     }
 

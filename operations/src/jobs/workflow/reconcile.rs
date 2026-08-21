@@ -98,7 +98,7 @@ impl ExternalReconciler for ComputeReconciler {
 
         let bucket = job_bucket(&adopted);
         if !bucket.is_empty() {
-            spec.resolve_outputs(&bucket);
+            spec.resolve_outputs(&bucket, adopted.owner_node_id);
         }
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
         let fence = FenceContext {
@@ -592,6 +592,7 @@ mod tests {
                 pinned_image: "alpine@sha256:digest".to_string(),
                 attempt_epoch: 0,
             },
+            None,
             unix_timestamp_millis(),
         )
         .await

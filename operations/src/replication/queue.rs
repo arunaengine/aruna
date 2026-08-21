@@ -8,13 +8,13 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE, NODE_STATE_KEYSPACE,
-    S3_BUCKET_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+    SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, BucketReplicationTarget,
-    ReferenceHandling, SyncMode, SyncRelationship, SyncState, WatchEvent, WatchEventDetail,
-    WatchEventKind, data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
+    ArunaArn, AuthContext, ReferenceHandling, SyncMode, SyncRelationship, SyncState, WatchEvent,
+    WatchEventDetail, WatchEventKind, data_watch_resource_path, sync_relationship_key,
+    sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -34,7 +34,7 @@ use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
     SourceAuthorization, SourceAuthorizationError,
 };
-use crate::driver::{DriverContext, drive, quota_marked_routing};
+use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
@@ -109,7 +109,6 @@ struct BlobReplicationJobIdentity<'a> {
 pub struct LiveReplicationContinuation {
     pub relationship_after: Option<Vec<u8>>,
     pub relationships_complete: bool,
-    pub config_after: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -908,18 +907,6 @@ fn same_endpoint(left: &ArunaArn, right: &ArunaArn) -> bool {
     left == right
 }
 
-fn filter_config(
-    mut config: BucketReplicationConfig,
-    relationship_targets: &[(NodeId, String)],
-) -> BucketReplicationConfig {
-    config.targets.retain(|legacy_target| {
-        !relationship_targets.iter().any(|(node_id, bucket)| {
-            node_id == &legacy_target.node_id && bucket == &legacy_target.bucket
-        })
-    });
-    config
-}
-
 fn validate_sync_key(
     bucket: &str,
     key: &Key,
@@ -931,65 +918,6 @@ fn validate_sync_key(
         ));
     }
     Ok(())
-}
-
-fn target_key(target: &BucketReplicationTarget) -> Result<Vec<u8>, ConversionError> {
-    Ok(postcard::to_allocvec(target)?)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn config_jobs_page(
-    local_node_id: NodeId,
-    auth_context: &AuthContext,
-    bucket: &str,
-    key: &str,
-    version_id: Ulid,
-    delete_marker: bool,
-    config: BucketReplicationConfig,
-    start: Option<&[u8]>,
-    limit: usize,
-) -> Result<(Vec<BlobReplicationJobRecord>, Option<Vec<u8>>), ConversionError> {
-    let mut targets = config
-        .targets
-        .into_iter()
-        .map(|target| target_key(&target).map(|key| (key, target)))
-        .collect::<Result<Vec<_>, _>>()?;
-    targets.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-    targets.dedup_by(|left, right| left.0 == right.0);
-    let now_ms = unix_timestamp_millis();
-    let mut jobs = Vec::with_capacity(limit);
-    let mut last_key = None;
-    for (cursor_key, target) in targets {
-        if start.is_some_and(|after| cursor_key.as_slice() <= after) {
-            continue;
-        }
-        if target.node_id == local_node_id || (delete_marker && !target.replicate_delete_markers) {
-            continue;
-        }
-        if jobs.len() == limit {
-            return Ok((jobs, Some(last_key.unwrap_or(cursor_key))));
-        }
-        jobs.push(
-            BlobReplicationJobRecord::new(
-                ReplicateScopeInput {
-                    bucket: bucket.to_string(),
-                    target: ReplicateScopeTarget::Version {
-                        key: key.to_string(),
-                        version_id,
-                    },
-                    target_node_id: target.node_id,
-                    auth_context: auth_context.clone(),
-                    replicate_delete_markers: target.replicate_delete_markers,
-                    mode: ReplicationMode::Live,
-                },
-                Some(delete_marker),
-                now_ms,
-            )
-            .with_writer_auth(auth_context.clone()),
-        );
-        last_key = Some(cursor_key);
-    }
-    Ok((jobs, None))
 }
 
 pub async fn restore_blob_replication_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
@@ -1381,7 +1309,16 @@ async fn process_blob_replication_job(
         }
         Err(error) => return Err(error.to_string()),
     };
+    // Reference materialization writes real bytes on this node, so the job
+    // carries this node's destination facts; a node mid-transition refuses.
+    let gate = match gate_context(context, job.input.auth_context.realm_id, now_ms()).await {
+        Ok(gate) => gate,
+        Err(error) => return Err(error.to_string()),
+    };
     let mut operation = ReplicateScopeOperation::new(job.input.clone()).with_routing(routing);
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
     let mut watch_group_id = None;
     let mut relationship = if let Some(relationship_id) = job.relationship_id {
         let Some(relationship) = stored_relationship else {
@@ -1707,18 +1644,6 @@ async fn process_live_obligations(
         relationship_work = relationship_work.saturating_add(page.values.len());
         relationship_cache.insert(bucket, page);
     }
-    let mut config_cache = HashMap::new();
-    for (_, obligation) in &obligations {
-        if obligation.origin.is_none()
-            && obligation.reference_advance.is_none()
-            && !config_cache.contains_key(&obligation.bucket)
-        {
-            config_cache.insert(
-                obligation.bucket.clone(),
-                read_bucket_replication_config(&context.storage_handle, &obligation.bucket).await?,
-            );
-        }
-    }
     let mut result = LiveReplicationRepairResult {
         has_more,
         ..Default::default()
@@ -1741,11 +1666,7 @@ async fn process_live_obligations(
             result.has_more = true;
             continue;
         }
-        let config = config_cache
-            .get(&obligation.bucket)
-            .and_then(|config| config.as_ref());
-        let write =
-            write_live_jobs(&context.storage_handle, &obligation, relationships, config).await?;
+        let write = write_live_jobs(&context.storage_handle, &obligation, relationships).await?;
         if !write.progressed {
             result.has_more = true;
             continue;
@@ -1807,29 +1728,6 @@ async fn read_live_obligations(
     }
 }
 
-async fn read_bucket_replication_config(
-    storage: &StorageHandle,
-    bucket: &str,
-) -> Result<Option<BucketReplicationConfig>, BlobReplicationQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(BucketInfo::from_bytes(value.as_ref())?.replication),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
 fn continuation_newer(
     candidate: &LiveReplicationContinuation,
     current: &LiveReplicationContinuation,
@@ -1838,11 +1736,7 @@ fn continuation_newer(
         return candidate.relationships_complete;
     }
     if candidate.relationships_complete {
-        return match (&candidate.config_after, &current.config_after) {
-            (Some(candidate), Some(current)) => candidate > current,
-            (Some(_), None) => true,
-            (None, Some(_)) | (None, None) => false,
-        };
+        return false;
     }
     match (&candidate.relationship_after, &current.relationship_after) {
         (Some(candidate), Some(current)) => candidate > current,
@@ -2004,7 +1898,6 @@ async fn write_live_jobs(
     storage: &StorageHandle,
     obligation: &LiveReplicationObligationRecord,
     relationships: Option<&RelationshipPage>,
-    config: Option<&BucketReplicationConfig>,
 ) -> Result<LiveRepairWrite, BlobReplicationQueueError> {
     if obligation
         .origin
@@ -2037,7 +1930,6 @@ async fn write_live_jobs(
     }
     let mut cursor = obligation.continuation.clone().unwrap_or_default();
     let mut relationship_jobs = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
-    let mut relationship_targets = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
     if !cursor.relationships_complete {
         let Some(page) = relationships else {
             return Ok(LiveRepairWrite {
@@ -2064,10 +1956,6 @@ async fn write_live_jobs(
             {
                 continue;
             }
-            let target = relationship
-                .target
-                .bucket()
-                .map(|bucket| (relationship.target.node_id, bucket.to_string()));
             if let Some(job) = relationship_job(
                 obligation.local_node_id,
                 RelationshipJobTarget {
@@ -2094,9 +1982,6 @@ async fn write_live_jobs(
                     break;
                 }
                 relationship_jobs.push(job);
-                if let Some(target) = target {
-                    relationship_targets.push(target);
-                }
                 if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
                     complete = index + 1 == page.values.len() && page.next.is_none();
                     break;
@@ -2119,37 +2004,9 @@ async fn write_live_jobs(
             cursor.relationships_complete = true;
         } else {
             cursor.relationships_complete = false;
-            cursor.config_after = None;
         }
     }
-    let mut continuation = (!cursor.relationships_complete).then(|| cursor.clone());
-    if cursor.relationships_complete
-        && obligation.origin.is_none()
-        && obligation.reference_advance.is_none()
-        && let Some(config) = config
-    {
-        let config = filter_config(config.clone(), &relationship_targets);
-        let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(relationship_jobs.len());
-        let (legacy, next_config) = config_jobs_page(
-            obligation.local_node_id,
-            &obligation.auth_context,
-            &obligation.bucket,
-            &obligation.key,
-            obligation.version_id,
-            obligation.delete_marker,
-            config,
-            cursor.config_after.as_deref(),
-            available,
-        )?;
-        relationship_jobs.extend(legacy);
-        if let Some(next_config) = next_config {
-            cursor.config_after = Some(next_config);
-            continuation = Some(cursor);
-        } else {
-            cursor.config_after = None;
-            continuation = None;
-        }
-    }
+    let continuation = (!cursor.relationships_complete).then_some(cursor);
     let jobs = relationship_jobs;
     if jobs.is_empty() {
         return Ok(LiveRepairWrite {
@@ -2741,43 +2598,6 @@ fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
 }
 
 #[cfg(test)]
-fn live_replication_jobs_from_config(
-    local_node_id: NodeId,
-    auth_context: &AuthContext,
-    bucket: &str,
-    key: &str,
-    version_id: Ulid,
-    delete_marker: bool,
-    config: BucketReplicationConfig,
-) -> Vec<BlobReplicationJobRecord> {
-    let now_ms = unix_timestamp_millis();
-    config
-        .targets
-        .into_iter()
-        .filter(|target| target.node_id != local_node_id)
-        .filter(|target| !delete_marker || target.replicate_delete_markers)
-        .map(|target| {
-            BlobReplicationJobRecord::new(
-                ReplicateScopeInput {
-                    bucket: bucket.to_string(),
-                    target: ReplicateScopeTarget::Version {
-                        key: key.to_string(),
-                        version_id,
-                    },
-                    target_node_id: target.node_id,
-                    auth_context: auth_context.clone(),
-                    replicate_delete_markers: target.replicate_delete_markers,
-                    mode: ReplicationMode::Live,
-                },
-                Some(delete_marker),
-                now_ms,
-            )
-            .with_writer_auth(auth_context.clone())
-        })
-        .collect()
-}
-
-#[cfg(test)]
 async fn read_relationships(
     storage: &StorageHandle,
     bucket: &str,
@@ -2827,10 +2647,10 @@ mod tests {
     };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
-        Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget, Group,
-        GroupAuthorizationDocument, PathRestriction, Permission, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, ReferenceHandling, SyncStatusSnapshot, VersionKey,
-        blob_object_permission_path, sync_relationship_key,
+        Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, Group, GroupAuthorizationDocument,
+        PathRestriction, Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        ReferenceHandling, SyncStatusSnapshot, VersionKey, blob_object_permission_path,
+        sync_relationship_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -2948,8 +2768,9 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: user(),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -3048,54 +2869,6 @@ mod tests {
             document.to_bytes(&actor).unwrap(),
         )
         .await;
-    }
-
-    async fn write_replication_config(storage: &StorageHandle, bucket: &str) {
-        let config = BucketReplicationConfig {
-            targets: vec![
-                BucketReplicationTarget {
-                    node_id: node(1),
-                    realm_id: realm(),
-                    bucket: bucket.to_string(),
-                    arn: "local".to_string(),
-                    replicate_delete_markers: true,
-                },
-                BucketReplicationTarget {
-                    node_id: node(2),
-                    realm_id: realm(),
-                    bucket: bucket.to_string(),
-                    arn: "remote-a".to_string(),
-                    replicate_delete_markers: false,
-                },
-                BucketReplicationTarget {
-                    node_id: node(3),
-                    realm_id: realm(),
-                    bucket: bucket.to_string(),
-                    arn: "remote-b".to_string(),
-                    replicate_delete_markers: true,
-                },
-            ],
-        };
-        let info = BucketInfo {
-            group_id: Ulid::generate(),
-            created_at: SystemTime::now(),
-            created_by: user(),
-            cors_configuration: None,
-            replication: Some(config),
-            storage_routing: Vec::new(),
-        };
-        match storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
-                value: info.to_bytes().expect("bucket info serializes").into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected replication config write event: {other:?}"),
-        }
     }
 
     fn relationship(
@@ -3631,64 +3404,10 @@ mod tests {
     }
 
     #[test]
-    fn config_cursor_stable() {
-        let config = BucketReplicationConfig {
-            targets: vec![
-                BucketReplicationTarget {
-                    node_id: node(3),
-                    realm_id: realm(),
-                    bucket: "bucket".to_string(),
-                    arn: "remote-b".to_string(),
-                    replicate_delete_markers: true,
-                },
-                BucketReplicationTarget {
-                    node_id: node(2),
-                    realm_id: realm(),
-                    bucket: "bucket".to_string(),
-                    arn: "remote-a".to_string(),
-                    replicate_delete_markers: true,
-                },
-            ],
-        };
-        let (first, after) = config_jobs_page(
-            node(1),
-            &auth_context(),
-            "bucket",
-            "key",
-            Ulid::from_parts(90, 1),
-            false,
-            config.clone(),
-            None,
-            1,
-        )
-        .unwrap();
-        let (second, end) = config_jobs_page(
-            node(1),
-            &auth_context(),
-            "bucket",
-            "key",
-            Ulid::from_parts(90, 1),
-            false,
-            config,
-            Some(after.as_deref().unwrap()),
-            1,
-        )
-        .unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_ne!(
-            first[0].input.target_node_id,
-            second[0].input.target_node_id
-        );
-        assert!(end.is_none());
-    }
-
-    #[test]
     fn continuation_order() {
         let current = LiveReplicationContinuation {
             relationship_after: Some(vec![2]),
             relationships_complete: false,
-            config_after: None,
         };
         let older = LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
@@ -4046,7 +3765,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            write_live_jobs(&storage, &obligation, Some(&relationships), None)
+            write_live_jobs(&storage, &obligation, Some(&relationships))
                 .await
                 .unwrap()
                 .queued,
@@ -4164,60 +3883,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_fallback_dedupes() {
-        let temp_dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
-        let mut relationship = relationship(5, 2, None, true);
-        relationship.created_by = UserId::local(Ulid::from_parts(9, 9), realm());
-        write_relationship(&storage, &relationship).await;
-        write_replication_config(&storage, "bucket").await;
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-
-        let result = drive(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
-                local_node_id: node(1),
-                auth_context: auth_context(),
-                bucket: "bucket".to_string(),
-                key: "key".to_string(),
-                version_id: Ulid::from_parts(33, 1),
-                delete_marker: false,
-            }),
-            &context,
-        )
-        .await
-        .expect("merged queue succeeds");
-
-        assert_eq!(result.queued, 0);
-        repair_live(&storage).await;
-        let jobs = read_jobs(&storage).await;
-        assert_eq!(jobs.len(), 2);
-        let relationship_job = jobs
-            .iter()
-            .find(|(_, job)| job.input.target_node_id == node(2))
-            .map(|(_, job)| job)
-            .unwrap();
-        assert_eq!(relationship_job.relationship_id, Some(relationship.id));
-        assert_eq!(
-            relationship_job.input.auth_context.user_id,
-            relationship.created_by
-        );
-        let legacy_job = jobs
-            .iter()
-            .find(|(_, job)| job.input.target_node_id == node(3))
-            .map(|(_, job)| job)
-            .unwrap();
-        assert_eq!(legacy_job.relationship_id, None);
-    }
-
-    #[tokio::test]
     async fn advance_filters_targets() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -4235,7 +3900,6 @@ mod tests {
         included.set_reference_handling(ReferenceHandling::Preserve);
         write_relationship(&storage, &skipped).await;
         write_relationship(&storage, &included).await;
-        write_replication_config(&storage, "bucket").await;
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -4276,68 +3940,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_version_queue_expands_targets_and_skips_disabled_delete_markers() {
-        let temp_dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
-        write_replication_config(&storage, "bucket").await;
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-
-        let result = drive(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
-                local_node_id: node(1),
-                auth_context: auth_context(),
-                bucket: "bucket".to_string(),
-                key: "key".to_string(),
-                version_id: Ulid::from_parts(3, 3),
-                delete_marker: true,
-            }),
-            &context,
-        )
-        .await
-        .expect("live queue succeeds");
-
-        assert_eq!(result.queued, 0);
-        repair_live(&storage).await;
-        let jobs = read_jobs(&storage).await;
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].1.input.target_node_id, node(3));
-        assert_eq!(jobs[0].1.source_delete_marker, Some(true));
-    }
-
-    #[tokio::test]
     async fn live_version_queue_preserves_future_retry_job() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let version_id = Ulid::from_parts(33, 3);
-        write_replication_config(&storage, "bucket").await;
-        let future_job = live_replication_jobs_from_config(
+        let link = relationship(34, 3, None, true);
+        write_relationship(&storage, &link).await;
+        let future_job = relationship_job(
             node(1),
-            &auth_context(),
-            "bucket",
-            "key",
-            version_id,
-            true,
-            BucketReplicationConfig {
-                targets: vec![BucketReplicationTarget {
-                    node_id: node(3),
-                    realm_id: realm(),
-                    bucket: "bucket".to_string(),
-                    arn: "remote-b".to_string(),
-                    replicate_delete_markers: true,
-                }],
+            RelationshipJobTarget {
+                bucket: "bucket",
+                key: "key",
+                version_id,
+                delete_marker: true,
             },
+            link,
+            None,
+            &[],
         )
-        .pop()
-        .expect("future job builds");
+        .expect("future job builds")
+        .with_writer_auth(auth_context());
         let future_job = BlobReplicationJobRecord {
             due_at_ms: unix_timestamp_millis().saturating_add(60_000),
             attempts: 1,
@@ -4770,7 +4393,8 @@ mod tests {
             .expect("storage opens");
         let version_id = Ulid::from_parts(5, 5);
         write_bucket(&storage, "bucket").await;
-        write_replication_config(&storage, "bucket").await;
+        write_relationship(&storage, &relationship(20, 2, None, true)).await;
+        write_relationship(&storage, &relationship(21, 3, None, true)).await;
         write_materialized_version(&storage, "bucket", "key", version_id).await;
         for index in 0..LIVE_REPLICATION_OBLIGATION_BATCH_SIZE {
             let key = format!("000-corrupt-live-{index:03}");
@@ -4856,7 +4480,6 @@ mod tests {
         let observed = LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
             relationships_complete: false,
-            config_after: None,
         };
 
         delete_live_obligation(&storage, key.clone(), Some(&observed))
@@ -4888,7 +4511,6 @@ mod tests {
         record.continuation = Some(LiveReplicationContinuation {
             relationship_after: Some(vec![2]),
             relationships_complete: false,
-            config_after: None,
         });
         super::write_live_obligation(&storage, &record)
             .await
@@ -4897,7 +4519,6 @@ mod tests {
         stale.continuation = Some(LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
             relationships_complete: false,
-            config_after: None,
         });
 
         super::write_live_obligation(&storage, &stale)
@@ -4966,28 +4587,17 @@ mod tests {
             .expect("storage opens");
         let version_id = Ulid::from_parts(4, 4);
         write_bucket(&storage, "bucket").await;
-        write_replication_config(&storage, "bucket").await;
+        write_relationship(&storage, &relationship(22, 2, None, true)).await;
+        write_relationship(&storage, &relationship(23, 3, None, true)).await;
         write_materialized_version(&storage, "bucket", "key", version_id).await;
         write_live_obligation(&storage, version_id).await;
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
 
-        let result = process_blob_replication_batch(&context)
-            .await
-            .expect("repair drain succeeds");
+        repair_live(&storage).await;
 
-        assert_eq!(result.processed, 2);
-        assert_eq!(result.failed, 2);
         assert!(read_obligations(&storage).await.is_empty());
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 2);
-        assert!(jobs.iter().all(|(_, job)| job.attempts == 1));
+        assert!(jobs.iter().all(|(_, job)| job.relationship_id.is_some()));
     }
 
     #[tokio::test]

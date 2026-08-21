@@ -77,6 +77,8 @@ use crate::document_sync_outbox::{
 use crate::driver::{DriverContext, drive};
 use crate::group_backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
+use crate::jobs::lifecycle::outbox::{OUTBOX_RETRY_AFTER, drain_family_outbox};
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
@@ -114,6 +116,7 @@ use crate::notifications::watch::interest::{
     WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
     refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
+use crate::placement_policy::observe_placement;
 use crate::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::queue_backoff::{queue_retry_after_ms, retry_after_ms};
 use crate::replication::queue::{
@@ -2187,6 +2190,24 @@ impl OperationsTaskHandler {
             .await;
     }
 
+    /// Replicates locally published job-family records to the other holders.
+    /// The pass is bounded, so a large backlog re-arms instead of blocking.
+    async fn drain_job_family_outbox(&self) {
+        if drain_family_outbox(self.context.as_ref()).await {
+            self.reschedule_timer(TaskKey::DrainJobFamilyOutbox, OUTBOX_RETRY_AFTER)
+                .await;
+        }
+    }
+
+    /// Runs every witness round whose persisted deadline has elapsed.
+    async fn drain_job_witness_queue(&self) {
+        let now_ms = unix_timestamp_millis();
+        if drain_witness_deadlines(self.context.as_ref(), now_ms).await {
+            self.reschedule_timer(TaskKey::DrainJobWitnessQueue, WITNESS_RETRY_AFTER)
+                .await;
+        }
+    }
+
     async fn drain_job_queue(&self) {
         if !self.jobs_runtime.is_started() {
             return;
@@ -2613,6 +2634,15 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
                 let key = TaskKey::SyncPlacements { realm_id, node_id };
+                // The same observation that reconciles shards reconciles this
+                // node's placement subject: a moved, draining or removed node
+                // stops admitting governed data and revalidates its inventory.
+                if let Err(error) =
+                    observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
+                        .await
+                {
+                    warn!(error = %error, "Placement subject reconcile failed");
+                }
                 let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
                 match outcome.status {
                     PlacementReconcileStatus::Clean => self.reset_backoff(&key),
@@ -2679,6 +2709,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::RefreshBlobHolders => {
                 self.refresh_blob_holders().await;
+            }
+            TaskKey::DrainJobFamilyOutbox => {
+                self.drain_job_family_outbox().await;
+            }
+            TaskKey::DrainJobWitnessQueue => {
+                self.drain_job_witness_queue().await;
             }
         }
     }

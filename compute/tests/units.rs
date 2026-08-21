@@ -76,6 +76,10 @@ fn status_mapping() {
     );
     assert_eq!(
         AttemptPhase::Failed { reason: "x".into() }.tes_state(),
+        TesState::ExecutorError
+    );
+    assert_eq!(
+        AttemptPhase::SystemError { reason: "x".into() }.tes_state(),
         TesState::SystemError
     );
     assert_eq!(AttemptPhase::Cancelled.tes_state(), TesState::Canceled);
@@ -83,10 +87,11 @@ fn status_mapping() {
 
 #[test]
 fn terminal_flags() {
-    // Only exit/failed/cancelled are terminal evidence.
+    // Only exit/failed/system-error/cancelled are terminal evidence.
     assert!(!AttemptPhase::Submitted.is_terminal());
     assert!(!AttemptPhase::Running.is_terminal());
     assert!(AttemptPhase::Exited { code: 1 }.is_terminal());
+    assert!(AttemptPhase::SystemError { reason: "x".into() }.is_terminal());
     assert!(AttemptPhase::Cancelled.is_terminal());
     let st = AttemptStatus {
         phase: AttemptPhase::Exited { code: 0 },

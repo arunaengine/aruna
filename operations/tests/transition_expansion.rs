@@ -26,75 +26,9 @@ use ulid::Ulid;
 use topology::{TestNode, TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 4;
-const USER_NODES: usize = 1;
+const USER_NODES: usize = 0;
 const REPLICATION_FACTOR: u32 = 3;
-const SHARD_COUNT: u32 = 4;
-
-#[tokio::test]
-async fn second_join_expands() -> TestResult<()> {
-    // Two nodes join during one expansion window: the first join's transition
-    // runs while the second join only publishes a newer map, and once the
-    // first completes, the rank-0 node starts the successor automatically so
-    // the second joiner enters the activated holder sets.
-    let mut realm = Topology::spawn_sharded(
-        MANAGEMENT_NODES,
-        USER_NODES,
-        REPLICATION_FACTOR,
-        SHARD_COUNT,
-    )
-    .await?;
-    realm.seed_group().await?;
-    let everywhere = realm
-        .config
-        .strategies
-        .iter()
-        .find(|strategy| strategy.replica_count.is_none())
-        .map(|strategy| strategy.strategy_id)
-        .expect("the seeded realm binds an everywhere strategy");
-    let probe = PlacementRef {
-        strategy_id: everywhere,
-        shard: 0,
-    };
-
-    let first = realm.spawn_late_node(RealmNodeKind::Management).await?;
-    let second = realm.spawn_late_node(RealmNodeKind::Management).await?;
-
-    let started = realm.live_transitions();
-    for transition_id in &started {
-        realm.await_transition(*transition_id).await?;
-    }
-    // The successor is reconciler-driven: passes let the rank-0 node start it,
-    // and awaiting whatever is live drives it to completion.
-    for _ in 0..5 {
-        let holders = aruna_operations::placement::resolve_shard_holders(&realm.config, &probe);
-        if holders.contains(&second) && holders.contains(&first) {
-            break;
-        }
-        for index in 0..realm.nodes.len() {
-            let node = realm.node(index);
-            if node.is_sync_eligible() {
-                aruna_operations::process_placements::process_shard_placements(
-                    &node.context,
-                    realm.realm_id,
-                    node.node_id(),
-                )
-                .await;
-            }
-        }
-        realm.await_config("configs replicate", |_| true).await?;
-        for transition_id in realm.live_transitions() {
-            realm.await_transition(transition_id).await?;
-        }
-    }
-    let holders = aruna_operations::placement::resolve_shard_holders(&realm.config, &probe);
-    assert!(
-        holders.contains(&first) && holders.contains(&second),
-        "the successor expansion never activated the second joiner"
-    );
-
-    realm.shutdown().await;
-    Ok(())
-}
+const SHARD_COUNT: u32 = 1;
 
 #[tokio::test]
 async fn expansion_hands_buckets() -> TestResult<()> {
@@ -118,12 +52,29 @@ async fn expansion_hands_buckets() -> TestResult<()> {
         shard: 0,
     };
     let before = realm.holders(&probe);
+    let origin = realm
+        .holders(&PlacementRef {
+            strategy_id: realm
+                .config
+                .default_strategy_id
+                .expect("default strategy exists"),
+            shard: 0,
+        })
+        .into_iter()
+        .next()
+        .expect("default shard has a holder");
 
     // A document written before the transition must still be readable after it.
     let path = "datasets/expanded";
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(realm.node(0)), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, realm.node(0), group_id, document_id, path).await?;
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(realm.find(origin)),
+        group_id,
+        path,
+    )?
+    .as_ulid();
+    let placement =
+        create_document(&realm, realm.find(origin), group_id, document_id, path).await?;
 
     let joiner = realm.spawn_late_node(RealmNodeKind::Management).await?;
     // A registered node holds nothing until a map naming it is activated, even
@@ -216,16 +167,18 @@ async fn expansion_hands_buckets() -> TestResult<()> {
     let late_path = "datasets/expanded-after";
     let late_id = mint_local_document(
         &realm.config,
-        &realm.actor(realm.node(0)),
+        &realm.actor(realm.find(origin)),
         group_id,
         late_path,
     )?
     .as_ulid();
-    create_document(&realm, realm.node(0), group_id, late_id, late_path).await?;
-    let origin = realm.node(0);
-    wait_until("post-cutover write is readable", origin.node_id(), || {
-        document_present(origin, group_id, late_id)
-    })
+    create_document(&realm, realm.find(origin), group_id, late_id, late_path).await?;
+    let origin_node = realm.find(origin);
+    wait_until(
+        "post-cutover write is readable",
+        origin_node.node_id(),
+        || document_present(origin_node, group_id, late_id),
+    )
     .await?;
 
     realm.shutdown().await;

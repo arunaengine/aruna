@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -10,9 +10,10 @@ use aruna_core::compute::{
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobError, JobRecord, OutputDestination, OutputObject, OutputSelection,
-    PathRestriction, Permission, UserAccess, WorkspaceMode, blob_bucket_permission_path,
+    AttemptControl, AuthContext, BackendLocation, BucketInfo, CollisionPolicy, ExecutionSpec,
+    InputMode, InputSelection, InputSource, JobError, JobInputFact, JobRecord,
+    MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection, PathRestriction,
+    Permission, PlacementPolicyRef, UserAccess, WorkspaceMode, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
     workspace_credential_id,
 };
@@ -23,20 +24,32 @@ use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
+use crate::driver::{
+    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
+    quota_marked_routing, routing_snapshot,
+};
 use crate::get_realm_config::GetRealmConfigOperation;
+use crate::jobs::store::reserve_output_commits;
+use crate::replication::protocol::ReplicationMode;
+use crate::replication::version_replication::{
+    ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
+    SourceAuthorizationError,
+};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
+use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::delete_object::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
-use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::put_object::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
-const MAX_OUTPUT_MANIFEST_OBJECTS: usize = 10_000;
 
 /// Minted workspace S3 credential handed to the container.
 pub struct WorkspaceCredential {
@@ -132,8 +145,9 @@ pub async fn ensure_workspace_bucket(
         created_at: SystemTime::now(),
         created_by: record.created_by,
         cors_configuration: None,
-        replication: None,
         storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
     };
     match Box::pin(drive(
         CreateBucketOperation::new(bucket.to_string(), bucket_info),
@@ -468,6 +482,8 @@ pub async fn load_inputs(
     Ok(files)
 }
 
+/// Export every declared file output under one write-ahead commit reservation, so
+/// an interrupted capture replays into the same versions instead of new ones.
 pub async fn capture_outputs(
     context: &DriverContext,
     backend: &Arc<dyn ExecutorBackend>,
@@ -476,18 +492,118 @@ pub async fn capture_outputs(
     record: &JobRecord,
     node_id: NodeId,
 ) -> Result<Vec<OutputObject>, JobError> {
-    let mut outputs = Vec::with_capacity(spec.file_outputs.len());
+    let mut selections = Vec::with_capacity(spec.file_outputs.len());
     for declared in &spec.file_outputs {
-        for output in resolve_output(backend, fence, declared).await? {
-            outputs.push(
-                Box::pin(put_file_output(
-                    context, backend, fence, spec, record, node_id, &output,
-                ))
-                .await?,
-            );
-        }
+        selections.extend(resolve_output(backend, fence, declared).await?);
+    }
+    if selections.len() > MAX_EXECUTION_OUTPUTS {
+        return Err(JobError::permanent(format!(
+            "output manifest exceeds {MAX_EXECUTION_OUTPUTS} objects"
+        )));
+    }
+    let destinations: Vec<(NodeId, String, String)> = selections
+        .iter()
+        .map(destination_of)
+        .collect::<Result<_, _>>()?;
+    let control = reserve_output_commits(&context.storage_handle, record.job_id, &destinations)
+        .await
+        .map_err(|error| {
+            JobError::retryable(format!("output commit reservation failed: {error}"))
+        })?;
+    if control.attempt_epoch != fence.attempt_epoch {
+        return Err(JobError::retryable(
+            "attempt fence moved during output capture",
+        ));
+    }
+    let reserved: HashMap<(NodeId, &str, &str), Ulid> = control
+        .output_commits
+        .iter()
+        .map(|commit| {
+            (
+                (commit.node_id, commit.bucket.as_str(), commit.key.as_str()),
+                commit.version_id,
+            )
+        })
+        .collect();
+    // Plan section 10: an output inherits the union of its inputs' refs and the
+    // destination default, so a result can never be less constrained than what
+    // produced it.
+    let inherited = Box::pin(staged_input_policies(context, spec, record)).await?;
+    let mut outputs = Vec::with_capacity(selections.len());
+    for (selection, (destination_node_id, bucket, key)) in selections.iter().zip(&destinations) {
+        let Some(version_id) = reserved
+            .get(&(*destination_node_id, bucket.as_str(), key.as_str()))
+            .copied()
+        else {
+            return Err(JobError::retryable("output commit reservation lost"));
+        };
+        outputs.push(
+            Box::pin(put_file_output(
+                context,
+                backend,
+                fence,
+                spec,
+                record,
+                node_id,
+                selection,
+                version_id,
+                control.execution_id,
+                &inherited,
+            ))
+            .await?,
+        );
     }
     Ok(outputs)
+}
+
+/// Union of the refs every staged input carries. Read from the workspace copies
+/// themselves, so a restarted capture inherits exactly what staging sealed.
+async fn staged_input_policies(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+) -> Result<Vec<PlacementPolicyRef>, JobError> {
+    let bucket = super::job_bucket(record);
+    if bucket.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut refs = Vec::new();
+    for input in &spec.inputs {
+        let head = Box::pin(drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: input.dest_key.clone(),
+                version_id: None,
+            }),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose());
+        match head {
+            Ok(Some(result)) => refs.extend(result.source_policies),
+            Ok(None)
+            | Err(
+                HeadObjectError::NoSuchKey
+                | HeadObjectError::NoSuchVersion
+                | HeadObjectError::DeleteMarker,
+            ) => {}
+            Err(error) => {
+                return Err(JobError::retryable(format!(
+                    "input policy lookup failed: {error}"
+                )));
+            }
+        }
+    }
+    PlacementPolicyRef::canonical_set(&refs)
+        .map_err(|error| JobError::permanent(format!("input policy refs invalid: {error}")))
+}
+
+fn destination_of(selection: &OutputSelection) -> Result<(NodeId, String, String), JobError> {
+    let OutputDestination::S3 { bucket, key } = &selection.destination;
+    let node_id = selection
+        .destination_node_id
+        .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
+    Ok((node_id, bucket.clone(), key.clone()))
 }
 
 /// Resolve one declared output into the concrete files to upload. A wildcard
@@ -543,6 +659,7 @@ fn expand_selection(
             Ok(OutputSelection {
                 container_path: path,
                 path_prefix: None,
+                destination_node_id: output.destination_node_id,
                 destination: OutputDestination::S3 {
                     bucket: bucket.clone(),
                     key: format!("{}/{suffix}", key.trim_end_matches('/')),
@@ -554,9 +671,9 @@ fn expand_selection(
         .collect()
 }
 
-/// Stream one declared container output into its S3 destination. When the
-/// destination already holds identical content (a retried finalize), the write
-/// is skipped after a streamed hash pass.
+/// Stream one declared container output into its S3 destination under its
+/// reserved VersionId. The write fences itself on that id, so a replayed capture
+/// resolves to the version it already created instead of writing a second one.
 #[allow(clippy::too_many_arguments)]
 async fn put_file_output(
     context: &DriverContext,
@@ -566,75 +683,57 @@ async fn put_file_output(
     record: &JobRecord,
     node_id: NodeId,
     output: &OutputSelection,
+    version_id: Ulid,
+    execution_id: Ulid,
+    inherited: &[PlacementPolicyRef],
 ) -> Result<OutputObject, JobError> {
     let OutputDestination::S3 { bucket, key } = &output.destination;
-    let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
+    let destination_node_id = output
+        .destination_node_id
+        .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
+    let remote = destination_node_id != node_id;
+    let (write_bucket, write_key) = if remote {
+        let stage_bucket = output_stage_bucket(record);
+        Box::pin(ensure_output_stage(context, spec, record, &stage_bucket)).await?;
+        (stage_bucket, version_id.to_string())
+    } else {
+        let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(|error| bucket_lookup_error("output", error))?
+            .ok_or_else(|| JobError::permanent(format!("output bucket {bucket} not found")))?;
+        if bucket_info.group_id != spec.group_id {
+            return Err(JobError::permanent(
+                "output bucket is outside the execution group",
+            ));
+        }
+        let allowed = Box::pin(drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id: record.created_by.realm_id,
+                    path_restrictions: None,
+                },
+                path: blob_object_permission_path(
+                    record.created_by.realm_id,
+                    spec.group_id,
+                    node_id,
+                    bucket,
+                    key,
+                ),
+                required_permission: Permission::WRITE,
+            }),
+            context,
+        ))
         .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| bucket_lookup_error("output", error))?
-        .ok_or_else(|| JobError::permanent(format!("output bucket {bucket} not found")))?;
-    if bucket_info.group_id != spec.group_id {
-        return Err(JobError::permanent(
-            "output bucket is outside the execution group",
-        ));
-    }
-    let allowed = Box::pin(drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: record.created_by,
-                realm_id: record.created_by.realm_id,
-                path_restrictions: None,
-            },
-            path: blob_object_permission_path(
-                record.created_by.realm_id,
-                spec.group_id,
-                node_id,
-                bucket,
-                key,
-            ),
-            required_permission: Permission::WRITE,
-        }),
-        context,
-    ))
-    .await
-    .map_err(|error| authorization_error("output", error))?;
-    if !allowed {
-        return Err(JobError::permanent(format!(
-            "output {bucket}/{key} access denied"
-        )));
-    }
-
-    let existing = match Box::pin(drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id: None,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    {
-        Ok(Some(result)) => result.location,
-        Ok(None)
-        | Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        ) => None,
-        Err(error) => {
-            return Err(JobError::retryable(format!(
-                "output destination lookup failed: {error}"
+        .map_err(|error| authorization_error("output", error))?;
+        if !allowed {
+            return Err(JobError::permanent(format!(
+                "output {bucket}/{key} access denied"
             )));
         }
+        (bucket.clone(), key.clone())
     };
-    if let Some(location) = &existing {
-        let (size, digest) = hash_output(backend, fence, &output.container_path).await?;
-        if location.blob_size == size && location.get_blake3() == Some(digest.as_bytes().as_slice())
-        {
-            return Ok(output_object(output, bucket, key, size, &digest));
-        }
-    }
 
     let realm_config = Box::pin(drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
@@ -649,85 +748,242 @@ async fn put_file_output(
         .await
         .map_err(|error| output_read_error(&error))?;
     let size = fetched.size;
-    let hasher = Arc::new(std::sync::Mutex::new(blake3::Hasher::new()));
     let stream_error = Arc::new(std::sync::Mutex::new(None));
-    let body_hasher = hasher.clone();
     let body_error = stream_error.clone();
-    let body = BackendStream::new(fetched.chunks.map(move |chunk| match chunk {
-        Ok(chunk) => {
-            if let Ok(mut hasher) = body_hasher.lock() {
-                hasher.update(&chunk);
-            }
-            Ok(chunk)
-        }
-        Err(error) => {
+    let body = BackendStream::new(fetched.chunks.map(move |chunk| {
+        chunk.map_err(|error| {
             if let Ok(mut slot) = body_error.lock() {
                 *slot = Some(error.clone());
             }
-            Err(std::io::Error::other(error))
-        }
+            std::io::Error::other(error)
+        })
     }));
-    let routing = routing_snapshot(context, spec.group_id, bucket)
+    let routing = routing_snapshot(context, spec.group_id, &write_bucket)
         .await
         .map_err(|error| routing_error("output write", error))?;
-    Box::pin(drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: record.created_by,
+    let gate = gate_context(context, record.created_by.realm_id, now_ms())
+        .await
+        .map_err(|error| gate_error("output write", error))?;
+    if gate.as_ref().is_some_and(|gate| !gate.admitting) {
+        return Err(gate_stopped("output write"));
+    }
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: record.created_by,
+        group_id: spec.group_id,
+        realm_id: record.created_by.realm_id,
+        node_id,
+        request: PutObjectInput {
+            bucket: write_bucket.clone(),
+            key: write_key.clone(),
+            content_length: Some(size),
+            body: Some(body),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: Some(version_id),
+        quota_ceiling,
+        routing,
+    })
+    .with_inherited_policies(inherited.to_vec());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let result = Box::pin(drive(operation, context))
+        .await
+        .and_then(|result| result.transpose())
+        // A failure caused by the container-side stream keeps its own
+        // retryable/permanent classification instead of the put's.
+        .map_err(
+            |error| match stream_error.lock().ok().and_then(|mut e| e.take()) {
+                Some(backend_error) => output_read_error(&backend_error),
+                None => put_object_error("output write", error),
+            },
+        )?
+        .ok_or_else(|| JobError::retryable("output write returned no version"))?;
+    if remote {
+        Box::pin(replicate_output(
+            context,
+            spec,
+            record,
+            &write_bucket,
+            &write_key,
+            result.version_id,
+            output,
+        ))
+        .await?;
+        Box::pin(cleanup_output_stage(
+            context,
+            spec,
+            record,
+            &write_bucket,
+            &write_key,
+            result.version_id,
+        ))
+        .await?;
+    }
+    Ok(output_object(
+        output,
+        destination_node_id,
+        bucket,
+        key,
+        &result,
+        execution_id,
+    ))
+}
+
+fn output_stage_bucket(record: &JobRecord) -> String {
+    format!("out-{}", record.job_id.to_string().to_lowercase())
+}
+
+async fn ensure_output_stage(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    bucket: &str,
+) -> Result<(), JobError> {
+    let info = BucketInfo {
+        group_id: spec.group_id,
+        created_at: SystemTime::now(),
+        created_by: record.created_by,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+    };
+    match Box::pin(drive(
+        CreateBucketOperation::new(bucket.to_string(), info),
+        context,
+    ))
+    .await
+    {
+        Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => Ok(()),
+        Err(error) => Err(JobError::retryable(format!(
+            "output staging bucket create failed: {error}"
+        ))),
+    }
+}
+
+async fn replicate_output(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    source_bucket: &str,
+    source_key: &str,
+    version_id: Ulid,
+    output: &OutputSelection,
+) -> Result<(), JobError> {
+    let destination_node_id = output
+        .destination_node_id
+        .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
+    let OutputDestination::S3 { bucket, key } = &output.destination;
+    let auth = AuthContext {
+        user_id: record.created_by,
+        realm_id: record.created_by.realm_id,
+        path_restrictions: None,
+    };
+    let source =
+        SourceAuthorization::load(context, auth.clone(), spec.group_id, record.owner_node_id)
+            .await
+            .map_err(|error| match error {
+                SourceAuthorizationError::Denied => {
+                    JobError::permanent("output staging read access denied")
+                }
+                SourceAuthorizationError::Unavailable(error) => {
+                    JobError::retryable(format!("output staging authorization failed: {error}"))
+                }
+            })?;
+    let routing = quota_marked_routing(context)
+        .await
+        .map_err(|error| routing_error("output copy", error))?;
+    let operation = ReplicateScopeOperation::new(ReplicateScopeInput {
+        bucket: source_bucket.to_string(),
+        target: ReplicateScopeTarget::Version {
+            key: source_key.to_string(),
+            version_id,
+        },
+        target_node_id: destination_node_id,
+        auth_context: auth.clone(),
+        replicate_delete_markers: false,
+        mode: ReplicationMode::OnDemand,
+    })
+    .with_routing(routing)
+    .with_source_authorization(source)
+    .with_destination(bucket.clone(), key.clone(), record.owner_node_id, auth);
+    let result = Box::pin(drive(operation, context))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| output_replication_error(error.to_string()))?
+        .ok_or_else(|| JobError::retryable("output copy returned no result"))?;
+    if result.failed > 0 || result.replicated == 0 && result.skipped == 0 {
+        return Err(output_replication_error(
+            result
+                .last_error
+                .unwrap_or_else(|| "output copy made no progress".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+async fn cleanup_output_stage(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) -> Result<(), JobError> {
+    match Box::pin(drive(
+        DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: Some(version_id),
             group_id: spec.group_id,
             realm_id: record.created_by.realm_id,
-            node_id,
-            request: PutObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                content_length: Some(size),
-                body: Some(body),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: None,
-            quota_ceiling,
-            routing,
+            node_id: record.owner_node_id,
+            deleted_by: record.created_by,
         }),
         context,
     ))
     .await
     .and_then(|result| result.transpose())
-    // A failure caused by the container-side stream keeps its own
-    // retryable/permanent classification instead of the put's.
-    .map_err(
-        |error| match stream_error.lock().ok().and_then(|mut e| e.take()) {
-            Some(backend_error) => output_read_error(&backend_error),
-            None => put_object_error("output write", error),
-        },
-    )?;
-    let digest = hasher
-        .lock()
-        .map(|hasher| hasher.finalize())
-        .map_err(|_| JobError::retryable("output digest lost"))?;
-    Ok(output_object(output, bucket, key, size, &digest))
+    {
+        Ok(Some(_)) | Err(DeleteObjectError::NoSuchVersion) => {}
+        Ok(None) => {
+            return Err(JobError::retryable(
+                "output staging delete returned no result",
+            ));
+        }
+        Err(error) => {
+            return Err(JobError::retryable(format!(
+                "output staging delete failed: {error}"
+            )));
+        }
+    }
+    match Box::pin(drive(
+        DeleteBucketOperation::new(bucket.to_string()),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(())) | Err(DeleteBucketError::NotFound) => Ok(()),
+        Ok(None) => Err(JobError::retryable(
+            "output staging bucket delete returned no result",
+        )),
+        Err(error) => Err(JobError::retryable(format!(
+            "output staging bucket delete failed: {error}"
+        ))),
+    }
 }
 
-/// Streamed size + blake3 of one container output, for the idempotent-retry check.
-async fn hash_output(
-    backend: &Arc<dyn ExecutorBackend>,
-    fence: &FenceContext,
-    path: &str,
-) -> Result<(u64, blake3::Hash), JobError> {
-    let fetched = backend
-        .fetch_output(fence, path)
-        .await
-        .map_err(|error| output_read_error(&error))?;
-    let mut chunks = fetched.chunks;
-    let mut hasher = blake3::Hasher::new();
-    let mut size = 0u64;
-    while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|error| output_read_error(&error))?;
-        size += chunk.len() as u64;
-        hasher.update(&chunk);
+fn output_replication_error(message: String) -> JobError {
+    if message.contains("access denied") || message.contains("writer_access_denied") {
+        JobError::permanent(format!("output copy failed: {message}"))
+    } else {
+        JobError::retryable(format!("output copy failed: {message}"))
     }
-    Ok((size, hasher.finalize()))
 }
 
 fn output_read_error(error: &BackendError) -> JobError {
@@ -739,20 +995,90 @@ fn output_read_error(error: &BackendError) -> JobError {
     }
 }
 
+/// Exact identity of one written output: the version this write created and the
+/// physical execution that produced it, both read back from the stored version.
 fn output_object(
     output: &OutputSelection,
+    node_id: NodeId,
     bucket: &str,
     key: &str,
-    size: u64,
-    digest: &blake3::Hash,
+    result: &PutObjectResult,
+    execution_id: Ulid,
 ) -> OutputObject {
     OutputObject {
+        node_id,
         bucket: bucket.to_string(),
         key: key.to_string(),
+        version_id: result.version_id,
+        execution_id,
         container_path: output.container_path.clone(),
-        size,
-        digest: Some(digest.to_hex().to_string()),
+        size: result.location.blob_size,
+        digest: result.location.get_blake3().map(hex_encode),
     }
+}
+
+/// One input's bytes plus the facts the workspace write needs, from the local
+/// copy or from a remote holder.
+struct StagedSource {
+    blob: BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>,
+    location: Option<BackendLocation>,
+    size: Option<u64>,
+    source_policies: Vec<PlacementPolicyRef>,
+}
+
+impl StagedSource {
+    fn from_local(get: crate::s3::get_object::GetObjectResult) -> Self {
+        Self {
+            blob: get.blob,
+            location: get.location,
+            size: get
+                .source_metadata
+                .as_ref()
+                .map(|metadata| metadata.content_length),
+            source_policies: get.source_policies,
+        }
+    }
+}
+
+/// Stages one exact version from a legal holder. The sealed version and hash
+/// are resolved first, so a remote read can never substitute other bytes.
+async fn remote_source(
+    context: &DriverContext,
+    record: &JobRecord,
+    input: &InputSelection,
+    fact: &JobInputFact,
+) -> Result<StagedSource, JobError> {
+    let version = match &input.source {
+        InputSource::S3 { version_id, .. } => version_id
+            .as_deref()
+            .map(Ulid::from_string)
+            .transpose()
+            .map_err(|_| JobError::permanent("input version is invalid".to_string()))?,
+    };
+    if version != Some(fact.version_id) || input.source_node_id != Some(fact.source_node_id) {
+        return Err(JobError::permanent(
+            "sealed remote input facts do not match the physical input".to_string(),
+        ));
+    }
+    let staged = crate::jobs::lifecycle::stage::stage_remote_input(
+        context,
+        record,
+        input,
+        fact.version_id,
+        fact.blake3,
+    )
+    .await?;
+    if staged.size != fact.bytes {
+        return Err(JobError::permanent(
+            "staged input size differs from the sealed fact".to_string(),
+        ));
+    }
+    Ok(StagedSource {
+        blob: staged.blob,
+        location: None,
+        size: Some(fact.bytes),
+        source_policies: fact.policies.clone(),
+    })
 }
 
 async fn stage_one_input(
@@ -777,55 +1103,93 @@ async fn stage_one_input(
                 "invalid input version_id for {src_bucket}/{src_key}"
             ))
         })?;
-    let bucket_info = Box::pin(drive(
-        GetBucketInfoOperation::new(src_bucket.clone()),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| bucket_lookup_error("input", error))?
-    .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
-    let allowed = Box::pin(drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: record.created_by,
-                realm_id: record.created_by.realm_id,
-                path_restrictions: None,
-            },
-            path: blob_object_permission_path(
-                record.created_by.realm_id,
-                bucket_info.group_id,
+    let staged = if input.source_node_id.is_some_and(|source| source != node_id) {
+        // A forwarded plan has already validated the source at its ingress
+        // endpoint; only the explicit exact-version staging path is local here.
+        let fact = record
+            .input_facts
+            .iter()
+            .find(|fact| fact.destination_key == input.dest_key)
+            .ok_or_else(|| JobError::permanent("sealed input facts are missing".to_string()))?;
+        Box::pin(remote_source(context, record, input, fact)).await?
+    } else {
+        let bucket_info = Box::pin(drive(
+            GetBucketInfoOperation::new(src_bucket.clone()),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| bucket_lookup_error("input", error))?
+        .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
+        let allowed = Box::pin(drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id: record.created_by.realm_id,
+                    path_restrictions: None,
+                },
+                path: blob_object_permission_path(
+                    record.created_by.realm_id,
+                    bucket_info.group_id,
+                    node_id,
+                    src_bucket,
+                    src_key,
+                ),
+                required_permission: Permission::READ,
+            }),
+            context,
+        ))
+        .await
+        .map_err(|error| authorization_error("input", error))?;
+        if !allowed {
+            return Err(JobError::permanent(format!(
+                "input {src_bucket}/{src_key} access denied"
+            )));
+        }
+        let local = Box::pin(drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: src_bucket.clone(),
+                key: src_key.clone(),
+                version_id: version,
+                range: None,
+                group_id: bucket_info.group_id,
+                user_identity: record.created_by,
                 node_id,
-                src_bucket,
-                src_key,
-            ),
-            required_permission: Permission::READ,
-        }),
-        context,
-    ))
-    .await
-    .map_err(|error| authorization_error("input", error))?;
-    if !allowed {
-        return Err(JobError::permanent(format!(
-            "input {src_bucket}/{src_key} access denied"
-        )));
-    }
-    let get = Box::pin(drive(
-        GetObjectOperation::new(GetObjectInput {
-            bucket: src_bucket.clone(),
-            key: src_key.clone(),
-            version_id: version,
-            range: None,
-            group_id: bucket_info.group_id,
-            user_identity: record.created_by,
-            node_id,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(source_input_error)?
-    .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
+            }),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose());
+        // A target that holds no copy stages the exact sealed version from a legal
+        // holder through the managed-copy handshake instead of failing the launch.
+        match local {
+            Ok(Some(get)) => StagedSource::from_local(get),
+            Ok(None) => {
+                let fact = record
+                    .input_facts
+                    .iter()
+                    .find(|fact| fact.destination_key == input.dest_key)
+                    .ok_or_else(|| {
+                        JobError::permanent("sealed input facts are missing".to_string())
+                    })?;
+                Box::pin(remote_source(context, record, input, fact)).await?
+            }
+            Err(error) => {
+                let Some(fact) = record
+                    .input_facts
+                    .iter()
+                    .find(|fact| fact.destination_key == input.dest_key)
+                else {
+                    return Err(source_input_error(error));
+                };
+                match Box::pin(remote_source(context, record, input, fact)).await {
+                    Ok(staged) => staged,
+                    Err(_) => return Err(source_input_error(error)),
+                }
+            }
+        }
+    };
+    let get = staged;
 
     let destination = match Box::pin(drive(
         HeadObjectOperation::new(HeadObjectInput {
@@ -857,8 +1221,24 @@ async fn stage_one_input(
     ) {
         return Ok(());
     }
+    if destination.is_some() {
+        match spec.collision_policy {
+            CollisionPolicy::Reject => {
+                return Err(JobError::permanent(format!(
+                    "composition key conflict on {}",
+                    input.dest_key
+                )));
+            }
+            CollisionPolicy::KeepExisting => return Ok(()),
+            CollisionPolicy::Replace => {}
+        }
+    }
 
-    let content_length = get.location.as_ref().map(|location| location.blob_size);
+    let content_length = get
+        .location
+        .as_ref()
+        .map(|location| location.blob_size)
+        .or(get.size);
     let realm_config = Box::pin(drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
         context,
@@ -869,31 +1249,41 @@ async fn stage_one_input(
     let routing = routing_snapshot(context, spec.group_id, bucket)
         .await
         .map_err(|error| routing_error("input stage", error))?;
-    Box::pin(drive(
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: record.created_by,
-            group_id: spec.group_id,
-            realm_id: record.created_by.realm_id,
-            node_id,
-            request: PutObjectInput {
-                bucket: bucket.to_string(),
-                key: input.dest_key.clone(),
-                content_length,
-                body: Some(get.blob),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: None,
-            quota_ceiling,
-            routing,
-        }),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| put_object_error("input stage", error))?;
+    let gate = gate_context(context, record.created_by.realm_id, now_ms())
+        .await
+        .map_err(|error| gate_error("input stage", error))?;
+    if gate.as_ref().is_some_and(|gate| !gate.admitting) {
+        return Err(gate_stopped("input stage"));
+    }
+    // The staged copy carries the source version's refs: staging can only
+    // tighten what the workspace bucket already requires.
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: record.created_by,
+        group_id: spec.group_id,
+        realm_id: record.created_by.realm_id,
+        node_id,
+        request: PutObjectInput {
+            bucket: bucket.to_string(),
+            key: input.dest_key.clone(),
+            content_length,
+            body: Some(get.blob),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling,
+        routing,
+    })
+    .with_inherited_policies(get.source_policies.clone());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    Box::pin(drive(operation, context))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| put_object_error("input stage", error))?;
     Ok(())
 }
 
@@ -954,6 +1344,18 @@ fn put_object_error(scope: &str, error: PutObjectError) -> JobError {
     }
 }
 
+/// A node mid-transition admits nothing governed. That ends on its own, so the
+/// attempt parks and retries instead of failing the job.
+fn gate_error(scope: &str, error: GateContextError) -> JobError {
+    JobError::retryable(format!("{scope} destination unavailable: {error}"))
+}
+
+fn gate_stopped(scope: &str) -> JobError {
+    JobError::retryable(format!(
+        "{scope} destination is not admitting governed data"
+    ))
+}
+
 fn routing_error(scope: &str, error: RoutingInputsError) -> JobError {
     let message = format!("{scope} routing lookup failed: {error}");
     if error.storage().is_some_and(storage_retryable) {
@@ -995,18 +1397,32 @@ fn staged_content_matches(
         )
 }
 
-/// Inventory the declared output prefixes in the workspace at completion. Missing
-/// prefixes contribute nothing; no declarations produce an empty manifest.
+/// Attribute this execution's outputs under the declared prefixes. A listed key
+/// counts only when this execution durably reserved its VersionId before
+/// writing: the current head may belong to a duplicate execution or to an
+/// unrelated later write, and stamping it here would forge provenance.
 pub async fn collect_outputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     bucket: &str,
+    control: &AttemptControl,
 ) -> Result<Vec<OutputObject>, JobError> {
+    if spec.file_outputs.is_empty() && !spec.output_prefixes.is_empty() {
+        return Err(JobError::permanent(
+            "output prefixes require declared file outputs",
+        ));
+    }
     if spec.output_prefixes.is_empty() {
         return Ok(Vec::new());
     }
+    let node_id = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or_else(|| JobError::retryable("output inventory needs a node identity"))?;
     let mut outputs = Vec::new();
     let mut keys = HashSet::new();
+    let mut foreign = 0usize;
     for prefix in &spec.output_prefixes {
         let mut continuation = None;
         loop {
@@ -1027,7 +1443,19 @@ pub async fn collect_outputs(
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
             let Some(result) = result else { break };
             for object in result.objects {
-                let (size, digest) = match object.location {
+                let key = object.head.key;
+                let Some(version_id) = reserved_version(control, node_id, bucket, &key) else {
+                    foreign += 1;
+                    continue;
+                };
+                let location = Box::pin(head_version(context, bucket, &key, version_id))
+                    .await?
+                    .ok_or_else(|| {
+                        JobError::permanent(format!(
+                            "reserved output {bucket}/{key} version {version_id} is absent"
+                        ))
+                    })?;
+                let (size, digest) = match location {
                     Some(location) => (location.blob_size, location.get_blake3().map(hex_encode)),
                     None => (0, None),
                 };
@@ -1035,8 +1463,11 @@ pub async fn collect_outputs(
                     &mut outputs,
                     &mut keys,
                     OutputObject {
+                        node_id,
                         bucket: bucket.to_string(),
-                        key: object.head.key,
+                        key,
+                        version_id,
+                        execution_id: control.execution_id,
                         container_path: String::new(),
                         size,
                         digest,
@@ -1049,7 +1480,66 @@ pub async fn collect_outputs(
             }
         }
     }
+    if foreign > 0 {
+        return Err(JobError::permanent(format!(
+            "output prefix inventory contains {foreign} unreserved objects"
+        )));
+    }
     Ok(outputs)
+}
+
+/// Version this execution reserved for `bucket`/`key` before writing, or `None`
+/// when the object under that key was produced by another writer. This is the
+/// only thing that attributes a workspace object to an execution.
+fn reserved_version(
+    control: &AttemptControl,
+    node_id: NodeId,
+    bucket: &str,
+    key: &str,
+) -> Option<Ulid> {
+    control
+        .output_commits
+        .iter()
+        .find(|commit| commit.node_id == node_id && commit.bucket == bucket && commit.key == key)
+        .map(|commit| commit.version_id)
+}
+
+/// Stored location of one reserved output version, or `None` when that exact
+/// version does not exist. The head is read by VersionId, never by current
+/// head, so a concurrent write cannot substitute its own bytes here.
+async fn head_version(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) -> Result<Option<Option<BackendLocation>>, JobError> {
+    match Box::pin(drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: Some(version_id),
+        }),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(result)) => match result.version_id {
+            Some(found) if found == version_id => Ok(Some(result.location)),
+            _ => Err(JobError::permanent(format!(
+                "output {bucket}/{key} does not carry reserved version {version_id}"
+            ))),
+        },
+        Ok(None)
+        | Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        ) => Ok(None),
+        Err(error) => Err(JobError::retryable(format!(
+            "output version lookup failed: {error}"
+        ))),
+    }
 }
 
 /// Fold the exported manifest into the inventoried one under the same keyed limit
@@ -1059,13 +1549,15 @@ pub(super) fn merge_outputs(
     inventoried: Vec<OutputObject>,
     captured: Vec<OutputObject>,
 ) -> Result<Vec<OutputObject>, JobError> {
-    let exported: HashSet<(&str, &str)> = captured
+    let exported: HashSet<(NodeId, &str, &str)> = captured
         .iter()
-        .map(|output| (output.bucket.as_str(), output.key.as_str()))
+        .map(|output| (output.node_id, output.bucket.as_str(), output.key.as_str()))
         .collect();
     let retained: Vec<OutputObject> = inventoried
         .into_iter()
-        .filter(|output| !exported.contains(&(output.bucket.as_str(), output.key.as_str())))
+        .filter(|output| {
+            !exported.contains(&(output.node_id, output.bucket.as_str(), output.key.as_str()))
+        })
         .collect();
 
     let mut outputs = Vec::new();
@@ -1078,15 +1570,15 @@ pub(super) fn merge_outputs(
 
 fn insert_output(
     outputs: &mut Vec<OutputObject>,
-    keys: &mut HashSet<(String, String)>,
+    keys: &mut HashSet<(NodeId, String, String)>,
     output: OutputObject,
 ) -> Result<(), JobError> {
-    if !keys.insert((output.bucket.clone(), output.key.clone())) {
+    if !keys.insert((output.node_id, output.bucket.clone(), output.key.clone())) {
         return Ok(());
     }
-    if outputs.len() >= MAX_OUTPUT_MANIFEST_OBJECTS {
+    if outputs.len() >= MAX_EXECUTION_OUTPUTS {
         return Err(JobError::permanent(format!(
-            "output manifest exceeds {MAX_OUTPUT_MANIFEST_OBJECTS} objects"
+            "output manifest exceeds {MAX_EXECUTION_OUTPUTS} objects"
         )));
     }
     outputs.push(output);
@@ -1110,7 +1602,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, JobErrorKind, JobId, JobPayload,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        OutputCommitIntent, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -1137,13 +1629,17 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes,
+            collision_policy: Default::default(),
         }
     }
 
     fn output(key: &str) -> OutputObject {
         OutputObject {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
             bucket: "workspace".to_string(),
             key: key.to_string(),
+            version_id: Ulid::generate(),
+            execution_id: Ulid::from_bytes([9; 16]),
             container_path: key.to_string(),
             size: 0,
             digest: None,
@@ -1216,11 +1712,107 @@ mod tests {
         };
 
         assert!(
-            collect_outputs(&context, &spec(Vec::new()), "workspace")
-                .await
-                .unwrap()
-                .is_empty()
+            collect_outputs(
+                &context,
+                &spec(Vec::new()),
+                "workspace",
+                &control(Vec::new())
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn prefix_only_rejected() {
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let error = collect_outputs(
+            &context,
+            &spec(vec!["reports/".to_string()]),
+            "workspace",
+            &control(Vec::new()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, JobErrorKind::Permanent);
+        assert_eq!(
+            error.message,
+            "output prefixes require declared file outputs"
+        );
+    }
+
+    fn control(output_commits: Vec<OutputCommitIntent>) -> AttemptControl {
+        AttemptControl {
+            attempt_epoch: 1,
+            execution_id: Ulid::from_bytes([9; 16]),
+            controller_generation: 1,
+            bound_token: None,
+            tombstone_ref: None,
+            output_commits,
+            output_record: None,
+        }
+    }
+
+    #[test]
+    fn attributes_reserved_only() {
+        // A duplicate execution's head under the same key, an unrelated later
+        // write, and another bucket all stay unattributed.
+        let version = Ulid::from_bytes([5; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let reserved = control(vec![OutputCommitIntent {
+            node_id,
+            bucket: "workspace".to_string(),
+            key: "reports/a.txt".to_string(),
+            version_id: version,
+        }]);
+
+        assert_eq!(
+            reserved_version(&reserved, node_id, "workspace", "reports/a.txt"),
+            Some(version)
+        );
+        assert_eq!(
+            reserved_version(&reserved, node_id, "workspace", "reports/b.txt"),
+            None
+        );
+        assert_eq!(
+            reserved_version(&reserved, node_id, "other", "reports/a.txt"),
+            None
+        );
+        assert_eq!(
+            reserved_version(&control(Vec::new()), node_id, "workspace", "reports/a.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicates_keep_versions() {
+        // Two executions writing one key reserve two versions, so neither can
+        // be attributed to the other.
+        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let destinations = vec![(
+            node_id,
+            "workspace".to_string(),
+            "reports/a.txt".to_string(),
+        )];
+        let mut first = control(Vec::new());
+        let mut second = control(Vec::new());
+        second.execution_id = Ulid::from_bytes([10; 16]);
+        first.reserve_outputs(&destinations, Ulid::generate);
+        second.reserve_outputs(&destinations, Ulid::generate);
+
+        let left = reserved_version(&first, node_id, "workspace", "reports/a.txt").unwrap();
+        let right = reserved_version(&second, node_id, "workspace", "reports/a.txt").unwrap();
+        assert_ne!(left, right);
     }
 
     struct CredentialFixture {
@@ -1545,13 +2137,13 @@ mod tests {
 
     #[test]
     fn merge_enforces_limit() {
-        let inventoried: Vec<_> = (0..MAX_OUTPUT_MANIFEST_OBJECTS)
+        let inventoried: Vec<_> = (0..MAX_EXECUTION_OUTPUTS)
             .map(|index| output(&index.to_string()))
             .collect();
 
         // A duplicate is absorbed, so a full inventory still merges.
         let merged = merge_outputs(inventoried.clone(), vec![output("0")]).unwrap();
-        assert_eq!(merged.len(), MAX_OUTPUT_MANIFEST_OBJECTS);
+        assert_eq!(merged.len(), MAX_EXECUTION_OUTPUTS);
 
         let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
@@ -1561,6 +2153,7 @@ mod tests {
         OutputSelection {
             container_path: pattern.to_string(),
             path_prefix: Some("/out".to_string()),
+            destination_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
             destination: OutputDestination::S3 {
                 bucket: "dest".to_string(),
                 key: "results/".to_string(),
@@ -1631,12 +2224,12 @@ mod tests {
     fn output_limit_errors() {
         let mut outputs = Vec::new();
         let mut keys = HashSet::new();
-        for index in 0..MAX_OUTPUT_MANIFEST_OBJECTS {
+        for index in 0..MAX_EXECUTION_OUTPUTS {
             insert_output(&mut outputs, &mut keys, output(&index.to_string())).unwrap();
         }
         insert_output(&mut outputs, &mut keys, output("0")).unwrap();
         let error = insert_output(&mut outputs, &mut keys, output("overflow")).unwrap_err();
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
-        assert_eq!(outputs.len(), MAX_OUTPUT_MANIFEST_OBJECTS);
+        assert_eq!(outputs.len(), MAX_EXECUTION_OUTPUTS);
     }
 }

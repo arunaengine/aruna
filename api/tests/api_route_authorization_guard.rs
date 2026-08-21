@@ -68,6 +68,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "realm-wide counters intentionally open to every realm member",
     ),
     (
+        "job_audit.rs",
+        "get_job_audit",
+        "self-scoped: family_report and family_audit answer NotFound unless the \
+         caller is the sealed submitter of the request",
+    ),
+    (
         "jobs.rs",
         "cancel_job",
         "self-scoped: read_owned_job requires the caller to be the creator",
@@ -193,6 +199,33 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "resolve_pid",
         "public w3id landing: the authority re-checks anonymous metadata.read per \
          record and answers 302, 404, or a 410 tombstone",
+    ),
+    (
+        "placement.rs",
+        "create_placement_policy",
+        "realm-admin WRITE checked inside CreatePolicyOperation; a forwarding \
+         holder re-runs the same check under the caller's token",
+    ),
+    (
+        "placement.rs",
+        "get_placement_coverage",
+        "realm-config READ checked inside PolicyCoverageOperation",
+    ),
+    (
+        "placement.rs",
+        "get_placement_diagnostics",
+        "realm-config READ checked inside PolicyDiagnosticsOperation",
+    ),
+    (
+        "placement.rs",
+        "get_placement_policy",
+        "realm-bearer read of an immutable replicated policy document every \
+         realm node can fetch to evaluate placement",
+    ),
+    (
+        "placement.rs",
+        "resolve_placement_quarantine",
+        "realm-admin WRITE checked inside ResolveQuarantineOperation",
     ),
     (
         "rocrate_import.rs",

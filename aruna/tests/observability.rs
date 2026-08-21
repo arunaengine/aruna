@@ -982,6 +982,9 @@ async fn restart_preserves_outbox() -> TestResult<()> {
 
     let mut first = env.launch();
     first.wait_status("/readyz", StatusCode::OK).await;
+    // The initial boot publishes full usage; terminating before that converged
+    // leaves a durable retry that the measured start would legitimately replay.
+    first.wait_log("startup.recovery.complete").await;
     first.terminate().await;
 
     inject_offline_peers(&env, 2).await?;

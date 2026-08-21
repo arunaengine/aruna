@@ -333,30 +333,6 @@ impl fmt::Display for ArunaArnType {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BucketReplicationConfig {
-    pub targets: Vec<BucketReplicationTarget>,
-}
-
-impl BucketReplicationConfig {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BucketReplicationTarget {
-    pub node_id: NodeId,
-    pub realm_id: RealmId,
-    pub bucket: String,
-    pub arn: String,
-    pub replicate_delete_markers: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReplicationItemKind {
     Materialized,
     DeleteMarker,

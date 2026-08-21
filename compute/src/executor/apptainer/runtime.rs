@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use aruna_core::compute::{AttemptPhase, BackendError};
 use nix::unistd::{Pid as NixPid, setpgid, setsid};
@@ -12,6 +12,7 @@ use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use super::state::{
     ControlRecord, LaunchRecord, PayloadRecord, ProcessRecord, StatusRecord, read_json, write_json,
 };
+use crate::executor::now_ms;
 
 const LOG_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -249,16 +250,15 @@ fn configure_cgroup(launch: &LaunchRecord) -> Result<(), BackendError> {
         launch.pids_limit.to_string(),
     )
     .map_err(io_error)?;
-    if let Some(memory) = launch.memory_bytes {
-        std::fs::write(launch.cgroup.join("memory.max"), memory.to_string()).map_err(io_error)?;
-    }
-    if let Some(cores) = launch.cpu_cores {
-        let quota = u64::from(cores)
-            .checked_mul(100_000)
-            .ok_or_else(|| BackendError::InvalidSpec("CPU limit overflows".to_string()))?;
-        std::fs::write(launch.cgroup.join("cpu.max"), format!("{quota} 100000"))
-            .map_err(io_error)?;
-    }
+    std::fs::write(
+        launch.cgroup.join("memory.max"),
+        launch.memory_bytes.to_string(),
+    )
+    .map_err(io_error)?;
+    let quota = u64::from(launch.cpu_cores)
+        .checked_mul(100_000)
+        .ok_or_else(|| BackendError::InvalidSpec("CPU limit overflows".to_string()))?;
+    std::fs::write(launch.cgroup.join("cpu.max"), format!("{quota} 100000")).map_err(io_error)?;
     Ok(())
 }
 
@@ -389,15 +389,6 @@ fn remove_socket(path: &Path) -> Result<(), BackendError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error(error)),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn runtime_error(error: nix::Error) -> BackendError {

@@ -5,7 +5,7 @@ mod handle;
 mod iri_index;
 pub mod materialization_queue;
 pub mod projector;
-mod protocol;
+pub(crate) mod protocol;
 pub mod prune_queue;
 mod query_cache;
 mod queue_storage;
@@ -25,8 +25,8 @@ use tracing::warn;
 
 use crate::driver::DriverContext;
 
-pub(crate) use handle::MetadataWritePeerError;
 pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+pub(crate) use handle::{MetadataWritePeerError, transport_message_kind};
 pub use protocol::{
     MetadataAuthToken, MetadataAuthTokenError, MetadataPathWinner, PersistentIdResolution,
 };

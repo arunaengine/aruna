@@ -747,7 +747,7 @@ mod tests {
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+    use aruna_core::structs::{BucketCompletion, PlacementStrategy, RealmNodeKind};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -950,6 +950,103 @@ mod tests {
         assert_eq!(
             load_config(&context, realm_id).await.newest_map_epoch(),
             Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_starts_successor() {
+        // A second join published during an active expansion must wait, then
+        // start exactly one successor against the newest map.
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([63; 32]);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(node(1), RealmNodeKind::Management);
+        let mut expansion = strategy(7, "everywhere");
+        expansion.replica_count = None;
+        expansion.shard_count = 1;
+        document.strategies.push(expansion.clone());
+        document.default_strategy_id = Some(expansion.strategy_id);
+        assert_eq!(document.snapshot_candidate_map(), 1);
+
+        document.ensure_node(node(2), RealmNodeKind::Management);
+        document.candidate_maps.push(document.freeze_map(2));
+        let previous_id = Ulid::from_bytes([8; 16]);
+        let previous = plan_transition(
+            &document,
+            TransitionRequest {
+                transition_id: previous_id,
+                strategy_id: expansion.strategy_id,
+                buckets: Vec::new(),
+                target_map_epoch: 2,
+                limits: Default::default(),
+                created_by: node(1),
+                created_at_ms: 1,
+            },
+        )
+        .unwrap();
+        document
+            .placement_transitions
+            .push(PlacementTransition::new(previous));
+        document.ensure_node(node(3), RealmNodeKind::Management);
+        document.candidate_maps.push(document.freeze_map(3));
+        store_config(&context, &document).await;
+
+        let issuer = [node(1), node(2), node(3)]
+            .into_iter()
+            .find(|candidate| {
+                candidate.to_string() == map_publisher(&document).expect("a management issuer")
+            })
+            .expect("the issuer is a configured node");
+        assert!(!ensure_expansions(&context, realm_id, issuer, &document).await);
+        assert_eq!(
+            load_config(&context, realm_id)
+                .await
+                .placement_transitions
+                .len(),
+            1
+        );
+
+        document.placement_transitions[0]
+            .completed
+            .push(BucketCompletion {
+                bucket: 0,
+                completed_at_ms: 1,
+            });
+        let activation = document
+            .placement_activations
+            .first_mut()
+            .expect("the first map activated the bucket");
+        activation.activation_epoch = 2;
+        activation.candidate_map_epoch = 2;
+        activation.transition_id = None;
+        store_config(&context, &document).await;
+
+        assert!(ensure_expansions(&context, realm_id, issuer, &document).await);
+        let started = load_config(&context, realm_id).await;
+        let successors: Vec<_> = started
+            .placement_transitions
+            .iter()
+            .filter(|transition| transition.plan.transition_id != previous_id)
+            .collect();
+        assert_eq!(successors.len(), 1);
+        assert_eq!(successors[0].plan.target_map_epoch, 3);
+        let bucket = successors[0]
+            .plan
+            .bucket_plan(0)
+            .expect("the successor covers the expanded bucket");
+        assert_eq!(bucket.old_holders.len(), 2);
+        assert_eq!(bucket.target_holders.len(), 3);
+        assert!(bucket.target_holders.contains(&node(2)));
+        assert!(bucket.target_holders.contains(&node(3)));
+
+        assert!(!ensure_expansions(&context, realm_id, issuer, &started).await);
+        assert_eq!(
+            load_config(&context, realm_id)
+                .await
+                .placement_transitions
+                .len(),
+            2
         );
     }
 

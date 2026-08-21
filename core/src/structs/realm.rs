@@ -8,8 +8,8 @@ use crate::structs::{
     CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
     DocumentClass, FrozenStrategySelector, HandleRange, HandleRangeDirectory, JobId,
     KIND_LABEL_KEY, METADATA_HANDLE, NodePlacementEntry, PlacementActivation, PlacementBinding,
-    PlacementOverride, PlacementScope, PlacementStrategy, PlacementTransition, SHARD_SUBJECT_LEN,
-    StrategyBinding, coordinator_spans,
+    PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, PlacementTransition,
+    SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, coordinator_spans, shard_for_subject,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -163,6 +163,9 @@ pub struct RealmConfigDocument {
     pub placement_map: Vec<NodePlacementEntry>,
     pub strategies: Vec<PlacementStrategy>,
     pub default_strategy_id: Option<Ulid>,
+    /// Strategy every node derives submission-family placement from. It and its
+    /// shard count are immutable while v1 family records are retained.
+    pub job_family_strategy_id: Ulid,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
     /// Append-only bindings materialized by the reducer overlay. Divergent
@@ -176,26 +179,24 @@ pub struct RealmConfigDocument {
     pub band_pools: Vec<BandPool>,
     /// Immutable snapshots of the placement view. `placement_map` stays the
     /// edit surface; only a published map can become a holder-set input.
-    #[serde(default)]
     pub candidate_maps: Vec<CandidatePlacementMap>,
     /// One activated map epoch per `(strategy, bucket)`; the pinned input every
     /// holder resolution reads.
-    #[serde(default)]
     pub placement_activations: Vec<PlacementActivation>,
     /// Non-terminal transitions plus their reduced barrier, proof, and
     /// completion sets.
-    #[serde(default)]
     pub placement_transitions: Vec<PlacementTransition>,
     /// CEL request policies applied realm-wide (Class-1 replicated, so
     /// evaluation is local on every node).
-    #[serde(default)]
     pub request_policies: Vec<crate::request_policy::RequestPolicy>,
     /// Bearer tokens revoked realm-wide. Class-1 replicated, so every node
     /// rejects a token revoked on any other node.
-    #[serde(default)]
     pub revoked_tokens: Vec<TokenRevocation>,
     /// Highest validation/compaction time observed for the revocation set.
     pub revocation_floor: u64,
+    /// Operator knowledge the planner reads: directed transfer bandwidth and
+    /// the staleness bound of ranking telemetry.
+    pub compute: crate::structs::RealmComputeConfig,
 }
 
 /// One realm-wide bearer token revocation. The expiry is the revoked token's
@@ -460,6 +461,7 @@ impl RealmConfigDocument {
             revocation_floor: 0,
             strategies: Vec::new(),
             default_strategy_id: None,
+            job_family_strategy_id: Ulid::nil(),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
@@ -468,6 +470,7 @@ impl RealmConfigDocument {
             candidate_maps: Vec::new(),
             placement_activations: Vec::new(),
             placement_transitions: Vec::new(),
+            compute: crate::structs::RealmComputeConfig::default(),
         }
     }
 
@@ -510,7 +513,19 @@ impl RealmConfigDocument {
             affinity: Vec::new(),
             shard_count: DEFAULT_SHARD_COUNT,
         };
+        // Submission families route through their own strategy for the life of
+        // the realm, so ordinary default-strategy administration stays free
+        // while this identity and its shard count are fenced as immutable.
+        let job_family_strategy = PlacementStrategy {
+            strategy_id: Ulid::generate(),
+            name: "job-family".to_string(),
+            replica_count: Some(self.metadata_replication.default_replication_factor),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: DEFAULT_SHARD_COUNT,
+        };
         self.default_strategy_id = Some(default_strategy.strategy_id);
+        self.job_family_strategy_id = job_family_strategy.strategy_id;
         self.strategy_bindings = [
             DocumentClass::MetadataRegistry,
             DocumentClass::Admin,
@@ -523,6 +538,12 @@ impl RealmConfigDocument {
             strategy_id: everywhere_strategy.strategy_id,
         })
         .collect();
+        // Policy documents are replica-capped like ordinary data documents: a
+        // non-holder resolves their holders from the ref and fetches by id.
+        self.strategy_bindings.push(StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::PlacementPolicy),
+            strategy_id: default_strategy.strategy_id,
+        });
         // Reserve the low-band Metadata binding before grants begin. JobControl
         // bindings are per node band and appended at onboarding, never seeded.
         self.placement_bindings = vec![PlacementBinding {
@@ -534,7 +555,7 @@ impl RealmConfigDocument {
             allocated_by: None,
             allocated_at_ms: None,
         }];
-        self.strategies = vec![default_strategy, everywhere_strategy];
+        self.strategies = vec![default_strategy, everywhere_strategy, job_family_strategy];
     }
 
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
@@ -647,6 +668,68 @@ impl RealmConfigDocument {
         self.strategies
             .iter()
             .find(|strategy| strategy.strategy_id == *strategy_id)
+    }
+
+    /// The one submission-family placement every node derives. Ingress, holder,
+    /// target, fetch, and audit routes all resolve it here; a missing or
+    /// dangling family strategy is refused instead of defaulted.
+    pub fn family_placement(
+        &self,
+        submission_id: SubmissionId,
+    ) -> Result<PlacementRef, JobFamilyError> {
+        if self.job_family_strategy_id.is_nil() {
+            return Err(JobFamilyError::Unset);
+        }
+        let strategy = self
+            .strategy(&self.job_family_strategy_id)
+            .ok_or(JobFamilyError::Dangling(self.job_family_strategy_id))?;
+        Ok(PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard: shard_for_subject(&submission_id.0, strategy.shard_count),
+        })
+    }
+
+    /// Strategy a class-scoped document rides: class binding, realm binding,
+    /// then the realm default. `Err(())` marks a configured ref naming no
+    /// strategy, which fails closed instead of falling through to the next one.
+    pub fn class_strategy(
+        &self,
+        class: DocumentClass,
+    ) -> Result<Option<&PlacementStrategy>, ClassStrategyError> {
+        for scope in [BindingScope::Class(class), BindingScope::Realm] {
+            if let Some(binding) = self
+                .strategy_bindings
+                .iter()
+                .find(|binding| binding.scope == scope)
+            {
+                return self.strategy(&binding.strategy_id).map(Some).ok_or(
+                    ClassStrategyError::Dangling {
+                        strategy_id: binding.strategy_id,
+                    },
+                );
+            }
+        }
+        match self.default_strategy_id {
+            Some(id) => self
+                .strategy(&id)
+                .map(Some)
+                .ok_or(ClassStrategyError::Dangling { strategy_id: id }),
+            None => Ok(None),
+        }
+    }
+
+    /// Bucket one immutable policy document rides: its policy id hashed into
+    /// the class-bound strategy's shards. It says where the rule is replicated,
+    /// never which subjects the rule allows.
+    pub fn policy_placement(&self, policy_id: Ulid) -> Option<PlacementRef> {
+        let strategy = self
+            .class_strategy(DocumentClass::PlacementPolicy)
+            .ok()?
+            .or_else(|| self.strategies.first())?;
+        Some(PlacementRef {
+            strategy_id: strategy.strategy_id,
+            shard: shard_for_subject(&policy_id.to_bytes(), strategy.shard_count),
+        })
     }
 
     /// Eligible-node view derived from the live config: one entry per node with
@@ -854,6 +937,24 @@ impl RealmConfigDocument {
     }
 }
 
+/// A class or realm binding names a strategy the config does not define, so no
+/// class placement can be derived without inventing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ClassStrategyError {
+    #[error("strategy binding references undefined strategy {strategy_id}")]
+    Dangling { strategy_id: Ulid },
+}
+
+/// Why submission-family placement cannot be derived. Both cases refuse
+/// admission; neither ever falls back to the realm default strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum JobFamilyError {
+    #[error("realm config names no job family placement strategy")]
+    Unset,
+    #[error("job family strategy {0} is not defined in this realm")]
+    Dangling(Ulid),
+}
+
 /// Failure of the pure `JobId -> owner` derivation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum JobOwnerError {
@@ -959,9 +1060,11 @@ mod test {
         Actor, CandidatePlacementMap, DynamicDiscoveryMethod, KIND_LABEL_KEY,
         MetadataGroupReplicationOverride, MetadataPathReplicationOverride, OidcProviderConfig,
         RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, TokenRevocation, default_realm_discovery_config,
+        RealmNodeKind, SubmissionId, TokenRevocation, default_realm_discovery_config,
     };
     use ulid::Ulid;
+
+    use super::JobFamilyError;
 
     #[test]
     pub fn test_realm_auth_doc_conversion() {
@@ -1012,10 +1115,12 @@ mod test {
             request_policies: Vec::new(),
             revoked_tokens: Vec::new(),
             revocation_floor: 0,
+            compute: Default::default(),
             description: "Example Realm".to_string(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
+            job_family_strategy_id: Ulid::from_bytes([3u8; 16]),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
@@ -1042,6 +1147,93 @@ mod test {
         let config = RealmConfigDocument::new(RealmId([4u8; 32]), Vec::new(), 3);
         let mut changed = config.clone();
         changed.description = "changed".to_string();
+
+        assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
+        assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
+    }
+
+    #[test]
+    fn config_bytes_canonical() {
+        // Pins the canonical wire form. Postcard is positional, so the field
+        // occupies a fixed slot that a shorter encoding cannot satisfy.
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e550001030000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000";
+        let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
+        config.job_family_strategy_id = Ulid::from_bytes([2u8; 16]);
+
+        let bytes = postcard::to_allocvec(&config).unwrap();
+        assert_eq!(hex::encode(&bytes), ENCODED);
+        assert_eq!(RealmConfigDocument::from_bytes(&bytes).unwrap(), config);
+
+        // Dropping the field's length-prefixed slot must fail to decode.
+        let text = config.job_family_strategy_id.to_string();
+        let start = bytes
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .expect("field is encoded as canonical ulid text");
+        let mut without = bytes.clone();
+        without.drain(start - 1..start + text.len());
+        assert!(RealmConfigDocument::from_bytes(&without).is_err());
+    }
+
+    #[test]
+    fn seeds_family_strategy() {
+        // Fresh creation must select a real strategy, not the nil placeholder.
+        let mut config = RealmConfigDocument::new(RealmId([9u8; 32]), Vec::new(), 3);
+        assert!(config.job_family_strategy_id.is_nil());
+        config.seed_default_placement();
+
+        assert!(!config.job_family_strategy_id.is_nil());
+        assert!(config.strategy(&config.job_family_strategy_id).is_some());
+        assert_ne!(
+            Some(config.job_family_strategy_id),
+            config.default_strategy_id
+        );
+    }
+
+    #[test]
+    fn derives_family_placement() {
+        // Two independently built configs sharing the sealed strategy must
+        // derive one identical placement for the same submission.
+        let mut left = RealmConfigDocument::new(RealmId([10u8; 32]), Vec::new(), 3);
+        left.seed_default_placement();
+        let mut right = RealmConfigDocument::new(RealmId([11u8; 32]), Vec::new(), 5);
+        right.strategies = left.strategies.clone();
+        right.job_family_strategy_id = left.job_family_strategy_id;
+
+        let submission = SubmissionId([7u8; 32]);
+        let placement = left.family_placement(submission).unwrap();
+        assert_eq!(placement.strategy_id, left.job_family_strategy_id);
+        assert_eq!(Ok(placement), right.family_placement(submission));
+        assert_ne!(
+            placement.shard,
+            left.family_placement(SubmissionId([8u8; 32]))
+                .unwrap()
+                .shard
+        );
+    }
+
+    #[test]
+    fn refuses_unset_family() {
+        let mut config = RealmConfigDocument::new(RealmId([12u8; 32]), Vec::new(), 3);
+        let submission = SubmissionId([1u8; 32]);
+        assert_eq!(
+            config.family_placement(submission),
+            Err(JobFamilyError::Unset)
+        );
+
+        let dangling = Ulid::from_bytes([5u8; 16]);
+        config.job_family_strategy_id = dangling;
+        assert_eq!(
+            config.family_placement(submission),
+            Err(JobFamilyError::Dangling(dangling))
+        );
+    }
+
+    #[test]
+    fn digest_binds_family() {
+        let config = RealmConfigDocument::new(RealmId([12u8; 32]), Vec::new(), 3);
+        let mut changed = config.clone();
+        changed.job_family_strategy_id = Ulid::from_bytes([1u8; 16]);
 
         assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
         assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
@@ -1421,10 +1613,12 @@ mod test {
             request_policies: Vec::new(),
             revoked_tokens: Vec::new(),
             revocation_floor: 0,
+            compute: Default::default(),
             description: String::new(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
+            job_family_strategy_id: Ulid::nil(),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
@@ -1681,5 +1875,60 @@ mod test {
             .push(binding(10, 2, owner, range_id));
         assert!(config.binding_directory().resolve(first.handle).is_err());
         assert_eq!(config.binding_directory().conflicted(), 1);
+    }
+
+    #[test]
+    fn seeds_policy_binding() {
+        // Policy documents ride the replica-capped default, not the everywhere
+        // strategy, so a realm always has non-holders that must resolve by id.
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.seed_default_placement();
+        let bound = config
+            .class_strategy(crate::structs::DocumentClass::PlacementPolicy)
+            .expect("binding resolves")
+            .expect("a strategy is bound");
+        assert_eq!(Some(bound.strategy_id), config.default_strategy_id);
+        assert_eq!(bound.replica_count, Some(2));
+    }
+
+    #[test]
+    fn bucket_follows_id() {
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.seed_default_placement();
+        let first = config
+            .policy_placement(Ulid::from_bytes([1u8; 16]))
+            .expect("bucket resolves");
+        let repeat = config
+            .policy_placement(Ulid::from_bytes([1u8; 16]))
+            .expect("bucket resolves");
+        let other = config
+            .policy_placement(Ulid::from_bytes([2u8; 16]))
+            .expect("bucket resolves");
+        assert_eq!(first, repeat);
+        assert_eq!(Some(first.strategy_id), config.default_strategy_id);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn rejects_missing_compute() {
+        // Fresh format: the compute block is mandatory on decode, so bytes that
+        // stop where the predecessor record ended must not decode at all.
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            user_id: crate::UserId::new(Ulid::generate(), RealmId([7u8; 32])),
+            realm_id: RealmId([7u8; 32]),
+        };
+        let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 2);
+        let encoded = config.to_bytes(&actor).expect("config encodes");
+        let tail = postcard::to_allocvec(&config.compute).expect("compute encodes");
+        assert!(encoded.ends_with(&tail));
+
+        let truncated = &encoded[..encoded.len() - tail.len()];
+
+        assert!(RealmConfigDocument::from_bytes(truncated).is_err());
+        assert_eq!(
+            RealmConfigDocument::from_bytes(&encoded).expect("full record decodes"),
+            config
+        );
     }
 }

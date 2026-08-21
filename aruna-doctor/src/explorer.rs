@@ -2,30 +2,45 @@ use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
-    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-    GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-    SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
-    USER_ACCESS_OWNER_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE,
+    CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE,
+    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE,
+    JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
+    JOB_FAMILY_RECORD_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE,
+    JOB_RESERVATION_KEYSPACE, JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE,
+    MANAGED_COPY_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    ONBOARDING_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+    USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
+    JobFamilyId, JobRecordEnvelope, JobRecordKey, ManagedCopyKey, ManagedCopyRecord,
     MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-    MultipartUploadPart, MultipartUploadPartKey, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmId, UserAccess, VersionKey,
+    MultipartUploadPart, MultipartUploadPartKey, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
+    POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PlacementPolicyDocument, PolicyBulkIntent,
+    PolicyBulkIntentKey, PolicyBulkRun, PolicyMutationRecord, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
+use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
+use aruna_operations::jobs::records::keys::alias_family;
+use aruna_operations::jobs::records::rows::{
+    ConflictRecord, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
+};
+use aruna_operations::placement_policy::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -157,10 +172,31 @@ enum DecodedField {
     BlobLocationKey { blake3: String, backend: String },
     #[serde(rename = "version_key")]
     VersionKey { value: VersionKey },
+    #[serde(rename = "managed_copy_key")]
+    ManagedCopyKey { value: ManagedCopyKey },
     #[serde(rename = "multipart_upload_part_key")]
     MultipartUploadPartKey { value: MultipartUploadPartKey },
     #[serde(rename = "multipart_object_metadata_key")]
     MultipartObjectMetadataKey { value: MultipartObjectMetadataKey },
+    #[serde(rename = "attempt_key")]
+    AttemptKey { job_id: String, attempt_epoch: u64 },
+    #[serde(rename = "policy_cache_key")]
+    PolicyCacheKey { policy_id: String, digest: String },
+    #[serde(rename = "policy_bulk_intent_key")]
+    PolicyBulkIntentKey { operation_id: String, key: String },
+    #[serde(rename = "job_record_key")]
+    JobRecordKey { value: JsonJobRecordKey },
+    #[serde(rename = "job_conflict_key")]
+    JobConflictKey {
+        record: JsonJobRecordKey,
+        digest: String,
+    },
+    #[serde(rename = "job_alias_key")]
+    JobAliasKey { job_id: String, family: String },
+    #[serde(rename = "job_family_key")]
+    JobFamilyKey { family: String },
+    #[serde(rename = "job_explain_key")]
+    JobExplainKey { family: String, node_id: String },
     #[serde(rename = "raw")]
     Raw { hex: String },
 }
@@ -195,6 +231,73 @@ enum DecodedValue {
     },
     BlobVersion {
         data: BlobVersion,
+    },
+    ManagedCopyRecord {
+        data: ManagedCopyRecord,
+    },
+    NodeSubjectRecord {
+        data: NodeSubjectRecord,
+    },
+    JobOutputRecord {
+        data: JsonJobRecordEnvelope,
+    },
+    JobFamilyRecord {
+        data: JsonJobRecordEnvelope,
+    },
+    JobPendingRecord {
+        envelope: JsonJobRecordEnvelope,
+        need: String,
+        first_seen_ms: u64,
+        attempts: u32,
+    },
+    JobConflictRecord {
+        envelope: JsonJobRecordEnvelope,
+        retained: String,
+        observed_at_ms: u64,
+        relayed_by: Option<String>,
+    },
+    JobAliasTarget {
+        data: JsonJobRecordKey,
+    },
+    JobProjectionCache {
+        revision: u64,
+        stale: bool,
+        projected: bool,
+    },
+    JobOutboxEntry {
+        data: OutboxEntry,
+    },
+    JobReservation {
+        data: JsonJobReservation,
+    },
+    JobWitnessDeadline {
+        data: WitnessDeadline,
+    },
+    JobPlanExplain {
+        sequence: u32,
+        selected: Option<String>,
+        alternatives: usize,
+        rejected: usize,
+        overlapping: bool,
+        sealed_at_ms: u64,
+    },
+    ComputeDepartureReport {
+        data: ComputeDepartureReport,
+    },
+    PlacementPolicyDocument {
+        data: JsonPlacementPolicyDocument,
+    },
+    PolicyCacheEntry {
+        data: JsonPolicyCacheEntry,
+    },
+    PolicyMutationRecord {
+        data: PolicyMutationRecord,
+    },
+    PolicyBulkRun {
+        data: PolicyBulkRun,
+    },
+    PolicyBulkIntent {
+        data: PolicyBulkIntent,
     },
     MultipartUpload {
         data: MultipartUpload,
@@ -476,6 +579,129 @@ impl Serialize for JsonUserAccess {
         state.serialize_field("path_restrictions", &self.0.path_restrictions)?;
         state.serialize_field("issued_by", &self.0.issued_by)?;
         state.serialize_field("revoked_at", &self.0.revoked_at)?;
+        state.end()
+    }
+}
+
+/// Signed output record projection: identity, authorship and integrity only.
+/// The record body stays out of the CLI so job payloads never reach a console.
+#[derive(Debug, PartialEq)]
+struct JsonJobRecordEnvelope(JobRecordEnvelope);
+
+impl Serialize for JsonJobRecordEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JobRecordEnvelope", 5)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("published_by", &self.0.published_by.to_string())?;
+        state.serialize_field("kind", &format!("{:?}", self.0.kind()))?;
+        state.serialize_field("digest", &self.0.digest().map(hex::encode).ok())?;
+        state.serialize_field("signature", &hex::encode(self.0.signature.to_bytes()))?;
+        state.end()
+    }
+}
+
+/// The signed identity a job record is stored under, rendered as hex so one
+/// key line stays readable next to its family.
+#[derive(Debug, PartialEq, Eq)]
+struct JsonJobRecordKey(JobRecordKey);
+
+impl Serialize for JsonJobRecordKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JobRecordKey", 4)?;
+        state.serialize_field("family", &family_id_string(&self.0.family))?;
+        state.serialize_field("kind", &format!("{:?}", self.0.kind))?;
+        state.serialize_field("subject", &hex::encode(self.0.subject))?;
+        state.serialize_field("sequence", &self.0.sequence)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct JsonJobReservation(JobReservationRecord);
+
+impl Serialize for JsonJobReservation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("JobReservationRecord", 8)?;
+        state.serialize_field("execution_id", &self.0.execution_id.to_string())?;
+        state.serialize_field("job_id", &self.0.job_id.to_string())?;
+        state.serialize_field("cpu_cores", &self.0.resources.cpu_cores)?;
+        state.serialize_field("ram_bytes", &self.0.resources.ram_bytes)?;
+        state.serialize_field("disk_bytes", &self.0.resources.disk_bytes)?;
+        state.serialize_field("created_at_ms", &self.0.created_at_ms)?;
+        // The sealed site fence: a refusal to start is diagnosed from these two.
+        state.serialize_field("subject_generation", &self.0.subject_generation)?;
+        state.serialize_field("subject_digest", &hex::encode(self.0.subject_digest))?;
+        state.end()
+    }
+}
+
+/// Stable text identity of one request family: submission id and request digest.
+fn family_id_string(family: &JobFamilyId) -> String {
+    format!(
+        "{}:{}",
+        hex::encode(family.submission_id.0),
+        hex::encode(family.request_digest)
+    )
+}
+
+#[derive(Debug, PartialEq)]
+struct JsonPlacementPolicyDocument(PlacementPolicyDocument);
+
+impl Serialize for JsonPlacementPolicyDocument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PlacementPolicyDocument", 6)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("policy_id", &self.0.policy.policy_id.to_string())?;
+        state.serialize_field("name", &self.0.policy.name)?;
+        state.serialize_field("allowed", &self.0.policy.allowed)?;
+        state.serialize_field("publisher", &self.0.publication.publisher.to_string())?;
+        state.serialize_field("created_at_ms", &self.0.publication.created_at_ms)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct JsonPolicyCacheEntry(PolicyCacheEntry);
+
+impl Serialize for JsonPolicyCacheEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PolicyCacheEntry", 4)?;
+        match &self.0 {
+            PolicyCacheEntry::Verified {
+                document,
+                stored_at_ms,
+            } => {
+                state.serialize_field("kind", "verified")?;
+                state.serialize_field("stored_at_ms", stored_at_ms)?;
+                state.serialize_field("expires_at_ms", &None::<u64>)?;
+                state
+                    .serialize_field("document", &JsonPlacementPolicyDocument(document.clone()))?;
+            }
+            PolicyCacheEntry::Unavailable {
+                stored_at_ms,
+                expires_at_ms,
+            } => {
+                state.serialize_field("kind", "unavailable")?;
+                state.serialize_field("stored_at_ms", stored_at_ms)?;
+                state.serialize_field("expires_at_ms", &Some(*expires_at_ms))?;
+                state.serialize_field("document", &None::<JsonPlacementPolicyDocument>)?;
+            }
+        }
         state.end()
     }
 }
@@ -961,7 +1187,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 33] {
+fn defined_keyspaces() -> [&'static str; 52] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -972,6 +1198,7 @@ fn defined_keyspaces() -> [&'static str; 33] {
         BLOB_LOCATIONS_KEYSPACE,
         BLOB_VERSIONS_KEYSPACE,
         BUCKET_STATS_DB,
+        COMPUTE_DEPARTURE_KEYSPACE,
         CRAQLE_GRAPHS_KEYSPACE,
         CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE,
@@ -980,12 +1207,30 @@ fn defined_keyspaces() -> [&'static str; 33] {
         GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
         DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        JOB_FAMILY_ALIAS_KEYSPACE,
+        JOB_FAMILY_CONFLICT_KEYSPACE,
+        JOB_FAMILY_OUTBOX_KEYSPACE,
+        JOB_FAMILY_PENDING_KEYSPACE,
+        JOB_FAMILY_PROJECTION_KEYSPACE,
+        JOB_FAMILY_RECORD_KEYSPACE,
+        JOB_OUTPUT_RECORD_KEYSPACE,
+        JOB_PLAN_EXPLAIN_KEYSPACE,
+        JOB_RESERVATION_KEYSPACE,
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE,
+        JOB_WITNESS_DEADLINE_KEYSPACE,
+        MANAGED_COPY_KEYSPACE,
         METADATA_AUDIT_KEYSPACE,
         METADATA_DOCUMENT_INDEX_KEYSPACE,
         METADATA_HOLDERS_KEYSPACE,
         METADATA_INDEX_KEYSPACE,
         NODE_STATE_KEYSPACE,
+        NODE_SUBJECT_KEYSPACE,
         ONBOARDING_KEYSPACE,
+        PLACEMENT_POLICY_CACHE_KEYSPACE,
+        PLACEMENT_POLICY_KEYSPACE,
+        POLICY_BULK_INTENT_KEYSPACE,
+        POLICY_BULK_RUN_KEYSPACE,
+        POLICY_MUTATION_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
@@ -1226,7 +1471,30 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | API_STATE_KEYSPACE
         | DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
+        | NODE_SUBJECT_KEYSPACE
+        | COMPUTE_DEPARTURE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
+        JOB_FAMILY_RECORD_KEYSPACE | JOB_FAMILY_PENDING_KEYSPACE | JOB_FAMILY_OUTBOX_KEYSPACE => {
+            decode_record_key(key)
+        }
+        JOB_FAMILY_CONFLICT_KEYSPACE => decode_conflict_key(key),
+        JOB_FAMILY_ALIAS_KEYSPACE => decode_alias_key(key),
+        JOB_FAMILY_PROJECTION_KEYSPACE => decode_family_key(key),
+        JOB_WITNESS_DEADLINE_KEYSPACE => decode_deadline_key(key),
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE => decode_family_key(key),
+        JOB_PLAN_EXPLAIN_KEYSPACE => decode_explain_key(key),
+        JOB_RESERVATION_KEYSPACE => decode_ulid_key(key),
+        PLACEMENT_POLICY_KEYSPACE | POLICY_MUTATION_KEYSPACE | POLICY_BULK_RUN_KEYSPACE => {
+            decode_policy_id_key(keyspace_name, key)
+        }
+        PLACEMENT_POLICY_CACHE_KEYSPACE => decode_policy_cache_key(key),
+        POLICY_BULK_INTENT_KEYSPACE => PolicyBulkIntentKey::from_bytes(key)
+            .map(|value| DecodedField::PolicyBulkIntentKey {
+                operation_id: value.operation_id.to_string(),
+                key: value.key,
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        JOB_OUTPUT_RECORD_KEYSPACE => decode_attempt_key(key),
         SYNC_PLACEMENT_KEYSPACE => raw_field(key),
         S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
         S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartUploadPartKey::from_bytes(key)
@@ -1244,6 +1512,9 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
             .unwrap_or_else(|_| raw_field(key)),
         BLOB_VERSIONS_KEYSPACE => VersionKey::from_bytes(key)
             .map(|value| DecodedField::VersionKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
+        MANAGED_COPY_KEYSPACE => ManagedCopyKey::from_bytes(key)
+            .map(|value| DecodedField::ManagedCopyKey { value })
             .unwrap_or_else(|_| raw_field(key)),
         BLOB_LOCATIONS_KEYSPACE => BlobLocationKey::from_bytes(key)
             .map(|value| DecodedField::BlobLocationKey {
@@ -1286,6 +1557,125 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         BLOB_VERSIONS_KEYSPACE => decode_value_with(value, BlobVersion::from_bytes, |data| {
             DecodedValue::BlobVersion { data }
         }),
+        MANAGED_COPY_KEYSPACE => decode_value_with(value, ManagedCopyRecord::from_bytes, |data| {
+            DecodedValue::ManagedCopyRecord { data }
+        }),
+        NODE_SUBJECT_KEYSPACE => decode_value_with(value, NodeSubjectRecord::from_bytes, |data| {
+            DecodedValue::NodeSubjectRecord { data }
+        }),
+        JOB_OUTPUT_RECORD_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
+            |data| DecodedValue::JobOutputRecord {
+                data: JsonJobRecordEnvelope(data),
+            },
+        ),
+        JOB_FAMILY_RECORD_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
+            |data| DecodedValue::JobFamilyRecord {
+                data: JsonJobRecordEnvelope(data),
+            },
+        ),
+        JOB_FAMILY_PENDING_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<PendingRecord>(bytes),
+            |data| DecodedValue::JobPendingRecord {
+                envelope: JsonJobRecordEnvelope(data.envelope),
+                need: pending_need_string(data.need),
+                first_seen_ms: data.first_seen_ms,
+                attempts: data.attempts,
+            },
+        ),
+        JOB_FAMILY_CONFLICT_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<ConflictRecord>(bytes),
+            |data| DecodedValue::JobConflictRecord {
+                envelope: JsonJobRecordEnvelope(data.envelope),
+                retained: hex::encode(data.retained),
+                observed_at_ms: data.observed_at_ms,
+                relayed_by: data.relayed_by.map(|node| node.to_string()),
+            },
+        ),
+        JOB_FAMILY_ALIAS_KEYSPACE => decode_value_with(value, JobRecordKey::from_bytes, |data| {
+            DecodedValue::JobAliasTarget {
+                data: JsonJobRecordKey(data),
+            }
+        }),
+        JOB_FAMILY_PROJECTION_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<ProjectionCache>(bytes),
+            |data| DecodedValue::JobProjectionCache {
+                revision: data.revision,
+                stale: data.stale,
+                projected: data.projection.is_some(),
+            },
+        ),
+        JOB_FAMILY_OUTBOX_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<OutboxEntry>(bytes),
+            |data| DecodedValue::JobOutboxEntry { data },
+        ),
+        JOB_RESERVATION_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<JobReservationRecord>(bytes),
+            |data| DecodedValue::JobReservation {
+                data: JsonJobReservation(data),
+            },
+        ),
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE | JOB_WITNESS_DEADLINE_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<WitnessDeadline>(bytes),
+            |data| DecodedValue::JobWitnessDeadline { data },
+        ),
+        JOB_PLAN_EXPLAIN_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<WitnessExplain>(bytes),
+            |data| DecodedValue::JobPlanExplain {
+                sequence: data.sequence,
+                selected: data
+                    .plan
+                    .selected
+                    .as_ref()
+                    .map(|selection| selection.target.node_id.to_string()),
+                alternatives: data.plan.alternatives.len(),
+                rejected: data.plan.rejected.len(),
+                overlapping: data.overlapping,
+                sealed_at_ms: data.sealed_at_ms,
+            },
+        ),
+        COMPUTE_DEPARTURE_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<ComputeDepartureReport>(bytes),
+            |data| DecodedValue::ComputeDepartureReport { data },
+        ),
+        PLACEMENT_POLICY_KEYSPACE => {
+            decode_value_with(value, PlacementPolicyDocument::from_bytes, |data| {
+                DecodedValue::PlacementPolicyDocument {
+                    data: JsonPlacementPolicyDocument(data),
+                }
+            })
+        }
+        PLACEMENT_POLICY_CACHE_KEYSPACE => {
+            decode_value_with(value, PolicyCacheEntry::from_bytes, |data| {
+                DecodedValue::PolicyCacheEntry {
+                    data: JsonPolicyCacheEntry(data),
+                }
+            })
+        }
+        POLICY_MUTATION_KEYSPACE => {
+            decode_value_with(value, PolicyMutationRecord::from_bytes, |data| {
+                DecodedValue::PolicyMutationRecord { data }
+            })
+        }
+        POLICY_BULK_RUN_KEYSPACE => decode_value_with(value, PolicyBulkRun::from_bytes, |data| {
+            DecodedValue::PolicyBulkRun { data }
+        }),
+        POLICY_BULK_INTENT_KEYSPACE => {
+            decode_value_with(value, PolicyBulkIntent::from_bytes, |data| {
+                DecodedValue::PolicyBulkIntent { data }
+            })
+        }
         S3_MULTIPART_UPLOAD_KEYSPACE => {
             decode_value_with(value, MultipartUpload::from_bytes, |data| {
                 DecodedValue::MultipartUpload { data }
@@ -1335,6 +1725,135 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             DecodedValue::DhtEntries { data }
         }),
         _ => raw_value(value, None),
+    }
+}
+
+/// Policy, mutation and bulk-run rows are all keyed by a postcard-encoded id;
+/// the placement-policy document keyspace stores the raw ulid bytes instead.
+fn decode_policy_id_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
+    if keyspace_name == PLACEMENT_POLICY_KEYSPACE {
+        return decode_ulid_key(key);
+    }
+    postcard::from_bytes::<Ulid>(key)
+        .map(|value| DecodedField::Ulid {
+            value: value.to_string(),
+        })
+        .unwrap_or_else(|_| raw_field(key))
+}
+
+fn decode_policy_cache_key(key: &[u8]) -> DecodedField {
+    let Some((policy_id, digest)) = key.split_at_checked(16) else {
+        return raw_field(key);
+    };
+    let Ok(policy_id) = <[u8; 16]>::try_from(policy_id) else {
+        return raw_field(key);
+    };
+    if digest.len() != 32 {
+        return raw_field(key);
+    }
+    DecodedField::PolicyCacheKey {
+        policy_id: Ulid::from_bytes(policy_id).to_string(),
+        digest: hex::encode(digest),
+    }
+}
+
+fn decode_record_key(key: &[u8]) -> DecodedField {
+    JobRecordKey::from_bytes(key)
+        .map(|value| DecodedField::JobRecordKey {
+            value: JsonJobRecordKey(value),
+        })
+        .unwrap_or_else(|_| raw_field(key))
+}
+
+/// Conflict rows carry the refused digest after the record key, so both bytes
+/// under one key stay addressable.
+fn decode_conflict_key(key: &[u8]) -> DecodedField {
+    let Some((record, digest)) = key.split_at_checked(key.len().saturating_sub(32)) else {
+        return raw_field(key);
+    };
+    match JobRecordKey::from_bytes(record) {
+        Ok(record) => DecodedField::JobConflictKey {
+            record: JsonJobRecordKey(record),
+            digest: hex::encode(digest),
+        },
+        Err(_) => raw_field(key),
+    }
+}
+
+/// Alias rows are keyed by `job id || family`, so two families claiming one id
+/// both stay visible.
+fn decode_alias_key(key: &[u8]) -> DecodedField {
+    let (Some(job_id), Some(family)) = (
+        key.get(..16)
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok()),
+        alias_family(key),
+    ) else {
+        return raw_field(key);
+    };
+    DecodedField::JobAliasKey {
+        job_id: Ulid::from_bytes(job_id).to_string(),
+        family: family_id_string(&family),
+    }
+}
+
+fn decode_family_key(key: &[u8]) -> DecodedField {
+    match family_from_key(key) {
+        Some(family) => DecodedField::JobFamilyKey {
+            family: family_id_string(&family),
+        },
+        None => raw_field(key),
+    }
+}
+
+fn decode_deadline_key(key: &[u8]) -> DecodedField {
+    if key.len() != 72 {
+        return raw_field(key);
+    }
+    match key.get(8..).and_then(family_from_key) {
+        Some(family) => DecodedField::JobFamilyKey {
+            family: family_id_string(&family),
+        },
+        None => raw_field(key),
+    }
+}
+
+/// Explain rows are keyed by `family || witness node`, one row per witness.
+fn decode_explain_key(key: &[u8]) -> DecodedField {
+    let (Some(family), Some(node)) = (family_from_key(key), key.get(64..)) else {
+        return raw_field(key);
+    };
+    DecodedField::JobExplainKey {
+        family: family_id_string(&family),
+        node_id: hex::encode(node),
+    }
+}
+
+fn family_from_key(key: &[u8]) -> Option<JobFamilyId> {
+    Some(JobFamilyId {
+        submission_id: aruna_core::structs::SubmissionId(key.get(..32)?.try_into().ok()?),
+        request_digest: key.get(32..64)?.try_into().ok()?,
+    })
+}
+
+fn pending_need_string(need: PendingNeed) -> String {
+    match need {
+        PendingNeed::Evidence(kind) => format!("evidence:{kind:?}"),
+        PendingNeed::LocalView => "local_view".to_string(),
+        PendingNeed::HolderView => "holder_view".to_string(),
+    }
+}
+
+/// Attempt-scoped rows are keyed by `job id || attempt epoch` in big-endian.
+fn decode_attempt_key(key: &[u8]) -> DecodedField {
+    let Some((job_id, epoch)) = key.split_at_checked(key.len().saturating_sub(8)) else {
+        return raw_field(key);
+    };
+    let (Ok(job_id), Ok(epoch)) = (<[u8; 16]>::try_from(job_id), <[u8; 8]>::try_from(epoch)) else {
+        return raw_field(key);
+    };
+    DecodedField::AttemptKey {
+        job_id: Ulid::from_bytes(job_id).to_string(),
+        attempt_epoch: u64::from_be_bytes(epoch),
     }
 }
 
@@ -1471,9 +1990,12 @@ mod tests {
     use super::{
         CRAQLE_BATCH_LOG_ENCODING_TAG, CRAQLE_DOT_ENCODING_TAG, CRAQLE_GRAPH_META_PREFIX,
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
-        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
-        CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        location_scan, raw_field,
+        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, ComputeDepartureReport, ConflictRecord,
+        CraqleStoredBatch, CraqleStoredGraphMeta, CraqleStoredQuadOp, DecodedField, DecodedValue,
+        JobFamilyId, JobRecordEnvelope, JobReservationRecord, JsonPlacementPolicyDocument,
+        JsonPolicyCacheEntry, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
+        WitnessDeadline, WitnessExplain, decode_entry, list_entries, list_keyspaces, location_scan,
+        raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1482,12 +2004,17 @@ mod tests {
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE,
-        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, DHT_KEYSPACE,
-        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
-        ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB,
+        COMPUTE_DEPARTURE_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
+        JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+        JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
+        METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+        METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+        PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
         USER_ACCESS_OWNER_KEYSPACE,
@@ -1495,12 +2022,18 @@ mod tests {
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        BucketReplicationConfig, BucketReplicationTarget, Group, HashPathIndexKey,
-        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-        MultipartUploadStatus, RealmConfigDocument, RealmId,
+        CurrentVersionPointer, Group, HashPathIndexKey, MultipartChecksumType,
+        MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+        MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus,
+        POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+        PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, PolicyBulkIntent,
+        PolicyBulkRun, PolicyBulkStatus, PolicyIntentOutcome, PolicyMutationParams,
+        PolicyMutationRecord, PolicyPublication, PolicyRefMode, RealmConfigDocument, RealmId,
+        placement_policy_key,
     };
     use aruna_net::dht::storage::StoredEntry;
+    use aruna_operations::jobs::records::rows::PROJECTION_CACHE_VERSION;
+    use aruna_operations::placement_policy::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -1647,6 +2180,7 @@ mod tests {
             BLOB_LOCATIONS_KEYSPACE.to_string(),
             BLOB_VERSIONS_KEYSPACE.to_string(),
             BUCKET_STATS_DB.to_string(),
+            COMPUTE_DEPARTURE_KEYSPACE.to_string(),
             CRAQLE_GRAPHS_KEYSPACE.to_string(),
             CRAQLE_LOG_KEYSPACE.to_string(),
             CRAQLE_QUADS_KEYSPACE.to_string(),
@@ -1654,12 +2188,30 @@ mod tests {
             DHT_KEYSPACE.to_string(),
             HASH_PATHS_INDEX_KEYSPACE.to_string(),
             DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            JOB_FAMILY_ALIAS_KEYSPACE.to_string(),
+            JOB_FAMILY_CONFLICT_KEYSPACE.to_string(),
+            JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+            JOB_FAMILY_PENDING_KEYSPACE.to_string(),
+            JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
+            JOB_PLAN_EXPLAIN_KEYSPACE.to_string(),
+            JOB_RESERVATION_KEYSPACE.to_string(),
+            JOB_WITNESS_DEADLINE_INDEX_KEYSPACE.to_string(),
+            JOB_WITNESS_DEADLINE_KEYSPACE.to_string(),
+            MANAGED_COPY_KEYSPACE.to_string(),
             METADATA_AUDIT_KEYSPACE.to_string(),
             METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
             METADATA_HOLDERS_KEYSPACE.to_string(),
             METADATA_INDEX_KEYSPACE.to_string(),
             NODE_STATE_KEYSPACE.to_string(),
+            NODE_SUBJECT_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
+            PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+            PLACEMENT_POLICY_KEYSPACE.to_string(),
+            POLICY_BULK_INTENT_KEYSPACE.to_string(),
+            POLICY_BULK_RUN_KEYSPACE.to_string(),
+            POLICY_MUTATION_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
@@ -1676,26 +2228,16 @@ mod tests {
     }
 
     #[test]
-    fn decodes_bucket_replication() {
-        // The replication config decodes as part of the bucket record.
+    fn decodes_bucket_record() {
         let realm_id = RealmId::from_bytes([4_u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
-        let config = BucketReplicationConfig {
-            targets: vec![BucketReplicationTarget {
-                node_id,
-                realm_id,
-                bucket: "replica-bucket".to_string(),
-                arn: format!("arn:aruna:{realm_id}:{node_id}:s3/replica-bucket"),
-                replicate_delete_markers: true,
-            }],
-        };
         let info = BucketInfo {
             group_id: Ulid::generate(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
             cors_configuration: None,
-            replication: Some(config.clone()),
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 7,
         };
 
         let decoded = decode_entry(
@@ -1710,9 +2252,453 @@ mod tests {
             }
         );
         match decoded.value {
-            DecodedValue::BucketInfo { data } => assert_eq!(data.replication, Some(config)),
+            DecodedValue::BucketInfo { data } => assert_eq!(data, info),
             other => panic!("expected bucket info, got {other:?}"),
         }
+    }
+
+    fn test_family() -> JobFamilyId {
+        JobFamilyId {
+            submission_id: aruna_core::structs::SubmissionId([9u8; 32]),
+            request_digest: [8u8; 32],
+        }
+    }
+
+    fn test_node() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[6u8; 32]).public()
+    }
+
+    fn test_envelope() -> JobRecordEnvelope {
+        let family = test_family();
+        JobRecordEnvelope::sign(
+            RealmId::from_bytes([2u8; 32]),
+            aruna_core::structs::JobFamilyRecord::Claim(aruna_core::structs::SubmissionClaim {
+                submission_id: family.submission_id,
+                job_id: aruna_core::structs::JobId::from_bytes(
+                    Ulid::from_bytes([5u8; 16]).to_bytes(),
+                ),
+                request_digest: family.request_digest,
+                spec_digest: [7u8; 32],
+                committing_node_id: test_node(),
+                accepted_at_ms: 11,
+            }),
+            &iroh::SecretKey::from_bytes(&[6u8; 32]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn decodes_job_family_rows() {
+        // Every append-only family keyspace must decode: an operator inspecting
+        // a stuck submission cannot be told the rows are opaque bytes.
+        let envelope = test_envelope();
+        let key = envelope.key();
+        let key_bytes = key.to_bytes();
+
+        let record = decode_entry(
+            JOB_FAMILY_RECORD_KEYSPACE,
+            &key_bytes,
+            &postcard::to_allocvec(&envelope).unwrap(),
+        );
+        assert!(matches!(
+            record.key,
+            DecodedField::JobRecordKey { .. } // the signed identity, not raw bytes
+        ));
+        assert!(matches!(record.value, DecodedValue::JobFamilyRecord { .. }));
+
+        let pending = PendingRecord {
+            envelope: envelope.clone(),
+            need: PendingNeed::Evidence(aruna_core::structs::JobRecordKind::Spec),
+            first_seen_ms: 12,
+            attempts: 2,
+        };
+        let decoded = decode_entry(
+            JOB_FAMILY_PENDING_KEYSPACE,
+            &key_bytes,
+            &postcard::to_allocvec(&pending).unwrap(),
+        );
+        match decoded.value {
+            DecodedValue::JobPendingRecord { need, attempts, .. } => {
+                assert_eq!(need, "evidence:Spec");
+                assert_eq!(attempts, 2);
+            }
+            other => panic!("expected a pending record, got {other:?}"),
+        }
+
+        let conflict = ConflictRecord {
+            envelope: envelope.clone(),
+            retained: [3u8; 32],
+            observed_at_ms: 13,
+            relayed_by: Some(test_node()),
+        };
+        let mut conflict_key = key_bytes.to_vec();
+        conflict_key.extend_from_slice(&[3u8; 32]);
+        let decoded = decode_entry(
+            JOB_FAMILY_CONFLICT_KEYSPACE,
+            &conflict_key,
+            &postcard::to_allocvec(&conflict).unwrap(),
+        );
+        assert!(matches!(decoded.key, DecodedField::JobConflictKey { .. }));
+        assert!(matches!(
+            decoded.value,
+            DecodedValue::JobConflictRecord { .. }
+        ));
+
+        let mut alias_key = Ulid::from_bytes([5u8; 16]).to_bytes().to_vec();
+        alias_key.extend_from_slice(&test_family().to_bytes());
+        let decoded = decode_entry(JOB_FAMILY_ALIAS_KEYSPACE, &alias_key, &key_bytes);
+        assert!(matches!(decoded.key, DecodedField::JobAliasKey { .. }));
+        assert!(matches!(decoded.value, DecodedValue::JobAliasTarget { .. }));
+
+        let cache = ProjectionCache {
+            version: PROJECTION_CACHE_VERSION,
+            revision: 4,
+            stale: true,
+            projection: None,
+        };
+        let decoded = decode_entry(
+            JOB_FAMILY_PROJECTION_KEYSPACE,
+            &test_family().to_bytes(),
+            &postcard::to_allocvec(&cache).unwrap(),
+        );
+        assert!(matches!(decoded.key, DecodedField::JobFamilyKey { .. }));
+        assert_eq!(
+            decoded.value,
+            DecodedValue::JobProjectionCache {
+                revision: 4,
+                stale: true,
+                projected: false,
+            }
+        );
+
+        let outbox = OutboxEntry {
+            queued_at_ms: 14,
+            delivered: Vec::new(),
+            next_holder: 0,
+            rejections: 0,
+        };
+        let decoded = decode_entry(
+            JOB_FAMILY_OUTBOX_KEYSPACE,
+            &key_bytes,
+            &postcard::to_allocvec(&outbox).unwrap(),
+        );
+        assert_eq!(decoded.value, DecodedValue::JobOutboxEntry { data: outbox });
+    }
+
+    #[test]
+    fn decodes_compute_rows() {
+        // Reservations, witness deadlines, plan explains, and the departure row
+        // are the operator's only local evidence about scheduled work.
+        let execution_id = Ulid::from_bytes([1u8; 16]);
+        let reservation = JobReservationRecord {
+            execution_id,
+            job_id: aruna_core::structs::JobId::from_bytes(Ulid::from_bytes([5u8; 16]).to_bytes()),
+            logical_job_id: aruna_core::structs::JobId::from_bytes([5u8; 16]),
+            resources: aruna_core::structs::EffectiveResources {
+                cpu_cores: 2,
+                ram_bytes: 1024,
+                disk_bytes: 2048,
+                max_walltime_ms: 60_000,
+                preemptible: false,
+            },
+            created_at_ms: 21,
+            subject_generation: 3,
+            subject_digest: [9u8; 32],
+        };
+        let decoded = decode_entry(
+            JOB_RESERVATION_KEYSPACE,
+            &execution_id.to_bytes(),
+            &postcard::to_allocvec(&reservation).unwrap(),
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: execution_id.to_string()
+            }
+        );
+        assert!(matches!(decoded.value, DecodedValue::JobReservation { .. }));
+
+        let deadline = WitnessDeadline {
+            due_at_ms: 22,
+            rank: 1,
+        };
+        let mut deadline_key = 22u64.to_be_bytes().to_vec();
+        deadline_key.extend_from_slice(&test_family().to_bytes());
+        let decoded = decode_entry(
+            JOB_WITNESS_DEADLINE_KEYSPACE,
+            &deadline_key,
+            &postcard::to_allocvec(&deadline).unwrap(),
+        );
+        assert!(matches!(decoded.key, DecodedField::JobFamilyKey { .. }));
+        assert_eq!(
+            decoded.value,
+            DecodedValue::JobWitnessDeadline { data: deadline }
+        );
+
+        let explain = WitnessExplain {
+            sequence: 3,
+            plan: aruna_core::scheduling::ExecutionPlan {
+                selected: None,
+                retryable: true,
+                alternatives: Vec::new(),
+                rejected: Vec::new(),
+                omitted: 0,
+            },
+            declined: Vec::new(),
+            overlapping: false,
+            sealed_at_ms: 23,
+        };
+        let mut explain_key = test_family().to_bytes().to_vec();
+        explain_key.extend_from_slice(test_node().as_bytes());
+        let decoded = decode_entry(
+            JOB_PLAN_EXPLAIN_KEYSPACE,
+            &explain_key,
+            &postcard::to_allocvec(&explain).unwrap(),
+        );
+        assert!(matches!(decoded.key, DecodedField::JobExplainKey { .. }));
+        assert_eq!(
+            decoded.value,
+            DecodedValue::JobPlanExplain {
+                sequence: 3,
+                selected: None,
+                alternatives: 0,
+                rejected: 0,
+                overlapping: false,
+                sealed_at_ms: 23,
+            }
+        );
+
+        let report = ComputeDepartureReport {
+            departed_at_ms: 24,
+            membership_generation: 5,
+            unresolved: vec![execution_id],
+            truncated: false,
+        };
+        let decoded = decode_entry(
+            COMPUTE_DEPARTURE_KEYSPACE,
+            b"departure",
+            &postcard::to_allocvec(&report).unwrap(),
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: "departure".to_string()
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::ComputeDepartureReport { data: report }
+        );
+    }
+
+    #[test]
+    fn decodes_output_key() {
+        // Output records share the attempt-control key, so the epoch has to
+        // survive decoding for a stuck attempt to be found at all.
+        let job_id = Ulid::from_bytes([3_u8; 16]);
+        let mut key = job_id.to_bytes().to_vec();
+        key.extend_from_slice(&7_u64.to_be_bytes());
+
+        let decoded = decode_entry(JOB_OUTPUT_RECORD_KEYSPACE, &key, b"not-an-envelope");
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::AttemptKey {
+                job_id: job_id.to_string(),
+                attempt_epoch: 7,
+            }
+        );
+        assert!(matches!(
+            decoded.value,
+            DecodedValue::Raw {
+                decode_error: Some(_),
+                ..
+            }
+        ));
+    }
+
+    fn policy_document(policy_id: Ulid, realm_id: RealmId) -> PlacementPolicyDocument {
+        let secret = iroh::SecretKey::from_bytes(&[11_u8; 32]);
+        PlacementPolicyDocument {
+            realm_id,
+            policy: PlacementPolicy {
+                policy_id,
+                name: "eu-only".to_string(),
+                allowed: Vec::new(),
+            },
+            publication: PolicyPublication {
+                publisher: secret.public(),
+                created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                created_at_ms: 42,
+                event_id: Ulid::from_bytes([12_u8; 16]),
+                config_digest: [13_u8; 32],
+                signature: secret.sign(b"publication"),
+            },
+        }
+    }
+
+    #[test]
+    fn decodes_policy_document() {
+        let realm_id = RealmId::from_bytes([10_u8; 32]);
+        let policy_id = Ulid::from_bytes([14_u8; 16]);
+        let document = policy_document(policy_id, realm_id);
+
+        let decoded = decode_entry(
+            PLACEMENT_POLICY_KEYSPACE,
+            &placement_policy_key(policy_id),
+            &document.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: policy_id.to_string()
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PlacementPolicyDocument {
+                data: JsonPlacementPolicyDocument(document)
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_policy_cache() {
+        let policy_id = Ulid::from_bytes([15_u8; 16]);
+        let policy_ref = PlacementPolicyRef {
+            policy_id,
+            digest: [16_u8; 32],
+        };
+        let entry = PolicyCacheEntry::Unavailable {
+            stored_at_ms: 5,
+            expires_at_ms: 15,
+        };
+        let mut key = policy_id.to_bytes().to_vec();
+        key.extend_from_slice(&policy_ref.digest);
+
+        let decoded = decode_entry(
+            PLACEMENT_POLICY_CACHE_KEYSPACE,
+            &key,
+            &entry.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::PolicyCacheKey {
+                policy_id: policy_id.to_string(),
+                digest: hex::encode([16_u8; 32]),
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PolicyCacheEntry {
+                data: JsonPolicyCacheEntry(entry)
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_policy_mutation() {
+        let realm_id = RealmId::from_bytes([17_u8; 32]);
+        let mutation_id = Ulid::from_bytes([18_u8; 16]);
+        let record = PolicyMutationRecord {
+            mutation_id,
+            params: PolicyMutationParams {
+                bucket: "bucket".to_string(),
+                key: "a.tar".to_string(),
+                expected_head: CurrentVersionPointer::new(Ulid::from_bytes([19_u8; 16])),
+                bucket_identity: (
+                    Ulid::from_bytes([20_u8; 16]),
+                    std::time::SystemTime::UNIX_EPOCH,
+                    aruna_core::UserId::local(Ulid::generate(), realm_id),
+                ),
+                target_refs: Vec::new(),
+                mode: PolicyRefMode::Union,
+            },
+            successor_version_id: Ulid::from_bytes([21_u8; 16]),
+            sealed_refs: Vec::new(),
+            materialized: true,
+        };
+
+        let decoded = decode_entry(
+            POLICY_MUTATION_KEYSPACE,
+            &PolicyMutationRecord::key(mutation_id).unwrap(),
+            &record.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: mutation_id.to_string()
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PolicyMutationRecord { data: record }
+        );
+    }
+
+    #[test]
+    fn decodes_bulk_run() {
+        let realm_id = RealmId::from_bytes([22_u8; 32]);
+        let operation_id = Ulid::from_bytes([23_u8; 16]);
+        let run = PolicyBulkRun {
+            operation_id,
+            bucket: "bucket".to_string(),
+            bucket_identity: (
+                Ulid::from_bytes([24_u8; 16]),
+                std::time::SystemTime::UNIX_EPOCH,
+                aruna_core::UserId::local(Ulid::generate(), realm_id),
+            ),
+            generation: 3,
+            target_refs: Vec::new(),
+            status: PolicyBulkStatus::Active,
+        };
+
+        let decoded = decode_entry(
+            POLICY_BULK_RUN_KEYSPACE,
+            &PolicyBulkRun::key(operation_id).unwrap(),
+            &run.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: operation_id.to_string()
+            }
+        );
+        assert_eq!(decoded.value, DecodedValue::PolicyBulkRun { data: run });
+    }
+
+    #[test]
+    fn decodes_bulk_intent() {
+        let operation_id = Ulid::from_bytes([25_u8; 16]);
+        let intent = PolicyBulkIntent {
+            operation_id,
+            key: "a.tar".to_string(),
+            observed_head: CurrentVersionPointer::new(Ulid::from_bytes([26_u8; 16])),
+            successor_version_id: Ulid::from_bytes([27_u8; 16]),
+            outcome: PolicyIntentOutcome::Planned,
+        };
+
+        let decoded = decode_entry(
+            POLICY_BULK_INTENT_KEYSPACE,
+            &intent.key().to_bytes().unwrap(),
+            &intent.to_bytes().unwrap(),
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::PolicyBulkIntentKey {
+                operation_id: operation_id.to_string(),
+                key: "a.tar".to_string(),
+            }
+        );
+        assert_eq!(
+            decoded.value,
+            DecodedValue::PolicyBulkIntent { data: intent }
+        );
     }
 
     #[test]
@@ -1971,6 +2957,8 @@ mod tests {
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
             metadata: HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
         };
 
         let decoded = decode_entry(

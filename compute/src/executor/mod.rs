@@ -1,8 +1,10 @@
 use aruna_core::compute::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
-    ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec,
+    ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
+    UserSpec,
 };
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -21,10 +23,57 @@ pub mod kubernetes;
 
 use logs::LogSink;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackendCaps {
     pub file_staging: bool,
     pub direct_s3: bool,
+    pub s3_mount: bool,
+    /// The backend proves where workers run and enforces their network
+    /// isolation, which protected data requires before open networking.
+    pub network_policy: bool,
+    /// The workload runs on the controller host, so it inherits the
+    /// controller's execution subject.
+    pub local_site: bool,
+    /// Where a non-local backend's workers run. `None` means their placement is
+    /// unproven, so the advertisement carries no site facts at all.
+    pub worker_site: Option<WorkerSite>,
+    /// Static ceilings; `None` is unmeasured and never filters.
+    pub limits: ResourceEnvelope,
+}
+
+/// The operator-declared execution site of workers that do not run on the
+/// controller host.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerSite {
+    pub location: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+/// The ceiling one attempt runs under: the sealed request's own, else the
+/// backend default. A dimension with neither is unbounded, which is never a
+/// legal execution envelope.
+pub fn enforced_limit(
+    sealed: Option<u64>,
+    default: Option<u64>,
+    dimension: &str,
+) -> Result<u64, BackendError> {
+    match sealed.or(default).filter(|limit| *limit > 0) {
+        Some(limit) => Ok(limit),
+        None => Err(BackendError::InvalidSpec(format!(
+            "attempt has no {dimension} ceiling and the backend configures none"
+        ))),
+    }
+}
+
+/// Wall-clock milliseconds every backend stamps its attempt evidence with.
+#[cfg(any(feature = "apptainer", feature = "docker"))]
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]

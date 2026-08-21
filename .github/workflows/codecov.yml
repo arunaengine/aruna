@@ -25,18 +25,17 @@ jobs:
   instrumented:
     name: Instrumented tests
     runs-on: ubuntu-latest
-    # Hang cap, not a performance budget. Tests use libtest's default
-    # parallelism; the large restart profiles run in the stress job below.
-    timeout-minutes: 90
+    # Job-level hang cap, not a performance budget. Test concurrency and the
+    # per-test hang cap live in .config/nextest.toml; restart profiles run below.
+    timeout-minutes: 120
     env:
-      LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
+      # nextest runs one process per test, so %m merges each binary's counters
+      # into one file instead of writing a profraw per test process.
+      LLVM_PROFILE_FILE: cargo-test-%m.profraw
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y clang mold
 
       - name: Install Rust with LLVM tools
         # rust-toolchain.toml supplies the channel used to build the tests.
@@ -44,16 +43,25 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
 
       - name: Install grcov
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: grcov
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
       - name: Run instrumented tests
-        env:
-          CARGO_BUILD_JOBS: 2
-        run: cargo test --workspace --all-features --locked
+        run: cargo nextest run --workspace --all-features --locked --profile ci
+
+      # nextest never runs doctests; they stay in the measured set.
+      - name: Run instrumented doctests
+        run: cargo test --workspace --all-features --locked --doc
 
       - name: Collect coverage
         run: |
@@ -80,6 +88,15 @@ jobs:
           path: coverage.lcov
           if-no-files-found: error
           retention-days: 1
+
+      - name: Upload JUnit report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-instrumented
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
 
   report:
     name: Generate Coverage Report
@@ -130,9 +147,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y clang mold
 
       - name: Install Rust
         run: rustup show active-toolchain

@@ -75,11 +75,9 @@ pub enum PolicyKind {
 pub struct RequestPolicy {
     pub policy_id: Ulid,
     pub name: String,
-    #[serde(default)]
     pub kind: PolicyKind,
     /// Optional applicability guard; the rule applies when it is absent or
     /// evaluates to `true`, and a guard that errors denies the request.
-    #[serde(default)]
     pub when: Option<String>,
     /// CEL expression over the request variables.
     pub expression: String,
@@ -611,6 +609,27 @@ mod tests {
             expression: expression.to_string(),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn rejects_partial_policy_json() {
+        // A missing kind is predecessor tolerance and must refuse; a missing
+        // `when` is a valid current value (serde fills an Option with None).
+        let current = serde_json::to_string(&policy("permission == 'write'")).unwrap();
+        assert!(serde_json::from_str::<RequestPolicy>(&current).is_ok());
+
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&current).unwrap();
+        fields.remove("kind");
+        let partial = serde_json::to_string(&fields).unwrap();
+        assert!(serde_json::from_str::<RequestPolicy>(&partial).is_err());
+
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&current).unwrap();
+        fields.remove("when");
+        let absent_guard = serde_json::to_string(&fields).unwrap();
+        let decoded = serde_json::from_str::<RequestPolicy>(&absent_guard).unwrap();
+        assert_eq!(decoded.when, None);
     }
 
     fn request(path: &str, permission: &str, user: &str) -> PolicyRequest {

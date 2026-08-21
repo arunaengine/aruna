@@ -9,11 +9,11 @@ use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_DESCRIPTION_PATH,
-    REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
-    REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH, RevocationIndex, USER_NAME_PATH,
-    decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
-    group_role_user_assignment_from_path, group_role_user_assignment_path,
+    GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_COMPUTE_PATH,
+    REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
+    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH,
+    RevocationIndex, USER_NAME_PATH, decode_admin_document_reducer_state, group_role_id_from_path,
+    group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
     overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
     realm_config_node_path, realm_config_oidc_provider_id_from_path, realm_role_path,
     realm_role_user_assignment_from_path, realm_role_user_assignment_path, user_attribute_path,
@@ -60,15 +60,16 @@ use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
     HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
-    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdStatus, PlacementRef,
-    PlacementScope, PoolAdmission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, Role, SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,
-    SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User,
-    WatchEventMask, WatchInterestDigest, WatchSubscription, admit_band_pool,
-    build_quarantine_entries, coordinator_spans, group_owner_index_key, node_usage_key_node_id,
-    persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
-    reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
-    watch_interest_key_realm_id,
+    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdStatus,
+    PlacementPolicyDocument, PlacementRef, PlacementScope, PoolAdmission,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
+    SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
+    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User, WatchEventMask,
+    WatchInterestDigest, WatchSubscription, admit_band_pool, build_quarantine_entries,
+    coordinator_spans, group_owner_index_key, node_usage_key_node_id, persistent_id_change,
+    persistent_id_key, persistent_id_target, placement_policy_change, placement_policy_target,
+    quarantine_usage_entry, reserved_label, verify_policy_authority, watch_interest_dirty_key,
+    watch_interest_key_node_id, watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -3080,6 +3081,114 @@ impl DocumentSyncService {
                             }
                         }
                     }
+                    DocumentSyncEvent::Upsert {
+                        event_id,
+                        target: DocumentSyncTarget::PlacementPolicy { policy_id },
+                        bytes,
+                        change,
+                    } => {
+                        let target = DocumentSyncTarget::PlacementPolicy { policy_id };
+                        let reject = |reason: String| {
+                            SyncRejection::new(
+                                identity,
+                                DocumentSyncEvent::Upsert {
+                                    event_id,
+                                    target: DocumentSyncTarget::PlacementPolicy { policy_id },
+                                    bytes: bytes.clone(),
+                                    change,
+                                },
+                                reason,
+                            )
+                        };
+                        let document = match postcard::from_bytes::<PlacementPolicyDocument>(&bytes)
+                        {
+                            Ok(document) => document,
+                            Err(error) => {
+                                warn!(%topic_id, %policy_id, %error, "Rejecting undecodable placement policy document");
+                                rejections.push(reject(format!(
+                                    "undecodable placement policy document: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        if let Err(reason) =
+                            validate_policy_document(policy_id, self.realm_id, &document, &change)
+                        {
+                            warn!(%topic_id, %policy_id, %reason, "Rejecting invalid placement policy document");
+                            rejections.push(reject(format!(
+                                "invalid placement policy document: {reason}"
+                            )));
+                            continue;
+                        }
+                        // The sealed actor is the original publisher, so a relay
+                        // that restates the document is not its author.
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&document.publication.publisher),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                %policy_id,
+                                "Rejecting placement policy document whose actor is not its publisher"
+                            );
+                            rejections.push(reject(
+                                "placement policy actor is not its publisher".to_string(),
+                            ));
+                            continue;
+                        }
+                        match self
+                            .apply_policy_document(&document, change.placement)
+                            .await?
+                        {
+                            MetadataPlacementOutcome::Accepted(true) => {
+                                applied_targets.push(target)
+                            }
+                            MetadataPlacementOutcome::Accepted(false) => {}
+                            MetadataPlacementOutcome::Deferred(dependency) => {
+                                warn!(
+                                    %topic_id,
+                                    %policy_id,
+                                    "Deferring placement policy document until its placement configuration is available"
+                                );
+                                cross_topic_dependencies.insert(dependency);
+                            }
+                            MetadataPlacementOutcome::Rejected => {
+                                warn!(
+                                    %topic_id,
+                                    %policy_id,
+                                    "Rejecting placement policy document with a mismatched placement or reused id"
+                                );
+                                rejections.push(reject(
+                                    "placement policy document has a mismatched placement or reuses its id"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    event @ (DocumentSyncEvent::Delete {
+                        target: DocumentSyncTarget::PlacementPolicy { .. },
+                        ..
+                    }
+                    | DocumentSyncEvent::AdminOperation {
+                        target: DocumentSyncTarget::PlacementPolicy { .. },
+                        ..
+                    }) => {
+                        // A policy document is immutable, so it only ever syncs as
+                        // an upsert; anything else is refused without wedging the
+                        // topic.
+                        warn!(
+                            %topic_id,
+                            target = ?event.target(),
+                            "Skipping unsupported non-upsert placement policy event"
+                        );
+                        rejections.push(SyncRejection::new(
+                            identity,
+                            event,
+                            "unsupported non-upsert placement policy event",
+                        ));
+                        continue;
+                    }
                     event @ (DocumentSyncEvent::Delete {
                         target: DocumentSyncTarget::PersistentIdMapping { .. },
                         ..
@@ -4131,6 +4240,36 @@ impl DocumentSyncService {
                 )),
             };
         }
+        if let DocumentSyncTarget::PlacementPolicy { policy_id } = target {
+            let document: PlacementPolicyDocument = postcard::from_bytes(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            validate_policy_document(policy_id, self.realm_id, &document, &change)
+                .map_err(NetError::Bootstrap)?;
+            // The generic write below would replace a stored rule with different
+            // bytes under the same id, so a policy always goes through its merge.
+            return match self
+                .apply_policy_document(&document, change.placement)
+                .await?
+            {
+                MetadataPlacementOutcome::Accepted(_) => Ok(()),
+                // The live loop handles this target itself and registers the
+                // dependency; here the error aborts the batch, so the topic
+                // cursor stays put and the event is redelivered.
+                MetadataPlacementOutcome::Deferred(dependency) => {
+                    warn!(
+                        %policy_id,
+                        ?dependency,
+                        "Deferring a placement policy document until its dependency replicates"
+                    );
+                    Err(NetError::Deferred(format!(
+                        "placement policy {policy_id} awaits its authority evidence"
+                    )))
+                }
+                MetadataPlacementOutcome::Rejected => Err(NetError::Bootstrap(
+                    "placement policy has a mismatched placement or reuses its id".to_string(),
+                )),
+            };
+        }
         if let DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } = target {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -4163,7 +4302,16 @@ impl DocumentSyncService {
             // Structural guard for the shared node-info keyspace, mirroring the
             // node-usage guard above so the generic storage write can never
             // persist an unvalidated node info document.
-            validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+            let incoming =
+                validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+            // Read-then-write without a transaction: only safe because the
+            // reconcile loop applies one event at a time per topic.
+            let stored = self
+                .storage_read(target.storage_keyspace().to_string(), target.storage_key())
+                .await?;
+            if !node_info_supersedes(&incoming, stored.as_ref().map(|value| value.as_ref())) {
+                return Ok(());
+            }
         }
         self.storage_write(
             target.storage_keyspace().to_string(),
@@ -4212,6 +4360,36 @@ impl DocumentSyncService {
         placement: PlacementRef,
     ) -> Result<MetadataPlacementOutcome<bool>> {
         store_pid_mapping(&self.storage, self.realm_id, mapping, placement).await
+    }
+
+    /// A publication counts only against this realm's current replicated view:
+    /// the original publisher must be a permitted node and its named authorizing
+    /// user must still hold realm-configuration write. A relay or current holder
+    /// never supplies that authority for someone else.
+    async fn apply_policy_document(
+        &self,
+        document: &PlacementPolicyDocument,
+        placement: PlacementRef,
+    ) -> Result<MetadataPlacementOutcome<bool>> {
+        let Some(config) = read_admin_realm_config(&self.storage, self.realm_id).await? else {
+            return Ok(MetadataPlacementOutcome::Deferred(
+                DocumentSyncDependency::RealmConfig(self.realm_id),
+            ));
+        };
+        let Some(auth) = read_admin_realm_authorization(&self.storage, self.realm_id).await? else {
+            return Ok(MetadataPlacementOutcome::Deferred(
+                DocumentSyncDependency::RealmAuthorization(self.realm_id),
+            ));
+        };
+        if let Err(reason) = verify_policy_authority(document, &config, &auth) {
+            warn!(
+                policy_id = %document.policy_id(),
+                %reason,
+                "Rejecting placement policy without realm-admin publication authority"
+            );
+            return Ok(MetadataPlacementOutcome::Rejected);
+        }
+        store_policy_document(&self.storage, self.realm_id, document, placement).await
     }
 
     async fn apply_delete(
@@ -4644,6 +4822,7 @@ fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
+    now_ms: u64,
     revocation_index: Option<&RevocationIndex>,
 ) {
     if !reducer_state
@@ -4685,6 +4864,14 @@ fn overlay_realm_config_reducer_materialization(
         && let Some(request_policies) = reducer_state.materialized_realm_policies()
     {
         config.request_policies = request_policies;
+    }
+
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_COMPUTE_PATH)
+        && let Some(compute) = reducer_state.materialized_realm_compute()
+    {
+        config.compute = compute;
     }
 
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
@@ -4730,25 +4917,24 @@ fn overlay_realm_config_reducer_materialization(
         }
     }
 
-    // The revocation clock is in seconds; the transition grace is in
-    // milliseconds, and a second of granularity is nothing against it.
-    overlay_realm_config_placement_reducer_materialization(
-        config,
-        reducer_state,
-        now.saturating_mul(1_000),
-    );
+    // Revocations run on the seconds clock; transition release needs the
+    // millisecond clock, or a report reduced within the completion's second
+    // leaves the record unreleased with nothing to re-materialize it.
+    overlay_realm_config_placement_reducer_materialization(config, reducer_state, now_ms);
 }
 
 fn realm_config_from_reducer_materialization(
     realm_id: RealmId,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
+    now_ms: u64,
     revocation_index: Option<&RevocationIndex>,
 ) -> Option<RealmConfigDocument> {
     let metadata_replication = reducer_state.materialized_realm_config_metadata_replication()?;
     let discovery = reducer_state.materialized_realm_config_discovery()?;
     let mut config = RealmConfigDocument {
         realm_id,
+        compute: Default::default(),
         metadata_replication,
         oidc_providers: Vec::new(),
         discovery,
@@ -4763,6 +4949,11 @@ fn realm_config_from_reducer_materialization(
         placement_map: Vec::new(),
         strategies: Vec::new(),
         default_strategy_id: None,
+        // Rebuilt from the reducer, never reset: the overlay below would restore
+        // it anyway, and a hardcoded nil here would defeat family routing.
+        job_family_strategy_id: reducer_state
+            .materialized_family_strategy()
+            .unwrap_or_else(Ulid::nil),
         strategy_bindings: Vec::new(),
         placement_overrides: Vec::new(),
         placement_bindings: Vec::new(),
@@ -4774,7 +4965,13 @@ fn realm_config_from_reducer_materialization(
         revoked_tokens: Vec::new(),
         revocation_floor: reducer_state.revocation_floor,
     };
-    overlay_realm_config_reducer_materialization(&mut config, reducer_state, now, revocation_index);
+    overlay_realm_config_reducer_materialization(
+        &mut config,
+        reducer_state,
+        now,
+        now_ms,
+        revocation_index,
+    );
     Some(config)
 }
 
@@ -5303,6 +5500,172 @@ async fn store_pid_mapping(
     Err(NetError::Dht(
         "persistent id mapping conflicted twice".to_string(),
     ))
+}
+
+/// Stores one replicated policy document. The bucket is re-derived from the
+/// policy id inside the transaction, and a known id whose definition differs is
+/// rejected rather than merged: one id resolves to exactly one rule.
+async fn store_policy_document(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    incoming: &PlacementPolicyDocument,
+    placement: PlacementRef,
+) -> Result<MetadataPlacementOutcome<bool>> {
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        match derive_policy_bucket(storage, realm_id, incoming.policy_id(), placement, txn_id).await
+        {
+            Ok(MetadataPlacementOutcome::Accepted(_)) => {}
+            Ok(outcome) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(match outcome {
+                    MetadataPlacementOutcome::Deferred(dependency) => {
+                        MetadataPlacementOutcome::Deferred(dependency)
+                    }
+                    _ => MetadataPlacementOutcome::Rejected,
+                });
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+        let merged = match policy_merge_txn(storage, incoming, txn_id).await {
+            Ok(Ok(Some(merged))) => merged,
+            Ok(Ok(None)) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Accepted(false));
+            }
+            Ok(Err(())) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Rejected);
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let target = placement_policy_target(merged.policy_id());
+        let change = placement_policy_change(&merged, placement);
+        let mut writes = vec![(
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+            Value::from(
+                merged
+                    .to_bytes()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            ),
+        )];
+        writes.push(
+            document_sync_revision_write_entry(&target, &change)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+        if let Some(entry) = shard_manifest_write_entry(&target, &change)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        {
+            writes.push(entry);
+        }
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), writes)
+            .await
+        {
+            Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "placement policy document conflicted twice".to_string(),
+    ))
+}
+
+/// The bucket a policy id must ride, derived from the realm config inside the
+/// caller's transaction and compared against the stamped placement.
+async fn derive_policy_bucket(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    policy_id: Ulid,
+    placement: PlacementRef,
+    txn_id: TxnId,
+) -> Result<MetadataPlacementOutcome<PlacementRef>> {
+    if placement == PlacementRef::NIL || placement.strategy_id.is_nil() {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let value = storage_read_from_transaction(
+        storage,
+        REALM_CONFIG_KEYSPACE.to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::RealmConfig(realm_id),
+        ));
+    };
+    let config = RealmConfigDocument::from_bytes(&value)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if config.realm_id != realm_id {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
+    match config.policy_placement(policy_id) {
+        Some(derived) if derived == placement => Ok(MetadataPlacementOutcome::Accepted(derived)),
+        Some(_) => Ok(MetadataPlacementOutcome::Rejected),
+        None => Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::PlacementStrategy {
+                realm_id,
+                strategy_id: placement.strategy_id,
+            },
+        )),
+    }
+}
+
+/// `Ok(Ok(None))` when the local row already absorbs the incoming one and
+/// `Ok(Err(()))` when the id is reused with a different definition.
+async fn policy_merge_txn(
+    storage: &StorageHandle,
+    incoming: &PlacementPolicyDocument,
+    txn_id: TxnId,
+) -> Result<std::result::Result<Option<PlacementPolicyDocument>, ()>> {
+    let target = placement_policy_target(incoming.policy_id());
+    let local = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(local) = local else {
+        return Ok(Ok(Some(incoming.clone())));
+    };
+    let mut local = PlacementPolicyDocument::from_bytes(&local)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    match local.merge(incoming) {
+        Ok(true) => Ok(Ok(Some(local))),
+        Ok(false) => Ok(Ok(None)),
+        Err(_) => Ok(Err(())),
+    }
 }
 
 /// `Ok(None)` when the local row already absorbs the incoming one.
@@ -5964,6 +6327,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
             | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
             | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+            | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
             | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
             | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
@@ -6144,6 +6508,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     &mut config,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config != before;
@@ -6154,6 +6519,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     realm_id,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config.is_some();
@@ -6411,6 +6777,7 @@ async fn apply_config_events(
                     &mut config,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config != before;
@@ -6421,6 +6788,7 @@ async fn apply_config_events(
                     realm_id,
                     &reducer_state,
                     effective_now,
+                    unix_timestamp_millis(),
                     revocation_index.as_ref(),
                 );
                 let changed = config.is_some();
@@ -7827,6 +8195,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
         | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
         | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+        | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
@@ -7844,6 +8213,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
         | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
         | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+        | AdminDocumentOperation::RealmConfigComputeSet { .. }
         | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
@@ -7956,11 +8326,19 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
         | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+        | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
+        AdminDocumentOperation::RealmConfigComputeSet { compute } => {
+            // A malformed link or quota set would make every planner estimate
+            // meaningless, so it is refused before it reaches storage.
+            if compute.validate().is_err() {
+                return reject("realm compute configuration is malformed");
+            }
+        }
         AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
         | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
         | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
@@ -8975,31 +9353,78 @@ fn validate_watch_subscription_target(
 }
 
 /// Validates the self-consistency of a replicated node-info document against its
-/// sync target: the payload must decode and its embedded `node_id` must match the
-/// target's node. Does not check the publisher's identity (the caller enforces
-/// that against the signed actor).
+/// sync target: the payload must decode within its bounds, advertise only
+/// execution sites of its own node, and match the target's node. Does not check
+/// the publisher's identity (the caller enforces that against the signed actor).
 fn validate_node_info_upsert(
     target: &DocumentSyncTarget,
     bytes: &[u8],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<NodeInfoDocument, String> {
     let DocumentSyncTarget::NodeInfo { node_id, .. } = target else {
         return Err("target is not a node info document".to_string());
     };
     let document = NodeInfoDocument::from_bytes(bytes)
-        .map_err(|error| format!("undecodable node info document: {error}"))?;
+        .map_err(|error| format!("invalid node info document: {error}"))?;
     if document.node_id != *node_id {
         return Err(format!(
             "node info document node id {} does not match target node id {node_id}",
             document.node_id
         ));
     }
-    Ok(())
+    Ok(document)
+}
+
+/// Whether an incoming advertisement replaces the stored one. Undecodable
+/// stored bytes are replaced; an equal or older epoch is not applied, so a
+/// delayed pre-rejoin advertisement cannot shadow the current one.
+fn node_info_supersedes(incoming: &NodeInfoDocument, stored: Option<&[u8]>) -> bool {
+    match stored.and_then(|bytes| NodeInfoDocument::from_bytes(bytes).ok()) {
+        Some(current) => incoming.supersedes(&current),
+        None => true,
+    }
 }
 
 /// Validates a replicated PID mapping against its sync target and change: the
 /// canonical PID for the target document, a consistent kind/status/provenance
 /// triple, and a change that is exactly the one the mapping row derives. The
 /// caller enforces the publisher identity against the signed actor.
+/// Structural gate for a replicated policy document: it must address this
+/// realm and target, carry a verifiable definition, and derive its own sync
+/// change, so a sender cannot restate a policy under someone else's revision.
+fn validate_policy_document(
+    policy_id: Ulid,
+    realm_id: RealmId,
+    document: &PlacementPolicyDocument,
+    change: &DocumentSyncChange,
+) -> std::result::Result<(), String> {
+    if document.policy_id() != policy_id {
+        return Err(format!(
+            "policy {} does not match target policy {policy_id}",
+            document.policy_id()
+        ));
+    }
+    if document.realm_id != realm_id {
+        return Err(format!(
+            "policy realm {} does not match this realm",
+            document.realm_id
+        ));
+    }
+    if let Err(error) = document.verified() {
+        return Err(format!("policy definition is invalid: {error}"));
+    }
+    // Structural gate: bytes without an authentic publication are never a rule.
+    if let Err(error) = document.verify_publication() {
+        return Err(format!("policy publication is invalid: {error}"));
+    }
+    if change.kind != DocumentSyncChangeKind::Upsert {
+        return Err("policy event is not an upsert".to_string());
+    }
+    if *change != placement_policy_change(document, change.placement) {
+        return Err("policy revision does not match its sync change".to_string());
+    }
+    Ok(())
+}
+
 fn validate_pid_mapping(
     document_id: Ulid,
     mapping: &PersistentIdMapping,
@@ -11171,7 +11596,13 @@ mod tests {
 
         let now = unix_timestamp_secs();
         let index = state.revocation_index(now);
-        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
+        overlay_realm_config_reducer_materialization(
+            &mut config,
+            &state,
+            now,
+            unix_timestamp_millis(),
+            Some(&index),
+        );
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -11205,7 +11636,13 @@ mod tests {
         assert_eq!(state.materialized_realm_config_default_strategy(), None);
 
         let index = state.revocation_index(now);
-        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
+        overlay_realm_config_reducer_materialization(
+            &mut config,
+            &state,
+            now,
+            unix_timestamp_millis(),
+            Some(&index),
+        );
         assert_eq!(config.default_strategy_id, None);
     }
 
@@ -11978,6 +12415,7 @@ mod tests {
             &mut future_config,
             &state,
             future,
+            unix_timestamp_millis(),
             Some(&index),
         );
         assert_eq!(future_config.revoked_tokens.len(), 1);
@@ -18808,7 +19246,9 @@ mod tests {
 
     #[test]
     fn validate_node_info_upsert_accepts_owner_and_rejects_forgeries() {
-        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization};
+        use aruna_core::structs::{
+            AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+        };
 
         let node_id = node(7);
         let realm_id = RealmId::from_bytes([2u8; 32]);
@@ -18829,6 +19269,15 @@ mod tests {
                 heartbeat_at_ms: 5,
             },
             updated_at_ms: 5,
+            epoch: AdvertisementEpoch {
+                membership_generation: 1,
+                publisher_generation: 1,
+                observed_at_ms: 5,
+            },
+            compute_draining: false,
+            leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         };
         assert!(validate_node_info_upsert(&target, &owned.to_bytes().unwrap()).is_ok());
 
@@ -18848,6 +19297,351 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn stale_advertisement_is_skipped() {
+        // A delayed advertisement from an older rejoin epoch must not replace
+        // the newer one this node already stored.
+        use aruna_core::structs::{
+            AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+        };
+
+        let document = |membership: u64, publisher: u64| NodeInfoDocument {
+            node_id: node(7),
+            executors: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 1,
+                documents_held: None,
+                load_permille: None,
+                heartbeat_at_ms: 5,
+            },
+            updated_at_ms: 5,
+            epoch: AdvertisementEpoch {
+                membership_generation: membership,
+                publisher_generation: publisher,
+                observed_at_ms: 5,
+            },
+            compute_draining: false,
+            leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
+        };
+        let current = document(7, 1).to_bytes().expect("document serializes");
+
+        assert!(node_info_supersedes(&document(7, 2), Some(&current)));
+        assert!(!node_info_supersedes(&document(6, 900), Some(&current)));
+        assert!(!node_info_supersedes(&document(7, 1), Some(&current)));
+        assert!(node_info_supersedes(&document(1, 1), None));
+        assert!(node_info_supersedes(&document(1, 1), Some(b"corrupt")));
+
+        // An unbounded or self-contradicting snapshot never reaches storage.
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let target = DocumentSyncTarget::NodeInfo {
+            realm_id,
+            node_id: node(7),
+        };
+        let mut ahead = document(7, 1);
+        ahead.demand.epoch.membership_generation = 8;
+        assert!(
+            validate_node_info_upsert(&target, &postcard::to_allocvec(&ahead).unwrap()).is_err()
+        );
+    }
+
+    /// The user every policy fixture publishes under.
+    fn policy_admin(realm_id: RealmId) -> UserId {
+        UserId::local(Ulid::from_bytes([4u8; 16]), realm_id)
+    }
+
+    /// One authentic publication of `policy` by node `seed`.
+    fn signed_policy_document(
+        realm_id: RealmId,
+        policy: &aruna_core::structs::VerifiedPolicy,
+        seed: u8,
+    ) -> PlacementPolicyDocument {
+        let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+        let publication = aruna_core::structs::PolicyPublicationClaim::new(
+            realm_id,
+            policy,
+            secret.public(),
+            policy_admin(realm_id),
+            Ulid::from_bytes([5u8; 16]),
+            9,
+            [0u8; 32],
+        )
+        .sign(&secret);
+        PlacementPolicyDocument::new(realm_id, policy, publication)
+    }
+
+    /// Realm view a policy publication is verified against: the publisher is a
+    /// server node and the admin user holds realm-configuration write.
+    fn policy_realm_view(realm_id: RealmId) -> (RealmConfigDocument, RealmAuthorizationDocument) {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.seed_default_placement();
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        let role = Role {
+            role_id: Ulid::from_bytes([1u8; 16]),
+            name: "realm_admin".to_string(),
+            permissions: HashMap::from([(
+                format!("/{realm_id}/admin/**"),
+                aruna_core::structs::Permission::WRITE,
+            )]),
+            assigned_users: HashSet::from([policy_admin(realm_id)]),
+        };
+        let auth = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::from([(role.role_id, role)]),
+            operation_restrictions: HashMap::new(),
+        };
+        (config, auth)
+    }
+
+    async fn write_realm_view(
+        storage: &StorageHandle,
+        config: &RealmConfigDocument,
+        auth: &RealmAuthorizationDocument,
+    ) {
+        let actor = aruna_core::structs::Actor {
+            node_id: node(1),
+            user_id: policy_admin(config.realm_id),
+            realm_id: config.realm_id,
+        };
+        let config_target = DocumentSyncTarget::RealmConfig {
+            realm_id: config.realm_id,
+        };
+        let auth_target = DocumentSyncTarget::RealmAuthorization {
+            realm_id: config.realm_id,
+        };
+        let writes = vec![
+            (
+                config_target.storage_keyspace().to_string(),
+                config_target.storage_key(),
+                Value::from(config.to_bytes(&actor).expect("config encodes")),
+            ),
+            (
+                auth_target.storage_keyspace().to_string(),
+                auth_target.storage_key(),
+                Value::from(auth.to_bytes(&actor).expect("authorization encodes")),
+            ),
+        ];
+        storage_batch_write_to(storage, writes)
+            .await
+            .expect("realm view is stored");
+    }
+
+    fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::VerifiedPolicy {
+        use aruna_core::structs::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
+
+        let policy = PlacementPolicy::new(
+            policy_id,
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some("eu-west".to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    async fn policy_service(
+        realm_id: RealmId,
+        storage: StorageHandle,
+        root: &Path,
+    ) -> DocumentSyncService {
+        DocumentSyncService::open_with_persist_policy(
+            test_endpoint(31).await,
+            storage,
+            root.join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens")
+    }
+
+    #[tokio::test]
+    async fn admits_authentic_policy() {
+        let realm_id = RealmId::from_bytes([21u8; 32]);
+        let (dir, storage) = test_storage();
+        let (config, auth) = policy_realm_view(realm_id);
+        write_realm_view(&storage, &config, &auth).await;
+        let service = policy_service(realm_id, storage.clone(), dir.path()).await;
+
+        let policy = policy_fixture(Ulid::from_bytes([8u8; 16]));
+        let document = signed_policy_document(realm_id, &policy, 1);
+        let placement = config
+            .policy_placement(policy.policy().policy_id)
+            .expect("policy bucket resolves");
+        assert!(matches!(
+            service
+                .apply_policy_document(&document, placement)
+                .await
+                .expect("apply runs"),
+            MetadataPlacementOutcome::Accepted(true)
+        ));
+
+        let target = placement_policy_target(policy.policy().policy_id);
+        assert!(
+            read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+                .await
+                .is_some(),
+            "an authentic publication must be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_forged_publication() {
+        // A self-authoring ordinary node and a relay that substitutes itself as
+        // origin both lack realm-admin publication authority.
+        let realm_id = RealmId::from_bytes([22u8; 32]);
+        let (dir, storage) = test_storage();
+        let (config, auth) = policy_realm_view(realm_id);
+        write_realm_view(&storage, &config, &auth).await;
+        let service = policy_service(realm_id, storage.clone(), dir.path()).await;
+
+        let policy = policy_fixture(Ulid::from_bytes([9u8; 16]));
+        let placement = config
+            .policy_placement(policy.policy().policy_id)
+            .expect("policy bucket resolves");
+        let authentic = signed_policy_document(realm_id, &policy, 1);
+
+        let secret = iroh::SecretKey::from_bytes(&[2u8; 32]);
+        let self_authored = PlacementPolicyDocument::new(
+            realm_id,
+            &policy,
+            aruna_core::structs::PolicyPublicationClaim::new(
+                realm_id,
+                &policy,
+                secret.public(),
+                UserId::local(Ulid::from_bytes([7u8; 16]), realm_id),
+                Ulid::from_bytes([5u8; 16]),
+                9,
+                [0u8; 32],
+            )
+            .sign(&secret),
+        );
+        let mut relayed = authentic.clone();
+        relayed.publication.publisher = node(2);
+
+        for forged in [self_authored, relayed] {
+            assert!(matches!(
+                service
+                    .apply_policy_document(&forged, placement)
+                    .await
+                    .expect("apply runs"),
+                MetadataPlacementOutcome::Rejected
+            ));
+        }
+
+        let target = placement_policy_target(policy.policy().policy_id);
+        assert!(
+            read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+                .await
+                .is_none(),
+            "a forged publication must leave no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn defers_unknown_authority() {
+        // Without the replicated authorization document the publication cannot
+        // be verified yet, so it waits instead of being accepted or dropped.
+        let realm_id = RealmId::from_bytes([23u8; 32]);
+        let (dir, storage) = test_storage();
+        let (config, _) = policy_realm_view(realm_id);
+        let actor = aruna_core::structs::Actor {
+            node_id: node(1),
+            user_id: policy_admin(realm_id),
+            realm_id,
+        };
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                target.storage_keyspace().to_string(),
+                target.storage_key(),
+                Value::from(config.to_bytes(&actor).expect("config encodes")),
+            )],
+        )
+        .await
+        .expect("config is stored");
+        let service = policy_service(realm_id, storage.clone(), dir.path()).await;
+
+        let policy = policy_fixture(Ulid::from_bytes([10u8; 16]));
+        let document = signed_policy_document(realm_id, &policy, 1);
+        let placement = config
+            .policy_placement(policy.policy().policy_id)
+            .expect("policy bucket resolves");
+        assert!(matches!(
+            service
+                .apply_policy_document(&document, placement)
+                .await
+                .expect("apply runs"),
+            MetadataPlacementOutcome::Deferred(DocumentSyncDependency::RealmAuthorization(deferred))
+                if deferred == realm_id
+        ));
+    }
+
+    #[test]
+    fn binds_policy_target() {
+        use aruna_core::structs::{
+            PlacementPolicy, PlacementSelector, VerifiedPolicy, placement_policy_change,
+        };
+
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let policy_id = Ulid::from_bytes([8u8; 16]);
+        let selector = |location: &str| PlacementSelector {
+            node_id: None,
+            location: Some(location.to_string()),
+            labels: Vec::new(),
+            executor_kind: None,
+        };
+        let policy = VerifiedPolicy::verify(
+            PlacementPolicy::new(
+                policy_id,
+                "residency".to_string(),
+                vec![selector("eu-west")],
+            )
+            .expect("policy is valid"),
+        )
+        .expect("policy verifies");
+        let document = signed_policy_document(realm_id, &policy, 7);
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([6u8; 16]),
+            shard: 3,
+        };
+        let change = placement_policy_change(&document, placement);
+        assert!(validate_policy_document(policy_id, realm_id, &document, &change).is_ok());
+
+        // Another target, another realm, or a restated revision is refused.
+        assert!(
+            validate_policy_document(Ulid::from_bytes([9u8; 16]), realm_id, &document, &change)
+                .is_err()
+        );
+        assert!(
+            validate_policy_document(
+                policy_id,
+                RealmId::from_bytes([3u8; 32]),
+                &document,
+                &change
+            )
+            .is_err()
+        );
+        let mut restated = change;
+        restated.current.actor = node(8);
+        assert!(validate_policy_document(policy_id, realm_id, &document, &restated).is_err());
     }
 
     #[tokio::test]
@@ -19343,7 +20137,9 @@ mod tests {
     }
 
     fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
-        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization};
+        use aruna_core::structs::{
+            AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+        };
 
         NodeInfoDocument {
             node_id,
@@ -19360,6 +20156,15 @@ mod tests {
                 heartbeat_at_ms: updated_at_ms,
             },
             updated_at_ms,
+            epoch: AdvertisementEpoch {
+                membership_generation: 1,
+                publisher_generation: updated_at_ms,
+                observed_at_ms: updated_at_ms,
+            },
+            compute_draining: false,
+            leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         }
         .to_bytes()
         .expect("node info serializes")

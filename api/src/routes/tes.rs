@@ -10,14 +10,14 @@ use aruna_core::compute::{
 };
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState, OutputDestination, OutputSelection,
-    blob_group_permission_path,
+    JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
+    OutputSelection, blob_group_permission_path,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
+use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
-    submit_execution_job,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
@@ -463,7 +463,7 @@ pub async fn service_info(
     path = "/ga4gh/tes/v1/tasks",
     tag = "tes",
     summary = "Create a TES task",
-    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 512 outputs; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id.",
+    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound the immutable output record carries; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id. Admission refusals carry the same status semantics as the native submit surface: a quota or composition refusal is a 409, an unusable input or workspace a 400, a refused routed authority a 403, and the retryable 503 is reserved for an unreachable family holder, a demand view that could not be read or did not settle, admission losing three transactions in a row to concurrent submissions of the same group, and an unhealthy id clock. A standing quota decided on an understated demand view is a 409 like an exceeded cap, and a replay of a known idempotency key is settled before any quota is read and is never quota-refused.",
     request_body(
         content = TesTask,
         description = "Task definition: one executor, s3:// inputs and outputs, and optional resources and tags",
@@ -502,16 +502,18 @@ pub async fn service_info(
             body = TesCreateTaskResponse,
             example = json!({"id": "01JABCDEF0123456789ABCDEFG"})
         ),
-        (status = 400, description = "Malformed task, or a TES feature this facade does not support", body = TesErrorPayload),
+        (status = 400, description = "Malformed task, a TES feature this facade does not support, an input that is not a readable object, or more outputs than a task may declare", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
-        (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, or a path restricted credential", body = TesErrorPayload),
-        (status = 409, description = "The idempotency key tag is already bound to a different task", body = TesErrorPayload)
+        (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, a path restricted credential, or a routed authority refusing the submission", body = TesErrorPayload),
+        (status = 409, description = "The idempotency key tag is already bound to a different task, the group's standing compute quota refuses this admission, or the composition conflicts on a staged key", body = TesErrorPayload),
+        (status = 503, description = "No family holder could admit the task, the group's demand view could not be read or did not settle, admission lost three transactions in a row to concurrent submissions, or the id clock is unhealthy; retryable, the caller may create the task again with the same idempotency key", body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
 pub async fn create_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     headers: HeaderMap,
     Json(task): Json<TesTask>,
 ) -> Response {
@@ -544,15 +546,23 @@ pub async fn create_task(
         aruna_core::structs::WorkspaceMode::Kept
     };
 
-    match submit_execution_job(
+    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+        Ok(token) => token.or_else(|| {
+            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+                caller.auth.clone(),
+            ))
+        }),
+        Err(error) => return error.into_response(),
+    };
+    match submit_external_job(
         &state.get_ctx(),
         spec,
         caller.auth.user_id,
-        state.get_node_id(),
         idempotency_key,
         workspace_mode,
         None,
         state.rocrate_limits().artifact_retention_ms,
+        forwarded,
     )
     .await
     {
@@ -562,13 +572,7 @@ pub async fn create_task(
                 id: result.job_id.to_string(),
             },
         ),
-        Err(aruna_operations::jobs::submit::SubmitJobError::JobPlanConflict {
-            existing_job_id,
-        }) => TesError::conflict(format!(
-            "idempotency key already bound to task {existing_job_id}"
-        ))
-        .into_response(),
-        Err(error) => TesError::internal(error.to_string()).into_response(),
+        Err(error) => TesError::from_submit(error).into_response(),
     }
 }
 
@@ -577,7 +581,7 @@ pub async fn create_task(
     path = "/ga4gh/tes/v1/tasks/{id}",
     tag = "tes",
     summary = "Get a single TES task",
-    description = "Returns one task of the calling user. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Tasks are self scoped: a task created by another user, a task outside the group of the basic credential, an id that is not a task of this facade and an id that does not parse are all answered with 404 rather than 403, so the existence of a task is never disclosed. The record is read from the node that owns the task and only that node answers absence; when it cannot be reached the call fails with a retryable 503 instead of reporting the task as missing. The state reported is the polling contract of task creation: QUEUED, INITIALIZING, RUNNING, then COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, with CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined. Executor logs, including the exit code, appear only once the task is terminal.",
+    description = "Returns one task of the calling user. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Tasks are self scoped: a task created by another user, a task outside the group of the basic credential, an id that is not a task of this facade and an id that does not parse are all answered with 404 rather than 403, so the existence of a task is never disclosed. A distributed execution task is reduced from its replicated records by whichever node answers, so it carries the same logical view as the native REST status; any other task is read from the node that owns it and only that node answers absence, and when it cannot be reached the call fails with a retryable 503 instead of reporting the task as missing. The state reported is the polling contract of task creation: QUEUED, INITIALIZING, RUNNING, then COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, with CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; UNKNOWN is also what a distributed task reports while no execution has succeeded, because realm-wide failure can never be inferred from silence. Output URLs in the task log name the exact `versionId` the canonical execution wrote, which is not necessarily the object's current version: a duplicate execution admitted during a partition, or any later write, may have made another version current. Executor logs, including the exit code, appear only once the task is terminal.",
     params(
         ("id" = String, Path, description = "TES task id (the JobId): the 26 character ULID returned by task creation; an id that does not parse is answered with 404 like an unknown task"),
         ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL projection: MINIMAL (the default) returns only `id` and `state`, BASIC adds the task definition, tags, timing and captured output files, FULL adds executor stdout and stderr and the system logs; any other value is a 400")
@@ -659,16 +663,29 @@ pub async fn get_task(
     };
 
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
-        Ok(token) => token,
+        Ok(token) => token.or_else(|| {
+            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+                caller.auth.clone(),
+            ))
+        }),
         Err(error) => return TesError::from_server(error).into_response(),
     };
-    // The owner is the sole 404 authority; a non-owner routes or reports 503.
-    let record =
-        match read_record_routed(&state.get_ctx(), caller.auth.user_id, job_id, forwarded).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return TesError::not_found("TES task not found").into_response(),
-            Err(error) => return TesError::from_job_route(error).into_response(),
-        };
+    // A distributed external job is projected from the replicated family, so
+    // this surface reports the same logical view and the same exact output
+    // VersionIds as the native REST status.
+    let record = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
+        Some(Ok(report)) => family_record(&report),
+        Some(Err(error)) => return TesError::from_job_route(error).into_response(),
+        // The owner is the sole 404 authority; a non-owner routes or reports 503.
+        None => {
+            match read_record_routed(&state.get_ctx(), caller.auth.user_id, job_id, forwarded).await
+            {
+                Ok(Some(record)) => record,
+                Ok(None) => return TesError::not_found("TES task not found").into_response(),
+                Err(error) => return TesError::from_job_route(error).into_response(),
+            }
+        }
+    };
     // Only execution jobs are TES tasks; other job kinds are not addressable here.
     if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
@@ -755,10 +772,15 @@ pub async fn list_tasks(
     };
 
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
-    let tasks = records
-        .iter()
-        .map(|record| project_task(record, view, &base_url))
-        .collect();
+    let mut tasks = Vec::with_capacity(records.len());
+    for record in records {
+        let record = match family_report(&state.get_ctx(), &caller.auth, record.job_id).await {
+            Some(Ok(report)) => family_record(&report),
+            Some(Err(error)) => return TesError::from_job_route(error).into_response(),
+            None => record,
+        };
+        tasks.push(project_task(&record, view, &base_url));
+    }
 
     tes_json_response(
         StatusCode::OK,
@@ -811,21 +833,28 @@ pub async fn cancel_task(
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
-        Ok(token) => token,
+        Ok(token) => token.or_else(|| {
+            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+                caller.auth.clone(),
+            ))
+        }),
         Err(error) => return TesError::from_server(error).into_response(),
     };
-    // Group scoping needs the owner record; the owner is the 404 authority.
-    let record = match read_record_routed(
-        &state.get_ctx(),
-        caller.auth.user_id,
-        job_id,
-        forwarded.clone(),
-    )
-    .await
-    {
-        Ok(Some(record)) => record,
-        Ok(None) => return TesError::not_found("TES task not found").into_response(),
-        Err(error) => return TesError::from_job_route(error).into_response(),
+    let record = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
+        Some(Ok(report)) => family_record(&report),
+        Some(Err(error)) => return TesError::from_job_route(error).into_response(),
+        None => match read_record_routed(
+            &state.get_ctx(),
+            caller.auth.user_id,
+            job_id,
+            forwarded.clone(),
+        )
+        .await
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => return TesError::not_found("TES task not found").into_response(),
+            Err(error) => return TesError::from_job_route(error).into_response(),
+        },
     };
     if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
@@ -948,7 +977,7 @@ fn map_task_to_spec(
         }
         inputs.push(input);
     }
-    if task.outputs.len() > MAX_TASK_IO {
+    if task.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(TesError::bad_request("too many task outputs"));
     }
     let mut file_outputs: Vec<OutputSelection> = Vec::with_capacity(task.outputs.len());
@@ -1056,9 +1085,10 @@ fn map_task_to_spec(
         file_outputs,
         workspace_outputs: Vec::new(),
         output_prefixes: Vec::new(),
+        collision_policy: Default::default(),
     };
 
-    // Handed over as the raw idempotency key: `submit_execution_job` applies the per-user
+    // Handed over as the raw idempotency key: the ingress applies the per-user
     // `user/` namespacing itself, so TES inherits dedup scoping for free.
     let idempotency_key = task.tags.get(IDEMPOTENCY_TAG_KEY).cloned();
 
@@ -1092,6 +1122,7 @@ fn map_input(input: &TesInput, s3_mounts: bool) -> Result<InputSelection, TesErr
             key,
             version_id: None,
         },
+        source_node_id: None,
         dest_key: input.path[1..].to_string(),
         mode: if s3_mounts {
             InputMode::Mount
@@ -1118,6 +1149,7 @@ fn map_output(output: &TesOutput) -> Result<OutputSelection, TesError> {
     Ok(OutputSelection {
         container_path: output.path.clone(),
         path_prefix,
+        destination_node_id: None,
         destination: OutputDestination::S3 { bucket, key },
         name: output.name.clone(),
         description: output.description.clone(),
@@ -1219,6 +1251,51 @@ fn tes_state(record: &JobRecord) -> TesState {
         },
         JobState::Cancelled => TesState::Canceled,
     }
+}
+
+/// The reduced family as the local row shape every TES projection reads. Only
+/// the canonical successful execution supplies outputs, and they keep their
+/// exact VersionIds, so a later unrelated write never becomes this task's
+/// result.
+fn family_record(report: &FamilyReport) -> JobRecord {
+    let mut record = JobRecord::new(
+        report.job.job_id,
+        JobPayload::Execution(report.spec.payload.clone()),
+        report.spec.created_by,
+        report.spec.origin_node_id,
+        report.spec.created_at_ms,
+        report.job.updated_at_ms,
+        None,
+    );
+    record.state = report.job.state;
+    record.attempts = report.job.attempts;
+    record.cancel_requested = report.cancel_requested;
+    record.workspace_mode = report.job.workspace_mode;
+    record.workspace_bucket = report.job.workspace_bucket.clone();
+    record.retention_ms = report.spec.retention_ms;
+    record.finished_at_ms = report.job.finished_at_ms;
+    record.last_error = report.job.last_error.clone();
+    record.result = matches!(report.job.state, JobState::Succeeded | JobState::Failed).then(|| {
+        JobResultPayload::Execution {
+            exit_code: report
+                .canonical_result
+                .as_ref()
+                .and_then(|result| result.exit_code),
+            workspace_bucket: report.job.workspace_bucket.clone(),
+            outputs: if report.job.state == JobState::Succeeded {
+                report.outputs.clone()
+            } else {
+                Vec::new()
+            },
+            stdout: String::new(),
+            stderr: String::new(),
+            output_digest: report
+                .canonical_result
+                .as_ref()
+                .and_then(|result| result.output_digest),
+        }
+    });
+    record
 }
 
 fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
@@ -1361,7 +1438,12 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
         outputs = captured
             .iter()
             .map(|output| TesOutputFileLog {
-                url: format!("s3://{}/{}", output.bucket, output.key),
+                // Names the exact version, so the caller still retrieves this
+                // output after a later write becomes the object's latest.
+                url: format!(
+                    "s3://{}/{}?versionId={}",
+                    output.bucket, output.key, output.version_id
+                ),
                 path: if output.container_path.is_empty() {
                     output.key.clone()
                 } else {
@@ -1589,13 +1671,6 @@ impl TesError {
         }
     }
 
-    fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-        }
-    }
-
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1608,8 +1683,17 @@ impl TesError {
             ServerError::Unauthorized => Self::unauthorized(),
             ServerError::Forbidden => Self::forbidden("forbidden"),
             ServerError::NotFound => Self::not_found("TES task not found"),
-            other => Self::internal(other.to_string()),
+            other => Self {
+                status: other.status_code(),
+                message: other.public_message(),
+            },
         }
+    }
+
+    /// Task creation shares the REST submit mapping, so a refusal a TES client
+    /// must not retry never reaches it as a retryable 500.
+    fn from_submit(error: aruna_operations::jobs::submit::SubmitJobError) -> Self {
+        Self::from_server(super::jobs::map_submit_error(error))
     }
 
     fn from_job_route(error: JobRouteError) -> Self {
@@ -1650,7 +1734,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use aruna_operations::jobs::service::read_owned_job;
     use axum::body::to_bytes;
 
     use aruna_core::effects::StorageEffect;
@@ -1659,7 +1742,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, JobError, NodeCapabilities, OutputObject,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, WorkspaceMode,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
     };
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
@@ -1888,6 +1971,7 @@ mod tests {
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         });
         let terminal = build_task_log(&record, "");
         assert_eq!(terminal.logs.len(), 1);
@@ -1911,6 +1995,72 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["msg"], "visible reason");
+    }
+
+    #[test]
+    fn maps_submit_errors() {
+        // A TES client retries 500, so every non-retryable admission refusal
+        // must keep the status the native submit surface answers with.
+        use aruna_core::ClockHealthError;
+        use aruna_core::compute_quota::{QuotaDenied, QuotaDimension, QuotaScope};
+        use aruna_core::structs::CompositionError;
+        use aruna_operations::jobs::submit::SubmitJobError;
+
+        let cases = [
+            (
+                SubmitJobError::JobPlanConflict {
+                    existing_job_id: JobId::from_bytes([7u8; 16]),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::QuotaDenied(QuotaDenied {
+                    scope: QuotaScope::Group,
+                    dimension: QuotaDimension::CpuCores,
+                    observed: 30,
+                    requested: 8,
+                    limit: 32,
+                }),
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::ActiveJobLimit { limit: 4 },
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::Composition(CompositionError::KeyConflict("reads".to_string())),
+                StatusCode::CONFLICT,
+            ),
+            (
+                SubmitJobError::Composition(CompositionError::MissingVersion("reads".to_string())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SubmitJobError::TooManyOutputs { limit: 1024 },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SubmitJobError::InvalidWorkspace("no bucket".to_string()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (SubmitJobError::AuthorityDenied, StatusCode::FORBIDDEN),
+            (
+                SubmitJobError::ClockHealth(ClockHealthError::TimestampOverflow {
+                    timestamp_ms: u64::MAX,
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(TesError::from_submit(error).status, expected);
+        }
+
+        // The 503 body carries the fixed reason, never a holder identity.
+        let unavailable = TesError::from_submit(SubmitJobError::PlacementUnavailable(
+            "node 7 idle".to_string(),
+        ));
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.message, "job_placement_unavailable");
     }
 
     #[test]
@@ -1945,7 +2095,7 @@ mod tests {
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
 
         let mut task = sample_task(group);
-        task.outputs = vec![task.outputs[0].clone(); MAX_TASK_IO + 1];
+        task.outputs = vec![task.outputs[0].clone(); MAX_EXECUTION_OUTPUTS + 1];
         let error = map_task_to_spec(&task, None, true).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
@@ -2298,6 +2448,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         };
         let mut record = execution_record(JobId::from_bytes([1u8; 16]), user(2), spec());
         let cases = [
@@ -2329,6 +2480,7 @@ mod tests {
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
+            output_digest: None,
         });
         assert_eq!(tes_state(&record), TesState::ExecutorError);
         if let Some(JobResultPayload::Execution { exit_code, .. }) = &mut record.result {
@@ -2357,6 +2509,7 @@ mod tests {
                 key: "workspace-only".to_string(),
                 version_id: None,
             },
+            source_node_id: None,
             dest_key: "native/input".to_string(),
             mode: InputMode::Snapshot,
             container_path: None,
@@ -2369,14 +2522,18 @@ mod tests {
             exit_code: Some(0),
             workspace_bucket: Some("ws-x".to_string()),
             outputs: vec![OutputObject {
+                node_id: record.owner_node_id,
                 bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),
+                version_id: Ulid::from_bytes([21u8; 16]),
+                execution_id: Ulid::from_bytes([22u8; 16]),
                 container_path: "/out/report.txt".to_string(),
                 size: 12,
                 digest: None,
             }],
             stdout: "hello".to_string(),
             stderr: "error".to_string(),
+            output_digest: None,
         });
 
         let minimal = project_task(&record, TesView::Minimal, "http://x");
@@ -2414,8 +2571,158 @@ mod tests {
         assert_eq!(full.logs[0].logs[0].stderr.as_deref(), Some("error"));
         assert_eq!(full.logs[0].system_logs, vec!["prior failure"]);
         assert_eq!(full.logs[0].outputs.len(), 1);
-        assert_eq!(full.logs[0].outputs[0].url, "s3://dest/out/r.txt");
+        assert_eq!(
+            full.logs[0].outputs[0].url,
+            format!(
+                "s3://dest/out/r.txt?versionId={}",
+                Ulid::from_bytes([21u8; 16])
+            )
+        );
         assert_eq!(full.logs[0].outputs[0].path, "/out/report.txt");
+    }
+
+    #[test]
+    fn family_keeps_exact_versions() {
+        // The TES view of a distributed job is the same logical projection as
+        // the native REST one: the canonical execution's exact VersionIds, and
+        // no result at all while the family has no canonical success.
+        use aruna_core::jobs::{JobKind, JobStatusView};
+        use aruna_core::structs::{
+            EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
+            LogicalJobState, OutputObject, PlacementRef, RealmId, SubmissionId, WorkspaceMode,
+        };
+        use aruna_operations::jobs::lifecycle::FamilyReport;
+
+        let realm_id = RealmId([1u8; 32]);
+        let created_by = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let submission_id = SubmissionId([5u8; 32]);
+        let resources = EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 1,
+            disk_bytes: 0,
+            max_walltime_ms: 1_000,
+            preemptible: false,
+        };
+        let mut payload = ExecutionSpec {
+            group_id: Ulid::from_bytes([6u8; 16]),
+            name: None,
+            description: None,
+            tags: BTreeMap::new(),
+            image: "img".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            workdir: None,
+            env: BTreeMap::new(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+        payload.name = Some("family task".to_string());
+        let spec = LogicalJobSpec {
+            submission_id,
+            job_id,
+            origin_node_id: node_id,
+            ingress_node_id: node_id,
+            realm_id,
+            group_id: payload.group_id,
+            created_by,
+            created_at_ms: 10,
+            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
+            payload,
+            request_digest: [7u8; 32],
+            spec_digest: [8u8; 32],
+            resources,
+            retry: JobRetryPolicy {
+                max_launches_per_witness: 3,
+            },
+            admission: JobAdmissionRecord {
+                submission_id,
+                request_digest: [7u8; 32],
+                job_id,
+                group_id: Ulid::from_bytes([6u8; 16]),
+                admitting_node_id: node_id,
+                membership_generation: 0,
+                resources,
+                admitted_at_ms: 10,
+            },
+            input_facts: Vec::new(),
+            output_policies: Vec::new(),
+            placement: PlacementRef::NIL,
+        };
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        let execution_id = Ulid::from_bytes([10u8; 16]);
+        let report = FamilyReport {
+            job: JobStatusView {
+                job_id,
+                created_by,
+                kind: JobKind::Execution,
+                state: JobState::Succeeded,
+                attempts: 2,
+                cancel_requested: false,
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                finished_at_ms: Some(20),
+                progress: JobProgress::new("phases"),
+                last_error: None,
+                result: None,
+                workspace_bucket: Some("ws".to_string()),
+                workspace_mode: WorkspaceMode::Kept,
+            },
+            spec,
+            submission_id,
+            request_digest: [7u8; 32],
+            canonical_job_id: job_id,
+            aliases: vec![job_id],
+            conflicts: 0,
+            state: LogicalJobState::Succeeded,
+            canonical_execution_id: Some(execution_id),
+            canonical_result: Some(aruna_core::structs::PhysicalExecutionResult {
+                exit_code: Some(0),
+                output_digest: Some([12u8; 32]),
+                message: None,
+            }),
+            executions: 2,
+            duplicate_successes: 1,
+            outputs: vec![OutputObject {
+                node_id,
+                bucket: "dest".to_string(),
+                key: "out/r.txt".to_string(),
+                version_id,
+                execution_id,
+                container_path: "/out/report.txt".to_string(),
+                size: 12,
+                digest: None,
+            }],
+            output_endpoints: std::collections::BTreeMap::new(),
+            revision: 3,
+            digest: [11u8; 32],
+            cancel_requested: false,
+            responder: Some(node_id),
+            partial: false,
+            locally_exhausted: false,
+            plan: None,
+        };
+
+        let task = project_task(&family_record(&report), TesView::Full, "http://x");
+
+        assert_eq!(task.state, Some(TesState::Complete));
+        assert_eq!(
+            task.logs[0].outputs[0].url,
+            format!("s3://dest/out/r.txt?versionId={version_id}")
+        );
+
+        let mut running = report.clone();
+        running.job.state = JobState::Running;
+        running.state = LogicalJobState::Running;
+        let pending = project_task(&family_record(&running), TesView::Full, "http://x");
+        assert_eq!(pending.state, Some(TesState::Running));
+        assert!(pending.logs[0].outputs.is_empty());
     }
 
     #[test]
@@ -2437,6 +2744,7 @@ mod tests {
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
         };
         let record = execution_record(JobId::from_bytes([3u8; 16]), user(2), spec.clone());
         let task = project_task(&record, TesView::Basic, "http://x");
@@ -2489,6 +2797,9 @@ mod tests {
 
     #[tokio::test]
     async fn creates_tagless_basic() {
+        // Tagless basic auth infers the group and reaches admission; the
+        // fixture has no network handle, so no family holder exists and the
+        // honest single-node answer is the fixed-text 503, not an auth failure.
         let (_dir, state) = build_state(true).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = sealed(&state, group);
@@ -2497,32 +2808,24 @@ mod tests {
         let mut task = sample_task(group);
         task.tags.remove(GROUP_TAG_KEY);
 
+        let (spec, workspace) = map_task_to_spec(&task, Some(group), true).unwrap();
+        assert_eq!(spec.group_id, group);
+        assert!(workspace.is_none());
+
         let response = create_task(
             State(state.clone()),
+            Extension(None),
             Extension(None),
             basic_headers(&access, TES_SECRET),
             Json(task),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let created: TesCreateTaskResponse = serde_json::from_slice(&body).unwrap();
-        let record = read_owned_job(
-            &state.get_ctx(),
-            access.user_identity,
-            JobId::from_str(&created.id).unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let JobPayload::Execution(spec) = record.payload else {
-            panic!("TES created a non-execution job");
-        };
-        assert_eq!(spec.group_id, group);
-        assert_eq!(record.workspace_mode, WorkspaceMode::None);
-        assert!(record.workspace_bucket.is_none());
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["msg"], "job_placement_unavailable");
     }
 
     #[test]
@@ -2537,38 +2840,27 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_when_disabled() {
-        // Without S3 mounts, TES falls back to a kept workspace and snapshot inputs.
+        // Without S3 mounts the mapping falls back to snapshot inputs, and the
+        // create call reaches admission; the handle-less fixture has no family
+        // holder, so 503 is the honest outcome.
         let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = sealed(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
 
+        let (spec, _) = map_task_to_spec(&sample_task(group), None, false).unwrap();
+        assert_eq!(spec.inputs[0].mode, InputMode::Snapshot);
+
         let response = create_task(
             State(state.clone()),
+            Extension(None),
             Extension(None),
             basic_headers(&access, TES_SECRET),
             Json(sample_task(group)),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let created: TesCreateTaskResponse = serde_json::from_slice(&body).unwrap();
-        let record = read_owned_job(
-            &state.get_ctx(),
-            access.user_identity,
-            JobId::from_str(&created.id).unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(record.workspace_mode, WorkspaceMode::Kept);
-        let JobPayload::Execution(spec) = record.payload else {
-            panic!("TES created a non-execution job");
-        };
-        assert_eq!(spec.inputs[0].mode, InputMode::Snapshot);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

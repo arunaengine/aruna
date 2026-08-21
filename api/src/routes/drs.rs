@@ -10,7 +10,12 @@ use aruna_core::structs::{
     VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
 };
 use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::replication::location_summary::{
+    LocationSummaryError, RemoteLocationSummaryOperation,
+};
+use aruna_operations::replication::protocol::LocationSummaryRequest;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -19,10 +24,13 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 use ulid::Ulid;
 use url::form_urlencoded::byte_serialize;
@@ -32,6 +40,13 @@ use utoipa_axum::routes;
 
 const W3ID_DATA_PREFIX: &str = "https://w3id.org/aruna/data/";
 const ACCESS_ID_HTTPS: &str = "https";
+/// Whole-request budget for the routed probes one call may need, however many
+/// identifiers it names.
+const DRS_ROUTED_TIMEOUT: Duration = Duration::from_secs(5);
+/// Identifiers one bulk request may name. Each foreign one costs a routed probe.
+const MAX_BULK_OBJECT_IDS: usize = 100;
+/// Routed probes of one bulk request that may be in flight at once.
+const BULK_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -191,8 +206,12 @@ struct ResolvedObject {
     version_id: Ulid,
     canonical_w3id: String,
     requested_id: String,
-    location: BackendLocation,
+    size: u64,
+    /// Ordered, so the same object always reports its checksums in one order.
+    hashes: BTreeMap<String, Vec<u8>>,
     source_metadata: Option<SourceMetadata>,
+    /// Present only when the bytes live here; a routed resolve reports metadata.
+    location: Option<BackendLocation>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -200,6 +219,8 @@ enum ResolveOutcome {
     Found(ResolvedObject),
     Denied,
     NotFound,
+    /// The owning node could not answer; absence was never established.
+    Unavailable,
 }
 
 #[utoipa::path(
@@ -291,7 +312,7 @@ pub async fn get_authorizations(
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
     summary = "Resolve a DRS object by identifier",
-    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. A request without a bearer token, or with one this node cannot validate, is treated as anonymous rather than rejected, and READ is then evaluated for the Everyone principal. Only content held by this node in this realm resolves; an identifier naming another realm or node answers 404 without any lookup, so this is a node-local operation with no fan-out. A caller that presented a token but lacks READ gets 403, while an anonymous caller in the same position gets the same 404 as for a missing object, so existence is never revealed to an unauthenticated caller. A content-hash identifier is resolved against every object on this node carrying that content and the first one the caller may read is returned, so the same digest can resolve differently for different callers. The response carries the requested identifier in `id`, the canonical W3ID in `aliases` when the request used a different form, the stored checksums including the blake3 content digest, and a single `https` access method whose `access_url.url` is a direct download URL on this node; no redirect is issued and no signed or time-limited URL is minted, so the caller must send its own bearer token to that URL. `contents` is always null because bundles are not served.",
+    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. A request without a bearer token, or with one this node cannot validate, is treated as anonymous rather than rejected, and READ is then evaluated for the Everyone principal. An identifier naming another realm answers 404 without any lookup. A versioned identifier naming another node of this realm is probed at that node, which alone establishes absence: within one bounded probe budget the answer is its own 404, 403 or the object's metadata, and anything short of an answer is a retryable 503 rather than a 404. Only the owning node serves the bytes, so a routed answer advertises no access method. A caller that presented a token but lacks READ gets 403, while an anonymous caller in the same position gets the same 404 as for a missing object, so existence is never revealed to an unauthenticated caller. A content-hash identifier is resolved against every object on this node carrying that content and the first one the caller may read is returned, so the same digest can resolve differently for different callers. The response carries the requested identifier in `id`, the canonical W3ID in `aliases` when the request used a different form, the stored checksums including the blake3 content digest in a stable order, and, for an object held here, a single `https` access method whose `access_url.url` is a direct download URL on this node; no redirect is issued and no signed or time-limited URL is minted, so the caller must send its own bearer token to that URL. `contents` is always null because bundles are not served.",
     params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator: `https://w3id.org/aruna/data/{blake3-hex}`, `https://w3id.org/aruna/data/{versioned-s3-arn}`, `arn:aruna:{realm_id}:{node_id}:ch/{blake3-hex}` with 64 lowercase hex characters, or `arn:aruna:{realm_id}:{node_id}:s3/{bucket}/{key}@{version-ulid}` whose key is percent-encoded except for the separating slashes. Identifiers contain slashes, so the whole remainder of the path is taken as the identifier")),
     responses(
         (status = 200, description = "The resolved DRS object, as visible to this caller", body = DrsObjectResponse, example = json!({
@@ -321,7 +342,8 @@ pub async fn get_authorizations(
         })),
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
         (status = 403, description = "The caller presented a token but may not read the object, or the token belongs to another realm", body = DrsErrorPayload),
-        (status = 404, description = "No such object on this node, or an anonymous caller may not read it", body = DrsErrorPayload)
+        (status = 404, description = "No such object on this node, or an anonymous caller may not read it", body = DrsErrorPayload),
+        (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, so absence was never established; the caller may retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -339,12 +361,13 @@ pub async fn get_object(
         Err(error) => return error.into_response(),
     };
 
-    match resolve_object(state.as_ref(), &auth, &object_id).await {
+    match resolve_object(state.as_ref(), &auth, &object_id, routed_deadline()).await {
         Ok(ResolveOutcome::Found(resolved)) => {
             drs_json_response(StatusCode::OK, build_object_response(&base_url, &resolved))
         }
         Ok(ResolveOutcome::Denied) => drs_denied_error(anonymous).into_response(),
         Ok(ResolveOutcome::NotFound) => DrsError::not_found("DRS object not found").into_response(),
+        Ok(ResolveOutcome::Unavailable) => DrsError::unavailable().into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -354,7 +377,7 @@ pub async fn get_object(
     path = "/ga4gh/drs/v1/objects",
     tag = "drs",
     summary = "Resolve several DRS objects in one request",
-    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. Each identifier is resolved and authorized exactly as the single-object lookup does, one after another and node-locally, so a batch is a convenience and not a transaction. The request itself succeeds with 200 whenever the body parses: per-identifier failures are reported inside the matching entry as `{status_code, msg}` instead of failing the batch, an unreadable object appears as 403 for a token-bearing caller and as 404 for an anonymous one, and an object that could not be serialized appears as 500. Entries are returned in the order the identifiers were given, one entry per identifier, including duplicates. The number of identifiers is bounded only by the server's maximum request body size.",
+    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role. Each identifier is resolved and authorized exactly as the single-object lookup does, so a batch is a convenience and not a transaction. At most 100 identifiers may be named and a longer list is rejected with 400 before anything is resolved. Identifiers owned by other nodes are probed concurrently against one budget for the whole request, so a batch costs no more wall time than a single lookup; an identifier whose owner did not answer inside that budget appears as a per-item 503, never as an absence. The request itself succeeds with 200 whenever the body parses and stays inside the cap: per-identifier failures are reported inside the matching entry as `{status_code, msg}` instead of failing the batch, an unreadable object appears as 403 for a token-bearing caller and as 404 for an anonymous one, and an object that could not be serialized appears as 500. Entries are returned in the order the identifiers were given, one entry per identifier, including duplicates.",
     request_body(
         content = DrsBulkObjectsRequestBody,
         description = "The DRS identifiers to resolve, in any of the forms the single-object lookup accepts",
@@ -399,7 +422,7 @@ pub async fn get_object(
                 }
             ]
         })),
-        (status = 400, description = "The request body is not valid JSON for a list of identifiers; this rejection comes from the body extractor and is returned as plain text rather than the declared payload", body = DrsErrorPayload)
+        (status = 400, description = "More than 100 identifiers were named, or the request body is not valid JSON for a list of identifiers; the malformed-body rejection comes from the body extractor and is returned as plain text rather than the declared payload", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -410,6 +433,12 @@ pub async fn post_objects(
     headers: HeaderMap,
     Json(body): Json<DrsBulkObjectsRequestBody>,
 ) -> Response {
+    if body.object_ids.len() > MAX_BULK_OBJECT_IDS {
+        return DrsError::bad_request(format!(
+            "a bulk request names at most {MAX_BULK_OBJECT_IDS} identifiers"
+        ))
+        .into_response();
+    }
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
     let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
@@ -417,24 +446,39 @@ pub async fn post_objects(
         Err(error) => return error.into_response(),
     };
 
-    let mut objects = Vec::with_capacity(body.object_ids.len());
-    for object_id in body.object_ids {
-        let result = match resolve_object(state.as_ref(), &auth, &object_id).await {
-            Ok(ResolveOutcome::Found(resolved)) => serde_json::to_value(build_object_response(
-                &base_url, &resolved,
-            ))
-            .unwrap_or_else(|_| json!({ "status_code": 500, "msg": "serialization failed" })),
-            Ok(ResolveOutcome::Denied) => {
-                let error = drs_denied_error(anonymous);
-                json!({ "status_code": error.status.as_u16(), "msg": error.message })
-            }
-            Ok(ResolveOutcome::NotFound) => {
-                json!({ "status_code": 404, "msg": "DRS object not found" })
-            }
-            Err(error) => json!({ "status_code": error.status.as_u16(), "msg": error.message }),
-        };
-        objects.push(DrsBulkObjectItem { object_id, result });
-    }
+    // One budget for the whole batch, spent by bounded concurrent probes, so a
+    // foreign identifier cannot multiply into a request-timeout with no answers.
+    let deadline = Instant::now() + DRS_ROUTED_TIMEOUT;
+    let node = state.as_ref();
+    let auth = &auth;
+    let base_url = &base_url;
+    let objects: Vec<DrsBulkObjectItem> = futures_util::stream::iter(body.object_ids)
+        .map(|object_id| async move {
+            let result = match resolve_object(node, auth, &object_id, deadline).await {
+                Ok(ResolveOutcome::Found(resolved)) => serde_json::to_value(build_object_response(
+                    base_url, &resolved,
+                ))
+                .unwrap_or_else(|_| json!({ "status_code": 500, "msg": "serialization failed" })),
+                Ok(ResolveOutcome::Denied) => {
+                    let error = drs_denied_error(anonymous);
+                    json!({ "status_code": error.status.as_u16(), "msg": error.message })
+                }
+                Ok(ResolveOutcome::NotFound) => {
+                    json!({ "status_code": 404, "msg": "DRS object not found" })
+                }
+                Ok(ResolveOutcome::Unavailable) => {
+                    let error = DrsError::unavailable();
+                    json!({ "status_code": error.status.as_u16(), "msg": error.message })
+                }
+                Err(error) => {
+                    json!({ "status_code": error.status.as_u16(), "msg": error.message })
+                }
+            };
+            DrsBulkObjectItem { object_id, result }
+        })
+        .buffered(BULK_PROBE_CONCURRENCY)
+        .collect()
+        .await;
     drs_json_response(StatusCode::OK, DrsBulkObjectsResponse { objects })
 }
 
@@ -467,14 +511,15 @@ fn download_error(error: GetObjectError) -> Response {
     path = "/ga4gh/drs/v1/download",
     tag = "drs",
     summary = "Download the bytes of a DRS object",
-    description = "Authentication is optional and changes the result: an anonymous caller only downloads objects readable by the public role. This is the URL advertised as the object's `https` access method; it streams the bytes itself and never redirects, so a client follows no `Location` and needs no signed URL, only its own bearer token. The identifier is resolved and authorized exactly as the object lookup does, node-locally, and every denial an anonymous caller could observe is reported as 404 so that existence stays hidden; an authenticated caller without READ gets 403. On success the response is 200 with the raw bytes and a `Content-Length` taken from the stored object; no content type is asserted and range requests are not supported. Each transfer takes one node-wide download slot and one per-caller slot, keyed by user for an authenticated caller and by client address for an anonymous one; when a slot cannot be taken the download is refused rather than queued and the caller may retry later. A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut mid-body: the 200 has already been sent, so a client must treat a body shorter than `Content-Length` as a failed download and retry.",
+    description = "Authentication is optional and changes the result: an anonymous caller only downloads objects readable by the public role. This is the URL advertised as the object's `https` access method; it streams the bytes itself and never redirects, so a client follows no `Location` and needs no signed URL, only its own bearer token. The identifier is resolved and authorized exactly as the object lookup does, and every denial an anonymous caller could observe is reported as 404 so that existence stays hidden; an authenticated caller without READ gets 403. Only the owning node serves bytes: an identifier that resolves at another node of the realm is answered 501, because this node holds the metadata but not the object. On success the response is 200 with the raw bytes and a `Content-Length` taken from the stored object; no content type is asserted and range requests are not supported. Each transfer takes one node-wide download slot and one per-caller slot, keyed by user for an authenticated caller and by client address for an anonymous one; when a slot cannot be taken the download is refused rather than queued and the caller may retry later. A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut mid-body: the 200 has already been sent, so a client must treat a body shorter than `Content-Length` as a failed download and retry.",
     params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator, in the same three forms the object lookup accepts, given as a single query parameter and URL-encoded because these identifiers contain `:` and `/`")),
     responses(
         (status = 200, description = "Object bytes, streamed inline with a `Content-Length` header and no content type"),
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
         (status = 404, description = "No such object on this node, an anonymous caller may not read it, or the recorded reference observation is no longer served by its source", body = DrsErrorPayload),
         (status = 409, description = "Reference binding reached its automatic advance limit; retrying does not help until the reference is rebound by an explicit write", body = DrsErrorPayload),
-        (status = 503, description = "Reference source is changing; retry. The same status is returned when the node's download capacity is exhausted, which is also retryable", body = DrsErrorPayload)
+        (status = 501, description = "The identifier resolves to an object owned by another node, which alone serves its bytes; read the object first and download from the endpoint it names", body = DrsErrorPayload),
+        (status = 503, description = "Reference source is changing, or the owning node could not answer within the probe budget; retry. The same status is returned when the node's download capacity is exhausted, which is also retryable", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -489,13 +534,21 @@ pub async fn download_object(
     let Ok(auth) = drs_auth_or_anonymous(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
-    let resolved = match resolve_object(state.as_ref(), &auth, &query.object_id).await {
-        Ok(ResolveOutcome::Found(resolved)) => resolved,
-        Ok(ResolveOutcome::Denied) => return drs_denied_error(anonymous).into_response(),
-        Ok(ResolveOutcome::NotFound) => {
-            return DrsError::not_found("DRS object not found").into_response();
-        }
-        Err(error) => return error.into_response(),
+    let resolved =
+        match resolve_object(state.as_ref(), &auth, &query.object_id, routed_deadline()).await {
+            Ok(ResolveOutcome::Found(resolved)) => resolved,
+            Ok(ResolveOutcome::Denied) => return drs_denied_error(anonymous).into_response(),
+            Ok(ResolveOutcome::NotFound) => {
+                return DrsError::not_found("DRS object not found").into_response();
+            }
+            Ok(ResolveOutcome::Unavailable) => return DrsError::unavailable().into_response(),
+            Err(error) => return error.into_response(),
+        };
+    let Some(resolved_location) = resolved.location.clone() else {
+        return drs_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "object bytes are served by the owning node",
+        );
     };
 
     let key = if anonymous {
@@ -535,7 +588,7 @@ pub async fn download_object(
         Ok(Some(Err(error))) | Err(error) => return download_error(error),
     };
 
-    let location = result.location.unwrap_or_else(|| resolved.location.clone());
+    let location = result.location.unwrap_or(resolved_location);
 
     let mut response = Response::new(download::body(result.blob, permit));
     *response.status_mut() = StatusCode::OK;
@@ -558,7 +611,6 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
         .unwrap_or_default();
     let name = format!("content-{}", &hash[..hash.len().min(12)]);
     let checksums = resolved
-        .location
         .hashes
         .iter()
         .map(|(kind, value)| DrsChecksum {
@@ -571,25 +623,30 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
     } else {
         vec![resolved.canonical_w3id.clone()]
     };
-    let access_methods = vec![DrsAccessMethod {
-        access_id: ACCESS_ID_HTTPS.to_string(),
-        kind: "https".to_string(),
-        region: None,
-        access_url: Some(DrsAccessUrl {
-            url: format!(
-                "{base_url}/api/v1/ga4gh/drs/v1/download?object_id={}",
-                encode_component(&resolved.requested_id)
-            ),
-            headers: HashMap::new(),
-        }),
-    }];
+    // Only the owning node can serve the bytes, so a routed answer advertises none.
+    let access_methods = resolved
+        .location
+        .iter()
+        .map(|_| DrsAccessMethod {
+            access_id: ACCESS_ID_HTTPS.to_string(),
+            kind: "https".to_string(),
+            region: None,
+            access_url: Some(DrsAccessUrl {
+                url: format!(
+                    "{base_url}/api/v1/ga4gh/drs/v1/download?object_id={}",
+                    encode_component(&resolved.requested_id)
+                ),
+                headers: HashMap::new(),
+            }),
+        })
+        .collect();
 
     DrsObjectResponse {
         id: resolved.requested_id.clone(),
         self_uri,
         name,
         description: None,
-        size: Some(resolved.location.blob_size),
+        size: Some(resolved.size),
         checksums,
         mime_type: resolved
             .source_metadata
@@ -629,10 +686,17 @@ fn drs_denied_error(anonymous: bool) -> DrsError {
     }
 }
 
+fn routed_deadline() -> Instant {
+    Instant::now() + DRS_ROUTED_TIMEOUT
+}
+
+/// `deadline` bounds every routed probe of one request, so a batch can never
+/// cost more wall time than a single lookup does.
 async fn resolve_object(
     state: &ServerState,
     auth: &AuthContext,
     object_id: &str,
+    deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
     match parse_requested_object_id(object_id)? {
         RequestedObjectId::CanonicalW3id(hash) => {
@@ -644,9 +708,68 @@ async fn resolve_object(
             hash,
         } => resolve_content_hash(state, auth, object_id, Some((realm_id, node_id)), &hash).await,
         RequestedObjectId::VersionedObject(arn) => {
-            resolve_versioned(state, auth, object_id, &arn).await
+            resolve_versioned(state, auth, object_id, &arn, deadline).await
         }
     }
+}
+
+/// Resolve a versioned ARN owned by another node in this realm. Only the owner
+/// establishes absence; anything short of its answer is `Unavailable`.
+async fn resolve_routed(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested_id: &str,
+    arn: &VersionedObjectArn,
+    deadline: Instant,
+) -> Result<ResolveOutcome, DrsError> {
+    let context = state.get_ctx();
+    let config = match drive(GetRealmConfigOperation::new(arn.realm_id), &context).await {
+        Ok(config) => config,
+        Err(_) => return Ok(ResolveOutcome::Unavailable),
+    };
+    // A stale config cannot prove a node is not a member, so absence is not 404.
+    if !config.has_node(arn.node_id) {
+        return Ok(ResolveOutcome::Unavailable);
+    }
+    let summary = drive_until(
+        RemoteLocationSummaryOperation::new(
+            arn.node_id,
+            LocationSummaryRequest {
+                realm_id: arn.realm_id,
+                bucket: arn.bucket.clone(),
+                key: arn.key.clone(),
+                version_id: Some(arn.version),
+                auth_context: auth.clone(),
+            },
+        ),
+        &context,
+        deadline,
+    )
+    .await;
+    let summary = match summary {
+        Ok(summary) => summary,
+        Err(LocationSummaryError::Denied) => return Ok(ResolveOutcome::Denied),
+        Err(LocationSummaryError::BucketNotFound) => return Ok(ResolveOutcome::NotFound),
+        Err(_) => return Ok(ResolveOutcome::Unavailable),
+    };
+    if summary.version_id != Some(arn.version) || !summary.materialized {
+        return Ok(ResolveOutcome::NotFound);
+    }
+    let (Some(group_id), Some(size)) = (summary.group_id, summary.blob_size) else {
+        return Ok(ResolveOutcome::Unavailable);
+    };
+    Ok(ResolveOutcome::Found(ResolvedObject {
+        bucket: arn.bucket.clone(),
+        key: arn.key.clone(),
+        group_id,
+        version_id: arn.version,
+        canonical_w3id: arn.to_w3id(),
+        requested_id: requested_id.to_string(),
+        size,
+        hashes: summary.hashes.into_iter().collect(),
+        source_metadata: None,
+        location: None,
+    }))
 }
 
 async fn resolve_versioned(
@@ -654,9 +777,14 @@ async fn resolve_versioned(
     auth: &AuthContext,
     requested_id: &str,
     arn: &VersionedObjectArn,
+    deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
-    if arn.realm_id != state.get_realm_id() || arn.node_id != state.get_node_id() {
+    // This node serves exactly one realm, so a foreign realm is definitive absence.
+    if arn.realm_id != state.get_realm_id() {
         return Ok(ResolveOutcome::NotFound);
+    }
+    if arn.node_id != state.get_node_id() {
+        return resolve_routed(state, auth, requested_id, arn, deadline).await;
     }
 
     let bucket_info = match drive(
@@ -722,8 +850,10 @@ async fn resolve_versioned(
         version_id: arn.version,
         canonical_w3id: arn.to_w3id(),
         requested_id: requested_id.to_string(),
-        location,
+        size: location.blob_size,
+        hashes: location.hashes.clone().into_iter().collect(),
         source_metadata: head.source_metadata,
+        location: Some(location),
     }))
 }
 
@@ -812,8 +942,10 @@ async fn resolve_content_hash(
             version_id: mapping.version_id,
             canonical_w3id: format!("{W3ID_DATA_PREFIX}{}", hex::encode(hash)),
             requested_id: requested_id.to_string(),
-            location,
+            size: location.blob_size,
+            hashes: location.hashes.clone().into_iter().collect(),
             source_metadata: head.source_metadata,
+            location: Some(location),
         }));
     }
 
@@ -930,6 +1062,14 @@ impl DrsError {
             message: message.into(),
         }
     }
+
+    /// The owning node did not answer, so absence was never established.
+    fn unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "DRS object owner unavailable".to_string(),
+        }
+    }
 }
 
 impl IntoResponse for DrsError {
@@ -941,9 +1081,10 @@ impl IntoResponse for DrsError {
 #[cfg(test)]
 mod tests {
     use super::{
-        GetObjectError, RequestedObjectId, ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX,
-        build_object_response, download_error, drs_denied_error, encode_component,
-        get_authorizations, get_object, parse_requested_object_id, resolve_object,
+        DrsBulkObjectsRequestBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId,
+        ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error,
+        drs_denied_error, encode_component, get_authorizations, get_object,
+        parse_requested_object_id, post_objects, resolve_object, routed_deadline,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -1130,8 +1271,9 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: owner,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         write_fixture(
             state,
@@ -1268,7 +1410,7 @@ mod tests {
         let (auth, _, arn) = seed_version(state.as_ref()).await;
 
         for object_id in [arn.to_string(), arn.to_w3id()] {
-            let outcome = resolve_object(state.as_ref(), &auth, &object_id)
+            let outcome = resolve_object(state.as_ref(), &auth, &object_id, routed_deadline())
                 .await
                 .expect("version resolves");
             let ResolveOutcome::Found(resolved) = outcome else {
@@ -1296,26 +1438,33 @@ mod tests {
                 .as_bytes(),
         );
         let version = Ulid::from_bytes([7u8; 16]);
-        let arns = [
-            VersionedObjectArn::new(
-                state.get_realm_id(),
-                other_node,
-                "mybucket",
-                "path/file.txt",
-                version,
-            )
-            .unwrap(),
-            VersionedObjectArn::new(
-                other_realm,
-                state.get_node_id(),
-                "mybucket",
-                "path/file.txt",
-                version,
-            )
-            .unwrap(),
+        // A foreign realm is definitive absence; a foreign node is only unproven.
+        let cases = [
+            (
+                VersionedObjectArn::new(
+                    other_realm,
+                    state.get_node_id(),
+                    "mybucket",
+                    "path/file.txt",
+                    version,
+                )
+                .unwrap(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                VersionedObjectArn::new(
+                    state.get_realm_id(),
+                    other_node,
+                    "mybucket",
+                    "path/file.txt",
+                    version,
+                )
+                .unwrap(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ];
 
-        for arn in arns {
+        for (arn, expected) in cases {
             let response = get_object(
                 State(state.clone()),
                 Extension(Some(auth.clone())),
@@ -1324,14 +1473,13 @@ mod tests {
                 Path(arn.to_string()),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.status(), expected);
             let body = to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("response body");
             let payload: serde_json::Value =
                 serde_json::from_slice(&body).expect("typed error body");
-            assert_eq!(payload["status_code"], 404);
-            assert_eq!(payload["msg"], "DRS object not found");
+            assert_eq!(payload["status_code"], expected.as_u16());
         }
     }
 
@@ -1340,7 +1488,7 @@ mod tests {
         let (_dir, state) = test_state().await;
         let (_, denied, arn) = seed_version(state.as_ref()).await;
 
-        let outcome = resolve_object(state.as_ref(), &denied, &arn.to_string())
+        let outcome = resolve_object(state.as_ref(), &denied, &arn.to_string(), routed_deadline())
             .await
             .expect("authorization resolves");
         assert!(matches!(outcome, ResolveOutcome::Denied));
@@ -1376,6 +1524,25 @@ mod tests {
         assert_eq!(payload["msg"], "DRS object not found");
     }
 
+    #[tokio::test]
+    async fn caps_bulk_ids() {
+        // An uncapped list would let one anonymous request spend a routed probe
+        // per identifier, so the cap is refused before anything is resolved.
+        let (_dir, state) = test_state().await;
+        let id = format!("{W3ID_DATA_PREFIX}{}", hex::encode([1u8; 32]));
+        let object_ids = std::iter::repeat_n(id, MAX_BULK_OBJECT_IDS + 1).collect();
+
+        let response = post_objects(
+            State(state),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            axum::Json(DrsBulkObjectsRequestBody { object_ids }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn materialized_canonical_w3id_response_omits_aliases_and_keeps_download_method() {
         let blake3 = [0x11u8; 32];
@@ -1387,7 +1554,9 @@ mod tests {
             version_id: Ulid::from_bytes([5u8; 16]),
             canonical_w3id: canonical_w3id.clone(),
             requested_id: canonical_w3id.clone(),
-            location: materialized_location(blake3),
+            size: 42,
+            hashes: materialized_location(blake3).hashes.into_iter().collect(),
+            location: Some(materialized_location(blake3)),
             source_metadata: Some(SourceMetadata {
                 content_length: 42,
                 content_type: Some("application/octet-stream".to_string()),
@@ -1440,7 +1609,9 @@ mod tests {
             version_id: Ulid::from_bytes([7u8; 16]),
             canonical_w3id: canonical_w3id.clone(),
             requested_id: requested_id.clone(),
-            location: materialized_location(blake3),
+            size: 42,
+            hashes: materialized_location(blake3).hashes.into_iter().collect(),
+            location: Some(materialized_location(blake3)),
             source_metadata: Some(SourceMetadata {
                 content_length: 42,
                 content_type: Some("application/octet-stream".to_string()),

@@ -9,11 +9,14 @@ use aruna_core::events::{
     BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
 };
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::keyspaces::{
+    NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+};
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::{
-    BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot,
-    StorageRoutingRule, UsageCounters, usage_backend_keys,
+    BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NODE_SUBJECT_KEY, NodeRouting,
+    NodeSubjectRecord, RealmId, RoutingSnapshot, StorageRoutingRule, UsageCounters,
+    usage_backend_keys,
 };
 use aruna_core::types::{GroupId, NodeId, TxnId};
 use aruna_net::NetHandle;
@@ -31,6 +34,7 @@ use tracing::{Instrument, debug, debug_span, error, trace, warn};
 use crate::group_backends::{RecordReadError, parse_read};
 use crate::group_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
 use crate::metadata::MetadataHandle;
+use crate::placement_policy::GateContext;
 use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
@@ -58,6 +62,8 @@ pub enum RoutingInputsError {
     /// Not `#[from]`: `BucketRules` already owns the conversion from a read.
     #[error("backend usage counters unavailable: {0}")]
     BackendUsage(#[source] RecordReadError),
+    #[error("node placement subject unavailable: {0}")]
+    NodeSubject(#[source] RecordReadError),
 }
 
 impl RoutingInputsError {
@@ -66,7 +72,7 @@ impl RoutingInputsError {
     pub fn storage(&self) -> Option<&aruna_core::errors::StorageError> {
         let read = match self {
             Self::GroupInputs(GroupRoutingInputsError::Read(read)) => read,
-            Self::BucketRules(read) | Self::BackendUsage(read) => read,
+            Self::BucketRules(read) | Self::BackendUsage(read) | Self::NodeSubject(read) => read,
             Self::GroupInputs(GroupRoutingInputsError::Incomplete) => return None,
         };
         match read {
@@ -102,6 +108,56 @@ async fn bucket_rules(
     Ok(parse_read(event, BucketInfo::from_bytes)?
         .map(|info| info.storage_routing)
         .unwrap_or_default())
+}
+
+/// Wall clock for the cache freshness a gate is built with. Operations stay
+/// sans-I/O by taking it as configuration.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// The destination this node evaluates governed writes and serves against.
+/// `None` means it has never advertised a subject, which fails every governed
+/// operation closed; an ungoverned one never consults it.
+///
+/// A node whose inventory is being revalidated reports `admitting: false`, so
+/// `write_gate` stops its governed writes while ungoverned ones keep working.
+pub async fn gate_context(
+    context: &DriverContext,
+    realm_id: RealmId,
+    now_ms: u64,
+) -> Result<Option<GateContext>, GateContextError> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: NODE_SUBJECT_KEY.to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    let Some(record) = parse_read(event, NodeSubjectRecord::from_bytes)
+        .map_err(RoutingInputsError::NodeSubject)?
+    else {
+        return Ok(None);
+    };
+    let admitting = !record.serving_blocked && !record.policy_draining;
+    Ok(Some(GateContext {
+        realm_id,
+        subject: record.subject,
+        now_ms,
+        admitting,
+    }))
+}
+
+/// Why a caller could not build a destination gate. An admission stop is not
+/// one: the gate is built either way and `write_gate` refuses a governed write.
+#[derive(Debug, Error, PartialEq)]
+pub enum GateContextError {
+    #[error(transparent)]
+    Routing(#[from] RoutingInputsError),
 }
 
 /// Routing inputs for one bucket write, assembled before the operation starts.
@@ -367,6 +423,23 @@ async fn dispatch_effect_until(
         Effect::Net(NetEffect::AuditPage(audit)) => {
             Box::pin(dispatch_audit_page(*audit, context, deadline)).await
         }
+        // Policy fetch resolves its holders in the operation and runs only the
+        // holder round-trips here.
+        Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
+            Box::pin(crate::placement_policy::fetch_policy(context, *fetch)).await,
+        )),
+        // Publication signing needs this node's key, which only the handle holds.
+        Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
+            crate::placement_policy::sign_publication(context, *claim),
+        )),
+        // Job-record replication and launch offers resolve their holders in the
+        // operation and run only the holder round-trips here.
+        Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(
+            Box::pin(crate::jobs::records::dispatch_record(context, *record)).await,
+        )),
+        Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
+            Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
+        )),
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await
@@ -1298,8 +1371,9 @@ mod test {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             cors_configuration: None,
-            replication: None,
             storage_routing: vec![rule.clone()],
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let record = GroupStorageRouting {
             group_id,
@@ -1401,6 +1475,54 @@ mod test {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_subject_reads() {
+        // A blocked node still reports its subject: only a write carrying refs
+        // is stopped, and that decision belongs to the gate.
+        use crate::driver::gate_context;
+        use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
+        use aruna_core::structs::{NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject, RealmId};
+
+        let dir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let subject = PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        };
+        // A node that never advertised a subject has no gate at all.
+        assert_eq!(gate_context(&context, realm_id, 0).await.unwrap(), None);
+
+        let mut record = NodeSubjectRecord::seed(subject).unwrap();
+        record.serving_blocked = true;
+        record.policy_draining = true;
+        write_value(
+            &context,
+            NODE_SUBJECT_KEYSPACE,
+            NODE_SUBJECT_KEY.to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+
+        let gate = gate_context(&context, realm_id, 0)
+            .await
+            .unwrap()
+            .expect("subject is advertised");
+        assert!(!gate.admitting);
     }
 
     #[tokio::test]
@@ -2524,7 +2646,9 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn nested_deadline_cleanup() {
+        tokio::time::resume();
         let (_directory, context) = blob_context().await;
+        tokio::time::pause();
         let seen = Arc::new(Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2566,7 +2690,9 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn nested_commit_survives() {
+        tokio::time::resume();
         let (_directory, context) = blob_context().await;
+        tokio::time::pause();
         let seen = Arc::new(Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -3050,8 +3176,9 @@ mod routing_tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 

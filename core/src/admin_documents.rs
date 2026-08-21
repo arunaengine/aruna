@@ -7,8 +7,8 @@ use crate::NodeId;
 use crate::structs::{
     Actor, BandPool, BindingScope, CandidatePlacementMap, CompletionProof, HandleRange,
     MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind, Role, StrategyBinding, TransitionPlan,
+    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmComputeConfig,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding, TransitionPlan,
 };
 use crate::types::{GroupId, RoleId, UserId};
 
@@ -266,6 +266,18 @@ pub enum AdminDocumentOperation {
         bucket: u32,
         reported_by: NodeId,
     },
+    /// Seals the realm's submission-family placement strategy at creation. The
+    /// reducer refuses a nil id and any later change, so family routing is
+    /// immutable once one node has observed it.
+    RealmConfigJobFamilySet {
+        strategy_id: Ulid,
+    },
+    /// Replaces the realm's compute configuration wholesale: the directed
+    /// location links the planner estimates transfers with, and the standing
+    /// group compute quotas new admissions are decided against.
+    RealmConfigComputeSet {
+        compute: RealmComputeConfig,
+    },
 }
 
 #[cfg(test)]
@@ -276,7 +288,7 @@ mod tests {
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
         PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, QuotaConfig,
-        RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
+        RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
     use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId, UserId};
@@ -408,6 +420,9 @@ mod tests {
             },
             AdminDocumentOperation::RealmConfigQuotaSet {
                 quota: QuotaConfig::default(),
+            },
+            AdminDocumentOperation::RealmConfigComputeSet {
+                compute: RealmComputeConfig::default(),
             },
             AdminDocumentOperation::RealmConfigNodePlacementSet {
                 entry: placement_entry(node(1)),

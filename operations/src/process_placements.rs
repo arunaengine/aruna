@@ -7,7 +7,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
-use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
@@ -543,10 +543,15 @@ async fn reconcile_placements(
         let _ = task_handle.send_effect(effect).await;
     }
 
-    // Release is a deadline, not an event: arm the timer for the earliest
-    // pending grace end (shorten-only, so a sooner retry is never postponed)
-    // and keep the normal retry driving post-grace drain scans.
+    // Release is a deadline, not an event: a record that is released in the
+    // local view is pruned here, because no later event may ever re-materialize
+    // the document for it.
     let deadline_now = unix_timestamp_millis();
+    retry_needed |=
+        prune_released_transitions(context, realm_id, local_node_id, &config, deadline_now).await;
+    // Arm the timer for the earliest pending grace end (shorten-only, so a
+    // sooner retry is never postponed) and keep the normal retry driving
+    // post-grace drain scans.
     retry_needed |= crate::placement::drain_pending(&config, deadline_now);
     if let Some(deadline) = crate::placement::next_release_ms(&config, deadline_now)
         && let Some(task_handle) = context.task_handle.as_ref()
@@ -816,6 +821,140 @@ async fn delete_record(context: &Arc<DriverContext>, key: Vec<u8>) {
             },
         ))
         .await;
+}
+
+/// Drops transitions the local view already considers released, by
+/// re-materializing the stored document from the reducer state. Returns
+/// whether the pass should retry, which it does only when storage failed.
+async fn prune_released_transitions(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+) -> bool {
+    if !config
+        .placement_transitions
+        .iter()
+        .any(|transition| transition.released(now_ms))
+    {
+        return false;
+    }
+    let document = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = aruna_core::admin_documents::AdminDocumentTarget::RealmConfig { realm_id };
+    let storage = &context.storage_handle;
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => {
+            warn!(event = ?other, "Failed to start a transition release transaction");
+            return true;
+        }
+    };
+    let values = match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    document.storage_keyspace().to_string(),
+                    document.storage_key(),
+                ),
+                (
+                    aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    aruna_core::storage_entries::admin_document_reducer_state_key(&target),
+                ),
+            ],
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        other => {
+            warn!(event = ?other, "Failed to read the realm config for transition release");
+            abort_release_txn(storage, txn_id).await;
+            return true;
+        }
+    };
+    let (Some(stored), Some(state)) = (
+        values.first().and_then(|(_, value)| value.as_ref()),
+        values.get(1).and_then(|(_, value)| value.as_ref()),
+    ) else {
+        abort_release_txn(storage, txn_id).await;
+        return false;
+    };
+    let (Ok(mut stored), Ok(state)) = (
+        RealmConfigDocument::from_bytes(stored.as_ref()),
+        aruna_core::admin_document_reducer::decode_admin_document_reducer_state(state.as_ref()),
+    ) else {
+        warn!("Undecodable realm config or reducer state; transition release skipped");
+        abort_release_txn(storage, txn_id).await;
+        return false;
+    };
+    let before = stored.placement_transitions.len();
+    crate::ensure_realm_config::overlay_realm_config_reducer_materialization(
+        &mut stored,
+        &state,
+        now_ms,
+    );
+    if stored.placement_transitions.len() == before {
+        abort_release_txn(storage, txn_id).await;
+        return false;
+    }
+    let actor = Actor {
+        node_id: local_node_id,
+        user_id: aruna_core::UserId::nil(realm_id),
+        realm_id,
+    };
+    let value = match stored.to_bytes(&actor) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, "Failed to encode the released realm config");
+            abort_release_txn(storage, txn_id).await;
+            return true;
+        }
+    };
+    let written = storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: document.storage_keyspace().to_string(),
+            key: document.storage_key(),
+            value: value.into(),
+            txn_id: Some(txn_id),
+        })
+        .await;
+    if !matches!(written, Event::Storage(StorageEvent::WriteResult { .. })) {
+        warn!(event = ?written, "Failed to write the released realm config");
+        abort_release_txn(storage, txn_id).await;
+        return true;
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            debug!(
+                pruned = before - stored.placement_transitions.len(),
+                "Released placement transitions pruned"
+            );
+            false
+        }
+        other => {
+            warn!(event = ?other, "Failed to commit the released realm config");
+            true
+        }
+    }
+}
+
+async fn abort_release_txn(
+    storage: &aruna_storage::StorageHandle,
+    txn_id: aruna_core::types::TxnId,
+) {
+    if let Event::Storage(StorageEvent::Error { error }) = storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await
+    {
+        warn!(%error, "Failed to abort a transition release transaction");
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::ApptainerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::{StageLayout, StagePlan};
-use super::{BackendCaps, ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, digest_pinned, enforced_limit, now_ms};
 
 mod runtime;
 mod state;
@@ -128,8 +128,17 @@ impl ApptainerBackend {
                 .max_walltime
                 .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
             pids_limit: spec.security.pids_limit.unwrap_or(2048),
-            memory_bytes: spec.resources.ram_bytes,
-            cpu_cores: spec.resources.cpu_cores,
+            memory_bytes: enforced_limit(
+                spec.resources.ram_bytes,
+                self.config.default_mem_bytes,
+                "memory",
+            )?,
+            cpu_cores: u32::try_from(enforced_limit(
+                spec.resources.cpu_cores.map(u64::from),
+                self.config.default_cpu_cores.map(u64::from),
+                "cpu",
+            )?)
+            .unwrap_or(u32::MAX),
             isolated_network: spec.security.network == NetworkAccess::Isolated,
         };
         write_json(&temp.join("attempt.json"), &record)?;
@@ -263,6 +272,9 @@ impl ExecutorBackend for ApptainerBackend {
         BackendCaps {
             file_staging: true,
             direct_s3: true,
+            local_site: true,
+            limits: self.config.envelope,
+            ..BackendCaps::default()
         }
     }
 
@@ -323,8 +335,7 @@ impl ExecutorBackend for ApptainerBackend {
             return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
         }
         if let Some(status) = self.existing_status(context)? {
-            if matches!(status.phase, AttemptPhase::Failed { ref reason } if reason.contains("lost evidence"))
-            {
+            if matches!(status.phase, AttemptPhase::SystemError { .. }) {
                 return Ok(status);
             }
             let payload = self.state.attempt_dir(context).join("payload.json");
@@ -378,8 +389,7 @@ impl ExecutorBackend for ApptainerBackend {
     async fn cancel(&self, context: &FenceContext) -> Result<CancelEvidence, BackendError> {
         let mut guard = self.state.control(context)?;
         let status = match self.existing_status(context)? {
-            Some(status) if matches!(status.phase, AttemptPhase::Failed { ref reason } if reason.contains("lost evidence")) =>
-            {
+            Some(status) if matches!(status.phase, AttemptPhase::SystemError { .. }) => {
                 guard.mark_cancel()?;
                 return Ok(CancelEvidence::Stopped(AttemptStatus {
                     phase: AttemptPhase::Cancelled,
@@ -1039,7 +1049,7 @@ fn running_status(directory: &Path, started_at_ms: Option<u64>) -> AttemptStatus
 
 fn lost_status(directory: &Path) -> AttemptStatus {
     AttemptStatus {
-        phase: AttemptPhase::Failed {
+        phase: AttemptPhase::SystemError {
             reason: "lost evidence after recorded launch".to_string(),
         },
         backend_ref: directory.display().to_string(),
@@ -1122,15 +1132,6 @@ fn remove_cgroup(path: &Path) -> Result<(), BackendError> {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 fn io_error(error: std::io::Error) -> BackendError {
     BackendError::Api(format!("Apptainer backend: {error}"))
 }
@@ -1210,6 +1211,7 @@ mod tests {
             cgroup_root: root.path().join("cgroup"),
             stop_grace: Duration::from_secs(1),
             pull_deadline: Duration::from_secs(30),
+            ..Default::default()
         })
         .unwrap();
         let context = FenceContext {
@@ -1219,6 +1221,69 @@ mod tests {
         };
 
         backend.cleanup(&context).await.unwrap();
+    }
+
+    async fn launch_record(
+        config: ApptainerConfig,
+        spec: &TaskSpec,
+    ) -> Result<LaunchRecord, String> {
+        let backend = ApptainerBackend::with_config(config).map_err(|error| error.to_string())?;
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 1),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        };
+        let metadata = OciMetadata {
+            entrypoint: vec!["/bin/true".to_string()],
+            command: Vec::new(),
+        };
+        let directory = backend
+            .prepare_attempt(&context, spec, PathBuf::from("/image.sif"), metadata)
+            .await
+            .map_err(|error| error.to_string())?;
+        read_json(&directory.join("launch.json")).map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn enforces_cgroup_ceilings() {
+        // Every attempt runs inside a cgroup limit: the sealed ceiling when it
+        // has one, the backend default otherwise, and never none at all.
+        let root = tempdir().unwrap();
+        let config = ApptainerConfig {
+            state_root: root.path().join("state"),
+            sif_cache: root.path().join("cache"),
+            cgroup_root: root.path().join("cgroup"),
+            ..Default::default()
+        };
+        let mut spec = TaskSpec::new(AttemptRef::new("job", 1), "alpine");
+
+        let record = launch_record(config.clone(), &spec)
+            .await
+            .expect("prepared");
+        assert_eq!(Some(record.memory_bytes), config.default_mem_bytes);
+        assert_eq!(Some(record.cpu_cores), config.default_cpu_cores);
+
+        spec.resources.ram_bytes = Some(4_096);
+        spec.resources.cpu_cores = Some(3);
+        let record = launch_record(config.clone(), &spec)
+            .await
+            .expect("prepared");
+        assert_eq!(record.memory_bytes, 4_096);
+        assert_eq!(record.cpu_cores, 3);
+
+        let unbounded = ApptainerConfig {
+            default_mem_bytes: None,
+            default_cpu_cores: None,
+            ..config
+        };
+        assert!(
+            launch_record(
+                unbounded,
+                &TaskSpec::new(AttemptRef::new("job", 1), "alpine")
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]
@@ -1305,6 +1370,7 @@ mod tests {
             cgroup_root: root.join("cgroup"),
             stop_grace: Duration::from_secs(1),
             pull_deadline: Duration::from_secs(30),
+            ..Default::default()
         })
         .unwrap()
     }
@@ -1372,7 +1438,7 @@ mod tests {
 
         let status = backend.attempt_status(&context).unwrap();
 
-        assert!(matches!(status.phase, AttemptPhase::Failed { .. }));
+        assert!(matches!(status.phase, AttemptPhase::SystemError { .. }));
     }
 
     #[test]
@@ -1404,6 +1470,7 @@ mod tests {
             cgroup_root: root.path().join("cgroup"),
             stop_grace: Duration::from_secs(1),
             pull_deadline: Duration::from_secs(30),
+            ..Default::default()
         })
         .unwrap();
         let context = FenceContext {
@@ -1518,6 +1585,7 @@ mod tests {
             cgroup_root: root.path().join("cgroup"),
             stop_grace: Duration::from_secs(1),
             pull_deadline: Duration::from_secs(30),
+            ..Default::default()
         })
         .unwrap();
         let cancel = CancellationToken::new();

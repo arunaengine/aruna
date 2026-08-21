@@ -4,12 +4,13 @@ use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
-    MultipartObjectSummary, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
-    SourceMetadata, VersionSourceBinding, VersionedObjectArn,
+    ArunaArn, AuthContext, BackendLocation, MAX_POLICY_REF_INPUT, MultipartChecksumType,
+    MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, PlacementSubject, RealmId,
+    ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata, VersionSourceBinding,
+    VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
 
 const VERSION_REPLICATION_MAGIC: &[u8; 4] = b"vrp1";
@@ -56,6 +57,9 @@ pub struct VersionReplicationManifest {
     /// Automatic advance count of the reference this manifest carries, so repair
     /// and snapshot replication preserve the cap instead of resetting it.
     pub reference_advance_count: Option<u16>,
+    /// Refs sealed on the replicated version. The target reconstructs the same
+    /// governed version, so replication never relaxes an attachment.
+    pub placement_policies: Vec<PlacementPolicyRef>,
 }
 
 impl VersionReplicationManifest {
@@ -66,6 +70,13 @@ impl VersionReplicationManifest {
 
     pub(crate) fn validate(&self) -> Result<(), ConversionError> {
         let mut budget = ManifestBudget::default();
+        if PlacementPolicyRef::canonical_set(&self.placement_policies)
+            .is_ok_and(|canonical| canonical == self.placement_policies)
+        {
+            budget.add(0, self.placement_policies.len())?;
+        } else {
+            return Err(ConversionError::NonCanonicalPolicyRefs);
+        }
         check_text(&mut budget, &self.bucket, MAX_REPLICATION_VALUE_BYTES)?;
         check_text(&mut budget, &self.key, MAX_REPLICATION_VALUE_BYTES)?;
         check_map(&mut budget, &self.metadata)?;
@@ -212,6 +223,30 @@ pub struct BaoReadRequest {
     pub target: BaoReadTarget,
     pub expected_blake3: Option<[u8; 32]>,
     pub metadata_only: bool,
+    /// Where the bytes would land. Absent means the caller is not asking for a
+    /// managed copy, so the source refuses anything governed.
+    pub destination: Option<PlacementSubject>,
+    /// Refs the requester has already resolved. Echoing one is never authority:
+    /// the source evaluates the destination independently.
+    pub known_refs: Vec<PlacementPolicyRef>,
+}
+
+impl BaoReadRequest {
+    /// Bounds the destination facts before they are evaluated or stored.
+    pub fn validate(&self) -> Result<(), ConversionError> {
+        if self.known_refs.len() > MAX_POLICY_REF_INPUT {
+            return Err(ConversionError::PlacementPolicyError(
+                aruna_core::structs::PlacementPolicyError::RefCount,
+            ));
+        }
+        if PlacementPolicyRef::canonical_set(&self.known_refs)? != self.known_refs {
+            return Err(ConversionError::NonCanonicalPolicyRefs);
+        }
+        if let Some(destination) = self.destination.as_ref() {
+            destination.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -423,6 +458,15 @@ pub enum VersionReplicationMessage {
         manifest: VersionReplicationManifest,
         advance: ReferenceAdvance,
     },
+    /// The requester has not resolved every rule this copy carries. Sent only
+    /// after authorization, so object existence and policy ids stay private.
+    PlacementPolicyRequired {
+        refs: Vec<PlacementPolicyRef>,
+    },
+    /// The source evaluated the authenticated destination and refused it.
+    PlacementPolicyDenied {
+        policy_ids: Vec<Ulid>,
+    },
 }
 
 /// Read-only question a node asks a peer: do you hold this version, and on
@@ -458,6 +502,11 @@ pub struct LocationSummary {
     /// Whether the resolved version carries stored bytes at all. A delete
     /// marker or a reference-only version never will, anywhere.
     pub materialized: bool,
+    /// Group owning the answering node's bucket record, so a routed resolve can
+    /// report the object without a second authorization round trip.
+    pub group_id: Option<Ulid>,
+    pub blob_size: Option<u64>,
+    pub hashes: BTreeMap<String, Vec<u8>>,
 }
 
 impl LocationSummary {
@@ -467,6 +516,9 @@ impl LocationSummary {
             held: false,
             storage: None,
             materialized: false,
+            group_id: None,
+            blob_size: None,
+            hashes: BTreeMap::new(),
         }
     }
 }
@@ -492,6 +544,25 @@ impl VersionReplicationMessage {
             Self::ReferenceAdvance { manifest, advance } => {
                 manifest.reference_advance = Some(*advance);
                 Some(manifest)
+            }
+            // A hostile peer must not decode into an unbounded ref set.
+            Self::BaoReadRequest(request) => {
+                request.validate()?;
+                None
+            }
+            Self::PlacementPolicyRequired { refs } => {
+                if PlacementPolicyRef::canonical_set(refs)? != *refs {
+                    return Err(ConversionError::NonCanonicalPolicyRefs);
+                }
+                None
+            }
+            Self::PlacementPolicyDenied { policy_ids } => {
+                if policy_ids.len() > MAX_POLICY_REF_INPUT {
+                    return Err(ConversionError::PlacementPolicyError(
+                        aruna_core::structs::PlacementPolicyError::RefCount,
+                    ));
+                }
+                None
             }
             _ => None,
         };
@@ -536,8 +607,8 @@ mod tests {
     use aruna_core::structs::checksum::HASH_SHA256;
     use aruna_core::structs::{
         ArunaArn, AuthContext, BackendLocation, BackendRef, MultipartChecksumType,
-        MultipartObjectPart, MultipartObjectSummary, PortableSourceDescriptor, RealmId,
-        ReplicationItemKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, PortableSourceDescriptor,
+        RealmId, ReplicationItemKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
         VersionSourceBinding,
     };
     use std::collections::HashMap;
@@ -579,6 +650,7 @@ mod tests {
             metadata: HashMap::new(),
             reference_advance: None,
             reference_advance_count: None,
+            placement_policies: Vec::new(),
         }
     }
 
@@ -656,6 +728,8 @@ mod tests {
             target: BaoReadTarget::Blake3([8u8; 32]),
             expected_blake3: Some([8u8; 32]),
             metadata_only: false,
+            destination: None,
+            known_refs: Vec::new(),
         });
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,
@@ -718,53 +792,23 @@ mod tests {
     }
 
     #[test]
-    fn preserves_manifest_wire() {
-        #[allow(dead_code)]
-        #[derive(serde::Deserialize)]
-        struct LegacyManifest {
-            bucket: String,
-            key: String,
-            version_id: Ulid,
-            group_id: aruna_core::types::GroupId,
-            kind: ReplicationItemKind,
-            created_at: SystemTime,
-            created_by: UserId,
-            current_version: bool,
-            current_version_generation: Option<u64>,
-            auth_context: AuthContext,
-            blob: Option<MaterializedBlobInfo>,
-            source: Option<VersionSourceBinding>,
-            multipart: Option<MultipartObjectReplicationMetadata>,
-            reference_intent: bool,
-            origin: Option<SyncOrigin>,
-            upstream_sources: Vec<ArunaArn>,
-            writer_auth_context: Option<AuthContext>,
-            reference_metadata: Option<SourceMetadata>,
-            metadata: HashMap<String, String>,
-        }
+    fn rejects_noncanonical_refs() {
+        // A governed manifest must carry the one canonical ref set or nothing.
+        let mut manifest = make_manifest();
+        manifest.placement_policies = vec![
+            PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([6u8; 16]),
+                digest: [6u8; 32],
+            },
+            PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([1u8; 16]),
+                digest: [1u8; 32],
+            },
+        ];
 
-        #[derive(serde::Deserialize)]
-        enum LegacyMessage {
-            VersionManifest(LegacyManifest),
-        }
-
-        let manifest = make_manifest();
-        let bytes = VersionReplicationMessage::VersionManifest(manifest.clone())
-            .to_bytes()
-            .unwrap();
-        let payload = bytes
-            .strip_prefix(super::VERSION_REPLICATION_MAGIC)
-            .unwrap();
-        let (legacy, remainder) = postcard::take_from_bytes::<LegacyMessage>(payload).unwrap();
-        let LegacyMessage::VersionManifest(legacy) = legacy;
-
-        // The advance count is strictly trailing, so every earlier field keeps
-        // its position on the wire.
-        assert_eq!(
-            remainder,
-            postcard::to_allocvec(&manifest.reference_advance_count).unwrap()
-        );
-        assert_eq!(legacy.bucket, manifest.bucket);
+        assert!(manifest.validate().is_err());
+        manifest.placement_policies.reverse();
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]

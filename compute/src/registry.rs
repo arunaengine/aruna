@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use aruna_core::compute::{ExecutorCapability, ExecutorKind};
+use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
+use aruna_core::structs::{PlacementPolicyError, PlacementSubject};
 
-use crate::executor::ExecutorBackend;
+use crate::executor::{BackendCaps, ExecutorBackend};
 
 /// Container-facing S3 endpoint the workspace credential targets. Injected into
 /// the attempt env so unconfigured tooling reaches the node's S3 plane.
@@ -74,18 +75,53 @@ impl ExecutorRegistry {
         self.backends.keys().cloned().collect()
     }
 
-    pub fn capabilities(&self) -> Vec<ExecutorCapability> {
+    /// Advertisement of every enabled backend at the site it actually runs on.
+    /// `subject` is the node's current placement subject; each backend pins its
+    /// own executor kind and execution site into its copy.
+    pub fn capabilities(
+        &self,
+        subject: &PlacementSubject,
+        policy_draining: bool,
+    ) -> Result<Vec<ExecutorCapability>, PlacementPolicyError> {
         self.backends
             .values()
             .map(|backend| {
-                let capabilities = backend.capabilities();
-                ExecutorCapability {
-                    kind: backend.kind().as_wire(),
-                    file_staging: capabilities.file_staging,
-                    direct_s3: capabilities.direct_s3,
-                }
+                let caps = backend.capabilities();
+                let mut capability =
+                    ExecutorCapability::new(backend.kind().as_wire(), site(subject, &caps))?;
+                capability.file_staging = caps.file_staging;
+                capability.direct_s3 = caps.direct_s3;
+                capability.s3_mount = caps.s3_mount;
+                capability.network_policy = caps.network_policy;
+                capability.limits = caps.limits;
+                capability.policy_draining = policy_draining;
+                Ok(capability)
             })
             .collect()
+    }
+
+    /// The backend for `kind`, but only while this node still advertises the
+    /// exact site the launch was receipted under. Subject drift refuses the
+    /// start instead of running accepted work at a site nobody authorized.
+    pub fn fenced(
+        &self,
+        kind: &ExecutorKind,
+        subject: &PlacementSubject,
+        sealed_generation: u64,
+        sealed_digest: &[u8; 32],
+    ) -> Result<&Arc<dyn ExecutorBackend>, BackendError> {
+        let backend = self
+            .get(kind)
+            .ok_or_else(|| BackendError::Unavailable(format!("no {} backend", kind.as_wire())))?;
+        let current =
+            ExecutorCapability::new(kind.as_wire(), site(subject, &backend.capabilities()))
+                .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
+        match current.subject.generation == sealed_generation
+            && &current.subject_digest == sealed_digest
+        {
+            true => Ok(backend),
+            false => Err(BackendError::Fenced),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -93,11 +129,35 @@ impl ExecutorRegistry {
     }
 }
 
+/// The execution site one backend advertises. A backend whose workers are
+/// neither the controller nor a declared worker site cannot prove placement, so
+/// it advertises no location and no labels rather than the controller's.
+fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
+    match (caps.local_site, &caps.worker_site) {
+        (true, _) => PlacementSubject {
+            local_to_controller: true,
+            ..subject.clone()
+        },
+        (false, Some(site)) => PlacementSubject {
+            local_to_controller: false,
+            location: site.location.clone(),
+            labels: site.labels.clone(),
+            ..subject.clone()
+        },
+        (false, None) => PlacementSubject {
+            local_to_controller: false,
+            location: String::new(),
+            labels: BTreeMap::new(),
+            ..subject.clone()
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::executor::logs::LogSink;
-    use crate::executor::{BackendCaps, ExecutorBackend};
+    use crate::executor::{BackendCaps, ExecutorBackend, WorkerSite};
     use aruna_core::compute::{
         AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
         LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
@@ -106,7 +166,20 @@ mod tests {
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 
-    struct StubBackend(ExecutorKind);
+    struct StubBackend(ExecutorKind, BackendCaps);
+
+    impl StubBackend {
+        fn local(kind: ExecutorKind) -> Self {
+            Self(
+                kind,
+                BackendCaps {
+                    file_staging: true,
+                    local_site: true,
+                    ..BackendCaps::default()
+                },
+            )
+        }
+    }
 
     #[async_trait]
     impl ExecutorBackend for StubBackend {
@@ -114,10 +187,7 @@ mod tests {
             self.0.clone()
         }
         fn capabilities(&self) -> BackendCaps {
-            BackendCaps {
-                file_staging: true,
-                direct_s3: false,
-            }
+            self.1.clone()
         }
         fn run_identity(&self) -> UserSpec {
             NOBODY
@@ -197,10 +267,21 @@ mod tests {
         }
     }
 
+    fn subject() -> PlacementSubject {
+        PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            generation: 4,
+            location: "eu-west".to_string(),
+            labels: std::collections::BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: false,
+        }
+    }
+
     #[test]
     fn select_by_kind() {
-        let registry =
-            ExecutorRegistry::new().with_backend(Arc::new(StubBackend(ExecutorKind::Docker)));
+        let registry = ExecutorRegistry::new()
+            .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
         assert!(registry.get(&ExecutorKind::Docker).is_some());
         assert!(registry.get(&ExecutorKind::Slurm).is_none());
         // Unconstrained selects the only enabled backend.
@@ -208,13 +289,145 @@ mod tests {
         // A constraint the node cannot satisfy selects nothing.
         assert!(registry.select(Some(&ExecutorKind::Slurm)).is_none());
         assert_eq!(registry.kinds().len(), 1);
-        assert_eq!(
-            registry.capabilities(),
-            [ExecutorCapability {
-                kind: "docker".to_string(),
+    }
+
+    fn remote(kind: ExecutorKind, worker_site: Option<WorkerSite>) -> StubBackend {
+        StubBackend(
+            kind,
+            BackendCaps {
                 file_staging: true,
-                direct_s3: false,
-            }]
+                local_site: false,
+                worker_site,
+                ..BackendCaps::default()
+            },
+        )
+    }
+
+    #[test]
+    fn advertises_worker_site() {
+        // Workers that run elsewhere must be advertised at their own location
+        // and labels, never at the controller's.
+        let site = WorkerSite {
+            location: "dc-b".to_string(),
+            labels: BTreeMap::from([("gpu".to_string(), "a100".to_string())]),
+        };
+        let registry = ExecutorRegistry::new().with_backend(Arc::new(remote(
+            ExecutorKind::Kubernetes,
+            Some(site.clone()),
+        )));
+        let subject = subject();
+
+        let capability = registry
+            .capabilities(&subject, false)
+            .expect("subject is valid")
+            .remove(0);
+
+        assert_eq!(capability.subject.location, "dc-b");
+        assert_eq!(capability.subject.labels, site.labels);
+        assert!(!capability.subject.local_to_controller);
+        assert!(capability.validate(subject.node_id).is_ok());
+    }
+
+    #[test]
+    fn hides_unproven_site() {
+        // A backend that cannot prove worker placement advertises no site facts,
+        // so no location or label rule can match it.
+        let mut subject = subject();
+        subject.location = "controller-site".to_string();
+        subject
+            .labels
+            .insert("tier".to_string(), "secure".to_string());
+        let registry =
+            ExecutorRegistry::new().with_backend(Arc::new(remote(ExecutorKind::Kubernetes, None)));
+
+        let capability = registry
+            .capabilities(&subject, false)
+            .expect("subject is valid")
+            .remove(0);
+
+        assert!(capability.subject.location.is_empty());
+        assert!(capability.subject.labels.is_empty());
+        assert!(!capability.subject.local_to_controller);
+    }
+
+    #[test]
+    fn fence_refuses_drift() {
+        // Work receipted under one site may not start after the site changed.
+        let registry = ExecutorRegistry::new()
+            .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
+        let subject = subject();
+        let sealed = registry
+            .capabilities(&subject, false)
+            .expect("subject is valid")
+            .remove(0);
+
+        assert!(
+            registry
+                .fenced(
+                    &ExecutorKind::Docker,
+                    &subject,
+                    sealed.subject.generation,
+                    &sealed.subject_digest
+                )
+                .is_ok()
         );
+
+        let mut moved = subject.clone();
+        moved.location = "elsewhere".to_string();
+        assert_eq!(
+            registry
+                .fenced(
+                    &ExecutorKind::Docker,
+                    &moved,
+                    sealed.subject.generation,
+                    &sealed.subject_digest
+                )
+                .err(),
+            Some(BackendError::Fenced)
+        );
+
+        let mut aged = subject.clone();
+        aged.generation += 1;
+        assert_eq!(
+            registry
+                .fenced(
+                    &ExecutorKind::Docker,
+                    &aged,
+                    sealed.subject.generation,
+                    &sealed.subject_digest
+                )
+                .err(),
+            Some(BackendError::Fenced)
+        );
+        assert!(
+            registry
+                .fenced(
+                    &ExecutorKind::Slurm,
+                    &subject,
+                    sealed.subject.generation,
+                    &sealed.subject_digest
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn advertises_backend_site() {
+        // Each backend advertises its own kind, site locality, and sealed digest.
+        let registry = ExecutorRegistry::new()
+            .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
+        let subject = subject();
+        let capabilities = registry
+            .capabilities(&subject, true)
+            .expect("subject is valid");
+
+        assert_eq!(capabilities.len(), 1);
+        let capability = &capabilities[0];
+        assert_eq!(capability.kind, "docker");
+        assert!(capability.file_staging && !capability.direct_s3);
+        assert!(capability.policy_draining);
+        assert!(capability.subject.local_to_controller);
+        assert_eq!(capability.subject.generation, subject.generation);
+        assert!(capability.validate(subject.node_id).is_ok());
     }
 }

@@ -17,7 +17,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
     TestResult, create_bearer_token, create_group_via_http, create_onboarding_secret_via_http,
-    spawn_full_joiner_node, spawn_full_seed_node, wait_for_realm_nodes, wait_until,
+    shutdown_pair, spawn_full_joiner_node, spawn_full_seed_node, wait_for_realm_nodes, wait_until,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -201,7 +201,7 @@ async fn check_recovery(
         announce_peer(&peer.net, seed.realm_id).await?;
         wait_until(
             "metadata fan-out recovery",
-            Duration::from_secs(30),
+            shared::WAIT_CAP,
             Duration::from_millis(100),
             || {
                 let seed_url = seed.base_url.clone();
@@ -272,7 +272,6 @@ async fn realm_outage_recovers() -> TestResult<()> {
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
-    joiner.shutdown().await;
-    seed.shutdown().await;
+    shutdown_pair(joiner, seed).await;
     result
 }

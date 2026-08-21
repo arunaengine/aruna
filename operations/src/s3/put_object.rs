@@ -3,7 +3,15 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::PendingCleanup;
+use crate::blob::managed_copy::{
+    CopyRequest, ManagedCopyError, register_effect, serve_reads, split_serve_reads,
+    validate_registration,
+};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
+use crate::placement_policy::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
+};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
 use crate::usage_stats::{
@@ -21,8 +29,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, PathRestriction, RealmId, RoCrateLimits, RoutingError,
-    RoutingSnapshot, UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
+    BucketInfo, CurrentVersionPointer, ManagedCopyKey, PathRestriction, PlacementPolicyError,
+    PlacementPolicyRef, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta,
+    VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -38,6 +47,9 @@ pub enum PutObjectState {
     Init,
     ReadPreassignedVersion,
     ReadPreassignedLocation,
+    ReadPreassignedCopy,
+    ReadGateBucket,
+    PolicyGate,
     WriteBlob,
     CleanupFailedWrite,
     QueueCleanupRow,
@@ -52,6 +64,7 @@ pub enum PutObjectState {
     WriteBlobHead,
     WriteHashPathIndex,
     CreateBlobVersionRecord,
+    RegisterManagedCopy,
     WriteLiveReplicationObligation,
     EnforceQuota,
     QuotaRejectAbort,
@@ -100,6 +113,12 @@ pub enum PutObjectError {
     RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
     BackendFenceError(#[from] BackendFenceError),
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
+    #[error(transparent)]
+    PolicyError(#[from] PlacementPolicyError),
+    #[error(transparent)]
+    PolicyGate(#[from] PolicyGateError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
@@ -165,6 +184,22 @@ pub struct PutObjectOperation {
     metadata: HashMap<String, String>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
+    /// Refs sealed on the version record, reused verbatim by its registration.
+    sealed_policies: Vec<PlacementPolicyRef>,
+    /// Destination default, read inside the version transaction so an edit
+    /// observed after streaming cannot commit a stale ref set.
+    bucket_policies: Vec<PlacementPolicyRef>,
+    inherited_policies: Vec<PlacementPolicyRef>,
+    /// Destination facts of this node. Absent means no governed byte may be
+    /// materialized here at all.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
+    /// What the gate decided on, re-read inside the version transaction.
+    gated_bucket: Option<GatedBucket>,
+    /// Refs of an existing preassigned version, checked against its registration
+    /// before the replay may hand back its location.
+    replay_policies: Vec<PlacementPolicyRef>,
+    replay_location: Option<BackendLocation>,
 }
 
 impl PutObjectOperation {
@@ -191,12 +226,52 @@ impl PutObjectOperation {
             metadata: HashMap::new(),
             rocrate_limits: RoCrateLimits::default(),
             restrictions: None,
+            sealed_policies: Vec::new(),
+            bucket_policies: Vec::new(),
+            inherited_policies: Vec::new(),
+            gate_context: None,
+            gate: None,
+            gated_bucket: None,
+            replay_policies: Vec::new(),
+            replay_location: None,
         }
+    }
+
+    /// The destination this write is evaluated against. Omitting it leaves the
+    /// ungoverned path untouched and fails every governed write closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
+        self
     }
 
     pub fn with_bucket_guard(mut self, bucket: BucketInfo) -> Self {
         self.expected_bucket = Some(bucket);
         self
+    }
+
+    /// Refs a copy or derived write carries over from its source. They are
+    /// unioned with the destination default, so a copy can only be at least as
+    /// constrained as what it was copied from.
+    pub fn with_inherited_policies(mut self, policies: Vec<PlacementPolicyRef>) -> Self {
+        self.inherited_policies = policies;
+        self
+    }
+
+    /// Subject generation the gate admitted this write under; zero for an
+    /// ungoverned write, which no subject ever evaluated.
+    fn sealed_subject(&self) -> u64 {
+        self.gated_bucket
+            .as_ref()
+            .and_then(|gated| gated.subject_generation)
+            .unwrap_or_default()
+    }
+
+    /// Union of the destination default read in this transaction and whatever
+    /// the write inherited. Both empty leaves the version ungoverned.
+    fn effective_policies(&self) -> Vec<PlacementPolicyRef> {
+        let mut policies = self.bucket_policies.clone();
+        policies.extend(self.inherited_policies.iter().copied());
+        policies
     }
 
     /// The writer's credential restrictions. They are persisted on the durable
@@ -248,6 +323,7 @@ impl PutObjectOperation {
         let Some(location_key) = version.location_key() else {
             return self.emit_error(PutObjectError::InvalidPreassignedVersion);
         };
+        self.replay_policies = version.placement_policies.clone();
         self.state = PutObjectState::ReadPreassignedLocation;
         smallvec![blob_location_read(&location_key, None)]
     }
@@ -263,9 +339,65 @@ impl PutObjectOperation {
             Ok(location) => location,
             Err(error) => return self.emit_error(error.into()),
         };
+        if self.replay_policies.is_empty() {
+            return self.finish_replay(location);
+        }
+        // A governed replay may only hand back a copy this node registered.
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
+        };
+        let key = ManagedCopyKey::new(self.version_key(version_id), location.backend.clone());
+        // The replay hands back bytes, so it answers the same question a serve
+        // does: is this copy registered *and* may this node serve at all.
+        let effect = match serve_reads(&key, None) {
+            Ok(effect) => effect,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.replay_location = Some(location);
+        self.state = PutObjectState::ReadPreassignedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_preassigned_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let (value, subject) = match split_serve_reads(values) {
+            Ok(split) => split,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let (Some(version_id), Some(location)) = (self.version_id, self.replay_location.take())
+        else {
+            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
+        };
+        let key = ManagedCopyKey::new(self.version_key(version_id), location.backend.clone());
+        match validate_registration(
+            value.as_deref(),
+            &CopyRequest {
+                key: &key,
+                node_id: Some(self.config.node_id),
+                blake3: None,
+                refs: &self.replay_policies,
+                subject_generation: Some(subject.subject.generation),
+            },
+        ) {
+            Ok(_) => self.finish_replay(location),
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn finish_replay(&mut self, location: BackendLocation) -> Effects {
         self.output = Some(Ok(location));
         self.state = PutObjectState::Finish;
         smallvec![]
+    }
+
+    fn version_key(&self, version_id: Ulid) -> VersionKey {
+        VersionKey::new(
+            self.config.request.bucket.clone(),
+            self.config.request.key.clone(),
+            version_id,
+        )
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -273,7 +405,82 @@ impl PutObjectOperation {
         self
     }
 
+    /// The destination default is read before any byte moves, so the gate that
+    /// admits this write sees the refs the version would actually carry.
     fn handle_init(&mut self) -> Effects {
+        self.state = PutObjectState::ReadGateBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.config.request.bucket.as_bytes().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let bucket = match value
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let refs = match union_refs(
+            &GatedBucket::observe(bucket.as_ref()).policies,
+            &self.inherited_policies,
+        ) {
+            Ok(refs) => refs,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.gated_bucket = Some(
+            GatedBucket::observe(bucket.as_ref())
+                .sealed_under(self.gate_context.as_ref(), !refs.is_empty()),
+        );
+        match write_gate(self.gate_context.as_ref(), &refs) {
+            Ok(None) => self.write_blob(),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = PutObjectState::PolicyGate;
+                match complete {
+                    true => self.finish_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn handle_policy_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_gate(&mut self) -> Effects {
+        let Some(gate) = self.gate.take() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let outcome = match gate.finalize() {
+            Ok(outcome) => outcome,
+            Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
+        };
+        match gate_decision(outcome.decision) {
+            Ok(()) => self.write_blob(),
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn write_blob(&mut self) -> Effects {
         // Resolution runs before any bytes move; a failure is terminal.
         let resolved = match resolve_backend(
             &self.config.routing,
@@ -350,16 +557,10 @@ impl PutObjectOperation {
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
-            if self.expected_bucket.is_some() {
-                self.state = PutObjectState::CheckBucket;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: self.config.request.bucket.as_bytes().into(),
-                    txn_id: self.txn_id,
-                })]
-            } else {
-                self.start_fence()
-            }
+            // Read unconditionally: the version snapshots the default this
+            // transaction observes, not one read before the bytes streamed.
+            self.state = PutObjectState::CheckBucket;
+            smallvec![drift_reads(&self.config.request.bucket, self.txn_id)]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
@@ -386,23 +587,34 @@ impl PutObjectOperation {
     }
 
     fn handle_bucket_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
-        let current = match value
-            .as_ref()
-            .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(current) => current,
+        let (current, subject) = match split_drift_reads(values) {
+            Ok(split) => split,
             Err(error) => return self.emit_error(error.into()),
         };
-        if current.as_ref().map(BucketInfo::identity)
-            != self.expected_bucket.as_ref().map(BucketInfo::identity)
-            || current.is_none_or(|bucket| bucket.group_id != self.config.group_id)
+        if self.expected_bucket.is_some()
+            && (current.as_ref().map(BucketInfo::identity)
+                != self.expected_bucket.as_ref().map(BucketInfo::identity)
+                || current
+                    .as_ref()
+                    .is_none_or(|bucket| bucket.group_id != self.config.group_id))
         {
             return self.emit_error(StorageError::TransactionConflict.into());
         }
+        // The refs the version commits must be the refs the gate admitted: a
+        // default changed while the bytes streamed was never evaluated.
+        let observed = GatedBucket::observe(current.as_ref());
+        if let Some(gated) = self.gated_bucket.as_ref() {
+            if !gated.matches(&observed) {
+                return self.emit_error(PolicyGateError::Drift.into());
+            }
+            if let Err(error) = gated.check_subject(subject.as_ref()) {
+                return self.emit_error(error.into());
+            }
+        }
+        self.bucket_policies = observed.policies;
         self.start_fence()
     }
 
@@ -561,7 +773,10 @@ impl PutObjectOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
-        let pointer = CurrentVersionPointer::next_for(existing, version_id);
+        let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => pointer,
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
         let effect = match write_blob_head_effect(&self.alias_context(), pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -638,11 +853,16 @@ impl PutObjectOperation {
                 self.config.version_source.clone(),
             )
             .with_metadata(self.metadata.clone());
+            let version = match version.with_policies(self.effective_policies()) {
+                Ok(version) => version,
+                Err(err) => return self.emit_error(err.into()),
+            };
             let version_key = VersionKey::new(
                 self.config.request.bucket.clone(),
                 self.config.request.key.clone(),
                 version_id,
             );
+            self.sealed_policies = version.placement_policies.clone();
             let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -655,6 +875,43 @@ impl PutObjectOperation {
     }
 
     fn handle_blob_version_record_created(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
+            self.register_managed_copy()
+        } else {
+            self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    /// Joins the version transaction, so the copy becomes serveable exactly when
+    /// the logical version does and never before.
+    fn register_managed_copy(&mut self) -> Effects {
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(PutObjectError::PutObjectFailed);
+        };
+        let Some(location) = self.get_output().cloned() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        let effect = match register_effect(
+            VersionKey::new(
+                self.config.request.bucket.clone(),
+                self.config.request.key.clone(),
+                version_id,
+            ),
+            self.config.node_id,
+            &location,
+            &self.sealed_policies,
+            self.sealed_subject(),
+            version_id.timestamp_ms(),
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.state = PutObjectState::RegisterManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_copy_registered(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             self.write_live_replication_obligation()
         } else {
@@ -1131,6 +1388,9 @@ impl Operation for PutObjectOperation {
             PutObjectState::Init => self.begin(),
             PutObjectState::ReadPreassignedVersion => self.handle_preassigned_version(event),
             PutObjectState::ReadPreassignedLocation => self.handle_preassigned_location(event),
+            PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(event),
+            PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
+            PutObjectState::PolicyGate => self.handle_policy_gate(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
@@ -1147,6 +1407,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::CreateBlobVersionRecord => {
                 self.handle_blob_version_record_created(event)
             }
+            PutObjectState::RegisterManagedCopy => self.handle_copy_registered(event),
             PutObjectState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
@@ -1215,6 +1476,16 @@ mod routing_test {
     use std::collections::{BTreeSet, HashMap};
     use ulid::Ulid;
 
+    /// Answers the pre-write bucket read with an absent bucket, which is the
+    /// ungoverned path every routing test exercises.
+    fn begin(operation: &mut PutObjectOperation) -> aruna_core::types::Effects {
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }))
+    }
+
     fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         PutObjectConfig {
@@ -1257,7 +1528,7 @@ mod routing_test {
             target: RoutingTarget::Class("archive".to_string()),
         }]);
 
-        let effects = PutObjectOperation::new(config(snapshot)).start();
+        let effects = begin(&mut PutObjectOperation::new(config(snapshot)));
 
         let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
             panic!("expected one blob write, got {effects:?}")
@@ -1298,7 +1569,7 @@ mod routing_test {
             target: RoutingTarget::Class("glacier".to_string()),
         }]);
 
-        let effects = PutObjectOperation::new(config(snapshot)).start();
+        let effects = begin(&mut PutObjectOperation::new(config(snapshot)));
 
         let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
             panic!("expected one blob write, got {effects:?}")
@@ -1317,7 +1588,7 @@ mod routing_test {
         }]);
 
         let mut operation = PutObjectOperation::new(config(snapshot));
-        let effects = operation.start();
+        let effects = begin(&mut operation);
 
         assert!(effects.is_empty());
         assert!(operation.is_complete());
@@ -1341,12 +1612,18 @@ mod routing_test {
             })
             .with_bucket_rules(Vec::new());
         let mut operation = PutObjectOperation::new(config(snapshot));
-        operation.start();
+        begin(&mut operation);
         operation.step(Event::Blob(BlobEvent::WriteFinished {
             location: written(backend_id),
         }));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"bucket".to_vec().into(), None),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1390,12 +1667,18 @@ mod routing_test {
             })
             .with_bucket_rules(Vec::new());
         let mut operation = PutObjectOperation::new(config(snapshot));
-        operation.start();
+        begin(&mut operation);
         operation.step(Event::Blob(BlobEvent::WriteFinished {
             location: written(backend_id),
         }));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"bucket".to_vec().into(), None),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
@@ -1584,8 +1867,9 @@ mod test {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: config.user_id,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let edited = BucketInfo {
             storage_routing: vec![aruna_core::structs::StorageRoutingRule {
@@ -1626,8 +1910,9 @@ mod test {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: config.user_id,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let recreated = BucketInfo {
             created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
@@ -1642,12 +1927,17 @@ mod test {
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == S3_BUCKET_KEYSPACE
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+                if reads.first().map(|(space, _)| space.as_str()) == Some(S3_BUCKET_KEYSPACE)
         ));
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"mybucket".to_vec().into(),
-            value: Some(recreated.to_bytes().unwrap().into()),
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    b"mybucket".to_vec().into(),
+                    Some(recreated.to_bytes().unwrap().into()),
+                ),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
 
         // The terminal state is complete, so this is the only chance to release
@@ -3123,5 +3413,364 @@ mod test {
             crate::s3::put_object::PutObjectError::ChecksumMismatch("SHA256")
         ));
         assert_eq!(count_files(Path::new(&blob_root)), 0);
+    }
+}
+
+/// F1 acceptance: no byte-materialization effect and no registration may be
+/// emitted before the destination passed the shared placement gate.
+#[cfg(test)]
+mod gate_test {
+    use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+    use crate::placement_policy::{GateContext, PolicyCacheEntry, PolicyGateError};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::{
+        BucketInfo, PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
+        RealmId, RoutingSnapshot, VerifiedPolicy,
+    };
+    use aruna_core::types::{Effects, NodeId, UserId, Value};
+    use byteview::ByteView;
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::UNIX_EPOCH;
+    use ulid::Ulid;
+
+    const BODY: &[u8] = b"payload";
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    /// A rule that admits exactly one location.
+    fn policy(location: &str) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn gate(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: PlacementSubject {
+                node_id: node(9),
+                generation: 1,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+            now_ms: 1_000,
+            admitting: true,
+        }
+    }
+
+    fn bucket(refs: Vec<PlacementPolicyRef>, generation: u64) -> Value {
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: UNIX_EPOCH,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: refs,
+            placement_policy_generation: generation,
+        };
+        ByteView::from(info.to_bytes().expect("bucket encodes"))
+    }
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value,
+        })
+    }
+
+    fn operation(location: &str) -> PutObjectOperation {
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            group_id,
+            realm_id: realm(),
+            node_id: node(9),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "governed.txt".to_string(),
+                content_length: Some(BODY.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        })
+        .with_gate(gate(location))
+    }
+
+    fn materializes(effects: &Effects) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Write { .. })))
+    }
+
+    #[test]
+    fn denies_before_write() {
+        // The rule admits another location, so nothing may be written at all.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west");
+        assert!(!materializes(&operation.start()));
+        let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        assert!(!materializes(&effects));
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(read(Some(ByteView::from(cached))));
+        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
+
+        assert!(!materializes(&effects));
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
+        ));
+    }
+
+    #[test]
+    fn unresolved_blocks_write() {
+        // A rule that cannot be obtained blocks; it is never read as a grant.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        let hint = PolicyCacheEntry::unavailable(1_000)
+            .to_bytes()
+            .expect("entry encodes");
+        let effects = operation.step(read(Some(ByteView::from(hint))));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::Unavailable { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn missing_subject_blocks() {
+        // A node that advertises no subject may hold nothing governed.
+        let mut config = operation("eu-west");
+        config.gate_context = None;
+        config.start();
+        let effects = config.step(read(Some(bucket(
+            vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([1u8; 16]),
+                digest: [4u8; 32],
+            }],
+            1,
+        ))));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            config.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::NoSubject))
+        ));
+    }
+
+    #[test]
+    fn ungoverned_skips_gate() {
+        // An ungoverned write reaches the blob effect with no policy round trip.
+        let mut operation = operation("eu-west");
+        operation.start();
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(materializes(&effects));
+    }
+
+    #[test]
+    fn drift_aborts_commit() {
+        // A default changed while the bytes streamed was never evaluated, so
+        // the version must not commit the refs it would now inherit.
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(Vec::new(), 0))));
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
+            location: location(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7u8; 16]),
+        }));
+        let effects = operation.step(drift_read(
+            Some(bucket(vec![policy("us-east").policy_ref()], 1)),
+            None,
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Storage(StorageEffect::AbortTransaction { .. })
+        )));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Drift))
+        ));
+    }
+
+    /// The exposing transaction re-reads the bucket and the local subject in
+    /// one batch; both must still be what the gate decided on.
+    fn drift_read(bucket: Option<Value>, subject: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (ByteView::from(Vec::new()), bucket),
+                (ByteView::from(Vec::new()), subject),
+            ],
+        })
+    }
+
+    fn subject_row(generation: u64, blocked: bool) -> Value {
+        let mut record = aruna_core::structs::NodeSubjectRecord::seed(
+            crate::placement_policy::fixtures::subject(node(9), "eu-west"),
+        )
+        .expect("subject is valid");
+        record.subject.generation = generation;
+        record.serving_blocked = blocked;
+        record.policy_draining = blocked;
+        ByteView::from(record.to_bytes().expect("record encodes"))
+    }
+
+    #[test]
+    fn subject_advance_aborts() {
+        // The subject that admitted the write moved on while the bytes
+        // streamed, so the copy would commit refs nothing evaluated.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(read(Some(ByteView::from(cached))));
+        operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
+            location: location(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7u8; 16]),
+        }));
+
+        let effects = operation.step(drift_read(
+            Some(bucket(vec![rule.policy_ref()], 1)),
+            Some(subject_row(2, false)),
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Storage(StorageEffect::AbortTransaction { .. })
+        )));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Drift))
+        ));
+    }
+
+    /// The realm view and the policy row a cache miss reads next.
+    fn opened(policy_row: Option<Value>) -> Event {
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm(), Vec::new(), 2);
+        config.seed_default_placement();
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
+        }
+        let (config_value, auth_value) = crate::placement_policy::fixtures::realm_view(
+            &config,
+            crate::placement_policy::fixtures::admin_user(realm()),
+        );
+        let key = ByteView::from(Vec::new());
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (key.clone(), policy_row),
+                (key.clone(), Some(config_value)),
+                (key, Some(auth_value)),
+            ],
+        })
+    }
+
+    #[test]
+    fn digest_mismatch_blocks() {
+        // The obtained document holds another definition under the same id, so
+        // the write refuses instead of falling back to allow.
+        let requested = policy("eu-west");
+        let mut operation = operation("eu-west");
+        operation.start();
+        operation.step(read(Some(bucket(vec![requested.policy_ref()], 1))));
+        operation.step(read(None));
+        let substituted =
+            crate::placement_policy::fixtures::signed_document(realm(), &policy("us-east"), 9);
+        let effects = operation.step(opened(Some(ByteView::from(
+            substituted.to_bytes().expect("document encodes"),
+        ))));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Invalid))
+        ));
+    }
+
+    #[test]
+    fn inherited_ref_gates() {
+        // Staging, imports and job outputs carry their source's refs into an
+        // otherwise ungoverned destination; a sender may never drop one.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        operation.start();
+        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        assert!(!materializes(&effects));
+
+        let document = crate::placement_policy::fixtures::signed_document(realm(), &rule, 9);
+        let cached = PolicyCacheEntry::verified(&document, 10)
+            .to_bytes()
+            .expect("entry encodes");
+        operation.step(read(Some(ByteView::from(cached))));
+        let effects = operation.step(crate::placement_policy::fixtures::authority(realm()));
+
+        assert!(!materializes(&effects));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
+        ));
+    }
+
+    fn location() -> aruna_core::structs::BackendLocation {
+        aruna_core::structs::BackendLocation {
+            backend: aruna_core::structs::BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "aruna".to_string(),
+            backend_path: "objects/one".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: BODY.len() as u64,
+            hashes: HashMap::from([("blake3".to_string(), vec![6u8; 32])]),
+        }
     }
 }

@@ -21,9 +21,9 @@ use aruna_core::keyspaces::{
     SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
 };
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, RealmId,
-    SourceConnector, SourceConnectorSecret, SourceMetadata, StagingStrategy, UsageDelta,
-    VersionKey, VersionSourceBinding,
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
+    PlacementPolicyError, PlacementPolicyRef, RealmId, SourceConnector, SourceConnectorSecret,
+    SourceMetadata, StagingStrategy, UsageDelta, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, TxnId, UserId};
 use std::time::SystemTime;
@@ -61,6 +61,8 @@ pub enum MaterializeReferenceError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
+    #[error(transparent)]
+    Policy(#[from] PlacementPolicyError),
 }
 
 pub async fn materialize_reference(
@@ -99,7 +101,7 @@ pub async fn materialize_reference(
     };
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
-        guard_expected_bucket(
+        let bucket_policies = guard_expected_bucket(
             context,
             txn_id,
             &input.bucket,
@@ -160,7 +162,7 @@ pub async fn materialize_reference(
             }
         }
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
-        let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id);
+        let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)?;
 
         for effect in build_head_transition_effects(
             &HeadAliasContext::new(
@@ -188,7 +190,8 @@ pub async fn materialize_reference(
                     now,
                     input.user_id,
                     now,
-                ),
+                )
+                .with_policies(bucket_policies)?,
                 Some(txn_id),
             )?,
         )
@@ -441,7 +444,7 @@ async fn guard_expected_bucket(
     bucket: &str,
     group_id: GroupId,
     expected: &BucketInfo,
-) -> Result<(), MaterializeReferenceError> {
+) -> Result<Vec<PlacementPolicyRef>, MaterializeReferenceError> {
     let current = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -463,7 +466,9 @@ async fn guard_expected_bucket(
     {
         return Err(StorageError::TransactionConflict.into());
     }
-    Ok(())
+    Ok(current
+        .map(|bucket| bucket.placement_policies)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -746,8 +751,9 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         let recreated = BucketInfo {
             created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
@@ -769,7 +775,9 @@ mod tests {
         let txn_id = start_write_transaction(&context).await;
 
         assert_conflict(
-            guard_expected_bucket(&context, txn_id, "bucket-a", group_id, &expected).await,
+            guard_expected_bucket(&context, txn_id, "bucket-a", group_id, &expected)
+                .await
+                .map(|_| ()),
         );
     }
 

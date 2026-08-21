@@ -434,6 +434,7 @@ mod tests {
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
                 output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
             }),
             UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
             node_id,
@@ -448,7 +449,7 @@ mod tests {
             lease_expires_at_ms: 10_000,
         });
         insert_job(storage, &record).await.unwrap();
-        record_attempt_intent(storage, job_id, token, intent(job_id, kind), 2)
+        record_attempt_intent(storage, job_id, token, intent(job_id, kind), None, 2)
             .await
             .unwrap()
             .record
@@ -485,6 +486,7 @@ mod tests {
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
                 output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
             }),
             user_id,
             node_id,
@@ -506,8 +508,9 @@ mod tests {
                     created_at: SystemTime::now(),
                     created_by: user_id,
                     cors_configuration: None,
-                    replication: None,
                     storage_routing: Vec::new(),
+                    placement_policies: Vec::new(),
+                    placement_policy_generation: 0,
                 },
             ),
             &ctx.driver,

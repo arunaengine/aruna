@@ -368,6 +368,21 @@ impl EnsureRealmConfigOperation {
                 AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
             )?);
         }
+        // A fresh document seeds its placement identity locally; without the
+        // matching reducer events a later reducer-only rebuild loses them and
+        // the sealed family routing with them.
+        if fresh
+            && reducer_state.materialized_family_strategy().is_none()
+            && reducer_state
+                .materialized_realm_config_placement_strategies()
+                .is_empty()
+        {
+            admin_events.extend(crate::create_realm::seed_placement_events(
+                &mut reducer_state,
+                &self.config.actor,
+                &document,
+            )?);
+        }
         overlay_realm_config_reducer_materialization(
             &mut document,
             &reducer_state,
@@ -637,7 +652,7 @@ fn apply_realm_config_node_ensure(
     Ok(event)
 }
 
-fn overlay_realm_config_reducer_materialization(
+pub(crate) fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now_ms: u64,
@@ -851,6 +866,50 @@ mod tests {
                 txn_id: Some(txn_id),
             }))
         );
+    }
+
+    #[test]
+    fn fresh_seeds_bindings() {
+        // A fresh bootstrap must materialize the placement identity the create
+        // path does: whatever only the document carries a rebuild loses.
+        let realm_id = RealmId::from_bytes([9; 32]);
+        let mut operation = EnsureRealmConfigOperation::new(config(actor(1, realm_id), 3));
+        let txn_id = TxnId::generate();
+        operation.txn_id = Some(txn_id);
+
+        let writes = batch_write(
+            operation
+                .emit_write_document_and_admin_state(None, None)
+                .unwrap(),
+            txn_id,
+        );
+
+        let stored =
+            RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
+        let state: AdminDocumentReducerState =
+            postcard::from_bytes(write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE)).unwrap();
+
+        let bindings = state.materialized_realm_config_strategy_bindings();
+        assert!(!bindings.is_empty());
+        assert_eq!(bindings.len(), stored.strategy_bindings.len());
+        for binding in &stored.strategy_bindings {
+            assert!(
+                bindings
+                    .values()
+                    .any(|materialized| materialized == binding)
+            );
+        }
+        let placement = state.materialized_placement_bindings();
+        for binding in &stored.placement_bindings {
+            assert_eq!(placement.get(&binding.handle), Some(binding));
+        }
+        assert!(
+            stored
+                .placement_bindings
+                .iter()
+                .any(|binding| binding.document_class == DocumentClass::Metadata)
+        );
+        assert!(state.materialized_family_strategy().is_some());
     }
 
     fn pooled_document(realm_id: RealmId, pools: &[(u8, Actor, u32, u32)]) -> RealmConfigDocument {

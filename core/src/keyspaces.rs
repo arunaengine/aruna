@@ -53,6 +53,11 @@ pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 /// departing holder has closed. A holder-authoritative writer reads it inside
 /// its own transaction, so a close conflicts every uncommitted predecessor write.
 pub const PLACEMENT_WRITE_FENCE_KEYSPACE: &str = "placement_write_fence";
+/// Immutable placement-policy documents a holder stores, keyed by policy id.
+pub const PLACEMENT_POLICY_KEYSPACE: &str = "placement_policies";
+/// Node-local policy cache keyed by `(policy_id, digest)`. An id-only key could
+/// accept changed bytes under a known id, which policy immutability forbids.
+pub const PLACEMENT_POLICY_CACHE_KEYSPACE: &str = "placement_policy_cache";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
 pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
 pub const TASK_TIMER_KEYSPACE: &str = "task_timers";
@@ -68,6 +73,10 @@ pub const BLOB_HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
+/// Local inventory of the logical version copies this node has registered.
+/// Written and removed atomically with the operation that exposes a copy
+/// locally; it is never evidence about another node's copies.
+pub const MANAGED_COPY_KEYSPACE: &str = "managed_copies";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
@@ -87,6 +96,9 @@ pub const REFERENCE_METADATA_REFRESH_JOB_KEYSPACE: &str = "reference_metadata_re
 pub const USAGE_STATS_KEYSPACE: &str = "usage_stats";
 pub const USAGE_NODE_STATS_KEYSPACE: &str = "usage_node_stats";
 pub const NODE_INFO_KEYSPACE: &str = "node_info";
+/// Single-row local placement subject and its generation. Governed writes and
+/// internal serves are evaluated against it; a rejoin blocks serving here.
+pub const NODE_SUBJECT_KEYSPACE: &str = "node_subject";
 pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
 pub const NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
@@ -124,8 +136,43 @@ pub const JOB_ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const JOB_RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+/// Signed immutable output records, keyed by ExecutionId.
+pub const JOB_OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
 pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
+
+// Append-only distributed job-record store.
+/// Immutable authentic record envelopes, keyed by `JobRecordKey`. A key is
+/// written once: the same digest replays as a no-op and a different digest is
+/// retained in the conflict keyspace instead of overwriting it.
+pub const JOB_FAMILY_RECORD_KEYSPACE: &str = "job_family_records";
+/// Bounded records whose predecessor evidence, or whose local holder view, is
+/// not available yet. A pending record is never projected or relayed.
+pub const JOB_FAMILY_PENDING_KEYSPACE: &str = "job_family_pending";
+/// Explicit same-key/different-digest evidence, keyed by record key and digest.
+/// Quarantined records stay auditable and never enter a projection.
+pub const JOB_FAMILY_CONFLICT_KEYSPACE: &str = "job_family_conflicts";
+/// Alias index: one accepted `JobId` to the request family that admitted it.
+pub const JOB_FAMILY_ALIAS_KEYSPACE: &str = "job_family_aliases";
+/// Per-family projection cache and its bounded revision. Derived state only; it
+/// is rebuilt from the immutable records and is never authority.
+pub const JOB_FAMILY_PROJECTION_KEYSPACE: &str = "job_family_projections";
+/// Locally published authentic records awaiting family replication, keyed by
+/// record key. Only a replicated-authority record is ever queued here.
+pub const JOB_FAMILY_OUTBOX_KEYSPACE: &str = "job_family_outbox";
+/// Exact local capacity held for one accepted execution, keyed by ExecutionId.
+/// The row is written with the signed receipt and released at terminal state.
+pub const JOB_RESERVATION_KEYSPACE: &str = "job_reservations";
+pub const JOB_ADMISSION_QUOTA_KEYSPACE: &str = "job_admission_quota";
+/// Persisted witness fallback deadlines, keyed by due time and family, so a
+/// later-ranked witness still plans after a restart.
+pub const JOB_WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
+/// Current witness deadline by family; the due-time rows are the scan index.
+pub const JOB_WITNESS_DEADLINE_INDEX_KEYSPACE: &str = "job_witness_deadline_index";
+/// Bounded explain record of the plan a witness sealed before it launched.
+pub const JOB_PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
 pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
+/// The single row recording what this node could not resolve when it departed.
+pub const COMPUTE_DEPARTURE_KEYSPACE: &str = "compute_departure";
 pub const ROCRATE_JOB_STATE_KEYSPACE: &str = "rocrate_job_state";
 pub const ROCRATE_UPLOAD_KEYSPACE: &str = "rocrate_uploads";
 pub const ROCRATE_UPLOAD_CLEANUP_KEYSPACE: &str = "rocrate_upload_cleanups";

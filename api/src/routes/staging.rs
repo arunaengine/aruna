@@ -1349,6 +1349,9 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
             ServerError::InternalError(error.to_string())
         }
         MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.to_string()),
+        // A node revalidating its inventory admits nothing governed; the client
+        // learns only that this node is busy, never which rule applies.
+        MaterializeSnapshotError::Gate(_) => ServerError::ServiceUnavailable,
     }
 }
 
@@ -1360,6 +1363,9 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
             ServerError::InternalError(error.to_string())
         }
         MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.to_string()),
+        // A policy error names the ids it conflicts on, which a client must
+        // never learn: the refusal is reported without them.
+        MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
     }
 }
 
@@ -2103,8 +2109,9 @@ mod tests {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: user_with_source_read,
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         };
         write_doc(
             &driver_ctx,

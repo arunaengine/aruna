@@ -5,9 +5,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
-    JobResultPayload, JobState, MintPersistentIdSpec, Permission, RealmId, RunCrateStatus,
-    StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key, shard_for_subject,
-    user_dedup_key,
+    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, Permission, RealmId,
+    RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key,
+    shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -40,6 +40,8 @@ use crate::metadata::repository::StorageReadError;
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 
+use super::lifecycle::cancel::cancel_family;
+use super::lifecycle::routing::{family_of_alias, family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
 pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
@@ -47,7 +49,7 @@ pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
 /// it never selects a remote owner.
-async fn mint_local_job(
+pub(crate) async fn mint_local_job(
     context: &DriverContext,
     realm_id: RealmId,
     owner_node_id: NodeId,
@@ -107,20 +109,29 @@ pub(crate) async fn submit_local_job(
     drive(SubmitJobOperation::new(spec, job_id), context).await
 }
 
-/// Submit a container execution job on behalf of `created_by`. The drain claims it
-/// and drives the fenced external attempt lifecycle. The idempotency key is
-/// namespaced per user, disjoint from internal obligation keys.
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_execution_job(
-    context: &DriverContext,
-    spec: ExecutionSpec,
-    created_by: UserId,
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
+/// Normalizes one execution request and enforces every bound that holds
+/// regardless of where the job runs: composition, the shared output bound, and
+/// the workspace rules. It is the single gate both the local and the
+/// distributed submission path pass through.
+pub(crate) fn validate_execution(
+    spec: &mut ExecutionSpec,
     workspace_mode: WorkspaceMode,
-    workspace_bucket: Option<String>,
-    retention_ms: u64,
-) -> Result<SubmitJobResult, SubmitJobError> {
+    workspace_bucket: Option<&str>,
+) -> Result<(), SubmitJobError> {
+    spec.inputs =
+        aruna_core::structs::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
+    // One bound governs declaration, expansion, the local result, and the
+    // immutable output record, so a valid success is always publishable.
+    if spec.file_outputs.len() + spec.workspace_outputs.len() > MAX_EXECUTION_OUTPUTS {
+        return Err(SubmitJobError::TooManyOutputs {
+            limit: MAX_EXECUTION_OUTPUTS,
+        });
+    }
+    if spec.file_outputs.is_empty() && !spec.output_prefixes.is_empty() {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "output prefixes require declared file outputs".to_string(),
+        ));
+    }
     match workspace_mode {
         WorkspaceMode::None if workspace_bucket.is_some() => {
             return Err(SubmitJobError::InvalidWorkspace(
@@ -128,9 +139,7 @@ pub async fn submit_execution_job(
             ));
         }
         WorkspaceMode::Existing
-            if workspace_bucket
-                .as_deref()
-                .is_none_or(|bucket| bucket.trim().is_empty()) =>
+            if workspace_bucket.is_none_or(|bucket| bucket.trim().is_empty()) =>
         {
             return Err(SubmitJobError::InvalidWorkspace(
                 "existing mode requires a bucket".to_string(),
@@ -165,6 +174,24 @@ pub async fn submit_execution_job(
             "mounted inputs require none workspace mode".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Submit a container execution job on behalf of `created_by`. The drain claims it
+/// and drives the fenced external attempt lifecycle. The idempotency key is
+/// namespaced per user, disjoint from internal obligation keys.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_execution_job(
+    context: &DriverContext,
+    mut spec: ExecutionSpec,
+    created_by: UserId,
+    owner_node_id: NodeId,
+    idempotency_key: Option<String>,
+    workspace_mode: WorkspaceMode,
+    workspace_bucket: Option<String>,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
@@ -470,7 +497,9 @@ async fn route_record(
             .map_err(JobRouteError::Internal);
     };
     let request = auth_token.map(|auth_token| JobRequest::Record { auth_token, job_id });
-    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    let responder = family_responder(context, job_id).await?;
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
+        .with_responder(responder);
     match drive(operation, context).await? {
         JobRouteOutcome::Local => read_record_data(context, user_id, job_id)
             .await
@@ -611,6 +640,11 @@ pub async fn read_job_routed(
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<RoutedJobStatus, JobRouteError> {
     let user_id = auth.user_id;
+    // An external job is answered from the family projection, which any node
+    // that reduced the family can do; only other jobs keep owner routing.
+    if let Some(status) = family_status(context, auth, job_id).await {
+        return status;
+    }
     let Some(net) = context.net_handle.as_ref() else {
         return local_status(context, auth, job_id).await;
     };
@@ -721,7 +755,9 @@ pub async fn read_report_routed(
         last_key: last_key.clone(),
         limit: wire_limit,
     });
-    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    let responder = family_responder(context, job_id).await?;
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
+        .with_responder(responder);
     match drive(operation, context).await? {
         JobRouteOutcome::Local => {
             read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
@@ -879,7 +915,10 @@ pub async fn read_artifact_routed(
         };
         return Ok((lookup, read));
     }
-    let owner = resolve_job_owner(context, job_id).await?;
+    let owner = match family_responder(context, job_id).await? {
+        Some(responder) => responder,
+        None => resolve_job_owner(context, job_id).await?,
+    };
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     if Some(owner) == local_node {
         let lookup = read_owned_artifact(context, user_id, job_id, now_ms)
@@ -1048,8 +1087,37 @@ fn cancel_outcome(outcome: CancelJobOutcome) -> RoutedCancelOutcome {
     }
 }
 
-/// Cancellation is owner-anchored: it either executes on the immutable owner or
-/// fails `Unavailable`; no passive copy is ever terminalized in its stead.
+/// Cancels one external job by publishing its family record. `None` means the
+/// alias names no family here, so ordinary owner-anchored cancellation applies.
+async fn family_cancel(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Option<Result<RoutedCancelOutcome, JobRouteError>> {
+    let auth = AuthContext {
+        user_id,
+        realm_id: user_id.realm_id,
+        path_restrictions: None,
+    };
+    let published = cancel_family(context, &auth, job_id, auth_token).await?;
+    Some(match published {
+        Ok(()) => match family_status(context, &auth, job_id).await {
+            Some(Ok(status)) => Ok(match status.job.state.is_terminal() {
+                true => RoutedCancelOutcome::AlreadyTerminal(status.job),
+                false => RoutedCancelOutcome::Requested(status.job),
+            }),
+            Some(Err(error)) => Err(error),
+            None => Err(JobRouteError::Unavailable(
+                "cancelled family is no longer projectable".to_string(),
+            )),
+        },
+        Err(error) => Err(error),
+    })
+}
+
+/// Cancellation of a node-local job is owner-anchored: it either executes on the
+/// immutable owner or fails `Unavailable`; no passive copy is terminalized.
 pub async fn cancel_job_routed(
     context: &DriverContext,
     runtime: &JobsRuntime,
@@ -1063,8 +1131,36 @@ pub async fn cancel_job_routed(
             .map(cancel_outcome)
             .map_err(JobRouteError::Internal);
     };
+    // Cancelling an external job is an append-only family record, not an owner
+    // call; the local row of a receipted execution is stopped separately.
+    if let Some(cancelled) = family_cancel(context, user_id, job_id, auth_token.clone()).await {
+        if cancelled.is_ok() {
+            let family = match family_of_alias(context, job_id).await {
+                Ok(Some(family)) => family,
+                Ok(None) => {
+                    return Err(JobRouteError::Unavailable(
+                        "cancelled family alias is no longer resolvable".to_string(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            for reservation in super::lifecycle::reservation::held_reservations(context)
+                .await
+                .map_err(JobRouteError::Unavailable)?
+                .into_iter()
+            {
+                if family_of_alias(context, reservation.logical_job_id).await? == Some(family) {
+                    runtime.request_cancel(reservation.job_id);
+                }
+            }
+            kick_drain(context).await;
+        }
+        return cancelled;
+    }
     let request = auth_token.map(|auth_token| JobRequest::Cancel { auth_token, job_id });
-    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    let responder = family_responder(context, job_id).await?;
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
+        .with_responder(responder);
     match drive(operation, context).await? {
         JobRouteOutcome::Local => cancel_owned_job(context, runtime, user_id, job_id)
             .await
@@ -1135,6 +1231,86 @@ mod tests {
 
     fn node_id() -> NodeId {
         iroh::SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    #[tokio::test]
+    async fn caps_declared_outputs() {
+        // The declaration bound is the immutable record's bound, so a valid
+        // local success can never be impossible to publish.
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId([1u8; 32]);
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
+                .map(|index| aruna_core::structs::WorkspaceOutput {
+                    container_path: format!("/out/{index}"),
+                    dest_key: format!("out/{index}"),
+                })
+                .collect(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+
+        let error = submit_execution_job(
+            &context,
+            spec.clone(),
+            UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
+            node_id(),
+            None,
+            WorkspaceMode::Kept,
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SubmitJobError::TooManyOutputs {
+                limit: MAX_EXECUTION_OUTPUTS
+            }
+        ));
+
+        spec.workspace_outputs.pop();
+        spec.output_prefixes.push("out/".to_string());
+        assert!(matches!(
+            validate_execution(&mut spec, WorkspaceMode::Kept, None),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+        spec.output_prefixes.clear();
+        assert!(!matches!(
+            submit_execution_job(
+                &context,
+                spec,
+                UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
+                node_id(),
+                None,
+                WorkspaceMode::Kept,
+                None,
+                1,
+            )
+            .await,
+            Err(SubmitJobError::TooManyOutputs { .. })
+        ));
     }
 
     #[test]

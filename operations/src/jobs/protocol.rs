@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
+use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{AuthContext, JobId, JobPayload, RealmId};
+use aruna_core::structs::{AuthContext, JobFamilyId, JobId, JobPayload, RealmId};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
@@ -263,11 +264,13 @@ async fn prepare_response(
             )
             .await
         }
-        JobRequest::Cancel { job_id, .. } => {
+        JobRequest::Cancel {
+            job_id, auth_token, ..
+        } => {
             if let Some(rejected) = owner_gate(context, job_id, local_node).await {
                 return rejected;
             }
-            prepare_cancel(context, runtime, auth.user_id, job_id).await
+            prepare_cancel(context, runtime, &auth, auth_token, job_id).await
         }
         JobRequest::Record { job_id, .. } => {
             if let Some(rejected) = owner_gate(context, job_id, local_node).await {
@@ -305,11 +308,23 @@ async fn prepare_record(
 /// Owner-directed requests are answered only by the derived owner, the sole
 /// absence authority: a non-owner or unresolved owner answers `Unavailable`,
 /// and only a provably invalid id is `NotFound`.
+/// Who may answer for a job here: its immutable owner, or any node that knows
+/// the request family the alias belongs to. An external job has no single
+/// owner, so a family holder or its executor answers for it.
 async fn owner_gate(
     context: &DriverContext,
     job_id: JobId,
     local_node: Option<NodeId>,
 ) -> Option<PreparedResponse> {
+    match crate::jobs::lifecycle::routing::family_of_alias(context, job_id).await {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(error) => {
+            return Some(PreparedResponse::new(JobResponse::Unavailable(
+                error.to_string(),
+            )));
+        }
+    }
     match resolve_job_owner(context, job_id).await {
         Ok(owner) if local_node == Some(owner) => None,
         Ok(_) => Some(PreparedResponse::new(JobResponse::Unavailable(
@@ -428,6 +443,152 @@ async fn prepare_artifact(
 async fn prepare_cancel(
     context: &DriverContext,
     runtime: &Arc<JobsRuntime>,
+    auth: &AuthContext,
+    auth_token: MetadataAuthToken,
+    job_id: JobId,
+) -> PreparedResponse {
+    let requested_family = match crate::jobs::lifecycle::routing::family_of_alias(context, job_id)
+        .await
+    {
+        Ok(family) => family,
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+    };
+    let holds = match holds_family(context, requested_family).await {
+        Ok(holds) => holds,
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+    };
+    // A cancel that already reached this node is never forwarded again: two
+    // divergent holder views would bounce it between the same two nodes. A
+    // non-holder answers for its own executions only.
+    if !holds {
+        let reservations =
+            match crate::jobs::lifecycle::reservation::held_reservations(context).await {
+                Ok(reservations) => reservations,
+                Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+            };
+        let mut stopped = None;
+        for reservation in reservations {
+            let matches = match reservation_matches(
+                context,
+                job_id,
+                requested_family,
+                reservation.logical_job_id,
+            )
+            .await
+            {
+                Ok(matches) => matches,
+                Err(error) => {
+                    return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+                }
+            };
+            if !matches {
+                continue;
+            }
+            match cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await {
+                Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
+                    stopped = Some((record, true));
+                }
+                Ok(CancelJobOutcome::Requested(record)) => {
+                    stopped = Some((record, false));
+                }
+                Ok(CancelJobOutcome::NotFound) => {}
+                Err(error) => {
+                    return PreparedResponse::new(JobResponse::Unavailable(error));
+                }
+            }
+        }
+        if let Some((record, terminal)) = stopped {
+            let mut job = JobStatusView::from(&record);
+            job.job_id = job_id;
+            return PreparedResponse::new(JobResponse::Cancelled { job, terminal });
+        }
+        if requested_family.is_some() {
+            // Availability, never a verdict: the caller keeps asking the holders
+            // its own view names instead of this node forwarding a second hop.
+            return PreparedResponse::new(JobResponse::Unavailable(
+                "this node does not hold the job family".to_string(),
+            ));
+        }
+        return local_cancel(context, runtime, auth.user_id, job_id).await;
+    }
+    // A forwarded cancel reaches a family holder here: it publishes the record
+    // and then still stops its own local execution row if it has one.
+    match crate::jobs::lifecycle::cancel::cancel_family(
+        context,
+        auth,
+        job_id,
+        Some(auth_token.clone()),
+    )
+    .await
+    {
+        Some(Ok(())) => {
+            let reservations =
+                match crate::jobs::lifecycle::reservation::held_reservations(context).await {
+                    Ok(reservations) => reservations,
+                    Err(error) => {
+                        return PreparedResponse::new(JobResponse::Unavailable(error));
+                    }
+                };
+            for reservation in reservations {
+                let matches = match reservation_matches(
+                    context,
+                    job_id,
+                    requested_family,
+                    reservation.logical_job_id,
+                )
+                .await
+                {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+                    }
+                };
+                if !matches {
+                    continue;
+                }
+                if let Err(error) =
+                    cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await
+                {
+                    return PreparedResponse::new(JobResponse::Unavailable(error));
+                }
+            }
+            return match crate::jobs::lifecycle::routing::family_status(context, auth, job_id).await
+            {
+                Some(Ok(status)) => PreparedResponse::new(JobResponse::Cancelled {
+                    terminal: status.job.state.is_terminal(),
+                    job: status.job,
+                }),
+                Some(Err(JobRouteError::Forbidden)) => {
+                    PreparedResponse::new(JobResponse::Forbidden)
+                }
+                Some(Err(JobRouteError::Unauthorized)) => {
+                    PreparedResponse::new(JobResponse::Unauthorized)
+                }
+                Some(Err(JobRouteError::NotFound)) | None => {
+                    PreparedResponse::new(JobResponse::NotFound)
+                }
+                Some(Err(error)) => {
+                    PreparedResponse::new(JobResponse::Unavailable(error.to_string()))
+                }
+            };
+        }
+        Some(Err(error)) => {
+            return PreparedResponse::new(match error {
+                JobRouteError::Forbidden => JobResponse::Forbidden,
+                JobRouteError::Unauthorized => JobResponse::Unauthorized,
+                JobRouteError::NotFound => JobResponse::NotFound,
+                error => JobResponse::Unavailable(error.to_string()),
+            });
+        }
+        None => {}
+    }
+    local_cancel(context, runtime, auth.user_id, job_id).await
+}
+
+/// Stops the local execution row of one job, whatever the family decided.
+async fn local_cancel(
+    context: &DriverContext,
+    runtime: &Arc<JobsRuntime>,
     user_id: UserId,
     job_id: JobId,
 ) -> PreparedResponse {
@@ -444,6 +605,44 @@ async fn prepare_cancel(
         Err(error) => JobResponse::Unavailable(error),
     };
     PreparedResponse::new(response)
+}
+
+async fn holds_family(
+    context: &DriverContext,
+    family: Option<JobFamilyId>,
+) -> Result<bool, JobRouteError> {
+    let Some(family) = family else {
+        return Ok(false);
+    };
+    let net = context
+        .net_handle
+        .as_ref()
+        .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
+    let config = crate::metadata::api::load_realm_config(context, *net.realm_id())
+        .await
+        .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
+    let view = crate::jobs::records::verify::FamilyView::resolve(&config, *net.realm_id(), family)
+        .ok_or_else(|| {
+            JobRouteError::Unavailable("job family holder view unavailable".to_string())
+        })?;
+    Ok(view.holds(net.node_id()))
+}
+
+async fn reservation_matches(
+    context: &DriverContext,
+    requested_alias: JobId,
+    requested_family: Option<JobFamilyId>,
+    reservation_alias: JobId,
+) -> Result<bool, JobRouteError> {
+    match requested_family {
+        Some(family) => Ok(crate::jobs::lifecycle::routing::family_of_alias(
+            context,
+            reservation_alias,
+        )
+        .await?
+            == Some(family)),
+        None => Ok(requested_alias == reservation_alias),
+    }
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {

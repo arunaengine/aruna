@@ -462,6 +462,7 @@ pub enum RealmPlacementDocumentClass {
     Metadata,
     MetadataRegistry,
     JobControl,
+    PlacementPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -661,6 +662,7 @@ impl From<aruna_core::structs::DocumentClass> for RealmPlacementDocumentClass {
             aruna_core::structs::DocumentClass::Metadata => Self::Metadata,
             aruna_core::structs::DocumentClass::MetadataRegistry => Self::MetadataRegistry,
             aruna_core::structs::DocumentClass::JobControl => Self::JobControl,
+            aruna_core::structs::DocumentClass::PlacementPolicy => Self::PlacementPolicy,
         }
     }
 }
@@ -674,6 +676,7 @@ impl From<RealmPlacementDocumentClass> for aruna_core::structs::DocumentClass {
             RealmPlacementDocumentClass::Metadata => Self::Metadata,
             RealmPlacementDocumentClass::MetadataRegistry => Self::MetadataRegistry,
             RealmPlacementDocumentClass::JobControl => Self::JobControl,
+            RealmPlacementDocumentClass::PlacementPolicy => Self::PlacementPolicy,
         }
     }
 }
@@ -3269,13 +3272,23 @@ mod tests {
 
         // The creating node's placement entry is seeded at realm creation with
         // the default location/weight. Publish a node info document for it too.
+        let mut docker = aruna_core::compute::ExecutorCapability::new(
+            "docker".to_string(),
+            aruna_core::structs::PlacementSubject {
+                node_id,
+                generation: 1,
+                location: "eu-west".to_string(),
+                labels: std::collections::BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+        )
+        .expect("subject is valid");
+        docker.file_staging = true;
+        docker.direct_s3 = true;
         let document = NodeInfoDocument {
             node_id,
-            executors: vec![aruna_core::compute::ExecutorCapability {
-                kind: "docker".to_string(),
-                file_staging: true,
-                direct_s3: true,
-            }],
+            executors: vec![docker],
             labels: std::collections::BTreeMap::from([("tier".to_string(), "hot".to_string())]),
             urls: NodeUrls {
                 api: None,
@@ -3288,6 +3301,15 @@ mod tests {
                 heartbeat_at_ms: 1_700_000_000_000,
             },
             updated_at_ms: 1_700_000_000_500,
+            epoch: aruna_core::structs::AdvertisementEpoch {
+                membership_generation: 1,
+                publisher_generation: 1,
+                observed_at_ms: 1_700_000_000_500,
+            },
+            compute_draining: false,
+            leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         };
         state
             .get_ctx()

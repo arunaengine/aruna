@@ -304,6 +304,18 @@ impl RealmPlacementMutation {
                     "placement strategy replica_count must not be zero".to_string(),
                 ))
             }
+            // Every node derives family shards from this count, so a reshape
+            // would silently re-route retained v1 family records.
+            Self::UpsertStrategy(strategy)
+                if document.job_family_strategy_id == strategy.strategy_id
+                    && document
+                        .strategy(&strategy.strategy_id)
+                        .is_some_and(|existing| existing.shard_count != strategy.shard_count) =>
+            {
+                Err(MutateRealmPlacementError::JobFamilyImmutable {
+                    strategy_id: strategy.strategy_id,
+                })
+            }
             // Per-shard activations cannot survive a bucket-space reshape.
             Self::UpsertStrategy(strategy)
                 if document
@@ -492,6 +504,11 @@ impl RealmPlacementMutation {
                 Ok(())
             }
             Self::RemoveStrategy(strategy_id) => {
+                if document.job_family_strategy_id == *strategy_id {
+                    return Err(MutateRealmPlacementError::JobFamilyImmutable {
+                        strategy_id: *strategy_id,
+                    });
+                }
                 let referenced = document.default_strategy_id == Some(*strategy_id)
                     || document
                         .strategy_bindings
@@ -674,6 +691,8 @@ pub enum MutateRealmPlacementError {
     EmptyShardHolders { strategy_id: Ulid, shard: u32 },
     #[error("placement strategy {strategy_id} is currently referenced")]
     StrategyReferenced { strategy_id: Ulid },
+    #[error("job family strategy {strategy_id} and its shard count are immutable")]
+    JobFamilyImmutable { strategy_id: Ulid },
     #[error("placement transition {transition_id} is still in flight")]
     TransitionInFlight { transition_id: Ulid },
     #[error("placement transition {transition_id} is unknown")]
@@ -1659,6 +1678,35 @@ mod tests {
         ));
 
         // Selector edits without a shard_count change stay allowed.
+        let mut edited = document.strategy(&strategy_id).unwrap().clone();
+        edited.replica_count = Some(1);
+        assert_eq!(
+            RealmPlacementMutation::UpsertStrategy(edited).validate(&document),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn family_strategy_frozen() {
+        // Removing or reshaping the family strategy would re-route every
+        // retained v1 family record, so both are refused outright.
+        let realm_id = RealmId::from_bytes([16; 32]);
+        let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        document.seed_default_placement();
+        let strategy_id = document.job_family_strategy_id;
+        let mut reshaped = document.strategy(&strategy_id).unwrap().clone();
+        reshaped.shard_count *= 2;
+
+        assert_eq!(
+            RealmPlacementMutation::UpsertStrategy(reshaped).validate(&document),
+            Err(MutateRealmPlacementError::JobFamilyImmutable { strategy_id })
+        );
+        assert_eq!(
+            RealmPlacementMutation::RemoveStrategy(strategy_id).validate(&document),
+            Err(MutateRealmPlacementError::JobFamilyImmutable { strategy_id })
+        );
+
+        // Holder movement under the same strategy stays allowed.
         let mut edited = document.strategy(&strategy_id).unwrap().clone();
         edited.replica_count = Some(1);
         assert_eq!(

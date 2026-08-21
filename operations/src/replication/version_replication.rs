@@ -1,4 +1,7 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
 use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
@@ -7,6 +10,9 @@ use crate::driver::{DriverContext, drive};
 use crate::group_backends::{RecordReadError, parse_read};
 use crate::group_routing::load_group_inputs;
 use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
+use crate::placement_policy::{
+    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReferenceAdvance, ReplicationMode,
@@ -23,12 +29,12 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs,
+    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, ManagedCopyKey,
     MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, Permission,
-    PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
-    SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
-    blob_object_permission_path, sync_state_key,
+    PlacementPolicyRef, PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind,
+    ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
+    RoutingError, SourceConnectorKind, SourceMetadata, StagingStrategy, SyncMode, SyncRelationship,
+    VersionKey, VersionSourceBinding, blob_object_permission_path, sync_state_key,
 };
 use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
@@ -44,14 +50,14 @@ const ITER_PAGE_SIZE: usize = 512;
 const MAX_SCOPE_VERSIONS: usize = 1024;
 
 #[derive(Debug, Error, PartialEq)]
-pub(super) enum SourceAuthorizationError {
+pub(crate) enum SourceAuthorizationError {
     #[error("source access denied")]
     Denied,
     #[error("source authorization unavailable: {0}")]
     Unavailable(String),
 }
 
-pub(super) struct SourceAuthorization {
+pub(crate) struct SourceAuthorization {
     group_id: GroupId,
     source_node_id: NodeId,
     auth_context: AuthContext,
@@ -80,7 +86,7 @@ impl std::fmt::Debug for SourceAuthorization {
 }
 
 impl SourceAuthorization {
-    pub(super) async fn load(
+    pub(crate) async fn load(
         context: &DriverContext,
         auth_context: AuthContext,
         group_id: GroupId,
@@ -107,7 +113,7 @@ impl SourceAuthorization {
         })
     }
 
-    pub(super) fn group_id(&self) -> GroupId {
+    pub(crate) fn group_id(&self) -> GroupId {
         self.group_id
     }
 
@@ -300,6 +306,9 @@ pub struct ReplicateScopeOperation {
     writer_auth_context: Option<AuthContext>,
     reference_advance: Option<ReferenceAdvance>,
     routing: NodeRouting,
+    /// Destination facts of this node, passed to every version sub-operation
+    /// that may materialize reference bytes here.
+    gate_context: Option<GateContext>,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
 }
@@ -321,6 +330,7 @@ impl ReplicateScopeOperation {
             writer_auth_context: None,
             reference_advance: None,
             routing: NodeRouting::default(),
+            gate_context: None,
             result: ReplicateScopeResult {
                 replicated: 0,
                 replicated_bytes: 0,
@@ -338,7 +348,14 @@ impl ReplicateScopeOperation {
         self
     }
 
-    pub(super) fn with_source_authorization(mut self, authorization: SourceAuthorization) -> Self {
+    /// The destination this node materializes reference bytes against. Omitting
+    /// it fails every governed reference materialization closed.
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
+        self
+    }
+
+    pub(crate) fn with_source_authorization(mut self, authorization: SourceAuthorization) -> Self {
         self.source_authorization = Some(authorization);
         self
     }
@@ -381,6 +398,34 @@ impl ReplicateScopeOperation {
             })),
             upstream_sources,
             writer_auth_context,
+        });
+        self
+    }
+
+    /// Maps one exact source version to an unrelated node-local destination.
+    pub(crate) fn with_destination(
+        mut self,
+        target_bucket: String,
+        target_key: String,
+        source_node_id: NodeId,
+        writer_auth_context: AuthContext,
+    ) -> Self {
+        let (source_prefix, relationship_id) = match &self.input.target {
+            ReplicateScopeTarget::Version { key, version_id } => (Some(key.clone()), *version_id),
+            _ => (None, Ulid::nil()),
+        };
+        self.writer_auth_context = Some(writer_auth_context.clone());
+        self.sync = Some(SyncTransferContext {
+            target_bucket,
+            source_prefix,
+            target_prefix: Some(target_key),
+            source_node_id,
+            relationship_id,
+            reference_intent: false,
+            reference_handling: ReferenceHandling::Materialize,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: Some(writer_auth_context),
         });
         self
     }
@@ -616,6 +661,10 @@ impl ReplicateScopeOperation {
             None => {
                 ReplicateObjectVersionOperation::new(request).with_routing(self.routing.clone())
             }
+        };
+        let operation = match self.gate_context.clone() {
+            Some(context) => operation.with_gate(context),
+            None => operation,
         };
         let operation = match writer_auth_context {
             Some(auth_context) => operation.with_writer_auth(auth_context),
@@ -904,6 +953,8 @@ impl Operation for ReplicateScopeOperation {
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplicateObjectVersionError {
     #[error(transparent)]
+    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error("could not load the group's routing inputs: {0}")]
     RoutingInputsFailed(String),
@@ -915,6 +966,8 @@ pub enum ReplicateObjectVersionError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     ReplicationError(#[from] ReplicationError),
+    #[error(transparent)]
+    PolicyGateError(#[from] PolicyGateError),
     #[error("Version not found")]
     VersionNotFound,
     #[error("Reference version must be materialized before manifest creation")]
@@ -938,12 +991,14 @@ enum ReplicateObjectVersionState {
     Init,
     ReadVersion,
     ReadBlobLocation,
+    CheckManagedCopy,
     ResolveReferenceAccess,
     HeadReferenceSource,
     ReadReferenceState,
     LoadRouting,
     ReadBucketRules,
     ReadReferenceSource,
+    ReferencePolicyGate,
     WriteReferenceBlob,
     CleanupReferenceBlob,
     ReadMultipartSummary,
@@ -981,6 +1036,13 @@ pub struct ReplicateObjectVersionOperation {
     sync: Option<SyncTransferContext>,
     writer_auth_context: Option<AuthContext>,
     reference_advance: Option<ReferenceAdvance>,
+    /// Refs read from the stored version, carried onto the manifest unchanged.
+    version_policies: Vec<PlacementPolicyRef>,
+    pending_copy: Option<ManagedCopyKey>,
+    /// Destination facts of this node, evaluated before reference bytes are
+    /// materialized locally.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
@@ -1007,6 +1069,10 @@ impl ReplicateObjectVersionOperation {
             sync: None,
             writer_auth_context: None,
             reference_advance: None,
+            version_policies: Vec::new(),
+            pending_copy: None,
+            gate_context: None,
+            gate: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
@@ -1014,6 +1080,11 @@ impl ReplicateObjectVersionOperation {
 
     pub fn with_routing(mut self, routing: NodeRouting) -> Self {
         self.routing = routing;
+        self
+    }
+
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
         self
     }
 
@@ -1037,12 +1108,14 @@ impl ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::Init => "Init",
             ReplicateObjectVersionState::ReadVersion => "ReadVersion",
             ReplicateObjectVersionState::ReadBlobLocation => "ReadBlobLocation",
+            ReplicateObjectVersionState::CheckManagedCopy => "CheckManagedCopy",
             ReplicateObjectVersionState::ResolveReferenceAccess => "ResolveReferenceAccess",
             ReplicateObjectVersionState::HeadReferenceSource => "HeadReferenceSource",
             ReplicateObjectVersionState::ReadReferenceState => "ReadReferenceState",
             ReplicateObjectVersionState::LoadRouting => "LoadRouting",
             ReplicateObjectVersionState::ReadBucketRules => "ReadBucketRules",
             ReplicateObjectVersionState::ReadReferenceSource => "ReadReferenceSource",
+            ReplicateObjectVersionState::ReferencePolicyGate => "ReferencePolicyGate",
             ReplicateObjectVersionState::WriteReferenceBlob => "WriteReferenceBlob",
             ReplicateObjectVersionState::CleanupReferenceBlob => "CleanupReferenceBlob",
             ReplicateObjectVersionState::ReadMultipartSummary => "ReadMultipartSummary",
@@ -1427,7 +1500,51 @@ impl ReplicateObjectVersionOperation {
         }
     }
 
+    /// A reference materializes real bytes on this node, so it passes the same
+    /// destination gate an ordinary write does, before the source is read.
     fn read_reference_source(&mut self) -> Effects {
+        match write_gate(self.gate_context.as_ref(), &self.version_policies) {
+            Ok(None) => self.open_reference_source(),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = ReplicateObjectVersionState::ReferencePolicyGate;
+                match complete {
+                    true => self.finish_reference_gate(),
+                    false => effects,
+                }
+            }
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn handle_reference_gate(&mut self, event: Event) -> Effects {
+        let Some(gate) = self.gate.as_mut() else {
+            return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+        };
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_reference_gate(),
+            false => effects,
+        }
+    }
+
+    fn finish_reference_gate(&mut self) -> Effects {
+        let Some(gate) = self.gate.take() else {
+            return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+        };
+        let decision = gate
+            .finalize()
+            .map_err(PolicyGateError::from)
+            .and_then(|outcome| gate_decision(outcome.decision));
+        match decision {
+            Ok(()) => self.open_reference_source(),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn open_reference_source(&mut self) -> Effects {
         let Some(access) = self.reference_access.take() else {
             return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
         };
@@ -1744,6 +1861,7 @@ impl ReplicateObjectVersionOperation {
             metadata,
             reference_advance: self.reference_advance,
             reference_advance_count,
+            placement_policies: self.version_policies.clone(),
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -1909,7 +2027,9 @@ impl Operation for ReplicateObjectVersionOperation {
                     state,
                     metadata,
                     published_by: _,
+                    placement_policies,
                 } = version;
+                self.version_policies = placement_policies;
 
                 match state {
                     BlobVersionState::Materialized {
@@ -1985,10 +2105,58 @@ impl Operation for ReplicateObjectVersionOperation {
                 self.replication_version = Some(ReplicationVersion::Materialized {
                     created_at,
                     created_by,
-                    location,
+                    location: location.clone(),
                     source,
                     metadata,
                 });
+                // A governed copy is only pushed to a peer when this node may
+                // still serve it; the destination gates itself on arrival.
+                if self.version_policies.is_empty() {
+                    return self.read_multipart_summary();
+                }
+                let key = ManagedCopyKey::new(
+                    VersionKey::new(
+                        &self.request.bucket,
+                        &self.request.key,
+                        self.request.version_id,
+                    ),
+                    location.backend.clone(),
+                );
+                let effect = match serve_reads(&key, None) {
+                    Ok(effect) => effect,
+                    Err(error) => return self.fail(error.into()),
+                };
+                self.pending_copy = Some(key);
+                self.state = ReplicateObjectVersionState::CheckManagedCopy;
+                smallvec![effect]
+            }
+            ReplicateObjectVersionState::CheckManagedCopy => {
+                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                        received: event,
+                    });
+                };
+                let (copy, subject) = match split_serve_reads(values) {
+                    Ok(split) => split,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let Some(key) = self.pending_copy.take() else {
+                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
+                };
+                if let Err(error) = validate_registration(
+                    copy.as_deref(),
+                    &CopyRequest {
+                        key: &key,
+                        node_id: None,
+                        blake3: None,
+                        refs: &self.version_policies,
+                        subject_generation: Some(subject.subject.generation),
+                    },
+                ) {
+                    return self.fail(error.into());
+                }
                 self.read_multipart_summary()
             }
             ReplicateObjectVersionState::ResolveReferenceAccess => {
@@ -2001,6 +2169,7 @@ impl Operation for ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::ReadReferenceSource => {
                 self.handle_reference_source_read(event)
             }
+            ReplicateObjectVersionState::ReferencePolicyGate => self.handle_reference_gate(event),
             ReplicateObjectVersionState::WriteReferenceBlob => {
                 self.handle_reference_blob_written(event)
             }
@@ -2427,8 +2596,9 @@ mod tests {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 
@@ -2659,6 +2829,32 @@ mod tests {
             upstream_sources: Vec::new(),
             writer_auth_context: None,
         }
+    }
+
+    #[test]
+    fn destination_maps_exact() {
+        let version_id = Ulid::generate();
+        let source_node_id = iroh::SecretKey::generate().public();
+        let writer = auth_context();
+        let operation = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Version {
+            key: "stage-version".to_string(),
+            version_id,
+        }))
+        .with_destination(
+            "final-bucket".to_string(),
+            "results/output.txt".to_string(),
+            source_node_id,
+            writer.clone(),
+        );
+        let sync = operation.sync.expect("destination mapping");
+
+        assert_eq!(sync.target_bucket, "final-bucket");
+        assert_eq!(sync.source_prefix.as_deref(), Some("stage-version"));
+        assert_eq!(sync.target_prefix.as_deref(), Some("results/output.txt"));
+        assert_eq!(sync.source_node_id, source_node_id);
+        assert_eq!(sync.relationship_id, version_id);
+        assert_eq!(sync.origin, None);
+        assert_eq!(sync.writer_auth_context, Some(writer));
     }
 
     fn multipart_part_entry(

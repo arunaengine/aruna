@@ -78,6 +78,7 @@ impl DaemonLock {
 pub struct ControlRecord {
     pub attempt_epoch: u64,
     pub highest_generation: u64,
+    pub started: bool,
     pub tombstone: bool,
     pub tombstone_ref: Option<String>,
 }
@@ -106,6 +107,7 @@ impl ControlGuard {
                 self.record = Some(ControlRecord {
                     attempt_epoch: context.attempt_epoch,
                     highest_generation: context.controller_generation,
+                    started: false,
                     tombstone: false,
                     tombstone_ref: None,
                 });
@@ -113,6 +115,24 @@ impl ControlGuard {
             }
         }
         Ok(())
+    }
+
+    pub fn started(&self) -> bool {
+        self.record.as_ref().is_some_and(|record| record.started)
+    }
+
+    /// Fences the start request before the daemon is asked to start: from here
+    /// on an absent container is lost evidence, never a licence to create one.
+    pub fn mark_start(&mut self) -> Result<(), BackendError> {
+        let record = self
+            .record
+            .as_mut()
+            .ok_or_else(|| BackendError::Api("missing Docker control record".to_string()))?;
+        if record.started {
+            return Ok(());
+        }
+        record.started = true;
+        self.persist()
     }
 
     pub fn tombstone(&self) -> Option<TombstoneEvidence> {
@@ -208,6 +228,18 @@ mod tests {
             daemon.control(&fence(1)),
             Err(BackendError::Fenced)
         ));
+    }
+
+    #[test]
+    fn records_start_durably() {
+        // A recorded start must survive the guard so a resubmit cannot re-create.
+        let directory = tempdir().unwrap();
+        let daemon = DaemonLock::acquire(directory.path()).unwrap();
+        let mut control = daemon.control(&fence(1)).unwrap();
+        assert!(!control.started());
+        control.mark_start().unwrap();
+        drop(control);
+        assert!(daemon.control(&fence(2)).unwrap().started());
     }
 
     #[test]

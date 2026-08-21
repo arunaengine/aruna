@@ -224,9 +224,7 @@ pub struct User {
     pub user_id: UserId,
     pub name: String,
     pub subject_ids: Vec<String>,
-    #[serde(default)]
     pub alias_user_ids: HashSet<UserId>,
-    #[serde(default)]
     pub attributes: HashMap<String, String>,
 }
 

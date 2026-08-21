@@ -1,4 +1,7 @@
 use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::managed_copy::{
+    CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
+};
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
@@ -12,9 +15,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, SourceConnectorKind, SourceMetadata, VersionKey, VersionSourceBinding,
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, MultipartObjectMetadataKey,
+    MultipartObjectSummary, PlacementPolicyRef, SourceConnectorKind, SourceMetadata, VersionKey,
+    VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -28,6 +32,7 @@ pub enum HeadObjectState {
     Init,
     StartTransaction,
     GetVersion,
+    CheckManagedCopy,
     GetBlobLocation,
     GetCurrentVersion,
     ReadMultipartSummary,
@@ -67,6 +72,8 @@ pub enum HeadObjectError {
     ResolveReferenceError(#[from] SourceConnectorResolutionError),
     #[error(transparent)]
     StagingSourceError(#[from] StagingSourceError),
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
     #[error("HeadObject failed")]
     HeadObjectFailed,
 }
@@ -90,6 +97,9 @@ pub struct HeadObjectResult {
     pub checksum_type: MultipartChecksumType,
     pub composite_hashes: HashMap<String, Vec<u8>>,
     pub part_count: Option<usize>,
+    /// Refs sealed on the version that was described. A derived write unions
+    /// them with its destination default and never drops one.
+    pub source_policies: Vec<PlacementPolicyRef>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -107,6 +117,11 @@ pub struct HeadObjectOperation {
     composite_hashes: HashMap<String, Vec<u8>>,
     part_count: Option<usize>,
     reference_source: Option<VersionSourceBinding>,
+    /// Held while a governed version's local registration is verified.
+    pending_location: Option<BlobLocationKey>,
+    pending_copy: Option<ManagedCopyKey>,
+    /// Refs of the version being served, compared against its registration.
+    source_policies: Vec<PlacementPolicyRef>,
     output: Option<Result<HeadObjectResult, HeadObjectError>>,
 }
 
@@ -126,6 +141,9 @@ impl HeadObjectOperation {
             composite_hashes: HashMap::new(),
             part_count: None,
             reference_source: None,
+            pending_location: None,
+            pending_copy: None,
+            source_policies: Vec::new(),
             output: None,
         }
     }
@@ -266,7 +284,11 @@ impl HeadObjectOperation {
                 self.source_metadata = None;
                 self.last_refresh = None;
                 self.version_created_at = Some(version.created_at);
-                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
+                self.source_policies = version.placement_policies.clone();
+                if version.placement_policies.is_empty() {
+                    return self.read_blob_location(BlobLocationKey::new(blob_hash, backend));
+                }
+                self.check_managed_copy(version_id, blob_hash, backend)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 HeadObjectError::DeleteMarker
@@ -304,6 +326,59 @@ impl HeadObjectOperation {
     fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = HeadObjectState::GetBlobLocation;
         smallvec![blob_location_read(&key, self.txn_id)]
+    }
+
+    /// A governed version is only serveable from a registered local copy, so an
+    /// unregistered or quarantined copy fails closed before any metadata is served.
+    fn check_managed_copy(
+        &mut self,
+        version_id: Ulid,
+        blob_hash: [u8; 32],
+        backend: BackendRef,
+    ) -> Effects {
+        let key = ManagedCopyKey::new(
+            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
+            backend.clone(),
+        );
+        let effect = match serve_reads(&key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.pending_copy = Some(key);
+        self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
+        self.state = HeadObjectState::CheckManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_managed_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(HeadObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let (copy, subject) = match split_serve_reads(values) {
+            Ok(split) => split,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let (Some(copy_key), Some(key)) = (self.pending_copy.take(), self.pending_location.take())
+        else {
+            return self.emit_error(HeadObjectError::HeadObjectFailed);
+        };
+        if let Err(err) = validate_registration(
+            copy.as_deref(),
+            &CopyRequest {
+                key: &copy_key,
+                node_id: Some(subject.subject.node_id),
+                blake3: Some(key.blake3_hash),
+                refs: &self.source_policies,
+                subject_generation: Some(subject.subject.generation),
+            },
+        ) {
+            return self.emit_error(err.into());
+        }
+        self.read_blob_location(key)
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
@@ -396,6 +471,7 @@ impl HeadObjectOperation {
             checksum_type: self.checksum_type,
             composite_hashes: self.composite_hashes.clone(),
             part_count: self.part_count,
+            source_policies: self.source_policies.clone(),
         }));
 
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -457,6 +533,7 @@ impl HeadObjectOperation {
                     checksum_type: self.checksum_type,
                     composite_hashes: self.composite_hashes.clone(),
                     part_count: self.part_count,
+                    source_policies: self.source_policies.clone(),
                 }));
                 smallvec![]
             }
@@ -489,6 +566,7 @@ impl Operation for HeadObjectOperation {
             HeadObjectState::Init => self.handle_init(),
             HeadObjectState::StartTransaction => self.handle_transaction_started(event),
             HeadObjectState::GetVersion => self.handle_received_version(event),
+            HeadObjectState::CheckManagedCopy => self.handle_managed_copy(event),
             HeadObjectState::GetBlobLocation => self.handle_blob_location_read(event),
             HeadObjectState::GetCurrentVersion => self.handle_received_current_version(event),
             HeadObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),

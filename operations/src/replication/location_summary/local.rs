@@ -1,5 +1,8 @@
 use super::LocationSummaryError;
 use crate::blob::blob_keyspace_helper::blob_location_read;
+use crate::blob::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm_peer::ensure_realm_peer;
 use crate::replication::protocol::{
@@ -17,8 +20,9 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFunctions};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CurrentVersionPointer, GroupAuthorizationDocument, GroupStorageBackend, Permission,
-    RealmConfigDocument, VersionKey, blob_bucket_permission_path, blob_object_permission_path,
+    CurrentVersionPointer, GroupAuthorizationDocument, GroupStorageBackend, ManagedCopyKey,
+    Permission, PlacementPolicyRef, RealmConfigDocument, VersionKey, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
 use aruna_core::types::{Effects, UserId};
 use smallvec::smallvec;
@@ -36,6 +40,7 @@ enum SummaryState {
     ReadHead,
     ReadVersion,
     ReadLocation,
+    CheckManagedCopy,
     ReadBackend,
     CommitTransaction,
     AbortTransaction,
@@ -80,6 +85,10 @@ pub struct LocationSummaryOperation {
     blake3: Option<[u8; 32]>,
     delete_marker: bool,
     summary: LocationSummary,
+    /// Refs of the resolved version, compared against its registration before
+    /// the summary may claim the copy is held.
+    version_refs: Vec<PlacementPolicyRef>,
+    pending_copy: Option<(ManagedCopyKey, BackendLocation)>,
     output: Option<Result<LocalSummary, LocationSummaryError>>,
 }
 
@@ -122,6 +131,8 @@ impl LocationSummaryOperation {
             blake3: None,
             delete_marker: false,
             summary: LocationSummary::absent(),
+            version_refs: Vec::new(),
+            pending_copy: None,
             output: None,
         }
     }
@@ -137,6 +148,7 @@ impl LocationSummaryOperation {
             SummaryState::ReadHead => "read_head",
             SummaryState::ReadVersion => "read_version",
             SummaryState::ReadLocation => "read_location",
+            SummaryState::CheckManagedCopy => "check_managed_copy",
             SummaryState::ReadBackend => "read_backend",
             SummaryState::CommitTransaction => "commit_transaction",
             SummaryState::AbortTransaction => "abort_transaction",
@@ -290,6 +302,7 @@ impl LocationSummaryOperation {
 
     fn send_answer(&mut self) -> Effects {
         self.summary.version_id = self.version_id;
+        self.summary.group_id = self.bucket.as_ref().map(|bucket| bucket.group_id);
         let summary = self.summary.clone();
         let Some(stream_id) = self.stream_id else {
             self.state = SummaryState::Finish;
@@ -531,6 +544,7 @@ impl LocationSummaryOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.delete_marker = version.is_deleted();
+        self.version_refs = version.placement_policies.clone();
         match version.location_key() {
             Some(key) => {
                 self.blake3 = Some(key.blake3_hash);
@@ -552,6 +566,60 @@ impl LocationSummaryOperation {
             Ok(location) => location,
             Err(error) => return self.fail(error.into()),
         };
+        self.summary.blob_size = Some(location.blob_size);
+        self.summary.hashes = location.hashes.clone().into_iter().collect();
+        // A governed copy is only advertised as held when this node could
+        // actually serve it; the summary discloses no rule either way.
+        if self.version_refs.is_empty() {
+            return self.describe(location);
+        }
+        let Some(version_id) = self.version_id else {
+            return self.answer();
+        };
+        let key = ManagedCopyKey::new(
+            VersionKey::new(
+                self.request.bucket.clone(),
+                self.request.key.clone(),
+                version_id,
+            ),
+            location.backend.clone(),
+        );
+        let effect = match serve_reads(&key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.pending_copy = Some((key, location));
+        self.state = SummaryState::CheckManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_managed_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected(event);
+        };
+        let Some((key, location)) = self.pending_copy.take() else {
+            return self.answer();
+        };
+        let serveable = split_serve_reads(values).is_ok_and(|(copy, subject)| {
+            validate_registration(
+                copy.as_deref(),
+                &CopyRequest {
+                    key: &key,
+                    node_id: self.local_node,
+                    blake3: self.blake3,
+                    refs: &self.version_refs,
+                    subject_generation: Some(subject.subject.generation),
+                },
+            )
+            .is_ok()
+        });
+        match serveable {
+            true => self.describe(location),
+            false => self.answer(),
+        }
+    }
+
+    fn describe(&mut self, location: BackendLocation) -> Effects {
         self.summary.held = true;
         match location.backend {
             BackendRef::Node(_) => {
@@ -612,6 +680,7 @@ impl Operation for LocationSummaryOperation {
             SummaryState::ReadHead => self.handle_head(event),
             SummaryState::ReadVersion => self.handle_version(event),
             SummaryState::ReadLocation => self.handle_location(event),
+            SummaryState::CheckManagedCopy => self.handle_managed_copy(event),
             SummaryState::ReadBackend => self.handle_backend(event),
             SummaryState::CommitTransaction => self.handle_commit(event),
             SummaryState::AbortTransaction => self.handle_abort(event),
@@ -711,8 +780,9 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::nil(realm_id()),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
     }
 

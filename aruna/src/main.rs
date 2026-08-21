@@ -35,10 +35,10 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_holder;
 use aruna_operations::jobs::drain::restore_job_queue_timer;
+use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
-use aruna_operations::replication::migration::migrate_legacy_sync;
 #[cfg(debug_assertions)]
 use aruna_operations::startup::RecoveryState;
 use aruna_operations::startup::{
@@ -356,21 +356,6 @@ async fn prepare_startup(
     }
 
     let announcement = prepare_mode(config, driver_ctx, net_handle).await?;
-    match migrate_legacy_sync(driver_ctx.as_ref(), config.node_id, config.realm_id).await {
-        Ok(summary) if summary.failed > 0 => warn!(
-            migrated = summary.migrated,
-            skipped = summary.skipped,
-            failed = summary.failed,
-            "Legacy S3 replication migration incomplete; startup will retry"
-        ),
-        Ok(summary) if !summary.already_complete => info!(
-            migrated = summary.migrated,
-            skipped = summary.skipped,
-            "Migrated legacy S3 replication configs"
-        ),
-        Ok(_) => {}
-        Err(error) => warn!(%error, "Failed to migrate legacy S3 replication configs"),
-    }
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
     prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
@@ -414,6 +399,9 @@ async fn init_realm(
         )
         .await?;
     }
+    // The subject comes first: the advertisement built from it carries no
+    // execution target while this node has no placement subject yet.
+    sync_placement_subject(driver_ctx.as_ref(), config).await?;
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
@@ -466,6 +454,7 @@ async fn join_realm(
             &config.node_state,
             &config.realm_id,
             bootstrap_peer,
+            config.onboarding_sync_timeout(),
         )
         .await?;
     }
@@ -474,6 +463,7 @@ async fn join_realm(
         config.realm_id,
         config.node_id,
         bootstrap_peer,
+        config.onboarding_sync_timeout(),
     )
     .await?;
     if matches!(phase, OnboardingPhase::Bootstrapped) {
@@ -487,6 +477,7 @@ async fn join_realm(
             warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
         }
     }
+    sync_placement_subject(driver_ctx.as_ref(), config).await?;
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
@@ -530,6 +521,7 @@ async fn provision_realm(
         .await?;
     }
 
+    sync_placement_subject(driver_ctx.as_ref(), config).await?;
     seed_local_node_info(driver_ctx.as_ref(), config).await?;
     let allow_genesis = config.is_initial_node();
     let documents = prepare_core_documents(
@@ -565,6 +557,7 @@ async fn bind_servers(
 ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
+    let s3_timeouts = config.s3_timeouts();
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
@@ -625,6 +618,7 @@ async fn bind_servers(
         config.rate_limits.s3_max_connections as usize,
         config.rate_limits.s3_max_requests as usize,
     )
+    .with_timeouts(s3_timeouts)
     .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
         config.rate_limits.ip_per_minute,
@@ -772,6 +766,7 @@ async fn start_background(background: Background) {
     jobs_runtime.start();
     task_queues.start(&shutdown).await;
     restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
+    restore_lifecycle_timers(&driver_ctx.storage_handle, &task_handle).await;
     spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
     let recovery_ctx = driver_ctx.clone();
@@ -996,6 +991,7 @@ async fn build_docker(
     let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
         pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
+        envelope: compute_envelope()?,
         ..aruna_compute::DockerConfig::default()
     };
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
@@ -1038,6 +1034,8 @@ async fn build_apptainer(
             cgroup_root,
             stop_grace: env_duration("ARUNA_COMPUTE_STOP_GRACE", 10)?,
             pull_deadline: env_duration("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE", 300)?,
+            envelope: compute_envelope()?,
+            ..aruna_compute::ApptainerConfig::default()
         },
     )
     .map_err(|error| error.to_string())?;
@@ -1087,6 +1085,14 @@ async fn build_kubernetes(
             s3_cidrs,
             s3_port,
             s3_mount_driver,
+            service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
+                .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
+            execution_location: dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
+                .unwrap_or_default(),
+            execution_labels: env_labels("ARUNA_COMPUTE_K8S_EXECUTION_LABELS")?,
+            node_selector: env_labels("ARUNA_COMPUTE_K8S_NODE_SELECTOR")?,
+            envelope: compute_envelope()?,
+            ..aruna_compute::KubernetesConfig::default()
         },
     )
     .await
@@ -1140,6 +1146,68 @@ fn parse_s3_cidrs(value: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// Static ceilings this node offers for execution. They hard-filter placement
+/// and are the basis of the advertised ranking availability, so an unset
+/// dimension stays unmeasured instead of becoming a false capacity claim.
+#[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
+fn compute_envelope() -> Result<aruna_core::compute::ResourceEnvelope, String> {
+    Ok(aruna_core::compute::ResourceEnvelope {
+        max_cpu_cores: env_number::<u32>("ARUNA_COMPUTE_MAX_CPU_CORES")?,
+        max_ram_bytes: env_number::<u64>("ARUNA_COMPUTE_MAX_RAM_BYTES")?,
+        max_disk_bytes: env_number::<u64>("ARUNA_COMPUTE_MAX_DISK_BYTES")?,
+        max_concurrent: env_number::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT")?,
+    })
+}
+
+#[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
+fn env_number<T: std::str::FromStr + Default + PartialEq>(name: &str) -> Result<Option<T>, String> {
+    dotenvy::var(name)
+        .ok()
+        .map(|value| parse_positive(name, value.trim()))
+        .transpose()
+}
+
+/// Zero is rejected rather than silently making this node ineligible: leaving
+/// the variable unset is how a dimension stays unmeasured.
+#[cfg(any(
+    feature = "docker",
+    feature = "apptainer",
+    feature = "kubernetes",
+    test
+))]
+fn parse_positive<T: std::str::FromStr + Default + PartialEq>(
+    name: &str,
+    value: &str,
+) -> Result<T, String> {
+    let parsed = value
+        .parse::<T>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    match parsed == T::default() {
+        true => Err(format!("{name} must be greater than zero")),
+        false => Ok(parsed),
+    }
+}
+
+/// Parses a bounded `key=value,key2=value2` label or selector list.
+#[cfg(feature = "kubernetes")]
+fn env_labels(name: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Ok(value) = dotenvy::var(name) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .filter(|(key, _)| !key.trim().is_empty())
+                .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+                .ok_or_else(|| format!("{name} entries must be key=value"))
+        })
+        .collect()
+}
+
 #[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
 fn env_duration(name: &str, default: u64) -> Result<std::time::Duration, String> {
     let seconds = dotenvy::var(name)
@@ -1166,6 +1234,24 @@ fn parse_disk_limit(value: Option<&str>) -> Result<Option<u64>, &'static str> {
     Ok(Some(bytes))
 }
 
+/// Reconciles this node's advertised placement subject with the realm's
+/// placement map before it serves anything. A changed subject blocks governed
+/// serving until the local inventory has been revalidated under it.
+async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
+    aruna_operations::placement_policy::sync_subject(
+        ctx,
+        config.realm_id,
+        config.node_id,
+        aruna_operations::placement_policy::SubjectScanMode::Revalidate(
+            aruna_core::structs::ManagedCopyQuarantine::Rejoin,
+        ),
+        aruna_operations::driver::now_ms(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
     aruna_operations::node_info::seed_node_info_document(
         ctx,
@@ -1175,10 +1261,6 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
             api: config.api_public_url.clone(),
             s3: config.s3_public_url.clone(),
         },
-        ctx.compute_handle
-            .as_ref()
-            .map(|registry| registry.capabilities())
-            .unwrap_or_default(),
     )
     .await
 }
@@ -1293,6 +1375,18 @@ mod tests {
         assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_ceiling() {
+        // A zero ceiling would silently make this node ineligible for every
+        // execution instead of leaving the dimension unmeasured.
+        assert_eq!(
+            parse_positive::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT", "4"),
+            Ok(4)
+        );
+        assert!(parse_positive::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT", "0").is_err());
+        assert!(parse_positive::<u64>("ARUNA_COMPUTE_MAX_RAM_BYTES", "-1").is_err());
     }
 
     #[tokio::test]

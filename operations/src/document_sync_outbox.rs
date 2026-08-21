@@ -144,7 +144,7 @@ pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, 
 }
 
 #[cfg(debug_assertions)]
-fn record_ledger(key: &[u8], value: &[u8]) {
+fn record_ledger(record: &DocumentSyncOutboxRecord, key: &[u8], value: &[u8]) {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
@@ -157,7 +157,10 @@ fn record_ledger(key: &[u8], value: &[u8]) {
     };
     let key_hash = blake3::hash(key).to_hex();
     let value_hash = blake3::hash(value).to_hex();
-    let line = format!("key_hash={key_hash} value_hash={value_hash}\n");
+    let line = format!(
+        "target={:?} key_hash={key_hash} value_hash={value_hash}\n",
+        record.target
+    );
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -174,7 +177,7 @@ pub fn outbox_write_entry(
     let key = outbox_key(record);
     let value = ByteView::from(postcard::to_allocvec(record)?);
     #[cfg(debug_assertions)]
-    record_ledger(key.as_ref(), value.as_ref());
+    record_ledger(record, key.as_ref(), value.as_ref());
     Ok((DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
 }
 

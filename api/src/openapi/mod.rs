@@ -227,6 +227,20 @@ mod tests {
         ("/metadata/{document_id}", "delete"),
         ("/metadata/references", "get"),
         ("/audit", "get"),
+        ("/admin/compute/config", "get"),
+        ("/admin/compute/config", "put"),
+        ("/admin/compute/drain", "post"),
+        ("/admin/compute/snapshots", "get"),
+        ("/admin/placement-quarantine", "post"),
+        ("/admin/placement-policies", "post"),
+        ("/admin/placement-policies/{policy_id}", "get"),
+        ("/admin/placement-diagnostics", "get"),
+        ("/buckets/{bucket}/placement", "get"),
+        ("/buckets/{bucket}/placement", "put"),
+        ("/buckets/{bucket}/placement/objects", "post"),
+        ("/buckets/{bucket}/placement/runs", "post"),
+        ("/buckets/{bucket}/placement/coverage", "get"),
+        ("/jobs/{job_id}/audit", "get"),
     ];
 
     fn operation_security(doc: &Value, path: &str, method: &str) -> Vec<Value> {

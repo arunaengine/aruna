@@ -59,7 +59,7 @@ axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["query"] }
 bao-tree = "0.16.0"
 base64 = "0.23.0"
-blake3 = { version = "1.8.5", features = ["serde"] }
+blake3 = { version = "=1.8.7", features = ["serde"] }
 bollard = "0.21.0"
 byteview = "0.10.1"
 bytes = "1.12.1"
@@ -200,3 +200,8 @@ zip = { version = "8.6.0", default-features = false }
 [profile.release]
 panic = "abort"
 
+# Tests spin up real multi-node clusters, so unoptimized dependencies dominate
+# their runtime; workspace crates stay at opt-level 0 for compile speed and
+# coverage fidelity.
+[profile.dev.package."*"]
+opt-level = 3

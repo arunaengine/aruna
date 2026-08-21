@@ -256,6 +256,30 @@ async fn idempotent_submit() {
 }
 
 #[tokio::test]
+async fn resubmit_after_removal() {
+    // A removed container must not license a second run of the same attempt.
+    let backend = backend_or_skip!();
+    let cancel = CancellationToken::new();
+    let spec = sh(&unique("lost"), "exit 0");
+    let attempt = spec.attempt.clone();
+
+    backend.submit(&spec, &cancel).await.unwrap();
+    backend.wait(&attempt, &cancel).await.unwrap();
+    backend.cleanup(&attempt).await.unwrap();
+
+    let resubmitted = backend.submit(&spec, &cancel).await.unwrap();
+    assert!(
+        matches!(resubmitted.phase, AttemptPhase::SystemError { ref reason } if reason.contains("lost evidence")),
+        "a started attempt with no container is lost, not restartable"
+    );
+    assert_eq!(
+        list_by_name(&attempt.external_name()).await,
+        0,
+        "resubmit must not create a second container"
+    );
+}
+
+#[tokio::test]
 async fn exit_code_capture() {
     // Distinct exit codes surface as distinct terminal evidence.
     let backend = backend_or_skip!();

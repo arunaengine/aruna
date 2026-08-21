@@ -2,6 +2,7 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, blob_location_read, build_head_transition_effects,
     delete_blob_version_effect, delete_hash_path_index_effect, write_blob_version_effect,
 };
+use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
     UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
@@ -38,6 +39,7 @@ pub enum DeleteObjectState {
     ApplyHeadTransition,
     DeleteTargetHashPathIndex,
     DeleteTargetVersion,
+    RemoveManagedCopies,
     DeleteMultipartSummary,
     ReadMultipartParts,
     DeleteMultipartPart,
@@ -102,6 +104,8 @@ pub enum DeleteObjectError {
     InvalidOperationState,
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
+    #[error(transparent)]
+    ManagedCopyError(#[from] ManagedCopyError),
     #[error("DeleteObject failed")]
     DeleteObjectFailed,
 }
@@ -144,6 +148,7 @@ pub struct DeleteObjectOperation {
     target_location: Option<BlobLocationKey>,
     live_before_marker: bool,
     usage_update: Option<UsageCounterUpdate>,
+    copy_removal: Option<ManagedCopyRemoval>,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
     restrictions: Option<Vec<PathRestriction>>,
 }
@@ -170,6 +175,7 @@ impl DeleteObjectOperation {
             target_location: None,
             live_before_marker: false,
             usage_update: None,
+            copy_removal: None,
             output: None,
             restrictions: None,
         }
@@ -449,8 +455,6 @@ impl DeleteObjectOperation {
             .map(|metadata| (metadata.version_id, metadata.materialized_hash))
         {
             Some((version_id, new_hash)) => {
-                self.pending_new_pointer =
-                    Some(CurrentVersionPointer::next_for(existing, version_id));
                 self.pending_new_current_hash = new_hash;
                 self.write_current_lookup(version_id, existing)
             }
@@ -467,7 +471,10 @@ impl DeleteObjectOperation {
         version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
     ) -> Effects {
-        self.pending_new_pointer = Some(CurrentVersionPointer::next_for(existing, version_id));
+        match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => self.pending_new_pointer = Some(pointer),
+            Err(err) => return self.emit_error(err.into()),
+        }
         self.prepare_head_transition(HeadTransitionContinuation::DeleteTargetVersion)
     }
 
@@ -531,6 +538,44 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
+        self.remove_managed_copies()
+    }
+
+    /// Joins the delete transaction, so no local registration outlives the
+    /// logical version it made serveable.
+    fn remove_managed_copies(&mut self) -> Effects {
+        let Some(version_id) = self.input.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let mut removal = match ManagedCopyRemoval::for_version(&VersionKey::new(
+            &self.input.bucket,
+            &self.input.key,
+            version_id,
+        )) {
+            Ok(removal) => removal,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let effects = removal.start(self.txn_id);
+        self.copy_removal = Some(removal);
+        self.state = DeleteObjectState::RemoveManagedCopies;
+        effects
+    }
+
+    fn handle_copies_removed(&mut self, event: Event) -> Effects {
+        let Some(removal) = self.copy_removal.as_mut() else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        match removal.step(event, self.txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.copy_removal = None;
+                self.delete_multipart_summary()
+            }
+            Err(err) => self.emit_error(err.into()),
+        }
+    }
+
+    fn delete_multipart_summary(&mut self) -> Effects {
         let Some(version_id) = self.input.version_id else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -714,7 +759,10 @@ impl DeleteObjectOperation {
         version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
     ) -> Effects {
-        self.pending_new_pointer = Some(CurrentVersionPointer::next_for(existing, version_id));
+        match CurrentVersionPointer::next_for(existing, version_id) {
+            Ok(pointer) => self.pending_new_pointer = Some(pointer),
+            Err(err) => return self.emit_error(err.into()),
+        }
         self.prepare_head_transition(HeadTransitionContinuation::WriteDeletedVersion)
     }
 
@@ -835,6 +883,7 @@ impl Operation for DeleteObjectOperation {
                 self.handle_target_hash_path_deleted(event)
             }
             DeleteObjectState::DeleteTargetVersion => self.handle_target_version_deleted(event),
+            DeleteObjectState::RemoveManagedCopies => self.handle_copies_removed(event),
             DeleteObjectState::DeleteMultipartSummary => {
                 self.handle_multipart_summary_deleted(event)
             }

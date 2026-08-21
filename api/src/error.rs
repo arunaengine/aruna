@@ -34,6 +34,10 @@ pub enum ServerError {
     Conflict(String),
     #[error("{0}")]
     JobPlanConflict(String),
+    /// Standing compute quota refused a new admission; the typed reason is
+    /// carried in the body so a client can act on the exact dimension.
+    #[error("{0}")]
+    ComputeQuotaDenied(aruna_core::compute_quota::QuotaDenied),
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("Bad request")]
@@ -151,6 +155,46 @@ pub struct ErrorResponse {
     /// Structured metadata validation failures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub violations: Option<Vec<ValidationViolationResponse>>,
+    /// The exact standing-quota refusal behind a 409, when one caused it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaDeniedResponse>,
+}
+
+/// Why a standing compute quota refused a new admission, with the numbers the
+/// decision used. Group totals are approximate across partitions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QuotaDeniedResponse {
+    /// `job` for a per-job ceiling, `group` for the group's standing cap.
+    pub scope: String,
+    /// `jobs`, `cpu_cores`, `ram_bytes`, `disk_bytes` or `walltime_ms`.
+    pub dimension: String,
+    pub observed: u64,
+    pub requested: u64,
+    pub limit: u64,
+}
+
+impl From<aruna_core::compute_quota::QuotaDenied> for QuotaDeniedResponse {
+    fn from(denied: aruna_core::compute_quota::QuotaDenied) -> Self {
+        use aruna_core::compute_quota::{QuotaDimension, QuotaScope};
+        Self {
+            scope: match denied.scope {
+                QuotaScope::Job => "job",
+                QuotaScope::Group => "group",
+            }
+            .to_string(),
+            dimension: match denied.dimension {
+                QuotaDimension::Jobs => "jobs",
+                QuotaDimension::CpuCores => "cpu_cores",
+                QuotaDimension::RamBytes => "ram_bytes",
+                QuotaDimension::DiskBytes => "disk_bytes",
+                QuotaDimension::WalltimeMs => "walltime_ms",
+            }
+            .to_string(),
+            observed: denied.observed,
+            requested: denied.requested,
+            limit: denied.limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -183,6 +227,7 @@ impl ErrorResponse {
             code: None,
             details: None,
             violations: None,
+            quota: None,
         }
     }
 
@@ -208,6 +253,13 @@ impl ErrorResponse {
         self.violations = Some(violations);
         self
     }
+
+    #[inline]
+    #[must_use]
+    pub fn with_quota(mut self, quota: QuotaDeniedResponse) -> Self {
+        self.quota = Some(quota);
+        self
+    }
 }
 
 impl<E: std::fmt::Display> From<E> for ErrorResponse {
@@ -229,6 +281,9 @@ impl IntoResponse for ServerError {
         if let ServerError::MetadataValidation(violations) = &self {
             body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
         }
+        if let ServerError::ComputeQuotaDenied(denied) = &self {
+            body = body.with_quota((*denied).into());
+        }
 
         let mut response = (status, Json(body)).into_response();
         if matches!(
@@ -245,14 +300,16 @@ impl IntoResponse for ServerError {
 }
 
 impl ServerError {
-    fn status_code(&self) -> StatusCode {
+    pub(crate) fn status_code(&self) -> StatusCode {
         match self {
             ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,
             ServerError::NotFound => StatusCode::NOT_FOUND,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Conflict(_) | ServerError::JobPlanConflict(_) => StatusCode::CONFLICT,
+            ServerError::Conflict(_)
+            | ServerError::JobPlanConflict(_)
+            | ServerError::ComputeQuotaDenied(_) => StatusCode::CONFLICT,
             ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
@@ -274,6 +331,7 @@ impl ServerError {
             ServerError::InternalError(_) => "Internal error".to_string(),
             ServerError::Conflict(_) => "Conflict".to_string(),
             ServerError::JobPlanConflict(_) => "JobPlanConflict".to_string(),
+            ServerError::ComputeQuotaDenied(_) => "compute_quota_denied".to_string(),
             ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
@@ -286,7 +344,7 @@ impl ServerError {
         }
     }
 
-    fn public_message(&self) -> String {
+    pub(crate) fn public_message(&self) -> String {
         match self {
             ServerError::InternalError(_) => "Internal server error".to_string(),
             ServerError::BadGateway => "Bad gateway".to_string(),
@@ -342,5 +400,30 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body.code.as_deref(), Some("JobPlanConflict"));
+    }
+
+    #[tokio::test]
+    async fn quota_denial_typed() {
+        // The refusal must carry the exact dimension and numbers, not prose.
+        use aruna_core::compute_quota::{QuotaDenied, QuotaDimension, QuotaScope};
+
+        let response = ServerError::ComputeQuotaDenied(QuotaDenied {
+            scope: QuotaScope::Group,
+            dimension: QuotaDimension::CpuCores,
+            observed: 30,
+            requested: 8,
+            limit: 32,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: ErrorResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body.code.as_deref(), Some("compute_quota_denied"));
+        let quota = body.quota.expect("the typed reason is carried in the body");
+        assert_eq!(quota.scope, "group");
+        assert_eq!(quota.dimension, "cpu_cores");
+        assert_eq!((quota.observed, quota.requested, quota.limit), (30, 8, 32));
     }
 }

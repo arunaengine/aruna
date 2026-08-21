@@ -92,7 +92,6 @@ pub async fn import(snapshot_path: String, target_path: String) -> Result<(), Cl
         stats.entry_count,
         stats.target_path.display(),
     );
-
     Ok(())
 }
 
@@ -501,7 +500,10 @@ fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotE
 
 #[cfg(test)]
 mod tests {
-    use super::{SnapshotError, import_snapshot_into_new_database, snapshot_database};
+    use super::{
+        KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError,
+        import_snapshot_into_new_database, snapshot_database,
+    };
     use crate::test_support::env_lock;
     use aruna::config::load;
     use aruna_api::server_state::ServerState;
@@ -519,15 +521,13 @@ mod tests {
     use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
-    use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::s3::create_bucket::CreateBucketOperation;
     use aruna_operations::s3::create_user_access::{
         CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
     };
     use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use aruna_operations::task_incoming::initialize_task_incoming;
     use aruna_tasks::TaskHandle;
-    use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
+    use fjall::Readable;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -636,14 +636,8 @@ mod tests {
                 task_handle: Some(task_handle.clone()),
                 compute_handle: None,
             });
-            initialize_net_incoming(context.clone());
-            initialize_task_incoming(
-                context.clone(),
-                task_handle.clone(),
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
-            )
-            .await;
-
+            // No incoming loops are started: snapshot and restore are the
+            // subject, and a background writer would conflict the fixture.
             let server_state = ServerState::new(
                 context.clone(),
                 config.realm_id,
@@ -730,8 +724,9 @@ mod tests {
                         created_at: SystemTime::now(),
                         created_by: realm_admin,
                         cors_configuration: None,
-                        replication: None,
                         storage_routing: Vec::new(),
+                        placement_policies: Vec::new(),
+                        placement_policy_generation: 0,
                     },
                 ),
                 context.as_ref(),

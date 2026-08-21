@@ -18,8 +18,9 @@ use crate::structs::{
     CandidatePlacementMap, CompletionProof, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
     MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
     PlacementActivation, PlacementBinding, PlacementOverride, PlacementStrategy,
-    PlacementTransition, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-    RealmNodeKind, StallReport, StrategyBinding, TransitionPlan, TransitionStatus, reserved_label,
+    PlacementTransition, QuotaConfig, RealmComputeConfig, RealmConfigDocument,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind, StallReport, StrategyBinding, TransitionPlan,
+    TransitionStatus, reserved_label,
 };
 use crate::structured_id::PlacementHandle;
 use crate::types::{RoleId, UserId};
@@ -68,6 +69,12 @@ pub enum AdminDocumentReducerError {
     TransitionOriginMismatch,
     #[error("placement transition report exceeds its size bound")]
     TransitionReportOversized,
+    #[error("job family placement strategy must not be nil")]
+    NilJobFamily,
+    #[error("job family placement strategy cannot be changed")]
+    JobFamilyChanged,
+    #[error("job family placement strategy cannot be removed")]
+    JobFamilyRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,11 +102,8 @@ pub struct AdminDocumentReducerState {
     pub applied_event_ids: BTreeSet<Ulid>,
     pub user_attributes: BTreeMap<String, AdminDocumentAttributeVersion>,
     pub conflicts: BTreeMap<String, AdminDocumentConflict>,
-    #[serde(default)]
     pub user_name: Option<AdminDocumentAttributeVersion>,
-    #[serde(default)]
     pub user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
-    #[serde(default)]
     pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
     pub revocation_floor: u64,
     pub revocation_next_expiry: Option<u64>,
@@ -499,6 +503,12 @@ pub fn overlay_realm_config_placement_reducer_materialization(
             .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
     {
         config.default_strategy_id = reducer_state.materialized_realm_config_default_strategy();
+    }
+
+    // The sealed family strategy is immutable, so a materialized value always
+    // wins and an absent one never clears what the document already carries.
+    if let Some(strategy_id) = reducer_state.materialized_family_strategy() {
+        config.job_family_strategy_id = strategy_id;
     }
 
     let materialized_placement_map = reducer_state.materialized_realm_config_placement_map();
@@ -1159,6 +1169,16 @@ impl AdminDocumentReducerState {
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigComputeSet { compute },
+            ) => {
+                self.apply_realm_config_setting(
+                    event,
+                    REALM_CONFIG_COMPUTE_PATH,
+                    compute_value(compute),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigPoliciesSet { policies },
             ) => {
                 self.apply_realm_config_setting(
@@ -1237,6 +1257,9 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
             ) => {
+                if self.materialized_family_strategy() == Some(*strategy_id) {
+                    return Err(AdminDocumentReducerError::JobFamilyRemoved);
+                }
                 self.apply_realm_config_placement_field(
                     event,
                     realm_config_placement_strategy_path(strategy_id),
@@ -1250,6 +1273,25 @@ impl AdminDocumentReducerState {
                 self.apply_realm_config_setting(
                     event,
                     REALM_CONFIG_DEFAULT_STRATEGY_PATH,
+                    strategy_id.to_string(),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
+            ) => {
+                if strategy_id.is_nil() {
+                    return Err(AdminDocumentReducerError::NilJobFamily);
+                }
+                if self
+                    .materialized_family_strategy()
+                    .is_some_and(|current| current != *strategy_id)
+                {
+                    return Err(AdminDocumentReducerError::JobFamilyChanged);
+                }
+                self.apply_realm_config_setting(
+                    event,
+                    REALM_CONFIG_JOB_FAMILY_PATH,
                     strategy_id.to_string(),
                 );
             }
@@ -1743,6 +1785,18 @@ impl AdminDocumentReducerState {
             .and_then(policies_from_value)
     }
 
+    /// The realm compute configuration the events agree on, if any.
+    pub fn materialized_realm_compute(&self) -> Option<RealmComputeConfig> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_COMPUTE_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(compute_from_value)
+    }
+
     pub fn materialized_realm_config_quota(&self) -> Option<QuotaConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
@@ -1803,6 +1857,20 @@ impl AdminDocumentReducerState {
             .get(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| Ulid::from_string(value).ok())
+    }
+
+    /// The sealed submission-family strategy. A conflicted or nil value
+    /// materializes as `None`, which every derivation refuses.
+    pub fn materialized_family_strategy(&self) -> Option<Ulid> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_JOB_FAMILY_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| Ulid::from_string(value).ok())
+            .filter(|strategy_id| !strategy_id.is_nil())
     }
 
     pub fn materialized_realm_config_strategy_bindings(&self) -> BTreeMap<String, StrategyBinding> {
@@ -2735,8 +2803,10 @@ pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
+pub const REALM_CONFIG_COMPUTE_PATH: &str = "realm_config.compute";
 pub const REALM_CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
 pub const REALM_CONFIG_DEFAULT_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
+pub const REALM_CONFIG_JOB_FAMILY_PATH: &str = "realm_config.placement.job_family_strategy";
 pub const REALM_CONFIG_REVOKED_TOKENS_PATH: &str = "realm_config.revoked_tokens";
 pub const MAX_LIVE_REVOCATIONS_PER_ORIGIN: usize = 1024;
 
@@ -2795,6 +2865,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigQuotaSet { .. } => {
             vec![REALM_CONFIG_QUOTA_PATH.to_string()]
         }
+        AdminDocumentOperation::RealmConfigComputeSet { .. } => {
+            vec![REALM_CONFIG_COMPUTE_PATH.to_string()]
+        }
         AdminDocumentOperation::RealmConfigPoliciesSet { .. } => {
             vec![REALM_CONFIG_POLICIES_PATH.to_string()]
         }
@@ -2815,6 +2888,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
             vec![REALM_CONFIG_DEFAULT_STRATEGY_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigJobFamilySet { .. } => {
+            vec![REALM_CONFIG_JOB_FAMILY_PATH.to_string()]
         }
         AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => {
             vec![realm_config_strategy_binding_path(&binding.scope)]
@@ -3041,6 +3117,7 @@ pub fn binding_scope_key(scope: &BindingScope) -> String {
             DocumentClass::Metadata => "class:metadata",
             DocumentClass::MetadataRegistry => "class:metadata_registry",
             DocumentClass::JobControl => "class:job_control",
+            DocumentClass::PlacementPolicy => "class:placement_policy",
         }
         .to_string(),
         BindingScope::MetadataPathPrefix(prefix) => format!(
@@ -3320,6 +3397,28 @@ fn metadata_replication_from_value(value: &str) -> Option<MetadataReplicationCon
 
 fn realm_discovery_from_value(value: &str) -> Option<RealmDiscoveryConfig> {
     serde_json::from_str(value).ok()
+}
+
+/// The compute configuration is stored canonically: link and quota order must
+/// not decide whether two publishers agree.
+fn compute_value(compute: &RealmComputeConfig) -> String {
+    serde_json::to_string(&canonical_compute(compute))
+        .expect("admin document compute config serializes")
+}
+
+fn canonical_compute(compute: &RealmComputeConfig) -> RealmComputeConfig {
+    let mut compute = compute.clone();
+    compute
+        .links
+        .sort_by(|left, right| (&left.from, &left.to).cmp(&(&right.from, &right.to)));
+    compute.group_quotas.sort_by_key(|entry| entry.group_id);
+    compute
+}
+
+fn compute_from_value(value: &str) -> Option<RealmComputeConfig> {
+    serde_json::from_str(value)
+        .ok()
+        .map(|compute| canonical_compute(&compute))
 }
 
 fn quota_from_value(value: &str) -> Option<QuotaConfig> {
@@ -6134,6 +6233,83 @@ mod tests {
             Some(strategy_id)
         );
         assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn family_survives_rebuild() {
+        // A reducer-only rebuild must reproduce the sealed family strategy
+        // instead of resetting it to the nil placeholder.
+        let mut state = realm_config_state();
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        upsert_placement_strategy(&mut state, 9, 9, strategy_id);
+        state
+            .apply(&realm_config_event(
+                1,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
+            ))
+            .unwrap();
+
+        assert_eq!(state.materialized_family_strategy(), Some(strategy_id));
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+        assert_eq!(config.job_family_strategy_id, strategy_id);
+        assert!(config.strategy(&strategy_id).is_some());
+    }
+
+    #[test]
+    fn rejects_family_mutation() {
+        let mut state = realm_config_state();
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        upsert_placement_strategy(&mut state, 9, 9, strategy_id);
+        assert_eq!(
+            state.apply(&realm_config_event(
+                1,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigJobFamilySet {
+                    strategy_id: Ulid::nil()
+                },
+            )),
+            Err(AdminDocumentReducerError::NilJobFamily)
+        );
+        state
+            .apply(&realm_config_event(
+                2,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
+            ))
+            .unwrap();
+        let sealed = state.clone();
+
+        assert_eq!(
+            state.apply(&realm_config_event(
+                3,
+                node(1),
+                2,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigJobFamilySet {
+                    strategy_id: Ulid::from_bytes([5; 16])
+                },
+            )),
+            Err(AdminDocumentReducerError::JobFamilyChanged)
+        );
+        assert_eq!(
+            state.apply(&realm_config_event(
+                4,
+                node(1),
+                2,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
+            )),
+            Err(AdminDocumentReducerError::JobFamilyRemoved)
+        );
+        assert_eq!(state, sealed);
     }
 
     #[test]

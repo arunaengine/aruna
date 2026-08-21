@@ -254,3 +254,60 @@ permission does not justify hiding an operational-hardening defect.
 - shutdown repeatedly forces exit (75) or is SIGKILLed (137);
 - `pipeline.drain.undeliverable` appears: those records need a placement fix, not
   an operator retry.
+
+## 12. Release compatibility
+
+Every peer protocol is negotiated by a versioned ALPN. There is no fallback ALPN
+and no downgrade: a peer whose frames differ never negotiates the protocol and
+fails the connection instead of decoding foreign bytes.
+
+This release advances three of them:
+
+| Protocol | ALPN | Predecessor now refused |
+| --- | --- | --- |
+| Blob streaming | `aruna/bao/2` | `aruna/bao/1` |
+| Metadata bootstrap | `aruna/metadata/2` | `aruna/metadata/1` |
+| Job control | `aruna/job-control/2` | `aruna/job-control/1` |
+
+Document sync additionally carries the event type id `aruna.document.v3`. A peer
+that advertises a sync topic with a different event type is refused during
+bootstrap rather than synchronized.
+
+**Every node must run the same release.** A node on the previous release cannot
+connect to a node on this one in either direction, so during a roll the two
+halves behave as a partition: blob replication, metadata bootstrap, job control
+and document sync between them all fail closed. That is the intended behaviour,
+not a defect, and it is what stops one release from decoding another's frames as
+if they were its own.
+
+Consequences for section 10's one-node-at-a-time rule: keep rolling one node at a
+time and keep watching health per node, but do not judge convergence until the
+last node runs the new release. The same applies to a rollback: rolling one node
+back leaves it unable to talk to the rest. Expect `degraded` and outbox backlog
+on both halves while a roll is in progress, and expect them to drain once the
+fleet is uniform again.
+
+## 13. Startup tunables
+
+These are optional environment values read once at startup. Each of the five
+below is rejected when it is zero or not a positive integer, so a typo fails the
+start instead of silently removing a bound.
+
+| Variable | Default | What it bounds |
+| --- | --- | --- |
+| `ONBOARDING_BOOTSTRAP_TIMEOUT_SECS` | `120` | Client-side budget for `POST /api/v1/onboarding/bootstrap`. The seed answers a bootstrap with a realm-config upsert, placement expansion and topic reconciliation inline, so raise this on a large or busy realm. |
+| `ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS` | `60` | One onboarding document-sync round trip, and the placement wait that repeats it until the seed has granted this node its placement. |
+| `S3_INITIAL_REQUEST_TIMEOUT_SECS` | `10` | How long an accepted S3 connection may stay silent before its first request. |
+| `S3_CONNECTION_IDLE_TIMEOUT_SECS` | `20` | How long an S3 connection may make no body progress before it is cancelled. Setting it too low truncates slow `GET`s. |
+| `S3_STREAM_LIFETIME_TIMEOUT_SECS` | `1800` | Total lifetime of one streamed S3 request. |
+
+`ARUNA_SHUTDOWN_GRACE_SECS` (section 8) is the exception: it does not fail the
+start. A value below the 16 second minimum, or one that does not parse, is
+logged as invalid and the 20 second default applies, so check the startup log
+after changing it.
+
+`ARUNA_FJALL_PERSIST_MODE` is a durability choice rather than a bound. `buffer`
+(the default) commits without an fsync per transaction; `sync_all` fsyncs on
+every commit and journal persist, which costs write throughput and buys
+durability against an unclean host stop. Any other value is a startup error. The
+explicit sync at shutdown always uses `sync_all` regardless of this setting.

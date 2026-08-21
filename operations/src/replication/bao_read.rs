@@ -12,8 +12,9 @@ use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision, PolicyFuncti
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-    HashPathIndexKey, Permission, RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn,
-    blob_object_permission_path,
+    HashPathIndexKey, ManagedCopyKey, NodePlacementEntry, Permission, PlacementPolicyRef,
+    PlacementSubject, RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn,
+    blob_object_permission_path, storage_subject,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use bytes::Bytes;
@@ -21,6 +22,14 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::blob::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
+use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
+use crate::placement_policy::{
+    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, union_refs, write_gate,
+};
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::blob::blob_keyspace_helper::blob_location_read;
@@ -53,6 +62,19 @@ pub enum BaoReadError {
     Unexpected { state: &'static str, event: String },
     #[error("bao read did not finish")]
     NotFinished,
+    #[error(transparent)]
+    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    /// The requester must resolve these rules and ask again.
+    #[error("the destination has not resolved every required placement policy")]
+    PolicyRequired { refs: Vec<PlacementPolicyRef> },
+    #[error("placement policy denies this destination")]
+    PolicyDenied { policy_ids: Vec<Ulid> },
+    #[error(transparent)]
+    Gate(#[from] PolicyGateError),
+    /// This node advertises no subject, or stopped admitting while in
+    /// transition, so nothing governed may land here.
+    #[error("this node is not a legal destination for governed data")]
+    NoDestination,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +217,14 @@ impl Operation for BaoReadOperation {
                     Ok(VersionReplicationMessage::BaoReadRefused(reason)) => {
                         self.fail(BaoReadError::Refused(reason))
                     }
+                    // The source teaches the rule before bytes: the caller
+                    // resolves it, caches it, and retries only when compliant.
+                    Ok(VersionReplicationMessage::PlacementPolicyRequired { refs }) => {
+                        self.fail(BaoReadError::PolicyRequired { refs })
+                    }
+                    Ok(VersionReplicationMessage::PlacementPolicyDenied { policy_ids }) => {
+                        self.fail(BaoReadError::PolicyDenied { policy_ids })
+                    }
                     Ok(_) => self.fail(BaoReadError::Unexpected {
                         state: self.state_name(),
                         event: "unexpected bao read response".to_string(),
@@ -264,6 +294,52 @@ impl Operation for BaoReadOperation {
     }
 }
 
+/// One teach-then-retry round. The source only ever teaches the refs it needs,
+/// so a second `Required` for the same set is a protocol dead end, not a loop.
+const CHALLENGE_ATTEMPTS: usize = 2;
+
+/// A governed remote read with the plan's destination challenge (5.6/10).
+///
+/// The request carries this node's advertised subject, so the source can
+/// evaluate it independently. On `PlacementPolicyRequired` the refs are
+/// resolved through the ordinary policy resolver, which verifies publication
+/// authority and caches the result, then evaluated locally; the read is retried
+/// only when the local subject complies. Echoed refs are never authority.
+pub async fn managed_read(
+    context: &DriverContext,
+    node_id: NodeId,
+    mut request: BaoReadRequest,
+) -> Result<BaoReadOutput, BaoReadError> {
+    // An admission stop is not decided here: `write_gate` below refuses once
+    // the source has taught the refs that make this read a governed one.
+    let destination = match gate_context(context, request.realm_id, now_ms()).await {
+        Ok(destination) => destination,
+        Err(GateContextError::Routing(_)) => return Err(BaoReadError::NoDestination),
+    };
+    request.destination = destination.as_ref().map(|gate| gate.subject.clone());
+    let mut taught: Vec<PlacementPolicyRef> = Vec::new();
+    for _ in 0..CHALLENGE_ATTEMPTS {
+        let refs = match drive(BaoReadOperation::new(node_id, request.clone()), context).await {
+            Err(BaoReadError::PolicyRequired { refs }) => refs,
+            other => return other,
+        };
+        let refs = PlacementPolicyRef::canonical_set(&refs).map_err(ConversionError::from)?;
+        if refs.is_empty() || refs == taught {
+            return Err(BaoReadError::PolicyRequired { refs });
+        }
+        // The refs are only a hint: this node decides on its own resolution,
+        // which also caches the verified publication for every later read.
+        let Some(gate) = write_gate(destination.as_ref(), &refs)? else {
+            return Err(BaoReadError::NoDestination);
+        };
+        let outcome = drive(gate, context).await.map_err(PolicyGateError::from)?;
+        gate_decision(outcome.decision)?;
+        request.known_refs = union_refs(&request.known_refs, &refs)?;
+        taught = refs;
+    }
+    Err(BaoReadError::PolicyRequired { refs: taught })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IncomingBaoReadResult {
     Served,
@@ -282,6 +358,8 @@ enum IncomingBaoReadState {
     CheckPermission,
     ReadHashVersion,
     ReadLocation,
+    CheckManagedCopy,
+    PolicyChallenge,
     SendAccepted,
     ServeRead,
     CloseMetadata,
@@ -324,6 +402,16 @@ pub struct IncomingBaoReadOperation {
     policy_group: Option<GroupId>,
     policy_next: Option<PolicyNext>,
     policy_current: bool,
+    /// The version this serve resolved and the refs it carries. A governed copy
+    /// answers the destination challenge before a single byte is offered.
+    version_key: Option<VersionKey>,
+    version_refs: Vec<PlacementPolicyRef>,
+    pending_location: Option<BackendLocation>,
+    gate: Option<PolicyGateOperation>,
+    /// The requesting peer's placement as this realm records it. The challenge
+    /// is decided against it, never against the subject the peer asserts.
+    peer_placement: Option<NodePlacementEntry>,
+    now_ms: u64,
 }
 
 impl IncomingBaoReadOperation {
@@ -358,7 +446,20 @@ impl IncomingBaoReadOperation {
             policy_group: None,
             policy_next: None,
             policy_current: false,
+            version_key: None,
+            version_refs: Vec::new(),
+            pending_location: None,
+            gate: None,
+            peer_placement: None,
+            now_ms: 0,
         }
+    }
+
+    /// Cache freshness for the challenge; the operation stays sans-I/O by
+    /// taking the clock as configuration.
+    pub fn with_now(mut self, now_ms: u64) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     pub fn with_policy_paths(mut self, paths: HashSet<String>) -> Self {
@@ -689,6 +790,8 @@ impl IncomingBaoReadOperation {
             IncomingBaoReadState::CheckPermission => "check_permission",
             IncomingBaoReadState::ReadHashVersion => "read_hash_version",
             IncomingBaoReadState::ReadLocation => "read_location",
+            IncomingBaoReadState::CheckManagedCopy => "check_managed_copy",
+            IncomingBaoReadState::PolicyChallenge => "policy_challenge",
             IncomingBaoReadState::SendAccepted => "send_accepted",
             IncomingBaoReadState::ServeRead => "serve_read",
             IncomingBaoReadState::CloseMetadata => "close_metadata",
@@ -715,6 +818,7 @@ impl IncomingBaoReadOperation {
         if ensure_realm_peer(&document, self.peer, self.request.realm_id, true).is_err() {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         }
+        self.peer_placement = document.placement_entry(self.peer).cloned();
         match &self.request.target {
             BaoReadTarget::ExactVersion(target) => {
                 if target.realm_id != self.request.realm_id || target.node_id != self.local_node {
@@ -762,6 +866,10 @@ impl IncomingBaoReadOperation {
         }
         self.blob_hash = Some(blob_hash);
         self.location_key = version.location_key();
+        self.version_refs = version.placement_policies.clone();
+        self.version_key = self
+            .exact_target()
+            .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.read_location()
     }
 
@@ -808,6 +916,10 @@ impl IncomingBaoReadOperation {
         }
         self.blob_hash = Some(hash);
         self.location_key = version.location_key();
+        self.version_refs = version.placement_policies.clone();
+        self.version_key = self.candidate.as_ref().map(|candidate| {
+            VersionKey::new(&candidate.bucket, &candidate.key, candidate.version_id)
+        });
         self.read_location()
     }
 
@@ -832,7 +944,147 @@ impl IncomingBaoReadOperation {
         if location.get_blake3() != Some(blake3.as_slice()) {
             return self.send_refusal(BaoReadRefusal::HashMismatch);
         }
-        self.send_accepted(location)
+        if self.version_refs.is_empty() {
+            return self.send_accepted(location);
+        }
+        self.check_managed_copy(location)
+    }
+
+    /// A governed copy is only offered from a registration this node can still
+    /// serve, and only to a destination it evaluated itself.
+    fn check_managed_copy(&mut self, location: BackendLocation) -> Effects {
+        let Some(version) = self.version_key.clone() else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let key = ManagedCopyKey::new(version, location.backend.clone());
+        let effect = match serve_reads(&key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.pending_location = Some(location);
+        self.state = IncomingBaoReadState::CheckManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_managed_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected(event);
+        };
+        let Some((copy, subject)) = split_serve_reads(values).ok() else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let (Some(location), Some(version)) =
+            (self.pending_location.clone(), self.version_key.clone())
+        else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let key = ManagedCopyKey::new(version, location.backend.clone());
+        if validate_registration(
+            copy.as_deref(),
+            &CopyRequest {
+                key: &key,
+                node_id: Some(self.local_node),
+                blake3: self.blob_hash,
+                refs: &self.version_refs,
+                subject_generation: Some(subject.subject.generation),
+            },
+        )
+        .is_err()
+        {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        }
+        self.challenge_destination(location)
+    }
+
+    /// The subject this realm places the authenticated peer at. The generation
+    /// is node-local, so it is carried over from the claim; every other
+    /// attribute must match, or the claim is not this peer's subject.
+    fn expected_subject(&self, claimed: &PlacementSubject) -> Option<PlacementSubject> {
+        let entry = self.peer_placement.as_ref()?;
+        let expected = storage_subject(entry, claimed.generation);
+        (*claimed == expected).then_some(expected)
+    }
+
+    /// Teaches the requester every rule it has not resolved, then evaluates the
+    /// authenticated destination independently. Authorization has already
+    /// passed here, so the refs may be disclosed; echoing one is never
+    /// authority.
+    fn challenge_destination(&mut self, location: BackendLocation) -> Effects {
+        let missing: Vec<PlacementPolicyRef> = self
+            .version_refs
+            .iter()
+            .filter(|policy_ref| !self.request.known_refs.contains(policy_ref))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return self.send_required(missing);
+        }
+        let Some(claimed) = self.request.destination.as_ref() else {
+            return self.send_denied(Vec::new());
+        };
+        // The requester asserts its own subject, so it is only ever a claim: the
+        // realm's own placement of the authenticated peer decides.
+        let Some(destination) = self.expected_subject(claimed) else {
+            return self.send_denied(Vec::new());
+        };
+        let context = GateContext {
+            realm_id: self.local_realm,
+            subject: destination,
+            now_ms: self.now_ms,
+            admitting: true,
+        };
+        match write_gate(Some(&context), &self.version_refs) {
+            Ok(None) => self.send_accepted(location),
+            Ok(Some(mut gate)) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.state = IncomingBaoReadState::PolicyChallenge;
+                match complete {
+                    true => self.finish_challenge(),
+                    false => effects,
+                }
+            }
+            Err(_) => self.send_denied(Vec::new()),
+        }
+    }
+
+    fn finish_challenge(&mut self) -> Effects {
+        let (Some(gate), Some(location)) = (self.gate.take(), self.pending_location.clone()) else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let decision = gate
+            .finalize()
+            .map_err(PolicyGateError::from)
+            .and_then(|outcome| gate_decision(outcome.decision));
+        match decision {
+            Ok(()) => self.send_accepted(location),
+            Err(PolicyGateError::Denied { policy_ids })
+            | Err(PolicyGateError::Unavailable { policy_ids }) => self.send_denied(policy_ids),
+            Err(PolicyGateError::Required { refs }) => self.send_required(refs),
+            Err(_) => self.send_denied(Vec::new()),
+        }
+    }
+
+    fn send_required(&mut self, refs: Vec<PlacementPolicyRef>) -> Effects {
+        self.send_policy(VersionReplicationMessage::PlacementPolicyRequired { refs })
+    }
+
+    fn send_denied(&mut self, policy_ids: Vec<Ulid>) -> Effects {
+        self.send_policy(VersionReplicationMessage::PlacementPolicyDenied { policy_ids })
+    }
+
+    fn send_policy(&mut self, message: VersionReplicationMessage) -> Effects {
+        let payload = match message.to_bytes() {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.refusal = Some(BaoReadRefusal::ReadDenied);
+        self.state = IncomingBaoReadState::SendRefusal;
+        smallvec![Effect::Blob(BlobEffect::SendMessage {
+            stream_id: self.stream_id,
+            payload,
+        })]
     }
 }
 
@@ -880,6 +1132,17 @@ impl Operation for IncomingBaoReadOperation {
             IncomingBaoReadState::CheckPermission => self.handle_permission(event),
             IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
             IncomingBaoReadState::ReadLocation => self.handle_location(event),
+            IncomingBaoReadState::CheckManagedCopy => self.handle_managed_copy(event),
+            IncomingBaoReadState::PolicyChallenge => {
+                let Some(gate) = self.gate.as_mut() else {
+                    return self.unexpected(event);
+                };
+                let effects = gate.step(event);
+                match gate.is_complete() {
+                    true => self.finish_challenge(),
+                    false => effects,
+                }
+            }
             IncomingBaoReadState::SendAccepted => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
                     return self.unexpected(event);
@@ -981,13 +1244,16 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, RealmConfigDocument,
-        RealmId, RealmNodeKind, VersionedObjectArn,
+        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, PlacementPolicyRef,
+        RealmConfigDocument, RealmId, RealmNodeKind, VersionedObjectArn,
     };
     use aruna_core::types::Effects;
     use ulid::Ulid;
 
-    use super::{BaoReadOperation, BaoReadOutput, IncomingBaoReadOperation, IncomingBaoReadResult};
+    use super::{
+        BaoReadError, BaoReadOperation, BaoReadOutput, IncomingBaoReadOperation,
+        IncomingBaoReadResult,
+    };
     use crate::replication::protocol::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage,
     };
@@ -1021,6 +1287,8 @@ mod tests {
             ),
             expected_blake3: Some(hash),
             metadata_only: false,
+            destination: None,
+            known_refs: Vec::new(),
         }
     }
 
@@ -1059,8 +1327,9 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::nil(test_realm()),
             cors_configuration: None,
-            replication: None,
             storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
         }
         .to_bytes()
         .unwrap()
@@ -1136,6 +1405,149 @@ mod tests {
                 blake3: hash,
             }
         );
+    }
+
+    /// Drives a requester read to the response frame and returns its effects.
+    fn respond(message: VersionReplicationMessage) -> BaoReadOperation {
+        let remote_node = node_from_seed(1);
+        let stream_id = Ulid::from(9u128);
+        let mut operation =
+            BaoReadOperation::new(remote_node, read_request(remote_node, [4u8; 32]));
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        operation.step(Event::Blob(BlobEvent::MessageReceived {
+            stream_id,
+            payload: message.to_bytes().unwrap(),
+        }));
+        operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+        operation
+    }
+
+    #[test]
+    fn required_teaches_refs() {
+        // The source teaches the rule instead of streaming, so the requester can
+        // resolve it and ask again.
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(3u128),
+            digest: [2u8; 32],
+        };
+        let operation = respond(VersionReplicationMessage::PlacementPolicyRequired {
+            refs: vec![policy_ref],
+        });
+        assert_eq!(
+            operation.finalize(),
+            Err(BaoReadError::PolicyRequired {
+                refs: vec![policy_ref]
+            })
+        );
+    }
+
+    #[test]
+    fn denied_never_streams() {
+        let operation = respond(VersionReplicationMessage::PlacementPolicyDenied {
+            policy_ids: vec![Ulid::from(3u128)],
+        });
+        assert_eq!(
+            operation.finalize(),
+            Err(BaoReadError::PolicyDenied {
+                policy_ids: vec![Ulid::from(3u128)]
+            })
+        );
+    }
+
+    #[test]
+    fn echoed_refs_never_grant() {
+        // The requester claims to know the rule, but the source still evaluates
+        // the destination itself and refuses it.
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(3u128),
+            digest: [2u8; 32],
+        };
+        let mut request = read_request(local_node, [4u8; 32]);
+        request.known_refs = vec![policy_ref];
+        request.destination = None;
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            request,
+        );
+        operation.version_refs = vec![policy_ref];
+        operation.request.known_refs = vec![policy_ref];
+
+        // No destination subject means nothing governed may be served, even
+        // though every ref was echoed back.
+        let (location, _) = location_value([4u8; 32]);
+        let effects = operation.challenge_destination(location);
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected a policy frame")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::PlacementPolicyDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn spoofed_subject_denied() {
+        // The requester may assert any subject; only the realm's placement of
+        // the authenticated peer decides where governed bytes may go.
+        use aruna_core::structs::{
+            DEFAULT_NODE_WEIGHT, NodePlacementEntry, PlacementSubject, storage_subject,
+        };
+
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let policy_ref = PlacementPolicyRef {
+            policy_id: Ulid::from(3u128),
+            digest: [2u8; 32],
+        };
+        let entry = NodePlacementEntry {
+            node_id: peer,
+            location: "us-east".to_string(),
+            weight: DEFAULT_NODE_WEIGHT,
+            full: false,
+            draining: false,
+            labels: std::collections::BTreeMap::new(),
+        };
+        let claimed = PlacementSubject {
+            location: "eu-west".to_string(),
+            ..storage_subject(&entry, 4)
+        };
+        let mut request = read_request(local_node, [4u8; 32]);
+        request.known_refs = vec![policy_ref];
+        request.destination = Some(claimed);
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            request,
+        );
+        operation.version_refs = vec![policy_ref];
+        operation.peer_placement = Some(entry.clone());
+
+        let (location, _) = location_value([4u8; 32]);
+        let effects = operation.challenge_destination(location.clone());
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected a policy frame")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::PlacementPolicyDenied { .. }
+        ));
+
+        // The honest claim resolves the rule instead of being refused outright.
+        operation.request.destination = Some(storage_subject(&entry, 4));
+        let effects = operation.challenge_destination(location);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
     }
 
     #[test]

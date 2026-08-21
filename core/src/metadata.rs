@@ -29,8 +29,15 @@ impl MetadataAuthToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct MetadataBearerToken(String);
+
+/// Redacted so a peer reply logged with `?` can never print a credential.
+impl std::fmt::Debug for MetadataBearerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MetadataBearerToken(redacted)")
+    }
+}
 
 impl MetadataBearerToken {
     pub fn new(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
@@ -1023,10 +1030,11 @@ pub struct MetadataValidationViolation {
 #[cfg(test)]
 mod tests {
     use super::{
-        METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataClockRelation,
-        MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
-        MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord, MetadataQueryResults,
-        apply_raw_upsert, compare_metadata_clocks, raw_quotas, resolve_raw_revision,
+        METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataBearerToken,
+        MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
+        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
+        MetadataGraphLifecycleRecord, MetadataQueryResults, apply_raw_upsert,
+        compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
@@ -1446,5 +1454,14 @@ mod tests {
         };
         assert_eq!(event.tombstone, tombstone);
         assert_eq!(event.deleted_after_event_id, deleted_after_event_id);
+    }
+
+    #[test]
+    fn debug_hides_token() {
+        // A peer reply logged with `?` must never print the credential.
+        let token = MetadataBearerToken::new("super-secret-value").unwrap();
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("super-secret-value"));
+        assert!(format!("{:?}", Some(token)).contains("redacted"));
     }
 }

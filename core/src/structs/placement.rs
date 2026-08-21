@@ -119,6 +119,7 @@ pub enum DocumentClass {
     Metadata,
     MetadataRegistry,
     JobControl,
+    PlacementPolicy,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]

@@ -46,8 +46,9 @@ pub struct LaunchRecord {
     pub stop_grace_ms: u64,
     pub walltime_ms: Option<u64>,
     pub pids_limit: u64,
-    pub memory_bytes: Option<u64>,
-    pub cpu_cores: Option<u32>,
+    /// Always bounded: an attempt with no ceiling is refused before launch.
+    pub memory_bytes: u64,
+    pub cpu_cores: u32,
     pub isolated_network: bool,
 }
 
