@@ -233,6 +233,10 @@ async fn pages_receipt_kind() {
     let mut receipt = family.receipt(&launch, 1);
     receipt.execution_id = Ulid::from_bytes([0xffu8; 16]);
 
+    // The fillers seal a different launch, so only the receipt seeded later
+    // can authenticate the offered one.
+    let mut other = family.launch(&spec, scheduler.public(), 1);
+    other.launch_id = Ulid::from_bytes([0x66u8; 16]);
     let mut seeded = vec![
         family.sign(
             &family.holder,
@@ -243,7 +247,7 @@ async fn pages_receipt_kind() {
             JobFamilyRecord::Budget(family.budget(&spec, scheduler.public())),
         ),
     ];
-    seeded.extend(filler_receipts(&family, &launch, 100));
+    seeded.extend(filler_receipts(&family, &other, 100));
     seed(&context, &seeded).await;
 
     let offered = family.sign(&scheduler, JobFamilyRecord::Launch(Box::new(launch)));
