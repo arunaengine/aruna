@@ -7,10 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::compute::{ExecutionTargetId, NetworkAccess, StagingMode};
+use aruna_core::compute::{ExecutionTargetId, ExecutorCapability, NetworkAccess, StagingMode};
 use aruna_core::scheduling::{
-    ExecutionPlan, InputHolder, MAX_TARGET_SCAN, PlanRequest, ResolvedInput, TargetCandidate,
-    plan_execution,
+    ExecutionPlan, InputHolder, MAX_TARGET_SCAN, PlanRequest, Planner, ResolvedInput,
+    TargetCandidate,
 };
 use aruna_core::structs::{
     AuthContext, BlobVersion, BlobVersionState, InputMode, InputSource, JobInputFact,
@@ -59,7 +59,7 @@ pub async fn build_plan(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
-    let documents = advertisements(context, config).await;
+    let (documents, unread) = advertisements(context, config).await;
     let inputs = resolve_inputs(config, spec)?;
     let mut output_policies = inputs
         .iter()
@@ -69,7 +69,6 @@ pub async fn build_plan(
     output_policies.sort_unstable();
     output_policies.dedup();
     let policies = resolve_policies(context, spec, &inputs, &output_policies, now_ms, local).await;
-    let scan = candidates(context, config, spec, &documents, excluded).await;
     let request = PlanRequest {
         submission_id: spec.submission_id,
         request_digest: spec.request_digest,
@@ -83,65 +82,71 @@ pub async fn build_plan(
         inputs,
         output_policies,
         policies,
-        candidates: scan.candidates,
-        scan_incomplete: scan.incomplete,
         now_ms,
     };
-    Ok(plan_execution(&request, &config.compute)?)
+    let mut planner = Planner::new(&request, &config.compute)?;
+    let scan = candidates(context, config, spec, &documents, excluded, &mut planner).await?;
+    debug!(
+        pages = scan.pages,
+        scanned = scan.scanned,
+        unread,
+        "Screened the realm advertisements for one planning round"
+    );
+    Ok(planner.finish(unread))
 }
 
-/// Node-info documents of every sync-eligible realm member that has one.
+/// Node-info documents of every sync-eligible realm member that has one, and
+/// whether a read failed. An unread advertisement may hold the only legal
+/// target, so the round is a continuation rather than a conclusive refusal.
 async fn advertisements(
     context: &DriverContext,
     config: &RealmConfigDocument,
-) -> BTreeMap<NodeId, NodeInfoDocument> {
+) -> (BTreeMap<NodeId, NodeInfoDocument>, bool) {
     let mut documents = BTreeMap::new();
     let Ok(members) = config.sync_eligible_node_ids() else {
-        return documents;
+        return (documents, true);
     };
+    let mut unread = false;
     for node_id in members {
-        if let Ok(Some(document)) = read_node_info_document(&context.storage_handle, node_id).await
-        {
-            documents.insert(node_id, document);
+        match read_node_info_document(&context.storage_handle, node_id).await {
+            Ok(Some(document)) => {
+                documents.insert(node_id, document);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(node = %node_id, error = %error, "Node info advertisement stayed unread");
+                unread = true;
+            }
         }
     }
-    documents
+    (documents, unread)
 }
 
-/// The advertisements one round scanned, and whether the scan bound stopped it
-/// with advertisements still unseen.
+/// What one paged advertisement walk handed to the planner.
 struct Scan {
-    candidates: Vec<TargetCandidate>,
-    incomplete: bool,
+    pages: u32,
+    scanned: u64,
 }
 
-impl Scan {
-    /// Takes one advertisement while the scan bound allows. The first one it
-    /// refuses makes the round a continuation rather than a full answer.
-    fn take(&mut self, candidate: TargetCandidate) -> bool {
-        if self.candidates.len() >= MAX_TARGET_SCAN {
-            self.incomplete = true;
-            return false;
-        }
-        self.candidates.push(candidate);
-        true
-    }
-}
-
-/// One candidate per advertised backend. `node_kind` and `active` come from the
-/// realm config; a document may only describe a backend, never its own standing.
-/// Eligibility is decided by the planner over the whole scan, never here.
+/// One candidate per advertised backend, screened in pages of at most
+/// [`MAX_TARGET_SCAN`]. `node_kind` and `active` come from the realm config; a
+/// document may only describe a backend, never its own standing. Eligibility is
+/// decided by the planner over the whole scan, never here.
 async fn candidates(
     context: &DriverContext,
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
     documents: &BTreeMap<NodeId, NodeInfoDocument>,
     excluded: &[ExecutionTargetId],
-) -> Scan {
+    planner: &mut Planner<'_>,
+) -> Result<Scan, PlanBuildError> {
     let mut scan = Scan {
-        candidates: Vec::new(),
-        incomplete: false,
+        pages: 0,
+        scanned: 0,
     };
+    let mut page = Vec::new();
+    // Members come out of the map in node id byte order and every document's
+    // backends are walked by kind: the canonical order pages must continue in.
     for (node_id, document) in documents {
         if ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
             && *node_id != spec.ingress_node_id
@@ -153,12 +158,13 @@ async fn candidates(
         };
         let entry = config.placement_entry(*node_id);
         let group_allowed = target_allowed(context, spec, *node_id).await;
-        for capability in &document.executors {
-            let target = capability.target(*node_id);
-            if excluded.contains(&target) {
+        let mut executors: Vec<&ExecutorCapability> = document.executors.iter().collect();
+        executors.sort_unstable_by(|left, right| left.kind.as_str().cmp(right.kind.as_str()));
+        for capability in executors {
+            if excluded.contains(&capability.target(*node_id)) {
                 continue;
             }
-            let taken = scan.take(TargetCandidate {
+            page.push(TargetCandidate {
                 node_id: *node_id,
                 node_kind: kind.clone(),
                 active: !document.leaving,
@@ -168,16 +174,30 @@ async fn candidates(
                 capability: capability.clone(),
                 load_permille: document.utilization.load_permille,
             });
-            if !taken {
-                warn!(
-                    scanned = MAX_TARGET_SCAN,
-                    "Advertisement scan bound reached before every target was seen"
-                );
-                return scan;
+            if page.len() == MAX_TARGET_SCAN {
+                flush(planner, &mut page, &mut scan)?;
             }
         }
     }
-    scan
+    flush(planner, &mut page, &mut scan)?;
+    Ok(scan)
+}
+
+/// Hands one buffered page to the planner. A page is only flushed with
+/// advertisements in it, so a scan never ends on an empty page.
+fn flush(
+    planner: &mut Planner<'_>,
+    page: &mut Vec<TargetCandidate>,
+    scan: &mut Scan,
+) -> Result<(), PlanBuildError> {
+    if page.is_empty() {
+        return Ok(());
+    }
+    planner.rank_page(page)?;
+    scan.pages += 1;
+    scan.scanned += page.len() as u64;
+    page.clear();
+    Ok(())
 }
 
 async fn target_allowed(context: &DriverContext, spec: &LogicalJobSpec, target: NodeId) -> bool {
@@ -395,46 +415,196 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::node;
-    use aruna_core::compute::ExecutorCapability;
+    use crate::jobs::records::tests::fixture::{Family, REALM, context, node};
+    use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+    use aruna_core::structs::{
+        AdvertisementEpoch, NodeUrls, NodeUtilization, node_info_storage_key,
+    };
 
-    fn advertised() -> TargetCandidate {
-        let subject = PlacementSubject {
-            node_id: node(1),
-            generation: 1,
-            location: "eu".to_string(),
+    /// A realm of `members` servers, each advertising eight backends, which is
+    /// more advertisements than one planning page screens.
+    fn realm(members: u8) -> (RealmConfigDocument, Vec<NodeInfoDocument>) {
+        let mut config = RealmConfigDocument::new(REALM, Vec::new(), 5);
+        let documents = (1..=members)
+            .map(|seed| {
+                config.ensure_node(node(seed), RealmNodeKind::Server);
+                advertised(node(seed))
+            })
+            .collect();
+        (config, documents)
+    }
+
+    fn advertised(node_id: NodeId) -> NodeInfoDocument {
+        let executors = (0..MAX_ADVERTISED_EXECUTORS)
+            .map(|index| {
+                let subject = PlacementSubject {
+                    node_id,
+                    generation: 1,
+                    location: "eu".to_string(),
+                    labels: BTreeMap::new(),
+                    executor_kind: None,
+                    local_to_controller: true,
+                };
+                ExecutorCapability::new(format!("k{index}"), subject).expect("subject is valid")
+            })
+            .collect();
+        NodeInfoDocument {
+            node_id,
+            executors,
             labels: BTreeMap::new(),
-            executor_kind: None,
-            local_to_controller: true,
-        };
-        TargetCandidate {
-            node_id: node(1),
-            node_kind: RealmNodeKind::Server,
-            active: true,
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 0,
+                documents_held: None,
+                load_permille: Some(100),
+                heartbeat_at_ms: 1,
+            },
+            updated_at_ms: 1,
+            epoch: AdvertisementEpoch::default(),
             compute_draining: false,
-            group_allowed: true,
-            capability: ExecutorCapability::new("docker".to_string(), subject)
-                .expect("subject is valid"),
-            load_permille: None,
+            leaving: false,
+            demand: Default::default(),
+            reservation: Default::default(),
         }
     }
 
-    #[test]
-    fn scan_bound_stops() {
-        // Filling the scan is not a continuation; only an advertisement the
-        // bound refused proves that more of them remain unseen.
-        let advertisement = advertised();
-        let mut scan = Scan {
-            candidates: Vec::new(),
-            incomplete: false,
-        };
-        for _ in 0..MAX_TARGET_SCAN {
-            assert!(scan.take(advertisement.clone()));
+    /// The pinned facts of one round, with the candidates left to the scan.
+    fn facts(spec: &LogicalJobSpec) -> PlanRequest {
+        PlanRequest {
+            submission_id: spec.submission_id,
+            request_digest: spec.request_digest,
+            spec_digest: spec.spec_digest,
+            admitted: true,
+            resources: spec.resources,
+            executor_constraint: None,
+            required_labels: Vec::new(),
+            staging: staging_mode(spec),
+            network: network_access(spec),
+            inputs: Vec::new(),
+            output_policies: Vec::new(),
+            policies: BTreeMap::new(),
+            now_ms: 2_000,
         }
+    }
 
-        assert!(!scan.incomplete);
-        assert!(!scan.take(advertisement));
-        assert!(scan.incomplete);
-        assert_eq!(scan.candidates.len(), MAX_TARGET_SCAN);
+    async fn publish(context: &DriverContext, document: &NodeInfoDocument) {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_INFO_KEYSPACE.to_string(),
+                key: node_info_storage_key(document.node_id).into(),
+                value: document.to_bytes().expect("advertisement is valid").into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    /// One planning walk over the advertisements in the order they were
+    /// published, with the cursor kept before the plan is sealed.
+    async fn walk(
+        config: &RealmConfigDocument,
+        documents: &[NodeInfoDocument],
+    ) -> (Scan, Option<ExecutionTargetId>, ExecutionPlan) {
+        let family = Family::new([4u8; 32]);
+        let (_dir, context) = context(config, node(1)).await;
+        for document in documents {
+            publish(&context, document).await;
+        }
+        let spec = family.spec();
+        let (read, _) = advertisements(&context, config).await;
+        let request = facts(&spec);
+        let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
+        let scan = candidates(&context, config, &spec, &read, &[], &mut planner)
+            .await
+            .expect("every page continues the scan");
+        let cursor = planner.cursor().cloned();
+        (scan, cursor, planner.finish(false))
+    }
+
+    #[tokio::test]
+    async fn reversed_order_agrees() {
+        // Publication order must never reach the plan: ascending nodes with
+        // k0..k7 and descending nodes with k7..k0 walk into one identical round.
+        let (config, ascending) = realm(129);
+        let descending: Vec<_> = ascending
+            .iter()
+            .rev()
+            .map(|document| {
+                let mut reversed = document.clone();
+                reversed.executors.reverse();
+                reversed
+            })
+            .collect();
+
+        let (first, first_cursor, first_plan) = walk(&config, &ascending).await;
+        let (second, second_cursor, second_plan) = walk(&config, &descending).await;
+
+        assert_eq!((first.pages, first.scanned), (second.pages, second.scanned));
+        assert_eq!(first_cursor, second_cursor);
+        assert_eq!(first_plan, second_plan);
+    }
+
+    #[tokio::test]
+    async fn walks_every_page() {
+        // 129 nodes advertising eight backends each overrun one page: the walk
+        // must page the overrun into the same planner instead of stopping.
+        let (config, documents) = realm(129);
+        let family = Family::new([4u8; 32]);
+        let (_dir, context) = context(&config, node(1)).await;
+        for document in &documents {
+            publish(&context, document).await;
+        }
+        let spec = family.spec();
+
+        let (read, unread) = advertisements(&context, &config).await;
+        assert!(!unread && read.len() == 129);
+        let request = facts(&spec);
+        let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
+        let scan = candidates(&context, &config, &spec, &read, &[], &mut planner)
+            .await
+            .expect("every page continues the scan");
+
+        assert_eq!((scan.pages, scan.scanned), (2, 1_032));
+        assert_eq!(planner.scanned(), 1_032);
+        // The cursor proves the walk reached the last advertisement of the
+        // highest node id, past the entries the old scan bound cut off.
+        let last = read.values().last().expect("the realm advertises");
+        assert_eq!(
+            planner.cursor(),
+            Some(&last.executors[MAX_ADVERTISED_EXECUTORS - 1].target(last.node_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_targets_skipped() {
+        // An excluded target leaves the scan without disturbing its order, so
+        // the following pages still continue past the cursor.
+        let (config, documents) = realm(129);
+        let family = Family::new([4u8; 32]);
+        let (_dir, context) = context(&config, node(1)).await;
+        for document in &documents {
+            publish(&context, document).await;
+        }
+        let spec = family.spec();
+        let excluded = vec![documents[0].executors[0].target(documents[0].node_id)];
+
+        let (read, _) = advertisements(&context, &config).await;
+        let request = facts(&spec);
+        let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
+        let scan = candidates(&context, &config, &spec, &read, &excluded, &mut planner)
+            .await
+            .expect("every page continues the scan");
+
+        assert_eq!((scan.pages, scan.scanned), (2, 1_031));
     }
 }

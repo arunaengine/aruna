@@ -11,6 +11,7 @@ mod digest;
 mod eligibility;
 mod facts;
 mod rank;
+mod scan;
 
 pub use cost::{InputRoute, UNKNOWN_PERMILLE};
 pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
@@ -20,6 +21,7 @@ pub use facts::{
     MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
     TargetScore,
 };
+pub use scan::Planner;
 
 use crate::compute::ExecutionTargetId;
 use crate::structs::RealmComputeConfig;
@@ -71,64 +73,33 @@ pub struct ExecutionPlan {
     /// `None` when no scanned target is currently eligible.
     pub selected: Option<Selection>,
     /// A later round may still find a target once missing policy documents or
-    /// holders are observed, or once the scan continues past its bound. Always
-    /// false once a target was selected.
+    /// holders are observed, or once an advertisement this round could not read
+    /// is readable. Always false once a target was selected.
     pub retryable: bool,
     pub alternatives: Vec<RankedTarget>,
     pub rejected: Vec<RejectedTarget>,
     pub omitted: u32,
 }
 
-/// Plans one execution over already resolved facts. Returns an error only when
-/// the request itself is unusable; an empty or fully rejected scan is a plan
-/// without a selection, not a failure, and stays retryable while the scan was
-/// cut short or a rejection may still resolve itself.
+/// Plans one execution over already resolved facts and one complete candidate
+/// set, paging it for the caller. Returns an error only when the request itself
+/// is unusable; an empty or fully rejected scan is a plan without a selection,
+/// not a failure, and stays retryable while a rejection may still resolve
+/// itself. A caller that discovers advertisements incrementally drives
+/// [`Planner`] itself.
 pub fn plan_execution(
     request: &PlanRequest,
+    candidates: &[TargetCandidate],
     compute: &RealmComputeConfig,
 ) -> Result<ExecutionPlan, PlanError> {
-    compute.validate()?;
-    let request = request.canonical()?;
-    let links = cost::LinkIndex::new(compute);
-    let ranking = rank::rank(&request, &links);
-
-    // An unfinished scan may still hold the only legal target, so a round
-    // without a selection is a continuation and never a conclusive refusal.
-    let retryable = ranking.ranked.is_empty()
-        && (request.scan_incomplete
-            || ranking
-                .rejected
-                .iter()
-                .any(|rejection| rejection.verdict.retryable()));
-    let omitted = ranking.rejected.len().saturating_sub(MAX_PLAN_REJECTIONS) as u32;
-    let mut rejected = ranking.rejected;
-    rejected.truncate(MAX_PLAN_REJECTIONS);
-    let alternatives = ranking
-        .ranked
-        .iter()
-        .skip(1)
-        .take(MAX_PLAN_ALTERNATIVES)
-        .map(|scored| RankedTarget {
-            target: scored.target.clone(),
-            score: scored.score,
-        })
-        .collect();
-    let selected = ranking.ranked.first().map(|scored| Selection {
-        target: scored.target.clone(),
-        subject_digest: scored.candidate.capability.subject_digest,
-        subject_generation: scored.candidate.capability.subject.generation,
-        score: scored.score,
-        inputs: planned_inputs(&request, &scored.routes),
-        output_policies: request.output_policies.clone(),
-        plan_digest: digest::plan_digest(&request, scored.candidate, &scored.routes, &scored.score),
-    });
-    Ok(ExecutionPlan {
-        selected,
-        retryable,
-        alternatives,
-        rejected,
-        omitted,
-    })
+    let mut planner = Planner::new(request, compute)?;
+    let mut ordered = candidates.to_vec();
+    ordered
+        .sort_unstable_by(|left, right| facts::target_order(left).cmp(&facts::target_order(right)));
+    for page in ordered.chunks(MAX_TARGET_SCAN) {
+        planner.rank_page(page)?;
+    }
+    Ok(planner.finish(false))
 }
 
 fn planned_inputs(request: &PlanRequest, routes: &[InputRoute]) -> Vec<PlannedInput> {

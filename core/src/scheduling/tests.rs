@@ -102,8 +102,6 @@ pub(crate) fn request(inputs: Vec<ResolvedInput>) -> PlanRequest {
         inputs,
         output_policies: Vec::new(),
         policies: BTreeMap::new(),
-        candidates: Vec::new(),
-        scan_incomplete: false,
         now_ms: NOW_MS,
     }
 }
@@ -162,12 +160,52 @@ fn scanned(count: u8) -> Vec<TargetCandidate> {
     targets
 }
 
-fn plan(request: &PlanRequest, compute: &RealmComputeConfig) -> ExecutionPlan {
-    plan_execution(request, compute).expect("request is well formed")
+/// `nodes` nodes advertising eight backends each, the realistic shape that
+/// overruns one page, in canonical scan order.
+fn backends(nodes: u16) -> Vec<TargetCandidate> {
+    let mut targets: Vec<_> = (0..nodes)
+        .flat_map(|seed| {
+            let node_id = node(u8::try_from(seed).expect("at most 256 nodes"));
+            (0..8).map(move |kind| candidate(node_id, &format!("k{kind}")))
+        })
+        .collect();
+    targets.sort_by(|left, right| {
+        (left.node_id.as_bytes(), &left.capability.kind)
+            .cmp(&(right.node_id.as_bytes(), &right.capability.kind))
+    });
+    targets
 }
 
-fn selected(request: &PlanRequest, compute: &RealmComputeConfig) -> Selection {
-    plan(request, compute).selected.expect("a target is legal")
+/// One page-by-page run over `candidates`, in the canonical order discovery
+/// walks them in.
+fn paged<'a>(
+    request: &PlanRequest,
+    candidates: &[TargetCandidate],
+    compute: &'a RealmComputeConfig,
+) -> Planner<'a> {
+    let mut planner = Planner::new(request, compute).expect("request is well formed");
+    for page in candidates.chunks(MAX_TARGET_SCAN) {
+        planner.rank_page(page).expect("pages are ordered");
+    }
+    planner
+}
+
+fn plan(
+    request: &PlanRequest,
+    candidates: Vec<TargetCandidate>,
+    compute: &RealmComputeConfig,
+) -> ExecutionPlan {
+    plan_execution(request, &candidates, compute).expect("request is well formed")
+}
+
+fn selected(
+    request: &PlanRequest,
+    candidates: Vec<TargetCandidate>,
+    compute: &RealmComputeConfig,
+) -> Selection {
+    plan(request, candidates, compute)
+        .selected
+        .expect("a target is legal")
 }
 
 fn verdict(plan: &ExecutionPlan, node_id: NodeId) -> RejectionVerdict {
@@ -223,9 +261,9 @@ fn policy_selects_site() {
         let mut plan_request = request(Vec::new());
         let policy = policy(4, selector);
         plan_request.output_policies = vec![known(&mut plan_request, &policy)];
-        plan_request.candidates = vec![candidate(first, "docker"), target.clone()];
+        let scan = vec![candidate(first, "docker"), target.clone()];
 
-        let selection = selected(&plan_request, &config(Vec::new()));
+        let selection = selected(&plan_request, scan, &config(Vec::new()));
         assert_eq!(selection.target, target.capability.target(second));
     }
 }
@@ -236,14 +274,14 @@ fn local_copy_wins() {
     let (local, remote) = (node(2), node(3));
     let mut input = resolved_input("in", 1);
     input.holders = vec![holder(local, "eu"), holder(node(4), "us")];
-    let mut plan_request = request(vec![input]);
-    plan_request.candidates = vec![
-        candidate(local, "docker"),
-        candidate_at(remote, "docker", "us"),
-    ];
+    let plan_request = request(vec![input]);
 
     let selection = selected(
         &plan_request,
+        vec![
+            candidate(local, "docker"),
+            candidate_at(remote, "docker", "us"),
+        ],
         &config(vec![link("us", "us", 1_000_000_000), link("eu", "eu", 1)]),
     );
 
@@ -259,11 +297,11 @@ fn cheapest_holder_wins() {
     let target = node(2);
     let mut input = resolved_input("in", 1);
     input.holders = vec![holder(node(5), "us"), holder(node(6), "ap")];
-    let mut plan_request = request(vec![input]);
-    plan_request.candidates = vec![candidate(target, "docker")];
+    let plan_request = request(vec![input]);
 
     let selection = selected(
         &plan_request,
+        vec![candidate(target, "docker")],
         &config(vec![link("us", "eu", 1_000), link("ap", "eu", 4_000)]),
     );
 
@@ -291,10 +329,10 @@ fn skips_noncompliant_holder() {
     input.policies = vec![policy_ref];
     input.holders = vec![holder(node(5), "us"), holder(node(6), "eu")];
     plan_request.inputs = vec![input.clone()];
-    plan_request.candidates = vec![candidate(target, "docker")];
 
     let selection = selected(
         &plan_request,
+        vec![candidate(target, "docker")],
         &config(vec![link("us", "eu", 1_000_000), link("eu", "eu", 1_000)]),
     );
     assert_eq!(selection.inputs[0].source_node_id, Some(node(6)));
@@ -302,7 +340,11 @@ fn skips_noncompliant_holder() {
 
     let mut without = plan_request.clone();
     without.inputs[0].holders = vec![holder(node(5), "us")];
-    let outcome = plan(&without, &config(Vec::new()));
+    let outcome = plan(
+        &without,
+        vec![candidate(target, "docker")],
+        &config(Vec::new()),
+    );
     assert!(outcome.selected.is_none() && outcome.retryable);
     assert_eq!(
         verdict(&outcome, target),
@@ -321,12 +363,12 @@ fn unknown_link_costs() {
     let mut large = small.clone();
     large.bytes = 10_000_000;
     let mut plan_request = request(vec![small]);
-    plan_request.candidates = vec![candidate(target, "docker")];
     let compute = config(Vec::new());
+    let scan = vec![candidate(target, "docker")];
 
-    let cheap = selected(&plan_request, &compute);
+    let cheap = selected(&plan_request, scan.clone(), &compute);
     plan_request.inputs = vec![large];
-    let expensive = selected(&plan_request, &compute);
+    let expensive = selected(&plan_request, scan, &compute);
 
     assert_eq!(cheap.score.unknown_link_count, 1);
     assert!(expensive.score.estimated_transfer_ms > cheap.score.estimated_transfer_ms);
@@ -340,10 +382,13 @@ fn saturates_transfer_cost() {
     let mut input = resolved_input("in", 1);
     input.bytes = u64::MAX;
     input.holders = vec![holder(node(5), "us")];
-    let mut plan_request = request(vec![input]);
-    plan_request.candidates = vec![candidate(target, "docker")];
+    let plan_request = request(vec![input]);
 
-    let selection = selected(&plan_request, &config(vec![link("us", "eu", 1)]));
+    let selection = selected(
+        &plan_request,
+        vec![candidate(target, "docker")],
+        &config(vec![link("us", "eu", 1)]),
+    );
     assert_eq!(selection.score.estimated_transfer_ms, u64::MAX);
 }
 
@@ -365,10 +410,9 @@ fn envelope_rejects_target() {
         max_cpu_cores: Some(1),
         ..Default::default()
     };
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![small];
+    let plan_request = request(Vec::new());
 
-    let outcome = plan(&plan_request, &config(Vec::new()));
+    let outcome = plan(&plan_request, vec![small], &config(Vec::new()));
     assert!(outcome.selected.is_none() && !outcome.retryable);
     assert_eq!(verdict(&outcome, target), RejectionVerdict::Resources);
 }
@@ -392,10 +436,9 @@ fn stale_hints_only_rank() {
         observed_at_ms: NOW_MS,
     });
     busy.load_permille = Some(990);
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![busy.clone()];
+    let plan_request = request(Vec::new());
 
-    let loaded = selected(&plan_request, &config(Vec::new()));
+    let loaded = selected(&plan_request, vec![busy.clone()], &config(Vec::new()));
     assert_eq!(
         loaded.score.availability_pressure_permille,
         UNKNOWN_PERMILLE
@@ -411,9 +454,8 @@ fn stale_hints_only_rank() {
             .availability
             .expect("fixture reports availability")
     });
-    plan_request.candidates = vec![idle];
     assert_eq!(
-        selected(&plan_request, &config(Vec::new()))
+        selected(&plan_request, vec![idle], &config(Vec::new()))
             .score
             .availability_pressure_permille,
         0
@@ -428,9 +470,8 @@ fn stale_hints_only_rank() {
         free_ram_bytes: None,
         free_disk_bytes: None,
     });
-    plan_request.candidates = vec![old];
     assert_eq!(
-        selected(&plan_request, &config(Vec::new()))
+        selected(&plan_request, vec![old], &config(Vec::new()))
             .score
             .availability_pressure_permille,
         UNKNOWN_PERMILLE
@@ -445,10 +486,13 @@ fn drops_draining_targets() {
     drained.compute_draining = true;
     let mut policy_drained = candidate(transitioning, "docker");
     policy_drained.capability.policy_draining = true;
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![drained, policy_drained, candidate(healthy, "docker")];
+    let plan_request = request(Vec::new());
 
-    let outcome = plan(&plan_request, &config(Vec::new()));
+    let outcome = plan(
+        &plan_request,
+        vec![drained, policy_drained, candidate(healthy, "docker")],
+        &config(Vec::new()),
+    );
 
     assert_eq!(
         outcome
@@ -473,7 +517,7 @@ fn drops_draining_targets() {
 fn excludes_local_nodes() {
     // Local and User nodes never take cross-node work, and a departed or
     // unauthorized controller is out regardless of what it advertises.
-    let mut plan_request = request(Vec::new());
+    let plan_request = request(Vec::new());
     let mut local = candidate(node(2), "docker");
     local.node_kind = RealmNodeKind::Local;
     let mut user = candidate(node(3), "docker");
@@ -482,9 +526,12 @@ fn excludes_local_nodes() {
     inactive.active = false;
     let mut unauthorized = candidate(node(5), "docker");
     unauthorized.group_allowed = false;
-    plan_request.candidates = vec![local, user, inactive, unauthorized];
 
-    let outcome = plan(&plan_request, &config(Vec::new()));
+    let outcome = plan(
+        &plan_request,
+        vec![local, user, inactive, unauthorized],
+        &config(Vec::new()),
+    );
 
     assert!(outcome.selected.is_none() && !outcome.retryable);
     assert_eq!(verdict(&outcome, node(2)), RejectionVerdict::NodeKind);
@@ -503,10 +550,9 @@ fn drops_drifted_subject() {
     let mut foreign = candidate(node(3), "docker");
     foreign.capability.subject.node_id = node(9);
     reseal(&mut foreign);
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![drifted, foreign];
+    let plan_request = request(Vec::new());
 
-    let outcome = plan(&plan_request, &config(Vec::new()));
+    let outcome = plan(&plan_request, vec![drifted, foreign], &config(Vec::new()));
 
     assert!(outcome.selected.is_none());
     assert_eq!(verdict(&outcome, target), RejectionVerdict::SubjectDrift);
@@ -517,19 +563,21 @@ fn drops_drifted_subject() {
 fn filters_request_constraints() {
     // Executor kind, staging mode, and required labels are request-level hard
     // constraints, independent of any policy.
+    let scan = vec![candidate(node(2), "docker")];
     let mut plan_request = request(Vec::new());
     plan_request.executor_constraint = Some("apptainer".to_string());
-    plan_request.candidates = vec![candidate(node(2), "docker")];
     assert_eq!(
-        verdict(&plan(&plan_request, &config(Vec::new())), node(2)),
+        verdict(
+            &plan(&plan_request, scan.clone(), &config(Vec::new())),
+            node(2)
+        ),
         RejectionVerdict::ExecutorKind
     );
 
     let mut staging = request(Vec::new());
     staging.staging = StagingMode::S3Mount;
-    staging.candidates = vec![candidate(node(2), "docker")];
     assert_eq!(
-        verdict(&plan(&staging, &config(Vec::new())), node(2)),
+        verdict(&plan(&staging, scan.clone(), &config(Vec::new())), node(2)),
         RejectionVerdict::Staging
     );
 
@@ -538,9 +586,8 @@ fn filters_request_constraints() {
         key: "tier".to_string(),
         value: "gpu".to_string(),
     }];
-    labelled.candidates = vec![candidate(node(2), "docker")];
     assert_eq!(
-        verdict(&plan(&labelled, &config(Vec::new())), node(2)),
+        verdict(&plan(&labelled, scan, &config(Vec::new())), node(2)),
         RejectionVerdict::RequiredLabels
     );
 }
@@ -560,20 +607,31 @@ fn guards_open_network() {
     );
     plan_request.output_policies = vec![known(&mut plan_request, &policy)];
     plan_request.network = NetworkAccess::Open;
-    plan_request.candidates = vec![candidate(target, "docker")];
+    let scan = vec![candidate(target, "docker")];
 
     assert_eq!(
-        verdict(&plan(&plan_request, &config(Vec::new())), target),
+        verdict(
+            &plan(&plan_request, scan.clone(), &config(Vec::new())),
+            target
+        ),
         RejectionVerdict::OpenNetwork
     );
 
-    let mut enforcing = plan_request.clone();
-    enforcing.candidates[0].capability.network_policy = true;
-    assert!(plan(&enforcing, &config(Vec::new())).selected.is_some());
+    let mut enforcing = scan.clone();
+    enforcing[0].capability.network_policy = true;
+    assert!(
+        plan(&plan_request, enforcing, &config(Vec::new()))
+            .selected
+            .is_some()
+    );
 
     let mut unprotected = plan_request;
     unprotected.output_policies = Vec::new();
-    assert!(plan(&unprotected, &config(Vec::new())).selected.is_some());
+    assert!(
+        plan(&unprotected, scan, &config(Vec::new()))
+            .selected
+            .is_some()
+    );
 }
 
 #[test]
@@ -589,9 +647,9 @@ fn reports_policy_gaps() {
     );
     let mut missing = request(Vec::new());
     missing.output_policies = vec![policy.policy_ref()];
-    missing.candidates = vec![candidate(target, "docker")];
+    let scan = vec![candidate(target, "docker")];
 
-    let outcome = plan(&missing, &config(Vec::new()));
+    let outcome = plan(&missing, scan.clone(), &config(Vec::new()));
     assert!(outcome.retryable);
     assert_eq!(
         verdict(&outcome, target),
@@ -603,7 +661,7 @@ fn reports_policy_gaps() {
 
     let mut denied = missing.clone();
     known(&mut denied, &policy);
-    let outcome = plan(&denied, &config(Vec::new()));
+    let outcome = plan(&denied, scan, &config(Vec::new()));
     assert!(!outcome.retryable);
     assert_eq!(
         verdict(&outcome, target),
@@ -622,14 +680,17 @@ fn ties_break_by_node() {
         true => (low, high),
         false => (high, low),
     };
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![
-        candidate(high, "docker"),
-        candidate(low, "docker"),
-        candidate(low, "apptainer"),
-    ];
+    let plan_request = request(Vec::new());
 
-    let outcome = plan(&plan_request, &config(Vec::new()));
+    let outcome = plan(
+        &plan_request,
+        vec![
+            candidate(high, "docker"),
+            candidate(low, "docker"),
+            candidate(low, "apptainer"),
+        ],
+        &config(Vec::new()),
+    );
     let selection = outcome.selected.clone().expect("a target is legal");
 
     assert_eq!(selection.target.node_id, low);
@@ -648,13 +709,22 @@ fn shuffled_facts_agree() {
     second.holders = vec![holder(node(6), "ap"), holder(node(5), "us")];
     let compute = config(vec![link("us", "eu", 1_000), link("ap", "eu", 2_000)]);
 
-    let mut forward = request(vec![first.clone(), second.clone()]);
-    forward.candidates = vec![candidate(node(2), "docker"), candidate(node(3), "docker")];
+    let forward = request(vec![first.clone(), second.clone()]);
     let mut reverse = request(vec![second, first]);
-    reverse.candidates = vec![candidate(node(3), "docker"), candidate(node(2), "docker")];
     reverse.inputs[0].holders.reverse();
 
-    assert_eq!(selected(&forward, &compute), selected(&reverse, &compute));
+    assert_eq!(
+        selected(
+            &forward,
+            vec![candidate(node(2), "docker"), candidate(node(3), "docker")],
+            &compute
+        ),
+        selected(
+            &reverse,
+            vec![candidate(node(3), "docker"), candidate(node(2), "docker")],
+            &compute
+        )
+    );
 }
 
 #[test]
@@ -664,35 +734,46 @@ fn digest_seals_facts() {
     let target = node(2);
     let mut input = resolved_input("in", 1);
     input.holders = vec![holder(node(5), "us")];
-    let mut plan_request = request(vec![input]);
-    plan_request.candidates = vec![candidate(target, "docker")];
+    let plan_request = request(vec![input]);
+    let scan = vec![candidate(target, "docker")];
     let compute = config(vec![link("us", "eu", 1_000)]);
-    let base = selected(&plan_request, &compute).plan_digest;
+    let base = selected(&plan_request, scan.clone(), &compute).plan_digest;
 
     let mut resized = plan_request.clone();
     resized.inputs[0].bytes += 1;
-    assert_ne!(selected(&resized, &compute).plan_digest, base);
+    assert_ne!(selected(&resized, scan.clone(), &compute).plan_digest, base);
 
-    let mut regenerated = plan_request.clone();
-    regenerated.candidates[0].capability.subject.generation += 1;
-    reseal(&mut regenerated.candidates[0]);
-    assert_ne!(selected(&regenerated, &compute).plan_digest, base);
+    let mut regenerated = scan.clone();
+    regenerated[0].capability.subject.generation += 1;
+    reseal(&mut regenerated[0]);
+    assert_ne!(
+        selected(&plan_request, regenerated, &compute).plan_digest,
+        base
+    );
 
     let mut moved = plan_request.clone();
     moved.inputs[0].holders = vec![holder(node(6), "us")];
-    assert_ne!(selected(&moved, &compute).plan_digest, base);
+    assert_ne!(selected(&moved, scan, &compute).plan_digest, base);
 
-    let mut elsewhere = plan_request;
-    elsewhere.candidates = vec![candidate(node(3), "docker")];
-    assert_ne!(selected(&elsewhere, &compute).plan_digest, base);
+    let elsewhere = vec![candidate(node(3), "docker")];
+    assert_ne!(
+        selected(&plan_request, elsewhere, &compute).plan_digest,
+        base
+    );
 }
 
 #[test]
 fn rejects_invalid_config() {
     // An unusable link table must fail closed instead of ranking on it.
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![candidate(node(2), "docker")];
-    assert!(plan_execution(&plan_request, &config(vec![link("eu", "us", 0)])).is_err());
+    let plan_request = request(Vec::new());
+    assert!(
+        plan_execution(
+            &plan_request,
+            &[candidate(node(2), "docker")],
+            &config(vec![link("eu", "us", 0)])
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -704,10 +785,9 @@ fn beyond_bound_selected() {
     for target in targets.iter_mut().take(MAX_PLAN_CANDIDATES) {
         target.compute_draining = true;
     }
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = targets;
+    let plan_request = request(Vec::new());
 
-    let outcome = plan(&plan_request, &config(Vec::new()));
+    let outcome = plan(&plan_request, targets, &config(Vec::new()));
 
     assert_eq!(
         outcome.selected.expect("a target is legal").target.node_id,
@@ -728,10 +808,9 @@ fn best_beyond_bound() {
     let last = targets.len() - 1;
     targets[last].load_permille = Some(1);
     let best = targets[last].node_id;
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = targets;
+    let plan_request = request(Vec::new());
 
-    let outcome = plan(&plan_request, &config(Vec::new()));
+    let outcome = plan(&plan_request, targets, &config(Vec::new()));
     let selection = outcome.selected.expect("a target is legal");
 
     assert_eq!(selection.target.node_id, best);
@@ -747,14 +826,12 @@ fn shuffled_scan_agrees() {
     for (index, target) in targets.iter_mut().enumerate() {
         target.load_permille = Some((index as u32 * 37) % 11);
     }
-    let mut forward = request(Vec::new());
-    forward.candidates = targets.clone();
-    let mut reverse = request(Vec::new());
-    reverse.candidates = targets.into_iter().rev().collect();
+    let plan_request = request(Vec::new());
+    let reverse: Vec<_> = targets.iter().rev().cloned().collect();
     let compute = config(Vec::new());
 
-    let first = plan(&forward, &compute);
-    let second = plan(&reverse, &compute);
+    let first = plan(&plan_request, targets, &compute);
+    let second = plan(&plan_request, reverse, &compute);
 
     assert_eq!(first.selected, second.selected);
     assert_eq!(first.alternatives, second.alternatives);
@@ -763,35 +840,236 @@ fn shuffled_scan_agrees() {
 
 #[test]
 fn incomplete_scan_retries() {
-    // A scan the bound cut short may still hold a legal target, so a round
-    // without a selection stays retryable instead of reading conclusive.
+    // A round that could not read every advertisement may still be missing the
+    // only legal target, so it stays retryable instead of reading conclusive.
     let mut drained = candidate(node(2), "docker");
     drained.compute_draining = true;
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![drained];
+    let plan_request = request(Vec::new());
     let compute = config(Vec::new());
 
-    let conclusive = plan(&plan_request, &compute);
+    let conclusive = paged(&plan_request, &[drained.clone()], &compute).finish(false);
     assert!(conclusive.selected.is_none() && !conclusive.retryable);
 
-    plan_request.scan_incomplete = true;
-    let continued = plan(&plan_request, &compute);
+    let continued = paged(&plan_request, &[drained.clone()], &compute).finish(true);
     assert!(continued.selected.is_none() && continued.retryable);
 
-    // A selection ends the round whatever the scan left unseen.
-    plan_request.candidates.push(candidate(node(3), "docker"));
-    let launched = plan(&plan_request, &compute);
+    // A selection ends the round whatever the scan left unread.
+    let scan = vec![drained, candidate(node(3), "docker")];
+    let launched = paged(&plan_request, &scan, &compute).finish(true);
     assert!(launched.selected.is_some() && !launched.retryable);
 }
 
 #[test]
-fn rejects_scan_bound() {
-    // The scan bound is separate from the ranked set it feeds: a scan larger
-    // than the ranking bound is ordinary, one past the scan bound is refused.
-    let mut plan_request = request(Vec::new());
-    plan_request.candidates = vec![candidate(node(2), "docker"); MAX_TARGET_SCAN + 1];
-    assert_eq!(plan_request.canonical(), Err(PlanError::ScanCount));
+fn pages_past_bound() {
+    // The page bound is separate from the scan it screens and from the ranked
+    // set it feeds: a scan past either bound is ordinary and fully screened.
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+    let targets = backends(129);
+    assert!(targets.len() > MAX_TARGET_SCAN);
 
-    plan_request.candidates = scanned((MAX_PLAN_CANDIDATES + 1) as u8);
-    assert!(plan_request.canonical().is_ok());
+    let planner = paged(&plan_request, &targets, &compute);
+    assert_eq!(planner.scanned(), targets.len() as u64);
+    assert!(
+        plan_execution(&plan_request, &targets, &compute)
+            .expect("a scan may exceed one page")
+            .selected
+            .is_some()
+    );
+}
+
+#[test]
+fn late_target_selected() {
+    // The single eligible advertisement sits past the first page: page one
+    // alone is never a conclusive refusal, and the second page selects it.
+    let mut targets = backends(129);
+    targets.truncate(MAX_TARGET_SCAN + 1);
+    for target in targets.iter_mut().take(MAX_TARGET_SCAN) {
+        target.compute_draining = true;
+    }
+    let legal = targets[MAX_TARGET_SCAN]
+        .capability
+        .target(targets[MAX_TARGET_SCAN].node_id);
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+
+    let unfinished = paged(&plan_request, &targets[..MAX_TARGET_SCAN], &compute).finish(true);
+    assert!(unfinished.selected.is_none() && unfinished.retryable);
+
+    let mut planner = Planner::new(&plan_request, &compute).expect("request is well formed");
+    planner
+        .rank_page(&targets[..MAX_TARGET_SCAN])
+        .expect("the page is ordered");
+    let boundary = &targets[MAX_TARGET_SCAN - 1];
+    assert_eq!(
+        planner.cursor(),
+        Some(&boundary.capability.target(boundary.node_id))
+    );
+
+    planner
+        .rank_page(&targets[MAX_TARGET_SCAN..])
+        .expect("the page continues the scan");
+    assert_eq!(planner.pages(), 2);
+    assert_eq!(planner.scanned(), MAX_TARGET_SCAN as u64 + 1);
+    let outcome = planner.finish(false);
+
+    assert_eq!(outcome.selected.expect("a target is legal").target, legal);
+    assert_eq!(outcome.rejected.len(), MAX_PLAN_REJECTIONS);
+    assert_eq!(
+        outcome.omitted,
+        (MAX_TARGET_SCAN - MAX_PLAN_REJECTIONS) as u32
+    );
+}
+
+#[test]
+fn best_after_page() {
+    // A cheaper target on the second page must win over the eligible one the
+    // first page already found, which stays as an alternative.
+    let mut targets = backends(129);
+    targets.truncate(MAX_TARGET_SCAN + 1);
+    for target in targets.iter_mut().take(MAX_TARGET_SCAN) {
+        target.compute_draining = true;
+    }
+    targets[0].compute_draining = false;
+    targets[0].load_permille = Some(500);
+    targets[MAX_TARGET_SCAN].load_permille = Some(1);
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+
+    let outcome = paged(&plan_request, &targets, &compute).finish(false);
+    let selection = outcome.selected.expect("a target is legal");
+
+    assert_eq!(selection.score.node_load_permille, 1);
+    assert_eq!(
+        selection.target,
+        targets[MAX_TARGET_SCAN]
+            .capability
+            .target(targets[MAX_TARGET_SCAN].node_id)
+    );
+    assert_eq!(outcome.alternatives.len(), 1);
+    assert_eq!(
+        outcome.alternatives[0].target,
+        targets[0].capability.target(targets[0].node_id)
+    );
+}
+
+#[test]
+fn realm_backends_paged() {
+    // 129 nodes advertising eight backends each overrun one page, and the only
+    // eligible target of the realm sits in the overrun.
+    let mut targets = backends(129);
+    let last = targets.len() - 1;
+    assert!(last >= MAX_TARGET_SCAN);
+    for target in targets.iter_mut().take(last) {
+        target.compute_draining = true;
+    }
+    let legal = targets[last].capability.target(targets[last].node_id);
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+
+    let planner = paged(&plan_request, &targets, &compute);
+    assert_eq!(planner.pages(), 2);
+    assert_eq!(planner.scanned(), 1_032);
+    let outcome = planner.finish(false);
+
+    assert_eq!(outcome.selected.expect("a target is legal").target, legal);
+}
+
+#[test]
+fn shuffled_pages_agree() {
+    // The same advertisements in any discovery order must page identically and
+    // seal one plan, digest included.
+    let mut targets = backends(129);
+    for (index, target) in targets.iter_mut().enumerate() {
+        target.load_permille = Some((index as u32 * 37) % 11);
+    }
+    let reverse: Vec<_> = targets.iter().rev().cloned().collect();
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+
+    let forward = plan(&plan_request, targets.clone(), &compute);
+    let shuffled = plan(&plan_request, reverse, &compute);
+    let walked = paged(&plan_request, &targets, &compute).finish(false);
+
+    assert_eq!(forward, shuffled);
+    assert_eq!(forward, walked);
+    assert!(forward.selected.is_some());
+}
+
+#[test]
+fn page_bounds_exact() {
+    // Page boundaries land exactly on the bound: a full page is one page, one
+    // entry more is two, and a scan of exactly two pages grows no empty third.
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+    let targets = backends(256);
+    assert_eq!(targets.len(), 2 * MAX_TARGET_SCAN);
+
+    let full = paged(&plan_request, &targets[..MAX_TARGET_SCAN], &compute);
+    assert_eq!((full.pages(), full.scanned()), (1, MAX_TARGET_SCAN as u64));
+
+    let over = paged(&plan_request, &targets[..MAX_TARGET_SCAN + 1], &compute);
+    assert_eq!(
+        (over.pages(), over.scanned()),
+        (2, MAX_TARGET_SCAN as u64 + 1)
+    );
+
+    let mut exact = paged(&plan_request, &targets, &compute);
+    assert_eq!(
+        (exact.pages(), exact.scanned()),
+        (2, 2 * MAX_TARGET_SCAN as u64)
+    );
+    exact.rank_page(&[]).expect("an empty page is allowed");
+    assert_eq!(exact.pages(), 2);
+
+    // Nothing may be screened twice, so the page just ranked is refused.
+    assert!(matches!(
+        exact.rank_page(&targets[MAX_TARGET_SCAN..]),
+        Err(PlanError::PageOrder { .. })
+    ));
+}
+
+#[test]
+fn paged_scan_conclusive() {
+    // Only a scan that reached its last page may answer "no eligible target".
+    let mut targets = backends(129);
+    for target in &mut targets {
+        target.compute_draining = true;
+    }
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+
+    let unfinished = paged(&plan_request, &targets[..MAX_TARGET_SCAN], &compute).finish(true);
+    assert!(unfinished.selected.is_none() && unfinished.retryable);
+
+    let outcome = paged(&plan_request, &targets, &compute).finish(false);
+
+    assert!(outcome.selected.is_none() && !outcome.retryable);
+    assert_eq!(
+        outcome.omitted,
+        (targets.len() - MAX_PLAN_REJECTIONS) as u32
+    );
+}
+
+#[test]
+fn retry_scans_pages() {
+    // A repeated round rescans every page instead of stopping where the last
+    // one did, so two rounds over unchanged advertisements plan identically.
+    let mut targets = backends(129);
+    let last = targets.len() - 1;
+    targets[last].load_permille = Some(1);
+    let plan_request = request(Vec::new());
+    let compute = config(Vec::new());
+
+    let first = paged(&plan_request, &targets, &compute);
+    let second = paged(&plan_request, &targets, &compute);
+
+    assert_eq!(first.scanned(), targets.len() as u64);
+    assert_eq!(second.scanned(), targets.len() as u64);
+    let (first, second) = (first.finish(false), second.finish(false));
+    assert_eq!(first, second);
+    assert_eq!(
+        first.selected.expect("a target is legal").target,
+        targets[last].capability.target(targets[last].node_id)
+    );
 }

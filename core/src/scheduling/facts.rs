@@ -18,8 +18,9 @@ use ulid::Ulid;
 pub const MAX_PLAN_INPUTS: usize = 512;
 /// Maximum registered holders considered per input.
 pub const MAX_INPUT_HOLDERS: usize = 32;
-/// Maximum advertisements one round screens before it must continue in a later
-/// round. Every one of them is screened; only the ranked set is bounded lower.
+/// Maximum advertisements one planning page screens. A scan continues in the
+/// next page of the same planning operation, so the realm total it reaches is
+/// bounded only by membership times `MAX_ADVERTISED_EXECUTORS`.
 pub const MAX_TARGET_SCAN: usize = 1_024;
 /// Maximum eligible targets one plan ranks, after screening the whole scan.
 pub const MAX_PLAN_CANDIDATES: usize = 128;
@@ -36,7 +37,7 @@ pub enum PlanError {
     InputCount,
     #[error("an input resolves at most {MAX_INPUT_HOLDERS} holders")]
     HolderCount,
-    #[error("a planning round scans at most {MAX_TARGET_SCAN} advertised targets")]
+    #[error("one planning page screens at most {MAX_TARGET_SCAN} advertised targets")]
     ScanCount,
     #[error("a request declares at most {MAX_SELECTOR_LABELS} required labels")]
     LabelCount,
@@ -46,6 +47,8 @@ pub enum PlanError {
     InputMismatch { key: String },
     #[error("target {kind} on node {node_id} is advertised twice")]
     DuplicateTarget { node_id: NodeId, kind: String },
+    #[error("target {kind} on node {node_id} does not continue the scan in order")]
+    PageOrder { node_id: NodeId, kind: String },
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
     #[error(transparent)]
@@ -109,11 +112,6 @@ pub struct PlanRequest {
     pub output_policies: Vec<PlacementPolicyRef>,
     /// Locally verified policy documents; a missing entry blocks, never allows.
     pub policies: BTreeMap<Ulid, PolicyResolution>,
-    /// Every advertisement this round scanned, eligible or not.
-    pub candidates: Vec<TargetCandidate>,
-    /// The scan bound left advertisements unseen, so a round that selects
-    /// nothing is a continuation rather than a conclusive refusal.
-    pub scan_incomplete: bool,
     pub now_ms: u64,
 }
 
@@ -126,9 +124,6 @@ impl PlanRequest {
         }
         if self.inputs.len() > MAX_PLAN_INPUTS {
             return Err(PlanError::InputCount);
-        }
-        if self.candidates.len() > MAX_TARGET_SCAN {
-            return Err(PlanError::ScanCount);
         }
         if self.required_labels.len() > MAX_SELECTOR_LABELS {
             return Err(PlanError::LabelCount);
@@ -154,22 +149,13 @@ impl PlanRequest {
                 });
             }
         }
-        request
-            .candidates
-            .sort_unstable_by(|left, right| target_order(left).cmp(&target_order(right)));
-        for pair in request.candidates.windows(2) {
-            if target_order(&pair[0]) == target_order(&pair[1]) {
-                return Err(PlanError::DuplicateTarget {
-                    node_id: pair[0].node_id,
-                    kind: pair[0].capability.kind.clone(),
-                });
-            }
-        }
         Ok(request)
     }
 }
 
-fn target_order(candidate: &TargetCandidate) -> (&[u8; 32], &str) {
+/// One advertisement's canonical scan position: node id bytes, then executor
+/// kind. Pages are screened in this order and must strictly increase.
+pub(crate) fn target_order(candidate: &TargetCandidate) -> (&[u8; 32], &str) {
     (
         candidate.node_id.as_bytes(),
         candidate.capability.kind.as_str(),
@@ -236,17 +222,15 @@ pub struct TargetScore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::tests::{candidate, node, request, resolved_input};
+    use crate::scheduling::tests::{node, request, resolved_input};
 
     #[test]
     fn canonical_sorts_facts() {
-        // Shuffled inputs, holders, and candidates must reduce to one order.
-        let mut plan = request(vec![resolved_input("b", 1), resolved_input("a", 2)]);
-        plan.candidates = vec![candidate(node(9), "docker"), candidate(node(2), "docker")];
+        // Shuffled inputs and holders must reduce to one order.
+        let plan = request(vec![resolved_input("b", 1), resolved_input("a", 2)]);
         let canonical = plan.canonical().expect("request is bounded");
 
         assert_eq!(canonical.inputs[0].destination_key, "a");
-        assert_eq!(canonical.candidates[0].node_id, node(2));
     }
 
     #[test]
@@ -288,17 +272,10 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_facts() {
-        let mut plan = request(vec![resolved_input("a", 1), resolved_input("a", 2)]);
+        let plan = request(vec![resolved_input("a", 1), resolved_input("a", 2)]);
         assert!(matches!(
             plan.canonical(),
             Err(PlanError::DuplicateInput { .. })
-        ));
-
-        plan = request(Vec::new());
-        plan.candidates = vec![candidate(node(2), "docker"), candidate(node(2), "docker")];
-        assert!(matches!(
-            plan.canonical(),
-            Err(PlanError::DuplicateTarget { .. })
         ));
     }
 }
