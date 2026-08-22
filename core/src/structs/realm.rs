@@ -748,6 +748,10 @@ impl RealmConfigDocument {
                 KIND_LABEL_KEY.to_string(),
                 realm_node.kind.label().to_string(),
             );
+            crate::structs::stamp_location(
+                &mut labels,
+                entry.map(|entry| entry.location.as_str()).unwrap_or_default(),
+            );
             nodes.push(CandidateMapNode {
                 node_id,
                 kind: realm_node.kind.clone(),

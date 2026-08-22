@@ -20,13 +20,31 @@ pub const KIND_LABEL_KEY: &str = "aruna-engine.org/kind";
 /// realm placement map that placement selection reads.
 pub const STORAGE_CLASS_LABEL_PREFIX: &str = "aruna-engine.org/storage-class/";
 
+/// Derived read-only label carrying the node's configured placement location,
+/// so an affinity rule or selector can match the location as a label. It is
+/// absent while the node declares no location; writes are rejected.
+pub const LOCATION_LABEL_KEY: &str = "aruna-engine.org/location";
+
 /// Names the first derived label a write surface tried to set. Every such label
 /// is stamped by the owning node, so no operator input may claim one.
 pub fn reserved_label(labels: &BTreeMap<String, String>) -> Option<&str> {
     labels
         .keys()
-        .find(|key| key.as_str() == KIND_LABEL_KEY || key.starts_with(STORAGE_CLASS_LABEL_PREFIX))
+        .find(|key| {
+            key.as_str() == KIND_LABEL_KEY
+                || key.as_str() == LOCATION_LABEL_KEY
+                || key.starts_with(STORAGE_CLASS_LABEL_PREFIX)
+        })
         .map(String::as_str)
+}
+
+/// Stamps the derived location label from the node's own configured location.
+/// An undeclared location is left unlabelled rather than given a made-up value.
+pub fn stamp_location(labels: &mut BTreeMap<String, String>, location: &str) {
+    match location.trim() {
+        "" => labels.remove(LOCATION_LABEL_KEY),
+        location => labels.insert(LOCATION_LABEL_KEY.to_string(), location.to_string()),
+    };
 }
 
 /// Storage key for a node's info document. One document per node, so the raw

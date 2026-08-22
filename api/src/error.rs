@@ -42,6 +42,9 @@ pub enum ServerError {
     PayloadTooLarge(String),
     #[error("Bad request")]
     BadRequest,
+    /// A write surface named a label the owning node derives for itself.
+    #[error("label `{0}` is reserved and derived by the owning node")]
+    ReservedLabel(String),
     #[error("{0}")]
     BadRequestReason(String),
     #[error("{0}")]
@@ -361,6 +364,7 @@ impl ServerError {
             | ServerError::ComputeQuotaDenied(_) => StatusCode::CONFLICT,
             ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::BadRequest
+            | ServerError::ReservedLabel(_)
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_)
             | ServerError::MetadataValidation(_) => StatusCode::BAD_REQUEST,
@@ -389,6 +393,7 @@ impl ServerError {
             ServerError::JobPlanConflict(_) => "JobPlanConflict".to_string(),
             ServerError::ComputeQuotaDenied(_) => "compute_quota_denied".to_string(),
             ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
+            ServerError::ReservedLabel(_) => "reserved_label".to_string(),
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_) => "Bad request".to_string(),

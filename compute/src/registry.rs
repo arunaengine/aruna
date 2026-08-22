@@ -138,12 +138,16 @@ fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
             local_to_controller: true,
             ..subject.clone()
         },
-        (false, Some(site)) => PlacementSubject {
-            local_to_controller: false,
-            location: site.location.clone(),
-            labels: site.labels.clone(),
-            ..subject.clone()
-        },
+        (false, Some(site)) => {
+            let mut labels = site.labels.clone();
+            aruna_core::structs::stamp_location(&mut labels, &site.location);
+            PlacementSubject {
+                local_to_controller: false,
+                location: site.location.clone(),
+                labels,
+                ..subject.clone()
+            }
+        }
         (false, None) => PlacementSubject {
             local_to_controller: false,
             location: String::new(),

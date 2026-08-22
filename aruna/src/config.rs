@@ -13,7 +13,7 @@ use aruna_core::onboarding::{
 };
 use aruna_core::structs::{
     Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, DynamicDiscoveryMethod,
-    KIND_LABEL_KEY, NodeBackendsConfig, NodeCapabilities, OidcProviderConfig, RealmConfigDocument,
+    KIND_LABEL_KEY, LOCATION_LABEL_KEY, NodeBackendsConfig, NodeCapabilities, OidcProviderConfig, RealmConfigDocument,
     RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits, STORAGE_CLASS_LABEL_PREFIX,
 };
 use aruna_core::util::unix_timestamp_secs;
@@ -1035,8 +1035,8 @@ fn parse_list_env(key: &str) -> Vec<String> {
 }
 
 /// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
-/// in `k=v,k2=v2` form. Rejects malformed pairs and the derived-only
-/// [`KIND_LABEL_KEY`], which is stamped from `RealmNode.kind`.
+/// in `k=v,k2=v2` form. Rejects malformed pairs and every derived-only label,
+/// which the owning node stamps for itself.
 fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
     const KEY: &str = "ARUNA_NODE_LABELS";
     let raw = dotenvy::var(KEY).unwrap_or_default();
@@ -1059,6 +1059,13 @@ fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
                 KEY,
                 pair,
                 format!("{KIND_LABEL_KEY} is a reserved derived label"),
+            ));
+        }
+        if label_key == LOCATION_LABEL_KEY {
+            return Err(invalid_config_value(
+                KEY,
+                pair,
+                format!("{LOCATION_LABEL_KEY} is derived from ARUNA_NODE_LOCATION"),
             ));
         }
         if label_key.starts_with(STORAGE_CLASS_LABEL_PREFIX) {
@@ -2117,6 +2124,26 @@ mod tests {
         unsafe { std::env::set_var(key, "aruna-engine.org/storage-class/cold=true") };
 
         let error = parse_node_labels_env().expect_err("derived class label should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "ARUNA_NODE_LABELS",
+                ..
+            }
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn rejects_location_label() {
+        // The location label is derived from ARUNA_NODE_LOCATION, never claimed.
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "aruna-engine.org/location=eu-west") };
+
+        let error = parse_node_labels_env().expect_err("derived location label should fail");
         assert!(matches!(
             error,
             super::SetupError::InvalidConfigValue {
