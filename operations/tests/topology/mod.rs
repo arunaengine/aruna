@@ -404,6 +404,20 @@ impl Topology {
         )
     }
 
+    /// The first node that leads a bucket of the strategy governing `path`,
+    /// so a local create there needs no forward.
+    pub fn leading_node(&self, group_id: Ulid, path: &str) -> &TestNode {
+        self.nodes
+            .iter()
+            .find(|node| {
+                self.origin_placement(node, group_id, Ulid::nil(), path)
+                    .is_some_and(|placement| {
+                        self.holders(&placement).first() == Some(&node.node_id())
+                    })
+            })
+            .expect("some Management node leads a bucket")
+    }
+
     /// Rank-ordered holders of `placement`, exactly as every node derives them.
     pub fn holders(&self, placement: &PlacementRef) -> Vec<NodeId> {
         resolve_shard_holders(&self.config, placement)
