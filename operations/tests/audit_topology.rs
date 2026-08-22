@@ -37,10 +37,10 @@ async fn nonholder_audit_trail() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
 
-    let origin = realm.node(0);
     let mut documents = Vec::new();
     for index in 0..DOCUMENTS {
         let path = format!("datasets/audit-{index}");
+        let origin = realm.leading_node(group_id, &path);
         let document_id =
             mint_local_document(&realm.config, &realm.actor(origin), group_id, &path)?.as_ulid();
         let placement = create_document(&realm, origin, group_id, document_id, &path).await?;
@@ -56,7 +56,7 @@ async fn nonholder_audit_trail() -> TestResult<()> {
 
     // A record on every holder of its bucket must appear once, not once per holder.
     let (first_document, first_placement) = documents[0];
-    let holders = realm.assert_holder(origin.node_id(), &first_placement);
+    let holders = realm.holders(&first_placement);
     assert!(holders.len() >= 2, "fixture must replicate to prove dedup");
     for holder in &holders {
         assert!(

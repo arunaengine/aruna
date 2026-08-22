@@ -457,8 +457,8 @@ async fn replica_mapping_ignored() -> TestResult<()> {
 async fn premature_mapping_unavailable() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    let origin = realm.node(0);
     let path = "datasets/unprojected";
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = realm
@@ -561,8 +561,8 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
 async fn delete_waits_projection() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    let origin = realm.node(0);
     let path = "datasets/lagging";
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = realm
@@ -871,7 +871,7 @@ async fn seed_document(
 ) -> TestResult<(Ulid, PlacementRef)> {
     // The id must be a structured MetaResourceId: routing resolves the mapping's
     // placement from the id itself, never from the deletable registry row.
-    let origin = realm.node(0);
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     realm

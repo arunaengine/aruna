@@ -36,12 +36,13 @@ const REPLICATION_FACTOR: u32 = 3;
 async fn config_edits_never_move_holders() -> TestResult<()> {
     let mut realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    let origin_id = realm.node(0).node_id();
     let path = "datasets/pinned";
+    let origin = realm.leading_node(group_id, path);
+    let origin_id = origin.node_id();
     let document_id =
-        mint_local_document(&realm.config, &realm.actor(realm.node(0)), group_id, path)?.as_ulid();
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = realm
-        .origin_placement(realm.node(0), group_id, document_id, path)
+        .origin_placement(origin, group_id, document_id, path)
         .expect("a Management node holds buckets");
     let before = realm.holder_map();
     assert!(
@@ -51,7 +52,7 @@ async fn config_edits_never_move_holders() -> TestResult<()> {
         "the fixture must cap at least one bucket below the node count"
     );
 
-    create_document(&realm, realm.node(0), group_id, document_id, path).await?;
+    create_document(&realm, origin, group_id, document_id, path).await?;
     for holder in realm.assert_holder(origin_id, &placement) {
         let node = realm.find(holder);
         wait_until("document reaches holder", node.node_id(), || {
@@ -101,16 +102,17 @@ async fn config_edits_never_move_holders() -> TestResult<()> {
         assert!(document_present(realm.find(*holder), group_id, document_id).await);
     }
     let second_path = "datasets/pinned-after";
+    let second_origin = realm.leading_node(group_id, second_path);
     let second_id = mint_local_document(
         &realm.config,
-        &realm.actor(realm.node(0)),
+        &realm.actor(second_origin),
         group_id,
         second_path,
     )?
     .as_ulid();
-    let stamped = create_document(&realm, realm.node(0), group_id, second_id, second_path).await?;
+    let stamped = create_document(&realm, second_origin, group_id, second_id, second_path).await?;
     assert!(
-        resolve_shard_holders(&realm.config, &stamped).contains(&origin_id),
+        resolve_shard_holders(&realm.config, &stamped).contains(&second_origin.node_id()),
         "create stamped a bucket its origin does not hold"
     );
 

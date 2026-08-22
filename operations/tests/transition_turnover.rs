@@ -37,12 +37,12 @@ const REPLICATION_FACTOR: u32 = 3;
 async fn turnover_moves_holder() -> TestResult<()> {
     let mut realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    let leaver = realm.node(0).node_id();
-
     let path = "datasets/turned-over";
+    let origin = realm.leading_node(group_id, path);
+    let leaver = origin.node_id();
     let document_id =
-        mint_local_document(&realm.config, &realm.actor(realm.node(0)), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, realm.node(0), group_id, document_id, path).await?;
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
     let before = realm.assert_holder(leaver, &placement);
     for holder in &before {
         let node = realm.find(*holder);
