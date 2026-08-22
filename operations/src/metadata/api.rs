@@ -502,6 +502,7 @@ impl ObjectSearchCursor {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_signed(
         fingerprint: [u8; 32],
         as_of: SystemTime,

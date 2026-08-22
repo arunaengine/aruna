@@ -584,7 +584,7 @@ impl CreateMetadataDocumentOperation {
                         jsonld,
                         &create_event.record.graph_iri,
                     )
-                    .map_err(|error| aruna_core::errors::ConversionError::FromStrError(error))?
+                    .map_err(aruna_core::errors::ConversionError::FromStrError)?
                 }
             };
             let dedup_key = pid_dedup_key(create_event.record.document_id);
