@@ -374,6 +374,16 @@ fn map_validation_error(error: RoCrateError) -> CrateValidationError {
         RoCrateError::Update(UpdateError::ValidationFailed(violations)) => {
             CrateValidationError::Violations(violations.into_iter().map(validation_issue).collect())
         }
+        // craqle reports version problems as errors; keep the structured code
+        // the import and export contracts expose.
+        error @ (RoCrateError::UnknownVersion(_) | RoCrateError::VersionMismatch { .. }) => {
+            CrateValidationError::Violations(vec![MetadataValidationViolation {
+                code: "unsupported_crate_version".to_string(),
+                message: error.to_string(),
+                pointer: String::new(),
+                entity_id: None,
+            }])
+        }
         other => CrateValidationError::Invalid(other.to_string()),
     }
 }
