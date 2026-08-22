@@ -1,6 +1,6 @@
 // Fresh (non-incremental) builds overflow the default query depth in the
 // deeply nested async state machines; incremental builds mask it.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 #![allow(clippy::large_enum_variant, clippy::result_large_err)]
 
 pub mod add_group_role;

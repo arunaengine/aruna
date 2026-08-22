@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use crate::error::CliError;
 use crate::explorer::{
     explore_entries, explore_keyspaces, print_node_state, print_topic_placements,
