@@ -778,6 +778,24 @@ async fn schedule_drain(ctx: &DriverContext) {
     }
 }
 
+/// The automatic PID a legacy (pre-mapping) document would carry, derived from
+/// its materialized summary; `None` while the summary is not readable.
+pub async fn expected_legacy_pid(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Option<String> {
+    let handle = context.metadata_handle.as_ref()?;
+    let summary = handle
+        .export_rocrate_summary_jsonld(record.graph_iri.clone())
+        .await
+        .ok()?;
+    let profile = crate::metadata::stats::summary_is_profile(&summary, &record.graph_iri).ok()?;
+    Some(PersistentIdMapping::automatic_pid(
+        record.document_id,
+        profile,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

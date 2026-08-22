@@ -285,18 +285,7 @@ async fn expected_legacy_pid(
     state: &ServerState,
     record: &MetadataRegistryRecord,
 ) -> Option<String> {
-    let ctx = state.get_ctx();
-    let handle = ctx.metadata_handle.as_ref()?;
-    let summary = handle
-        .export_rocrate_summary_jsonld(record.graph_iri.clone())
-        .await
-        .ok()?;
-    let profile =
-        aruna_operations::metadata::stats::summary_is_profile(&summary, &record.graph_iri).ok()?;
-    Some(PersistentIdMapping::automatic_pid(
-        record.document_id,
-        profile,
-    ))
+    aruna_operations::persistent_id::expected_legacy_pid(&state.get_ctx(), record).await
 }
 
 /// Authenticated typed status is sourced only from the durable PID mapping.
