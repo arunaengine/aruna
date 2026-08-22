@@ -2,7 +2,10 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission_with, parse_group_id, require_realm_auth,
     require_unrestricted_realm_auth,
 };
-use crate::error::{ErrorResponse, ProfileValidationFindingResponse, ServerError, ServerResult};
+use crate::error::{
+    ErrorResponse, ProfileValidationFindingResponse, ServerError, ServerResult,
+    ValidationViolationResponse,
+};
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
@@ -47,7 +50,8 @@ use aruna_operations::metadata::forward::{
     update_metadata_document_routed as run_update_metadata_document,
 };
 use aruna_operations::metadata::profile_validation::{
-    SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
+    MetadataProfilePreview, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
+    preview_submission as run_preview_submission,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::request_policy::PolicyRequestExtras;
@@ -103,6 +107,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_metadata_path))
         .routes(routes!(get_metadata_document, delete_metadata_document))
         .routes(routes!(profile_validation_capabilities))
+        .routes(routes!(preview_profile_validation))
         .routes(routes!(get_profile_validation_status))
         .routes(routes!(revalidate_profile))
         .routes(routes!(export_metadata_rocrate, replace_metadata_rocrate))
@@ -136,6 +141,53 @@ pub struct ProfileValidationCapabilitiesResponse {
     pub unsupported_constraint_policy: String,
     pub public_profile_iri_template: String,
     pub legacy_profile_iri_template: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileValidationPreviewRequest {
+    /// RO-Crate JSON-LD draft. Nothing is stored.
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProfileValidationPreviewResponse {
+    /// Whether a create or replace of this draft would be accepted.
+    pub accepted: bool,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_iri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    pub evaluator: String,
+    pub findings: Vec<ProfileValidationFindingResponse>,
+    pub completeness: String,
+    pub structural_violations: Vec<ValidationViolationResponse>,
+}
+
+impl From<MetadataProfilePreview> for ProfileValidationPreviewResponse {
+    fn from(preview: MetadataProfilePreview) -> Self {
+        let accepted = preview.accepted();
+        let status = ProfileValidationStatusResponse::from(preview.status);
+        Self {
+            accepted,
+            state: status.state,
+            profile_id: status.profile_id,
+            profile_iri: status.profile_iri,
+            profile_revision: status.profile_revision,
+            evaluator: status.evaluator,
+            findings: status.findings,
+            completeness: status.completeness,
+            structural_violations: preview
+                .structural_violations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1074,7 +1126,7 @@ pub async fn get_metadata_path(
     path = "/metadata/profile-validation/capabilities",
     tag = "metadata",
     summary = "Get backend Profile validation capabilities",
-    description = "P0-1 evaluator decision: this backend uses the stable ProfileConstraintEvaluator adapter with SHACL Core compiled to SPARQL and evaluated by the repository's pinned spareval engine; the rudof shacl_validation candidate was unavailable in the offline registry. The exact supported dispatch and constraint set is sh:targetClass, sh:targetNode, sh:property, sh:path with predicate IRI paths, sh:minCount, sh:maxCount, sh:datatype, sh:class, sh:nodeKind, sh:pattern, sh:in, sh:hasValue, sh:closed, sh:ignoredProperties, sh:severity, and sh:deactivated. The accepted annotation terms are sh:message, sh:name, sh:description, sh:order, and sh:group. Any other SHACL construct fails closed with an unsupported_constraint finding.",
+    description = "Shapes registered as a Profile are compiled and executed by craqle's native SHACL Core Subset v1 engine, server side and authoritative. Supported targets are sh:targetClass, sh:targetNode, sh:targetSubjectsOf, sh:targetObjectsOf, and implicit class targets; a node shape that names no target at all is bound to the crate root, so a Profile can constrain the root entity without knowing its minted IRI. Supported paths are predicate, sh:inversePath, sequence, sh:alternativePath, sh:zeroOrOnePath, sh:zeroOrMorePath, and sh:oneOrMorePath. The supported constraint set is listed in supported_constraints. SHACL-SPARQL, SHACL-JS, SHACL-AF, custom components and targets, recursive shapes, RDF-star terms, and remote owl:imports fail closed with an unsupported_constraint finding that names the construct; the same finding is returned when the registered Turtle cannot be parsed. sh:class is exact rdf:type membership: no RDFS or OWL inference is applied, so a subclass instance does not satisfy a superclass constraint. Shapes may reference crate-local ids relative to the crate root, for example sh:hasValue <#person-1>. Evaluation is bounded: exceeding the result, path-edge, or path-depth budget returns a permanent validation_limit finding with incomplete completeness instead of a partial verdict, while a temporarily unavailable Profile or evaluator returns 503 with Retry-After.",
     responses((status = 200, description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms", body = ProfileValidationCapabilitiesResponse))
 )]
 pub async fn profile_validation_capabilities()
@@ -1092,6 +1144,34 @@ pub async fn profile_validation_capabilities()
             legacy_profile_iri_template: "https://w3id.org/aruna/{id}".to_string(),
         }),
     )
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/profile-validation/preview",
+    tag = "metadata",
+    summary = "Preview the Profile verdict for an unsaved RO-Crate draft",
+    description = "Runs the exact verdict POST /metadata and PUT /metadata/{document_id}/rocrate would enforce against a draft, without storing anything. structural_violations carries the RO-Crate structural failures and findings carries the Profile constraint findings; accepted is true only when both would let the write through. The draft is evaluated under its own crate root, so focus nodes and paths are reported in crate-local form with the root as `./`. Requires an authenticated realm caller; no document permission is checked because only the realm-public registered Profile is read.",
+    request_body = ProfileValidationPreviewRequest,
+    responses(
+        (status = 200, description = "Verdict for the draft, including structural violations and Profile findings", body = ProfileValidationPreviewResponse),
+        (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
+        (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
+        (status = 503, description = "The Profile or the evaluator is temporarily unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn preview_profile_validation(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<ProfileValidationPreviewRequest>,
+) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
+    require_realm_auth(&state, auth)?;
+    let jsonld = serialize_jsonld_object(&request.rocrate)?;
+    let preview = run_preview_submission(&state.get_ctx(), &jsonld)
+        .await
+        .map_err(map_metadata_error)?;
+    Ok((StatusCode::OK, Json(preview.into())))
 }
 
 #[utoipa::path(

@@ -494,6 +494,19 @@ mod tests {
             unavailable.headers().get(axum::http::header::RETRY_AFTER),
             Some(&axum::http::HeaderValue::from_static("1"))
         );
+
+        // An exhausted validation budget is permanent, not a retryable outage.
+        for code in ["validation_limit", "unsupported_constraint"] {
+            let permanent =
+                ServerError::MetadataProfileValidation(vec![finding(code)]).into_response();
+            assert_eq!(permanent.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                permanent
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
