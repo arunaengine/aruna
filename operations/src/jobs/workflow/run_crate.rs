@@ -18,8 +18,8 @@ use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_status};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_job_document,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_job_document,
 };
 use crate::driver::drive;
 use crate::metadata::MetadataAuthToken;
@@ -497,6 +497,7 @@ fn rfc3339(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::create_metadata_document::CreateMetadataDocumentError;
     use aruna_core::metadata::{
         MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
         MetadataProfileValidationSeverity,
