@@ -45,13 +45,10 @@ use crate::server_state::ServerState;
 pub struct PidApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PidApiDoc::openapi()).routes(routes!(
-        resolve_pid,
-        resolve_profile_pid,
-        list_persistent_ids,
-        mint_pid,
-        withdraw_pid
-    ))
+    OpenApiRouter::with_openapi(PidApiDoc::openapi())
+        .routes(routes!(resolve_pid, mint_pid, withdraw_pid))
+        .routes(routes!(resolve_profile_pid))
+        .routes(routes!(list_persistent_ids))
 }
 
 fn rocrate_location(document_id: Ulid) -> String {
