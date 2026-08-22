@@ -203,13 +203,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
 }
 
 fn is_transient(error: &MetadataWriteError) -> bool {
-    matches!(
-        error,
-        MetadataWriteError::Create(
-            CreateMetadataDocumentError::StorageError(_)
-                | CreateMetadataDocumentError::MetadataError(_)
-        ) | MetadataWriteError::Undeliverable(_)
-    )
+    crate::jobs::metadata_class::metadata_is_transient(error)
 }
 
 /// RO-Crate 1.2 JSON-LD conforming to the Process Run Crate 0.5 profile. No
@@ -503,6 +497,33 @@ fn rfc3339(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::metadata::{
+        MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
+        MetadataProfileValidationSeverity,
+    };
+
+    fn profile_rejection(code: &str) -> MetadataWriteError {
+        MetadataWriteError::Create(CreateMetadataDocumentError::MetadataError(
+            MetadataError::ProfileValidation(vec![MetadataProfileValidationFinding {
+                code: code.to_string(),
+                severity: MetadataProfileValidationSeverity::Violation,
+                focus_node: None,
+                path: None,
+                rule: "http://purl.org/dc/terms/conformsTo".to_string(),
+                message: String::new(),
+                profile_revision: None,
+                completeness: MetadataProfileValidationCompleteness::Complete,
+            }]),
+        ))
+    }
+
+    #[test]
+    fn profile_rejections_settle() {
+        // A Profile verdict is permanent; only an unavailable evaluator retries.
+        assert!(!is_transient(&profile_rejection("profile_not_registered")));
+        assert!(is_transient(&profile_rejection("validator_unavailable")));
+    }
+
     use aruna_core::UserId;
     use aruna_core::structs::{AttemptIntent, InputMode, InputSelection, OutputObject, RealmId};
     use serde_json::Value;
