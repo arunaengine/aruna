@@ -1406,6 +1406,7 @@ fn term_value(term: &Term) -> String {
         Term::NamedNode(node) => node.as_str().to_string(),
         Term::BlankNode(node) => node.to_string(),
         Term::Literal(value) => value.to_string(),
+        Term::Triple(triple) => triple.to_string(),
     }
 }
 

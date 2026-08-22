@@ -3039,10 +3039,12 @@ async fn graph_lifecycle_deleted(
 }
 
 async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<(), MetadataError> {
-    tokio::task::spawn_blocking(move || node.delete_graph_unchecked(&GraphId::new(&graph_iri)))
-        .await
-        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-        .map_err(metadata_error_from_craqle)
+    tokio::task::spawn_blocking(move || {
+        node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    .map_err(metadata_error_from_craqle)
 }
 
 async fn contains_local_graph(
@@ -3390,26 +3392,13 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             let started = Instant::now();
             let durability = request.durability;
             let actor = request.deterministic_actor.map(ActorId::from_bytes);
-            // Event-log materialization (deterministic actor + WAL-durable
-            // request) replays payloads validated at the origin.
-            let prevalidated =
-                actor.is_some() && durability == MetadataRequestDurability::WalAlreadyDurable;
             let result = call_span.in_scope(|| {
-                if prevalidated {
-                    node.create_crate_prevalidated_with_durability_as(
-                        &auth,
-                        craqle_create_request(request.clone()),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                } else {
-                    node.create_crate_with_durability_as(
-                        &auth,
-                        craqle_create_request(request.clone()),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                }
+                node.create_crate_with_durability_as(
+                    &auth,
+                    craqle_create_request(request.clone()),
+                    craqle_request_durability(durability),
+                    actor,
+                )
             });
             record_craqle_call_result(
                 &call_span,
@@ -3444,28 +3433,15 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
-            let prevalidated =
-                actor.is_some() && durability == MetadataRequestDurability::WalAlreadyDurable;
             let result = call_span.in_scope(|| {
-                if prevalidated {
-                    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
-                        &auth,
-                        GraphId::new(&graph_iri),
-                        &jsonld,
-                        craqle_graph_policy(policy),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                } else {
-                    node.apply_rocrate_document_checked_with_policy_and_durability_as(
-                        &auth,
-                        GraphId::new(&graph_iri),
-                        &jsonld,
-                        craqle_graph_policy(policy),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                }
+                node.apply_rocrate_document_checked_with_policy_and_durability_as(
+                    &auth,
+                    GraphId::new(&graph_iri),
+                    &jsonld,
+                    craqle_graph_policy(policy),
+                    craqle_request_durability(durability),
+                    actor,
+                )
             });
             record_craqle_call_result(
                 &call_span,
@@ -3554,7 +3530,11 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             let started = Instant::now();
             let result = call_span
                 .in_scope(|| {
-                    node.import_graph_policy(&GraphId::new(&graph_iri), craqle_graph_policy(policy))
+                    node.set_graph_policy(
+                        &auth,
+                        &GraphId::new(&graph_iri),
+                        craqle_graph_policy(policy),
+                    )
                 })
                 .map(|_| MetadataEvent::GraphPolicySet {
                     graph_iri: graph_iri.clone(),
@@ -3728,7 +3708,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.delete_graph_unchecked(&GraphId::new(&graph_iri)))
+                .in_scope(|| node.delete_graph(&auth, &GraphId::new(&graph_iri)))
                 .map(|_| MetadataEvent::GraphDeleted {
                     graph_iri: graph_iri.clone(),
                 });
@@ -5728,12 +5708,11 @@ fn collect_metadata_query_results(
                 let row = solution
                     .iter()
                     .map(|(variable, term)| {
-                        (
-                            variable.as_str().to_string(),
-                            craqle::EncodedTerm::from_term(term).0,
-                        )
+                        let encoded = craqle::EncodedTerm::from_term(term)
+                            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+                        Ok((variable.as_str().to_string(), encoded.0))
                     })
-                    .collect::<BTreeMap<_, _>>();
+                    .collect::<Result<BTreeMap<_, _>, MetadataError>>()?;
                 serialized_bytes = serialized_bytes.saturating_add(
                     serde_json::to_vec(&row)
                         .map_err(|error| MetadataError::Backend(error.to_string()))?
