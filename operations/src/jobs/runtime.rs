@@ -466,7 +466,7 @@ impl JobsRuntime {
             .map(|job| job.completion.subscribe());
         loop {
             if let Ok(Some(record)) = read_job_record(storage, job_id, None).await
-                && record.state.is_terminal()
+                && record.is_settled()
             {
                 return Some(record.state);
             }

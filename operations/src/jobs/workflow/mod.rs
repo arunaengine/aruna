@@ -896,8 +896,8 @@ async fn park_attempt(context: &DriverContext, job_id: JobId, token: ulid::Ulid,
     .await
     {
         Ok(ParkOutcome::Parked(_)) => {}
-        Ok(ParkOutcome::Failed(record)) => {
-            warn!(job_id = %job_id, "Indeterminate attempts exhausted; failing job");
+        Ok(ParkOutcome::Exhausted(record)) => {
+            warn!(job_id = %job_id, "Local attempts exhausted; parking job");
             Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
         }
         Err(error) => warn!(job_id = %job_id, error = %error, "Attempt park write failed"),
@@ -1244,24 +1244,16 @@ pub(crate) async fn finalize_attempt(
             .await;
             Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
-        // Infrastructure evidence proves nothing about the job, so this stays
-        // retryable and the family may still run it elsewhere.
+        // Infrastructure evidence proves nothing about the job: park it so the
+        // family may still run it elsewhere instead of writing a terminal row.
         AttemptPhase::SystemError { reason } => {
-            let Some(logs) =
-                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
-            else {
-                return;
-            };
-            let result = execution_result_for(bucket, None, Vec::new(), logs);
-            let record = Box::pin(terminal_fail(
-                storage,
+            Box::pin(park_attempt(
+                context,
                 job_id,
                 token,
                 JobError::retryable(format!("backend infrastructure failure: {reason}")),
-                result,
             ))
             .await;
-            Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
         AttemptPhase::Cancelled => {
             Box::pin(finalize_cancel(
@@ -1682,7 +1674,7 @@ async fn requeue_or_fail_pre_submit(
     )
     .await
     {
-        Ok(record) if record.state == aruna_core::structs::JobState::Failed => {
+        Ok(record) if record.is_settled() => {
             Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
         }
         Ok(_) => {}
@@ -2323,6 +2315,53 @@ mod tests {
         assert!(stored.result.is_none(), "no false-empty manifest recorded");
     }
 
+    // Infrastructure evidence proves nothing about the job, so a system error must
+    // park instead of writing a terminal row the family would read as a verdict.
+    #[tokio::test]
+    async fn system_error_parks() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+            .await
+            .unwrap();
+        let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
+
+        Box::pin(finalize_attempt(
+            &ctx,
+            job_id,
+            token,
+            &backend,
+            &fence(&attempt),
+            &execution_spec(),
+            "ws-test",
+            Ok(AttemptStatus {
+                phase: AttemptPhase::SystemError {
+                    reason: "node evicted".to_string(),
+                },
+                backend_ref: "c1".to_string(),
+                started_at_ms: Some(1),
+                finished_at_ms: Some(2),
+            }),
+        ))
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Indeterminate);
+        assert!(!stored.locally_exhausted);
+        assert!(stored.finished_at_ms.is_none());
+        assert_eq!(
+            stored.last_error.as_ref().map(|error| error.kind),
+            Some(JobErrorKind::Retryable)
+        );
+    }
+
     // A capture failing retryably on every pass must terminalize at the attempt cap.
     // Without the charge it parks Indeterminate forever and the lease sweep re-drives
     // the same attempt at the lease cadence.
@@ -2364,7 +2403,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(stored.state, JobState::Indeterminate);
+        assert!(stored.locally_exhausted);
         assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
         assert!(stored.claim.is_none());
         assert!(

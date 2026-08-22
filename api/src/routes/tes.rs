@@ -2673,6 +2673,7 @@ mod tests {
                 result: None,
                 workspace_bucket: Some("ws".to_string()),
                 workspace_mode: WorkspaceMode::Kept,
+                locally_exhausted: false,
             },
             spec,
             submission_id,

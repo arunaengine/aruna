@@ -87,6 +87,9 @@ pub struct JobStatusView {
     pub result: Option<JsonValue>,
     pub workspace_bucket: Option<String>,
     pub workspace_mode: WorkspaceMode,
+    /// This node spent its attempts without a job-specific verdict; no further
+    /// automatic attempt runs here and the outcome stays undecided.
+    pub locally_exhausted: bool,
 }
 
 mod json_value {
@@ -127,6 +130,7 @@ impl From<&JobRecord> for JobStatusView {
             result: record.result.as_ref().map(JobResultPayload::to_public_json),
             workspace_bucket: record.workspace_bucket.clone(),
             workspace_mode: record.workspace_mode,
+            locally_exhausted: record.locally_exhausted,
         }
     }
 }

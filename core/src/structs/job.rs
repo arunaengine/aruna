@@ -1340,6 +1340,9 @@ pub struct JobRecord {
     pub input_facts: Vec<JobInputFact>,
     pub report_digest: Option<[u8; 32]>,
     pub retention_ms: u64,
+    /// Local attempts are spent without job-specific evidence: no further attempt
+    /// runs here, yet the distributed outcome stays `Indeterminate`.
+    pub locally_exhausted: bool,
 }
 
 impl JobRecord {
@@ -1384,12 +1387,19 @@ impl JobRecord {
             input_facts: Vec::new(),
             report_digest: None,
             retention_ms: DEFAULT_JOB_RETENTION_MS,
+            locally_exhausted: false,
         }
     }
 
     /// The run bucket name for an execution job, deterministic from the id.
     pub fn workspace_bucket_name(job_id: JobId) -> String {
         format!("ws-{}", job_id.to_string().to_lowercase())
+    }
+
+    /// No further attempt will be started here: either the job is terminal or it
+    /// spent its local attempts without evidence.
+    pub fn is_settled(&self) -> bool {
+        self.state.is_terminal() || self.locally_exhausted
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1441,6 +1451,9 @@ fn in_process_transition(from: JobState, to: JobState) -> bool {
             | (Running, Failed)
             | (Running, Cancelled)
             | (Running, Queued)
+            // Local retry exhaustion without a job-specific verdict parks here too.
+            | (Claimed, Indeterminate)
+            | (Running, Indeterminate)
     )
 }
 
@@ -1458,6 +1471,9 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Claimed, Queued)
             | (Claimed, Cancelled)
             | (Claimed, Failed)
+            // Pre-submit exhaustion parks: no container exists, so nothing is proven.
+            | (Claimed, Indeterminate)
+            | (Preparing, Indeterminate)
             | (Preparing, Ready)
             | (Preparing, Queued)
             | (Preparing, Failed)

@@ -119,7 +119,7 @@ pub async fn process_job_queue_batch(
                                 }
                                 result.reconciled = result.reconciled.saturating_add(1);
                             }
-                            Ok(RequeueOutcome::Failed(record)) => {
+                            Ok(RequeueOutcome::Exhausted(record)) => {
                                 result.swept = result.swept.saturating_add(1);
                                 result.terminal.push(record);
                             }

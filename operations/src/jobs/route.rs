@@ -239,6 +239,7 @@ mod tests {
             result: None,
             workspace_bucket: None,
             workspace_mode: WorkspaceMode::None,
+            locally_exhausted: false,
         }
     }
 
