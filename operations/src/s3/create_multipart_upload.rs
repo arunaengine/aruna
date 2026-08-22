@@ -410,6 +410,14 @@ mod tests {
         })
     }
 
+    /// Answers the purge fence read with no fence held.
+    fn fence_clear() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: crate::s3::purge_fence::fence_key("bucket"),
+            value: None,
+        })
+    }
+
     fn snapshot() -> RoutingSnapshot {
         RoutingSnapshot::new(
             Ulid::generate(),
@@ -434,9 +442,11 @@ mod tests {
         operation.start();
         operation.step(ungoverned_bucket());
 
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
+
+        let effects = operation.step(fence_clear());
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one record write, got {effects:?}")
@@ -454,9 +464,11 @@ mod tests {
         operation.start();
         operation.step(ungoverned_bucket());
 
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
+
+        let effects = operation.step(fence_clear());
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one record write, got {effects:?}")
@@ -480,6 +492,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));
+        operation.step(fence_clear());
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),

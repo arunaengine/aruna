@@ -1508,13 +1508,21 @@ mod routing_test {
     use ulid::Ulid;
 
     /// Answers the pre-write bucket read with an absent bucket, which is the
-    /// ungoverned path every routing test exercises.
+    /// ungoverned path every routing test exercises, then clears the fence.
     fn begin(operation: &mut PutObjectOperation) -> aruna_core::types::Effects {
         operation.start();
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: None,
-        }))
+        }));
+        operation.step(fence_clear())
+    }
+
+    fn fence_clear() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: crate::s3::purge_fence::fence_key("bucket"),
+            value: None,
+        })
     }
 
     fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
@@ -1650,6 +1658,7 @@ mod routing_test {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));
+        operation.step(fence_clear());
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (b"bucket".to_vec().into(), None),
@@ -1705,6 +1714,7 @@ mod routing_test {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));
+        operation.step(fence_clear());
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (b"bucket".to_vec().into(), None),
@@ -1792,7 +1802,7 @@ mod test {
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, S3_PURGE_FENCE_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
@@ -1885,6 +1895,13 @@ mod test {
         }
     }
 
+    fn fence_clear() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: crate::s3::purge_fence::fence_key("mybucket"),
+            value: None,
+        })
+    }
+
     #[test]
     fn guard_allows_edit() {
         // A routing or CORS edit is prospective policy, not a different bucket:
@@ -1956,6 +1973,12 @@ mod test {
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
         }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == S3_PURGE_FENCE_KEYSPACE
+        ));
+        let effects = op.step(fence_clear());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
@@ -3529,6 +3552,14 @@ mod gate_test {
         })
     }
 
+    /// Answers a purge fence read with no fence held.
+    fn fence_clear() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: crate::s3::purge_fence::fence_key("bucket"),
+            value: None,
+        })
+    }
+
     fn operation(location: &str) -> PutObjectOperation {
         let group_id = Ulid::from_bytes([2u8; 16]);
         PutObjectOperation::new(PutObjectConfig {
@@ -3629,7 +3660,8 @@ mod gate_test {
         // An ungoverned write reaches the blob effect with no policy round trip.
         let mut operation = operation("eu-west");
         operation.start();
-        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
+        operation.step(read(Some(bucket(Vec::new(), 0))));
+        let effects = operation.step(fence_clear());
         assert!(materializes(&effects));
     }
 
@@ -3640,12 +3672,14 @@ mod gate_test {
         let mut operation = operation("eu-west");
         operation.start();
         operation.step(read(Some(bucket(Vec::new(), 0))));
+        operation.step(fence_clear());
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
         }));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([7u8; 16]),
         }));
+        operation.step(fence_clear());
         let effects = operation.step(drift_read(
             Some(bucket(vec![policy("us-east").policy_ref()], 1)),
             None,
@@ -3697,12 +3731,14 @@ mod gate_test {
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
         operation.step(crate::placement_policy::fixtures::authority(realm()));
+        operation.step(fence_clear());
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
         }));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([7u8; 16]),
         }));
+        operation.step(fence_clear());
 
         let effects = operation.step(drift_read(
             Some(bucket(vec![rule.policy_ref()], 1)),

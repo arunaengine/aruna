@@ -1992,6 +1992,14 @@ mod tests {
         }
     }
 
+    /// Answers a purge fence read with no fence held.
+    fn fence_clear() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: crate::s3::purge_fence::fence_key("bucket"),
+            value: None,
+        })
+    }
+
     #[test]
     fn obligation_keeps_restrictions() {
         // The durable repair record is what a lost enqueue replays, so a scoped
@@ -2110,6 +2118,16 @@ mod tests {
         let txn_id = TxnId::generate();
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(
+            op.state,
+            CompleteMultipartUploadState::CheckPurgeFenceForFinalize
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(fence_clear());
         assert_eq!(op.state, CompleteMultipartUploadState::ReadBucketDefault);
         assert!(matches!(
             effects.as_slice(),

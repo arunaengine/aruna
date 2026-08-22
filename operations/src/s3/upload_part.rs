@@ -771,6 +771,14 @@ mod test {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
 
+    /// Answers a purge fence read with no fence held.
+    fn fence_clear() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: crate::s3::purge_fence::fence_key("mybucket"),
+            value: None,
+        })
+    }
+
     #[test]
     fn part_follows_pin() {
         // The pinned backend on the upload record reaches WritePart unchanged.
@@ -921,9 +929,10 @@ mod test {
         op.state = UploadPartState::StartTransaction;
         op.written_location = Some(part_location(backend_id));
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([3u8; 16]),
         }));
+        let effects = op.step(fence_clear());
         assert_eq!(op.state, UploadPartState::FenceBackend);
         assert!(matches!(
             effects.as_slice(),
