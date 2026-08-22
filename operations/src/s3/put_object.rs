@@ -1920,11 +1920,9 @@ mod test {
             placement_policy_generation: 0,
         };
         let edited = BucketInfo {
-            storage_routing: vec![aruna_core::structs::StorageRoutingRule {
-                key_prefix: String::new(),
-                exact: false,
-                target: aruna_core::structs::RoutingTarget::Class("cold".to_string()),
-            }],
+            cors_configuration: Some(aruna_core::structs::BucketCorsConfiguration {
+                rules: Vec::new(),
+            }),
             ..expected.clone()
         };
         let mut op = PutObjectOperation::new(config).with_bucket_guard(expected);
@@ -1933,17 +1931,24 @@ mod test {
         op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
         }));
+        op.step(fence_clear());
 
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"mybucket".to_vec().into(),
-            value: Some(edited.to_bytes().unwrap().into()),
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    b"mybucket".to_vec().into(),
+                    Some(edited.to_bytes().unwrap().into()),
+                ),
+                (b"subject".to_vec().into(), None),
+            ],
         }));
 
-        assert_ne!(
-            op.finalize(),
-            Err(PutObjectError::StorageError(
-                StorageError::TransactionConflict
-            ))
+        // Past the guard the minimal fixture fails at the hash step; a recreate
+        // would have ended here with a transaction conflict instead.
+        let outcome = op.finalize();
+        assert!(
+            matches!(outcome, Err(PutObjectError::MissingHash(_))),
+            "expected the write to pass the guard, got {outcome:?} after {effects:?}"
         );
     }
 

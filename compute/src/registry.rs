@@ -167,6 +167,7 @@ mod tests {
         LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
         TombstoneSpec, UserSpec,
     };
+    use aruna_core::structs::LOCATION_LABEL_KEY;
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 
@@ -327,7 +328,9 @@ mod tests {
             .remove(0);
 
         assert_eq!(capability.subject.location, "dc-b");
-        assert_eq!(capability.subject.labels, site.labels);
+        let mut expected = site.labels.clone();
+        expected.insert(LOCATION_LABEL_KEY.to_string(), "dc-b".to_string());
+        assert_eq!(capability.subject.labels, expected);
         assert!(!capability.subject.local_to_controller);
         assert!(capability.validate(subject.node_id).is_ok());
     }
