@@ -612,6 +612,7 @@ fn purge_result(outcome: JobRunOutcome) -> aruna_core::structs::StoragePurgeResu
         JobRunOutcome::Succeeded(JobResultPayload::StoragePurge(result)) => result,
         JobRunOutcome::Succeeded(_) => panic!("purge returned the wrong result kind"),
         JobRunOutcome::Failed(error) => panic!("purge failed: {}", error.message),
+        JobRunOutcome::Deferred(error) => panic!("purge was deferred: {}", error.message),
         JobRunOutcome::Cancelled => panic!("purge was cancelled"),
         JobRunOutcome::Interrupted => panic!("purge was interrupted"),
     }

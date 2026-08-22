@@ -560,6 +560,7 @@ fn describe(outcome: &JobRunOutcome) -> &'static str {
     match outcome {
         JobRunOutcome::Succeeded(_) => "succeeded",
         JobRunOutcome::Failed(_) => "failed",
+        JobRunOutcome::Deferred(_) => "deferred",
         JobRunOutcome::Cancelled => "cancelled",
         JobRunOutcome::Interrupted => "interrupted",
     }
