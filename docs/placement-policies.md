@@ -86,6 +86,14 @@ never becomes the author.
 digest is required. A digest that does not match what the holders serve is `404`
 rather than a substituted rule.
 
+`GET /admin/placement-policies?limit&cursor` lists policies in ascending policy
+id, `limit` defaulting to 50 and capped at 200. It needs realm-config `READ`, and
+a caller without it is refused before anything is read, so the listing is no
+existence oracle. A document replicates only to the holders its id resolves to,
+so a page reports what this responder stores rather than a realm-wide catalog:
+`complete` means this node's own bounded iterator was exhausted in the pass, and
+`next_cursor` continues after the last policy returned.
+
 | Status | `POST` | `GET` |
 | --- | --- | --- |
 | `200` | Published, or the identical document that already existed | The authenticated document |

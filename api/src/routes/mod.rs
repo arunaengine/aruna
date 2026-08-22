@@ -138,6 +138,7 @@ mod tests {
         ("GET", "/admin/compute/snapshots"),
         ("GET", "/admin/onboarding/secrets"),
         ("GET", "/admin/placement-diagnostics"),
+        ("GET", "/admin/placement-policies"),
         ("GET", "/admin/placement-policies/{policy_id}"),
         ("GET", "/admin/sync-quarantine"),
         ("GET", "/admin/sync-quarantine/{record_id}"),

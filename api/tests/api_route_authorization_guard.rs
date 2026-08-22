@@ -218,6 +218,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "placement.rs",
+        "list_placement_policies",
+        "realm-config READ checked inside ListPoliciesOperation",
+    ),
+    (
+        "placement.rs",
         "get_placement_policy",
         "realm-bearer read of an immutable replicated policy document every \
          realm node can fetch to evaluate placement",

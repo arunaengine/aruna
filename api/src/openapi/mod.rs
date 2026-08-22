@@ -233,6 +233,7 @@ mod tests {
         ("/admin/compute/snapshots", "get"),
         ("/admin/placement-quarantine", "post"),
         ("/admin/placement-policies", "post"),
+        ("/admin/placement-policies", "get"),
         ("/admin/placement-policies/{policy_id}", "get"),
         ("/admin/placement-diagnostics", "get"),
         ("/buckets/{bucket}/placement", "get"),
