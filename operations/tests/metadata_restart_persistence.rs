@@ -11,7 +11,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
-use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, DocumentClass, HandleRange, PlacementBinding, PlacementScope, RealmConfigDocument,
+    RealmId, RealmNodeKind, band_start,
+};
+use aruna_core::structured_id::PlacementHandle;
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
@@ -189,6 +193,25 @@ fn build_context(
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    // Persistent-id minting needs a job-control binding served by this node.
+    let range = HandleRange {
+        range_id: Ulid::from_bytes([1; 16]),
+        owner: actor.node_id,
+        start: band_start(0),
+        end: band_start(1),
+    };
+    config.placement_handle_ranges.push(range);
+    config.placement_bindings.push(PlacementBinding {
+        handle: PlacementHandle::new(range.start).expect("band start is a valid handle"),
+        scope: PlacementScope::Realm(actor.realm_id),
+        document_class: DocumentClass::JobControl,
+        strategy_id: config
+            .default_strategy_id
+            .expect("seeded config has a default strategy"),
+        allocator_range_id: Some(range.range_id),
+        allocated_by: Some(actor.node_id),
+        allocated_at_ms: Some(1),
+    });
     Ok((
         Arc::new(DriverContext {
             storage_handle,
