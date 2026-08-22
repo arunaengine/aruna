@@ -74,7 +74,18 @@ pub struct S3SessionResponse {
         example = json!({"group_id": "01JGRP00123456789ABCDEFGHJ"})
     ),
     responses(
-        (status = 201, description = "A new node-local temporary S3 session", body = S3SessionResponse),
+        (status = 201, description = "A new node-local temporary S3 session; the secret and token are shown redacted here and are returned in full to the caller", body = S3SessionResponse, example = json!({
+            "access_key_id": "ARUNASESSION0123456789AB",
+            "secret_access_key": "<redacted>",
+            "session_token": "<redacted>",
+            "expires_at": "2026-04-09T12:00:00Z",
+            "group": {"id": "01JGRP00123456789ABCDEFGHJ"},
+            "restrictions": [{"pattern": "/realm/group/*", "permission": "WRITE"}],
+            "issuer_node": {
+                "node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                "s3_endpoint": "https://s3.example.org"
+            }
+        })),
         (status = 400, description = "group_id is not a ULID", body = ErrorResponse),
         (status = 401, description = "The bearer token is absent, invalid, expired, or has no remaining lifetime", body = ErrorResponse),
         (status = 403, description = "The caller is not a group member or lacks effective WRITE capability", body = ErrorResponse),
@@ -125,7 +136,18 @@ pub async fn create_s3_session(
     params(("access_key_id" = String, Path, description = "Temporary access key returned by the session exchange")),
     description = "Requires the owning bearer identity to remain a member with effective WRITE capability. Refresh is accepted at or after five minutes before expiry only when this session has completed an authenticated S3 request since its last issuance. It keeps the access key id, rotates the signing secret and session token in place, resets activity for the next cycle, and caps the new expiry by the current bearer.",
     responses(
-        (status = 200, description = "The same session id with rotated temporary secret and token", body = S3SessionResponse),
+        (status = 200, description = "The same session id with rotated temporary secret and token, shown redacted here", body = S3SessionResponse, example = json!({
+            "access_key_id": "ARUNASESSION0123456789AB",
+            "secret_access_key": "<redacted>",
+            "session_token": "<redacted>",
+            "expires_at": "2026-04-09T12:00:00Z",
+            "group": {"id": "01JGRP00123456789ABCDEFGHJ"},
+            "restrictions": [{"pattern": "/realm/group/*", "permission": "WRITE"}],
+            "issuer_node": {
+                "node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                "s3_endpoint": "https://s3.example.org"
+            }
+        })),
         (status = 401, description = "The bearer token is absent, invalid, expired, or has no remaining lifetime", body = ErrorResponse),
         (status = 403, description = "The caller is no longer a group member or lacks effective WRITE capability", body = ErrorResponse),
         (status = 404, description = "The session is absent, purged, foreign, or belongs to another user", body = ErrorResponse),

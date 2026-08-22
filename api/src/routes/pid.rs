@@ -316,7 +316,18 @@ async fn expected_legacy_pid(
     description = "Returns the one stored automatic w3id record as a typed list while storage remains keyed 1:1 by document. Stored mapping state is authoritative for requested, processing, active, failed, admin-withdrawn and tombstoned, including its job reference and failure/retry data; job-read failure is never interpreted as unminted. An authorized live legacy document with no authority mapping is legacy-unminted only after its projected root identifies the exact general or Profile identity. Authority or classification ambiguity is unknown. Public records may be read anonymously; a private record returns 404 anonymously and requires READ on its frozen document permission path when authenticated.",
     params(("document_id" = String, Path, description = "Metadata document ULID")),
     responses(
-        (status = 200, description = "Typed list containing the automatic w3id status", body = [PersistentIdView]),
+        (status = 200, description = "Typed list containing the automatic w3id status", body = [PersistentIdView], example = json!([{
+            "kind": "conceptual",
+            "provider": "w3id",
+            "value": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+            "state": "active",
+            "document_id": "01JMETADATA0123456789ABCDE",
+            "job_id": "01JABCDEF0123456789ABCDEFG",
+            "failure": null,
+            "requested_at_ms": 1755500000000u64,
+            "minted_at_ms": 1755500001000u64,
+            "withdrawn_at_ms": null
+        }])),
         (status = 400, description = "Malformed document id", body = ErrorResponse),
         (status = 403, description = "Authenticated caller lacks READ", body = ErrorResponse),
         (status = 404, description = "Unknown document or anonymous private status", body = ErrorResponse)
@@ -482,6 +493,15 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerR
     summary = "Withdraw a document's w3id persistent identifier",
     description = "Exceptional administration route. It requires an unrestricted realm bearer token and WRITE on /{realm}/admin/pids/{document_id}; document WRITE alone is deliberately insufficient. The JSON body must name provider w3id, confirm the exact stored PID value and contain a non-empty reason. The authority stores admin-withdrawn, actor and reason and writes a WithdrawPersistentId metadata audit row in the same transaction. Normal document deletion instead stores tombstoned. The transition is terminal and idempotent.",
     params(("document_id" = String, Path, description = "Document ULID whose PID is withdrawn, for example 01JMETADATA0123456789ABCDE")),
+    request_body(
+        content = WithdrawPersistentIdRequest,
+        description = "Provider, the exact stored PID as confirmation, and a non-empty reason",
+        example = json!({
+            "provider": "w3id",
+            "confirm_pid": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+            "reason": "published in error"
+        })
+    ),
     responses(
         (status = 204, description = "The withdrawal is durable on the PID authority; the response has no body"),
         (status = 400, description = "Malformed id, unsupported provider, wrong confirmation, or invalid reason", body = ErrorResponse),
