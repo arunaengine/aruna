@@ -56,8 +56,8 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use aruna_core::StructuredId;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::{MetaResourceId, StructuredId};
 
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";
@@ -66,9 +66,8 @@ const PAYLOAD: &[u8] = b"remote bao export payload";
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// A fixed structured id (handle 1, bucket 0); the RF-3 realm over two nodes
-/// makes every node hold every bucket, so bucket 0 is always held.
-
+/// A fixed job id (handle 1, bucket 0); the RF-3 realm over two nodes makes
+/// every node hold every bucket, so bucket 0 is always held.
 fn job_id() -> JobId {
     mint_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
