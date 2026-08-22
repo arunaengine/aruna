@@ -6,7 +6,10 @@ use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::metadata::{MetadataError, MetadataProfileValidationState};
+use aruna_core::metadata::{
+    MetadataEffect, MetadataError, MetadataEvent, MetadataProfileValidationSeverity,
+    MetadataProfileValidationState,
+};
 use aruna_core::storage_entries::metadata_event_log_prefix;
 use aruna_core::structs::{
     Actor, DocumentClass, HandleRange, PlacementBinding, PlacementScope, RealmConfigDocument,
@@ -20,7 +23,8 @@ use aruna_operations::create_metadata_document::{
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
 use aruna_operations::metadata::profile_validation::{
-    current_validation_status, load_validation_status, profile_public_iri, revalidate_current,
+    current_validation_status, load_validation_status, preview_submission, profile_public_iri,
+    revalidate_current,
 };
 use aruna_operations::metadata::{
     MetadataHandle, MetadataHandleOptions,
@@ -168,6 +172,7 @@ async fn external_tag_and_unavailable_validator_fail_closed()
 #[tokio::test]
 async fn unsupported_registered_constraint_rejects_without_mutation()
 -> Result<(), Box<dyn std::error::Error>> {
+    // SHACL-SPARQL is outside craqle's Core subset and must fail closed.
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
     let (profile_id, revision) = register_profile(
@@ -175,7 +180,10 @@ async fn unsupported_registered_constraint_rejects_without_mutation()
         group_id,
         r#"
           @prefix sh: <http://www.w3.org/ns/shacl#> .
-          <urn:test:unsupported> a sh:NodeShape ; sh:minLength 2 .
+          @prefix schema: <http://schema.org/> .
+          <urn:test:unsupported> a sh:NodeShape ;
+            sh:targetClass schema:Dataset ;
+            sh:sparql [ sh:select "SELECT $this WHERE { $this a ?type }" ] .
         "#,
     )
     .await?;
@@ -199,12 +207,297 @@ async fn unsupported_registered_constraint_rejects_without_mutation()
     else {
         panic!("expected structured Profile validation findings");
     };
-    assert!(findings.iter().any(|finding| {
-        finding.code == "unsupported_constraint"
-            && finding.rule == "http://www.w3.org/ns/shacl#minLength"
-            && finding.profile_revision == Some(revision)
-    }));
+    assert!(
+        findings.iter().any(|finding| {
+            finding.code == "unsupported_constraint"
+                && finding.rule == "http://www.w3.org/ns/shacl#SPARQLConstraintComponent"
+                && finding.profile_revision == Some(revision)
+        }),
+        "{findings:#?}"
+    );
     assert_eq!(event_count(&test, document_id).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn enforces_core_constraints() -> Result<(), Box<dyn std::error::Error>> {
+    // sh:minLength and sh:or were unsupported before craqle owned evaluation.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, revision) = register_profile(
+        &test,
+        group_id,
+        r#"
+          @prefix sh: <http://www.w3.org/ns/shacl#> .
+          @prefix schema: <http://schema.org/> .
+          <urn:test:core> a sh:NodeShape ;
+            sh:targetClass schema:Dataset ;
+            sh:property [ sh:path schema:identifier ; sh:minLength 64 ] ;
+            sh:or (
+              [ sh:path schema:creator ; sh:minCount 1 ]
+              [ sh:path schema:publisher ; sh:minCount 1 ]
+            ) .
+        "#,
+    )
+    .await?;
+    let document_id = mint(&test, group_id, "datasets/core")?;
+    let error = create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/core",
+        crate_json(
+            document_id,
+            Some(&profile_public_iri(profile_id)),
+            true,
+            true,
+        ),
+    )
+    .await
+    .expect_err("a short identifier and a missing alternative must be rejected");
+    let CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) =
+        error
+    else {
+        panic!("expected structured Profile validation findings");
+    };
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code == "constraint_violation"
+                && finding.profile_revision == Some(revision)),
+        "{findings:#?}"
+    );
+    for rule in [
+        "http://www.w3.org/ns/shacl#minLength",
+        "http://www.w3.org/ns/shacl#or",
+    ] {
+        assert!(
+            findings.iter().any(|finding| finding.rule == rule),
+            "{rule} missing in {findings:#?}"
+        );
+    }
+    assert_eq!(event_count(&test, document_id).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn warning_severity_accepts() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(
+        &test,
+        group_id,
+        r#"
+          @prefix sh: <http://www.w3.org/ns/shacl#> .
+          @prefix schema: <http://schema.org/> .
+          <urn:test:advisory> a sh:NodeShape ;
+            sh:targetClass schema:Dataset ;
+            sh:property [ sh:path schema:citation ; sh:minCount 1 ; sh:severity sh:Warning ] .
+        "#,
+    )
+    .await?;
+    let document_id = mint(&test, group_id, "datasets/advisory")?;
+    create_crate(
+        &test,
+        group_id,
+        document_id,
+        "datasets/advisory",
+        crate_json(
+            document_id,
+            Some(&profile_public_iri(profile_id)),
+            true,
+            true,
+        ),
+    )
+    .await?;
+    let status = load_validation_status(test.context.as_ref(), document_id, None)
+        .await?
+        .expect("status is durable");
+    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.findings.len(), 1, "{:#?}", status.findings);
+    assert_eq!(
+        status.findings[0].severity,
+        MetadataProfileValidationSeverity::Warning
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn spans_crate_versions() -> Result<(), Box<dyn std::error::Error>> {
+    // A policy is compiled per detected RO-Crate version, not per profile.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
+    let tag = profile_public_iri(profile_id);
+    for version in ["1.2", "1.3"] {
+        let path = format!("datasets/version-{version}");
+        let document_id = mint(&test, group_id, &path)?;
+        let invalid = create_crate(
+            &test,
+            group_id,
+            document_id,
+            &path,
+            versioned_crate(document_id, &tag, version, false),
+        )
+        .await
+        .expect_err("the missing identifier must be rejected for every version");
+        assert_profile_code(invalid, "constraint_violation");
+        create_crate(
+            &test,
+            group_id,
+            document_id,
+            &path,
+            versioned_crate(document_id, &tag, version, true),
+        )
+        .await?;
+        let status = load_validation_status(test.context.as_ref(), document_id, None)
+            .await?
+            .expect("status is durable");
+        assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn preview_stores_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, revision) = register_profile(&test, group_id, minimum_shape()).await?;
+    let draft_id = mint(&test, group_id, "datasets/draft")?;
+    let tag = profile_public_iri(profile_id);
+
+    let rejected = preview_submission(
+        test.context.as_ref(),
+        &crate_json(draft_id, Some(&tag), false, true),
+    )
+    .await?;
+    assert!(!rejected.accepted());
+    assert_eq!(
+        rejected.status.state,
+        MetadataProfileValidationState::Invalid
+    );
+    assert!(rejected.structural_violations.is_empty());
+    assert!(
+        rejected.status.findings.iter().any(|finding| {
+            finding.rule == "http://www.w3.org/ns/shacl#minCount"
+                && finding.focus_node.as_deref() == Some("./")
+                && finding.profile_revision == Some(revision)
+        }),
+        "{:#?}",
+        rejected.status.findings
+    );
+
+    let accepted = preview_submission(
+        test.context.as_ref(),
+        &crate_json(draft_id, Some(&tag), true, true),
+    )
+    .await?;
+    assert!(accepted.accepted());
+    assert_eq!(accepted.status.state, MetadataProfileValidationState::Valid);
+
+    assert!(!graph_exists(&test, draft_id).await?);
+    assert_eq!(event_count(&test, draft_id).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn preview_reports_structural() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let draft_id = mint(&test, group_id, "datasets/structural")?;
+    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(draft_id);
+    let jsonld = json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": graph_iri}
+            },
+            {"@id": graph_iri, "@type": "Dataset", "name": "No description"}
+        ]
+    })
+    .to_string();
+    let preview = preview_submission(test.context.as_ref(), &jsonld).await?;
+    assert!(!preview.accepted());
+    assert_eq!(
+        preview.status.state,
+        MetadataProfileValidationState::NotProfiled
+    );
+    assert!(
+        !preview.structural_violations.is_empty(),
+        "an incomplete root data entity must be reported"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn binds_untargeted_root() -> Result<(), Box<dyn std::error::Error>> {
+    // Portal Profiles leave root shapes untargeted, with or without a crate base.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    for (suffix, shapes) in [("based", portal_shape(true)), ("bare", portal_shape(false))] {
+        let (profile_id, _) = register_profile(&test, group_id, &shapes).await?;
+        let tag = profile_public_iri(profile_id);
+        let path = format!("datasets/portal-{suffix}");
+        let document_id = mint(&test, group_id, &path)?;
+        let preview = preview_submission(
+            test.context.as_ref(),
+            &portal_crate(document_id, &tag, false),
+        )
+        .await?;
+        assert!(!preview.accepted());
+        assert!(
+            preview.status.findings.iter().any(|finding| {
+                finding.rule == "http://www.w3.org/ns/shacl#minCount"
+                    && finding.focus_node.as_deref() == Some("./")
+            }),
+            "{suffix}: {:#?}",
+            preview.status.findings
+        );
+        let complete = preview_submission(
+            test.context.as_ref(),
+            &portal_crate(document_id, &tag, true),
+        )
+        .await?;
+        assert!(complete.accepted(), "{suffix}: {:#?}", complete.status);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_crate_local() -> Result<(), Box<dyn std::error::Error>> {
+    // Craqle stores non-root crate ids in relative form its compiler rejects.
+    let test = build_context(false).await?;
+    let group_id = Ulid::generate();
+    let (profile_id, _) = register_profile(
+        &test,
+        group_id,
+        r#"
+          @prefix sh: <http://www.w3.org/ns/shacl#> .
+          @prefix schema: <http://schema.org/> .
+          @base <arcp://name,aruna-portal/crate/> .
+          <urn:test:local> a sh:NodeShape ;
+            sh:property [ sh:path schema:hasPart ; sh:hasValue <#person-1> ] .
+        "#,
+    )
+    .await?;
+    let tag = profile_public_iri(profile_id);
+    let document_id = mint(&test, group_id, "datasets/crate-local")?;
+    let preview = preview_submission(
+        test.context.as_ref(),
+        &portal_crate(document_id, &tag, true),
+    )
+    .await?;
+    assert!(!preview.accepted());
+    assert!(
+        preview.status.findings.iter().any(|finding| {
+            finding.code == "unsupported_constraint" && finding.rule == "crate_local_reference"
+        }),
+        "{:#?}",
+        preview.status.findings
+    );
     Ok(())
 }
 
@@ -366,6 +659,100 @@ fn assert_profile_code(error: CreateMetadataDocumentError, code: &str) {
         panic!("expected structured Profile validation findings");
     };
     assert!(findings.iter().any(|finding| finding.code == code));
+}
+
+fn portal_shape(with_base: bool) -> String {
+    let base = if with_base {
+        "@base <arcp://name,aruna-portal/crate/> ."
+    } else {
+        ""
+    };
+    format!(
+        r#"
+          @prefix sh: <http://www.w3.org/ns/shacl#> .
+          @prefix schema: <http://schema.org/> .
+          {base}
+          <urn:test:portal-root> a sh:NodeShape ;
+            sh:property [ sh:path schema:identifier ; sh:minCount 1 ] .
+        "#
+    )
+}
+
+fn portal_crate(document_id: Ulid, tag: &str, complete: bool) -> String {
+    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let mut root = json!({
+        "@id": graph_iri,
+        "@type": "Dataset",
+        "name": "Portal Dataset",
+        "description": "Portal profile fixture",
+        "datePublished": "2026-08-22",
+        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+        "conformsTo": {"@id": tag}
+    });
+    let mut entries = vec![json!({
+        "@id": "ro-crate-metadata.json",
+        "@type": "CreativeWork",
+        "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+        "about": {"@id": graph_iri}
+    })];
+    if complete {
+        root["identifier"] = json!("portal-identifier");
+        root["hasPart"] = json!({"@id": "#person-1"});
+        entries.push(root);
+        entries.push(json!({"@id": "#person-1", "@type": "Person", "name": "Ada"}));
+    } else {
+        entries.push(root);
+    }
+    json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": entries}).to_string()
+}
+
+fn versioned_crate(document_id: Ulid, tag: &str, version: &str, valid: bool) -> String {
+    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let specification = format!("https://w3id.org/ro/crate/{version}");
+    let mut root = json!({
+        "@id": graph_iri,
+        "@type": "Dataset",
+        "name": "Versioned Dataset",
+        "description": "Profile validation contract fixture",
+        "datePublished": "2026-08-22",
+        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+        "conformsTo": {"@id": tag}
+    });
+    if valid {
+        root["identifier"] = json!("dataset-identifier");
+    }
+    json!({
+        "@context": format!("{specification}/context"),
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": specification},
+                "about": {"@id": graph_iri}
+            },
+            root
+        ]
+    })
+    .to_string()
+}
+
+async fn graph_exists(
+    test: &TestContext,
+    document_id: Ulid,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let metadata = test
+        .context
+        .metadata_handle
+        .as_ref()
+        .ok_or("metadata handle is configured")?;
+    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    match metadata
+        .send_metadata_effect(MetadataEffect::ContainsGraph { graph_iri })
+        .await
+    {
+        Event::Metadata(MetadataEvent::ContainsGraphResult { exists, .. }) => Ok(exists),
+        other => Err(format!("unexpected graph existence result: {other:?}").into()),
+    }
 }
 
 async fn register_profile(
