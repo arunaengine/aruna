@@ -750,7 +750,9 @@ impl RealmConfigDocument {
             );
             crate::structs::stamp_location(
                 &mut labels,
-                entry.map(|entry| entry.location.as_str()).unwrap_or_default(),
+                entry
+                    .map(|entry| entry.location.as_str())
+                    .unwrap_or_default(),
             );
             nodes.push(CandidateMapNode {
                 node_id,

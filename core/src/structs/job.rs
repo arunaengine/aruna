@@ -3237,13 +3237,13 @@ mod tests {
 
     #[test]
     fn internal_rejects_external() {
-        // External-only states must be rejected for an in-process job.
+        // External-only states must be rejected for an in-process job. Parking on
+        // local exhaustion is the one Indeterminate edge both classes share.
         let external_only = [
             (JobState::Claimed, JobState::Preparing),
             (JobState::Preparing, JobState::Ready),
             (JobState::Ready, JobState::Running),
             (JobState::Running, JobState::Cancelling),
-            (JobState::Running, JobState::Indeterminate),
             (JobState::Cancelling, JobState::Cancelled),
             (JobState::Indeterminate, JobState::Running),
         ];

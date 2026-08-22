@@ -9,15 +9,15 @@ use aruna_core::keyspaces::{
     ROCRATE_JOB_STATE_KEYSPACE, S3_PURGE_CHECKPOINT_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
-    AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobExecutionClass,
-    JobErrorKind, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope, JobRecordError, JobResultPayload,
-    JobState, JobTransitionError, RunCrateStatus, StoragePurgeCheckpoint, UserAccess,
-    attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id, encode_job_dedup_value,
-    job_active_key, job_due_index_key, job_entry_key, job_entry_prefix, job_lease_index_key,
-    job_owner_cursor, job_owner_index_key, job_owner_index_prefix, job_prune_index_key,
-    job_record_key, job_run_crate_key, parse_entry_key, parse_job_dedup_value,
-    parse_job_owner_index_key, rocrate_plan_key, run_crate_dedup_key, validate_transition,
-    workspace_credential_id,
+    AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobErrorKind,
+    JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope,
+    JobRecordError, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
+    StoragePurgeCheckpoint, UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
+    crate_job_id, encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key,
+    job_entry_prefix, job_lease_index_key, job_owner_cursor, job_owner_index_key,
+    job_owner_index_prefix, job_prune_index_key, job_record_key, job_run_crate_key,
+    parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key,
+    run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -3124,9 +3124,10 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Exhausted(failed) = requeue_job(&storage, job_id, None, 6_000, None, None)
-            .await
-            .unwrap()
+        let RequeueOutcome::Exhausted(failed) =
+            requeue_job(&storage, job_id, None, 6_000, None, None)
+                .await
+                .unwrap()
         else {
             panic!("expected local exhaustion");
         };
@@ -3248,9 +3249,10 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Exhausted(failed) = requeue_job(&storage, job_id, None, 6_000, None, None)
-            .await
-            .unwrap()
+        let RequeueOutcome::Exhausted(failed) =
+            requeue_job(&storage, job_id, None, 6_000, None, None)
+                .await
+                .unwrap()
         else {
             panic!("import must stop after exhausting attempts");
         };

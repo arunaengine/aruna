@@ -294,9 +294,7 @@ fn terminal_state(record: &JobRecord) -> Option<PhysicalExecutionState> {
         JobState::Failed => Some(PhysicalExecutionState::Error),
         JobState::Cancelled => Some(PhysicalExecutionState::Cancelled),
         // Local exhaustion is an error the family may still resolve elsewhere.
-        JobState::Indeterminate if record.locally_exhausted => {
-            Some(PhysicalExecutionState::Error)
-        }
+        JobState::Indeterminate if record.locally_exhausted => Some(PhysicalExecutionState::Error),
         _ => None,
     }
 }

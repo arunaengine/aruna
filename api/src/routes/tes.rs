@@ -799,13 +799,12 @@ pub async fn list_tasks(
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let mut tasks = Vec::with_capacity(records.len());
     for record in records {
-        let (record, facts) = match family_report(&state.get_ctx(), &caller.auth, record.job_id)
-            .await
-        {
-            Some(Ok(report)) => (family_record(&report), TaskFacts::from_report(&report)),
-            Some(Err(error)) => return TesError::from_job_route(error).into_response(),
-            None => (record, TaskFacts::default()),
-        };
+        let (record, facts) =
+            match family_report(&state.get_ctx(), &caller.auth, record.job_id).await {
+                Some(Ok(report)) => (family_record(&report), TaskFacts::from_report(&report)),
+                Some(Err(error)) => return TesError::from_job_route(error).into_response(),
+                None => (record, TaskFacts::default()),
+            };
         tasks.push(project_task(&record, &facts, view, &base_url));
     }
 
@@ -1369,12 +1368,7 @@ impl TaskFacts {
     }
 }
 
-fn project_task(
-    record: &JobRecord,
-    facts: &TaskFacts,
-    view: TesView,
-    base_url: &str,
-) -> TesTask {
+fn project_task(record: &JobRecord, facts: &TaskFacts, view: TesView, base_url: &str) -> TesTask {
     let id = record.job_id.to_string();
     let state = tes_state(record);
     if view == TesView::Minimal {
@@ -2756,7 +2750,7 @@ mod tests {
         };
         let version_id = Ulid::from_bytes([9u8; 16]);
         let execution_id = Ulid::from_bytes([10u8; 16]);
-        let report = FamilyReport {
+        FamilyReport {
             job: JobStatusView {
                 job_id,
                 created_by,
@@ -2807,8 +2801,7 @@ mod tests {
             partial: false,
             locally_exhausted: false,
             plan: None,
-        };
-        report
+        }
     }
 
     #[test]
@@ -2821,7 +2814,12 @@ mod tests {
         let report = family_fixture();
         let version_id = Ulid::from_bytes([9u8; 16]);
 
-        let task = project_task(&family_record(&report), &TaskFacts::from_report(&report), TesView::Full, "http://x");
+        let task = project_task(
+            &family_record(&report),
+            &TaskFacts::from_report(&report),
+            TesView::Full,
+            "http://x",
+        );
 
         assert_eq!(task.state, Some(TesState::Complete));
         assert_eq!(
@@ -2832,7 +2830,12 @@ mod tests {
         let mut running = report.clone();
         running.job.state = JobState::Running;
         running.state = LogicalJobState::Running;
-        let pending = project_task(&family_record(&running), &TaskFacts::from_report(&running), TesView::Full, "http://x");
+        let pending = project_task(
+            &family_record(&running),
+            &TaskFacts::from_report(&running),
+            TesView::Full,
+            "http://x",
+        );
         assert_eq!(pending.state, Some(TesState::Running));
         assert!(pending.logs[0].outputs.is_empty());
     }
@@ -2902,7 +2905,6 @@ mod tests {
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error.code.as_deref(), Some("reserved_tag"));
     }
-
 
     #[test]
     fn projects_full_command() {
