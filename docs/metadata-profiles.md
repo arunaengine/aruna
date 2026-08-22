@@ -32,8 +32,10 @@ Two IRI forms address the same registered Profile and pin the same revision:
 | Legacy | `https://w3id.org/aruna/{id}`         |
 
 A Dataset opts in by naming one of them in the root entity's `conformsTo`. An
-RO-Crate specification IRI such as `https://w3id.org/ro/crate/1.3` is never a
-Profile tag. Exactly one Profile tag is supported; more than one is rejected.
+RO-Crate specification IRI such as `https://w3id.org/ro/crate/1.3` and the
+RO-Crate community profiles under `https://w3id.org/ro/wfrun/` and
+`https://w3id.org/workflowhub/workflow-ro-crate/` are never Profile tags.
+Exactly one Profile tag is supported; more than one is rejected.
 
 ## Validation on writes
 

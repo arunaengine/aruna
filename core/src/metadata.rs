@@ -12,12 +12,34 @@ use crate::types::{GroupId, UserId};
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 
-/// Supported RO-Crate specification IRIs are version markers, not Profiles.
+/// Supported RO-Crate specification IRIs and the RO-Crate community profiles
+/// (workflow run crates, Workflow RO-Crate) are version markers, not Profiles.
 pub fn is_rocrate_specification(iri: &str) -> bool {
     matches!(
         iri,
         "https://w3id.org/ro/crate/1.2" | "https://w3id.org/ro/crate/1.3"
-    )
+    ) || iri.starts_with("https://w3id.org/ro/wfrun/")
+        || iri.starts_with("https://w3id.org/workflowhub/workflow-ro-crate/")
+}
+
+#[cfg(test)]
+mod specification_tests {
+    use super::is_rocrate_specification;
+
+    #[test]
+    fn community_profiles_are_markers() {
+        assert!(is_rocrate_specification("https://w3id.org/ro/crate/1.3"));
+        assert!(is_rocrate_specification(
+            "https://w3id.org/ro/wfrun/process/0.5"
+        ));
+        assert!(is_rocrate_specification(
+            "https://w3id.org/workflowhub/workflow-ro-crate/1.0"
+        ));
+        assert!(!is_rocrate_specification(
+            "https://w3id.org/aruna/profile/01J"
+        ));
+        assert!(!is_rocrate_specification("https://example.org/profile"));
+    }
 }
 
 /// Credential a forwarded metadata or job-control request carries to the holder.

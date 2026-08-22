@@ -1006,7 +1006,10 @@ mod tests {
                         "name": "Versioned crate",
                         "description": "Specification IRIs are not Profiles",
                         "datePublished": "2026-08-19",
-                        "conformsTo": {"@id": specification}
+                        "conformsTo": [
+                            {"@id": specification},
+                            {"@id": "https://w3id.org/ro/wfrun/process/0.5"}
+                        ]
                     }
                 ]
             })
