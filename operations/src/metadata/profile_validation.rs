@@ -7,7 +7,7 @@ use aruna_core::keyspaces::METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
     MetadataProfileValidationSeverity, MetadataProfileValidationState,
-    MetadataProfileValidationStatus, is_rocrate_specification,
+    MetadataProfileValidationStatus, MetadataValidationViolation, is_rocrate_specification,
 };
 use aruna_core::storage_entries::{
     metadata_profile_validation_status_key, metadata_profile_validation_status_write_entry,
@@ -15,13 +15,16 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::TxnId;
 use chrono::Utc;
-use oxrdf::{Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-use oxttl::{NQuadsParser, TurtleParser};
-use spareval::{QueryEvaluator, QueryResults};
-use spargebra::SparqlParser;
+use craqle::{CrateViolation, ShaclValidationResult};
+use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxttl::NQuadsParser;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::metadata::MetadataHandle;
+use crate::metadata::profile_shacl::{
+    ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+};
 use crate::metadata::raw::load_raw_revision;
 use crate::metadata::repository::{
     StorageReadError, parse_registry_read, read_registry_by_document_effect,
@@ -29,9 +32,6 @@ use crate::metadata::repository::{
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
-const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
-const RDF_NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
 const DCTERMS_CONFORMS_TO: &str = "http://purl.org/dc/terms/conformsTo";
 const SCHEMA_CONFORMS_TO: &str = "http://schema.org/conformsTo";
 const SCHEMA_HTTPS_CONFORMS_TO: &str = "https://schema.org/conformsTo";
@@ -44,35 +44,58 @@ const SCHEMA_HTTPS_TEXT: &str = "https://schema.org/text";
 const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
 const PROFILE_PUBLIC_PREFIX: &str = "https://w3id.org/aruna/profile/";
 const LEGACY_GRAPH_PREFIX: &str = "https://w3id.org/aruna/";
-const EVALUATOR_NAME: &str = "shacl-core-to-sparql/spareval-0.2.6";
-const RDF_LIST_LIMIT: usize = 4096;
+const EVALUATOR_NAME: &str = "craqle-shacl-core/0.2";
 
-/// Authoritative backend SHACL support for profile validation.
+/// Authoritative backend SHACL support for Profile validation.
 ///
-/// Evaluator decision (P0-1): SHACL Core is compiled to SPARQL and executed by
-/// the repository's pinned `spareval` engine. The rudof `shacl_validation`
-/// candidate was not present in the offline registry, so it could not be added
-/// and built in this sandbox. The exact supported constraint/dispatch terms are
-/// `sh:targetClass`, `sh:targetNode`, `sh:property`, predicate-IRI `sh:path`,
-/// `sh:minCount`, `sh:maxCount`, `sh:datatype`, `sh:class`, `sh:nodeKind`,
-/// `sh:pattern`, `sh:in`, `sh:hasValue`, `sh:closed`,
-/// `sh:ignoredProperties`, `sh:severity`, and `sh:deactivated`. Harmless
-/// annotations `sh:message`, `sh:name`, `sh:description`, `sh:order`, and
-/// `sh:group` are preserved. Every other SHACL term fails closed with an
-/// `unsupported_constraint` finding.
+/// Shapes are compiled and executed by craqle's native SHACL Core Subset v1
+/// engine. Every construct outside this set, including SHACL-SPARQL, SHACL-JS,
+/// SHACL-AF, custom components and targets, recursive shapes, RDF-star, and
+/// remote `owl:imports`, fails closed with an `unsupported_constraint` finding.
 pub const SUPPORTED_PROFILE_CONSTRAINTS: &[&str] = &[
     "sh:targetClass",
     "sh:targetNode",
+    "sh:targetSubjectsOf",
+    "sh:targetObjectsOf",
+    "implicit class target",
     "sh:property",
-    "sh:path (predicate IRI only)",
+    "sh:path (predicate)",
+    "sh:path (sh:inversePath)",
+    "sh:path (sequence)",
+    "sh:path (sh:alternativePath)",
+    "sh:path (sh:zeroOrOnePath)",
+    "sh:path (sh:zeroOrMorePath)",
+    "sh:path (sh:oneOrMorePath)",
+    "sh:class",
+    "sh:datatype",
+    "sh:nodeKind",
     "sh:minCount",
     "sh:maxCount",
-    "sh:datatype",
-    "sh:class",
-    "sh:nodeKind",
+    "sh:minExclusive",
+    "sh:minInclusive",
+    "sh:maxExclusive",
+    "sh:maxInclusive",
+    "sh:minLength",
+    "sh:maxLength",
     "sh:pattern",
-    "sh:in",
+    "sh:flags",
+    "sh:uniqueLang",
+    "sh:languageIn",
+    "sh:equals",
+    "sh:disjoint",
+    "sh:lessThan",
+    "sh:lessThanOrEquals",
+    "sh:or",
+    "sh:and",
+    "sh:not",
+    "sh:xone",
+    "sh:node",
     "sh:hasValue",
+    "sh:in",
+    "sh:qualifiedValueShape",
+    "sh:qualifiedMinCount",
+    "sh:qualifiedMaxCount",
+    "sh:qualifiedValueShapesDisjoint",
     "sh:closed",
     "sh:ignoredProperties",
     "sh:severity",
@@ -83,98 +106,6 @@ pub const SUPPORTED_PROFILE_CONSTRAINTS: &[&str] = &[
     "sh:order (annotation)",
     "sh:group (annotation)",
 ];
-
-const SUPPORTED_SHACL_PREDICATES: &[&str] = &[
-    "targetClass",
-    "targetNode",
-    "property",
-    "path",
-    "minCount",
-    "maxCount",
-    "datatype",
-    "class",
-    "nodeKind",
-    "pattern",
-    "in",
-    "hasValue",
-    "closed",
-    "ignoredProperties",
-    "severity",
-    "deactivated",
-    "message",
-    "name",
-    "description",
-    "order",
-    "group",
-];
-
-pub struct ProfileEvaluationRequest<'a> {
-    pub data: &'a Dataset,
-    pub root: &'a NamedOrBlankNode,
-    pub shapes: &'a [&'a str],
-    pub profile_revision: Ulid,
-}
-
-#[derive(Debug)]
-pub enum ProfileEvaluatorError {
-    Unsupported(Vec<MetadataProfileValidationFinding>),
-    Unavailable(String),
-}
-
-/// Stable evaluator seam. Registry resolution and write/status persistence do
-/// not depend on a concrete SHACL implementation.
-pub trait ProfileConstraintEvaluator: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn supported_constraints(&self) -> &'static [&'static str];
-    fn evaluate(
-        &self,
-        request: ProfileEvaluationRequest<'_>,
-    ) -> Result<Vec<MetadataProfileValidationFinding>, ProfileEvaluatorError>;
-}
-
-#[derive(Debug, Default)]
-pub struct SparevalShaclEvaluator;
-
-impl ProfileConstraintEvaluator for SparevalShaclEvaluator {
-    fn name(&self) -> &'static str {
-        EVALUATOR_NAME
-    }
-
-    fn supported_constraints(&self) -> &'static [&'static str] {
-        SUPPORTED_PROFILE_CONSTRAINTS
-    }
-
-    fn evaluate(
-        &self,
-        request: ProfileEvaluationRequest<'_>,
-    ) -> Result<Vec<MetadataProfileValidationFinding>, ProfileEvaluatorError> {
-        let mut shapes = Dataset::new();
-        for source in request.shapes {
-            for triple in TurtleParser::new().for_slice(source.as_bytes()) {
-                let triple = triple.map_err(|error| {
-                    ProfileEvaluatorError::Unsupported(vec![unsupported_finding(
-                        "shapes_turtle",
-                        format!("the registered Profile's SHACL could not be parsed: {error}"),
-                        request.profile_revision,
-                    )])
-                })?;
-                shapes.insert(&Quad::new(
-                    triple.subject,
-                    triple.predicate,
-                    triple.object,
-                    GraphName::DefaultGraph,
-                ));
-            }
-        }
-        validate_supported_terms(&shapes, request.profile_revision)?;
-        evaluate_shapes(
-            request.data,
-            &shapes,
-            request.root,
-            request.profile_revision,
-        )
-    }
-}
 
 #[derive(Debug)]
 struct ResolvedProfile {
@@ -228,55 +159,219 @@ async fn assess_submission(
     jsonld: &str,
 ) -> Result<MetadataProfileValidationStatus, MetadataError> {
     let (data, root) = data_graph(jsonld)?;
-    let profile_tags = profile_tags(&data, &root);
-    if profile_tags.is_empty() {
+    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
         return Ok(not_profiled_status(document_id));
+    };
+    let profile = resolve_registered_profile(context, &requested_iri).await?;
+    let metadata = evaluator_handle(context, Some(profile.revision))?;
+    let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
+    Ok(profiled_status(document_id, &profile, assessment.findings))
+}
+
+/// The verdict a create or replace would enforce for an unsaved draft.
+#[derive(Debug)]
+pub struct MetadataProfilePreview {
+    pub status: MetadataProfileValidationStatus,
+    pub structural_violations: Vec<MetadataValidationViolation>,
+}
+
+impl MetadataProfilePreview {
+    pub fn accepted(&self) -> bool {
+        self.structural_violations.is_empty()
+            && self.status.state != MetadataProfileValidationState::Invalid
     }
-    if profile_tags.len() != 1 {
-        return Err(MetadataError::ProfileValidation(vec![unsupported_finding(
+}
+
+/// Validates a draft without reading or writing any stored document.
+pub async fn preview_submission(
+    context: &DriverContext,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let (data, root) = data_graph(jsonld)?;
+    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
+        let metadata = evaluator_handle(context, None)?;
+        let structural = metadata
+            .preview_crate_structure(jsonld.to_string())
+            .await
+            .map_err(|error| shacl_failure(error, None))?;
+        return Ok(MetadataProfilePreview {
+            status: not_profiled_status(Ulid::nil()),
+            structural_violations: structural.into_iter().map(structural_violation).collect(),
+        });
+    };
+    let profile = resolve_registered_profile(context, &requested_iri).await?;
+    let metadata = evaluator_handle(context, Some(profile.revision))?;
+    let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
+    Ok(MetadataProfilePreview {
+        status: profiled_status(Ulid::nil(), &profile, assessment.findings),
+        structural_violations: assessment.structural,
+    })
+}
+
+struct ProfileAssessment {
+    findings: Vec<MetadataProfileValidationFinding>,
+    structural: Vec<MetadataValidationViolation>,
+}
+
+async fn evaluate_profile(
+    metadata: &MetadataHandle,
+    profile: &ResolvedProfile,
+    jsonld: &str,
+) -> Result<ProfileAssessment, MetadataError> {
+    let shapes = ProfileShapes {
+        profile_id: profile.id,
+        revision: profile.revision,
+        graph_iri: MetadataRegistryRecord::graph_iri_for(profile.id),
+        sources: profile.shapes.clone(),
+    };
+    match metadata
+        .evaluate_profile_shapes(shapes, jsonld.to_string())
+        .await
+    {
+        Ok(report) => Ok(shacl_assessment(report, profile.revision)),
+        Err(ProfileShaclError::Unsupported { rule, message }) => Ok(ProfileAssessment {
+            findings: vec![unsupported_finding(&rule, message, profile.revision)],
+            structural: Vec::new(),
+        }),
+        Err(ProfileShaclError::Limit { message }) => Ok(ProfileAssessment {
+            findings: vec![limit_finding(message, profile.revision)],
+            structural: Vec::new(),
+        }),
+        Err(error) => Err(shacl_failure(error, Some(profile.revision))),
+    }
+}
+
+fn shacl_assessment(report: ProfileShaclReport, profile_revision: Ulid) -> ProfileAssessment {
+    ProfileAssessment {
+        findings: report
+            .results
+            .iter()
+            .map(|result| constraint_finding(result, profile_revision))
+            .collect(),
+        structural: report
+            .structural
+            .into_iter()
+            .map(structural_violation)
+            .collect(),
+    }
+}
+
+fn constraint_finding(
+    result: &ShaclValidationResult,
+    profile_revision: Ulid,
+) -> MetadataProfileValidationFinding {
+    let component = constraint_term(&result.source_constraint_component);
+    MetadataProfileValidationFinding {
+        code: "constraint_violation".to_string(),
+        severity: finding_severity(&result.severity.0),
+        focus_node: Some(crate_local(&result.focus_node.0)),
+        path: result.result_path.as_deref().map(crate_local),
+        rule: component.as_ref().map_or_else(
+            || result.source_constraint_component.clone(),
+            |component| format!("{SH}{component}"),
+        ),
+        message: result.messages.first().map_or_else(
+            || default_message(component.as_deref().unwrap_or_default()).to_string(),
+            |message| message.text.clone(),
+        ),
+        profile_revision: Some(profile_revision),
+        completeness: MetadataProfileValidationCompleteness::Complete,
+    }
+}
+
+/// `sh:MinCountConstraintComponent` reports as the `sh:minCount` rule.
+fn constraint_term(component: &str) -> Option<String> {
+    let local = component
+        .strip_prefix(SH)?
+        .strip_suffix("ConstraintComponent")?;
+    let mut characters = local.chars();
+    let first = characters.next()?;
+    Some(format!("{}{}", first.to_lowercase(), characters.as_str()))
+}
+
+fn finding_severity(severity: &str) -> MetadataProfileValidationSeverity {
+    match decode_term(severity).strip_prefix(SH) {
+        Some("Warning") => MetadataProfileValidationSeverity::Warning,
+        Some("Info" | "Debug" | "Trace") => MetadataProfileValidationSeverity::Info,
+        _ => MetadataProfileValidationSeverity::Violation,
+    }
+}
+
+/// Craqle reports terms in N-Triples form; IRIs arrive in angle brackets.
+fn decode_term(term: &str) -> String {
+    term.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(term)
+        .to_string()
+}
+
+/// Reports the crate root as `./` so a caller can locate the entity in the
+/// document it submitted rather than in the validation store.
+fn crate_local(term: &str) -> String {
+    let decoded = decode_term(term);
+    if decoded == VALIDATION_GRAPH_IRI {
+        "./".to_string()
+    } else {
+        decoded
+    }
+}
+
+fn structural_violation(violation: CrateViolation) -> MetadataValidationViolation {
+    MetadataValidationViolation {
+        code: violation.code.to_string(),
+        message: violation.message,
+        pointer: violation.pointer,
+        entity_id: violation.entity_id,
+    }
+}
+
+fn single_profile_tag(
+    data: &Dataset,
+    root: &NamedOrBlankNode,
+) -> Result<Option<String>, MetadataError> {
+    let mut tags = profile_tags(data, root);
+    match tags.len() {
+        0 => Ok(None),
+        1 => Ok(tags.pop()),
+        _ => Err(MetadataError::ProfileValidation(vec![unsupported_finding(
             "multiple_profile_tags",
             "multiple root conformsTo Profile tags are not supported by the revision-bound status contract"
                 .to_string(),
             Ulid::nil(),
-        )]));
+        )])),
     }
-    let requested_iri = profile_tags.into_iter().next().expect("one profile tag");
-    let profile = resolve_registered_profile(context, &requested_iri).await?;
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return Err(unavailable_error(
+}
+
+fn evaluator_handle(
+    context: &DriverContext,
+    profile_revision: Option<Ulid>,
+) -> Result<&MetadataHandle, MetadataError> {
+    match context.metadata_handle.as_ref() {
+        Some(metadata) if metadata.profile_validation_available() => Ok(metadata),
+        _ => Err(unavailable_error(
             "validator_unavailable",
             "the profile evaluator is unavailable; retry or remove the Profile tag",
-            Some(profile.revision),
-        ));
-    };
-    if !metadata.profile_validation_available() {
-        return Err(unavailable_error(
-            "validator_unavailable",
-            "the profile evaluator is unavailable; retry or remove the Profile tag",
-            Some(profile.revision),
-        ));
+            profile_revision,
+        )),
     }
-    let evaluator = SparevalShaclEvaluator;
-    let shape_refs = profile
-        .shapes
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let findings = match evaluator.evaluate(ProfileEvaluationRequest {
-        data: &data,
-        root: &root,
-        shapes: &shape_refs,
-        profile_revision: profile.revision,
-    }) {
-        Ok(findings) | Err(ProfileEvaluatorError::Unsupported(findings)) => findings,
-        Err(ProfileEvaluatorError::Unavailable(message)) => {
-            return Err(unavailable_error(
-                "validator_unavailable",
-                &message,
-                Some(profile.revision),
-            ));
-        }
-    };
+}
+
+fn shacl_failure(error: ProfileShaclError, profile_revision: Option<Ulid>) -> MetadataError {
+    match error {
+        ProfileShaclError::InvalidInput { message } => MetadataError::InvalidInput(message),
+        other => unavailable_error(
+            "validator_unavailable",
+            &other.to_string(),
+            profile_revision,
+        ),
+    }
+}
+
+fn profiled_status(
+    document_id: Ulid,
+    profile: &ResolvedProfile,
+    findings: Vec<MetadataProfileValidationFinding>,
+) -> MetadataProfileValidationStatus {
     let invalid = findings
         .iter()
         .any(|finding| finding.severity == MetadataProfileValidationSeverity::Violation);
@@ -288,7 +383,7 @@ async fn assess_submission(
     } else {
         MetadataProfileValidationCompleteness::Complete
     };
-    Ok(MetadataProfileValidationStatus {
+    MetadataProfileValidationStatus {
         document_id,
         dataset_revision: Ulid::nil(),
         state: if invalid {
@@ -297,14 +392,14 @@ async fn assess_submission(
             MetadataProfileValidationState::Valid
         },
         profile_id: Some(profile.id),
-        profile_iri: Some(profile.requested_iri),
+        profile_iri: Some(profile.requested_iri.clone()),
         profile_revision: Some(profile.revision),
-        evaluator: evaluator.name().to_string(),
+        evaluator: EVALUATOR_NAME.to_string(),
         validated_at_ms: Some(now_ms()),
         findings,
         completeness,
         stale_reason: None,
-    })
+    }
 }
 
 pub fn not_profiled_status(document_id: Ulid) -> MetadataProfileValidationStatus {
@@ -678,686 +773,12 @@ fn profile_shapes(dataset: &Dataset) -> Result<Vec<String>, String> {
     Ok(shapes)
 }
 
-fn validate_supported_terms(
-    shapes: &Dataset,
-    profile_revision: Ulid,
-) -> Result<(), ProfileEvaluatorError> {
-    let mut unsupported = BTreeSet::new();
-    for quad in shapes.quads_for_graph_name(&GraphName::DefaultGraph) {
-        let predicate = quad.predicate.as_str();
-        if let Some(local) = predicate.strip_prefix(SH)
-            && !SUPPORTED_SHACL_PREDICATES.contains(&local)
-        {
-            unsupported.insert(predicate.to_string());
-        }
-    }
-    if unsupported.is_empty() {
-        return Ok(());
-    }
-    Err(ProfileEvaluatorError::Unsupported(
-        unsupported
-            .into_iter()
-            .map(|term| {
-                unsupported_finding(
-                    &term,
-                    format!("the registered Profile uses unsupported SHACL construct `{term}`"),
-                    profile_revision,
-                )
-            })
-            .collect(),
-    ))
-}
-
-fn evaluate_shapes(
-    data: &Dataset,
-    shapes: &Dataset,
-    root: &NamedOrBlankNode,
-    profile_revision: Ulid,
-) -> Result<Vec<MetadataProfileValidationFinding>, ProfileEvaluatorError> {
-    let node_shape_type = Term::NamedNode(NamedNode::new_unchecked(format!("{SH}NodeShape")));
-    let property_shape_type =
-        Term::NamedNode(NamedNode::new_unchecked(format!("{SH}PropertyShape")));
-    let mut node_shapes = subjects(shapes, RDF_TYPE, &node_shape_type);
-    let mut property_shapes = subjects(shapes, RDF_TYPE, &property_shape_type);
-    for predicate in ["targetClass", "targetNode", "property"] {
-        node_shapes.extend(subjects_for_predicate(shapes, &format!("{SH}{predicate}")));
-    }
-    property_shapes.extend(subjects_for_predicate(shapes, &format!("{SH}path")));
-    node_shapes.sort_by_key(node_token);
-    node_shapes.dedup();
-    property_shapes.sort_by_key(node_token);
-    property_shapes.dedup();
-
-    let property_members = node_shapes
-        .iter()
-        .flat_map(|shape| objects(shapes, shape, &format!("{SH}property")))
-        .filter_map(term_as_node)
-        .collect::<HashSet<_>>();
-    let mut findings = Vec::new();
-    for shape in &node_shapes {
-        if deactivated(shapes, shape, profile_revision)? {
-            continue;
-        }
-        let bind_root = target_terms(shapes, shape).is_empty()
-            && !property_members.contains(shape)
-            && objects(shapes, shape, &format!("{SH}class")).is_empty();
-        let focuses = resolve_targets(data, shapes, shape, bind_root.then_some(root))?;
-        evaluate_shape_constraints(
-            data,
-            shapes,
-            shape,
-            &focuses,
-            None,
-            true,
-            profile_revision,
-            &mut findings,
-        )?;
-        for property in objects(shapes, shape, &format!("{SH}property")) {
-            let property = term_as_node(property).ok_or_else(|| {
-                unsupported_error(
-                    "sh:property",
-                    "sh:property must identify a property shape",
-                    profile_revision,
-                )
-            })?;
-            if deactivated(shapes, &property, profile_revision)? {
-                continue;
-            }
-            let path = predicate_path(shapes, &property, profile_revision)?;
-            evaluate_shape_constraints(
-                data,
-                shapes,
-                &property,
-                &focuses,
-                Some(&path),
-                false,
-                profile_revision,
-                &mut findings,
-            )?;
-        }
-    }
-    for shape in property_shapes {
-        if property_members.contains(&shape) || deactivated(shapes, &shape, profile_revision)? {
-            continue;
-        }
-        let focuses = resolve_targets(data, shapes, &shape, None)?;
-        let path = predicate_path(shapes, &shape, profile_revision)?;
-        evaluate_shape_constraints(
-            data,
-            shapes,
-            &shape,
-            &focuses,
-            Some(&path),
-            false,
-            profile_revision,
-            &mut findings,
-        )?;
-    }
-    findings.sort_by(|left, right| {
-        (&left.focus_node, &left.path, &left.rule, &left.message).cmp(&(
-            &right.focus_node,
-            &right.path,
-            &right.rule,
-            &right.message,
-        ))
-    });
-    findings.dedup();
-    Ok(findings)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn evaluate_shape_constraints(
-    data: &Dataset,
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    focuses: &[Term],
-    path: Option<&NamedNode>,
-    node_shape: bool,
-    profile_revision: Ulid,
-    findings: &mut Vec<MetadataProfileValidationFinding>,
-) -> Result<(), ProfileEvaluatorError> {
-    if focuses.is_empty() {
-        return Ok(());
-    }
-    let severity = severity(shapes, shape, profile_revision)?;
-    let message = message(shapes, shape);
-    let source = node_value(shape);
-    let values = values_clause(focuses);
-    let value_pattern = path.map_or_else(
-        || "BIND(?focus AS ?value)".to_string(),
-        |path| format!("?focus {path} ?value ."),
-    );
-
-    for (local, comparison) in [("minCount", "<"), ("maxCount", ">")] {
-        let terms = objects(shapes, shape, &format!("{SH}{local}"));
-        if terms.is_empty() {
-            continue;
-        }
-        if node_shape || path.is_none() || terms.len() != 1 {
-            return Err(unsupported_error(
-                &format!("sh:{local}"),
-                &format!("sh:{local} requires one predicate-path property shape"),
-                profile_revision,
-            ));
-        }
-        let count = unsigned_integer(&terms[0]).ok_or_else(|| {
-            unsupported_error(
-                &format!("sh:{local}"),
-                &format!("sh:{local} must be one non-negative integer"),
-                profile_revision,
-            )
-        })?;
-        let query = format!(
-            "SELECT ?focus WHERE {{ VALUES ?focus {{ {values} }} OPTIONAL {{ {value_pattern} }} }} GROUP BY ?focus HAVING(COUNT(?value) {comparison} {count})"
-        );
-        push_query_findings(
-            data,
-            &query,
-            local,
-            severity,
-            &source,
-            path.map(|path| path.as_str()),
-            message.as_deref(),
-            profile_revision,
-            findings,
-        )?;
-    }
-
-    if let Some(datatype) = single_named(shapes, shape, "datatype", profile_revision)? {
-        let query = format!(
-            "SELECT ?focus ?value WHERE {{ VALUES ?focus {{ {values} }} {value_pattern} FILTER(!isLiteral(?value) || datatype(?value) != {datatype}) }}"
-        );
-        push_query_findings(
-            data,
-            &query,
-            "datatype",
-            severity,
-            &source,
-            path.map(|p| p.as_str()),
-            message.as_deref(),
-            profile_revision,
-            findings,
-        )?;
-    }
-    if let Some(class) = single_named(shapes, shape, "class", profile_revision)? {
-        let query = format!(
-            "SELECT ?focus ?value WHERE {{ VALUES ?focus {{ {values} }} {value_pattern} FILTER NOT EXISTS {{ ?value <{RDF_TYPE}> {class} }} }}"
-        );
-        push_query_findings(
-            data,
-            &query,
-            "class",
-            severity,
-            &source,
-            path.map(|p| p.as_str()),
-            message.as_deref(),
-            profile_revision,
-            findings,
-        )?;
-    }
-    if let Some(kind) = single_named(shapes, shape, "nodeKind", profile_revision)? {
-        let valid = match kind.as_str().strip_prefix(SH) {
-            Some("IRI") => "isIRI(?value)",
-            Some("BlankNode") => "isBlank(?value)",
-            Some("Literal") => "isLiteral(?value)",
-            Some("BlankNodeOrIRI") => "(isBlank(?value) || isIRI(?value))",
-            Some("BlankNodeOrLiteral") => "(isBlank(?value) || isLiteral(?value))",
-            Some("IRIOrLiteral") => "(isIRI(?value) || isLiteral(?value))",
-            _ => {
-                return Err(unsupported_error(
-                    "sh:nodeKind",
-                    "sh:nodeKind uses an unsupported node-kind value",
-                    profile_revision,
-                ));
-            }
-        };
-        let query = format!(
-            "SELECT ?focus ?value WHERE {{ VALUES ?focus {{ {values} }} {value_pattern} FILTER(!{valid}) }}"
-        );
-        push_query_findings(
-            data,
-            &query,
-            "nodeKind",
-            severity,
-            &source,
-            path.map(|p| p.as_str()),
-            message.as_deref(),
-            profile_revision,
-            findings,
-        )?;
-    }
-    if let Some(pattern) = single_literal(shapes, shape, "pattern", profile_revision)? {
-        let pattern = Literal::new_simple_literal(pattern).to_string();
-        let query = format!(
-            "SELECT ?focus ?value WHERE {{ VALUES ?focus {{ {values} }} {value_pattern} FILTER(!isLiteral(?value) || !regex(str(?value), {pattern})) }}"
-        );
-        push_query_findings(
-            data,
-            &query,
-            "pattern",
-            severity,
-            &source,
-            path.map(|p| p.as_str()),
-            message.as_deref(),
-            profile_revision,
-            findings,
-        )?;
-    }
-    if let Some(head) = single_term(shapes, shape, "in", profile_revision)? {
-        let allowed = rdf_list(shapes, &head, profile_revision)?;
-        let filter = if allowed.is_empty() {
-            "true".to_string()
-        } else {
-            format!(
-                "?value NOT IN ({})",
-                allowed
-                    .iter()
-                    .map(Term::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let query = format!(
-            "SELECT ?focus ?value WHERE {{ VALUES ?focus {{ {values} }} {value_pattern} FILTER({filter}) }}"
-        );
-        push_query_findings(
-            data,
-            &query,
-            "in",
-            severity,
-            &source,
-            path.map(|p| p.as_str()),
-            message.as_deref(),
-            profile_revision,
-            findings,
-        )?;
-    }
-    if let Some(required) = single_term(shapes, shape, "hasValue", profile_revision)? {
-        let query = match path {
-            Some(path) => format!(
-                "SELECT ?focus WHERE {{ VALUES ?focus {{ {values} }} FILTER NOT EXISTS {{ ?focus {path} {required} }} }}"
-            ),
-            None => format!(
-                "SELECT ?focus WHERE {{ VALUES ?focus {{ {values} }} FILTER(!sameTerm(?focus, {required})) }}"
-            ),
-        };
-        push_query_findings(
-            data,
-            &query,
-            "hasValue",
-            severity,
-            &source,
-            path.map(|p| p.as_str()),
-            message.as_deref(),
-            profile_revision,
-            findings,
-        )?;
-    }
-
-    let closed = optional_boolean(shapes, shape, "closed", profile_revision)?;
-    let ignored = single_term(shapes, shape, "ignoredProperties", profile_revision)?;
-    if ignored.is_some() && closed != Some(true) {
-        return Err(unsupported_error(
-            "sh:ignoredProperties",
-            "sh:ignoredProperties is supported only with sh:closed true",
-            profile_revision,
-        ));
-    }
-    if closed == Some(true) {
-        if !node_shape || path.is_some() {
-            return Err(unsupported_error(
-                "sh:closed",
-                "sh:closed is supported on node shapes",
-                profile_revision,
-            ));
-        }
-        let mut allowed = objects(shapes, shape, &format!("{SH}property"))
-            .into_iter()
-            .map(|property| {
-                term_as_node(property)
-                    .ok_or_else(|| {
-                        unsupported_error(
-                            "sh:property",
-                            "sh:property must identify a property shape",
-                            profile_revision,
-                        )
-                    })
-                    .and_then(|property| predicate_path(shapes, &property, profile_revision))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(head) = ignored {
-            for term in rdf_list(shapes, &head, profile_revision)? {
-                let Term::NamedNode(predicate) = term else {
-                    return Err(unsupported_error(
-                        "sh:ignoredProperties",
-                        "sh:ignoredProperties entries must be predicate IRIs",
-                        profile_revision,
-                    ));
-                };
-                allowed.push(predicate);
-            }
-        }
-        allowed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        allowed.dedup();
-        for focus in focuses {
-            let Some(node) = term_as_node(focus.clone()) else {
-                continue;
-            };
-            for quad in data.quads_for_subject(&node).filter(|quad| {
-                quad.graph_name.is_default_graph()
-                    && !allowed
-                        .iter()
-                        .any(|predicate| predicate.as_ref() == quad.predicate)
-            }) {
-                findings.push(MetadataProfileValidationFinding {
-                    code: "constraint_violation".to_string(),
-                    severity,
-                    focus_node: Some(term_value(focus)),
-                    path: Some(quad.predicate.as_str().to_string()),
-                    rule: format!("{SH}closed"),
-                    message: message
-                        .clone()
-                        .unwrap_or_else(|| default_message("closed").to_string()),
-                    profile_revision: Some(profile_revision),
-                    completeness: MetadataProfileValidationCompleteness::Complete,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_query_findings(
-    data: &Dataset,
-    query: &str,
-    component: &str,
-    severity: MetadataProfileValidationSeverity,
-    source: &str,
-    fixed_path: Option<&str>,
-    message: Option<&str>,
-    profile_revision: Ulid,
-    findings: &mut Vec<MetadataProfileValidationFinding>,
-) -> Result<(), ProfileEvaluatorError> {
-    for solution in select(data, query)? {
-        let focus = solution.get("focus").map(term_value);
-        let path = fixed_path.map(str::to_string).or_else(|| {
-            solution.get("unexpectedPath").and_then(|term| match term {
-                Term::NamedNode(path) => Some(path.as_str().to_string()),
-                _ => None,
-            })
-        });
-        findings.push(MetadataProfileValidationFinding {
-            code: "constraint_violation".to_string(),
-            severity,
-            focus_node: focus,
-            path,
-            rule: format!("{SH}{component}"),
-            message: message.map_or_else(|| default_message(component).to_string(), str::to_string),
-            profile_revision: Some(profile_revision),
-            completeness: MetadataProfileValidationCompleteness::Complete,
-        });
-        let _ = source;
-    }
-    Ok(())
-}
-
-fn select(
-    data: &Dataset,
-    query: &str,
-) -> Result<Vec<spareval::QuerySolution>, ProfileEvaluatorError> {
-    let query = SparqlParser::new()
-        .parse_query(query)
-        .map_err(|error| ProfileEvaluatorError::Unavailable(error.to_string()))?;
-    let evaluator = QueryEvaluator::new();
-    match evaluator
-        .prepare(&query)
-        .execute(data)
-        .map_err(|error| ProfileEvaluatorError::Unavailable(error.to_string()))?
-    {
-        QueryResults::Solutions(solutions) => solutions
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ProfileEvaluatorError::Unavailable(error.to_string())),
-        _ => Err(ProfileEvaluatorError::Unavailable(
-            "compiled SHACL query did not return solutions".to_string(),
-        )),
-    }
-}
-
-fn resolve_targets(
-    data: &Dataset,
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    root: Option<&NamedOrBlankNode>,
-) -> Result<Vec<Term>, ProfileEvaluatorError> {
-    let mut focuses = objects(shapes, shape, &format!("{SH}targetNode"));
-    for class in objects(shapes, shape, &format!("{SH}targetClass")) {
-        let Term::NamedNode(class) = class else {
-            return Err(ProfileEvaluatorError::Unavailable(
-                "sh:targetClass must be an IRI".to_string(),
-            ));
-        };
-        let predicate = NamedNode::new_unchecked(RDF_TYPE);
-        focuses.extend(
-            data.quads_for_predicate(&predicate)
-                .filter(|quad| {
-                    quad.graph_name.is_default_graph()
-                        && matches!(quad.object, oxrdf::TermRef::NamedNode(value) if value == class.as_ref())
-                })
-                .map(|quad| quad.subject.into_owned().into()),
-        );
-    }
-    if let Some(root) = root {
-        focuses.push(root.clone().into());
-    }
-    let mut unique = Vec::with_capacity(focuses.len());
-    for focus in focuses {
-        if !unique.contains(&focus) {
-            unique.push(focus);
-        }
-    }
-    Ok(unique)
-}
-
-fn target_terms(shapes: &Dataset, shape: &NamedOrBlankNode) -> Vec<Term> {
-    ["targetClass", "targetNode"]
-        .into_iter()
-        .flat_map(|local| objects(shapes, shape, &format!("{SH}{local}")))
-        .collect()
-}
-
-fn predicate_path(
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    profile_revision: Ulid,
-) -> Result<NamedNode, ProfileEvaluatorError> {
-    let paths = objects(shapes, shape, &format!("{SH}path"));
-    match paths.as_slice() {
-        [Term::NamedNode(path)] => Ok(path.clone()),
-        _ => Err(unsupported_error(
-            "sh:path",
-            "each property shape must have exactly one predicate-IRI sh:path",
-            profile_revision,
-        )),
-    }
-}
-
-fn severity(
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    profile_revision: Ulid,
-) -> Result<MetadataProfileValidationSeverity, ProfileEvaluatorError> {
-    let values = objects(shapes, shape, &format!("{SH}severity"));
-    match values.as_slice() {
-        [] => Ok(MetadataProfileValidationSeverity::Violation),
-        [Term::NamedNode(value)] if value.as_str() == format!("{SH}Violation") => {
-            Ok(MetadataProfileValidationSeverity::Violation)
-        }
-        [Term::NamedNode(value)] if value.as_str() == format!("{SH}Warning") => {
-            Ok(MetadataProfileValidationSeverity::Warning)
-        }
-        [Term::NamedNode(value)] if value.as_str() == format!("{SH}Info") => {
-            Ok(MetadataProfileValidationSeverity::Info)
-        }
-        _ => Err(unsupported_error(
-            "sh:severity",
-            "sh:severity must be one of sh:Violation, sh:Warning, or sh:Info",
-            profile_revision,
-        )),
-    }
-}
-
-fn deactivated(
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    profile_revision: Ulid,
-) -> Result<bool, ProfileEvaluatorError> {
-    Ok(optional_boolean(shapes, shape, "deactivated", profile_revision)?.unwrap_or(false))
-}
-
-fn optional_boolean(
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    local: &str,
-    profile_revision: Ulid,
-) -> Result<Option<bool>, ProfileEvaluatorError> {
-    let values = objects(shapes, shape, &format!("{SH}{local}"));
-    match values.as_slice() {
-        [] => Ok(None),
-        [Term::Literal(value)] if matches!(value.value(), "true" | "1") => Ok(Some(true)),
-        [Term::Literal(value)] if matches!(value.value(), "false" | "0") => Ok(Some(false)),
-        _ => Err(unsupported_error(
-            &format!("sh:{local}"),
-            &format!("sh:{local} must be one boolean"),
-            profile_revision,
-        )),
-    }
-}
-
-fn single_named(
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    local: &str,
-    profile_revision: Ulid,
-) -> Result<Option<NamedNode>, ProfileEvaluatorError> {
-    match objects(shapes, shape, &format!("{SH}{local}")).as_slice() {
-        [] => Ok(None),
-        [Term::NamedNode(value)] => Ok(Some(value.clone())),
-        _ => Err(unsupported_error(
-            &format!("sh:{local}"),
-            &format!("sh:{local} must have exactly one IRI value"),
-            profile_revision,
-        )),
-    }
-}
-
-fn single_literal(
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    local: &str,
-    profile_revision: Ulid,
-) -> Result<Option<String>, ProfileEvaluatorError> {
-    match objects(shapes, shape, &format!("{SH}{local}")).as_slice() {
-        [] => Ok(None),
-        [Term::Literal(value)] => Ok(Some(value.value().to_string())),
-        _ => Err(unsupported_error(
-            &format!("sh:{local}"),
-            &format!("sh:{local} must have exactly one literal value"),
-            profile_revision,
-        )),
-    }
-}
-
-fn single_term(
-    shapes: &Dataset,
-    shape: &NamedOrBlankNode,
-    local: &str,
-    profile_revision: Ulid,
-) -> Result<Option<Term>, ProfileEvaluatorError> {
-    match objects(shapes, shape, &format!("{SH}{local}")).as_slice() {
-        [] => Ok(None),
-        [value] => Ok(Some(value.clone())),
-        _ => Err(unsupported_error(
-            &format!("sh:{local}"),
-            &format!("sh:{local} must have exactly one value"),
-            profile_revision,
-        )),
-    }
-}
-
-fn message(shapes: &Dataset, shape: &NamedOrBlankNode) -> Option<String> {
-    objects(shapes, shape, &format!("{SH}message"))
-        .into_iter()
-        .find_map(|term| match term {
-            Term::Literal(value) => Some(value.value().to_string()),
-            _ => None,
-        })
-}
-
-fn rdf_list(
-    shapes: &Dataset,
-    head: &Term,
-    profile_revision: Ulid,
-) -> Result<Vec<Term>, ProfileEvaluatorError> {
-    let mut cursor = head.clone();
-    let mut values = Vec::new();
-    let mut visited = HashSet::new();
-    loop {
-        if matches!(&cursor, Term::NamedNode(node) if node.as_str() == RDF_NIL) {
-            return Ok(values);
-        }
-        let node = term_as_node(cursor.clone()).ok_or_else(|| {
-            unsupported_error(
-                "rdf:list",
-                "SHACL list value is not an RDF list",
-                profile_revision,
-            )
-        })?;
-        if !visited.insert(node.clone()) || visited.len() > RDF_LIST_LIMIT {
-            return Err(unsupported_error(
-                "rdf:list",
-                "SHACL list is cyclic or exceeds the supported bound",
-                profile_revision,
-            ));
-        }
-        let first = objects(shapes, &node, RDF_FIRST);
-        let rest = objects(shapes, &node, RDF_REST);
-        let ([first], [rest]) = (first.as_slice(), rest.as_slice()) else {
-            return Err(unsupported_error(
-                "rdf:list",
-                "SHACL list is malformed",
-                profile_revision,
-            ));
-        };
-        values.push(first.clone());
-        cursor = rest.clone();
-    }
-}
-
 fn objects(dataset: &Dataset, subject: &NamedOrBlankNode, predicate: &str) -> Vec<Term> {
     let predicate = NamedNode::new_unchecked(predicate);
     dataset
         .quads_for_subject(subject)
         .filter(|quad| quad.graph_name.is_default_graph() && quad.predicate == predicate.as_ref())
         .map(|quad| quad.object.into_owned())
-        .collect()
-}
-
-fn subjects(dataset: &Dataset, predicate: &str, object: &Term) -> Vec<NamedOrBlankNode> {
-    let predicate = NamedNode::new_unchecked(predicate);
-    dataset
-        .quads_for_predicate(&predicate)
-        .filter(|quad| quad.graph_name.is_default_graph() && quad.object == object.as_ref())
-        .map(|quad| quad.subject.into_owned())
-        .collect()
-}
-
-fn subjects_for_predicate(dataset: &Dataset, predicate: &str) -> Vec<NamedOrBlankNode> {
-    let predicate = NamedNode::new_unchecked(predicate);
-    dataset
-        .quads_for_predicate(&predicate)
-        .filter(|quad| quad.graph_name.is_default_graph())
-        .map(|quad| quad.subject.into_owned())
         .collect()
 }
 
@@ -1372,41 +793,6 @@ fn term_as_node(term: Term) -> Option<NamedOrBlankNode> {
         Term::NamedNode(node) => Some(NamedOrBlankNode::NamedNode(node)),
         Term::BlankNode(node) => Some(NamedOrBlankNode::BlankNode(node)),
         _ => None,
-    }
-}
-
-fn unsigned_integer(term: &Term) -> Option<u64> {
-    match term {
-        Term::Literal(value) => value.value().parse().ok(),
-        _ => None,
-    }
-}
-
-fn values_clause(focuses: &[Term]) -> String {
-    focuses
-        .iter()
-        .map(Term::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn node_token(node: &NamedOrBlankNode) -> String {
-    node.to_string()
-}
-
-fn node_value(node: &NamedOrBlankNode) -> String {
-    match node {
-        NamedOrBlankNode::NamedNode(node) => node.as_str().to_string(),
-        NamedOrBlankNode::BlankNode(node) => node.to_string(),
-    }
-}
-
-fn term_value(term: &Term) -> String {
-    match term {
-        Term::NamedNode(node) => node.as_str().to_string(),
-        Term::BlankNode(node) => node.to_string(),
-        Term::Literal(value) => value.to_string(),
-        Term::Triple(triple) => triple.to_string(),
     }
 }
 
@@ -1425,12 +811,17 @@ fn default_message(component: &str) -> &'static str {
     }
 }
 
-fn unsupported_error(rule: &str, message: &str, profile_revision: Ulid) -> ProfileEvaluatorError {
-    ProfileEvaluatorError::Unsupported(vec![unsupported_finding(
-        rule,
-        message.to_string(),
-        profile_revision,
-    )])
+fn limit_finding(message: String, profile_revision: Ulid) -> MetadataProfileValidationFinding {
+    MetadataProfileValidationFinding {
+        code: "validation_limit".to_string(),
+        severity: MetadataProfileValidationSeverity::Violation,
+        focus_node: None,
+        path: None,
+        rule: "validation_limit".to_string(),
+        message,
+        profile_revision: Some(profile_revision),
+        completeness: MetadataProfileValidationCompleteness::Incomplete,
+    }
 }
 
 fn unsupported_finding(
@@ -1484,132 +875,99 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
+    use craqle::{EncodedTerm, ShaclMessage};
 
-    const DATA: &str = r#"{
-      "@context": "https://w3id.org/ro/crate/1.2/context",
-      "@graph": [
-        {"@id":"ro-crate-metadata.json","@type":"CreativeWork","conformsTo":{"@id":"https://w3id.org/ro/crate/1.2"},"about":{"@id":"https://example.test/dataset"}},
-        {"@id":"https://example.test/dataset","@type":"Dataset","name":"Example","description":"allowed"}
-      ]
-    }"#;
-
-    fn evaluate(
-        shapes: &str,
-    ) -> Result<Vec<MetadataProfileValidationFinding>, ProfileEvaluatorError> {
-        let (data, root) = data_graph(DATA).unwrap();
-        SparevalShaclEvaluator.evaluate(ProfileEvaluationRequest {
-            data: &data,
-            root: &root,
-            shapes: &[shapes],
-            profile_revision: Ulid::from_parts(1, 1),
-        })
+    fn result(component: &str, severity: &str, path: Option<&str>) -> ShaclValidationResult {
+        ShaclValidationResult {
+            focus_node: EncodedTerm("<https://example.test/dataset>".to_string()),
+            value: None,
+            result_path: path.map(str::to_string),
+            source_shape: EncodedTerm("<urn:shape>".to_string()),
+            source_constraint_component: component.to_string(),
+            severity: EncodedTerm(format!("<{SH}{severity}>")),
+            messages: Vec::new(),
+        }
     }
 
     #[test]
-    fn enforces_supported_core_constraints_and_open_world_default() {
-        let findings = evaluate(r#"
-            @prefix sh: <http://www.w3.org/ns/shacl#> .
-            @prefix schema: <http://schema.org/> .
-            @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
-            <urn:shape> a sh:NodeShape ;
-              sh:targetClass schema:Dataset ;
-              sh:property [ sh:path schema:name ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] .
-        "#).unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn enforces_value_class_kind_pattern_set_and_required_value() {
-        let findings = evaluate(
-            r#"
-            @prefix sh: <http://www.w3.org/ns/shacl#> .
-            @prefix schema: <http://schema.org/> .
-            <urn:shape> a sh:NodeShape ;
-              sh:targetNode <https://example.test/dataset> ;
-              sh:class schema:Dataset ;
-              sh:property [
-                sh:path schema:name ;
-                sh:nodeKind sh:Literal ;
-                sh:pattern "^Ex" ;
-                sh:in ( "Example" "Alternative" ) ;
-                sh:hasValue "Example"
-              ] .
-        "#,
-        )
-        .unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn preserves_non_violation_severity_in_findings() {
-        let findings = evaluate(
-            r#"
-            @prefix sh: <http://www.w3.org/ns/shacl#> .
-            @prefix schema: <http://schema.org/> .
-            <urn:shape> a sh:NodeShape ;
-              sh:targetNode <https://example.test/dataset> ;
-              sh:property [ sh:path schema:missing ; sh:minCount 1 ; sh:severity sh:Warning ] .
-        "#,
-        )
-        .unwrap();
-        assert_eq!(findings.len(), 1);
+    fn maps_component_rules() {
         assert_eq!(
-            findings[0].severity,
-            MetadataProfileValidationSeverity::Warning
+            constraint_term(&format!("{SH}MinCountConstraintComponent")).as_deref(),
+            Some("minCount")
+        );
+        assert_eq!(
+            constraint_term(&format!("{SH}QualifiedMinCountConstraintComponent")).as_deref(),
+            Some("qualifiedMinCount")
+        );
+        assert_eq!(constraint_term("urn:custom:component"), None);
+    }
+
+    #[test]
+    fn decodes_term_forms() {
+        assert_eq!(
+            decode_term("<https://example.test/a>"),
+            "https://example.test/a"
+        );
+        assert_eq!(decode_term("_:b0"), "_:b0");
+        assert_eq!(decode_term("\"value\""), "\"value\"");
+    }
+
+    #[test]
+    fn maps_shacl_severities() {
+        let revision = Ulid::from_parts(1, 1);
+        let finding = constraint_finding(
+            &result(&format!("{SH}MinCountConstraintComponent"), "Warning", None),
+            revision,
+        );
+        assert_eq!(finding.severity, MetadataProfileValidationSeverity::Warning);
+        assert_eq!(finding.rule, format!("{SH}minCount"));
+        assert_eq!(
+            finding.message,
+            "fewer values are present than the Profile requires"
+        );
+        for (severity, expected) in [
+            ("Trace", MetadataProfileValidationSeverity::Info),
+            ("Debug", MetadataProfileValidationSeverity::Info),
+            ("Info", MetadataProfileValidationSeverity::Info),
+            ("Violation", MetadataProfileValidationSeverity::Violation),
+            ("Custom", MetadataProfileValidationSeverity::Violation),
+        ] {
+            let finding = constraint_finding(
+                &result(&format!("{SH}MinCountConstraintComponent"), severity, None),
+                revision,
+            );
+            assert_eq!(finding.severity, expected);
+        }
+    }
+
+    #[test]
+    fn prefers_shape_message() {
+        let mut input = result(
+            &format!("{SH}DatatypeConstraintComponent"),
+            "Violation",
+            Some("<http://schema.org/name>"),
+        );
+        input.messages.push(ShaclMessage {
+            language: None,
+            text: "name must be a string".to_string(),
+        });
+        let finding = constraint_finding(&input, Ulid::from_parts(1, 1));
+        assert_eq!(finding.message, "name must be a string");
+        assert_eq!(finding.path.as_deref(), Some("http://schema.org/name"));
+        assert_eq!(
+            finding.focus_node.as_deref(),
+            Some("https://example.test/dataset")
         );
     }
 
     #[test]
-    fn closed_shape_rejects_extra_data() {
-        let source = r#"
-            @prefix sh: <http://www.w3.org/ns/shacl#> .
-            @prefix schema: <http://schema.org/> .
-            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-            <urn:shape> a sh:NodeShape ;
-              sh:targetClass schema:Dataset ; sh:closed true ; sh:ignoredProperties ( rdf:type ) ;
-              sh:property [ sh:path schema:name ] .
-        "#;
-        let findings = evaluate(source).unwrap();
-        assert!(
-            findings.iter().any(|finding| {
-                finding.rule == format!("{SH}closed")
-                    && finding
-                        .path
-                        .as_deref()
-                        .is_some_and(|path| path.ends_with("/description"))
-            }),
-            "{findings:#?}"
+    fn limits_are_incomplete() {
+        let finding = limit_finding("budget exhausted".to_string(), Ulid::from_parts(1, 1));
+        assert_eq!(finding.code, "validation_limit");
+        assert_eq!(
+            finding.completeness,
+            MetadataProfileValidationCompleteness::Incomplete
         );
-    }
-
-    #[test]
-    fn unsupported_constraint_fails_closed() {
-        let error = evaluate(
-            r#"
-            @prefix sh: <http://www.w3.org/ns/shacl#> .
-            <urn:shape> a sh:NodeShape ; sh:minLength 2 .
-        "#,
-        )
-        .unwrap_err();
-        let ProfileEvaluatorError::Unsupported(findings) = error else {
-            panic!("expected unsupported finding");
-        };
-        assert_eq!(findings[0].code, "unsupported_constraint");
-        assert_eq!(findings[0].rule, "http://www.w3.org/ns/shacl#minLength");
-    }
-
-    #[test]
-    fn deactivated_shape_does_not_run() {
-        let findings = evaluate(
-            r#"
-            @prefix sh: <http://www.w3.org/ns/shacl#> .
-            @prefix schema: <http://schema.org/> .
-            <urn:shape> a sh:NodeShape ; sh:targetNode <https://example.test/dataset> ;
-              sh:deactivated true ; sh:property [ sh:path schema:missing ; sh:minCount 1 ] .
-        "#,
-        )
-        .unwrap();
-        assert!(findings.is_empty());
     }
 
     #[test]

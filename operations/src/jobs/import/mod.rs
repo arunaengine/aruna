@@ -1990,7 +1990,7 @@ mod tests {
             severity: aruna_core::metadata::MetadataProfileValidationSeverity::Violation,
             focus_node: None,
             path: None,
-            rule: "http://www.w3.org/ns/shacl#minLength".to_string(),
+            rule: "http://www.w3.org/ns/shacl#SPARQLConstraintComponent".to_string(),
             message: "unsupported".to_string(),
             profile_revision: None,
             completeness: aruna_core::metadata::MetadataProfileValidationCompleteness::Incomplete,

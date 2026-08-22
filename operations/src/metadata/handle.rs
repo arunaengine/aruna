@@ -36,9 +36,9 @@ use byteview::ByteView;
 use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
-    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
-    CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy, GraphSearchRequest,
-    PatchEntityRequest, RoCrateError, SearchRequest, SearchStorage, vocab,
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CrateViolation,
+    CreateCrateRequest, CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy,
+    GraphSearchRequest, PatchEntityRequest, RoCrateError, SearchRequest, SearchStorage, vocab,
 };
 use futures_util::FutureExt;
 use jsonwebtoken::DecodingKey;
@@ -54,6 +54,9 @@ use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::materialization_queue::metadata_graph_fence;
+use super::profile_shacl::{
+    ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
+};
 use super::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
@@ -293,6 +296,7 @@ struct MetadataInner {
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
     profile_validation_disabled: bool,
+    profile_shacl: Option<Arc<ProfileShaclEngine>>,
 }
 
 #[derive(Clone)]
@@ -850,6 +854,7 @@ impl MetadataHandle {
         document_sync_db: Option<fjall::OptimisticTxDatabase>,
         metadata_options: MetadataHandleOptions,
     ) -> Result<Self, MetadataError> {
+        let path = path.as_ref();
         let actor = ActorId::from_bytes(*node_id.as_bytes());
         let options = CraqleOptions::new()
             .with_actor(actor)
@@ -865,6 +870,14 @@ impl MetadataHandle {
         };
         let node = CraqleNode::open_with_options(path, options)
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let profile_shacl = if metadata_options.profile_validation_disabled {
+            None
+        } else {
+            Some(Arc::new(
+                ProfileShaclEngine::open(&path.join("profile-validation"))
+                    .map_err(|error| MetadataError::Backend(error.to_string()))?,
+            ))
+        };
         let pool_size = metadata_options.backend_pool_size.unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|cores| cores.get())
@@ -892,6 +905,7 @@ impl MetadataHandle {
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
                 profile_validation_disabled: metadata_options.profile_validation_disabled,
+                profile_shacl,
             }),
             storage_priority: StoragePriority::Foreground,
         })
@@ -994,6 +1008,45 @@ impl MetadataHandle {
 
     pub(crate) fn profile_validation_available(&self) -> bool {
         !self.inner.profile_validation_disabled
+    }
+
+    /// Structural RO-Crate findings for a candidate that carries no Profile
+    /// tag. Nothing is committed: the document is only prepared.
+    pub(crate) async fn preview_crate_structure(
+        &self,
+        jsonld: String,
+    ) -> Result<Vec<CrateViolation>, ProfileShaclError> {
+        self.run_profile_shacl(move |engine| engine.structural(&jsonld))
+            .await
+    }
+
+    /// Evaluates one candidate against a registered Profile's shapes.
+    pub(crate) async fn evaluate_profile_shapes(
+        &self,
+        profile: ProfileShapes,
+        jsonld: String,
+    ) -> Result<ProfileShaclReport, ProfileShaclError> {
+        self.run_profile_shacl(move |engine| engine.evaluate(&profile, &jsonld))
+            .await
+    }
+
+    async fn run_profile_shacl<T, F>(&self, work: F) -> Result<T, ProfileShaclError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ProfileShaclEngine) -> Result<T, ProfileShaclError> + Send + 'static,
+    {
+        let Some(engine) = self.inner.profile_shacl.clone() else {
+            return Err(ProfileShaclError::Unavailable {
+                message: "the profile evaluator is unavailable; retry or remove the Profile tag"
+                    .to_string(),
+            });
+        };
+        let _permit = self.inner.craqle_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || work(engine.as_ref()))
+            .await
+            .map_err(|error| ProfileShaclError::Unavailable {
+                message: error.to_string(),
+            })?
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next

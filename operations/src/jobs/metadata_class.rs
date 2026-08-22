@@ -148,13 +148,15 @@ mod tests {
 
     #[test]
     fn profile_gate_is_permanent_except_for_unavailable_dependencies() {
-        let permanent = create(CreateMetadataDocumentError::MetadataError(
-            MetadataError::ProfileValidation(vec![profile_finding("unsupported_constraint")]),
-        ));
-        assert!(matches!(
-            classify_metadata(permanent),
-            MetadataFailure::Permanent(_)
-        ));
+        for code in ["unsupported_constraint", "validation_limit"] {
+            let permanent = create(CreateMetadataDocumentError::MetadataError(
+                MetadataError::ProfileValidation(vec![profile_finding(code)]),
+            ));
+            assert!(matches!(
+                classify_metadata(permanent),
+                MetadataFailure::Permanent(_)
+            ));
+        }
 
         let retryable = create(CreateMetadataDocumentError::MetadataError(
             MetadataError::ProfileValidation(vec![profile_finding("validator_unavailable")]),
