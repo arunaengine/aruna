@@ -1459,11 +1459,13 @@ mod tests {
         begin_transaction(&mut operation, effects.as_slice());
         operation.conflict_recheck = true;
 
-        let expected = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+        let mut expected = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor,
             group_id,
             document_id,
         ));
+        // The status carries its construction time; the copy keeps the original's.
+        expected.profile_validation_status = operation.profile_validation_status.clone();
         assert_eq!(operation.fresh_copy(), expected);
     }
 
