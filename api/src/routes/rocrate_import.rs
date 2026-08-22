@@ -945,6 +945,7 @@ mod tests {
         let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
         config.seed_default_placement();
         config.ensure_node(node_id, RealmNodeKind::Server);
+        config.seed_job_control(node_id, 0);
         let actor = Actor {
             node_id,
             user_id: user,

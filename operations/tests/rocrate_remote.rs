@@ -455,7 +455,9 @@ async fn seed_exporter(
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
+    config.seed_job_control(node.net.node_id(), 0);
     config.ensure_node(peer, RealmNodeKind::Server);
+    config.seed_job_control(peer, 1);
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
     let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
     let writes = vec![

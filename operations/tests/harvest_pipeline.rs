@@ -161,6 +161,7 @@ async fn seed_config(storage: &StorageHandle, actor: &Actor) -> Result<(), BoxEr
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    config.seed_job_control(actor.node_id, 0);
     write_value(
         storage,
         REALM_CONFIG_KEYSPACE,

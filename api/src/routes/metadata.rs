@@ -5937,13 +5937,14 @@ mod tests {
     ) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
-        for node in nodes {
+        for (band, node) in nodes.iter().enumerate() {
             let kind = if Some(node.net.node_id()) == user_node {
                 RealmNodeKind::User
             } else {
                 RealmNodeKind::Server
             };
             config.ensure_node(node.net.node_id(), kind);
+            config.seed_job_control(node.net.node_id(), band as u32);
         }
 
         for node in nodes {
@@ -6929,6 +6930,7 @@ mod tests {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         config.ensure_node(node_id, RealmNodeKind::Server);
+        config.seed_job_control(node_id, 0);
         write_doc(
             &driver_ctx,
             REALM_CONFIG_KEYSPACE,
@@ -7012,6 +7014,7 @@ mod tests {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         config.ensure_node(node_id, RealmNodeKind::Server);
+        config.seed_job_control(node_id, 0);
         write_doc(
             &driver_ctx,
             REALM_CONFIG_KEYSPACE,

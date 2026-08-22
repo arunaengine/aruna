@@ -1125,6 +1125,7 @@ async fn seed_realm_config(
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    config.seed_job_control(actor.node_id, 0);
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
