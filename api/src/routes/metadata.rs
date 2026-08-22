@@ -1127,7 +1127,8 @@ pub async fn get_metadata_path(
     tag = "metadata",
     summary = "Get backend Profile validation capabilities",
     description = "Shapes registered as a Profile are compiled and executed by craqle's native SHACL Core Subset v1 engine, server side and authoritative. Supported targets are sh:targetClass, sh:targetNode, sh:targetSubjectsOf, sh:targetObjectsOf, and implicit class targets; a node shape that names no target at all is bound to the crate root, so a Profile can constrain the root entity without knowing its minted IRI. Supported paths are predicate, sh:inversePath, sequence, sh:alternativePath, sh:zeroOrOnePath, sh:zeroOrMorePath, and sh:oneOrMorePath. The supported constraint set is listed in supported_constraints. SHACL-SPARQL, SHACL-JS, SHACL-AF, custom components and targets, recursive shapes, RDF-star terms, and remote owl:imports fail closed with an unsupported_constraint finding that names the construct; the same finding is returned when the registered Turtle cannot be parsed. sh:class is exact rdf:type membership: no RDFS or OWL inference is applied, so a subclass instance does not satisfy a superclass constraint. Shapes may reference crate-local ids relative to the crate root, for example sh:hasValue <#person-1>. Evaluation is bounded: exceeding the result, path-edge, or path-depth budget returns a permanent validation_limit finding with incomplete completeness instead of a partial verdict, while a temporarily unavailable Profile or evaluator returns 503 with Retry-After.",
-    responses((status = 200, description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms", body = ProfileValidationCapabilitiesResponse))
+    responses((status = 200, description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms", body = ProfileValidationCapabilitiesResponse,
+        example = json!({"evaluator": "craqle-shacl-core/0.2", "supported_constraints": ["sh:targetClass", "sh:property", "sh:path", "sh:minCount", "sh:maxCount", "sh:datatype", "sh:class", "sh:nodeKind", "sh:pattern", "sh:in", "sh:hasValue", "sh:closed"], "unsupported_constraint_policy": "fail_closed", "public_profile_iri_template": "https://w3id.org/aruna/profile/{document_id}", "legacy_profile_iri_template": "https://w3id.org/aruna/{document_id}"})))
 )]
 pub async fn profile_validation_capabilities()
 -> (StatusCode, Json<ProfileValidationCapabilitiesResponse>) {
@@ -1152,9 +1153,11 @@ pub async fn profile_validation_capabilities()
     tag = "metadata",
     summary = "Preview the Profile verdict for an unsaved RO-Crate draft",
     description = "Runs the exact verdict POST /metadata and PUT /metadata/{document_id}/rocrate would enforce against a draft, without storing anything. structural_violations carries the RO-Crate structural failures and findings carries the Profile constraint findings; accepted is true only when both would let the write through. The draft is evaluated under its own crate root, so focus nodes and paths are reported in crate-local form with the root as `./`. Requires an authenticated realm caller; no document permission is checked because only the realm-public registered Profile is read.",
-    request_body = ProfileValidationPreviewRequest,
+    request_body(content = ProfileValidationPreviewRequest,
+        example = json!({"rocrate": {"@context": "https://w3id.org/ro/crate/1.3/context", "@graph": [{"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "conformsTo": {"@id": "https://w3id.org/ro/crate/1.3"}, "about": {"@id": "./"}}, {"@id": "./", "@type": "Dataset", "name": "Draft dataset", "description": "Validated before it is saved", "datePublished": "2026-08-22", "conformsTo": {"@id": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000"}}]}})),
     responses(
-        (status = 200, description = "Verdict for the draft, including structural violations and Profile findings", body = ProfileValidationPreviewResponse),
+        (status = 200, description = "Verdict for the draft, including structural violations and Profile findings", body = ProfileValidationPreviewResponse,
+            example = json!({"accepted": false, "state": "invalid", "profile_id": "01JPROFILE0000000000000000", "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000", "profile_revision": "01JPROFILEREVISION00000000", "evaluator": "craqle-shacl-core/0.2", "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "http://schema.org/identifier", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "fewer values are present than the Profile requires", "profile_revision": "01JPROFILEREVISION00000000", "completeness": "complete"}], "completeness": "complete", "structural_violations": []})),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
         (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
         (status = 503, description = "The Profile or the evaluator is temporarily unavailable", body = ErrorResponse)
@@ -1182,7 +1185,8 @@ pub async fn preview_profile_validation(
     description = "Returns the durable validation status written atomically with the accepted metadata revision. The response becomes stale when either the Dataset revision or the exact registered Profile revision changes. Authentication is optional and uses the same document READ rules as metadata retrieval.",
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
-        (status = 200, description = "Current, invalid, unprofiled, or stale revision-bound validation status", body = ProfileValidationStatusResponse),
+        (status = 200, description = "Current, invalid, unprofiled, or stale revision-bound validation status", body = ProfileValidationStatusResponse,
+            example = json!({"document_id": "01JMETADATA0123456789ABCDE", "dataset_revision": "01JREVISION000000000000000", "state": "invalid", "profile_id": "01JPROFILE0000000000000000", "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000", "profile_revision": "01JPROFILEREVISION00000000", "evaluator": "craqle-shacl-core/0.2", "validated_at_ms": 1787000000000_u64, "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "http://schema.org/identifier", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "fewer values are present than the Profile requires", "profile_revision": "01JPROFILEREVISION00000000", "completeness": "complete"}], "completeness": "complete", "stale_reason": null})),
         (status = 400, description = "Document id is not a structured metadata id", body = ErrorResponse),
         (status = 401, description = "A holder rejected the forwarded credential", body = ErrorResponse),
         (status = 403, description = "READ is denied", body = ErrorResponse),
@@ -1218,7 +1222,8 @@ pub async fn get_profile_validation_status(
     description = "Reconstructs validation from the last accepted raw Dataset revision and the registered Profile's current exact revision, fences the Dataset revision, and durably replaces the status. Requires an authenticated caller allowed to READ the document.",
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
-        (status = 200, description = "Fresh valid, invalid, or unprofiled status", body = ProfileValidationStatusResponse),
+        (status = 200, description = "Fresh valid, invalid, or unprofiled status", body = ProfileValidationStatusResponse,
+            example = json!({"document_id": "01JMETADATA0123456789ABCDE", "dataset_revision": "01JREVISION000000000000000", "state": "valid", "profile_id": "01JPROFILE0000000000000000", "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000", "profile_revision": "01JPROFILEREVISION00000000", "evaluator": "craqle-shacl-core/0.2", "validated_at_ms": 1787000000000_u64, "findings": [], "completeness": "complete", "stale_reason": null})),
         (status = 400, description = "Document id or Profile tag is invalid", body = ErrorResponse),
         (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
         (status = 403, description = "READ is denied", body = ErrorResponse),
@@ -2316,9 +2321,11 @@ fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
     tag = "metadata",
     summary = "Preflight destructive content operations against metadata backlinks",
     description = "Maps a bounded exact content-W3ID set or an authorized bucket/prefix inventory to canonical content identities, then queries canonical and known legacy location IRIs. Local mode reports realm coverage incomplete. Distributed mode fans out to realm nodes and reports per-node index freshness, failed partitions, and stable cursor pagination. With allow_partial=false, any failed, stale, or otherwise incomplete partition returns 503 rather than silently downgrading the request. Restricted referencing documents are represented only by hidden_references_exist; their count and identity are never returned.",
-    request_body = MetadataReferencePreflightBody,
+    request_body(content = MetadataReferencePreflightBody,
+        example = json!({"target": {"kind": "bucket_prefix", "bucket": "results", "prefix": "run-42/", "operation": "latest_version_tombstone"}, "allow_partial": true, "limit": 50})),
     responses(
-        (status = 200, description = "Reference warnings, location impact, pagination, and explicit coverage metadata", body = MetadataReferencePreflightResponse),
+        (status = 200, description = "Reference warnings, location impact, pagination, and explicit coverage metadata", body = MetadataReferencePreflightResponse,
+            example = json!({"targets": [{"content_w3id": "https://w3id.org/aruna/data/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "targeted_versions": [{"node_id": "node-a", "bucket": "results", "key": "run-42/output.csv", "version_id": "01JVERSION0000000000000000"}], "visible_references": [{"document_id": "01JMETADATA0123456789ABCDE", "title": "Run 42 results"}], "hidden_references_exist": false, "would_remove_last_resolvable_aruna_location": true, "location_impact_complete": true}], "next_cursor": null, "truncated": false, "nodes_queried": 3, "nodes_failed": 0, "complete": true, "failed_partitions": [], "coverage": {"queried_scope": "realm", "queried_forms": ["content_w3id", "aruna_s3_url"], "excluded_forms": [{"form": "literal_content_url", "reason": "plain string contentUrl values are structurally invisible"}], "node_freshness": [{"node_id": "node-a", "index_state": "fresh", "oldest_status_updated_at_ms": 1787000000000_u64}], "target_resolution_complete": true, "path_style_endpoint_coverage_complete": true, "realm_coverage_complete": true}})),
         (status = 400, description = "Malformed or oversized target set, unsupported content identity, or invalid cursor", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Wrong realm or insufficient WRITE permission for the bucket/prefix", body = ErrorResponse),

@@ -401,7 +401,8 @@ pub async fn bucket_search(
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode")
     ),
     responses(
-        (status = 200, description = "Authorized live object heads with explicit coverage", body = ObjectSearchResponse),
+        (status = 200, description = "Authorized live object heads with explicit coverage", body = ObjectSearchResponse,
+            example = json!({"hits": [{"kind": "object", "mode": "distributed_best_effort", "issuer_node_id": "node-a", "group_id": "01JGROUP000000000000000000", "bucket": "results", "key": "run-42/output.csv", "content_w3id": "https://w3id.org/aruna/data/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "checksum": {"algorithm": "blake3", "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, "size": 4096, "updated_at": "2026-08-22T12:00:00Z"}], "next_cursor": null, "coverage": {"scope": "realm", "mode": "distributed_best_effort", "index_freshness": {"source": "inventory", "as_of": "2026-08-22T12:00:00Z", "oldest_observed_at": "2026-08-22T11:59:00Z"}, "nodes_queried": 3, "nodes_failed": 0, "failed_partitions": [], "omitted_partitions": 0, "complete": true, "truncated": false, "partitions": [{"node_id": "node-a", "observed_at": "2026-08-22T12:00:00Z", "truncated": false}]}})),
         (status = 400, description = "Malformed query or cursor", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
