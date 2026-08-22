@@ -722,12 +722,26 @@ pub fn choose_origin_bucket(
     subject: &[u8],
 ) -> Option<PlacementRef> {
     let held = held_buckets(config, strategy, origin);
+    // Buckets this node leads keep the create local: the leading holder is
+    // also the persistent-id authority, so no forward is needed.
+    let led: Vec<u32> = held
+        .iter()
+        .copied()
+        .filter(|shard| {
+            let placement = PlacementRef {
+                strategy_id: strategy.strategy_id,
+                shard: *shard,
+            };
+            resolve_shard_holders(config, &placement).first() == Some(&origin)
+        })
+        .collect();
+    let pool = if led.is_empty() { &held } else { &led };
     let candidates: Vec<([u8; 4], u64)> =
-        held.iter().map(|shard| (shard.to_be_bytes(), 1)).collect();
+        pool.iter().map(|shard| (shard.to_be_bytes(), 1)).collect();
     let best = *rank_weighted(ROLE_SHARD, subject, &candidates).first()?;
     Some(PlacementRef {
         strategy_id: strategy.strategy_id,
-        shard: held[best],
+        shard: pool[best],
     })
 }
 
@@ -890,18 +904,31 @@ mod tests {
 
     #[test]
     fn origin_buckets_spread() {
+        // Creates spread across the buckets the origin leads, never landing
+        // in one it merely holds while another node leads it.
         let (config, _) = config_and_placement();
         let strategy = strategy_of(&config);
-        let held = held_buckets(&config, strategy, node(1));
+        let led: Vec<u32> = held_buckets(&config, strategy, node(1))
+            .into_iter()
+            .filter(|shard| {
+                let placement = PlacementRef {
+                    strategy_id: strategy.strategy_id,
+                    shard: *shard,
+                };
+                resolve_shard_holders(&config, &placement).first() == Some(&node(1))
+            })
+            .collect();
+        assert!(!led.is_empty(), "fixture node leads no bucket");
         let chosen: std::collections::HashSet<u32> = (0..1_000u64)
             .filter_map(|seed| choose_origin_bucket(&config, strategy, node(1), &subject(seed)))
             .map(|placement| placement.shard)
             .collect();
+        assert!(chosen.iter().all(|shard| led.contains(shard)));
         assert!(
-            chosen.len() * 2 > held.len(),
-            "chosen {} of {} held buckets",
+            chosen.len() * 2 > led.len(),
+            "chosen {} of {} led buckets",
             chosen.len(),
-            held.len()
+            led.len()
         );
     }
 
