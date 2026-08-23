@@ -369,7 +369,18 @@ async fn require_group_read(
     path = "/policies/realm",
     tag = "policies",
     summary = "Read the realm's request policy set",
-    description = "Requires a bearer token issued for this realm and READ on the realm configuration path. Returns the stored realm-scoped policies in the order enforcement evaluates them, together with `set_hash`, the 64-character hexadecimal content address of the set that a later write can pass as `expected_hash`. Policies only ever narrow access: a deny policy rejects a request its expression matches and a require policy rejects one it does not match, and neither can grant anything the caller's roles do not already allow. A realm whose configuration has not been written or replicated to this node reads as an empty set rather than a missing resource.",
+    description = r#"Returns the stored realm-scoped request policies in the order enforcement evaluates them.
+
+**Authentication**: realm bearer token with READ on the realm configuration path.
+
+**Behavior**
+- `set_hash` is the 64-character hexadecimal content address of the set, which a later write can
+  pass as `expected_hash`.
+- Policies only ever narrow access: a deny policy rejects a request its expression matches and a
+  require policy rejects one it does not match, and neither can grant anything the caller's roles do
+  not already allow.
+- A realm whose configuration has not been written or replicated to this node reads as an empty set
+  rather than a missing resource."#,
     responses(
         (
             status = 200,
@@ -408,7 +419,23 @@ pub async fn get_realm_policies(
     path = "/policies/realm",
     tag = "policies",
     summary = "Replace the realm's request policy set",
-    description = "Requires a bearer token issued for this realm and WRITE on the realm configuration path. The set is replaced wholesale: policies missing from the request are removed, an entry without a `policy_id` is given a fresh one, and the stored order is the evaluation order. The set is checked before it is stored, so at most 64 policies per scope, at most 4096 bytes per expression or guard, and every expression and guard must compile; a failure names the offending policy and stores nothing. When `expected_hash` is sent it is compared inside the write transaction, and a set changed in the meantime is rejected without writing, so re-read the set and reapply. The new set takes effect on this node as soon as it commits and reaches the rest of the realm afterwards as a single last-writer-wins value, so other nodes keep enforcing their previous set until it arrives, and concurrent writes on two nodes resolve to one of them rather than merging.",
+    description = r#"Replaces the realm's request policy set wholesale with the submitted list.
+
+**Authentication**: realm bearer token with WRITE on the realm configuration path.
+
+**Behavior**
+- Policies missing from the request are removed, an entry without a `policy_id` is given a fresh
+  one, and the stored order is the evaluation order.
+- When `expected_hash` is sent it is compared inside the write transaction, and a set changed in the
+  meantime is rejected without writing, so re-read the set and reapply.
+- The new set takes effect on this node as soon as it commits and reaches the rest of the realm
+  afterwards as a single last-writer-wins value, so other nodes keep enforcing their previous set
+  until it arrives, and concurrent writes on two nodes resolve to one of them rather than merging.
+
+**Limits** (checked before storing; a failure names the offending policy and stores nothing)
+- At most 64 policies per scope.
+- At most 4096 bytes per expression or guard.
+- Every expression and guard must compile."#,
     request_body(
         content = SetPoliciesRequest,
         description = "The complete realm policy set, optionally guarded by the hash of the set it is expected to replace.",
@@ -503,7 +530,16 @@ pub async fn set_realm_policies(
     path = "/policies/group/{group_id}",
     tag = "policies",
     summary = "Read a group's request policy set",
-    description = "Requires a bearer token issued for this realm and READ on the group's administrative configuration path, which the group's built-in member and admin roles both grant. Returns the group-scoped policies in evaluation order with `set_hash`, the 64-character hexadecimal content address to pass as `expected_hash` on a write. Group policies are evaluated after the realm ones and, like them, can only narrow access. A group that carries no policies, and one whose authorization document has not replicated to this node, both read as an empty set.",
+    description = r#"Returns the group-scoped request policies in the order enforcement evaluates them.
+
+**Authentication**: realm bearer token with READ on the group's administrative configuration path,
+which the group's built-in member and admin roles both grant.
+
+**Behavior**
+- `set_hash` is the 64-character hexadecimal content address to pass as `expected_hash` on a write.
+- Group policies are evaluated after the realm ones and, like them, can only narrow access.
+- A group that carries no policies, and one whose authorization document has not replicated to this
+  node, both read as an empty set."#,
     params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
@@ -545,7 +581,24 @@ pub async fn get_group_policies(
     path = "/policies/group/{group_id}",
     tag = "policies",
     summary = "Replace a group's request policy set",
-    description = "Requires a bearer token issued for this realm and WRITE on the group's configuration path. The set is replaced wholesale: policies missing from the request are removed, an entry without a `policy_id` is given a fresh one, and the stored order is the evaluation order. The same limits apply as to the realm set, at most 64 policies and at most 4096 bytes per expression or guard, and every expression and guard must compile before anything is stored. When `expected_hash` is sent it is compared inside the write transaction and a set changed in the meantime is rejected without writing. The set takes effect on this node as soon as it commits and rides the group's authorization document to the rest of the realm afterwards as a single last-writer-wins value. Because policies only deny, a group set can restrict the group's own members further but can never widen what their roles grant.",
+    description = r#"Replaces a group's request policy set wholesale with the submitted list.
+
+**Authentication**: realm bearer token with WRITE on the group's configuration path.
+
+**Behavior**
+- Policies missing from the request are removed, an entry without a `policy_id` is given a fresh
+  one, and the stored order is the evaluation order.
+- When `expected_hash` is sent it is compared inside the write transaction and a set changed in the
+  meantime is rejected without writing.
+- The set takes effect on this node as soon as it commits and rides the group's authorization
+  document to the rest of the realm afterwards as a single last-writer-wins value.
+- Because policies only deny, a group set can restrict the group's own members further but can never
+  widen what their roles grant.
+
+**Limits** (the same as for the realm set, all checked before anything is stored)
+- At most 64 policies.
+- At most 4096 bytes per expression or guard.
+- Every expression and guard must compile."#,
     params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     request_body(
         content = SetPoliciesRequest,
@@ -640,8 +693,19 @@ pub async fn set_group_policies(
     get,
     path = "/policies/effective",
     tag = "policies",
-    summary = "List the policies that would be evaluated for a scope",
-    description = "Requires a bearer token issued for this realm and READ on the realm configuration path; naming a group additionally requires READ on that group's configuration path. Returns the realm policies first and the group policies after them, in exactly the order enforcement walks them, each entry labelled with the scope it came from so an inherited rule is distinguishable from a group-local one. Evaluation stops at the first policy that denies, so a later entry in this list only applies while every earlier one passes. The merged view is derived, not stored: it carries no content address, and changes are made through the per-scope endpoints.",
+    summary = "List the effective policies for a scope",
+    description = r#"Returns the realm policies followed by the group policies, in the order enforcement walks them.
+
+**Authentication**: realm bearer token with READ on the realm configuration path; naming a group
+additionally requires READ on that group's configuration path.
+
+**Behavior**
+- Each entry is labelled with the scope it came from, so an inherited rule is distinguishable from a
+  group-local one.
+- Evaluation stops at the first policy that denies, so a later entry in this list only applies while
+  every earlier one passes.
+- The merged view is derived, not stored: it carries no content address, and changes are made
+  through the per-scope endpoints."#,
     params(("group_id" = Option<String>, Query, description = "Group id as a 26-character ULID whose policies are appended after the realm ones; omit it to list realm policies only")),
     responses(
         (
@@ -711,7 +775,19 @@ pub async fn effective_policies(
     path = "/policies/validate",
     tag = "policies",
     summary = "Compile-check a candidate policy expression",
-    description = "Requires a bearer token issued for this realm and READ on the realm configuration path, because the endpoint compiles caller-supplied expressions; it is restricted to policy authors for that reason. Nothing is stored and no request is evaluated: the guard and expression are only parsed, and the report names the request variables they reference plus any variable or function outside the set enforcement provides. Unknown names are informational and do not by themselves make the candidate invalid, since a helper may be registered elsewhere; `valid` turns false only when a source fails to compile or exceeds 4096 bytes, and each reason is listed in `errors`.",
+    description = r#"Parses a candidate policy guard and expression and reports whether they compile.
+
+**Authentication**: realm bearer token with READ on the realm configuration path, because the
+endpoint compiles caller-supplied expressions; it is restricted to policy authors for that reason.
+
+**Behavior**
+- Nothing is stored and no request is evaluated: the guard and expression are only parsed.
+- The report names the request variables they reference plus any variable or function outside the
+  set enforcement provides.
+- Unknown names are informational and do not by themselves make the candidate invalid, since a
+  helper may be registered elsewhere.
+- `valid` turns false only when a source fails to compile or exceeds 4096 bytes, and each reason is
+  listed in `errors`."#,
     request_body(
         content = ValidatePolicyRequest,
         description = "The candidate expression, its kind, and an optional applicability guard.",
@@ -729,7 +805,11 @@ pub async fn effective_policies(
             example = json!({
                 "valid": true,
                 "errors": [],
-                "referenced_variables": ["operation", "path", "permission"],
+                "referenced_variables": [
+                    "operation",
+                    "path",
+                    "permission"
+                ],
                 "unknown_variables": [],
                 "unknown_functions": []
             })
@@ -770,7 +850,24 @@ pub async fn validate_policy(
     path = "/policies/dry-run",
     tag = "policies",
     summary = "Evaluate policies against a hypothetical request",
-    description = "Requires a bearer token issued for this realm; sending a `group_id` requires WRITE on that group's configuration path, and otherwise READ on the realm configuration path is required, with the stored scopes each additionally checked as if they were read directly. The call never changes anything: no policy is stored, and no real request is authorized or denied by it. Either ad hoc `candidate_policies` are evaluated, size- and compile-checked first, or, when none are given, the stored set named by `scope`. Within a scope the policies run in stored order, disabled ones are skipped, a guard that is false skips its policy, a deny matches when its expression is true and a require matches when it is not, and the first match ends evaluation; an expression that errors or does not return a boolean also denies, so a broken policy fails closed. The response reports whether the request would be denied, which scope and policy decided it, and a trace of every policy considered up to that point.",
+    description = r#"Evaluates policies against a hypothetical request and reports the decision they would reach.
+
+**Authentication**: realm bearer token; sending a `group_id` requires WRITE on that group's
+configuration path, and otherwise READ on the realm configuration path is required, with the stored
+scopes each additionally checked as if they were read directly.
+
+**Behavior**
+- The call never changes anything: no policy is stored, and no real request is authorized or denied
+  by it.
+- Either ad hoc `candidate_policies` are evaluated, size- and compile-checked first, or, when none
+  are given, the stored set named by `scope`.
+- Within a scope the policies run in stored order, disabled ones are skipped, a guard that is false
+  skips its policy, a deny matches when its expression is true and a require matches when it is not,
+  and the first match ends evaluation.
+- An expression that errors or does not return a boolean also denies, so a broken policy fails
+  closed.
+- The response reports whether the request would be denied, which scope and policy decided it, and a
+  trace of every policy considered up to that point."#,
     request_body(
         content = DryRunRequest,
         description = "The request attributes to evaluate, plus either candidate policies to try or the stored scope to evaluate.",
