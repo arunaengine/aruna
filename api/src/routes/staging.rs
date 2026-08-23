@@ -402,6 +402,7 @@ them.
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a prefix is not a confined relative path, or the batch would exceed 1000 objects", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or prefixes were given and the caller has no READ on the group's data path", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -576,6 +577,7 @@ unavailable job placement binding or an unhealthy structured id clock is a 503 c
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm, or the caller lacks READ on a source path or WRITE on a target key", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse),
+        (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
         (status = 503, description = "Job placement or the structured id clock is unavailable; retry the same body", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
