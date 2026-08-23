@@ -454,7 +454,8 @@ pub async fn put_compute_config(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<ComputeConfigBody>,
 ) -> ServerResult<Json<ComputeConfigBody>> {
-    let auth = require_realm_auth(&state, auth)?;
+    // Request policies live at this boundary; the operation only checks roles.
+    let auth = require_config_admin(&state, auth, Permission::WRITE).await?;
     let compute = compute_config(request)?;
     let stored = drive(
         SetRealmComputeOperation::new(SetRealmComputeConfig {

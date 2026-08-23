@@ -18,11 +18,6 @@ const BOUNDARY: &[&str] = &[
 /// is still authorized. A new route must gain a check or a reviewed entry here.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
-        "compute.rs",
-        "put_compute_config",
-        "realm-config WRITE checked inside SetRealmComputeOperation",
-    ),
-    (
         "credentials.rs",
         "list_s3_credentials",
         "self-scoped: only credentials whose identity is the caller",
@@ -71,12 +66,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "info.rs",
         "get_usage",
         "realm-wide counters intentionally open to every realm member",
-    ),
-    (
-        "info.rs",
-        "set_realm_quota",
-        "realm-config WRITE and the management-node guard checked inside \
-         SetRealmQuotaOperation",
     ),
     (
         "job_audit.rs",
@@ -272,16 +261,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "placement.rs",
         "resolve_placement_quarantine",
         "realm-admin WRITE checked inside ResolveQuarantineOperation",
-    ),
-    (
-        "policies.rs",
-        "set_group_policies",
-        "group-config WRITE checked inside SetGroupPoliciesOperation",
-    ),
-    (
-        "policies.rs",
-        "set_realm_policies",
-        "realm-config WRITE checked inside SetRealmPoliciesOperation",
     ),
     (
         "rocrate_import.rs",

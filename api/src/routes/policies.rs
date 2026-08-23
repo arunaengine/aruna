@@ -475,6 +475,14 @@ pub async fn set_realm_policies(
     Json(request): Json<SetPoliciesRequest>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    // Request policies live at this boundary; the operation only checks roles.
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{}/admin/config", state.get_realm_id()),
+        Permission::WRITE,
+    )
+    .await?;
 
     let policies = request
         .policies
@@ -643,6 +651,8 @@ pub async fn set_group_policies(
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
+    // Request policies live at this boundary; the operation only checks roles.
+    require_group_admin(&state, &auth, group_id).await?;
 
     let policies = request
         .policies
@@ -1369,6 +1379,15 @@ mod tests {
             &anonymous,
             format!("/{realm}/admin/config"),
             Permission::WRITE,
+        )
+        .await;
+        assert!(matches!(denied, Err(ServerError::Forbidden)));
+
+        // The config route itself must honour the deny, not only the RBAC check.
+        let denied = set_realm_policies(
+            State(fx.state.clone()),
+            Extension(Some(fx.admin.clone())),
+            Json(body("true")),
         )
         .await;
         assert!(matches!(denied, Err(ServerError::Forbidden)));

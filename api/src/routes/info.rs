@@ -1,4 +1,4 @@
-use crate::auth::{permission_granted, require_realm_auth};
+use crate::auth::{ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
@@ -7,7 +7,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     Actor, AuthContext, GroupQuotaOverride, Permission, PlacementScope, QuotaConfig,
-    UserGroupCapOverride,
+    UserGroupCapOverride, policy_admin_path,
 };
 use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
@@ -1409,13 +1409,23 @@ pub async fn mutate_realm_placement(
     };
     let context = state.get_ctx();
     let document = match action {
-        RealmPlacementAction::Mutation(mutation) => drive_realm_placement_mutation(
-            MutateRealmPlacementConfig { actor, mutation },
-            Some(auth),
-            &context,
-        )
-        .await
-        .map_err(map_mutate_realm_placement_error)?,
+        RealmPlacementAction::Mutation(mutation) => {
+            // Request policies live at this boundary; the operation only checks roles.
+            ensure_permission(
+                &state,
+                &auth,
+                policy_admin_path(actor.realm_id),
+                Permission::WRITE,
+            )
+            .await?;
+            drive_realm_placement_mutation(
+                MutateRealmPlacementConfig { actor, mutation },
+                Some(auth),
+                &context,
+            )
+            .await
+            .map_err(map_mutate_realm_placement_error)?
+        }
         RealmPlacementAction::Provision {
             strategy_id,
             group_id,
@@ -1566,6 +1576,14 @@ pub async fn set_realm_quota(
     Json(request): Json<RealmQuotaConfig>,
 ) -> ServerResult<(StatusCode, Json<RealmQuotaConfig>)> {
     let auth = require_realm_auth(&state, auth)?;
+    // Request policies live at this boundary; the operation only checks roles.
+    ensure_permission(
+        &state,
+        &auth,
+        policy_admin_path(state.get_realm_id()),
+        Permission::WRITE,
+    )
+    .await?;
     let quota = request.into_quota_config()?;
     let actor = Actor {
         node_id: state.get_node_id(),
