@@ -1078,8 +1078,9 @@ answers 404 rather than 403, so the surface never confirms that an id exists.
 - Node identities of other nodes are never disclosed; only the responder names itself, and an
   output whose owning node's S3 endpoint is unknown here carries `endpoint_url: null` rather than
   failing the read.
-- The read is answered by the node that owns the job, derived from the id itself: when that is
-  another node the request is forwarded under the caller's own bearer token.
+- A distributed execution job is answered here from the replicated family projection, without
+  routing. Every other kind is answered by the node that owns the job, derived from the id itself:
+  when that is another node the request is forwarded under the caller's own bearer token.
 - `run_crate` appears only for jobs that owe a run crate and reports that side obligation, not the
   job itself.
 
