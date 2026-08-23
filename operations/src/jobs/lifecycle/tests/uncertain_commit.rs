@@ -345,6 +345,7 @@ fn uncertain_never_drains() {
         (StorageError::TransactionConflict, CommitVerdict::Raced),
         (StorageError::CommitFailed, CommitVerdict::Uncertain),
         (StorageError::TransactionNotFound, CommitVerdict::Uncertain),
+        (StorageError::CleanupCapacity, CommitVerdict::Retry),
         (
             StorageError::KeyspaceError("x".to_string()),
             CommitVerdict::Uncertain,
