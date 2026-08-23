@@ -501,6 +501,7 @@ mod tests {
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::{AuthorizationError, StorageError};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::operation::Operation;
@@ -745,6 +746,34 @@ mod tests {
         assert_eq!(
             operation.finalize(),
             Err(SetGroupPoliciesError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn capacity_not_denied() {
+        // Storage exhaustion inside the check is infrastructure, not a verdict.
+        let realm_id = RealmId([23u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation = SetGroupPoliciesOperation::new(group_config(
+            &actor,
+            Ulid::from_bytes([5u8; 16]),
+            Vec::new(),
+            None,
+        ));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::StorageError(
+                    StorageError::CleanupCapacity,
+                )),
+            },
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetGroupPoliciesError::StorageError(
+                StorageError::CleanupCapacity
+            ))
         );
     }
 

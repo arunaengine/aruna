@@ -2617,6 +2617,30 @@ mod tests {
     }
 
     #[test]
+    fn capacity_not_denied() {
+        // Storage exhaustion inside the check is infrastructure, not a verdict.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::StorageError(
+                    StorageError::CleanupCapacity,
+                )),
+            },
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(MutateRealmPlacementError::StorageError(
+                StorageError::CleanupCapacity
+            ))
+        );
+    }
+
+    #[test]
     fn internal_skips_authorization() {
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(realm_id);

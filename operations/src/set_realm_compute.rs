@@ -705,6 +705,30 @@ mod tests {
     }
 
     #[test]
+    fn capacity_not_denied() {
+        // Storage exhaustion inside the check is infrastructure, not a verdict.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let actor = actor(realm_id);
+        let mut operation =
+            SetRealmComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::StorageError(
+                    StorageError::CleanupCapacity,
+                )),
+            },
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetRealmComputeError::StorageError(
+                StorageError::CleanupCapacity
+            ))
+        );
+    }
+
+    #[test]
     fn allowed_starts_transaction() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);

@@ -615,12 +615,14 @@ mod test {
     use crate::auth::{
         OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, bucket_blob_permission_path,
         extract_auth_context, extract_auth_context_and_bearer_token, handle_token,
+        map_authorize_error,
     };
-    use crate::error::TokenError;
+    use crate::error::{ServerError, TokenError};
     use crate::server::ServerState;
     use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
@@ -636,6 +638,7 @@ mod test {
     use aruna_operations::register_or_get_oidc_user::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
     };
+    use aruna_operations::request_authorization::AuthorizeError;
     use aruna_operations::revoke_token::{
         RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
     };
@@ -660,6 +663,23 @@ mod test {
     use tokio::net::TcpListener;
     use tokio::sync::RwLock;
     use ulid::Ulid;
+
+    #[test]
+    fn capacity_is_retryable() {
+        // The choke point must not hide a storage fault behind 403 or 500.
+        assert!(matches!(
+            map_authorize_error(AuthorizeError::Storage(StorageError::CleanupCapacity)),
+            ServerError::ServiceUnavailableReason(_)
+        ));
+        assert!(matches!(
+            map_authorize_error(AuthorizeError::Storage(StorageError::DeleteError)),
+            ServerError::InternalError(_)
+        ));
+        assert!(matches!(
+            map_authorize_error(AuthorizeError::PermissionDenied),
+            ServerError::Forbidden
+        ));
+    }
 
     #[tokio::test]
     async fn bucket_blob_permission_path_matches_canonical_blob_object_path() {
