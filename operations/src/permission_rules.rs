@@ -372,6 +372,8 @@ impl PermissionRulesOperation {
         ) = (self.state, event)
         {
             if self.txn_id == Some(txn_id) {
+                // The transaction is committed, so no later failure may abort it.
+                self.txn_id = None;
                 match self.emit_rules() {
                     Ok(effects) => effects,
                     Err(err) => self.fail(err),
@@ -1001,23 +1003,31 @@ mod test {
         ));
     }
 
-    // A completed collection must reject a late event instead of ignoring it.
+    // A completed collection must reject a late event without aborting the
+    // transaction it already committed.
     #[test]
     fn finished_rejects_event() {
         let realm_id = RealmId([16u8; 32]);
         let txn_id = Ulid::from(17u128);
-        let mut operation = PermissionRulesOperation::new_with_txn(
-            PermissionRulesConfig {
-                auth_context: AuthContext::anonymous(realm_id),
-                path: format!("/{realm_id}/admin"),
-            },
-            txn_id,
-        );
+        let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
+            auth_context: AuthContext::anonymous(realm_id),
+            path: format!("/{realm_id}/admin"),
+        });
         operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let realm = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        operation.step(Event::Storage(StorageEvent::ReadResult {
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(postcard::to_allocvec(&realm).unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: committed
+            })] if *committed == txn_id
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
         }));
         assert!(operation.is_complete());
 
