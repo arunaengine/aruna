@@ -509,8 +509,28 @@ async fn register_admin(
     post,
     path = "/users/register",
     tag = "users",
-    summary = "Register the calling OIDC identity as a realm user",
-    description = "Requires an OIDC bearer token from a configured issuer, not an Aruna access token. It serves two callers: a user registering themselves, and an operator bootstrapping the first realm administrator. Any holder of a valid OIDC token registers themselves by leaving the onboarding secret out; that path is get or create, so a subject that already has a user gets the existing user back unchanged, still with 201. Sending an onboarding secret takes the administrator path: the secret must have been issued for this realm with the initial administrator purpose, it is consumed single use, and the registered user then claims the initial realm administrator role. A secret issued for any other purpose is refused with 403, and one that is unknown, expired, already claimed or issued for another realm is refused with 401. The registered identity is always the subject of the presented token, never a user id chosen by the caller, and the display name comes from the token. The user document is written on the node that serves the request and replicates to the other realm nodes asynchronously, so it may not be visible elsewhere immediately. No access token is returned here: exchange the same OIDC token at GET /users/token.",
+    summary = "Register the calling OIDC identity",
+    description = r#"Registers the subject of the presented OIDC token as a user of this realm.
+
+**Authentication**: an OIDC bearer token from a configured issuer, not an Aruna access token. Any
+holder of a valid one registers themselves; an onboarding secret in the body additionally claims
+the initial realm administrator role.
+
+**Behavior**
+- Two callers are served: a user registering themselves, and an operator bootstrapping the first
+  realm administrator.
+- Leaving the onboarding secret out is get or create, so a subject that already has a user gets
+  the existing user back unchanged, still with 201.
+- An onboarding secret must have been issued for this realm with the initial administrator
+  purpose, it is consumed single use, and the registered user then claims that role.
+- The registered identity is always the subject of the presented token, never a user id chosen by
+  the caller, and the display name comes from the token.
+- The user document is written on the node that serves the request and replicates to the other
+  realm nodes asynchronously, so it may not be visible elsewhere immediately.
+- No access token is returned here: exchange the same OIDC token at `GET /users/token`.
+
+**Errors**: an onboarding secret issued for another purpose is refused with 403, while one that is
+unknown, expired, already claimed or issued for another realm is refused with 401."#,
     request_body(
         content = RegisterUserRequest,
         description = "Optional onboarding secret. Omit it, or send null, for ordinary self service registration; send the secret handed out by the node operator only to claim the initial realm administrator.",
@@ -518,13 +538,17 @@ async fn register_admin(
             (
                 "SelfService" = (
                     summary = "Register the OIDC subject with no special role",
-                    value = json!({"onboarding_secret": null})
+                    value = json!({
+                        "onboarding_secret": null
+                    })
                 )
             ),
             (
                 "InitialAdministrator" = (
                     summary = "Consume an onboarding secret and claim the realm administrator role",
-                    value = json!({"onboarding_secret": "<onboarding-secret-issued-by-the-node-operator>"})
+                    value = json!({
+                        "onboarding_secret": "<onboarding-secret-issued-by-the-node-operator>"
+                    })
                 )
             )
         )
@@ -597,13 +621,28 @@ async fn register_user(
     path = "/users/token",
     tag = "users",
     summary = "Issue an access token for the calling identity",
-    description = "Self-scoped: the token is always minted for the caller's own identity and can never be requested on behalf of somebody else. Two kinds of bearer token are accepted. An Aruna access token without path restrictions refreshes itself, while a path-restricted (delegated) token is refused with 403, as is a token whose subject is an alias rather than the canonical user of that OIDC subject. An OIDC token from a configured issuer is accepted once its subject has been registered at POST /users/register. The issued token is a realm bearer credential valid for 24 hours, it is returned only in this response and is not retrievable afterwards, so a lost token has to be reissued here.",
+    description = r#"Mints a realm access token for the calling identity.
+
+**Authentication**: an Aruna access token without path restrictions, which refreshes itself, or an
+OIDC token from a configured issuer whose subject has been registered at `POST /users/register`.
+Self-scoped: the token is always minted for the caller's own identity and can never be requested
+on behalf of somebody else.
+
+**Behavior**
+- The issued token is a realm bearer credential valid for 24 hours.
+- It is returned only in this response and is not retrievable afterwards, so a lost token has to
+  be reissued here.
+
+**Errors**: a path-restricted (delegated) token is refused with 403, as is a token whose subject is
+an alias rather than the canonical user of that OIDC subject."#,
     responses(
         (
             status = 200,
             description = "A freshly issued access token for the caller, valid for 24 hours and shown only here",
             body = GetTokenResponse,
-            example = json!({"token": "<aruna-access-token>"})
+            example = json!({
+                "token": "<aruna-access-token>"
+            })
         ),
         (status = 400, description = "Not produced by this operation; a request that cannot be authenticated is answered with 401 or 403 instead", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented, the OIDC token failed validation, or this node knows no user for the presented identity", body = ErrorResponse),
@@ -651,7 +690,23 @@ async fn get_token(
     path = "/users/info",
     tag = "users",
     summary = "Get the calling user's profile, roles and preferences",
-    description = "Self-scoped: it always describes the caller and takes no user id. Requires a realm bearer token that carries no path restrictions; a delegated token, or a token issued by another realm, is refused with 403. The response combines the caller's user document, the realm roles whose assignment list contains the caller, one entry for every group known to this node whose roles list the caller, and the UI preferences derived from the caller's ui.theme, ui.preferred_profile_path and ui.favourite_metadata_ids attributes, where the favourites attribute is a comma separated list. Group membership is collected from the groups this node holds, so a group that has not replicated here yet is missing. 404 means this node holds no user document for the caller, which can happen while a registration made on another node is still replicating.",
+    description = r#"Describes the calling user: profile, realm roles, group memberships and UI preferences.
+
+**Authentication**: realm bearer token that carries no path restrictions; a delegated token, or a
+token issued by another realm, is refused with 403. Self-scoped: it always describes the caller
+and takes no user id.
+
+**Behavior**
+- The response combines the caller's user document, the realm roles whose assignment list contains
+  the caller, and one entry for every group known to this node whose roles list the caller.
+- The preferences are derived from the caller's `ui.theme`, `ui.preferred_profile_path` and
+  `ui.favourite_metadata_ids` attributes, where the favourites attribute is a comma separated
+  list.
+- Group membership is collected from the groups this node holds, so a group that has not
+  replicated here yet is missing.
+
+**Errors**: 404 means this node holds no user document for the caller, which can happen while a
+registration made on another node is still replicating."#,
     responses(
         (
             status = 200,
@@ -724,13 +779,36 @@ async fn get_user_info(
     path = "/users/info",
     tag = "users",
     summary = "Update the calling user's profile",
-    description = "Self-scoped: it always writes the caller's own user document and takes no user id. Requires a realm bearer token that carries no path restrictions; a delegated token, or a token issued by another realm, is refused with 403. Fields left out change nothing. The name is trimmed and must be 1 to 256 characters. An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes, a value is at most 4096 bytes and carries no control characters, and a user holds at most 128 attributes. Removals are applied before sets, so a key named in both ends up set to the new value. UI preferences are ordinary attributes: ui.theme, ui.preferred_profile_path and ui.favourite_metadata_ids as a comma separated list. The write is durable on the node that answers and replicates to the other realm nodes asynchronously. The response is the caller's refreshed profile in the same shape as GET /users/info.",
+    description = r#"Updates the calling user's display name and attributes and returns the refreshed profile.
+
+**Authentication**: realm bearer token that carries no path restrictions; a delegated token, or a
+token issued by another realm, is refused with 403. Self-scoped: it always writes the caller's own
+user document and takes no user id.
+
+**Behavior**
+- Fields left out change nothing.
+- Removals are applied before sets, so a key named in both ends up set to the new value.
+- UI preferences are ordinary attributes: `ui.theme`, `ui.preferred_profile_path` and
+  `ui.favourite_metadata_ids` as a comma separated list.
+- The write is durable on the node that answers and replicates to the other realm nodes
+  asynchronously.
+- The response is the caller's refreshed profile in the same shape as `GET /users/info`.
+
+**Limits**
+- The name is trimmed and must be 1 to 256 characters.
+- An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128
+  bytes.
+- An attribute value is at most 4096 bytes and carries no control characters.
+- A user holds at most 128 attributes."#,
     request_body(
         content = PatchUserInfoRequest,
         description = "Optional new display name, attributes to set and attribute keys to remove. Send only what changes.",
         example = json!({
             "name": "Alice Example",
-            "set_attributes": {"ui.theme": "dark", "orcid": "0000-0002-1825-0097"},
+            "set_attributes": {
+                "ui.theme": "dark",
+                "orcid": "0000-0002-1825-0097"
+            },
             "remove_attributes": ["ui.preferred_profile_path"]
         })
     ),
@@ -837,10 +915,24 @@ async fn patch_user_info(
     path = "/users",
     tag = "users",
     summary = "List the users of this realm",
-    description = "Requires a realm bearer token and read access on the realm's user administration path, so an ordinary member is refused with 403; the realm request policies are evaluated as well and may deny a read that the role grant alone would allow. Only users of this realm are listed, in user id order, from the replica held by the node that serves the request, so a user registered on another node appears once replication has caught up. Every entry is the full user document including its attributes. Pagination is cursor based: limit defaults to 100 and is clamped into 1 to 1000, next_start_after repeats the last returned user id, and its absence means the end of the listing was reached.",
+    description = r#"Pages this realm's user documents in user id order.
+
+**Authentication**: realm bearer token with READ on the realm's user administration path, so an
+ordinary member is refused with 403; the realm request policies are evaluated as well and may deny
+a read that the role grant alone would allow.
+
+**Behavior**
+- Only users of this realm are listed, from the replica held by the node that serves the request,
+  so a user registered on another node appears once replication has caught up.
+- Every entry is the full user document including its attributes.
+- Pagination is cursor based: `next_start_after` repeats the last returned user id, and its
+  absence means the end of the listing was reached.
+
+**Limits**
+- `limit` defaults to 100 and is clamped into 1 to 1000."#,
     params(
         ("limit" = Option<usize>, Query, description = "Page size; defaults to 100 and is clamped into 1 to 1000"),
-        ("start_after" = Option<String>, Query, description = "Exclusive cursor: the user id returned as next_start_after by the previous page; omit it to start at the first user")
+        ("start_after" = Option<String>, Query, description = "Exclusive cursor: the `next_start_after` of the previous page; omit it to start at the first user")
     ),
     responses(
         (
@@ -853,7 +945,10 @@ async fn patch_user_info(
                         "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
                         "name": "Alice Example",
                         "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
-                        "attributes": {"email": "user@example.test", "orcid": "0000-0002-1825-0097"}
+                        "attributes": {
+                            "email": "user@example.test",
+                            "orcid": "0000-0002-1825-0097"
+                        }
                     }
                 ],
                 "next_start_after": "01JB2C3D4E5F6G7H8J9KABCDEF@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"
@@ -921,11 +1016,27 @@ async fn list_users(
     path = "/users/search",
     tag = "users",
     summary = "Search this realm's users by name or email",
-    description = "Requires a realm bearer token and read access on the realm's user administration path, the same grant as the full listing, so an ordinary member is refused with 403. The query is trimmed and matched case insensitively as a substring of the display name and of the email attribute, over the users of this realm held by the node that serves the request; a user registered elsewhere is found once replication has caught up. A result carries only the user id and the display name, never attributes. Pagination is cursor based: limit defaults to 20 and is clamped into 1 to 20, next_start_after repeats the last returned user id, and its absence means the scan reached the end of the realm's users rather than that no further match exists on a later page.",
+    description = r#"Pages this realm's users whose display name or email attribute contains the query.
+
+**Authentication**: realm bearer token with READ on the realm's user administration path, the same
+grant as the full listing, so an ordinary member is refused with 403.
+
+**Behavior**
+- The query is trimmed and matched case insensitively as a substring of the display name and of
+  the email attribute, over the users of this realm held by the node that serves the request; a
+  user registered elsewhere is found once replication has caught up.
+- A result carries only the user id and the display name, never attributes.
+- Pagination is cursor based: `next_start_after` repeats the last returned user id, and its
+  absence means the scan reached the end of the realm's users rather than that no further match
+  exists on a later page.
+
+**Limits**
+- `q` must hold at least 2 characters after trimming.
+- `limit` defaults to 20 and is clamped into 1 to 20."#,
     params(
-        ("q" = String, Query, description = "Substring matched case insensitively against the user name and the email attribute; at least 2 characters after trimming"),
+        ("q" = String, Query, description = "Substring matched case insensitively against the user name and the email attribute; at least 2 characters"),
         ("limit" = Option<usize>, Query, description = "Page size; defaults to 20 and is clamped into 1 to 20"),
-        ("start_after" = Option<String>, Query, description = "Exclusive cursor: the user id returned as next_start_after by the previous page; omit it to start at the first user")
+        ("start_after" = Option<String>, Query, description = "Exclusive cursor: the `next_start_after` of the previous page; omit it to start at the first user")
     ),
     responses(
         (
@@ -1010,7 +1121,21 @@ async fn search_users(
     path = "/users/resolve",
     tag = "users",
     summary = "Resolve user ids to directory entries",
-    description = "Requires a realm bearer token and read access on the realm's user administration path, so an ordinary member is refused with 403. Batch lookup of at most 100 user ids per request against the replica held by the node that serves the request. Duplicate ids collapse and ids unknown to this node are dropped silently, so the result may be shorter than the request and carries no positional mapping; match the entries by user id. Only the directory safe attributes orcid, affiliation and department are exposed, while email and every other attribute are withheld here. The response body is a JSON array, not an object.",
+    description = r#"Resolves a batch of user ids to directory entries held by this node.
+
+**Authentication**: realm bearer token with READ on the realm's user administration path, so an
+ordinary member is refused with 403.
+
+**Behavior**
+- The lookup runs against the replica held by the node that serves the request.
+- Duplicate ids collapse and ids unknown to this node are dropped silently, so the result may be
+  shorter than the request and carries no positional mapping; match the entries by user id.
+- Only the directory safe attributes `orcid`, `affiliation` and `department` are exposed, while
+  `email` and every other attribute are withheld here.
+- The response body is a JSON array, not an object.
+
+**Limits**
+- At most 100 user ids per request."#,
     request_body(
         content = ResolveUsersRequest,
         description = "Up to 100 user ids, each in the form ulid@realm-id. Duplicates are collapsed and unknown ids are omitted from the result.",
@@ -1030,7 +1155,10 @@ async fn search_users(
                 {
                     "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
                     "name": "Alice Example",
-                    "attributes": {"orcid": "0000-0002-1825-0097", "affiliation": "Example University"}
+                    "attributes": {
+                        "orcid": "0000-0002-1825-0097",
+                        "affiliation": "Example University"
+                    }
                 }
             ])
         ),
@@ -1094,7 +1222,21 @@ async fn resolve_users(
     path = "/users/{id}",
     tag = "users",
     summary = "Get a user of this realm by id",
-    description = "Requires a realm bearer token and read access on the administration path of that specific user, so a caller without the grant is refused with 403 whether or not the user exists and existence stays hidden; the realm request policies are evaluated as well and may deny a read the role grant would allow. The reply is served from the replica held by the node that receives the request, so a user registered on another node appears once replication has caught up, and 404 is only reachable for a caller that may read that user. The response is the full user document including its attributes. A token issued by another trusted realm is answered with 501, because forwarding a read to the owning realm is not implemented.",
+    description = r#"Returns one user document of this realm as held by the responding node.
+
+**Authentication**: realm bearer token with READ on the administration path of that specific user,
+so a caller without the grant is refused with 403 whether or not the user exists and existence
+stays hidden; the realm request policies are evaluated as well and may deny a read the role grant
+would allow.
+
+**Behavior**
+- The reply is served from the replica held by the node that receives the request, so a user
+  registered on another node appears once replication has caught up.
+- The response is the full user document including its attributes.
+
+**Errors**: 404 is only reachable for a caller that may read that user. A token issued by another
+trusted realm is answered with 501, because forwarding a read to the owning realm is not
+implemented."#,
     params(("id" = String, Path, description = "User id in the form ulid@realm-id, as returned by the listing and search operations")),
     responses(
         (
@@ -1105,7 +1247,10 @@ async fn resolve_users(
                 "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
                 "name": "Alice Example",
                 "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
-                "attributes": {"email": "user@example.test", "orcid": "0000-0002-1825-0097"}
+                "attributes": {
+                    "email": "user@example.test",
+                    "orcid": "0000-0002-1825-0097"
+                }
             })
         ),
         (status = 400, description = "Declared for malformed input; in practice an id that is not a user id is refused by the authorization check with 403 instead", body = ErrorResponse),
@@ -1157,14 +1302,36 @@ async fn get_user(
     path = "/users/{id}",
     tag = "users",
     summary = "Update a user of this realm by id",
-    description = "Requires a realm bearer token; a token issued by another realm is refused with 403. Updating the caller's own user needs no further grant but refuses a path-restricted (delegated) token with 403. Updating anybody else requires write access on that user's administration path and additionally passes the realm request policies, which may deny the write even when the role grant allows it. Validation matches the self service profile update: the name is trimmed and must be 1 to 256 characters, an attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes, a value is at most 4096 bytes without control characters, and a user holds at most 128 attributes. Removals are applied before sets, so a key named in both ends up set, and fields left out change nothing. The write is durable on the node that answers and replicates to the other realm nodes asynchronously. The response is the updated user document.",
+    description = r#"Updates one user's display name and attributes and returns the updated document.
+
+**Authentication**: realm bearer token; a token issued by another realm is refused with 403.
+Updating the caller's own user needs no further grant but refuses a path-restricted (delegated)
+token with 403. Updating anybody else requires WRITE on that user's administration path and
+additionally passes the realm request policies, which may deny the write even when the role grant
+allows it.
+
+**Behavior**
+- Fields left out change nothing.
+- Removals are applied before sets, so a key named in both ends up set.
+- The write is durable on the node that answers and replicates to the other realm nodes
+  asynchronously.
+- The response is the updated user document.
+
+**Limits** (validation matches the self service profile update)
+- The name is trimmed and must be 1 to 256 characters.
+- An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128
+  bytes.
+- An attribute value is at most 4096 bytes and carries no control characters.
+- A user holds at most 128 attributes."#,
     params(("id" = String, Path, description = "User id in the form ulid@realm-id of the user to update; the caller's own id for a self service update")),
     request_body(
         content = UpdateUserRequest,
         description = "Optional new display name, attributes to set and attribute keys to remove. Send only what changes.",
         example = json!({
             "name": "Alice Example",
-            "set_attributes": {"affiliation": "Example University"},
+            "set_attributes": {
+                "affiliation": "Example University"
+            },
             "remove_attributes": ["department"]
         })
     ),
@@ -1177,7 +1344,10 @@ async fn get_user(
                 "user_id": "01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
                 "name": "Alice Example",
                 "subject_ids": ["YXJ1bmEtZXhhbXBsZS1vaWRjLXN1YmplY3QtMDAwMDA"],
-                "attributes": {"email": "user@example.test", "affiliation": "Example University"}
+                "attributes": {
+                    "email": "user@example.test",
+                    "affiliation": "Example University"
+                }
             })
         ),
         (status = 400, description = "The id is not a user id, the name is empty or longer than 256 characters, or an attribute key or value is rejected", body = ErrorResponse),
