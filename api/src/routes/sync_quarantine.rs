@@ -181,10 +181,28 @@ fn event_summary(event: &DocumentSyncEvent) -> String {
     path = "/admin/sync-quarantine",
     tag = "sync-quarantine",
     summary = "List rejected sync events held on this node",
-    description = "Realm-admin evidence console over the replicated sync events this node refused. Requires a realm bearer token with WRITE on the realm's sync-quarantine admin path, because a retained row carries the whole rejected document; a path-restricted (delegated) token is refused outright. The listing is node-local and never fanned out: each node keeps the events its own replication path rejected, so an operator asks the node that saw them. Rows are ordered by their transport identity, publisher then delivery order, not by rejection time. Retention is manual: a row stays until an operator acknowledges it and prunes it, and `usage` reports how much of the node's fixed quarantine budget is consumed, so an operator can see a node approaching the point where new rejections can no longer be retained. `limit` defaults to 50 and is clamped to 1..=200, and a page without `next_cursor` is the last one.",
+    description = r#"Realm-admin evidence console over the replicated sync events this node refused.
+
+**Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path,
+because a retained row carries the whole rejected document; a path-restricted (delegated) token is
+refused outright.
+
+**Behavior**
+- The listing is node-local and never fanned out: each node keeps the events its own replication
+  path rejected, so an operator asks the node that saw them.
+- Rows are ordered by their transport identity, publisher then delivery order, not by rejection
+  time.
+- Retention is manual: a row stays until an operator acknowledges it and prunes it.
+- `usage` reports how much of the node's fixed quarantine budget is consumed, so an operator can
+  see a node approaching the point where new rejections can no longer be retained.
+- A page without `next_cursor` is the last one.
+
+**Limits**
+- `limit` defaults to 50 and is clamped to 1..=200.
+- A `cursor` or `topic` that is not valid hex is refused with 400."#,
     params(
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous page's `next_cursor`, hex encoded. Non-hex values are rejected with 400. Absent starts at the first row"),
-        ("topic" = Option<String>, Query, description = "Hex-encoded sync topic, 64 characters, restricting the page to the evidence that arrived on it; a shorter even-length hex string matches as a leading prefix. Non-hex values are rejected with 400. Absent lists every topic"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous page's `next_cursor`, hex encoded. Absent starts at the first row"),
+        ("topic" = Option<String>, Query, description = "Hex-encoded sync topic, 64 characters; a shorter even-length hex string matches as a leading prefix. Absent lists every topic"),
         ("limit" = Option<usize>, Query, description = "Maximum rows in one page. Default 50, clamped to 1..=200")
     ),
     responses(
@@ -210,7 +228,12 @@ fn event_summary(event: &DocumentSyncEvent) -> String {
                     }
                 ],
                 "next_cursor": "a5d03b267c5480c60614edcfc08d83615fd0d6ce38048282ba9a85e8d9d61b64d8d15044cac756439413aaa60e3fa5cf7e7c500a6433f9512c1700b7f7fc0a950000000000000007",
-                "usage": {"records": 3, "bytes": 2048, "max_records": 4096, "max_bytes": 67108864}
+                "usage": {
+                    "records": 3,
+                    "bytes": 2048,
+                    "max_records": 4096,
+                    "max_bytes": 67108864
+                }
             })
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
@@ -244,8 +267,23 @@ pub async fn list_quarantine(
     path = "/admin/sync-quarantine/{record_id}",
     tag = "sync-quarantine",
     summary = "Inspect one rejected sync event",
-    description = "Reads a single retained row together with a summary of the envelope it carried, for an operator deciding why a replicated event was refused. Requires a realm bearer token with WRITE on the realm's sync-quarantine admin path, because the row carries the whole rejected document; a path-restricted (delegated) token is refused. Evidence is node-local, so only the node that rejected the event can answer for it and an id retained elsewhere is 404 here. A payload that never decoded into a sync event is still kept, byte for byte, as evidence: such a row has no decoded `event` and no `event_id`, `family`, `target` or `origin_node_id`. Inspecting changes nothing: the event stays rejected and the row stays unacknowledged.",
-    params(("record_id" = String, Path, description = "Hex row id exactly as the listing reported it in `id`, the row's transport identity of topic, publisher and sequence. Non-hex values are rejected with 400")),
+    description = r#"Reads one retained row and a summary of the envelope it carried.
+
+**Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path,
+because the row carries the whole rejected document; a path-restricted (delegated) token is
+refused.
+
+**Behavior**
+- The row is the evidence an operator uses to decide why a replicated event was refused.
+- Evidence is node-local, so only the node that rejected the event can answer for it and an id
+  retained elsewhere is 404 here.
+- A payload that never decoded into a sync event is still kept, byte for byte, as evidence: such a
+  row has no decoded `event` and no `event_id`, `family`, `target` or `origin_node_id`.
+- Inspecting changes nothing: the event stays rejected and the row stays unacknowledged.
+
+**Limits**
+- A `record_id` that is not valid hex is refused with 400."#,
+    params(("record_id" = String, Path, description = "Hex row id exactly as the listing reported it in `id`: the row's transport identity of topic, publisher and sequence")),
     responses(
         (
             status = 200,
@@ -302,8 +340,22 @@ pub async fn inspect_quarantine(
     path = "/admin/sync-quarantine/{record_id}/acknowledge",
     tag = "sync-quarantine",
     summary = "Acknowledge one piece of quarantine evidence",
-    description = "Marks a retained row as seen by an operator, which is the only thing that makes it prunable. This is bookkeeping, not recovery: the rejected event is not replayed, re-applied or accepted, nothing is sent back to the publisher, and the document it carried stays exactly as it was. Requires a realm bearer token with WRITE on the realm's sync-quarantine admin path; a path-restricted (delegated) token is refused. Evidence is node-local, so the acknowledgement applies to this node's copy only and an id retained elsewhere is 404 here. The call is idempotent: acknowledging an already acknowledged row rewrites nothing and answers with the same row.",
-    params(("record_id" = String, Path, description = "Hex row id exactly as the listing reported it in `id`, the row's transport identity of topic, publisher and sequence. Non-hex values are rejected with 400")),
+    description = r#"Marks a retained row as seen by an operator, the only thing that makes it prunable.
+
+**Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path; a
+path-restricted (delegated) token is refused.
+
+**Behavior**
+- This is bookkeeping, not recovery: the rejected event is not replayed, re-applied or accepted,
+  nothing is sent back to the publisher, and the document it carried stays exactly as it was.
+- Evidence is node-local, so the acknowledgement applies to this node's copy only and an id
+  retained elsewhere is 404 here.
+- The call is idempotent: acknowledging an already acknowledged row rewrites nothing and answers
+  with the same row.
+
+**Limits**
+- A `record_id` that is not valid hex is refused with 400."#,
+    params(("record_id" = String, Path, description = "Hex row id exactly as the listing reported it in `id`: the row's transport identity of topic, publisher and sequence")),
     responses(
         (
             status = 200,
@@ -351,10 +403,28 @@ pub async fn acknowledge_quarantine(
     path = "/admin/sync-quarantine",
     tag = "sync-quarantine",
     summary = "Prune acknowledged quarantine evidence",
-    description = "Runs one bounded sweep over this node's retained evidence and deletes the acknowledged rows it scanned. Requires a realm bearer token with WRITE on the realm's sync-quarantine admin path; a path-restricted (delegated) token is refused. Only acknowledged rows are removed, so unreviewed evidence is never lost to a sweep, and deletion is permanent: the rejected events are gone from this node and are not replayed by removing them. One call is a page, not the whole store: `scanned` reports how many rows the pass looked at and `pruned` how many it deleted, and the caller repeats the call with the returned `next_cursor` until none comes back. Pruning is how a node reclaims its fixed quarantine budget, and a node whose budget is full stops accepting further replicated events on the affected topics until it has room again, so `usage` in the answer is the signal to keep sweeping.",
+    description = r#"Runs one bounded sweep over this node's evidence and deletes the acknowledged rows it scanned.
+
+**Authentication**: realm bearer token with WRITE on the realm's sync-quarantine admin path; a
+path-restricted (delegated) token is refused.
+
+**Behavior**
+- Only acknowledged rows are removed, so unreviewed evidence is never lost to a sweep, and deletion
+  is permanent: the rejected events are gone from this node and are not replayed by removing them.
+- One call is a page, not the whole store: `scanned` reports how many rows the pass looked at and
+  `pruned` how many it deleted, and the caller repeats the call with the returned `next_cursor`
+  until none comes back.
+- Pruning is how a node reclaims its fixed quarantine budget, and a node whose budget is full stops
+  accepting further replicated events on the affected topics until it has room again, so `usage` in
+  the answer is the signal to keep sweeping.
+
+**Limits**
+- `limit` bounds the rows examined in one pass, not the rows deleted. Default 50, clamped to
+  1..=200.
+- A `cursor` or `topic` that is not valid hex is refused with 400."#,
     params(
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token taken from a previous pass's `next_cursor`, hex encoded. Non-hex values are rejected with 400. Absent starts at the first row"),
-        ("topic" = Option<String>, Query, description = "Hex-encoded sync topic, 64 characters, restricting the sweep to the evidence that arrived on it; a shorter even-length hex string matches as a leading prefix. Non-hex values are rejected with 400. Absent sweeps every topic"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous pass's `next_cursor`, hex encoded. Absent starts at the first row"),
+        ("topic" = Option<String>, Query, description = "Hex-encoded sync topic, 64 characters; a shorter even-length hex string matches as a leading prefix. Absent sweeps every topic"),
         ("limit" = Option<usize>, Query, description = "Maximum rows examined in one pass, of which only the acknowledged ones are deleted. Default 50, clamped to 1..=200")
     ),
     responses(
@@ -366,7 +436,12 @@ pub async fn acknowledge_quarantine(
                 "pruned": 1,
                 "scanned": 50,
                 "next_cursor": "a5d03b267c5480c60614edcfc08d83615fd0d6ce38048282ba9a85e8d9d61b64d8d15044cac756439413aaa60e3fa5cf7e7c500a6433f9512c1700b7f7fc0a950000000000000007",
-                "usage": {"records": 2, "bytes": 1536, "max_records": 4096, "max_bytes": 67108864}
+                "usage": {
+                    "records": 2,
+                    "bytes": 1536,
+                    "max_records": 4096,
+                    "max_bytes": 67108864
+                }
             })
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
