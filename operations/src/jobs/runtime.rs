@@ -25,9 +25,9 @@ use tracing::{info, warn};
 use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payload, run_cleanup};
 use super::reconcile::ExternalReconciler;
 use super::store::{
-    JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, fail_job,
-    flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record, release_job,
-    renew_lease, requeue_job, transition_to_running,
+    JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job,
+    fail_job, flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record,
+    release_job, renew_lease, requeue_job, transition_to_running,
 };
 use super::submit::schedule_job_drain_effect;
 use super::{
@@ -37,6 +37,7 @@ use super::{
 use crate::driver::DriverContext;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DEPENDENCY_RETRY_AFTER_MS: u64 = 1_000;
 
 struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
@@ -465,7 +466,7 @@ impl JobsRuntime {
             .map(|job| job.completion.subscribe());
         loop {
             if let Ok(Some(record)) = read_job_record(storage, job_id, None).await
-                && record.state.is_terminal()
+                && record.is_settled()
             {
                 return Some(record.state);
             }
@@ -686,6 +687,21 @@ async fn run_job(
                     .await,
                     job_id,
                 );
+            }
+        }
+        SuperviseResult::Outcome(JobRunOutcome::Deferred(error)) => {
+            if let Err(error) = defer_job(
+                storage,
+                job_id,
+                token,
+                unix_timestamp_millis(),
+                DEPENDENCY_RETRY_AFTER_MS,
+                error,
+            )
+            .await
+                && !matches!(error, JobMutationError::TokenMismatch)
+            {
+                warn!(job_id = %job_id, error = %error, "Failed to defer job");
             }
         }
         SuperviseResult::Outcome(JobRunOutcome::Cancelled) => {

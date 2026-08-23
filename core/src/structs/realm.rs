@@ -9,7 +9,8 @@ use crate::structs::{
     DocumentClass, FrozenStrategySelector, HandleRange, HandleRangeDirectory, JobId,
     KIND_LABEL_KEY, METADATA_HANDLE, NodePlacementEntry, PlacementActivation, PlacementBinding,
     PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, PlacementTransition,
-    SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, coordinator_spans, shard_for_subject,
+    SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start, coordinator_spans,
+    shard_for_subject,
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
@@ -558,6 +559,34 @@ impl RealmConfigDocument {
         self.strategies = vec![default_strategy, everywhere_strategy, job_family_strategy];
     }
 
+    /// Grants `node` the band `band` and appends the immutable JobControl
+    /// binding on the band's first handle, exactly as onboarding does. The
+    /// range id is derived from the band so distinct bands never collide.
+    pub fn seed_job_control(&mut self, node: NodeId, band: u32) -> PlacementHandle {
+        let mut range_bytes = [0u8; 16];
+        range_bytes[..4].copy_from_slice(&(band + 1).to_be_bytes());
+        let range = HandleRange {
+            range_id: Ulid::from_bytes(range_bytes),
+            owner: node,
+            start: band_start(band),
+            end: band_start(band + 1),
+        };
+        let handle = PlacementHandle::new(range.start).expect("band start is a valid handle");
+        self.placement_handle_ranges.push(range);
+        self.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(self.realm_id),
+            document_class: DocumentClass::JobControl,
+            strategy_id: self
+                .default_strategy_id
+                .expect("seeded config has a default strategy"),
+            allocator_range_id: Some(range.range_id),
+            allocated_by: Some(node),
+            allocated_at_ms: Some(1),
+        });
+        handle
+    }
+
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
         self.metadata_replication.factor_for(group_id, path)
     }
@@ -747,6 +776,12 @@ impl RealmConfigDocument {
             labels.insert(
                 KIND_LABEL_KEY.to_string(),
                 realm_node.kind.label().to_string(),
+            );
+            crate::structs::stamp_location(
+                &mut labels,
+                entry
+                    .map(|entry| entry.location.as_str())
+                    .unwrap_or_default(),
             );
             nodes.push(CandidateMapNode {
                 node_id,
@@ -1380,6 +1415,26 @@ mod test {
                 expires_at: 2_000,
             }]
         );
+    }
+
+    #[test]
+    fn seeds_job_control() {
+        // Each seeded band must resolve for its own node and for no other.
+        fn node_id(seed: u8) -> NodeId {
+            iroh::SecretKey::from_bytes(&[seed; 32]).public()
+        }
+        let mut config = RealmConfigDocument::new(RealmId([12u8; 32]), Vec::new(), 3);
+        config.seed_default_placement();
+        let first = config.seed_job_control(node_id(1), 0);
+        let second = config.seed_job_control(node_id(2), 1);
+
+        assert_ne!(first, second);
+        assert_eq!(config.job_control_handle(&node_id(1)), Some(first));
+        assert_eq!(config.job_control_handle(&node_id(2)), Some(second));
+        assert_eq!(config.job_control_handle(&node_id(3)), None);
+        assert!(config.binding_directory().resolve(first).is_ok());
+        let ranges = &config.placement_handle_ranges;
+        assert_ne!(ranges[0].range_id, ranges[1].range_id);
     }
 
     #[test]

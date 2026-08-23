@@ -70,6 +70,7 @@ clap = { version = "4.6.4", features = ["derive"] }
 console-subscriber = "0.5.0"
 craqle = { git = "https://github.com/arunaengine/craqle", branch = "main", features = [
     "iroh",
+    "shacl-core",
 ] }
 crc-fast = "1.10.0"
 crossfire = "3.1.19"
@@ -99,7 +100,8 @@ hyper-util = { version = "0.1.20", features = [
 ipnet = "2.12.0"
 iroh = "1.0.3"
 iroh-base = "1.0.3"
-irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [
+# Pinned to the exact revision craqle uses so one irokle crate is resolved.
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f66816a16492c615525809f6c8b663", features = [
     "fjall",
     "iroh",
 ] }

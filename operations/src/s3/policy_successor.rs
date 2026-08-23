@@ -13,6 +13,7 @@ use crate::blob::managed_copy::{
 };
 use crate::placement_policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -118,6 +119,8 @@ pub enum SuccessorError {
     ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Purge(#[from] PurgeFenceError),
     #[error("mutation {0} is recorded with different parameters")]
     MutationConflict(Ulid),
     #[error("the object head is no longer the expected version")]
@@ -655,6 +658,7 @@ fn read_value(event: Event) -> Result<Option<Value>, SuccessorError> {
 enum OperationState {
     Init,
     StartTransaction,
+    CheckPurgeFence,
     Minting,
     CommitTransaction,
     Finish,
@@ -726,8 +730,22 @@ impl Operation for MintPolicySuccessorOperation {
                     return self.fail(SuccessorError::InvalidEvent);
                 };
                 self.txn_id = Some(txn_id);
+                self.state = OperationState::CheckPurgeFence;
+                smallvec![write_fence_read(
+                    &self.mint.plan.context.bucket,
+                    Some(txn_id)
+                )]
+            }
+            OperationState::CheckPurgeFence => {
+                if let Err(error) = check_write_fence(
+                    event,
+                    &self.mint.plan.context.bucket,
+                    &self.mint.plan.context.key,
+                ) {
+                    return self.fail(error.into());
+                }
                 self.state = OperationState::Minting;
-                match self.mint.start(Some(txn_id)) {
+                match self.mint.start(self.txn_id) {
                     Ok(effects) => effects,
                     Err(error) => self.fail(error),
                 }
@@ -786,6 +804,7 @@ impl Operation for MintPolicySuccessorOperation {
                 | SuccessorError::IntentConflict
                 | SuccessorError::HeadDeleted
                 | SuccessorError::VersionMissing
+                | SuccessorError::Purge(PurgeFenceError::Suspended)
         )
     }
 }
@@ -793,22 +812,24 @@ impl Operation for MintPolicySuccessorOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        MintState, SealedDefault, SuccessorError, SuccessorMint, SuccessorOutcome, SuccessorPlan,
-        successor_version,
+        MintPolicySuccessorOperation, MintState, SealedDefault, SuccessorError, SuccessorMint,
+        SuccessorOutcome, SuccessorPlan, successor_version,
     };
     use crate::blob::blob_keyspace_helper::HeadAliasContext;
+    use crate::s3::purge_fence::PurgeFenceError;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     };
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
+        JobId, ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
         PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome, PolicyMutationRecord,
-        PolicyRefMode, PolicyResolution, RealmId, VerifiedPolicy, VersionKey,
-        checksum::HASH_BLAKE3,
+        PolicyRefMode, PolicyResolution, RealmId, StoragePurgeFence, StoragePurgeScope,
+        VerifiedPolicy, VersionKey, checksum::HASH_BLAKE3,
     };
     use aruna_core::types::{Key, NodeId, UserId, Value};
     use std::collections::{BTreeMap, HashMap};
@@ -920,6 +941,39 @@ mod tests {
             successor_version_id: Ulid::from_bytes([9u8; 16]),
             outcome: PolicyIntentOutcome::Planned,
         }
+    }
+
+    #[test]
+    fn successor_obeys_fence() {
+        let mut operation =
+            MintPolicySuccessorOperation::new(plan(Vec::new(), PolicyRefMode::Replace));
+        let transaction = Ulid::from_bytes([11; 16]);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: transaction,
+        }));
+        let fence = StoragePurgeFence {
+            job_id: JobId::from_bytes([12; 16]),
+            scope: StoragePurgeScope::File {
+                bucket: BUCKET.to_string(),
+                key: OBJECT.to_string(),
+            },
+        };
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: BUCKET.as_bytes().to_vec().into(),
+            value: Some(fence.to_bytes().unwrap().into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+                if *txn_id == transaction
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(SuccessorError::Purge(PurgeFenceError::Suspended))
+        );
     }
 
     fn location() -> BackendLocation {

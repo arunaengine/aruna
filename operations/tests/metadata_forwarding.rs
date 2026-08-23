@@ -890,13 +890,14 @@ async fn install_realm_config(
     let realm_id = realm.realm_id;
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.seed_default_placement();
-    for node in nodes {
+    for (band, node) in nodes.iter().enumerate() {
         let kind = if node.sync_eligible {
             RealmNodeKind::Management
         } else {
             RealmNodeKind::User
         };
         config.ensure_node(node.net.node_id(), kind);
+        config.seed_job_control(node.net.node_id(), band as u32);
     }
 
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);

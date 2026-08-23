@@ -54,10 +54,11 @@ async fn unreachable_target_stalls() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
 
     let path = "datasets/stalled";
+    let origin = realm.leading_node(group_id, path);
     let document_id =
-        mint_local_document(&realm.config, &realm.actor(realm.node(0)), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, realm.node(0), group_id, document_id, path).await?;
-    let before = realm.assert_holder(realm.node(0).node_id(), &placement);
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let before = realm.assert_holder(origin.node_id(), &placement);
     for holder in &before {
         let node = realm.find(*holder);
         wait_until("document reaches holder", node.node_id(), || {

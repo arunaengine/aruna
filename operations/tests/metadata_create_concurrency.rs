@@ -74,6 +74,7 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
     // register the node as a holder so it holds the bucket the id embeds.
     realm_config.seed_default_placement();
     realm_config.ensure_node(node_id, RealmNodeKind::Server);
+    realm_config.seed_job_control(node_id, 0);
     storage
         .send_storage_effect(StorageEffect::Write {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),

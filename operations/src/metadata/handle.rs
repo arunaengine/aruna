@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
@@ -36,9 +36,9 @@ use byteview::ByteView;
 use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
-    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
-    CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy, GraphSearchRequest,
-    PatchEntityRequest, RoCrateError, SearchRequest, SearchStorage, vocab,
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CrateViolation,
+    CreateCrateRequest, CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy,
+    GraphSearchRequest, PatchEntityRequest, RoCrateError, SearchRequest, SearchStorage, vocab,
 };
 use futures_util::FutureExt;
 use jsonwebtoken::DecodingKey;
@@ -54,6 +54,9 @@ use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::materialization_queue::metadata_graph_fence;
+use super::profile_shacl::{
+    ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
+};
 use super::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
@@ -78,6 +81,9 @@ use crate::request_policy::PolicyRequestExtras;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
+use crate::s3::search_objects::{
+    ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput, search_local_objects,
+};
 use crate::sync_mirror_repair::RECONCILE_GRACE;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
@@ -232,6 +238,9 @@ pub struct MetadataHandleOptions {
     /// host parallelism; set explicitly when cgroup limits make
     /// `available_parallelism` unrepresentative.
     pub backend_pool_size: Option<usize>,
+    /// Test/maintenance fault injection. Tagged writes fail closed while an
+    /// untagged crate continues through ordinary structural validation.
+    pub profile_validation_disabled: bool,
 }
 
 impl MetadataHandleOptions {
@@ -247,6 +256,11 @@ impl MetadataHandleOptions {
 
     pub fn with_backend_pool_size(mut self, backend_pool_size: usize) -> Self {
         self.backend_pool_size = Some(backend_pool_size.max(1));
+        self
+    }
+
+    pub fn with_profile_validation_disabled(mut self, disabled: bool) -> Self {
+        self.profile_validation_disabled = disabled;
         self
     }
 }
@@ -281,6 +295,8 @@ struct MetadataInner {
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
+    profile_validation_disabled: bool,
+    profile_shacl: Option<Arc<ProfileShaclEngine>>,
 }
 
 #[derive(Clone)]
@@ -838,6 +854,7 @@ impl MetadataHandle {
         document_sync_db: Option<fjall::OptimisticTxDatabase>,
         metadata_options: MetadataHandleOptions,
     ) -> Result<Self, MetadataError> {
+        let path = path.as_ref();
         let actor = ActorId::from_bytes(*node_id.as_bytes());
         let options = CraqleOptions::new()
             .with_actor(actor)
@@ -853,6 +870,14 @@ impl MetadataHandle {
         };
         let node = CraqleNode::open_with_options(path, options)
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let profile_shacl = if metadata_options.profile_validation_disabled {
+            None
+        } else {
+            Some(Arc::new(
+                ProfileShaclEngine::open(&path.join("profile-validation"))
+                    .map_err(|error| MetadataError::Backend(error.to_string()))?,
+            ))
+        };
         let pool_size = metadata_options.backend_pool_size.unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|cores| cores.get())
@@ -879,6 +904,8 @@ impl MetadataHandle {
                 )),
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
+                profile_validation_disabled: metadata_options.profile_validation_disabled,
+                profile_shacl,
             }),
             storage_priority: StoragePriority::Foreground,
         })
@@ -977,6 +1004,49 @@ impl MetadataHandle {
 
     pub(crate) fn visibility_generation(&self) -> u64 {
         self.inner.visibility_cache.current_generation()
+    }
+
+    pub(crate) fn profile_validation_available(&self) -> bool {
+        !self.inner.profile_validation_disabled
+    }
+
+    /// Structural RO-Crate findings for a candidate that carries no Profile
+    /// tag. Nothing is committed: the document is only prepared.
+    pub(crate) async fn preview_crate_structure(
+        &self,
+        jsonld: String,
+    ) -> Result<Vec<CrateViolation>, ProfileShaclError> {
+        self.run_profile_shacl(move |engine| engine.structural(&jsonld))
+            .await
+    }
+
+    /// Evaluates one candidate against a registered Profile's shapes.
+    pub(crate) async fn evaluate_profile_shapes(
+        &self,
+        profile: ProfileShapes,
+        jsonld: String,
+    ) -> Result<ProfileShaclReport, ProfileShaclError> {
+        self.run_profile_shacl(move |engine| engine.evaluate(&profile, &jsonld))
+            .await
+    }
+
+    async fn run_profile_shacl<T, F>(&self, work: F) -> Result<T, ProfileShaclError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ProfileShaclEngine) -> Result<T, ProfileShaclError> + Send + 'static,
+    {
+        let Some(engine) = self.inner.profile_shacl.clone() else {
+            return Err(ProfileShaclError::Unavailable {
+                message: "the profile evaluator is unavailable; retry or remove the Profile tag"
+                    .to_string(),
+            });
+        };
+        let _permit = self.inner.craqle_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || work(engine.as_ref()))
+            .await
+            .map_err(|error| ProfileShaclError::Unavailable {
+                message: error.to_string(),
+            })?
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next
@@ -1436,6 +1506,42 @@ impl MetadataHandle {
                 })
                 .await
             }
+            MetadataTransportMessage::ReferencePreflight {
+                auth_token,
+                request,
+            } => {
+                Box::pin(async {
+                    let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                        Ok(auth) => match context.net_handle.as_ref() {
+                            Some(net) => {
+                                let endpoint = crate::node_info::read_node_info_document(
+                                    &context.storage_handle,
+                                    net.node_id(),
+                                )
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|document| document.urls.s3);
+                                super::api::references_preflight_local(
+                                    context.as_ref(),
+                                    *net.realm_id(),
+                                    net.node_id(),
+                                    auth,
+                                    *request,
+                                    endpoint,
+                                )
+                                .await
+                                .map(Box::new)
+                                .map_err(super::api::preflight_read_error)
+                            }
+                            None => Err(MetadataReadError::Unavailable),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    MetadataTransportMessage::ReferencePreflightResults { result }
+                })
+                .await
+            }
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
                 query,
@@ -1478,6 +1584,60 @@ impl MetadataHandle {
                         },
                         Err(error) => {
                             MetadataTransportMessage::BucketSearchResults { result: Err(error) }
+                        }
+                    }
+                })
+                .await
+            }
+            MetadataTransportMessage::SearchObjects {
+                auth_token,
+                query,
+                key_match,
+                bucket,
+                limit,
+                start_after,
+                as_of,
+            } => {
+                Box::pin(async {
+                    match bucket_search_auth(
+                        &self.inner.auth_validation,
+                        &self.inner.storage_handle,
+                        peer,
+                        self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
+                        auth_token,
+                    )
+                    .await
+                    {
+                        Ok(auth) => match self.inner.net_handle.as_ref() {
+                            Some(net_handle) => match search_local_objects(
+                                context.as_ref(),
+                                SearchObjectsInput {
+                                    auth,
+                                    realm_id: *net_handle.realm_id(),
+                                    node_id: net_handle.node_id(),
+                                    query,
+                                    key_match,
+                                    bucket,
+                                    limit,
+                                    start_after,
+                                    as_of,
+                                },
+                            )
+                            .await
+                            {
+                                Ok(page) => MetadataTransportMessage::ObjectSearchResults {
+                                    result: Ok(page),
+                                },
+                                Err(_) => MetadataTransportMessage::ObjectSearchResults {
+                                    result: Err(MetadataReadError::Unavailable),
+                                },
+                            },
+                            None => MetadataTransportMessage::ObjectSearchResults {
+                                result: Err(MetadataReadError::Unavailable),
+                            },
+                        },
+                        Err(error) => {
+                            MetadataTransportMessage::ObjectSearchResults { result: Err(error) }
                         }
                     }
                 })
@@ -1673,7 +1833,8 @@ impl MetadataHandle {
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardReadDocument { .. }) => {
+            | MetadataTransportMessage::ForwardReadDocument { .. }
+            | MetadataTransportMessage::ForwardProfileValidationStatus { .. }) => {
                 Box::pin(async {
                     super::forward::apply_forwarded_write(context, peer, forward).await
                 })
@@ -1740,6 +1901,7 @@ impl MetadataHandle {
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
+            | MetadataTransportMessage::ObjectSearchResults { .. }
             | MetadataTransportMessage::SyncMirrorCreated
             | MetadataTransportMessage::SyncMirrorDeleted
             | MetadataTransportMessage::ForwardedRecord { .. }
@@ -1764,6 +1926,9 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedJobRecordPage { .. }
             | MetadataTransportMessage::ForwardedLaunchOffer { .. }
             | MetadataTransportMessage::ForwardedJobSubmission { .. }
+            | MetadataTransportMessage::ForwardedProfileValidation { .. }
+            | MetadataTransportMessage::ForwardedProfileValidationStatus { .. }
+            | MetadataTransportMessage::ReferencePreflightResults { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -2453,6 +2618,64 @@ impl MetadataHandle {
         result
     }
 
+    #[tracing::instrument(
+        name = "metadata.object_search.remote",
+        level = "debug",
+        skip(self, auth_token, query, start_after),
+        fields(
+            peer = ?node_id,
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_object_search(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        query: String,
+        key_match: ObjectKeyMatch,
+        bucket: Option<String>,
+        limit: usize,
+        start_after: Option<Vec<u8>>,
+        as_of: SystemTime,
+    ) -> Result<ObjectSearchNodePage, MetadataReadError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = match send_remote_metadata_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::SearchObjects {
+                auth_token,
+                query,
+                key_match,
+                bucket,
+                limit,
+                start_after,
+                as_of,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ObjectSearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        };
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        match &result {
+            Ok(page) => {
+                span.record("result", "ok");
+                span.record("hit_count", page.hits.len() as u64);
+            }
+            Err(error) => record_error(&span, &format!("{error:?}")),
+        }
+        result
+    }
+
     pub async fn request_sync_create(
         &self,
         node_id: NodeId,
@@ -2580,6 +2803,31 @@ impl MetadataHandle {
             Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
+    }
+
+    pub async fn request_remote_reference_preflight(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        request: super::api::MetadataReferencePreflightNodeRequest,
+    ) -> Result<super::api::MetadataReferencePreflightNodeExecution, MetadataReadError> {
+        match send_remote_metadata_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::ReferencePreflight {
+                auth_token,
+                request: Box::new(request),
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ReferencePreflightResults { result } => {
+                result.map(|result| *result)
+            }
+            _ => Err(MetadataReadError::Unavailable),
+        }
     }
 }
 
@@ -2844,10 +3092,12 @@ async fn graph_lifecycle_deleted(
 }
 
 async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<(), MetadataError> {
-    tokio::task::spawn_blocking(move || node.delete_graph_unchecked(&GraphId::new(&graph_iri)))
-        .await
-        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-        .map_err(metadata_error_from_craqle)
+    tokio::task::spawn_blocking(move || {
+        node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    .map_err(metadata_error_from_craqle)
 }
 
 async fn contains_local_graph(
@@ -3195,26 +3445,13 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             let started = Instant::now();
             let durability = request.durability;
             let actor = request.deterministic_actor.map(ActorId::from_bytes);
-            // Event-log materialization (deterministic actor + WAL-durable
-            // request) replays payloads validated at the origin.
-            let prevalidated =
-                actor.is_some() && durability == MetadataRequestDurability::WalAlreadyDurable;
             let result = call_span.in_scope(|| {
-                if prevalidated {
-                    node.create_crate_prevalidated_with_durability_as(
-                        &auth,
-                        craqle_create_request(request.clone()),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                } else {
-                    node.create_crate_with_durability_as(
-                        &auth,
-                        craqle_create_request(request.clone()),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                }
+                node.create_crate_with_durability_as(
+                    &auth,
+                    craqle_create_request(request.clone()),
+                    craqle_request_durability(durability),
+                    actor,
+                )
             });
             record_craqle_call_result(
                 &call_span,
@@ -3249,28 +3486,15 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
-            let prevalidated =
-                actor.is_some() && durability == MetadataRequestDurability::WalAlreadyDurable;
             let result = call_span.in_scope(|| {
-                if prevalidated {
-                    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
-                        &auth,
-                        GraphId::new(&graph_iri),
-                        &jsonld,
-                        craqle_graph_policy(policy),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                } else {
-                    node.apply_rocrate_document_checked_with_policy_and_durability_as(
-                        &auth,
-                        GraphId::new(&graph_iri),
-                        &jsonld,
-                        craqle_graph_policy(policy),
-                        craqle_request_durability(durability),
-                        actor,
-                    )
-                }
+                node.apply_rocrate_document_checked_with_policy_and_durability_as(
+                    &auth,
+                    GraphId::new(&graph_iri),
+                    &jsonld,
+                    craqle_graph_policy(policy),
+                    craqle_request_durability(durability),
+                    actor,
+                )
             });
             record_craqle_call_result(
                 &call_span,
@@ -3359,7 +3583,11 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             let started = Instant::now();
             let result = call_span
                 .in_scope(|| {
-                    node.import_graph_policy(&GraphId::new(&graph_iri), craqle_graph_policy(policy))
+                    node.set_graph_policy(
+                        &auth,
+                        &GraphId::new(&graph_iri),
+                        craqle_graph_policy(policy),
+                    )
                 })
                 .map(|_| MetadataEvent::GraphPolicySet {
                     graph_iri: graph_iri.clone(),
@@ -3533,7 +3761,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.delete_graph_unchecked(&GraphId::new(&graph_iri)))
+                .in_scope(|| node.delete_graph(&auth, &GraphId::new(&graph_iri)))
                 .map(|_| MetadataEvent::GraphDeleted {
                     graph_iri: graph_iri.clone(),
                 });
@@ -4422,6 +4650,7 @@ pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
         | MetadataError::HandleMissing
         | MetadataError::TaskJoin(_)
         | MetadataError::Validation(_)
+        | MetadataError::ProfileValidation(_)
         | MetadataError::Persist(_)
         | MetadataError::Storage(_)
         | MetadataError::Backend(_) => MetadataReadError::Unavailable,
@@ -4449,6 +4678,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::SearchResults { .. } => "search_results",
         MetadataTransportMessage::SearchBuckets { .. } => "search_buckets",
         MetadataTransportMessage::BucketSearchResults { .. } => "bucket_search_results",
+        MetadataTransportMessage::SearchObjects { .. } => "search_objects",
+        MetadataTransportMessage::ObjectSearchResults { .. } => "object_search_results",
         MetadataTransportMessage::CreateSyncMirror { .. } => "create_sync_mirror",
         MetadataTransportMessage::DeleteSyncMirror { .. } => "delete_sync_mirror",
         MetadataTransportMessage::SyncMirrorCreated => "sync_mirror_created",
@@ -4503,6 +4734,17 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedLaunchOffer { .. } => "forwarded_launch_offer",
         MetadataTransportMessage::ForwardJobSubmission { .. } => "forward_job_submission",
         MetadataTransportMessage::ForwardedJobSubmission { .. } => "forwarded_job_submission",
+        MetadataTransportMessage::ForwardedProfileValidation { .. } => {
+            "forwarded_profile_validation"
+        }
+        MetadataTransportMessage::ForwardProfileValidationStatus { .. } => {
+            "forward_profile_validation_status"
+        }
+        MetadataTransportMessage::ForwardedProfileValidationStatus { .. } => {
+            "forwarded_profile_validation_status"
+        }
+        MetadataTransportMessage::ReferencePreflight { .. } => "reference_preflight",
+        MetadataTransportMessage::ReferencePreflightResults { .. } => "reference_preflight_results",
     }
 }
 
@@ -5519,12 +5761,11 @@ fn collect_metadata_query_results(
                 let row = solution
                     .iter()
                     .map(|(variable, term)| {
-                        (
-                            variable.as_str().to_string(),
-                            craqle::EncodedTerm::from_term(term).0,
-                        )
+                        let encoded = craqle::EncodedTerm::from_term(term)
+                            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+                        Ok((variable.as_str().to_string(), encoded.0))
                     })
-                    .collect::<BTreeMap<_, _>>();
+                    .collect::<Result<BTreeMap<_, _>, MetadataError>>()?;
                 serialized_bytes = serialized_bytes.saturating_add(
                     serde_json::to_vec(&row)
                         .map_err(|error| MetadataError::Backend(error.to_string()))?
@@ -6783,6 +7024,7 @@ mod tests {
     use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::metadata::MetadataApplyRoCrateRequest;
     use aruna_core::structs::{
         ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
         SyncMode, SyncState, SyncStatusSnapshot, TokenClaims, TokenRevocation,
@@ -6796,6 +7038,15 @@ mod tests {
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
     use tokio::io::AsyncWriteExt;
+
+    const ROCRATE_12: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/rocrate/roundtrip-1.2.json"
+    ));
+    const ROCRATE_13: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/rocrate/roundtrip-1.3.json"
+    ));
 
     #[test]
     fn maps_violations() {
@@ -7069,6 +7320,129 @@ mod tests {
         )
         .expect("metadata handle opens");
         (metadata_dir, metadata_handle)
+    }
+
+    #[tokio::test]
+    async fn versions_roundtrip() {
+        let (_storage_dir, storage) = auth_storage();
+        let (_metadata_dir, handle) = memory_handle(storage);
+        let cases = [
+            ("1.2", "urn:fixture:aruna:rocrate:1.2", ROCRATE_12),
+            ("1.3", "urn:fixture:aruna:rocrate:1.3", ROCRATE_13),
+        ];
+
+        // One handle stores both versions, covering a mixed-version realm.
+        for (version, graph_iri, jsonld) in cases {
+            let request = MetadataApplyRoCrateRequest {
+                graph_iri: graph_iri.to_string(),
+                jsonld: jsonld.to_string(),
+                policy: MetadataGraphPolicy {
+                    public: true,
+                    permission_paths: Vec::new(),
+                },
+                durability: MetadataRequestDurability::Durable,
+                deterministic_actor: None,
+            };
+            assert!(matches!(
+                handle
+                    .send_metadata_effect(MetadataEffect::ValidateRoCrate {
+                        request: request.clone(),
+                    })
+                    .await,
+                Event::Metadata(MetadataEvent::ValidationResult { graph_iri: validated })
+                    if validated == graph_iri
+            ));
+            assert!(matches!(
+                handle
+                    .send_metadata_effect(MetadataEffect::ApplyRoCrate { request })
+                    .await,
+                Event::Metadata(MetadataEvent::ApplyRoCrateResult { graph_iri: applied, .. })
+                    if applied == graph_iri
+            ));
+
+            let exported = handle
+                .export_rocrate_jsonld(graph_iri.to_string())
+                .await
+                .expect("RO-Crate exports");
+            let output = serde_json::from_str::<Value>(&exported).expect("export is JSON");
+            let input = serde_json::from_str::<Value>(jsonld).expect("fixture is JSON");
+            assert_eq!(output["@context"], input["@context"]);
+            let output_descriptor = output["@graph"]
+                .as_array()
+                .expect("export graph")
+                .iter()
+                .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+                .expect("export descriptor");
+            let input_descriptor = input["@graph"]
+                .as_array()
+                .expect("fixture graph")
+                .iter()
+                .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+                .expect("fixture descriptor");
+            assert_eq!(
+                output_descriptor["conformsTo"],
+                input_descriptor["conformsTo"]
+            );
+            if version == "1.2" {
+                assert_eq!(
+                    output, input,
+                    "RO-Crate 1.2 JSON-LD behavior changed during import/export"
+                );
+            }
+            assert_eq!(
+                craqle::validate_rocrate_jsonld(&exported)
+                    .expect("export validates")
+                    .nquads,
+                craqle::validate_rocrate_jsonld(jsonld)
+                    .expect("fixture validates")
+                    .nquads,
+                "RO-Crate {version} RDF changed during import/export"
+            );
+        }
+
+        let graph_iri = "urn:fixture:aruna:rocrate:created";
+        assert!(matches!(
+            handle
+                .send_metadata_effect(MetadataEffect::CreateCrate {
+                    request: MetadataCreateCrateRequest {
+                        graph_iri: graph_iri.to_string(),
+                        name: "RO-Crate 1.3 scaffold".to_string(),
+                        description: "Aruna scaffold version contract".to_string(),
+                        date_published: "2026-08-19".to_string(),
+                        license: None,
+                        policy: MetadataGraphPolicy {
+                            public: true,
+                            permission_paths: Vec::new(),
+                        },
+                        durability: MetadataRequestDurability::Durable,
+                        deterministic_actor: None,
+                    },
+                })
+                .await,
+            Event::Metadata(MetadataEvent::CreateCrateResult { graph_iri: created, .. })
+                if created == graph_iri
+        ));
+        let scaffold: Value = serde_json::from_str(
+            &handle
+                .export_rocrate_jsonld(graph_iri.to_string())
+                .await
+                .expect("scaffold exports"),
+        )
+        .expect("scaffold is JSON");
+        assert_eq!(
+            scaffold["@context"],
+            serde_json::json!("https://w3id.org/ro/crate/1.3/context")
+        );
+        let descriptor = scaffold["@graph"]
+            .as_array()
+            .expect("scaffold graph")
+            .iter()
+            .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+            .expect("scaffold descriptor");
+        assert_eq!(
+            descriptor["conformsTo"]["@id"],
+            serde_json::json!("https://w3id.org/ro/crate/1.3")
+        );
     }
 
     async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {

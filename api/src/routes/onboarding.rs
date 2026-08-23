@@ -561,8 +561,10 @@ fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
         BootstrapOnboardingFinalizeError::EnsureRealmConfig(
             EnsureRealmConfigError::HandleSpaceExhausted,
         ) => ServerError::Conflict("realm handle space is exhausted".to_string()),
-        BootstrapOnboardingFinalizeError::ReservedNodeLabel(_)
-        | BootstrapOnboardingFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
+        BootstrapOnboardingFinalizeError::ReservedNodeLabel(label) => {
+            ServerError::ReservedLabel(label)
+        }
+        BootstrapOnboardingFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -806,7 +808,7 @@ mod tests {
             map_finalize_error(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
                 String::new()
             )),
-            ServerError::BadRequest
+            ServerError::ReservedLabel(_)
         ));
         assert!(matches!(
             map_finalize_error(BootstrapOnboardingFinalizeError::NodeLocationTooLong),

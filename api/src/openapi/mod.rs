@@ -233,6 +233,7 @@ mod tests {
         ("/admin/compute/snapshots", "get"),
         ("/admin/placement-quarantine", "post"),
         ("/admin/placement-policies", "post"),
+        ("/admin/placement-policies", "get"),
         ("/admin/placement-policies/{policy_id}", "get"),
         ("/admin/placement-diagnostics", "get"),
         ("/buckets/{bucket}/placement", "get"),
@@ -1004,12 +1005,7 @@ mod tests {
                 .as_array()
                 .is_some_and(|security| security.contains(&json!({})))
         );
-        let mint = &doc["paths"]["/pid/{document_id}"]["post"];
-        assert!(mint["responses"]["202"]["content"]["application/json"].is_object());
-        assert_eq!(
-            operation_security(&doc, "/pid/{document_id}", "post"),
-            vec![json!({ "bearer_auth": [] })]
-        );
+        assert!(doc["paths"]["/pid/{document_id}"]["post"].is_null());
         let withdraw = &doc["paths"]["/pid/{document_id}"]["delete"];
         assert!(withdraw["responses"]["204"]["content"].is_null());
     }

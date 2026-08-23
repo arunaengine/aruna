@@ -12,6 +12,36 @@ use crate::types::{GroupId, UserId};
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 
+/// Supported RO-Crate specification IRIs and the RO-Crate community profiles
+/// (workflow run crates, Workflow RO-Crate) are version markers, not Profiles.
+pub fn is_rocrate_specification(iri: &str) -> bool {
+    matches!(
+        iri,
+        "https://w3id.org/ro/crate/1.2" | "https://w3id.org/ro/crate/1.3"
+    ) || iri.starts_with("https://w3id.org/ro/wfrun/")
+        || iri.starts_with("https://w3id.org/workflowhub/workflow-ro-crate/")
+}
+
+#[cfg(test)]
+mod specification_tests {
+    use super::is_rocrate_specification;
+
+    #[test]
+    fn community_profiles_are_markers() {
+        assert!(is_rocrate_specification("https://w3id.org/ro/crate/1.3"));
+        assert!(is_rocrate_specification(
+            "https://w3id.org/ro/wfrun/process/0.5"
+        ));
+        assert!(is_rocrate_specification(
+            "https://w3id.org/workflowhub/workflow-ro-crate/1.0"
+        ));
+        assert!(!is_rocrate_specification(
+            "https://w3id.org/aruna/profile/01J"
+        ));
+        assert!(!is_rocrate_specification("https://example.org/profile"));
+    }
+}
+
 /// Credential a forwarded metadata or job-control request carries to the holder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataAuthToken {
@@ -1005,6 +1035,8 @@ pub enum MetadataError {
     InvalidInput(String),
     #[error("metadata validation failed: {0:?}")]
     Validation(Vec<MetadataValidationViolation>),
+    #[error("metadata profile validation failed: {0:?}")]
+    ProfileValidation(Vec<MetadataProfileValidationFinding>),
     #[error("metadata graph not found")]
     GraphNotFound,
     /// Durability failure while persisting backend state. Infrastructure, not the
@@ -1025,6 +1057,57 @@ pub struct MetadataValidationViolation {
     pub message: String,
     pub pointer: String,
     pub entity_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataProfileValidationSeverity {
+    Violation,
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataProfileValidationCompleteness {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataProfileValidationFinding {
+    pub code: String,
+    pub severity: MetadataProfileValidationSeverity,
+    pub focus_node: Option<String>,
+    pub path: Option<String>,
+    pub rule: String,
+    pub message: String,
+    pub profile_revision: Option<Ulid>,
+    pub completeness: MetadataProfileValidationCompleteness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataProfileValidationState {
+    NotProfiled,
+    Valid,
+    Invalid,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataProfileValidationStatus {
+    pub document_id: Ulid,
+    pub dataset_revision: Ulid,
+    pub state: MetadataProfileValidationState,
+    pub profile_id: Option<Ulid>,
+    pub profile_iri: Option<String>,
+    pub profile_revision: Option<Ulid>,
+    pub evaluator: String,
+    pub validated_at_ms: Option<u64>,
+    pub findings: Vec<MetadataProfileValidationFinding>,
+    pub completeness: MetadataProfileValidationCompleteness,
+    pub stale_reason: Option<String>,
 }
 
 #[cfg(test)]

@@ -567,8 +567,9 @@ async fn wire_peers(nodes: &[TestNode]) {
 async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
     let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
     config.seed_default_placement();
-    for node in nodes {
+    for (band, node) in nodes.iter().enumerate() {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+        config.seed_job_control(node.net.node_id(), band as u32);
     }
 
     write_config(nodes, realm_id, &config).await?;

@@ -45,14 +45,7 @@ async fn turnover_keeps_history() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
 
     let path = "datasets/disjoint";
-    let origin = (0..MANAGEMENT_NODES)
-        .map(|index| realm.node(index))
-        .find(|node| {
-            realm
-                .origin_placement(node, group_id, Ulid::nil(), path)
-                .is_some()
-        })
-        .expect("a management node holds a bucket");
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = create_document(&realm, origin, group_id, document_id, path).await?;

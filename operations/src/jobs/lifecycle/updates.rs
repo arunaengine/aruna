@@ -270,7 +270,7 @@ pub async fn settle_terminals(context: &DriverContext) -> Result<(), String> {
         else {
             continue;
         };
-        if record.state.is_terminal() && !publish_terminal(context, &record).await {
+        if record.is_settled() && !publish_terminal(context, &record).await {
             return Err(format!(
                 "terminal obligation for execution {} remains pending",
                 reservation.execution_id
@@ -293,6 +293,8 @@ fn terminal_state(record: &JobRecord) -> Option<PhysicalExecutionState> {
         }
         JobState::Failed => Some(PhysicalExecutionState::Error),
         JobState::Cancelled => Some(PhysicalExecutionState::Cancelled),
+        // Local exhaustion is an error the family may still resolve elsewhere.
+        JobState::Indeterminate if record.locally_exhausted => Some(PhysicalExecutionState::Error),
         _ => None,
     }
 }

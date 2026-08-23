@@ -21,6 +21,9 @@ use aruna_operations::placement_policy::create::{CreatePolicyConfig, CreatePolic
 use aruna_operations::placement_policy::diagnostics::{
     DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,
 };
+use aruna_operations::placement_policy::list::{
+    ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
+};
 use aruna_operations::placement_policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
@@ -60,7 +63,7 @@ pub struct PlacementApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(PlacementApiDoc::openapi())
-        .routes(routes!(create_placement_policy))
+        .routes(routes!(create_placement_policy, list_placement_policies))
         .routes(routes!(get_placement_policy))
         .routes(routes!(get_placement_diagnostics))
         .routes(routes!(get_bucket_placement, put_bucket_placement))
@@ -117,6 +120,26 @@ pub struct PolicyResponse {
     pub publisher: String,
     pub created_by: String,
     pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct PolicyListQuery {
+    /// Opaque continuation returned by the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Page bound; the server default applies when omitted.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct PolicyListResponse {
+    /// Ascending by policy id.
+    pub policies: Vec<PolicyResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// True only when this responder's bounded iterator was exhausted.
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -679,6 +702,63 @@ pub async fn get_placement_policy(
     .await
     .map_err(map_read_error)?;
     Ok(Json(policy_response(&authentic.document)?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/placement-policies",
+    tag = "placement",
+    summary = "List the placement policies this responder holds",
+    description = "Requires a bearer token issued for this realm and READ on the realm configuration path, checked inside the operation. Policy documents replicate only to the holders their id resolves to, so a page names what this node stores rather than a realm-wide catalog, and `complete` means this node's own bounded iterator was exhausted in the pass. Policies are ordered by ascending policy id; `next_cursor` continues after the last one returned.",
+    params(PolicyListQuery),
+    responses(
+        (status = 200, description = "One bounded page of policies this node holds", body = PolicyListResponse, example = json!({
+            "policies": [{
+                "policy_id": "01K2ZK4Q0X3D5M6P7R8S9T0V1W",
+                "digest": "9d3b0c1a2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+                "name": "eu-residency",
+                "allowed": [{ "location": "eu-west" }],
+                "publisher": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                "created_by": "01K2ZK4Q0X3D5M6P7R8S9T0V2A@0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+                "created_at_ms": 1755500000000u64
+            }],
+            "next_cursor": "0197d0b41c1e3d5a6b7c8d9e0f1a2b3c",
+            "complete": false
+        })),
+        (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
+        (status = 401, description = "No bearer token was presented", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_placement_policies(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<PolicyListQuery>,
+) -> ServerResult<Json<PolicyListResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let page = drive(
+        ListPoliciesOperation::new(ListPoliciesInput {
+            auth_context: auth,
+            start_after: decode_cursor(query.cursor)?,
+            limit: query.limit.unwrap_or(POLICY_LIST_DEFAULT),
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        ListPoliciesError::Unauthorized => ServerError::Forbidden,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    Ok(Json(PolicyListResponse {
+        policies: page
+            .policies
+            .iter()
+            .map(policy_response)
+            .collect::<ServerResult<Vec<_>>>()?,
+        next_cursor: page.cursor.map(hex::encode),
+        complete: page.complete,
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]

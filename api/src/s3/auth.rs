@@ -3,8 +3,8 @@ use super::util::{get_s3_operation_permission, is_anonymous_object_read_operatio
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use aruna_core::credential_seal::{CredentialSealKey, SealedS3Secret};
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
-    blob_group_permission_path, blob_object_permission_path,
+    AuthContext, BucketInfo, Permission, RealmId, S3Session, UserAccess,
+    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
 };
 use aruna_core::{NodeId, UserId};
 use aruna_operations::driver::{DriverContext, drive};
@@ -13,6 +13,10 @@ use aruna_operations::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::session::{
+    GetS3SessionOperation, S3SessionError, TouchS3SessionConfig, TouchS3SessionOperation,
+};
+use http::{HeaderMap, Uri};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::{S3Result, s3_error};
@@ -55,6 +59,22 @@ pub struct AuthProvider {
 #[async_trait::async_trait]
 impl S3Auth for AuthProvider {
     async fn get_secret_key(&self, access_key_id: &str) -> S3Result<SecretKey> {
+        if S3Session::is_session_key(access_key_id) {
+            let session = self.query_session(access_key_id).await?;
+            if session.issued_by != *self.node_id.as_bytes() {
+                return Err(s3_error!(
+                    InvalidAccessKeyId,
+                    "The Access Key Id you provided does not exist in our records."
+                ));
+            }
+            let secret = session.open_secret(&self.seal_key).map_err(|_| {
+                s3_error!(
+                    InvalidAccessKeyId,
+                    "The Access Key Id you provided does not exist in our records."
+                )
+            })?;
+            return Ok(SecretKey::from(secret));
+        }
         let user_access = self.query_user_access(access_key_id).await?;
         // Secrets seal at rest with an issuer-local key, so only the issuing
         // node can recover the plaintext s3s needs to verify a signature. A
@@ -98,9 +118,18 @@ impl S3Access for AuthProvider {
             None => return self.check_anonymous(cx, action).await,
         };
 
-        // Fetch user access -> GetUserAccess state machine
-        let user_access = self.query_user_access(&access_key_id).await?;
-        let permit = self.admit_credential(&user_access)?;
+        let now = SystemTime::now();
+        let (user_access, permit, session_token_hash) = if S3Session::is_session_key(&access_key_id)
+        {
+            let session = self.query_session(&access_key_id).await?;
+            let token_hash = request_token_hash(cx.headers(), cx.uri())?;
+            let permit = self.admit_session(&session, &token_hash, now)?;
+            (session.as_user_access(), permit, Some(token_hash))
+        } else {
+            let user_access = self.query_user_access(&access_key_id).await?;
+            let permit = self.admit_credential(&user_access)?;
+            (user_access, permit, None)
+        };
         let lease = cx
             .extensions_mut()
             .get::<LocalLease>()
@@ -147,6 +176,20 @@ impl S3Access for AuthProvider {
             )
             .await
             .map_err(map_authorize_error)?;
+        }
+
+        if let Some(token_hash) = session_token_hash {
+            drive(
+                TouchS3SessionOperation::new(TouchS3SessionConfig {
+                    access_key: access_key_id,
+                    token_hash,
+                    now,
+                    issued_by: *self.node_id.as_bytes(),
+                }),
+                self.driver_ctx.as_ref(),
+            )
+            .await
+            .map_err(map_session_error)?;
         }
 
         cx.extensions_mut().insert(extras);
@@ -197,6 +240,43 @@ fn header_allowed(name: &str) -> bool {
         name,
         "content-type" | "content-length" | "x-amz-tagging" | "x-amz-acl"
     ) || name.starts_with("x-amz-meta-")
+}
+
+fn request_token_hash(headers: &HeaderMap, uri: &Uri) -> S3Result<String> {
+    let mut token = None;
+    for value in headers.get_all("x-amz-security-token") {
+        let value = value
+            .to_str()
+            .map_err(|_| s3_error!(InvalidToken, "Invalid session token"))?;
+        if token.replace(value.to_string()).is_some() {
+            return Err(s3_error!(InvalidToken, "Invalid session token"));
+        }
+    }
+    if let Some(query) = uri.query() {
+        for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if name != "X-Amz-Security-Token" {
+                continue;
+            }
+            if token.replace(value.into_owned()).is_some() {
+                return Err(s3_error!(InvalidToken, "Invalid session token"));
+            }
+        }
+    }
+    token
+        .map(|token| S3Session::hash_token(&token))
+        .ok_or_else(|| s3_error!(MissingAuthenticationToken, "Session token is required"))
+}
+
+fn map_session_error(error: S3SessionError) -> s3s::S3Error {
+    match error {
+        S3SessionError::NotFound | S3SessionError::WrongIssuer => s3_error!(
+            InvalidAccessKeyId,
+            "The Access Key Id you provided does not exist in our records."
+        ),
+        S3SessionError::InvalidToken => s3_error!(InvalidToken, "Invalid session token"),
+        S3SessionError::Expired => s3_error!(ExpiredToken, "Session token has expired"),
+        _ => s3_error!(InternalError, "Failed to update session activity"),
+    }
 }
 
 impl AuthProvider {
@@ -266,10 +346,18 @@ impl AuthProvider {
     /// expired credential must not drain the owner's shared request rate or
     /// take one of the owner's admission permits.
     fn admit_credential(&self, user_access: &UserAccess) -> S3Result<LocalPermit> {
+        self.admit_credential_at(user_access, SystemTime::now())
+    }
+
+    fn admit_credential_at(
+        &self,
+        user_access: &UserAccess,
+        now: SystemTime,
+    ) -> S3Result<LocalPermit> {
         if user_access.is_revoked() {
             return Err(s3_error!(AccessDenied, "Credential has been revoked"));
         }
-        if user_access.is_expired(SystemTime::now()) {
+        if user_access.is_expired(now) {
             return Err(s3_error!(AccessDenied, "Credential has expired"));
         }
         // Charge the stable identity after lookup so credential rotation cannot
@@ -284,6 +372,27 @@ impl AuthProvider {
         self.rate_limits
             .try_acquire_local(LocalKey::User(user_access.user_identity))
             .ok_or_else(|| s3_error!(SlowDown, "Reduce your request rate"))
+    }
+
+    fn admit_session(
+        &self,
+        session: &S3Session,
+        token_hash: &str,
+        now: SystemTime,
+    ) -> S3Result<LocalPermit> {
+        if session.issued_by != *self.node_id.as_bytes() {
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            ));
+        }
+        if session.is_expired(now) {
+            return Err(s3_error!(ExpiredToken, "Session token has expired"));
+        }
+        if !session.token_matches(token_hash) {
+            return Err(s3_error!(InvalidToken, "Invalid session token"));
+        }
+        self.admit_credential_at(&session.as_user_access(), now)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -307,6 +416,31 @@ impl AuthProvider {
                 "The Access Key Id you provided does not exist in our records."
             )),
             Err(_) => Err(s3_error!(InternalError, "Failed to query user access")),
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn query_session(&self, access_key_id: &str) -> S3Result<S3Session> {
+        if !S3Session::valid_access_key(access_key_id) {
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            ));
+        }
+        match drive(
+            GetS3SessionOperation::new(access_key_id.to_string()),
+            self.driver_ctx.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(session)) => Ok(session),
+            Ok(None) | Err(S3SessionError::NotFound | S3SessionError::InvalidAccessKey) => {
+                Err(s3_error!(
+                    InvalidAccessKeyId,
+                    "The Access Key Id you provided does not exist in our records."
+                ))
+            }
+            Err(_) => Err(s3_error!(InternalError, "Failed to query S3 session")),
         }
     }
 
@@ -442,6 +576,21 @@ mod tests {
             .await;
     }
 
+    async fn store_session(provider: &AuthProvider, session: &S3Session) {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::S3_SESSION_KEYSPACE;
+        provider
+            .driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_SESSION_KEYSPACE.to_string(),
+                key: session.access_key.as_bytes().into(),
+                value: session.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
     fn sealed_access(provider: &AuthProvider, issued_by: [u8; 32]) -> UserAccess {
         use ulid::Ulid;
         let mut access = UserAccess {
@@ -458,6 +607,29 @@ mod tests {
             .seal_secret(&CredentialSealKey::derive(&[7u8; 32]), "unsealed-secret")
             .unwrap();
         access
+    }
+
+    fn sealed_session(
+        provider: &AuthProvider,
+        issued_by: [u8; 32],
+        expiry: SystemTime,
+    ) -> S3Session {
+        use ulid::Ulid;
+        let mut session = S3Session {
+            access_key: S3Session::build_access_key(&Ulid::generate().to_string()).unwrap(),
+            user_identity: UserId::local(Ulid::generate(), provider.realm_id),
+            group_id: Ulid::generate(),
+            secret: SealedS3Secret::empty(),
+            token_hash: S3Session::hash_token("temporary-token"),
+            expiry,
+            path_restrictions: None,
+            issued_by,
+            last_used_at: None,
+        };
+        session
+            .seal_secret(&CredentialSealKey::derive(&[7u8; 32]), "temporary-secret")
+            .unwrap();
+        session
     }
 
     #[tokio::test]
@@ -508,6 +680,108 @@ mod tests {
             .get_secret_key(&foreign.access_key)
             .await
             .unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
+    }
+
+    #[tokio::test]
+    async fn token_required_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let session = sealed_session(
+            &provider,
+            *provider.node_id.as_bytes(),
+            now + std::time::Duration::from_secs(600),
+        );
+        let uri = Uri::from_static("/");
+
+        let missing = request_token_hash(&HeaderMap::new(), &uri).unwrap_err();
+        assert_eq!(
+            missing.code(),
+            &s3s::S3ErrorCode::MissingAuthenticationToken
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-security-token", "wrong-token".parse().unwrap());
+        let mismatch = request_token_hash(&headers, &uri).unwrap();
+        let Err(error) = provider.admit_session(&session, &mismatch, now) else {
+            panic!("mismatched session token admitted");
+        };
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidToken);
+
+        headers.insert("x-amz-security-token", "temporary-token".parse().unwrap());
+        let exact = request_token_hash(&headers, &uri).unwrap();
+        assert!(provider.admit_session(&session, &exact, now).is_ok());
+        let Err(expired) = provider.admit_session(&session, &exact, session.expiry) else {
+            panic!("expired session admitted");
+        };
+        assert_eq!(expired.code(), &s3s::S3ErrorCode::ExpiredToken);
+    }
+
+    #[tokio::test]
+    async fn session_never_degrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+        let mut long_lived = sealed_access(&provider, *provider.node_id.as_bytes());
+        long_lived.access_key =
+            S3Session::build_access_key(&ulid::Ulid::generate().to_string()).unwrap();
+        long_lived.secret = SealedS3Secret::empty();
+        long_lived
+            .seal_secret(&provider.seal_key, "long-lived-secret")
+            .unwrap();
+        store_access(&provider, &long_lived).await;
+
+        let error = provider
+            .get_secret_key(&long_lived.access_key)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
+    }
+
+    #[test]
+    fn query_token_supported() {
+        let headers = HeaderMap::new();
+        let uri = Uri::from_static("/?X-Amz-Security-Token=temporary-token");
+        assert_eq!(
+            request_token_hash(&headers, &uri).unwrap(),
+            S3Session::hash_token("temporary-token")
+        );
+
+        let duplicate = Uri::from_static("/?X-Amz-Security-Token=one&X-Amz-Security-Token=two");
+        let error = request_token_hash(&headers, &duplicate).unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidToken);
+    }
+
+    #[tokio::test]
+    async fn wrong_node_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+        let expiry = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let local = sealed_session(&provider, *provider.node_id.as_bytes(), expiry);
+        store_session(&provider, &local).await;
+        assert_eq!(
+            provider
+                .get_secret_key(&local.access_key)
+                .await
+                .unwrap()
+                .expose(),
+            "temporary-secret"
+        );
+        let foreign = sealed_session(&provider, [9u8; 32], expiry);
+        store_session(&provider, &foreign).await;
+
+        let error = provider
+            .get_secret_key(&foreign.access_key)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
+        let Err(error) = provider.admit_session(
+            &foreign,
+            &S3Session::hash_token("temporary-token"),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        ) else {
+            panic!("foreign session admitted");
+        };
         assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
     }
 }

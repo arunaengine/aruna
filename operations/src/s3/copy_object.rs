@@ -3,6 +3,7 @@ use crate::driver::{
     routing_snapshot,
 };
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::purge_fence::ensure_write_allowed;
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -128,6 +129,9 @@ pub async fn copy_object(
     context: &DriverContext,
     input: CopyObjectInput,
 ) -> Result<CopyObjectResultData, CopyObjectError> {
+    ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
+        .await
+        .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
     let source = drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: input.source_bucket,

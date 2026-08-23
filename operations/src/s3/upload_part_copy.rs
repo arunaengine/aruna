@@ -4,6 +4,7 @@ use crate::s3::copy_object::{CopySourceConditions, evaluate_source_conditions};
 use crate::s3::get_object::{
     GetObjectError, GetObjectInput, GetObjectOperation, ObjectRangeRequest,
 };
+use crate::s3::purge_fence::ensure_write_allowed;
 use crate::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -61,6 +62,9 @@ pub async fn upload_part_copy(
     context: &DriverContext,
     input: UploadPartCopyInput,
 ) -> Result<UploadPartCopyResultData, UploadPartCopyError> {
+    ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
+        .await
+        .map_err(|error| UploadPartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
     let sealed = validate_destination_upload(context, &input).await?;
 
     let source = drive(

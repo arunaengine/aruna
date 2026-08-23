@@ -4,6 +4,7 @@ use crate::blob::blob_keyspace_helper::{
 };
 use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::usage_stats::{
     UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
 };
@@ -31,6 +32,7 @@ use ulid::Ulid;
 pub enum DeleteObjectState {
     Init,
     StartTransaction,
+    CheckPurgeFence,
     ReadTargetVersion,
     ReadTargetLocation,
     ReadAllVersions,
@@ -106,6 +108,8 @@ pub enum DeleteObjectError {
     UsageUpdateError(#[from] UsageUpdateError),
     #[error(transparent)]
     ManagedCopyError(#[from] ManagedCopyError),
+    #[error(transparent)]
+    PurgeFence(#[from] PurgeFenceError),
     #[error("DeleteObject failed")]
     DeleteObjectFailed,
 }
@@ -260,7 +264,15 @@ impl DeleteObjectOperation {
         if let Some(version_id) = self.input.version_id {
             self.read_target_version(version_id)
         } else {
-            self.write_tombstone()
+            self.state = DeleteObjectState::CheckPurgeFence;
+            smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
+        }
+    }
+
+    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+        match check_write_fence(event, &self.input.bucket, &self.input.key) {
+            Ok(()) => self.write_tombstone(),
+            Err(error) => self.emit_error(error.into()),
         }
     }
 
@@ -873,6 +885,7 @@ impl Operation for DeleteObjectOperation {
         match self.state {
             DeleteObjectState::Init => self.handle_init(),
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
+            DeleteObjectState::CheckPurgeFence => self.handle_purge_fence_checked(event),
             DeleteObjectState::ReadTargetVersion => self.handle_target_version_read(event),
             DeleteObjectState::ReadTargetLocation => self.handle_target_location_read(event),
             DeleteObjectState::ReadAllVersions => self.handle_all_versions_read(event),

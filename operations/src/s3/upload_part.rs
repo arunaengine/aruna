@@ -1,6 +1,7 @@
 use crate::blob::cleanup::PendingCleanup;
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement_policy::PolicyGateError;
+use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -25,12 +26,14 @@ use ulid::Ulid;
 #[derive(Debug, Eq, PartialEq)]
 pub enum UploadPartState {
     Init,
+    CheckPurgeFenceBeforeWrite,
     ReadUpload,
     WritePart,
     CleanupFailedWrite,
     QueueCleanupRow,
     WriteCleanupRow,
     StartTransaction,
+    CheckPurgeFence,
     FenceBackend,
     ReReadUpload,
     ReadExistingPart,
@@ -74,6 +77,8 @@ pub enum UploadPartError {
     BlobWriteFailed(String),
     #[error(transparent)]
     PolicyGateError(#[from] PolicyGateError),
+    #[error(transparent)]
+    PurgeFence(#[from] PurgeFenceError),
     #[error("UploadPart failed")]
     UploadPartFailed,
 }
@@ -136,9 +141,19 @@ impl UploadPartOperation {
         self.abort()
     }
 
-    /// One round trip answers both "does this upload exist" and "does the
-    /// subject that admitted it still hold".
+    /// Reject an already-fenced destination before accepting the part body.
+    /// The commit transaction rechecks the same row after the bytes move.
     fn handle_init(&mut self) -> Effects {
+        self.state = UploadPartState::CheckPurgeFenceBeforeWrite;
+        smallvec![write_fence_read(&self.input.bucket, None)]
+    }
+
+    fn handle_purge_fence_before_write(&mut self, event: Event) -> Effects {
+        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+            return self.emit_error(error.into());
+        }
+        // One round trip answers both "does this upload exist" and "does the
+        // subject that admitted it still hold".
         self.state = UploadPartState::ReadUpload;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
@@ -394,6 +409,14 @@ impl UploadPartOperation {
         };
 
         self.txn_id = Some(txn_id);
+        self.state = UploadPartState::CheckPurgeFence;
+        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
+    }
+
+    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+            return self.cleanup_failed_write(error.into());
+        }
         // The pin was taken at creation, so the part write must still prove the
         // tenant backend is enabled before its record joins the transaction.
         match self
@@ -649,12 +672,16 @@ impl Operation for UploadPartOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             UploadPartState::Init => self.handle_init(),
+            UploadPartState::CheckPurgeFenceBeforeWrite => {
+                self.handle_purge_fence_before_write(event)
+            }
             UploadPartState::ReadUpload => self.handle_upload_read(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             UploadPartState::QueueCleanupRow => self.handle_cleanup_queued(event),
             UploadPartState::WriteCleanupRow => self.handle_cleanup_row(event),
             UploadPartState::StartTransaction => self.handle_transaction_started(event),
+            UploadPartState::CheckPurgeFence => self.handle_purge_fence_checked(event),
             UploadPartState::FenceBackend => self.handle_backend_fenced(event),
             UploadPartState::ReReadUpload => self.handle_upload_reread(event),
             UploadPartState::ReadExistingPart => self.handle_existing_part_read(event),
@@ -742,6 +769,14 @@ mod test {
 
     fn test_user_id() -> UserId {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
+    }
+
+    /// Answers a purge fence read with no fence held.
+    fn fence_clear() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: crate::s3::purge_fence::fence_key("mybucket"),
+            value: None,
+        })
     }
 
     #[test]
@@ -894,9 +929,10 @@ mod test {
         op.state = UploadPartState::StartTransaction;
         op.written_location = Some(part_location(backend_id));
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([3u8; 16]),
         }));
+        let effects = op.step(fence_clear());
         assert_eq!(op.state, UploadPartState::FenceBackend);
         assert!(matches!(
             effects.as_slice(),

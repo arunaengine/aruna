@@ -34,6 +34,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::incoming::initialize_net_incoming;
@@ -55,8 +56,8 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use aruna_core::StructuredId;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::{MetaResourceId, StructuredId};
 
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";
@@ -65,14 +66,8 @@ const PAYLOAD: &[u8] = b"remote bao export payload";
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// A fixed structured id (handle 1, bucket 0); the RF-3 realm over two nodes
-/// makes every node hold every bucket, so bucket 0 is always held.
-fn doc_id(seed: u64) -> Ulid {
-    MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
-        .unwrap()
-        .as_ulid()
-}
-
+/// A fixed job id (handle 1, bucket 0); the RF-3 realm over two nodes makes
+/// every node hold every bucket, so bucket 0 is always held.
 fn job_id() -> JobId {
     mint_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
@@ -94,10 +89,8 @@ async fn remote_export_streams() -> TestResult {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let version_id = Ulid::generate();
-    let document_id = doc_id(1);
-
-    let (holder, exporter) =
-        setup_remote(realm_id, owner, group_id, version_id, document_id).await?;
+    let (holder, exporter, document_id) =
+        setup_remote(realm_id, owner, group_id, version_id).await?;
 
     let spec = ExportRoCrateSpec {
         auth_context: AuthContext {
@@ -167,10 +160,8 @@ async fn remote_denial_omits() -> TestResult {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let version_id = Ulid::generate();
-    let document_id = doc_id(1);
-
-    let (holder, exporter) =
-        setup_remote(realm_id, owner, group_id, version_id, document_id).await?;
+    let (holder, exporter, document_id) =
+        setup_remote(realm_id, owner, group_id, version_id).await?;
 
     let metadata_path =
         MetadataRegistryRecord::permission_path_for(&realm_id, group_id, DOC_PATH, document_id);
@@ -223,8 +214,7 @@ async fn setup_remote(
     owner: UserId,
     group_id: GroupId,
     version_id: Ulid,
-    document_id: Ulid,
-) -> Result<(Node, Node), Box<dyn std::error::Error>> {
+) -> Result<(Node, Node, Ulid), Box<dyn std::error::Error>> {
     let holder = build_node(realm_id, false).await?;
     let exporter = build_node(realm_id, true).await?;
     connect(&exporter, &holder).await;
@@ -242,11 +232,18 @@ async fn setup_remote(
     .await?;
     initialize_net_incoming(holder.context.clone());
 
-    seed_exporter(&exporter, holder.net.node_id(), owner, group_id, realm_id).await?;
+    let config = seed_exporter(&exporter, holder.net.node_id(), owner, group_id, realm_id).await?;
+    // Minted on the exporter so the document lands in a bucket it leads.
+    let exporter_actor = Actor {
+        node_id: exporter.net.node_id(),
+        user_id: owner,
+        realm_id,
+    };
+    let document_id = mint_local_document(&config, &exporter_actor, group_id, DOC_PATH)?.as_ulid();
     let arn = VersionedObjectArn::new(realm_id, holder.net.node_id(), BUCKET, KEY, version_id)?;
     let jsonld = remote_crate_json(&arn.to_w3id(), &content_hash_w3id(hash));
     create_document(&exporter, owner, group_id, realm_id, document_id, jsonld).await?;
-    Ok((holder, exporter))
+    Ok((holder, exporter, document_id))
 }
 
 async fn build_node(
@@ -446,7 +443,7 @@ async fn seed_exporter(
     owner: UserId,
     group_id: GroupId,
     realm_id: RealmId,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     let actor = Actor {
         node_id: node.net.node_id(),
         user_id: owner,
@@ -455,7 +452,9 @@ async fn seed_exporter(
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
+    config.seed_job_control(node.net.node_id(), 0);
     config.ensure_node(peer, RealmNodeKind::Server);
+    config.seed_job_control(peer, 1);
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
     let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
     let writes = vec![
@@ -491,7 +490,7 @@ async fn seed_exporter(
         })
         .await
     {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(config),
         event => Err(format!("exporter seed failed: {event:?}").into()),
     }
 }

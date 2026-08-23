@@ -11,8 +11,10 @@ use aruna_core::structs::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    search_buckets_distributed, search_metadata as run_search_metadata,
+    ObjectSearchExecution, ObjectSearchQueryMode, ObjectSearchRequest, search_buckets_distributed,
+    search_metadata as run_search_metadata, search_objects,
 };
+use aruna_operations::s3::search_objects::ObjectKeyMatch;
 use aruna_operations::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
@@ -39,8 +41,10 @@ const SEARCH_TYPE_USERS: &str = "users";
 )]
 pub struct SearchApiDoc;
 
-// DEFERRED (#260 typed S3 inventory search): needs the signed inventory-generations
-// subsystem (spec 8.6/9.1), which does not exist yet; not built.
+// IMPLEMENTED (2H pragmatic inventory): /search/objects searches authenticated
+// live local heads and can federate them with explicit partial/strict coverage.
+// DEFERRED (#260): durable signed inventory generations/snapshots are still not
+// built; pagination is a query-bound live-head keyset with an as-of watermark.
 // DEFERRED (#266 directories): the /search groups/users and /search/buckets core
 // landed (#427); visibility tiers, public profiles, and the signed bucket
 // directory are the deferred enhancements.
@@ -48,6 +52,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(SearchApiDoc::openapi())
         .routes(routes!(unified_search))
         .routes(routes!(bucket_search))
+        .routes(routes!(object_search))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -67,7 +72,7 @@ pub struct SearchParams {
     /// Documents-only: restrict metadata hits to a single group id.
     #[serde(default)]
     pub group_id: Option<String>,
-    /// Documents-only: exact RO-Crate conformsTo profile IRI.
+    /// Documents-only: exact RO-Crate conformsTo specification or Profile IRI.
     #[serde(default)]
     pub conforms_to: Option<String>,
     /// Documents-only: search mode (local or distributed).
@@ -93,6 +98,113 @@ pub struct BucketSearchParams {
     pub q: String,
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectSearchMode {
+    Local,
+    #[default]
+    DistributedBestEffort,
+    DistributedStrict,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectSearchMatchMode {
+    #[default]
+    Substring,
+    Prefix,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ObjectSearchParams {
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default, rename = "match")]
+    pub match_mode: Option<ObjectSearchMatchMode>,
+    #[serde(default)]
+    pub mode: Option<ObjectSearchMode>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectSearchScope {
+    ThisNode,
+    Realm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectSearchResultKind {
+    Object,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObjectSearchChecksum {
+    pub algorithm: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObjectSearchHit {
+    pub kind: ObjectSearchResultKind,
+    pub mode: ObjectSearchMode,
+    pub issuer_node_id: String,
+    pub group_id: String,
+    pub bucket: String,
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_w3id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<ObjectSearchChecksum>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObjectSearchIndexFreshness {
+    pub source: String,
+    pub as_of: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_observed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObjectSearchPartitionCoverage {
+    pub node_id: String,
+    pub observed_at: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObjectSearchCoverage {
+    pub scope: ObjectSearchScope,
+    pub mode: ObjectSearchMode,
+    pub index_freshness: ObjectSearchIndexFreshness,
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub failed_partitions: Vec<String>,
+    pub omitted_partitions: usize,
+    pub complete: bool,
+    pub truncated: bool,
+    pub partitions: Vec<ObjectSearchPartitionCoverage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObjectSearchResponse {
+    pub hits: Vec<ObjectSearchHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub coverage: ObjectSearchCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -276,6 +388,163 @@ pub async fn bucket_search(
 
 #[utoipa::path(
     get,
+    path = "/search/objects",
+    tag = "search",
+    summary = "Search current object heads locally or across the realm",
+    description = "Requires a bearer token issued by this realm. Keys are matched case-sensitively by substring or prefix, optionally inside one exact bucket. Every current live head is checked against group READ, token path restrictions, and request policies before it can be returned; delete markers and historical versions are excluded, and no total is exposed. local searches this node, distributed_best_effort returns reachable node pages with explicit failed coverage, and distributed_strict returns 503 rather than a partial page. The opaque cursor is bound to the query, bucket, match type, and mode; it composes per-node keyset positions and an as-of watermark so newly created versions do not enter a cursor chain. Coverage names the live-head source, observation times, failed partitions, completeness, and truncation.",
+    params(
+        ("q" = String, Query, description = "Case-sensitive key substring or prefix; trimmed, minimum 2 characters"),
+        ("bucket" = Option<String>, Query, description = "Optional exact bucket name"),
+        ("match" = Option<ObjectSearchMatchMode>, Query, description = "Key match mode: substring (default) or prefix"),
+        ("mode" = Option<ObjectSearchMode>, Query, description = "Coverage mode: distributed_best_effort (default), distributed_strict, or local"),
+        ("limit" = Option<usize>, Query, description = "Maximum merged hits (default 10, clamped to 1..=100)"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode")
+    ),
+    responses(
+        (status = 200, description = "Authorized live object heads with explicit coverage", body = ObjectSearchResponse,
+            example = json!({"hits": [{"kind": "object", "mode": "distributed_best_effort", "issuer_node_id": "node-a", "group_id": "01JGROUP000000000000000000", "bucket": "results", "key": "run-42/output.csv", "content_w3id": "https://w3id.org/aruna/data/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "checksum": {"algorithm": "blake3", "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, "size": 4096, "updated_at": "2026-08-22T12:00:00Z"}], "next_cursor": null, "coverage": {"scope": "realm", "mode": "distributed_best_effort", "index_freshness": {"source": "inventory", "as_of": "2026-08-22T12:00:00Z", "oldest_observed_at": "2026-08-22T11:59:00Z"}, "nodes_queried": 3, "nodes_failed": 0, "failed_partitions": [], "omitted_partitions": 0, "complete": true, "truncated": false, "partitions": [{"node_id": "node-a", "observed_at": "2026-08-22T12:00:00Z", "truncated": false}]}})),
+        (status = 400, description = "Malformed query or cursor", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
+        (status = 503, description = "Strict distributed coverage could not be completed, or the local live-head scan was unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn object_search(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Query(params): Query<ObjectSearchParams>,
+) -> ServerResult<(StatusCode, Json<ObjectSearchResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let query = params.q.trim();
+    if query.chars().count() < MIN_SEARCH_QUERY_CHARS {
+        return Err(ServerError::BadRequest);
+    }
+    let bucket = params
+        .bucket
+        .map(|bucket| bucket.trim().to_string())
+        .filter(|bucket| !bucket.is_empty());
+    let mode = params.mode.unwrap_or_default();
+    let key_match = match params.match_mode.unwrap_or_default() {
+        ObjectSearchMatchMode::Substring => ObjectKeyMatch::Substring,
+        ObjectSearchMatchMode::Prefix => ObjectKeyMatch::Prefix,
+    };
+    let result = search_objects(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        ObjectSearchRequest {
+            auth,
+            bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
+            query: query.to_string(),
+            key_match,
+            bucket,
+            limit: params
+                .limit
+                .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                .clamp(1, MAX_SEARCH_LIMIT),
+            cursor: params.cursor,
+            mode: match mode {
+                ObjectSearchMode::Local => ObjectSearchQueryMode::Local,
+                ObjectSearchMode::DistributedBestEffort => {
+                    ObjectSearchQueryMode::DistributedBestEffort
+                }
+                ObjectSearchMode::DistributedStrict => ObjectSearchQueryMode::DistributedStrict,
+            },
+            target_nodes: None,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((
+        StatusCode::OK,
+        Json(map_object_search_response(result, mode)),
+    ))
+}
+
+fn map_object_search_response(
+    result: ObjectSearchExecution,
+    mode: ObjectSearchMode,
+) -> ObjectSearchResponse {
+    let oldest_observed_at = result
+        .partitions
+        .iter()
+        .map(|partition| partition.observed_at)
+        .min()
+        .map(format_system_time);
+    let mut failed_partitions = result
+        .fanout_stats
+        .failed_partitions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if result.fanout_stats.discovery_failed {
+        failed_partitions.push("partition-discovery".to_string());
+    }
+    if result.omitted_partitions > 0 {
+        failed_partitions.push("fanout-cap".to_string());
+    }
+    let truncated = result.next_cursor.is_some();
+    ObjectSearchResponse {
+        hits: result
+            .hits
+            .into_iter()
+            .map(|hit| ObjectSearchHit {
+                kind: ObjectSearchResultKind::Object,
+                mode,
+                issuer_node_id: hit.node_id.to_string(),
+                group_id: hit.group_id.to_string(),
+                bucket: hit.bucket,
+                key: hit.key,
+                content_w3id: hit.content_w3id,
+                checksum: hit.checksum.map(|checksum| ObjectSearchChecksum {
+                    algorithm: checksum.algorithm,
+                    value: checksum.value,
+                }),
+                size: hit.size,
+                updated_at: hit.updated_at.map(format_system_time),
+            })
+            .collect(),
+        next_cursor: result.next_cursor,
+        coverage: ObjectSearchCoverage {
+            scope: match mode {
+                ObjectSearchMode::Local => ObjectSearchScope::ThisNode,
+                ObjectSearchMode::DistributedBestEffort | ObjectSearchMode::DistributedStrict => {
+                    ObjectSearchScope::Realm
+                }
+            },
+            mode,
+            index_freshness: ObjectSearchIndexFreshness {
+                source: "live_heads".to_string(),
+                as_of: format_system_time(result.as_of),
+                oldest_observed_at,
+            },
+            nodes_queried: result.fanout_stats.nodes_queried,
+            nodes_failed: result.fanout_stats.nodes_failed,
+            failed_partitions,
+            omitted_partitions: result.omitted_partitions,
+            complete: result.complete,
+            truncated,
+            partitions: result
+                .partitions
+                .into_iter()
+                .map(|partition| ObjectSearchPartitionCoverage {
+                    node_id: partition.node_id.to_string(),
+                    observed_at: format_system_time(partition.observed_at),
+                    truncated: partition.truncated,
+                })
+                .collect(),
+        },
+    }
+}
+
+fn format_system_time(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
+}
+
+#[utoipa::path(
+    get,
     path = "/search",
     tag = "search",
     summary = "Search documents, buckets, groups and users in one request",
@@ -286,7 +555,7 @@ pub async fn bucket_search(
         ("limit" = Option<usize>, Query, description = "Per-section page size (default 10, clamped to 1..=100, and additionally capped at 50 for the buckets section)"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same section's next_cursor. Only accepted when exactly one type is requested; for documents it is a signed token bound to the exact query and filters, for groups the last returned group id as a ULID and for users the last returned user id in its ulid@realm form, and a malformed or unsupported cursor returns 400"),
         ("group_id" = Option<String>, Query, description = "Documents-only: restrict metadata hits to a single group id, given as a ULID; a malformed id returns 400"),
-        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo profile IRI, such as https://w3id.org/ro/crate/1.1"),
+        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo specification or Profile IRI, such as the https://w3id.org/ro/crate/1.3 specification or an https://w3id.org/aruna/profile/{id} Profile"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Documents-only: local restricts the document search to this node, distributed fans out over the realm; defaults to distributed")
     ),
     responses(
@@ -761,6 +1030,7 @@ mod tests {
         let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
         config.seed_default_placement();
         config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        config.seed_job_control(actor.node_id, 0);
         config.request_policies = policies;
         write_bytes(
             state,
@@ -1405,6 +1675,73 @@ mod tests {
         )
         .await;
         assert!(matches!(wrong_realm, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn object_search_requires_auth() {
+        let fx = setup().await;
+        let result = object_search(
+            State(fx.state.clone()),
+            Extension(None),
+            Extension(None),
+            Query(ObjectSearchParams {
+                q: "reads".to_string(),
+                mode: Some(ObjectSearchMode::Local),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[test]
+    fn object_search_maps_partiality_without_totals() {
+        let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
+        let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
+        let result = ObjectSearchExecution {
+            hits: vec![aruna_operations::s3::search_objects::ObjectInventoryHit {
+                node_id: healthy,
+                group_id: Ulid::from_bytes([23u8; 16]),
+                bucket: "data".to_string(),
+                key: "reads/a.fastq".to_string(),
+                content_w3id: Some(format!("https://w3id.org/aruna/data/{}", "01".repeat(32))),
+                checksum: None,
+                size: Some(42),
+                updated_at: Some(SystemTime::UNIX_EPOCH),
+            }],
+            next_cursor: Some("opaque".to_string()),
+            as_of: SystemTime::UNIX_EPOCH,
+            partitions: vec![
+                aruna_operations::metadata::api::ObjectSearchPartitionCoverage {
+                    node_id: healthy,
+                    observed_at: SystemTime::UNIX_EPOCH,
+                    truncated: true,
+                },
+            ],
+            fanout_stats: aruna_operations::metadata::api::MetadataFanoutStats {
+                nodes_queried: 2,
+                nodes_failed: 1,
+                failed_partitions: vec![failed],
+                discovery_failed: false,
+            },
+            omitted_partitions: 0,
+            complete: false,
+        };
+
+        let response = map_object_search_response(result, ObjectSearchMode::DistributedBestEffort);
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.coverage.scope, ObjectSearchScope::Realm);
+        assert!(!response.coverage.complete);
+        assert!(response.coverage.truncated);
+        assert_eq!(response.coverage.nodes_failed, 1);
+        assert_eq!(
+            response.coverage.failed_partitions,
+            vec![failed.to_string()]
+        );
+        assert_eq!(response.coverage.index_freshness.source, "live_heads");
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("\"total"));
     }
 
     #[test]

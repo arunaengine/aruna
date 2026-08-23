@@ -2,11 +2,15 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission_with, parse_group_id, require_realm_auth,
     require_unrestricted_realm_auth,
 };
-use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::error::{
+    ErrorResponse, ProfileValidationFindingResponse, ServerError, ServerResult,
+    ValidationViolationResponse,
+};
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
-    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationState,
+    MetadataProfileValidationStatus, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{
     Actor, AuthContext, ExportRoCrateSpec, MetadataRegistryRecord, Permission, WatchEvent,
@@ -26,13 +30,15 @@ use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
     MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataListOrder,
-    MetadataPathLookupRequest, MetadataQueryRequest, MetadataReferenceEntry,
-    MetadataReferencesExecution, MetadataReferencesRequest,
+    MetadataPathLookupRequest, MetadataPreflightStorageOperation, MetadataQueryRequest,
+    MetadataReferenceEntry, MetadataReferencePreflightExecution, MetadataReferencePreflightRequest,
+    MetadataReferencePreflightTarget, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     forwarded_bearer, list_visible_metadata_documents as run_list_visible_metadata_documents,
     load_realm_config, lookup_metadata_path as run_lookup_metadata_path,
     query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
-    references_metadata as run_references_metadata, search_metadata as run_search_metadata,
+    references_metadata as run_references_metadata,
+    references_preflight as run_references_preflight, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
@@ -40,7 +46,12 @@ use aruna_operations::metadata::forward::{
     export_rocrate_routed as run_export_rocrate,
     get_metadata_routed as run_get_visible_metadata_document, is_user_origin,
     origin_holds_document as run_origin_holds_document,
+    profile_validation_status_routed as run_profile_validation_status,
     update_metadata_document_routed as run_update_metadata_document,
+};
+use aruna_operations::metadata::profile_validation::{
+    MetadataProfilePreview, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
+    preview_submission as run_preview_submission,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::request_policy::PolicyRequestExtras;
@@ -90,10 +101,15 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         ))
         .routes(routes!(search_metadata))
         .routes(routes!(metadata_references))
+        .routes(routes!(metadata_reference_preflight))
         .routes(routes!(query_all_metadata))
         .routes(routes!(list_metadata_documents))
         .routes(routes!(get_metadata_path))
         .routes(routes!(get_metadata_document, delete_metadata_document))
+        .routes(routes!(profile_validation_capabilities))
+        .routes(routes!(preview_profile_validation))
+        .routes(routes!(get_profile_validation_status))
+        .routes(routes!(revalidate_profile))
         .routes(routes!(export_metadata_rocrate, replace_metadata_rocrate))
         .routes(routes!(submit_rocrate_export))
         .routes(routes!(add_metadata_data_entity))
@@ -116,6 +132,109 @@ pub struct MetadataDocumentSummary {
     pub replicas: usize,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProfileValidationCapabilitiesResponse {
+    pub evaluator: String,
+    pub supported_constraints: Vec<String>,
+    pub unsupported_constraint_policy: String,
+    pub public_profile_iri_template: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileValidationPreviewRequest {
+    /// RO-Crate JSON-LD draft. Nothing is stored.
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProfileValidationPreviewResponse {
+    /// Whether a create or replace of this draft would be accepted.
+    pub accepted: bool,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_iri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    pub evaluator: String,
+    pub findings: Vec<ProfileValidationFindingResponse>,
+    pub completeness: String,
+    pub structural_violations: Vec<ValidationViolationResponse>,
+}
+
+impl From<MetadataProfilePreview> for ProfileValidationPreviewResponse {
+    fn from(preview: MetadataProfilePreview) -> Self {
+        let accepted = preview.accepted();
+        let status = ProfileValidationStatusResponse::from(preview.status);
+        Self {
+            accepted,
+            state: status.state,
+            profile_id: status.profile_id,
+            profile_iri: status.profile_iri,
+            profile_revision: status.profile_revision,
+            evaluator: status.evaluator,
+            findings: status.findings,
+            completeness: status.completeness,
+            structural_violations: preview
+                .structural_violations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProfileValidationStatusResponse {
+    pub document_id: String,
+    pub dataset_revision: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_iri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    pub evaluator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validated_at_ms: Option<u64>,
+    pub findings: Vec<ProfileValidationFindingResponse>,
+    pub completeness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+}
+
+impl From<MetadataProfileValidationStatus> for ProfileValidationStatusResponse {
+    fn from(status: MetadataProfileValidationStatus) -> Self {
+        Self {
+            document_id: status.document_id.to_string(),
+            dataset_revision: status.dataset_revision.to_string(),
+            state: match status.state {
+                MetadataProfileValidationState::NotProfiled => "not_profiled",
+                MetadataProfileValidationState::Valid => "valid",
+                MetadataProfileValidationState::Invalid => "invalid",
+                MetadataProfileValidationState::Stale => "stale",
+            }
+            .to_string(),
+            profile_id: status.profile_id.map(|id| id.to_string()),
+            profile_iri: status.profile_iri,
+            profile_revision: status.profile_revision.map(|revision| revision.to_string()),
+            evaluator: status.evaluator,
+            validated_at_ms: status.validated_at_ms,
+            findings: status.findings.into_iter().map(Into::into).collect(),
+            completeness: match status.completeness {
+                MetadataProfileValidationCompleteness::Complete => "complete",
+                MetadataProfileValidationCompleteness::Incomplete => "incomplete",
+            }
+            .to_string(),
+            stale_reason: status.stale_reason,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -389,6 +508,104 @@ pub struct MetadataReferencesResponse {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MetadataReferencePreflightTargetBody {
+    ContentW3ids {
+        content_w3ids: Vec<String>,
+        #[serde(default)]
+        remove_all_resolvable_locations: bool,
+    },
+    BucketPrefix {
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        #[serde(default)]
+        operation: MetadataPreflightStorageOperationBody,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataPreflightStorageOperationBody {
+    #[default]
+    LatestVersionTombstone,
+    AllVersionsPurge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencePreflightBody {
+    pub target: MetadataReferencePreflightTargetBody,
+    #[serde(default)]
+    pub mode: Option<MetadataQueryMode>,
+    #[serde(default = "default_allow_partial")]
+    pub allow_partial: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightLocationResponse {
+    pub node_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightVisibleReferenceResponse {
+    pub document_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightTargetResponse {
+    pub content_w3id: String,
+    pub targeted_versions: Vec<MetadataPreflightLocationResponse>,
+    pub visible_references: Vec<MetadataPreflightVisibleReferenceResponse>,
+    pub hidden_references_exist: bool,
+    pub would_remove_last_resolvable_aruna_location: bool,
+    pub location_impact_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightExcludedFormResponse {
+    pub form: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightNodeFreshnessResponse {
+    pub node_id: String,
+    pub index_state: String,
+    pub oldest_status_updated_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPreflightCoverageResponse {
+    pub queried_scope: String,
+    pub queried_forms: Vec<String>,
+    pub excluded_forms: Vec<MetadataPreflightExcludedFormResponse>,
+    pub node_freshness: Vec<MetadataPreflightNodeFreshnessResponse>,
+    pub target_resolution_complete: bool,
+    pub path_style_endpoint_coverage_complete: bool,
+    pub realm_coverage_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencePreflightResponse {
+    pub targets: Vec<MetadataPreflightTargetResponse>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub complete: bool,
+    pub failed_partitions: Vec<String>,
+    pub coverage: MetadataPreflightCoverageResponse,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MetadataIncludeFlags {
     summary: bool,
@@ -499,7 +716,7 @@ impl MetadataDocumentListItem {
     description = "Requires a realm bearer token. On a server or management node the caller needs WRITE on the group's metadata path and on the new document's permission path; a user-kind node holds no metadata bucket, so it forwards the create to a holder that re-runs the same checks under the caller's own bearer token. The document path is normalized and must not be empty, and the token's realm must match the serving node's realm. A 201 means the create was durably accepted into the event/projection pipeline: the graph may not be materialized, queryable, searchable or present on every replica yet, so a follow-up read can still answer 404 or 503 for a moment. A write that can neither be applied locally nor delivered to a holder is refused rather than accepted.",
     request_body(
         content = CreateMetadataRequest,
-        description = "Create metadata either from scaffold fields or from a full RO-Crate JSON-LD object. Both forms reject unknown fields; the RO-Crate form must be a JSON object and is validated before acceptance.",
+        description = "Create metadata either from scaffold fields or from a full RO-Crate JSON-LD object. Scaffold creation emits RO-Crate 1.3. The RO-Crate form accepts 1.2 and 1.3 contexts and specification IRIs and preserves the submitted version. Both forms reject unknown fields; the RO-Crate form must be a JSON object and is validated before acceptance.",
         examples(
             (
                 "ScaffoldCreate" = (
@@ -905,6 +1122,139 @@ pub async fn get_metadata_path(
 
 #[utoipa::path(
     get,
+    path = "/metadata/profile-validation/capabilities",
+    tag = "metadata",
+    summary = "Get backend Profile validation capabilities",
+    description = "Shapes registered as a Profile are compiled and executed by craqle's native SHACL Core Subset v1 engine, server side and authoritative. Supported targets are sh:targetClass, sh:targetNode, sh:targetSubjectsOf, sh:targetObjectsOf, and implicit class targets; a node shape that names no target at all is bound to the crate root, so a Profile can constrain the root entity without knowing its minted IRI. Supported paths are predicate, sh:inversePath, sequence, sh:alternativePath, sh:zeroOrOnePath, sh:zeroOrMorePath, and sh:oneOrMorePath. The supported constraint set is listed in supported_constraints. SHACL-SPARQL, SHACL-JS, SHACL-AF, custom components and targets, recursive shapes, RDF-star terms, and remote owl:imports fail closed with an unsupported_constraint finding that names the construct; the same finding is returned when the registered Turtle cannot be parsed. sh:class is exact rdf:type membership: no RDFS or OWL inference is applied, so a subclass instance does not satisfy a superclass constraint. Shapes may reference crate-local ids relative to the crate root, for example sh:hasValue <#person-1>. Evaluation is bounded: exceeding the result, path-edge, or path-depth budget returns a permanent validation_limit finding with incomplete completeness instead of a partial verdict, while a temporarily unavailable Profile or evaluator returns 503 with Retry-After.",
+    responses((status = 200, description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms", body = ProfileValidationCapabilitiesResponse,
+        example = json!({"evaluator": "craqle-shacl-core/0.2", "supported_constraints": ["sh:targetClass", "sh:property", "sh:path", "sh:minCount", "sh:maxCount", "sh:datatype", "sh:class", "sh:nodeKind", "sh:pattern", "sh:in", "sh:hasValue", "sh:closed"], "unsupported_constraint_policy": "fail_closed", "public_profile_iri_template": "https://w3id.org/aruna/profile/{document_id}"})))
+)]
+pub async fn profile_validation_capabilities()
+-> (StatusCode, Json<ProfileValidationCapabilitiesResponse>) {
+    (
+        StatusCode::OK,
+        Json(ProfileValidationCapabilitiesResponse {
+            evaluator: evaluator_name().to_string(),
+            supported_constraints: SUPPORTED_PROFILE_CONSTRAINTS
+                .iter()
+                .map(|constraint| (*constraint).to_string())
+                .collect(),
+            unsupported_constraint_policy: "fail_closed".to_string(),
+            public_profile_iri_template: "https://w3id.org/aruna/profile/{id}".to_string(),
+        }),
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/profile-validation/preview",
+    tag = "metadata",
+    summary = "Preview the Profile verdict for an unsaved RO-Crate draft",
+    description = "Runs the exact verdict POST /metadata and PUT /metadata/{document_id}/rocrate would enforce against a draft, without storing anything. structural_violations carries the RO-Crate structural failures and findings carries the Profile constraint findings; accepted is true only when both would let the write through. The draft is evaluated under its own crate root, so focus nodes and paths are reported in crate-local form with the root as `./`. Requires an authenticated realm caller; no document permission is checked because only the realm-public registered Profile is read.",
+    request_body(content = ProfileValidationPreviewRequest,
+        example = json!({"rocrate": {"@context": "https://w3id.org/ro/crate/1.3/context", "@graph": [{"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "conformsTo": {"@id": "https://w3id.org/ro/crate/1.3"}, "about": {"@id": "./"}}, {"@id": "./", "@type": "Dataset", "name": "Draft dataset", "description": "Validated before it is saved", "datePublished": "2026-08-22", "conformsTo": {"@id": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000"}}]}})),
+    responses(
+        (status = 200, description = "Verdict for the draft, including structural violations and Profile findings", body = ProfileValidationPreviewResponse,
+            example = json!({"accepted": false, "state": "invalid", "profile_id": "01JPROFILE0000000000000000", "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000", "profile_revision": "01JPROFILEREVISION00000000", "evaluator": "craqle-shacl-core/0.2", "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "http://schema.org/identifier", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "fewer values are present than the Profile requires", "profile_revision": "01JPROFILEREVISION00000000", "completeness": "complete"}], "completeness": "complete", "structural_violations": []})),
+        (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
+        (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
+        (status = 503, description = "The Profile or the evaluator is temporarily unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn preview_profile_validation(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<ProfileValidationPreviewRequest>,
+) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
+    require_realm_auth(&state, auth)?;
+    let jsonld = serialize_jsonld_object(&request.rocrate)?;
+    let preview = run_preview_submission(&state.get_ctx(), &jsonld)
+        .await
+        .map_err(map_metadata_error)?;
+    Ok((StatusCode::OK, Json(preview.into())))
+}
+
+#[utoipa::path(
+    get,
+    path = "/metadata/{document_id}/profile-validation",
+    tag = "metadata",
+    summary = "Get revision-bound Profile validation status",
+    description = "Returns the durable validation status written atomically with the accepted metadata revision. The response becomes stale when either the Dataset revision or the exact registered Profile revision changes. Authentication is optional and uses the same document READ rules as metadata retrieval.",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    responses(
+        (status = 200, description = "Current, invalid, unprofiled, or stale revision-bound validation status", body = ProfileValidationStatusResponse,
+            example = json!({"document_id": "01JMETADATA0123456789ABCDE", "dataset_revision": "01JREVISION000000000000000", "state": "invalid", "profile_id": "01JPROFILE0000000000000000", "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000", "profile_revision": "01JPROFILEREVISION00000000", "evaluator": "craqle-shacl-core/0.2", "validated_at_ms": 1787000000000_u64, "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "http://schema.org/identifier", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "fewer values are present than the Profile requires", "profile_revision": "01JPROFILEREVISION00000000", "completeness": "complete"}], "completeness": "complete", "stale_reason": null})),
+        (status = 400, description = "Document id is not a structured metadata id", body = ErrorResponse),
+        (status = 401, description = "A holder rejected the forwarded credential", body = ErrorResponse),
+        (status = 403, description = "READ is denied", body = ErrorResponse),
+        (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
+        (status = 503, description = "No holder can supply the exact status", body = ErrorResponse)
+    ),
+    security((), ("bearer_auth" = []))
+)]
+pub async fn get_profile_validation_status(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Path(document_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<ProfileValidationStatusResponse>)> {
+    let document_id = parse_document_id(&document_id)?;
+    let status = run_profile_validation_status(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        GetVisibleMetadataDocumentRequest { document_id, auth },
+        forwarded_auth_token(bearer_token)?,
+        false,
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(status.into())))
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/{document_id}/profile-validation/revalidate",
+    tag = "metadata",
+    summary = "Revalidate a metadata document against its exact current Profile revision",
+    description = "Reconstructs validation from the last accepted raw Dataset revision and the registered Profile's current exact revision, fences the Dataset revision, and durably replaces the status. Requires an authenticated caller allowed to READ the document.",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    responses(
+        (status = 200, description = "Fresh valid, invalid, or unprofiled status", body = ProfileValidationStatusResponse,
+            example = json!({"document_id": "01JMETADATA0123456789ABCDE", "dataset_revision": "01JREVISION000000000000000", "state": "valid", "profile_id": "01JPROFILE0000000000000000", "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000", "profile_revision": "01JPROFILEREVISION00000000", "evaluator": "craqle-shacl-core/0.2", "validated_at_ms": 1787000000000_u64, "findings": [], "completeness": "complete", "stale_reason": null})),
+        (status = 400, description = "Document id or Profile tag is invalid", body = ErrorResponse),
+        (status = 401, description = "Authentication is missing or invalid", body = ErrorResponse),
+        (status = 403, description = "READ is denied", body = ErrorResponse),
+        (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
+        (status = 503, description = "The Profile, validator, Dataset revision, or a holder is temporarily unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn revalidate_profile(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Path(document_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<ProfileValidationStatusResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let document_id = parse_document_id(&document_id)?;
+    let status = run_profile_validation_status(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        GetVisibleMetadataDocumentRequest {
+            document_id,
+            auth: Some(auth),
+        },
+        forwarded_auth_token(bearer_token)?,
+        true,
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(status.into())))
+}
+
+#[utoipa::path(
+    get,
     path = "/metadata/{document_id}",
     tag = "metadata",
     summary = "Get a metadata document summary",
@@ -1009,7 +1359,7 @@ pub async fn delete_metadata_document(
     path = "/metadata/{document_id}/rocrate",
     tag = "metadata",
     summary = "Export a metadata document as RO-Crate",
-    description = "Authentication is optional and changes the result: a document that is not public is only exported to a caller whose identity may read it, and an unknown document is indistinguishable from an unreadable one because both answer 404. The export is routed to the document's current holders and answered by the first holder that succeeds. The projected views (full, summary, page) require the document's graph to be materialized and answer 503 while a recently accepted write is still being projected; the raw view returns the last accepted revision together with its projection state, so it is the view that can be read during that window. An export larger than this node's configured metadata byte limit is refused with 503 rather than truncated.",
+    description = "Authentication is optional and changes the result: a document that is not public is only exported to a caller whose identity may read it, and an unknown document is indistinguishable from an unreadable one because both answer 404. The export is routed to the document's current holders and answered by the first holder that succeeds. RO-Crate 1.2 and 1.3 documents retain their stored context and specification version in every export view. The projected views (full, summary, page) require the document's graph to be materialized and answer 503 while a recently accepted write is still being projected; the raw view returns the last accepted revision together with its projection state, so it is the view that can be read during that window. An export larger than this node's configured metadata byte limit is refused with 503 rather than truncated.",
     params(
         ("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list"),
         ("view" = Option<MetadataRoCrateView>, Query, description = "Export view, default full. full returns the whole projected crate, summary only the root entity, page a window over the root-linked data entities, and raw the last accepted revision with its projection state"),
@@ -1164,7 +1514,7 @@ pub async fn export_metadata_rocrate(
     path = "/metadata/{document_id}/rocrate/exports",
     tag = "metadata",
     summary = "Submit an RO-Crate export job",
-    description = "Requires a realm bearer token that is not path-restricted: a delegated token whose scope is confined to a path is rejected with 403 even when it would pass the per-document check. The caller needs READ on the document, which is resolved from this node's registry view. A 202 only means the job was durably accepted and is owned by this node; the crate is assembled asynchronously, so the artifact does not exist yet. Poll status_url for progress and fetch artifact_url once the job reports success. Submissions are idempotent per caller when idempotency_key is set: replaying the same key returns the same job with created set to false, while reusing it for a different document is a conflict.",
+    description = "Requires a realm bearer token that is not path-restricted: a delegated token whose scope is confined to a path is rejected with 403 even when it would pass the per-document check. The caller needs READ on the document, which is resolved from this node's registry view. A 202 only means the job was durably accepted and is owned by this node; the crate is assembled asynchronously, so the artifact does not exist yet. The artifact preserves whether the source document is RO-Crate 1.2 or 1.3. Poll status_url for progress and fetch artifact_url once the job reports success. Submissions are idempotent per caller when idempotency_key is set: replaying the same key returns the same job with created set to false, while reusing it for a different document is a conflict.",
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = SubmitRoCrateExportRequest,
@@ -1252,7 +1602,7 @@ pub async fn submit_rocrate_export(
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = ReplaceMetadataRoCrateRequest,
-        description = "Replace the full RO-Crate document. Use the entity endpoints for small incremental changes. rocrate must be a JSON object and is validated before acceptance; public is optional and keeps the current visibility when omitted.",
+        description = "Replace the full RO-Crate document with a 1.2 or 1.3 context and specification IRI; the submitted version is preserved. Use the entity endpoints for small incremental changes. rocrate must be a JSON object and is validated before acceptance; public is optional and keeps the current visibility when omitted.",
         examples(
             (
                 "ReplaceRoCrate" = (
@@ -1354,7 +1704,7 @@ pub async fn replace_metadata_rocrate(
     path = "/metadata/{document_id}/rocrate/data-entities",
     tag = "metadata",
     summary = "Upsert a data entity in a document's RO-Crate",
-    description = "Requires a realm bearer token and WRITE on the document's permission path. When this node holds the document the permission is checked here and the write is applied locally; otherwise it is forwarded to a holder that re-runs the same check under the caller's own bearer token. The entity is matched by its @id: an existing data entity with that id is replaced, otherwise it is added and linked from the crate's root dataset. The rest of the crate is left untouched, and the document's visibility is unchanged. A 200 means the upsert was durably accepted into the event/projection pipeline, not that it is already materialized, queryable, searchable or present on every replica.",
+    description = "Requires a realm bearer token and WRITE on the document's permission path. When this node holds the document the permission is checked here and the write is applied locally; otherwise it is forwarded to a holder that re-runs the same check under the caller's own bearer token. The entity is matched by its @id: an existing data entity with that id is replaced, otherwise it is added and linked from the crate's root dataset. The rest of the crate, including its RO-Crate 1.2 or 1.3 version, is left untouched, and the document's visibility is unchanged. A 200 means the upsert was durably accepted into the event/projection pipeline, not that it is already materialized, queryable, searchable or present on every replica.",
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = inline(JsonLdObject),
@@ -1448,7 +1798,7 @@ pub async fn add_metadata_data_entity(
     path = "/metadata/{document_id}/rocrate/contextual-entities",
     tag = "metadata",
     summary = "Upsert a contextual entity in a document's RO-Crate",
-    description = "Requires a realm bearer token and WRITE on the document's permission path. When this node holds the document the permission is checked here and the write is applied locally; otherwise it is forwarded to a holder that re-runs the same check under the caller's own bearer token. The entity is matched by its @id: an existing contextual entity with that id is replaced, otherwise it is added. Contextual entities describe people, organizations, licenses and the like and are not linked from the root dataset as parts. A 200 means the upsert was durably accepted into the event/projection pipeline, not that it is already materialized, queryable, searchable or present on every replica.",
+    description = "Requires a realm bearer token and WRITE on the document's permission path. When this node holds the document the permission is checked here and the write is applied locally; otherwise it is forwarded to a holder that re-runs the same check under the caller's own bearer token. The entity is matched by its @id: an existing contextual entity with that id is replaced, otherwise it is added. Contextual entities describe people, organizations, licenses and the like and are not linked from the root dataset as parts. The surrounding crate retains its RO-Crate 1.2 or 1.3 version. A 200 means the upsert was durably accepted into the event/projection pipeline, not that it is already materialized, queryable, searchable or present on every replica.",
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = inline(JsonLdObject),
@@ -1752,7 +2102,7 @@ pub async fn query_all_metadata(
     description = "Authentication is optional and changes the result: hits are restricted to metadata the caller may read, so an anonymous request returns fewer documents. Either q or conforms_to must be given. Distributed searches fan out to at most 32 realm node partitions, at most 8 of them concurrently, under an overall deadline of a few seconds; nodes_failed counts the partitions that failed, timed out or were dropped by that cap, and any non-zero value means the page is a partial view of the realm. Pagination is cursor-based and stops at a server-side depth of 1000 hits per node, which is reported as truncated. Hits come from each node's own index, so a document whose write was only just accepted may not be findable yet.",
     params(
         ("q" = Option<String>, Query, description = "Free-text search query, matched against indexed literals. Optional when conforms_to is set; a request with neither is rejected with 400"),
-        ("conforms_to" = Option<String>, Query, description = "Exact RO-Crate conformsTo profile IRI, for example https://w3id.org/ro/crate/1.2. Must be a valid absolute IRI and is matched exactly, never as a prefix"),
+        ("conforms_to" = Option<String>, Query, description = "RO-Crate conformsTo specification or Profile IRI. The 1.2 and 1.3 specification IRIs and the RO-Crate community profiles under https://w3id.org/ro/wfrun/ and https://w3id.org/workflowhub/workflow-ro-crate/ match exactly and are not treated as registered Profiles. A registered Profile uses only https://w3id.org/aruna/profile/{id}; other absolute IRIs are matched exactly, never as a prefix"),
         ("group_id" = Option<String>, Query, description = "Restrict hits to a single group ULID"),
         ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100). Hits are ordered by descending score"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous response's next_cursor. Bound to the original query; replaying it with a changed query returns 400. Paging is best-effort: results may shift under concurrent metadata churn or node failures"),
@@ -1963,6 +2313,176 @@ fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/metadata/references/preflight",
+    tag = "metadata",
+    summary = "Preflight destructive content operations against metadata backlinks",
+    description = "Maps a bounded exact content-W3ID set or an authorized bucket/prefix inventory to canonical content identities, then queries canonical and known legacy location IRIs. Local mode reports realm coverage incomplete. Distributed mode fans out to realm nodes and reports per-node index freshness, failed partitions, and stable cursor pagination. With allow_partial=false, any failed, stale, or otherwise incomplete partition returns 503 rather than silently downgrading the request. Restricted referencing documents are represented only by hidden_references_exist; their count and identity are never returned.",
+    request_body(content = MetadataReferencePreflightBody,
+        example = json!({"target": {"kind": "bucket_prefix", "bucket": "results", "prefix": "run-42/", "operation": "latest_version_tombstone"}, "allow_partial": true, "limit": 50})),
+    responses(
+        (status = 200, description = "Reference warnings, location impact, pagination, and explicit coverage metadata", body = MetadataReferencePreflightResponse,
+            example = json!({"targets": [{"content_w3id": "https://w3id.org/aruna/data/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "targeted_versions": [{"node_id": "node-a", "bucket": "results", "key": "run-42/output.csv", "version_id": "01JVERSION0000000000000000"}], "visible_references": [{"document_id": "01JMETADATA0123456789ABCDE", "title": "Run 42 results"}], "hidden_references_exist": false, "would_remove_last_resolvable_aruna_location": true, "location_impact_complete": true}], "next_cursor": null, "truncated": false, "nodes_queried": 3, "nodes_failed": 0, "complete": true, "failed_partitions": [], "coverage": {"queried_scope": "realm", "queried_forms": ["content_w3id", "aruna_s3_url"], "excluded_forms": [{"form": "literal_content_url", "reason": "plain string contentUrl values are structurally invisible"}], "node_freshness": [{"node_id": "node-a", "index_state": "fresh", "oldest_status_updated_at_ms": 1787000000000_u64}], "target_resolution_complete": true, "path_style_endpoint_coverage_complete": true, "realm_coverage_complete": true}})),
+        (status = 400, description = "Malformed or oversized target set, unsupported content identity, or invalid cursor", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Wrong realm or insufficient WRITE permission for the bucket/prefix", body = ErrorResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+        (status = 503, description = "Strict lookup could not produce complete current coverage", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn metadata_reference_preflight(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Json(request): Json<MetadataReferencePreflightBody>,
+) -> ServerResult<(StatusCode, Json<MetadataReferencePreflightResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let target = match request.target {
+        MetadataReferencePreflightTargetBody::ContentW3ids {
+            content_w3ids,
+            remove_all_resolvable_locations,
+        } => MetadataReferencePreflightTarget::ContentW3ids {
+            content_w3ids,
+            remove_all_resolvable_locations,
+        },
+        MetadataReferencePreflightTargetBody::BucketPrefix {
+            bucket,
+            prefix,
+            operation,
+        } => MetadataReferencePreflightTarget::BucketPrefix {
+            bucket,
+            prefix,
+            operation: match operation {
+                MetadataPreflightStorageOperationBody::LatestVersionTombstone => {
+                    MetadataPreflightStorageOperation::LatestVersionTombstone
+                }
+                MetadataPreflightStorageOperationBody::AllVersionsPurge => {
+                    MetadataPreflightStorageOperation::AllVersionsPurge
+                }
+            },
+        },
+    };
+    let s3_endpoint = state
+        .interface_state()
+        .await
+        .s3
+        .map(|interface| interface.base_url);
+    let execution = run_references_preflight(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataReferencePreflightRequest {
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            target,
+            s3_endpoint,
+            limit: request.limit,
+            cursor: request.cursor,
+            mode: map_query_mode(request.mode),
+            target_nodes: None,
+            allow_partial: request.allow_partial,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(map_preflight_response(execution))))
+}
+
+fn map_preflight_response(
+    execution: MetadataReferencePreflightExecution,
+) -> MetadataReferencePreflightResponse {
+    MetadataReferencePreflightResponse {
+        targets: execution
+            .targets
+            .into_iter()
+            .map(|target| MetadataPreflightTargetResponse {
+                content_w3id: target.content_w3id,
+                targeted_versions: target
+                    .targeted_versions
+                    .into_iter()
+                    .map(|location| MetadataPreflightLocationResponse {
+                        node_id: location.node_id.to_string(),
+                        bucket: location.bucket,
+                        key: location.key,
+                        version_id: location.version_id.to_string(),
+                    })
+                    .collect(),
+                visible_references: target
+                    .visible_references
+                    .into_iter()
+                    .map(|reference| MetadataPreflightVisibleReferenceResponse {
+                        document_id: reference.document_id,
+                        title: reference.title,
+                    })
+                    .collect(),
+                hidden_references_exist: target.hidden_references_exist,
+                would_remove_last_resolvable_aruna_location: target
+                    .would_remove_last_resolvable_aruna_location,
+                location_impact_complete: target.location_impact_complete,
+            })
+            .collect(),
+        next_cursor: execution.next_cursor,
+        truncated: execution.truncated,
+        nodes_queried: execution.nodes_queried,
+        nodes_failed: execution.nodes_failed,
+        complete: execution.complete,
+        failed_partitions: execution
+            .failed_partitions
+            .into_iter()
+            .map(|node_id| node_id.to_string())
+            .collect(),
+        coverage: MetadataPreflightCoverageResponse {
+            queried_scope: execution.coverage.queried_scope.to_string(),
+            queried_forms: execution
+                .coverage
+                .queried_forms
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            excluded_forms: execution
+                .coverage
+                .excluded_forms
+                .into_iter()
+                .map(|excluded| MetadataPreflightExcludedFormResponse {
+                    form: excluded.form.to_string(),
+                    reason: excluded.reason.to_string(),
+                })
+                .collect(),
+            node_freshness: execution
+                .coverage
+                .node_freshness
+                .into_iter()
+                .map(|freshness| MetadataPreflightNodeFreshnessResponse {
+                    node_id: freshness.node_id.to_string(),
+                    index_state: match freshness.index_state {
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Current => {
+                            "current"
+                        }
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Pending => {
+                            "pending"
+                        }
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Failed => {
+                            "failed"
+                        }
+                        aruna_operations::metadata::api::MetadataPreflightIndexState::Mixed => {
+                            "mixed"
+                        }
+                    }
+                    .to_string(),
+                    oldest_status_updated_at_ms: freshness.oldest_status_updated_at_ms,
+                })
+                .collect(),
+            target_resolution_complete: execution.coverage.target_resolution_complete,
+            path_style_endpoint_coverage_complete: execution
+                .coverage
+                .path_style_endpoint_coverage_complete,
+            realm_coverage_complete: execution.coverage.realm_coverage_complete,
+        },
+    }
+}
+
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     MetaResourceId::parse(document_id)
         .map(|id| id.as_ulid())
@@ -2130,6 +2650,9 @@ fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
         MetadataError::InvalidInput(_) => ServerError::BadRequest,
         MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
+        MetadataError::ProfileValidation(findings) => {
+            ServerError::MetadataProfileValidation(findings)
+        }
         MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -2463,7 +2986,8 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, TASK_TIMER_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE,
     };
     use aruna_core::metadata::{
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -2474,8 +2998,10 @@ mod tests {
         metadata_materialization_status_write_entry, metadata_registry_delete_entries,
     };
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, METADATA_HANDLE, NodeCapabilities,
+        BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group,
+        GroupAuthorizationDocument, HashPathIndexKey, METADATA_HANDLE, NodeCapabilities,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+        VersionKey,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
@@ -2505,6 +3031,7 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     struct TestState {
@@ -5408,13 +5935,14 @@ mod tests {
     ) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
-        for node in nodes {
+        for (band, node) in nodes.iter().enumerate() {
             let kind = if Some(node.net.node_id()) == user_node {
                 RealmNodeKind::User
             } else {
                 RealmNodeKind::Server
             };
             config.ensure_node(node.net.node_id(), kind);
+            config.seed_job_control(node.net.node_id(), band as u32);
         }
 
         for node in nodes {
@@ -5503,6 +6031,35 @@ mod tests {
         )
         .await
         .map(|(_, Json(response))| response)
+    }
+
+    async fn preflight_route(
+        test: &TestState,
+        auth: Option<AuthContext>,
+        target: MetadataReferencePreflightTargetBody,
+        mode: MetadataQueryMode,
+        allow_partial: bool,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> ServerResult<MetadataReferencePreflightResponse> {
+        metadata_reference_preflight(
+            State(test.state.clone()),
+            Extension(auth),
+            Extension(None),
+            Json(MetadataReferencePreflightBody {
+                target,
+                mode: Some(mode),
+                allow_partial,
+                limit,
+                cursor,
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+    }
+
+    fn preflight_w3id(hash: [u8; 32]) -> String {
+        format!("https://w3id.org/aruna/data/{}", hex::encode(hash))
     }
 
     async fn create_linking_doc(
@@ -5879,6 +6436,268 @@ mod tests {
         assert_eq!(full.references.len(), 2);
     }
 
+    #[tokio::test]
+    async fn preflight_distinguishes_no_references_incomplete_and_unauthorized() {
+        let test = setup_state().await;
+        let w3id = preflight_w3id([31u8; 32]);
+        let target = || MetadataReferencePreflightTargetBody::ContentW3ids {
+            content_w3ids: vec![w3id.clone()],
+            remove_all_resolvable_locations: false,
+        };
+
+        let no_references = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            target(),
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(no_references.complete);
+        assert!(no_references.targets[0].visible_references.is_empty());
+        assert!(!no_references.targets[0].hidden_references_exist);
+        assert!(!no_references.coverage.realm_coverage_complete);
+        let excluded_forms = no_references
+            .coverage
+            .excluded_forms
+            .iter()
+            .map(|excluded| excluded.form.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            excluded_forms,
+            HashSet::from([
+                "literal_content_url",
+                "imported_relative_identity",
+                "imported_external_identity",
+            ])
+        );
+
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/pending-preflight",
+            "Pending preflight",
+            true,
+            &[("license", &w3id)],
+        )
+        .await;
+        let incomplete = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            target(),
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!incomplete.complete);
+        assert!(
+            incomplete
+                .coverage
+                .node_freshness
+                .iter()
+                .any(|freshness| { matches!(freshness.index_state.as_str(), "pending" | "mixed") })
+        );
+        let strict = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            target(),
+            MetadataQueryMode::Local,
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(strict, Err(ServerError::ServiceUnavailable)));
+
+        let unauthorized = preflight_route(
+            &test,
+            None,
+            target(),
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(unauthorized, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn preflight_hidden_references_expose_only_boolean() {
+        let test = setup_state().await;
+        let realm_id = test.state.get_realm_id();
+        let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let foreign_group = Ulid::generate();
+        seed_group_owned_by(&test, foreign_group, foreign_user).await;
+        let foreign_auth = AuthContext {
+            user_id: foreign_user,
+            realm_id,
+            path_restrictions: None,
+        };
+        let w3id = preflight_w3id([32u8; 32]);
+        let visible_id = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/visible-preflight",
+            "Visible preflight",
+            true,
+            &[("license", &w3id)],
+        )
+        .await;
+        let hidden_id = create_linking_doc(
+            &test,
+            foreign_auth,
+            foreign_group,
+            "datasets/hidden-preflight",
+            "Restricted preflight secret",
+            false,
+            &[("license", &w3id)],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            MetadataReferencePreflightTargetBody::ContentW3ids {
+                content_w3ids: vec![w3id],
+                remove_all_resolvable_locations: false,
+            },
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let target = &response.targets[0];
+        assert!(target.hidden_references_exist);
+        assert_eq!(target.visible_references.len(), 1);
+        assert_eq!(target.visible_references[0].document_id, visible_id);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(&hidden_id));
+        assert!(!serialized.contains("Restricted preflight secret"));
+        assert!(!serialized.contains("hidden_references_count"));
+    }
+
+    #[tokio::test]
+    async fn preflight_bucket_prefix_finds_legacy_s3_ids() {
+        let test = setup_state().await;
+        test.state
+            .register_s3_interface("127.0.0.1:9000".parse().unwrap(), "https://s3.example.test")
+            .await;
+        let bucket = "preflight-bucket";
+        let key = "folder/file.bin";
+        let hash = [33u8; 32];
+        let version_id = Ulid::generate();
+        let ctx = test.state.get_ctx();
+        let bucket_info = BucketInfo {
+            group_id: test.group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test.auth.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        };
+        write_doc(
+            &ctx,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().into(),
+            bucket_info.to_bytes().unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(bucket, key).to_bytes().unwrap().into(),
+            CurrentVersionPointer::new(version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, key, version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            BlobVersion::materialized(
+                hash,
+                BackendRef::node_default(),
+                SystemTime::UNIX_EPOCH,
+                test.auth.user_id,
+                None,
+            )
+            .to_bytes()
+            .unwrap()
+            .into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                hash,
+                version_id,
+                test.state.get_realm_id(),
+                test.group_id,
+                test.state.get_node_id(),
+                bucket,
+                key,
+            )
+            .to_bytes()
+            .unwrap()
+            .into(),
+            Vec::<u8>::new().into(),
+        )
+        .await;
+        let document_id = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/legacy-s3-reference",
+            "Legacy S3 reference",
+            true,
+            &[("license", &format!("s3://{bucket}/{key}"))],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = preflight_route(
+            &test,
+            Some(test.auth.clone()),
+            MetadataReferencePreflightTargetBody::BucketPrefix {
+                bucket: bucket.to_string(),
+                prefix: Some("folder/".to_string()),
+                operation: MetadataPreflightStorageOperationBody::AllVersionsPurge,
+            },
+            MetadataQueryMode::Local,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.targets.len(), 1);
+        let target = &response.targets[0];
+        assert_eq!(target.content_w3id, preflight_w3id(hash));
+        assert_eq!(target.targeted_versions.len(), 1);
+        assert_eq!(target.visible_references[0].document_id, document_id);
+        assert!(target.would_remove_last_resolvable_aruna_location);
+        assert!(response.coverage.path_style_endpoint_coverage_complete);
+    }
+
     async fn create_test_metadata_document(
         state: Arc<ServerState>,
         auth: AuthContext,
@@ -6109,6 +6928,7 @@ mod tests {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         config.ensure_node(node_id, RealmNodeKind::Server);
+        config.seed_job_control(node_id, 0);
         write_doc(
             &driver_ctx,
             REALM_CONFIG_KEYSPACE,
@@ -6192,6 +7012,7 @@ mod tests {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         config.ensure_node(node_id, RealmNodeKind::Server);
+        config.seed_job_control(node_id, 0);
         write_doc(
             &driver_ctx,
             REALM_CONFIG_KEYSPACE,

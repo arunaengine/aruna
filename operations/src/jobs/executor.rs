@@ -68,6 +68,9 @@ pub struct JobContext {
 pub enum JobRunOutcome {
     Succeeded(JobResultPayload),
     Failed(JobError),
+    /// A dependency such as metadata projection is not readable yet. The
+    /// runtime requeues without incrementing the bounded execution attempts.
+    Deferred(JobError),
     Cancelled,
     Interrupted,
 }
@@ -117,6 +120,9 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::MintPersistentId(spec) => {
             crate::jobs::persistent_id::run_mint_pid(ctx, spec).await
         }
+        JobPayload::StoragePurge(spec) => {
+            crate::jobs::workflow::purge::run_storage_purge(ctx, spec).await
+        }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -138,6 +144,7 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::ImportRoCrate(_)
         | JobPayload::ExportRoCrate(_)
         | JobPayload::Harvest(_)
+        | JobPayload::StoragePurge(_)
         | JobPayload::MintPersistentId(_)
         | JobPayload::WriteRunCrate { .. }
         | JobPayload::TerminalCleanup { .. } => {}

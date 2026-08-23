@@ -288,6 +288,7 @@ fn too_many_requests(retry_after: u64) -> Response {
         code: Some("rate_limited".to_string()),
         details: None,
         violations: None,
+        findings: None,
         quota: None,
     })
     .unwrap_or_else(|_| b"{\"error\":\"too many requests\"}".to_vec());

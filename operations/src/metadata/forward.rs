@@ -10,11 +10,14 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
 };
-use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
+use aruna_core::metadata::{
+    MetadataCreateEventRecord, MetadataError, MetadataProfileValidationStatus, MetadataQueryResults,
+};
 use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
     Actor, AuthContext, JobId, MetadataRegistryRecord, MintPersistentIdSpec, Permission,
-    PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
+    PersistentIdFailure, PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId,
+    RealmNodeKind,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
@@ -38,11 +41,13 @@ use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
-    MetadataApiError, export_metadata_rocrate, get_visible_metadata_document,
+    MetadataApiError, ensure_record_readable, export_metadata_rocrate,
+    get_visible_metadata_document, load_record_by_document,
 };
 use crate::metadata::handle::{
     MetadataRequestDelivery, MetadataRequestError, MetadataWritePeerError,
 };
+use crate::metadata::profile_validation::{current_validation_status, revalidate_current};
 use crate::metadata::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
     PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
@@ -434,6 +439,146 @@ pub async fn get_metadata_routed(
     }
 }
 
+/// Reads or recomputes Profile status on the document's holders. The holder
+/// performs the same per-document READ check as the ordinary metadata route.
+pub async fn profile_validation_status_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    request: GetVisibleMetadataDocumentRequest,
+    auth_token: Option<MetadataAuthToken>,
+    revalidate: bool,
+) -> Result<MetadataProfileValidationStatus, MetadataApiError> {
+    let registry = load_record_by_document(context.as_ref(), request.document_id).await?;
+    if context.net_handle.is_none() {
+        ensure_record_readable(
+            context.as_ref(),
+            realm_id,
+            request.auth.as_ref(),
+            &registry,
+            None,
+        )
+        .await?;
+        return if revalidate {
+            revalidate_current(context.as_ref(), &registry).await
+        } else {
+            current_validation_status(context.as_ref(), &registry).await
+        }
+        .map_err(|_| MetadataApiError::ServiceUnavailable);
+    }
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let holders =
+        read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
+    let holder_count = holders.len();
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let context = Arc::clone(context);
+    let metadata = context.metadata_handle.clone();
+    let request_template = request.clone();
+    let (responses, timed_out) = read_holders(holders, move |holder| {
+        let context = context.clone();
+        let metadata = metadata.clone();
+        let request = request_template.clone();
+        let auth_token = auth_token.clone();
+        Box::pin(async move {
+            if Some(holder) == local_node {
+                let record = load_record_by_document(context.as_ref(), request.document_id)
+                    .await
+                    .map_err(read_error)?;
+                ensure_record_readable(
+                    context.as_ref(),
+                    realm_id,
+                    request.auth.as_ref(),
+                    &record,
+                    None,
+                )
+                .await
+                .map_err(read_error)?;
+                if revalidate {
+                    revalidate_current(context.as_ref(), &record).await
+                } else {
+                    current_validation_status(context.as_ref(), &record).await
+                }
+                .map_err(|_| MetadataReadError::Unavailable)
+            } else {
+                let Some(metadata) = metadata else {
+                    return Err(MetadataReadError::Unavailable);
+                };
+                match metadata
+                    .request_forwarded_write(
+                        holder,
+                        MetadataTransportMessage::ForwardProfileValidationStatus {
+                            auth_token,
+                            config_digest,
+                            document_id: request.document_id,
+                            revalidate,
+                        },
+                    )
+                    .await
+                {
+                    Ok(MetadataTransportMessage::ForwardedProfileValidationStatus { result }) => {
+                        result.map(|status| *status)
+                    }
+                    _ => Err(MetadataReadError::Unavailable),
+                }
+            }
+        })
+    })
+    .await;
+    let mut not_found = 0usize;
+    let mut success = None;
+    let mut auth_error = None;
+    let mut unavailable = timed_out;
+    for (_, response) in responses {
+        match response {
+            Ok(status) => {
+                keep_status(&mut success, status, registry.last_event_id);
+            }
+            Err(MetadataReadError::Unauthorized) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
+            }
+            Err(MetadataReadError::Forbidden) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
+            }
+            Err(MetadataReadError::NotFound) => not_found += 1,
+            Err(MetadataReadError::Unavailable) => unavailable = true,
+        }
+    }
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if success.is_some() && not_found > 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(status) = success {
+        return Ok(status);
+    }
+    if !unavailable && holder_count > 0 && not_found == holder_count {
+        Err(MetadataApiError::NotFound)
+    } else {
+        Err(MetadataApiError::ServiceUnavailable)
+    }
+}
+
+fn keep_status(
+    current: &mut Option<MetadataProfileValidationStatus>,
+    incoming: MetadataProfileValidationStatus,
+    expected_revision: Ulid,
+) {
+    let incoming_exact = incoming.dataset_revision == expected_revision;
+    let current_exact = current
+        .as_ref()
+        .is_some_and(|status| status.dataset_revision == expected_revision);
+    if current.is_none() || incoming_exact && !current_exact {
+        *current = Some(incoming);
+    }
+}
+
 /// Exports locally on a holder or forwards with the caller's bearer or
 /// peer-attested internal principal for another READ check.
 pub async fn export_rocrate_routed(
@@ -625,6 +770,10 @@ pub async fn create_metadata_document_routed(
         MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
             "holder returned a metadata create record for another document".to_string(),
         )),
+        MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
+            CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings))
+                .into(),
+        ),
         other => Err(unexpected_response(other)),
     }
 }
@@ -724,6 +873,10 @@ pub async fn update_metadata_document_routed(
         )),
         MetadataTransportMessage::ForwardedUpdateInvalidInput { message } => Err(
             UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into(),
+        ),
+        MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
+            UpdateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings))
+                .into(),
         ),
         other => Err(unexpected_response(other)),
     }
@@ -946,7 +1099,10 @@ pub(crate) async fn apply_forwarded_write(
         MetadataTransportMessage::ForwardCreateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardUpdateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardDeleteDocument { config_digest, .. }
-        | MetadataTransportMessage::ForwardReadDocument { config_digest, .. } => *config_digest,
+        | MetadataTransportMessage::ForwardReadDocument { config_digest, .. }
+        | MetadataTransportMessage::ForwardProfileValidationStatus { config_digest, .. } => {
+            *config_digest
+        }
         _ => return reject("unexpected forwarded metadata message"),
     };
     if config.digest().ok() != Some(expected_digest) {
@@ -986,6 +1142,64 @@ pub(crate) async fn apply_forwarded_write(
                 Err(error) => Err(error),
             };
             MetadataTransportMessage::ForwardedRead { result }
+        })
+        .await;
+    }
+
+    if let MetadataTransportMessage::ForwardProfileValidationStatus {
+        auth_token,
+        document_id,
+        revalidate,
+        ..
+    } = &message
+    {
+        return Box::pin(async {
+            let Some(metadata) = context.metadata_handle.as_ref() else {
+                return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                    result: Err(MetadataReadError::Unavailable),
+                };
+            };
+            let result = match metadata
+                .authorize_read_peer(peer, auth_token.clone(), false)
+                .await
+            {
+                Ok(auth)
+                    if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
+                {
+                    let record = match load_record_by_document(context.as_ref(), *document_id).await
+                    {
+                        Ok(record) => record,
+                        Err(error) => {
+                            return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                                result: Err(read_error(error)),
+                            };
+                        }
+                    };
+                    if let Err(error) = ensure_record_readable(
+                        context.as_ref(),
+                        realm_id,
+                        auth.as_ref(),
+                        &record,
+                        None,
+                    )
+                    .await
+                    {
+                        return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                            result: Err(read_error(error)),
+                        };
+                    }
+                    if *revalidate {
+                        revalidate_current(context.as_ref(), &record).await
+                    } else {
+                        current_validation_status(context.as_ref(), &record).await
+                    }
+                    .map(Box::new)
+                    .map_err(|_| MetadataReadError::Unavailable)
+                }
+                Ok(_) => Err(MetadataReadError::Unavailable),
+                Err(error) => Err(error),
+            };
+            MetadataTransportMessage::ForwardedProfileValidationStatus { result }
         })
         .await;
     }
@@ -1053,6 +1267,9 @@ pub(crate) async fn apply_forwarded_write(
                             Err(error) => reject(error),
                         }
                     }
+                    Err(CreateMetadataDocumentError::MetadataError(
+                        MetadataError::ProfileValidation(findings),
+                    )) => MetadataTransportMessage::ForwardedProfileValidation { findings },
                     Err(error) => reject(format!("forwarded metadata create failed: {error}")),
                 }
             })
@@ -1103,6 +1320,9 @@ pub(crate) async fn apply_forwarded_write(
                     Err(UpdateMetadataDocumentError::MetadataError(
                         MetadataError::InvalidInput(message),
                     )) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
+                    Err(UpdateMetadataDocumentError::MetadataError(
+                        MetadataError::ProfileValidation(findings),
+                    )) => MetadataTransportMessage::ForwardedProfileValidation { findings },
                     Err(error) => reject(format!("forwarded metadata update failed: {error}")),
                 }
             })
@@ -1250,6 +1470,12 @@ pub async fn submit_pid_routed(
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<(JobId, bool), MetadataApiError> {
     let realm_id = minted_by.realm_id;
+    if let Some(job_id) = read_pid_routed(context, realm_id, document_id)
+        .await?
+        .and_then(|mapping| mapping.job_id)
+    {
+        return Ok((job_id, false));
+    }
     if context.net_handle.is_none() {
         return submit_pid_local(context, document_id, minted_by, local_node_id, retention_ms)
             .await;
@@ -1302,14 +1528,18 @@ pub async fn withdraw_pid_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     document_id: Ulid,
+    withdrawn_by: UserId,
+    reason: String,
     withdrawn_at_ms: u64,
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<PersistentIdMapping, MetadataApiError> {
     if context.net_handle.is_none() {
-        return crate::persistent_id::withdraw_persistent_id(
+        return crate::persistent_id::admin_withdraw_persistent_id(
             context.as_ref(),
             realm_id,
             document_id,
+            withdrawn_by,
+            reason,
             withdrawn_at_ms,
         )
         .await
@@ -1318,10 +1548,12 @@ pub async fn withdraw_pid_routed(
     }
     let (config, authority) = pid_authority(context, realm_id, document_id).await?;
     if is_local_node(context, authority) {
-        return crate::persistent_id::withdraw_persistent_id(
+        return crate::persistent_id::admin_withdraw_persistent_id(
             context.as_ref(),
             realm_id,
             document_id,
+            withdrawn_by,
+            reason,
             withdrawn_at_ms,
         )
         .await
@@ -1333,11 +1565,96 @@ pub async fn withdraw_pid_routed(
         &config,
         authority,
         document_id,
-        PersistentIdRequest::Withdraw { withdrawn_at_ms },
+        PersistentIdRequest::Withdraw {
+            withdrawn_by,
+            reason,
+            withdrawn_at_ms,
+        },
         auth_token,
     )
     .await?;
     match outcome {
+        PersistentIdOutcome::Mapping { mapping, .. } => Ok(*mapping),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+/// Read the typed intent from the document's PID authority. This reads only the
+/// mapping; the HTTP layer applies its visibility/permission contract before
+/// returning any status.
+pub async fn read_pid_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> Result<Option<PersistentIdMapping>, MetadataApiError> {
+    if context.net_handle.is_none() {
+        return crate::persistent_id::read_mapping(context.as_ref(), document_id)
+            .await
+            .map_err(pid_error);
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return crate::persistent_id::read_mapping(context.as_ref(), document_id)
+            .await
+            .map_err(pid_error);
+    }
+    match forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::Status,
+        None,
+    )
+    .await?
+    {
+        PersistentIdOutcome::Status(mapping) => Ok(mapping.map(|mapping| *mapping)),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+/// Store a terminal provider failure on the authority. Only the internal mint
+/// worker calls this; HTTP callers have no transition that can forge failures.
+pub async fn fail_pid_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+    failure: PersistentIdFailure,
+    auth_token: MetadataAuthToken,
+) -> Result<PersistentIdMapping, MetadataApiError> {
+    if context.net_handle.is_none() {
+        return crate::persistent_id::fail_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            failure,
+        )
+        .await
+        .map(|(mapping, _)| mapping)
+        .map_err(pid_error);
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return crate::persistent_id::fail_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            failure,
+        )
+        .await
+        .map(|(mapping, _)| mapping)
+        .map_err(pid_error);
+    }
+    match forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::Fail { failure },
+        Some(auth_token),
+    )
+    .await?
+    {
         PersistentIdOutcome::Mapping { mapping, .. } => Ok(*mapping),
         _ => Err(MetadataApiError::ServiceUnavailable),
     }
@@ -1352,20 +1669,21 @@ pub async fn resolve_pid_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     document_id: Ulid,
+    pid: String,
 ) -> Result<PersistentIdResolution, MetadataApiError> {
     if context.net_handle.is_none() {
-        return local_pid_resolution(context, realm_id, document_id).await;
+        return local_pid_resolution(context, realm_id, document_id, &pid).await;
     }
     let (config, authority) = pid_authority(context, realm_id, document_id).await?;
     if is_local_node(context, authority) {
-        return local_pid_resolution(context, realm_id, document_id).await;
+        return local_pid_resolution(context, realm_id, document_id, &pid).await;
     }
     let outcome = forward_pid(
         context,
         &config,
         authority,
         document_id,
-        PersistentIdRequest::Resolve,
+        PersistentIdRequest::Resolve { pid },
         None,
     )
     .await?;
@@ -1382,6 +1700,7 @@ async fn local_pid_resolution(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     document_id: Ulid,
+    expected_pid: &str,
 ) -> Result<PersistentIdResolution, MetadataApiError> {
     let mapping = crate::persistent_id::read_mapping(context.as_ref(), document_id)
         .await
@@ -1389,8 +1708,17 @@ async fn local_pid_resolution(
     let Some(mapping) = mapping else {
         return Ok(PersistentIdResolution::Missing);
     };
-    if !mapping.is_active() {
+    if mapping.pid != expected_pid {
+        return Ok(PersistentIdResolution::Missing);
+    }
+    if mapping.public == Some(false) {
+        return Ok(PersistentIdResolution::Missing);
+    }
+    if mapping.is_retired() {
         return Ok(PersistentIdResolution::Gone { pid: mapping.pid });
+    }
+    if !mapping.is_active() {
+        return Ok(PersistentIdResolution::Missing);
     }
     let record = load_metadata_record_by_document(context.as_ref(), document_id)
         .await
@@ -1481,16 +1809,27 @@ pub(crate) async fn apply_forwarded_pid(
     if pid_authority_node(&config, realm_id, document_id) != Some(net_handle.node_id()) {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     }
-    if let PersistentIdRequest::Resolve = request {
-        let result = local_pid_resolution(context, realm_id, document_id)
-            .await
-            .map(PersistentIdOutcome::Resolution)
-            .map_err(read_error);
-        return MetadataTransportMessage::ForwardedPersistentId { result };
+    match &request {
+        PersistentIdRequest::Resolve { pid } => {
+            let result = local_pid_resolution(context, realm_id, document_id, pid)
+                .await
+                .map(PersistentIdOutcome::Resolution)
+                .map_err(read_error);
+            return MetadataTransportMessage::ForwardedPersistentId { result };
+        }
+        PersistentIdRequest::Status => {
+            let result = crate::persistent_id::read_mapping(context.as_ref(), document_id)
+                .await
+                .map(|mapping| PersistentIdOutcome::Status(mapping.map(Box::new)))
+                .map_err(|_| MetadataReadError::Unavailable);
+            return MetadataTransportMessage::ForwardedPersistentId { result };
+        }
+        _ => {}
     }
 
     // Transitions carry the caller's authority: forwarding is a routing hop, so
     // the holder re-runs the WRITE check the origin's handler ran.
+    let internal = matches!(&auth_token, Some(MetadataAuthToken::Internal(_)));
     let auth = match authorize_forwarded_pid(context, peer, realm_id, auth_token).await {
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
@@ -1500,6 +1839,7 @@ pub(crate) async fn apply_forwarded_pid(
     let minting_subject = match &request {
         PersistentIdRequest::Mint { minted_by, .. }
         | PersistentIdRequest::SubmitMint { minted_by, .. } => Some(*minted_by),
+        PersistentIdRequest::Withdraw { withdrawn_by, .. } => Some(*withdrawn_by),
         _ => None,
     };
     if minting_subject.is_some_and(|minted_by| minted_by != auth.user_id) {
@@ -1511,6 +1851,21 @@ pub(crate) async fn apply_forwarded_pid(
         Err(error) => return reject(error),
     };
     match (&request, record.as_ref()) {
+        (PersistentIdRequest::Fail { .. }, _) if !internal => {
+            return forward_auth_error(ForwardAuthError::Forbidden);
+        }
+        (PersistentIdRequest::Mint { .. } | PersistentIdRequest::Fail { .. }, _) if internal => {}
+        (PersistentIdRequest::Withdraw { .. }, Some(_)) => {
+            if let Err(error) = authorize_write(
+                context,
+                auth.clone(),
+                format!("/{realm_id}/admin/pids/{document_id}"),
+            )
+            .await
+            {
+                return forward_auth_error(error);
+            }
+        }
         (_, Some(record)) => {
             if let Err(error) =
                 authorize_write(context, auth.clone(), record.permission_path.clone()).await
@@ -1541,19 +1896,23 @@ pub(crate) async fn apply_forwarded_pid(
             mapping: Box::new(mapping),
             changed,
         }),
-        PersistentIdRequest::Withdraw { withdrawn_at_ms } => {
-            crate::persistent_id::withdraw_persistent_id(
-                context.as_ref(),
-                realm_id,
-                document_id,
-                withdrawn_at_ms,
-            )
-            .await
-            .map(|(mapping, changed)| PersistentIdOutcome::Mapping {
-                mapping: Box::new(mapping),
-                changed,
-            })
-        }
+        PersistentIdRequest::Withdraw {
+            withdrawn_by,
+            reason,
+            withdrawn_at_ms,
+        } => crate::persistent_id::admin_withdraw_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            withdrawn_by,
+            reason,
+            withdrawn_at_ms,
+        )
+        .await
+        .map(|(mapping, changed)| PersistentIdOutcome::Mapping {
+            mapping: Box::new(mapping),
+            changed,
+        }),
         PersistentIdRequest::SubmitMint {
             minted_by,
             retention_ms,
@@ -1576,15 +1935,29 @@ pub(crate) async fn apply_forwarded_pid(
                 }
             };
         }
-        PersistentIdRequest::Resolve => unreachable!("resolve returned above"),
+        PersistentIdRequest::Fail { failure } => crate::persistent_id::fail_persistent_id(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            failure,
+        )
+        .await
+        .map(|(mapping, changed)| PersistentIdOutcome::Mapping {
+            mapping: Box::new(mapping),
+            changed,
+        }),
+        PersistentIdRequest::Resolve { .. } | PersistentIdRequest::Status => {
+            unreachable!("read-only request returned above")
+        }
     };
     match outcome {
         Ok(outcome) => MetadataTransportMessage::ForwardedPersistentId {
             result: Ok(outcome),
         },
-        Err(crate::persistent_id::PersistentIdError::DocumentMissing) => {
-            MetadataTransportMessage::ForwardedWriteNotFound
-        }
+        Err(
+            crate::persistent_id::PersistentIdError::DocumentMissing
+            | crate::persistent_id::PersistentIdError::IntentMissing,
+        ) => MetadataTransportMessage::ForwardedWriteNotFound,
         Err(error) => {
             warn!(%document_id, ?error, "Forwarded persistent id transition failed");
             MetadataTransportMessage::ForwardedWriteUnavailable
@@ -1620,7 +1993,8 @@ async fn authorize_forwarded_pid(
 
 fn pid_error(error: crate::persistent_id::PersistentIdError) -> MetadataApiError {
     match error {
-        crate::persistent_id::PersistentIdError::DocumentMissing => MetadataApiError::NotFound,
+        crate::persistent_id::PersistentIdError::DocumentMissing
+        | crate::persistent_id::PersistentIdError::IntentMissing => MetadataApiError::NotFound,
         error => MetadataApiError::Internal(error.to_string()),
     }
 }
@@ -2205,6 +2579,11 @@ fn forwarded_unavailable(message: &MetadataTransportMessage) -> MetadataTranspor
                 result: Err(MetadataReadError::Unavailable),
             }
         }
+        MetadataTransportMessage::ForwardProfileValidationStatus { .. } => {
+            MetadataTransportMessage::ForwardedProfileValidationStatus {
+                result: Err(MetadataReadError::Unavailable),
+            }
+        }
         MetadataTransportMessage::ForwardCreateDocument { .. }
         | MetadataTransportMessage::ForwardUpdateDocument { .. }
         | MetadataTransportMessage::ForwardDeleteDocument { .. }
@@ -2239,12 +2618,44 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::metadata::{
+        MetadataProfileValidationCompleteness, MetadataProfileValidationState,
+    };
     use aruna_core::structs::{METADATA_HANDLE, PlacementStrategy, RealmNodeKind};
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn validation_status(revision: Ulid) -> MetadataProfileValidationStatus {
+        MetadataProfileValidationStatus {
+            document_id: Ulid::nil(),
+            dataset_revision: revision,
+            state: MetadataProfileValidationState::NotProfiled,
+            profile_id: None,
+            profile_iri: None,
+            profile_revision: None,
+            evaluator: "test".to_string(),
+            validated_at_ms: None,
+            findings: Vec::new(),
+            completeness: MetadataProfileValidationCompleteness::Complete,
+            stale_reason: None,
+        }
+    }
+
+    #[test]
+    fn prefers_exact_status() {
+        let expected = Ulid::from_bytes([1; 16]);
+        let stale = Ulid::from_bytes([2; 16]);
+        let mut selected = None;
+
+        keep_status(&mut selected, validation_status(stale), expected);
+        keep_status(&mut selected, validation_status(expected), expected);
+        keep_status(&mut selected, validation_status(stale), expected);
+
+        assert_eq!(selected.unwrap().dataset_revision, expected);
     }
 
     fn config_and_placement() -> (RealmConfigDocument, PlacementRef) {

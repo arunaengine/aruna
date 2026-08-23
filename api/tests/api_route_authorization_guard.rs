@@ -120,6 +120,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "metadata.rs",
+        "get_profile_validation_status",
+        "per-document visibility checked inside the routed status operation (GetVisibleMetadataDocumentRequest), forwarded under the caller's token",
+    ),
+    (
+        "metadata.rs",
         "list_all_metadata_documents",
         "records filtered by GroupPermissionRules and policies",
     ),
@@ -130,8 +135,23 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "metadata.rs",
+        "metadata_reference_preflight",
+        "realm bearer; per-document visibility checked inside the preflight operation, restricted references surface only as a boolean",
+    ),
+    (
+        "metadata.rs",
         "metadata_references",
         "each backlink filtered by can_read_record",
+    ),
+    (
+        "metadata.rs",
+        "preview_profile_validation",
+        "realm bearer; nothing stored is read except the realm-public registered Profile, nothing is written",
+    ),
+    (
+        "metadata.rs",
+        "profile_validation_capabilities",
+        "realm bearer read of static evaluator capabilities; no resource is addressed",
     ),
     (
         "metadata.rs",
@@ -142,6 +162,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "metadata.rs",
         "query_metadata_document",
         "ensure_record_readable checks READ on the record path",
+    ),
+    (
+        "metadata.rs",
+        "revalidate_profile",
+        "realm bearer; per-document visibility checked inside the routed status operation (GetVisibleMetadataDocumentRequest), forwarded under the caller's token",
     ),
     (
         "metadata.rs",
@@ -201,6 +226,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          record and answers 302, 404, or a 410 tombstone",
     ),
     (
+        "pid.rs",
+        "resolve_profile_pid",
+        "anonymous landing resolution that redirects to the rocrate route, which enforces document authorization",
+    ),
+    (
         "placement.rs",
         "create_placement_policy",
         "realm-admin WRITE checked inside CreatePolicyOperation; a forwarding \
@@ -224,6 +254,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "placement.rs",
+        "list_placement_policies",
+        "realm-config READ checked inside ListPoliciesOperation",
+    ),
+    (
+        "placement.rs",
         "resolve_placement_quarantine",
         "realm-admin WRITE checked inside ResolveQuarantineOperation",
     ),
@@ -237,6 +272,21 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "bucket_search",
         "realm-wide fan-out with no single permission path; candidates filtered \
          by per-bucket READ and policies",
+    ),
+    (
+        "search.rs",
+        "object_search",
+        "realm bearer; every live head is re-checked against group READ, token path restrictions and request policies inside the search operation",
+    ),
+    (
+        "sessions.rs",
+        "create_s3_session",
+        "realm bearer, explicit group membership and WRITE on the group node-local data path checked via authorize_credential_issuance",
+    ),
+    (
+        "sessions.rs",
+        "refresh_s3_session",
+        "realm bearer, explicit group membership and WRITE on the group node-local data path checked via authorize_credential_issuance",
     ),
     (
         "staging.rs",

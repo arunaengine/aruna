@@ -5,7 +5,7 @@
 //! The mapping keyspace is deliberately not the registry row: the row is deleted
 //! with the document while the mapping has to survive it to serve a permanent 410.
 //! These tests prove that every node answers the same way regardless of which one
-//! receives the request, that `Withdrawn` is terminal against a racing mint, and
+//! receives the request, that retirement is terminal against a racing mint, and
 //! that a node which cannot reach the authority reports unavailable rather than
 //! inventing a local 404.
 
@@ -18,8 +18,11 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_PENDING_PROJECTION_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
 use aruna_core::storage_entries::metadata_pending_projection_key;
 use aruna_core::structs::{
-    MintPersistentIdSpec, PersistentIdMapping, PersistentIdRevision, PersistentIdStatus,
-    PlacementRef, persistent_id_key, pid_dedup_key,
+    JobId, MetadataRegistryRecord, MintPersistentIdSpec, PersistentIdMapping, PersistentIdRevision,
+    PersistentIdStatus, PlacementRef, persistent_id_key, pid_dedup_key,
+};
+use aruna_operations::claim_initial_realm_admin::{
+    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
@@ -33,8 +36,8 @@ use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, delete_metadata_document_routed, mint_pid_routed, resolve_pid_routed,
-    withdraw_pid_routed,
+    MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
+    mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::persistent_id::read_mapping;
@@ -94,6 +97,13 @@ async fn mint_routes_holder() -> TestResult<()> {
 #[tokio::test]
 async fn withdraw_precedes_mint() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    drive(
+        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+            actor: realm.actor(realm.node(0)),
+        }),
+        realm.node(0).context.as_ref(),
+    )
+    .await?;
     let group_id = realm.seed_group().await?;
     let (document_id, placement) = seed_document(&realm, group_id, "datasets/raced", true).await?;
     let forwarder = realm.non_holder(&placement);
@@ -103,12 +113,12 @@ async fn withdraw_precedes_mint() -> TestResult<()> {
     submit_routed(&realm, realm.node(0), document_id, realm.user_id).await?;
 
     let withdrawn = withdraw_routed(&realm, forwarder, document_id).await?;
-    assert_eq!(withdrawn.status, PersistentIdStatus::Withdrawn);
+    assert_eq!(withdrawn.status, PersistentIdStatus::AdminWithdrawn);
     assert_eq!(withdrawn.minted_at_ms, None);
 
     let (mapping, minted) = mint_routed(&realm, forwarder, document_id).await?;
     assert!(!minted, "a mint may never replace a tombstone");
-    assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+    assert_eq!(mapping.status, PersistentIdStatus::AdminWithdrawn);
 
     for holder in realm.holders(&placement) {
         let node = realm.find(holder);
@@ -156,7 +166,7 @@ async fn delete_withdraws_mapping() -> TestResult<()> {
     let mapping = read_mapping(holder.context.as_ref(), document_id)
         .await?
         .expect("the mapping survives the registry row it can no longer be derived from");
-    assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+    assert_eq!(mapping.status, PersistentIdStatus::Tombstoned);
     assert!(mapping.minted_at_ms.is_some());
     assert!(registry_record(holder, document_id).await.is_none());
     assert!(matches!(
@@ -202,7 +212,7 @@ async fn replica_delete_routes_to_pid_authority() -> TestResult<()> {
     let mapping = read_mapping(authority.context.as_ref(), document_id)
         .await?
         .expect("the authority retains the withdrawn mapping");
-    assert_eq!(mapping.status, PersistentIdStatus::Withdrawn);
+    assert_eq!(mapping.status, PersistentIdStatus::Tombstoned);
     assert_eq!(mapping.revision.actor, authority.node_id());
     assert!(registry_record(authority, document_id).await.is_none());
 
@@ -259,7 +269,13 @@ async fn holder_loss_unavailable() -> TestResult<()> {
 
     assert!(
         matches!(
-            resolve_pid_routed(&forwarder.context, realm.realm_id, document_id).await,
+            resolve_pid_routed(
+                &forwarder.context,
+                realm.realm_id,
+                document_id,
+                MetadataRegistryRecord::graph_iri_for(document_id),
+            )
+            .await,
             Err(MetadataApiError::ServiceUnavailable)
         ),
         "an unreachable authority is unavailable, never a local 404"
@@ -302,7 +318,13 @@ async fn authority_loss_unavailable() -> TestResult<()> {
     {
         assert!(
             matches!(
-                resolve_pid_routed(&node.context, realm.realm_id, document_id).await,
+                resolve_pid_routed(
+                    &node.context,
+                    realm.realm_id,
+                    document_id,
+                    MetadataRegistryRecord::graph_iri_for(document_id),
+                )
+                .await,
                 Err(MetadataApiError::ServiceUnavailable)
             ),
             "a replica may not answer for the authority"
@@ -407,7 +429,11 @@ async fn replica_mapping_ignored() -> TestResult<()> {
     let authority = realm.holder(&minted_placement);
     assert!(mint_routed(&realm, authority, minted_id).await?.1);
     for node_id in realm.non_holder_ids(&minted_placement) {
-        write_mapping(realm.find(node_id), withdrawn_mapping(minted_id)).await?;
+        write_mapping(
+            realm.find(node_id),
+            withdrawn_mapping(minted_id, realm.user_id),
+        )
+        .await?;
     }
 
     for node in realm.nodes.iter() {
@@ -435,8 +461,8 @@ async fn replica_mapping_ignored() -> TestResult<()> {
 async fn premature_mapping_unavailable() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    let origin = realm.node(0);
     let path = "datasets/unprojected";
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = realm
@@ -448,7 +474,13 @@ async fn premature_mapping_unavailable() -> TestResult<()> {
 
     assert!(
         matches!(
-            resolve_pid_routed(&authority.context, realm.realm_id, document_id).await,
+            resolve_pid_routed(
+                &authority.context,
+                realm.realm_id,
+                document_id,
+                MetadataRegistryRecord::graph_iri_for(document_id),
+            )
+            .await,
             Err(MetadataApiError::ServiceUnavailable)
         ),
         "an unexplained active mapping is unavailable, never a false 410"
@@ -458,30 +490,31 @@ async fn premature_mapping_unavailable() -> TestResult<()> {
     Ok(())
 }
 
-/// A forwarded withdrawal is a document operation, so the authority re-runs the
-/// document's WRITE check. Without a registry row there is no permission path to
-/// check at all, and bare realm membership must not be able to tombstone an
-/// arbitrary id: mint never replaces a tombstone, so that would brick the PID.
+/// Administrative withdrawal is not a document-owner operation: a group member
+/// with document WRITE is still forbidden without the realm PID-admin grant.
 #[tokio::test]
-async fn withdraw_needs_write() -> TestResult<()> {
+async fn owner_cannot_withdraw() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let (document_id, placement) =
         seed_document(&realm, group_id, "datasets/guarded", true).await?;
-    let outsider = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
+    let owner = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
+    realm.grant_group_user(group_id, owner).await?;
     let sender = realm.non_holder(&placement);
 
     let denied = withdraw_pid_routed(
         &sender.context,
         realm.realm_id,
         document_id,
+        owner,
+        "test denial".to_string(),
         aruna_core::util::unix_timestamp_millis(),
-        Some(realm.bearer_for(outsider)),
+        Some(realm.bearer_for(owner)),
     )
     .await;
     assert!(
         matches!(denied, Err(MetadataApiError::Forbidden)),
-        "a realm member without document WRITE may not withdraw it: {denied:?}"
+        "document WRITE must not grant primary-PID withdrawal: {denied:?}"
     );
 
     let never_created = mint_local_document(
@@ -495,8 +528,10 @@ async fn withdraw_needs_write() -> TestResult<()> {
         &sender.context,
         realm.realm_id,
         never_created,
+        owner,
+        "test denial".to_string(),
         aruna_core::util::unix_timestamp_millis(),
-        Some(realm.bearer_for(outsider)),
+        Some(realm.bearer_for(owner)),
     )
     .await;
     assert!(
@@ -505,12 +540,17 @@ async fn withdraw_needs_write() -> TestResult<()> {
     );
 
     for node in realm.nodes.iter() {
-        for id in [document_id, never_created] {
+        if let Some(mapping) = read_mapping(node.context.as_ref(), document_id).await? {
             assert!(
-                read_mapping(node.context.as_ref(), id).await?.is_none(),
-                "no tombstone may be written by an unauthorized withdrawal"
+                !mapping.is_retired(),
+                "unauthorized withdrawal may not retire the automatic intent"
             );
         }
+        assert!(
+            read_mapping(node.context.as_ref(), never_created)
+                .await?
+                .is_none()
+        );
     }
 
     realm.shutdown().await;
@@ -525,8 +565,8 @@ async fn withdraw_needs_write() -> TestResult<()> {
 async fn delete_waits_projection() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
-    let origin = realm.node(0);
     let path = "datasets/lagging";
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = realm
@@ -617,11 +657,31 @@ fn revision(occurred_at_ms: u64) -> PersistentIdRevision {
 }
 
 fn active_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
-    PersistentIdMapping::conceptual(document_id, minted_by, revision(1))
+    let mut mapping = PersistentIdMapping::requested(
+        document_id,
+        false,
+        minted_by,
+        JobId::from_bytes([7; 16]),
+        true,
+        "/documents/test".to_string(),
+        revision(1),
+    );
+    assert!(mapping.activate(minted_by, revision(1)));
+    mapping
 }
 
-fn withdrawn_mapping(document_id: Ulid) -> PersistentIdMapping {
-    PersistentIdMapping::tombstone(document_id, revision(2))
+fn withdrawn_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
+    let mut mapping = PersistentIdMapping::requested(
+        document_id,
+        false,
+        minted_by,
+        JobId::from_bytes([7; 16]),
+        true,
+        "/documents/test".to_string(),
+        revision(1),
+    );
+    assert!(mapping.mark_tombstoned(revision(2)));
+    mapping
 }
 
 /// Writes a mapping row straight into one node's store, which is what a delayed
@@ -757,12 +817,14 @@ async fn withdraw_routed(
                 &node.context,
                 realm.realm_id,
                 document_id,
+                realm.user_id,
+                "test administrator withdrawal".to_string(),
                 aruna_core::util::unix_timestamp_millis(),
                 Some(realm.bearer_token()),
             )
             .await
             {
-                Err(MetadataApiError::ServiceUnavailable) => Ok(1),
+                Err(MetadataApiError::ServiceUnavailable | MetadataApiError::Forbidden) => Ok(1),
                 other => {
                     *withdrawn.borrow_mut() = Some(other?);
                     Ok(0)
@@ -787,7 +849,14 @@ async fn resolve_until_answer(
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed resolve reached the authority",
         || async {
-            match resolve_pid_routed(&node.context, realm.realm_id, document_id).await {
+            match resolve_pid_routed(
+                &node.context,
+                realm.realm_id,
+                document_id,
+                MetadataRegistryRecord::graph_iri_for(document_id),
+            )
+            .await
+            {
                 Err(MetadataApiError::ServiceUnavailable) => Ok(1),
                 other => {
                     *answer.borrow_mut() = Some(other?);
@@ -812,7 +881,7 @@ async fn mapping_active(node: &TestNode, document_id: Ulid) -> bool {
 async fn mapping_withdrawn(node: &TestNode, document_id: Ulid) -> bool {
     matches!(
         read_mapping(node.context.as_ref(), document_id).await,
-        Ok(Some(mapping)) if mapping.status == PersistentIdStatus::Withdrawn
+        Ok(Some(mapping)) if mapping.status.is_retired()
     )
 }
 
@@ -826,13 +895,13 @@ async fn seed_document(
 ) -> TestResult<(Ulid, PlacementRef)> {
     // The id must be a structured MetaResourceId: routing resolves the mapping's
     // placement from the id itself, never from the deletable registry row.
-    let origin = realm.node(0);
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     realm
         .origin_placement(origin, group_id, document_id, path)
         .ok_or("a Management node holds buckets")?;
-    let created = drive(
+    let created = create_metadata_document_routed(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: realm.actor(origin),
             group_id,
@@ -846,11 +915,13 @@ async fn seed_document(
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }),
-        origin.context.as_ref(),
+        origin.context.clone(),
+        Some(realm.bearer_token()),
     )
     .await?;
-    replay_metadata_event_log(origin.context.as_ref()).await?;
     let placement = created.record.placement;
+    let authority = realm.holder(&placement);
+    replay_metadata_event_log(authority.context.as_ref()).await?;
 
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "the seeded document's registry row never reached every sync-eligible node",
@@ -862,6 +933,16 @@ async fn seed_document(
                 }
             }
             Ok(pending)
+        },
+    )
+    .await?;
+    wait_until(
+        "the automatic PID intent reaches its authority",
+        authority.node_id(),
+        || async {
+            read_mapping(authority.context.as_ref(), document_id)
+                .await
+                .is_ok_and(|mapping| mapping.is_some())
         },
     )
     .await?;

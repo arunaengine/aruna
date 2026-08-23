@@ -75,6 +75,7 @@ pub struct ListMultipartUploadsOperation {
     scan_rows: usize,
     scan_round_limit: usize,
     max_scan_rows: usize,
+    include_in_progress: bool,
     output: Option<Result<ListMultipartUploadsResult, ListMultipartUploadsError>>,
 }
 
@@ -93,8 +94,23 @@ impl ListMultipartUploadsOperation {
             scan_rows: 0,
             scan_round_limit: Self::SCAN_ROUND_LIMIT,
             max_scan_rows: Self::MAX_SCAN_ROWS,
+            include_in_progress: false,
             output: None,
         }
+    }
+
+    /// Internal purge inventory must also see Completing/Aborting rows so its
+    /// final emptiness proof cannot race a multipart state transition.
+    pub fn including_in_progress(mut self) -> Self {
+        self.include_in_progress = true;
+        self
+    }
+
+    /// Deletion inventory cannot mistake the global scan safety budget for a
+    /// complete bucket result. Callers still bound the returned page.
+    pub fn complete_scan(mut self) -> Self {
+        self.max_scan_rows = usize::MAX;
+        self
     }
 
     #[cfg(test)]
@@ -200,7 +216,9 @@ impl ListMultipartUploadsOperation {
                 Ok(record) => record,
                 Err(err) => return self.emit_error(err.into()),
             };
-            if record.bucket != self.input.bucket || record.status != MultipartUploadStatus::Open {
+            if record.bucket != self.input.bucket
+                || (!self.include_in_progress && record.status != MultipartUploadStatus::Open)
+            {
                 continue;
             }
             if let Some(prefix) = self.prefix()

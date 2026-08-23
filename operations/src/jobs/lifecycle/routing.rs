@@ -210,6 +210,7 @@ pub(crate) fn status_view(
         result: result_view(projection, workspace_bucket.clone()),
         workspace_bucket,
         workspace_mode: mode,
+        locally_exhausted: false,
     }
 }
 

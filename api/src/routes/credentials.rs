@@ -24,6 +24,8 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+mod sessions;
+
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "credentials", description = "User credential management"))
@@ -34,6 +36,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(CredentialsApiDoc::openapi())
         .routes(routes!(list_s3_credentials, create_s3_credentials))
         .routes(routes!(revoke_s3_credentials))
+        .merge(sessions::router())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

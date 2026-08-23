@@ -85,19 +85,28 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let irokle_a = irokle::Irokle::builder().build()?;
     let irokle_b = irokle::Irokle::builder().build()?;
+    // craqle 0.2 denies replicated policy changes unless the node opts in; the
+    // peers here trust each other so the synced graph stays writable.
+    let accept_policies = || -> Arc<dyn craqle::RemotePolicyAuthorizer> {
+        Arc::new(|_: &GraphId, _: &craqle::ActorId, _: &GraphPolicy| true)
+    };
     let node_a = CraqleNode::open_with_options(
         dir.path().join("a"),
-        CraqleOptions::new().with_irokle(
-            irokle_a.clone(),
-            CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_b.peer_id()])),
-        ),
+        CraqleOptions::new()
+            .with_remote_policy_authorizer(accept_policies())
+            .with_irokle(
+                irokle_a.clone(),
+                CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_b.peer_id()])),
+            ),
     )?;
     let node_b = CraqleNode::open_with_options(
         dir.path().join("b"),
-        CraqleOptions::new().with_irokle(
-            irokle_b.clone(),
-            CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_a.peer_id()])),
-        ),
+        CraqleOptions::new()
+            .with_remote_policy_authorizer(accept_policies())
+            .with_irokle(
+                irokle_b.clone(),
+                CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_a.peer_id()])),
+            ),
     )?;
     let writer = GrantAuthorizer::new(vec![PermissionGrant::new(
         "/datasets/**",

@@ -138,12 +138,16 @@ fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
             local_to_controller: true,
             ..subject.clone()
         },
-        (false, Some(site)) => PlacementSubject {
-            local_to_controller: false,
-            location: site.location.clone(),
-            labels: site.labels.clone(),
-            ..subject.clone()
-        },
+        (false, Some(site)) => {
+            let mut labels = site.labels.clone();
+            aruna_core::structs::stamp_location(&mut labels, &site.location);
+            PlacementSubject {
+                local_to_controller: false,
+                location: site.location.clone(),
+                labels,
+                ..subject.clone()
+            }
+        }
         (false, None) => PlacementSubject {
             local_to_controller: false,
             location: String::new(),
@@ -163,6 +167,7 @@ mod tests {
         LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
         TombstoneSpec, UserSpec,
     };
+    use aruna_core::structs::LOCATION_LABEL_KEY;
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 
@@ -323,7 +328,9 @@ mod tests {
             .remove(0);
 
         assert_eq!(capability.subject.location, "dc-b");
-        assert_eq!(capability.subject.labels, site.labels);
+        let mut expected = site.labels.clone();
+        expected.insert(LOCATION_LABEL_KEY.to_string(), "dc-b".to_string());
+        assert_eq!(capability.subject.labels, expected);
         assert!(!capability.subject.local_to_controller);
         assert!(capability.validate(subject.node_id).is_ok());
     }

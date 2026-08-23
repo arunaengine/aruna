@@ -10,6 +10,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::Value;
 use byteview::ByteView;
+use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
 use super::store::put_staging_checkpoint;
@@ -343,7 +344,9 @@ async fn stage_item(
             ));
         }
     };
-    let _ = drive(
+    // Without the replication seed peers never learn about the staged version, so
+    // the item is not a success.
+    if let Err(error) = drive(
         QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
             local_node_id: spec.node_id,
             auth_context: spec.auth_context.clone(),
@@ -354,7 +357,18 @@ async fn stage_item(
         }),
         &ctx.driver,
     )
-    .await;
+    .await
+    {
+        warn!(
+            bucket = %spec.bucket,
+            key = %item.target_key,
+            error = %error,
+            "Staging replication queue write failed"
+        );
+        return Err(ItemFailure::Stage(format!(
+            "replication queue failed: {error}"
+        )));
+    }
     Ok(size)
 }
 

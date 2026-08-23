@@ -65,7 +65,18 @@ placement-map operation.
 | --- | --- | --- |
 | `ARUNA_NODE_LOCATION` | Placement location this node advertises. Trimmed; at most 64 bytes, and a longer value is refused. Empty means unset, and an unset location normalizes to `default` for matching, so a selector naming `default` matches it. | unset |
 | `ARUNA_NODE_WEIGHT` | Relative selection weight in the placement map, clamped into 1 to 10000. Weight 0 in the map means the node is never selected. | 100 |
-| `ARUNA_NODE_LABELS` | Comma-separated `key=value` label pairs. The derived key `aruna-engine.org/kind` and any `aruna-engine.org/storage-class/` key are rejected: both are stamped by the owning node, so operator input may not claim them. | none |
+| `ARUNA_NODE_LABELS` | Comma-separated `key=value` label pairs. The derived keys `aruna-engine.org/kind` and `aruna-engine.org/location`, and any `aruna-engine.org/storage-class/` key, are rejected: all are stamped by the owning node, so operator input may not claim them. | none |
+
+The node stamps its own location as the read-only label
+`aruna-engine.org/location`, so a rule may match the location either through a
+selector's `location` field or as an ordinary label, without an operator writing
+it into the label map. The value is the configured location exactly as given: a
+node with no configured location carries no such label at all, rather than one
+naming the `default` location that empty locations normalize to for selector
+matching. A compute backend advertising its own worker site stamps that site's
+location instead of the controller's. Writing the key by hand is refused
+everywhere a label map is accepted: startup fails with the offending pair for
+`ARUNA_NODE_LABELS`, and an API write is `400` with the code `reserved_label`.
 
 A compute backend may advertise a different site than the node it runs on; see
 [Compute executors](compute-executors.md#kubernetes).
@@ -85,6 +96,14 @@ never becomes the author.
 `GET /admin/placement-policies/{policy_id}?digest=…` reads one policy back. The
 digest is required. A digest that does not match what the holders serve is `404`
 rather than a substituted rule.
+
+`GET /admin/placement-policies?limit&cursor` lists policies in ascending policy
+id, `limit` defaulting to 50 and capped at 200. It needs realm-config `READ`, and
+a caller without it is refused before anything is read, so the listing is no
+existence oracle. A document replicates only to the holders its id resolves to,
+so a page reports what this responder stores rather than a realm-wide catalog:
+`complete` means this node's own bounded iterator was exhausted in the pass, and
+`next_cursor` continues after the last policy returned.
 
 | Status | `POST` | `GET` |
 | --- | --- | --- |

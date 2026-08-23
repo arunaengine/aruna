@@ -654,7 +654,7 @@ async fn create_stamps_origin() -> TestResult<()> {
 
     let group_id = Ulid::from_bytes([21; 16]);
     let path = "datasets/stamped-by-origin";
-    let origin = realm.node(0);
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let expected = realm
@@ -705,7 +705,7 @@ async fn read_misses_nonholder() -> TestResult<()> {
 
     let group_id = Ulid::from_bytes([31; 16]);
     let path = "datasets/read-off-holders";
-    let origin = realm.node(0);
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = create_document(&realm, origin, group_id, document_id, path).await?;
@@ -765,7 +765,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
 
     let path = "datasets/bystander-writes";
-    let origin = realm.node(0);
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = create_document(&realm, origin, group_id, document_id, path).await?;
@@ -899,7 +899,7 @@ async fn document_sparql_routes() -> TestResult<()> {
     // the group document exists on the queried holders.
     let group_id = realm.seed_group().await?;
     let path = "datasets/sparql-routes";
-    let origin = realm.node(0);
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = create_document(&realm, origin, group_id, document_id, path).await?;
@@ -953,7 +953,7 @@ async fn document_export_routes() -> TestResult<()> {
     // document exists on the holders.
     let group_id = realm.seed_group().await?;
     let path = "datasets/export-routes";
-    let origin = realm.node(0);
+    let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = create_document(&realm, origin, group_id, document_id, path).await?;

@@ -1,5 +1,5 @@
 // Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
@@ -1310,6 +1310,7 @@ async fn seed_config(
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    config.seed_job_control(actor.node_id, 0);
     write_value(
         storage,
         REALM_CONFIG_KEYSPACE,
@@ -2003,6 +2004,7 @@ fn run_name(result: Result<JobRunOutcome, tokio::task::JoinError>) -> &'static s
     match result {
         Ok(JobRunOutcome::Succeeded(_)) => "succeeded",
         Ok(JobRunOutcome::Failed(_)) => "failed",
+        Ok(JobRunOutcome::Deferred(_)) => "deferred",
         Ok(JobRunOutcome::Cancelled) => "cancelled",
         Ok(JobRunOutcome::Interrupted) => "interrupted",
         Err(_) => "panicked",

@@ -6,8 +6,8 @@ use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
     JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, Permission, RealmId,
-    RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key,
-    shard_for_subject, user_dedup_key,
+    RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode,
+    pid_dedup_key, shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -73,6 +73,17 @@ pub(crate) async fn mint_local_job(
     let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
+    mint_local_job_from_config(&config, owner_node_id, subject)
+}
+
+/// Synchronous form used by producer transactions that already fenced and read
+/// the realm config. The resulting job id and dedup shard can therefore be
+/// written atomically with the producer's own records.
+pub(crate) fn mint_local_job_from_config(
+    config: &aruna_core::structs::RealmConfigDocument,
+    owner_node_id: NodeId,
+    subject: &[u8],
+) -> Result<JobId, SubmitJobError> {
     let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
         SubmitJobError::PlacementUnavailable(
             "serving node has no job-control binding yet".to_string(),
@@ -232,6 +243,39 @@ pub async fn submit_staging_job(
             created_by,
             owner_node_id,
             dedup_key: None,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+        },
+        job_id,
+    )
+    .await
+}
+
+pub async fn submit_storage_purge_job(
+    context: &DriverContext,
+    spec: StoragePurgeSpec,
+    owner_node_id: NodeId,
+    idempotency_key: Option<String>,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
+    let job_id = mint_local_job(
+        context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::StoragePurge(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
             now_ms: unix_timestamp_millis(),
             retention_ms,
             workspace_mode: WorkspaceMode::default(),

@@ -39,6 +39,7 @@ use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
+use aruna_operations::s3::session::spawn_session_sweep;
 #[cfg(debug_assertions)]
 use aruna_operations::startup::RecoveryState;
 use aruna_operations::startup::{
@@ -768,6 +769,7 @@ async fn start_background(background: Background) {
     restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
     restore_lifecycle_timers(&driver_ctx.storage_handle, &task_handle).await;
     spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
+    spawn_session_sweep(driver_ctx.clone(), &shutdown);
 
     let recovery_ctx = driver_ctx.clone();
     let recovery_config = RecoveryConfig {

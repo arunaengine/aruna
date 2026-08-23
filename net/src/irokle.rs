@@ -60,8 +60,8 @@ use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
     HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
-    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdStatus,
-    PlacementPolicyDocument, PlacementRef, PlacementScope, PoolAdmission,
+    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
+    PersistentIdStatus, PlacementPolicyDocument, PlacementRef, PlacementScope, PoolAdmission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
     SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
     SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User, WatchEventMask,
@@ -3020,7 +3020,7 @@ impl DocumentSyncService {
                                 reason,
                             )
                         };
-                        let mapping = match postcard::from_bytes::<PersistentIdMapping>(&bytes) {
+                        let mapping = match PersistentIdMapping::from_bytes(&bytes) {
                             Ok(mapping) => mapping,
                             Err(error) => {
                                 warn!(%topic_id, %document_id, %error, "Rejecting undecodable persistent id mapping");
@@ -4225,7 +4225,7 @@ impl DocumentSyncService {
             return Ok(());
         }
         if let DocumentSyncTarget::PersistentIdMapping { document_id } = target {
-            let mapping: PersistentIdMapping = postcard::from_bytes(&bytes)
+            let mapping = PersistentIdMapping::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             validate_pid_mapping(document_id, &mapping, &change).map_err(NetError::Bootstrap)?;
             // The generic write below would clobber a local tombstone with a
@@ -9436,11 +9436,19 @@ fn validate_pid_mapping(
             mapping.target
         ));
     }
-    if mapping.pid != MetadataRegistryRecord::graph_iri_for(document_id) {
+    if mapping.pid != MetadataRegistryRecord::graph_iri_for(document_id)
+        && mapping.pid != PersistentIdMapping::profile_pid(document_id)
+    {
         return Err(format!("mapping pid `{}` is not canonical", mapping.pid));
     }
     if !matches!(mapping.kind, PersistentIdKind::Conceptual) {
         return Err("mapping kind is unsupported".to_string());
+    }
+    if !matches!(mapping.provider, PersistentIdProvider::W3id) {
+        return Err("mapping provider is unsupported".to_string());
+    }
+    if mapping.requested_at_ms.is_some() != mapping.requested_by.is_some() {
+        return Err("mapping request provenance is incomplete".to_string());
     }
     if mapping.minted_at_ms.is_some() != mapping.minted_by.is_some() {
         return Err("mapping mint provenance is incomplete".to_string());
@@ -9451,9 +9459,36 @@ fn validate_pid_mapping(
                 return Err("active mapping has inconsistent transition fields".to_string());
             }
         }
-        PersistentIdStatus::Withdrawn => {
+        PersistentIdStatus::Requested | PersistentIdStatus::Processing => {
+            if mapping.requested_at_ms.is_none()
+                || mapping.minted_at_ms.is_some()
+                || mapping.withdrawn_at_ms.is_some()
+            {
+                return Err("pending mapping has inconsistent transition fields".to_string());
+            }
+        }
+        PersistentIdStatus::Failed => {
+            if mapping.requested_at_ms.is_none()
+                || mapping.failure.is_none()
+                || mapping.withdrawn_at_ms.is_some()
+            {
+                return Err("failed mapping has inconsistent transition fields".to_string());
+            }
+        }
+        PersistentIdStatus::AdminWithdrawn => {
+            if mapping.withdrawn_at_ms.is_none()
+                || mapping.withdrawn_by.is_none()
+                || mapping
+                    .withdrawal_reason
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return Err("admin-withdrawn mapping lacks actor or reason".to_string());
+            }
+        }
+        PersistentIdStatus::Tombstoned => {
             if mapping.withdrawn_at_ms.is_none() {
-                return Err("withdrawn mapping has no withdrawal timestamp".to_string());
+                return Err("tombstoned mapping has no deletion timestamp".to_string());
             }
         }
     }
@@ -10060,12 +10095,13 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, Group,
-        GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, HandleRange, METADATA_HANDLE,
-        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding,
-        SyncQuarantineFamily, SyncQuarantineRecord, UserGroupCapOverride, band_start,
+        GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, HandleRange, JobId,
+        METADATA_HANDLE, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
+        Permission, PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy,
+        QuotaConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RealmNodeKind, Role, SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint,
+        StrategyBinding, SyncQuarantineFamily, SyncQuarantineRecord, UserGroupCapOverride,
+        band_start,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId, UserId};
@@ -21129,15 +21165,22 @@ mod tests {
         };
         let placed = |shard: u32| PlacementRef { strategy_id, shard };
         let mapping = |document_id, actor, seed: u64| {
-            PersistentIdMapping::conceptual(
+            let revision = PersistentIdRevision {
+                event_id: Ulid::from_parts(seed, 1),
+                actor,
+                occurred_at_ms: 100 + seed,
+            };
+            let mut mapping = PersistentIdMapping::requested(
                 document_id,
+                false,
                 minted_by,
-                PersistentIdRevision {
-                    event_id: Ulid::from_parts(seed, 1),
-                    actor,
-                    occurred_at_ms: 100 + seed,
-                },
-            )
+                JobId::from_bytes([7; 16]),
+                true,
+                "/documents/test".to_string(),
+                revision,
+            );
+            assert!(mapping.activate(minted_by, revision));
+            mapping
         };
 
         let valid_document = document(4, 3_110);

@@ -20,6 +20,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::metadata::stats::count_group_documents_by_purpose;
 use aruna_operations::remove_group_role::{
     RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
 };
@@ -40,7 +41,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::{Instrument, Span, field, info_span, trace};
+use tracing::{Instrument, Span, field, info_span, trace, warn};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
@@ -683,7 +684,7 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
     path = "/groups/{id}/usage",
     tag = "groups",
     summary = "Read a group's storage usage",
-    description = "Requires a bearer token issued for this realm and membership in the group: membership is the only check, so a realm administrator who is not a member is forbidden. The flat counters report what this node stores for the group, while `realm` reports the realm-wide totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes. `quota` restates the realm quota configuration for this group together with a warning flag evaluated against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be read, and the document count reported by the realm-wide usage endpoint is never included here.",
+    description = "Requires a bearer token issued for this realm and membership in the group: membership is the only check, so a realm administrator who is not a member is forbidden. The flat counters report what this node stores for the group, while `realm` reports the realm-wide totals aggregated from the usage summaries the realm's nodes publish, which trail recent writes. `dataset_count`, `profile_count` and `process_run_count` are exact lifecycle-live metadata-document counts for this group when this node's metadata subsystem can answer; all three are omitted together when it cannot. Classification reads each live registry record's root-only RO-Crate summary from the metadata graph store: a root whose `@type` contains `http://www.w3.org/ns/dx/prof/Profile` is a Profile; otherwise exact `conformsTo` `https://w3id.org/ro/wfrun/process/0.5` is a Process Run; every other root is a Dataset. Document storage paths never participate. The registry/lifecycle candidate set is bounded by the metadata registry limit and root-summary reads have at most eight in flight, so an over-limit or unreadable set is reported as unavailable rather than partially counted; full crates are never scanned and no result cache is added. `quota` restates the realm quota configuration for this group together with a warning flag evaluated against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be read, and the document count reported by the realm-wide usage endpoint is never included here.",
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
@@ -697,6 +698,9 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
                 "stored_bytes": 87412338176_i64,
                 "logical_bytes": 91002113024_i64,
                 "referenced_bytes": 91002113024_i64,
+                "dataset_count": 37,
+                "profile_count": 4,
+                "process_run_count": 19,
                 "realm": {
                     "buckets": 5,
                     "objects": 2048,
@@ -743,6 +747,17 @@ pub async fn get_group_usage(
     // warning threshold is evaluated against the same counter.
     let realm_group_logical_bytes = realm.logical_bytes;
     let mut response = crate::routes::info::UsageResponse::new(local, realm);
+    match count_group_documents_by_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
+        Ok(Some(counts)) => {
+            response.dataset_count = Some(counts.dataset_count);
+            response.profile_count = Some(counts.profile_count);
+            response.process_run_count = Some(counts.process_run_count);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(group_id = %group_id, error = %error, "metadata purpose counts unavailable for group usage response");
+        }
+    }
     // Best effort: omit the quota block rather than failing the request if the
     // realm config is unavailable.
     if let Ok(config) = drive(
@@ -1971,6 +1986,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Membership is checked before any group metadata aggregate is read.
+    #[tokio::test]
+    async fn non_member_cannot_read_group_usage_counts() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        let outsider = member_auth(UserId::local(Ulid::generate(), state.get_realm_id()));
+
+        assert!(matches!(
+            get_group_usage(
+                State(state),
+                Extension(Some(outsider)),
+                Path(group_id.to_string()),
+            )
+            .await,
+            Err(ServerError::Forbidden)
+        ));
     }
 
     #[tokio::test]

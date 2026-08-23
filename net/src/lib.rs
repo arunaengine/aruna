@@ -1,5 +1,6 @@
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 #![deny(unsafe_code)]
+#![recursion_limit = "256"]
 
 mod connection_pool;
 pub mod dht;

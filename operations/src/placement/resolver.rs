@@ -431,8 +431,8 @@ mod tests {
     };
     use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::structs::{
-        AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY, NodePlacementEntry,
-        RealmId, RealmNode, RealmNodeKind, StrategyBinding,
+        AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
+        NodePlacementEntry, RealmId, RealmNode, RealmNodeKind, StrategyBinding,
     };
     use aruna_core::types::UserId;
     use proptest::prelude::*;
@@ -588,6 +588,49 @@ mod tests {
 
         let holders = resolve_holders(&view, &strategy, b"subject", None);
         assert_eq!(holders, vec![labeled]);
+    }
+
+    #[test]
+    fn location_label_is_derived() {
+        // The location label is stamped from the configured location, so a rule
+        // matches a node whose label map was never written by hand. A node with
+        // no configured location carries no label rather than an invented one.
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let placed = node_id(1);
+        let unplaced = node_id(2);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(placed, RealmNodeKind::Server);
+        config.ensure_node(unplaced, RealmNodeKind::Server);
+        config.placement_map.push(NodePlacementEntry {
+            node_id: placed,
+            location: "eu-west".to_string(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        });
+        config.placement_map.push(NodePlacementEntry {
+            node_id: unplaced,
+            location: String::new(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        });
+
+        let view = build_view(&config);
+        let unlabelled = view
+            .nodes
+            .iter()
+            .find(|node| node.node_id == unplaced)
+            .expect("node is in the view");
+        assert!(!unlabelled.labels.contains_key(LOCATION_LABEL_KEY));
+
+        let mut strategy = strategy(None, false);
+        strategy.affinity = vec![filter_rule(LOCATION_LABEL_KEY, "eu-west")];
+        let holders = resolve_holders(&view, &strategy, b"subject", None);
+        assert_eq!(holders, vec![placed]);
     }
 
     #[test]

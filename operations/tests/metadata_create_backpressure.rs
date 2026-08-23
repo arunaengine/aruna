@@ -183,6 +183,7 @@ async fn run_phase(label: &str, with_drains: bool) -> Result<(), BoxError> {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(writer_node, RealmNodeKind::Server);
+    config.seed_job_control(writer_node, 0);
     node.context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {

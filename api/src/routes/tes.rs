@@ -46,6 +46,19 @@ const EXECUTOR_TAG_KEY: &str = "aruna-engine.org/executor";
 /// Optional tag carrying the submission idempotency key.
 const IDEMPOTENCY_TAG_KEY: &str = "aruna-engine.org/idempotency-key";
 
+/// Read-only tags derived at read time from the job and its family. They are
+/// never stored, so a task creation naming one of them is refused.
+const JOB_ID_TAG_KEY: &str = "aruna-engine.org/job-id";
+const LOGICAL_STATE_TAG_KEY: &str = "aruna-engine.org/logical-state";
+const EXECUTOR_KIND_TAG_KEY: &str = "aruna-engine.org/executor-kind";
+const TRANSFER_BYTES_TAG_KEY: &str = "aruna-engine.org/estimated-transfer-bytes";
+const DERIVED_TAG_KEYS: [&str; 4] = [
+    JOB_ID_TAG_KEY,
+    LOGICAL_STATE_TAG_KEY,
+    EXECUTOR_KIND_TAG_KEY,
+    TRANSFER_BYTES_TAG_KEY,
+];
+
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
 /// Bounds the quadratic input/output path-overlap validation.
@@ -295,6 +308,9 @@ pub struct TesServiceInfo {
 pub struct TesErrorPayload {
     status_code: u16,
     msg: String,
+    /// Machine-readable cause, present only where this facade defines one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -330,6 +346,16 @@ impl TaskFilters {
     }
 
     fn matches(&self, record: &JobRecord) -> bool {
+        self.matches_base(record)
+    }
+
+    fn has_derived(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|(key, _)| DERIVED_TAG_KEYS.contains(&key.as_str()))
+    }
+
+    fn matches_base(&self, record: &JobRecord) -> bool {
         let JobPayload::Execution(spec) = &record.payload else {
             return false;
         };
@@ -340,7 +366,29 @@ impl TaskFilters {
                     .as_deref()
                     .is_some_and(|name| name.starts_with(prefix))
             })
-            && self.tags.iter().all(|(key, value)| {
+            && self
+                .tags
+                .iter()
+                .filter(|(key, _)| !DERIVED_TAG_KEYS.contains(&key.as_str()))
+                .all(|(key, value)| {
+                    tags.get(key)
+                        .is_some_and(|stored| value.is_empty() || stored == value)
+                })
+    }
+
+    fn matches_facts(&self, record: &JobRecord, facts: &TaskFacts) -> bool {
+        if !self.matches_base(record) {
+            return false;
+        }
+        let JobPayload::Execution(spec) = &record.payload else {
+            return false;
+        };
+        let mut tags = project_tags(spec);
+        facts.stamp(&record.job_id.to_string(), &mut tags);
+        self.tags
+            .iter()
+            .filter(|(key, _)| DERIVED_TAG_KEYS.contains(&key.as_str()))
+            .all(|(key, value)| {
                 tags.get(key)
                     .is_some_and(|stored| value.is_empty() || stored == value)
             })
@@ -463,7 +511,7 @@ pub async fn service_info(
     path = "/ga4gh/tes/v1/tasks",
     tag = "tes",
     summary = "Create a TES task",
-    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound the immutable output record carries; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id. Admission refusals carry the same status semantics as the native submit surface: a quota or composition refusal is a 409, an unusable input or workspace a 400, a refused routed authority a 403, and the retryable 503 is reserved for an unreachable family holder, a demand view that could not be read or did not settle, admission losing three transactions in a row to concurrent submissions of the same group, and an unhealthy id clock. A standing quota decided on an understated demand view is a 409 like an exceeded cap, and a replay of a known idempotency key is settled before any quota is read and is never quota-refused.",
+    description = "Accepts a task for asynchronous execution. Authenticate either with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Every task runs inside one group: with basic authentication the group of the credential is used and an `aruna-engine.org/group` tag naming a different group is refused, while with a bearer token that tag is required. The caller needs WRITE permission on the target group. A 200 means only that the task was durably accepted and queued, never that it started or finished: poll the returned id, whose state runs QUEUED, INITIALIZING, RUNNING and then to COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, reports CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; PAUSED and PREEMPTED are never emitted. Facade limits, all answered with 400: exactly one executor whose `command` is the full argv; `id`, `state`, `logs` and `creation_time` are read only, as are the derived tags `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind` and `aruna-engine.org/estimated-transfer-bytes`, which a task naming any of them is refused for with the error code `reserved_tag`; input and output urls must be s3://bucket/key; container paths must be absolute and canonical and may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound the immutable output record carries; directory entries, inline input content, wildcards in an input path, volumes, executor stdin/stdout/stderr redirection and resource zones are unsupported. An output path carrying POSIX wildcards additionally requires `path_prefix`, the literal ancestor stripped from each match before it is appended to the destination url. An `aruna-engine.org/idempotency-key` tag deduplicates submissions per caller, and reusing a key already bound to a different task is a 409 carrying that task id. Admission refusals carry the same status semantics as the native submit surface: a quota or composition refusal is a 409, an unusable input or workspace a 400, a refused routed authority a 403, and the retryable 503 is reserved for an unreachable family holder, a demand view that could not be read or did not settle, admission losing three transactions in a row to concurrent submissions of the same group, and an unhealthy id clock. A standing quota decided on an understated demand view is a 409 like an exceeded cap, and a replay of a known idempotency key is settled before any quota is read and is never quota-refused.",
     request_body(
         content = TesTask,
         description = "Task definition: one executor, s3:// inputs and outputs, and optional resources and tags",
@@ -502,7 +550,7 @@ pub async fn service_info(
             body = TesCreateTaskResponse,
             example = json!({"id": "01JABCDEF0123456789ABCDEFG"})
         ),
-        (status = 400, description = "Malformed task, a TES feature this facade does not support, an input that is not a readable object, or more outputs than a task may declare", body = TesErrorPayload),
+        (status = 400, description = "Malformed task, a TES feature this facade does not support, an input that is not a readable object, more outputs than a task may declare, or a tag claiming a derived read-only key, which carries the error code `reserved_tag`", body = TesErrorPayload),
         (status = 401, description = "Missing or invalid bearer token or basic credential", body = TesErrorPayload),
         (status = 403, description = "No WRITE permission on the target group, a group tag contradicting the credential, a path restricted credential, or a routed authority refusing the submission", body = TesErrorPayload),
         (status = 409, description = "The idempotency key tag is already bound to a different task, the group's standing compute quota refuses this admission, or the composition conflicts on a staged key", body = TesErrorPayload),
@@ -584,7 +632,7 @@ pub async fn create_task(
     description = "Returns one task of the calling user. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. Tasks are self scoped: a task created by another user, a task outside the group of the basic credential, an id that is not a task of this facade and an id that does not parse are all answered with 404 rather than 403, so the existence of a task is never disclosed. A distributed execution task is reduced from its replicated records by whichever node answers, so it carries the same logical view as the native REST status; any other task is read from the node that owns it and only that node answers absence, and when it cannot be reached the call fails with a retryable 503 instead of reporting the task as missing. The state reported is the polling contract of task creation: QUEUED, INITIALIZING, RUNNING, then COMPLETE, EXECUTOR_ERROR, SYSTEM_ERROR or CANCELED, with CANCELING while a cancellation is in flight and UNKNOWN when the outcome cannot be determined; UNKNOWN is also what a distributed task reports while no execution has succeeded, because realm-wide failure can never be inferred from silence. Output URLs in the task log name the exact `versionId` the canonical execution wrote, which is not necessarily the object's current version: a duplicate execution admitted during a partition, or any later write, may have made another version current. Executor logs, including the exit code, appear only once the task is terminal.",
     params(
         ("id" = String, Path, description = "TES task id (the JobId): the 26 character ULID returned by task creation; an id that does not parse is answered with 404 like an unknown task"),
-        ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL projection: MINIMAL (the default) returns only `id` and `state`, BASIC adds the task definition, tags, timing and captured output files, FULL adds executor stdout and stderr and the system logs; any other value is a 400")
+        ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL projection: MINIMAL (the default) returns only `id` and `state`, BASIC adds the task definition, tags, timing and captured output files, FULL adds executor stdout and stderr and the system logs; any other value is a 400. BASIC and FULL also carry the derived read-only tags `aruna-engine.org/job-id` always, `aruna-engine.org/logical-state` once a family is known, and `aruna-engine.org/executor-kind` plus `aruna-engine.org/estimated-transfer-bytes` once this responder sealed a placement")
     ),
     responses(
         (
@@ -614,7 +662,13 @@ pub async fn create_task(
                     "workdir": "/data",
                     "env": {"THREADS": "4"}
                 }],
-                "tags": {"aruna-engine.org/group": "01JABCDEF0123456789ABCDEFG"},
+                "tags": {
+                    "aruna-engine.org/group": "01JABCDEF0123456789ABCDEFG",
+                    "aruna-engine.org/job-id": "01JABCDEF0123456789ABCDEFG",
+                    "aruna-engine.org/logical-state": "running",
+                    "aruna-engine.org/executor-kind": "docker",
+                    "aruna-engine.org/estimated-transfer-bytes": "4096"
+                },
                 "logs": [{
                     "logs": [{
                         "start_time": "2026-04-09T14:23:11.123+00:00",
@@ -673,14 +727,14 @@ pub async fn get_task(
     // A distributed external job is projected from the replicated family, so
     // this surface reports the same logical view and the same exact output
     // VersionIds as the native REST status.
-    let record = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
-        Some(Ok(report)) => family_record(&report),
+    let (record, facts) = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
+        Some(Ok(report)) => (family_record(&report), TaskFacts::from_report(&report)),
         Some(Err(error)) => return TesError::from_job_route(error).into_response(),
         // The owner is the sole 404 authority; a non-owner routes or reports 503.
         None => {
             match read_record_routed(&state.get_ctx(), caller.auth.user_id, job_id, forwarded).await
             {
-                Ok(Some(record)) => record,
+                Ok(Some(record)) => (record, TaskFacts::default()),
                 Ok(None) => return TesError::not_found("TES task not found").into_response(),
                 Err(error) => return TesError::from_job_route(error).into_response(),
             }
@@ -692,7 +746,56 @@ pub async fn get_task(
     }
 
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
-    tes_json_response(StatusCode::OK, project_task(&record, view, &base_url))
+    tes_json_response(
+        StatusCode::OK,
+        project_task(&record, &facts, view, &base_url),
+    )
+}
+
+async fn task_record(
+    state: &ServerState,
+    auth: &AuthContext,
+    record: JobRecord,
+) -> Result<(JobRecord, TaskFacts), TesError> {
+    match family_report(&state.get_ctx(), auth, record.job_id).await {
+        Some(Ok(report)) => Ok((family_record(&report), TaskFacts::from_report(&report))),
+        Some(Err(error)) => Err(TesError::from_job_route(error)),
+        None => Ok((record, TaskFacts::default())),
+    }
+}
+
+async fn list_derived(
+    state: &ServerState,
+    caller: &TesCaller,
+    filters: &TaskFilters,
+    mut cursor: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<(JobRecord, TaskFacts)>, Option<Vec<u8>>), TesError> {
+    let mut selected = Vec::with_capacity(limit);
+    let mut page_cursor = None;
+    loop {
+        let (mut records, next_cursor) =
+            list_owned_jobs(&state.get_ctx(), caller.auth.user_id, cursor, 1, |record| {
+                filters.matches_base(record) && task_in_group(record, caller.credential_group)
+            })
+            .await
+            .map_err(TesError::internal)?;
+        let Some(record) = records.pop() else {
+            return Ok((selected, None));
+        };
+        let task = task_record(state, &caller.auth, record).await?;
+        if filters.matches_facts(&task.0, &task.1) {
+            if selected.len() == limit {
+                return Ok((selected, page_cursor));
+            }
+            page_cursor = next_cursor.clone();
+            selected.push(task);
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Ok((selected, None));
+        };
+        cursor = Some(next_cursor);
+    }
 }
 
 #[utoipa::path(
@@ -702,7 +805,7 @@ pub async fn get_task(
     summary = "List the caller's TES tasks",
     description = "Lists the tasks the calling user created, newest first. Authenticate with a realm bearer token or with HTTP Basic using an access key and secret issued by this node; a path restricted credential is rejected. The listing is keyed by the caller: another user's tasks are never returned, and a basic credential additionally sees only tasks of that credential's group. Only tasks owned by the node that answers are listed, so tasks submitted through another node of the realm are omitted rather than fetched from it. Paging is cursor based and forward only: read `next_page_token` from a page and send it back as `page_token`, and treat its absence as the end of the listing. State, name and tag filters are applied before a page is filled, so a short page means the listing is exhausted, not that everything was filtered away.",
     params(
-        ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL projection applied to every task in the page: MINIMAL (the default) returns only `id` and `state`, BASIC adds the task definition, tags, timing and captured output files, FULL adds executor stdout and stderr and the system logs; any other value is a 400"),
+        ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL projection applied to every task in the page: MINIMAL (the default) returns only `id` and `state`, BASIC adds the task definition, tags, timing and captured output files, FULL adds executor stdout and stderr and the system logs; any other value is a 400. BASIC and FULL also carry the derived read-only tags `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind` and `aruna-engine.org/estimated-transfer-bytes` wherever this responder knows them"),
         ("page_size" = Option<usize>, Query, description = "Max tasks per page: default 256, capped at 512, and 0 is treated as unset"),
         ("page_token" = Option<String>, Query, description = "Opaque page token: the `next_page_token` of the previous page; omit it to start at the newest task, and anything that is not a token of this listing is a 400"),
         ("state" = Option<String>, Query, description = "TES task state to filter by, for example QUEUED, RUNNING or COMPLETE; an unknown state name is a 400"),
@@ -758,29 +861,39 @@ pub async fn list_tasks(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .min(MAX_PAGE_SIZE);
 
-    let (records, next_cursor) = match list_owned_jobs(
-        &state.get_ctx(),
-        caller.auth.user_id,
-        cursor,
-        limit,
-        |record| filters.matches(record) && task_in_group(record, caller.credential_group),
-    )
-    .await
-    {
-        Ok(page) => page,
-        Err(error) => return TesError::internal(error).into_response(),
-    };
-
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
-    let mut tasks = Vec::with_capacity(records.len());
-    for record in records {
-        let record = match family_report(&state.get_ctx(), &caller.auth, record.job_id).await {
-            Some(Ok(report)) => family_record(&report),
-            Some(Err(error)) => return TesError::from_job_route(error).into_response(),
-            None => record,
+    let page = if filters.has_derived() {
+        list_derived(&state, &caller, &filters, cursor, limit).await
+    } else {
+        let (records, next_cursor) = match list_owned_jobs(
+            &state.get_ctx(),
+            caller.auth.user_id,
+            cursor,
+            limit,
+            |record| filters.matches(record) && task_in_group(record, caller.credential_group),
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => return TesError::internal(error).into_response(),
         };
-        tasks.push(project_task(&record, view, &base_url));
-    }
+        let mut tasks = Vec::with_capacity(records.len());
+        for record in records {
+            match task_record(&state, &caller.auth, record).await {
+                Ok(task) => tasks.push(task),
+                Err(error) => return error.into_response(),
+            }
+        }
+        Ok((tasks, next_cursor))
+    };
+    let (records, next_cursor) = match page {
+        Ok(page) => page,
+        Err(error) => return error.into_response(),
+    };
+    let tasks = records
+        .iter()
+        .map(|(record, facts)| project_task(record, facts, view, &base_url))
+        .collect();
 
     tes_json_response(
         StatusCode::OK,
@@ -918,6 +1031,13 @@ fn map_task_to_spec(
     {
         return Err(TesError::bad_request(
             "task id, state, logs, and creation_time are read-only",
+        ));
+    }
+    if let Some(key) = reserved_tag(&task.tags) {
+        return Err(TesError::coded(
+            StatusCode::BAD_REQUEST,
+            format!("tag `{key}` is derived at read time and read-only"),
+            "reserved_tag",
         ));
     }
     let executor = match task.executors.as_slice() {
@@ -1298,7 +1418,44 @@ fn family_record(report: &FamilyReport) -> JobRecord {
     record
 }
 
-fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
+/// Facts a TES tag exposes at read time. They come from the same family and
+/// sealed plan `GET /jobs/{id}` reports and are never stored on the task.
+#[derive(Debug, Default)]
+struct TaskFacts {
+    logical_state: Option<String>,
+    executor_kind: Option<String>,
+    transfer_bytes: Option<u64>,
+}
+
+impl TaskFacts {
+    fn from_report(report: &FamilyReport) -> Self {
+        // Only a plan that selected a target is a placement; without one the
+        // transfer estimate names nothing.
+        let placed = report.plan.as_ref().filter(|plan| plan.target.is_some());
+        Self {
+            logical_state: Some(report.state.name().to_string()),
+            executor_kind: placed
+                .and_then(|plan| plan.target.as_ref())
+                .map(|target| target.executor_kind.clone()),
+            transfer_bytes: placed.map(|plan| plan.estimated_transfer_bytes),
+        }
+    }
+
+    fn stamp(&self, id: &str, tags: &mut BTreeMap<String, String>) {
+        tags.insert(JOB_ID_TAG_KEY.to_string(), id.to_string());
+        if let Some(state) = &self.logical_state {
+            tags.insert(LOGICAL_STATE_TAG_KEY.to_string(), state.clone());
+        }
+        if let Some(kind) = &self.executor_kind {
+            tags.insert(EXECUTOR_KIND_TAG_KEY.to_string(), kind.clone());
+        }
+        if let Some(bytes) = self.transfer_bytes {
+            tags.insert(TRANSFER_BYTES_TAG_KEY.to_string(), bytes.to_string());
+        }
+    }
+}
+
+fn project_task(record: &JobRecord, facts: &TaskFacts, view: TesView, base_url: &str) -> TesTask {
     let id = record.job_id.to_string();
     let state = tes_state(record);
     if view == TesView::Minimal {
@@ -1378,7 +1535,8 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
         ..Default::default()
     });
 
-    let tags = project_tags(spec);
+    let mut tags = project_tags(spec);
+    facts.stamp(&id, &mut tags);
 
     let mut log = build_task_log(record, base_url);
     if view == TesView::Basic {
@@ -1403,6 +1561,14 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
         creation_time: Some(rfc3339(record.created_at_ms)),
         ..Default::default()
     }
+}
+
+/// Names the first derived tag a creation tried to set. Every one of them is
+/// stamped from the job and its family on read, so no client may claim one.
+fn reserved_tag(tags: &BTreeMap<String, String>) -> Option<&str> {
+    tags.keys()
+        .find(|key| DERIVED_TAG_KEYS.contains(&key.as_str()))
+        .map(String::as_str)
 }
 
 fn project_tags(spec: &ExecutionSpec) -> BTreeMap<String, String> {
@@ -1640,6 +1806,7 @@ pub(crate) fn cancel_response() -> Response {
 struct TesError {
     status: StatusCode,
     message: String,
+    code: Option<String>,
 }
 
 impl TesError {
@@ -1647,6 +1814,7 @@ impl TesError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: "unauthorized".to_string(),
+            code: None,
         }
     }
 
@@ -1654,6 +1822,15 @@ impl TesError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
+        }
+    }
+
+    fn coded(status: StatusCode, message: impl Into<String>, code: &str) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            code: Some(code.to_string()),
         }
     }
 
@@ -1661,6 +1838,7 @@ impl TesError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -1668,6 +1846,7 @@ impl TesError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -1675,6 +1854,7 @@ impl TesError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -1686,6 +1866,7 @@ impl TesError {
             other => Self {
                 status: other.status_code(),
                 message: other.public_message(),
+                code: None,
             },
         }
     }
@@ -1704,6 +1885,7 @@ impl TesError {
             JobRouteError::Unavailable(message) => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message,
+                code: None,
             },
             JobRouteError::Internal(message) => Self::internal(message),
         }
@@ -1724,6 +1906,7 @@ impl IntoResponse for TesError {
             TesErrorPayload {
                 status_code: self.status.as_u16(),
                 msg: message,
+                code: self.code,
             },
         )
     }
@@ -2158,6 +2341,23 @@ mod tests {
         let filters = TaskFilters::from_query(&query, uri.query()).unwrap();
         assert!(filters.matches(&record));
 
+        let derived = TaskFilters::from_query(
+            &ListTasksQuery::default(),
+            Some(&format!(
+                "tag_key=aruna-engine.org%2Fjob-id&tag_value={}&tag_key=aruna-engine.org%2Flogical-state&tag_value=running&tag_key=aruna-engine.org%2Fexecutor-kind&tag_value=docker&tag_key=aruna-engine.org%2Festimated-transfer-bytes&tag_value=4096",
+                record.job_id
+            )),
+        )
+        .unwrap();
+        let facts = TaskFacts {
+            logical_state: Some("running".to_string()),
+            executor_kind: Some("docker".to_string()),
+            transfer_bytes: Some(4_096),
+        };
+        assert!(derived.has_derived());
+        assert!(derived.matches(&record));
+        assert!(derived.matches_facts(&record, &facts));
+
         let wrong_name = ListTasksQuery {
             name_prefix: Some("other".to_string()),
             ..Default::default()
@@ -2494,7 +2694,7 @@ mod tests {
         let (spec, _) =
             map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None, true).unwrap();
         let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
-        let queued = project_task(&record, TesView::Full, "http://x");
+        let queued = project_task(&record, &TaskFacts::default(), TesView::Full, "http://x");
         assert!(queued.logs[0].start_time.is_none());
         assert!(queued.logs[0].logs.is_empty());
         record.state = JobState::Succeeded;
@@ -2536,12 +2736,12 @@ mod tests {
             output_digest: None,
         });
 
-        let minimal = project_task(&record, TesView::Minimal, "http://x");
+        let minimal = project_task(&record, &TaskFacts::default(), TesView::Minimal, "http://x");
         assert!(minimal.executors.is_empty());
         assert!(minimal.logs.is_empty());
         assert_eq!(minimal.state, Some(TesState::Complete));
 
-        let basic = project_task(&record, TesView::Basic, "http://x");
+        let basic = project_task(&record, &TaskFacts::default(), TesView::Basic, "http://x");
         assert_eq!(basic.name.as_deref(), Some("align reads"));
         assert_eq!(basic.description.as_deref(), Some("sample task"));
         assert_eq!(basic.tags.get("project").map(String::as_str), Some("alpha"));
@@ -2564,7 +2764,7 @@ mod tests {
         assert_eq!(basic.resources.as_ref().unwrap().disk_gb, Some(8.0));
         assert_eq!(basic.resources.as_ref().unwrap().preemptible, Some(true));
 
-        let full = project_task(&record, TesView::Full, "http://x");
+        let full = project_task(&record, &TaskFacts::default(), TesView::Full, "http://x");
         assert_eq!(full.logs.len(), 1);
         assert_eq!(full.logs[0].logs[0].exit_code, Some(0));
         assert_eq!(full.logs[0].logs[0].stdout.as_deref(), Some("hello"));
@@ -2581,11 +2781,8 @@ mod tests {
         assert_eq!(full.logs[0].outputs[0].path, "/out/report.txt");
     }
 
-    #[test]
-    fn family_keeps_exact_versions() {
-        // The TES view of a distributed job is the same logical projection as
-        // the native REST one: the canonical execution's exact VersionIds, and
-        // no result at all while the family has no canonical success.
+    /// The replicated family behind one succeeded distributed task.
+    fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
         use aruna_core::jobs::{JobKind, JobStatusView};
         use aruna_core::structs::{
             EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
@@ -2657,7 +2854,7 @@ mod tests {
         };
         let version_id = Ulid::from_bytes([9u8; 16]);
         let execution_id = Ulid::from_bytes([10u8; 16]);
-        let report = FamilyReport {
+        FamilyReport {
             job: JobStatusView {
                 job_id,
                 created_by,
@@ -2673,6 +2870,7 @@ mod tests {
                 result: None,
                 workspace_bucket: Some("ws".to_string()),
                 workspace_mode: WorkspaceMode::Kept,
+                locally_exhausted: false,
             },
             spec,
             submission_id,
@@ -2707,9 +2905,25 @@ mod tests {
             partial: false,
             locally_exhausted: false,
             plan: None,
-        };
+        }
+    }
 
-        let task = project_task(&family_record(&report), TesView::Full, "http://x");
+    #[test]
+    fn family_keeps_exact_versions() {
+        // The TES view of a distributed job is the same logical projection as
+        // the native REST one: the canonical execution's exact VersionIds, and
+        // no result at all while the family has no canonical success.
+        use aruna_core::structs::LogicalJobState;
+
+        let report = family_fixture();
+        let version_id = Ulid::from_bytes([9u8; 16]);
+
+        let task = project_task(
+            &family_record(&report),
+            &TaskFacts::from_report(&report),
+            TesView::Full,
+            "http://x",
+        );
 
         assert_eq!(task.state, Some(TesState::Complete));
         assert_eq!(
@@ -2720,9 +2934,80 @@ mod tests {
         let mut running = report.clone();
         running.job.state = JobState::Running;
         running.state = LogicalJobState::Running;
-        let pending = project_task(&family_record(&running), TesView::Full, "http://x");
+        let pending = project_task(
+            &family_record(&running),
+            &TaskFacts::from_report(&running),
+            TesView::Full,
+            "http://x",
+        );
         assert_eq!(pending.state, Some(TesState::Running));
         assert!(pending.logs[0].outputs.is_empty());
+    }
+
+    #[test]
+    fn derives_family_tags() {
+        // Placement facts are stamped at read time, so a task that was never
+        // placed carries the job id and logical state and nothing more.
+        use aruna_core::compute::ExecutionTargetId;
+        use aruna_operations::jobs::lifecycle::PlanEstimate;
+
+        let mut report = family_fixture();
+        let unplaced = project_task(
+            &family_record(&report),
+            &TaskFacts::from_report(&report),
+            TesView::Basic,
+            "http://x",
+        );
+        assert_eq!(
+            unplaced.tags.get(JOB_ID_TAG_KEY).map(String::as_str),
+            Some(report.job.job_id.to_string().as_str())
+        );
+        assert_eq!(
+            unplaced.tags.get(LOGICAL_STATE_TAG_KEY).map(String::as_str),
+            Some("succeeded")
+        );
+        assert!(!unplaced.tags.contains_key(EXECUTOR_KIND_TAG_KEY));
+        assert!(!unplaced.tags.contains_key(TRANSFER_BYTES_TAG_KEY));
+
+        report.plan = Some(PlanEstimate {
+            target: Some(ExecutionTargetId {
+                node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+                executor_kind: "docker".to_string(),
+            }),
+            estimated_transfer_bytes: 4_096,
+            estimated_transfer_ms: 12,
+            alternatives: 2,
+            rejected: 1,
+            omitted: 0,
+            sealed_at_ms: 15,
+        });
+        let facts = TaskFacts::from_report(&report);
+        let record = family_record(&report);
+        for view in [TesView::Basic, TesView::Full] {
+            let task = project_task(&record, &facts, view, "http://x");
+            assert_eq!(
+                task.tags.get(EXECUTOR_KIND_TAG_KEY).map(String::as_str),
+                Some("docker")
+            );
+            assert_eq!(
+                task.tags.get(TRANSFER_BYTES_TAG_KEY).map(String::as_str),
+                Some("4096")
+            );
+        }
+        let minimal = project_task(&record, &facts, TesView::Minimal, "http://x");
+        assert!(minimal.tags.is_empty());
+    }
+
+    #[test]
+    fn rejects_derived_tag() {
+        let group = Ulid::from_bytes([5u8; 16]);
+        let mut task = sample_task(group);
+        task.tags
+            .insert(EXECUTOR_KIND_TAG_KEY.to_string(), "docker".to_string());
+
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.code.as_deref(), Some("reserved_tag"));
     }
 
     #[test]
@@ -2747,12 +3032,12 @@ mod tests {
             collision_policy: Default::default(),
         };
         let record = execution_record(JobId::from_bytes([3u8; 16]), user(2), spec.clone());
-        let task = project_task(&record, TesView::Basic, "http://x");
+        let task = project_task(&record, &TaskFacts::default(), TesView::Basic, "http://x");
         assert_eq!(task.executors[0].command, vec!["/bin/tool", "--flag", "x"]);
 
         spec.entrypoint = None;
         let record = execution_record(JobId::from_bytes([4u8; 16]), user(2), spec);
-        let task = project_task(&record, TesView::Basic, "http://x");
+        let task = project_task(&record, &TaskFacts::default(), TesView::Basic, "http://x");
         assert_eq!(task.executors[0].command, vec!["--flag", "x"]);
     }
 
@@ -2983,6 +3268,57 @@ mod tests {
             .unwrap();
         let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lists_derived_tags() {
+        let (_dir, state) = build_state(false).await;
+        let owner = user(2);
+        let group = Ulid::from_bytes([5u8; 16]);
+        let access = sealed(&state, group);
+        write_credential(&state, &access).await;
+        let headers = basic_headers(&access, TES_SECRET);
+        let target = JobId::from_bytes([9u8; 16]);
+        for job_id in [
+            JobId::from_bytes([8u8; 16]),
+            target,
+            JobId::from_bytes([10u8; 16]),
+        ] {
+            let (spec, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
+            insert_job(
+                &state.get_ctx().storage_handle,
+                &execution_record(job_id, owner, spec),
+            )
+            .await
+            .unwrap();
+        }
+
+        let raw_query = format!("tag_key=aruna-engine.org%2Fjob-id&tag_value={target}");
+        let listed = list_tasks(
+            State(state),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            headers,
+            RawQuery(Some(raw_query)),
+            Query(ListTasksQuery {
+                view: Some("BASIC".to_string()),
+                page_size: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.tasks.len(), 1);
+        assert_eq!(page.tasks[0].id, Some(target.to_string()));
+        assert_eq!(
+            page.tasks[0].tags.get(JOB_ID_TAG_KEY),
+            Some(&target.to_string())
+        );
+        assert!(page.next_page_token.is_none());
     }
 
     #[tokio::test]

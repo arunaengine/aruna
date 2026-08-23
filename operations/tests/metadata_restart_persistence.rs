@@ -189,6 +189,8 @@ fn build_context(
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    // Persistent-id minting needs a job-control binding served by this node.
+    config.seed_job_control(actor.node_id, 0);
     Ok((
         Arc::new(DriverContext {
             storage_handle,

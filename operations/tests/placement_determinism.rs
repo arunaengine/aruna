@@ -541,6 +541,7 @@ fn base_config(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
     for (index, node) in nodes.iter().enumerate() {
         let node_id = node.net.node_id();
         config.ensure_node(node_id, RealmNodeKind::Management);
+        config.seed_job_control(node_id, index as u32);
         config.placement_map.push(NodePlacementEntry {
             node_id,
             location: locations[index % locations.len()].to_string(),

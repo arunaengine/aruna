@@ -110,6 +110,20 @@ pub(crate) struct IriBacklink {
     pub subject_iris: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IriIndexFreshnessState {
+    Current,
+    Pending,
+    Failed,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IriIndexFreshness {
+    pub state: IriIndexFreshnessState,
+    pub oldest_status_updated_at_ms: Option<u64>,
+}
+
 /// Backlinks to `object_iri`. A `predicate_iri` uses the predicate-first index
 /// prefix; without it the keyspace is scanned and filtered on the object, since
 /// the object is not a key prefix. Both fence stale document cursors.
@@ -128,6 +142,88 @@ pub(crate) async fn lookup_iri_backlinks(
         object_iri,
         predicate_iri,
     ))
+}
+
+/// Backlinks to a bounded set of exact object IRIs. The predicate-less index
+/// scan is shared across all targets and stale document cursors are fenced.
+pub(crate) async fn lookup_iri_backlinks_for_objects(
+    storage: &StorageHandle,
+    registry_records: &[MetadataRegistryRecord],
+    object_iris: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<IriBacklink>>, MetadataError> {
+    let records = scan_iri_reference_records(storage, None).await?;
+    let current_cursors = registry_records
+        .iter()
+        .map(|record| (record.document_id, record.last_event_id))
+        .collect::<HashMap<_, _>>();
+    let mut grouped = BTreeMap::<(String, Ulid, String), BTreeSet<String>>::new();
+    for record in records {
+        if !object_iris.contains(&record.object_iri)
+            || current_cursors.get(&record.document_id) != Some(&record.document_cursor)
+        {
+            continue;
+        }
+        grouped
+            .entry((record.object_iri, record.document_id, record.predicate_iri))
+            .or_default()
+            .extend(record.subject_iris);
+    }
+    let mut backlinks = BTreeMap::<String, Vec<IriBacklink>>::new();
+    for ((object_iri, document_id, predicate_iri), subject_iris) in grouped {
+        backlinks.entry(object_iri).or_default().push(IriBacklink {
+            document_id,
+            predicate_iri,
+            subject_iris: subject_iris.into_iter().collect(),
+        });
+    }
+    Ok(backlinks)
+}
+
+pub(crate) async fn iri_index_freshness(
+    storage: &StorageHandle,
+    registry_records: &[MetadataRegistryRecord],
+) -> Result<IriIndexFreshness, MetadataError> {
+    let mut current = false;
+    let mut pending = false;
+    let mut failed = false;
+    let mut oldest_status_updated_at_ms = None;
+    for record in registry_records {
+        let status = read_materialization_status(storage, record.document_id).await?;
+        if let Some(status) = status.as_ref() {
+            oldest_status_updated_at_ms = Some(
+                oldest_status_updated_at_ms.map_or(status.updated_at_ms, |oldest: u64| {
+                    oldest.min(status.updated_at_ms)
+                }),
+            );
+        }
+        match status {
+            Some(status)
+                if status.event_id == record.last_event_id
+                    && status.graph_iri == record.graph_iri
+                    && status.state == MetadataMaterializationState::Materialized =>
+            {
+                current = true;
+            }
+            Some(status) if status.state == MetadataMaterializationState::Failed => {
+                failed = true;
+            }
+            Some(_) | None => pending = true,
+        }
+    }
+    let kinds = usize::from(current) + usize::from(pending) + usize::from(failed);
+    let state = if kinds > 1 {
+        IriIndexFreshnessState::Mixed
+    } else if failed {
+        IriIndexFreshnessState::Failed
+    } else if pending {
+        IriIndexFreshnessState::Pending
+    } else {
+        IriIndexFreshnessState::Current
+    };
+    Ok(IriIndexFreshness {
+        state,
+        oldest_status_updated_at_ms,
+    })
 }
 
 async fn scan_iri_reference_records(

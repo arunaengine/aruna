@@ -89,11 +89,13 @@ impl NodeSubjectRecord {
 /// already agrees on. A node absent from the placement map has no subject and
 /// therefore holds no governed data.
 pub fn storage_subject(entry: &NodePlacementEntry, generation: u64) -> PlacementSubject {
+    let mut labels = entry.labels.clone();
+    crate::structs::stamp_location(&mut labels, &entry.location);
     PlacementSubject {
         node_id: entry.node_id,
         generation,
         location: entry.effective_location().to_string(),
-        labels: entry.labels.clone(),
+        labels,
         executor_kind: None,
         local_to_controller: true,
     }

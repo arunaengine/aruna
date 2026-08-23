@@ -25,6 +25,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
 };
@@ -66,13 +67,17 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     // This fixture uses one shard so distinct metadata paths can exercise
     // interleaved writes without violating path uniqueness.
     let placement = shared_path_bucket(&config, &holders, realm_id, group_id);
-    // Each document's structured id is minted for the holder that creates it, so
-    // its embedded bucket is the shared shard both holders choose for CONVERGE_PATH.
+    // Only the shard leader accepts local creates (it is the persistent-id
+    // authority); the other holder learns every entry through replication.
+    let leader = resolve_shard_holders(&config, &placement)[0];
+    let leader_node = nodes
+        .iter()
+        .find(|node| node.net.node_id() == leader)
+        .expect("the shard leader is one of the two holders");
     let document_ids: Vec<Ulid> = (0..6)
-        .map(|index| {
-            let node = &nodes[index % 2];
+        .map(|_| {
             let actor = Actor {
-                node_id: node.net.node_id(),
+                node_id: leader,
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             };
@@ -80,25 +85,18 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Interleave the creates across the two holders.
     for (index, document_id) in document_ids.iter().enumerate() {
-        let node = &nodes[index % 2];
-        create_document(node, realm_id, group_id, *document_id, index).await?;
+        create_document(leader_node, realm_id, group_id, *document_id, index).await?;
     }
 
-    // Both holders must converge to the same entry set and digest.
-    wait_for_manifest_agreement(
-        &nodes[0],
-        &nodes[1],
-        realm_id,
-        placement,
-        document_ids.len(),
-    )
-    .await?;
+    // Every create lands two rows in the shard: the document and its
+    // persistent-id mapping. Both holders must converge on set and digest.
+    let manifest_rows = document_ids.len() * 2;
+    wait_for_manifest_agreement(&nodes[0], &nodes[1], realm_id, placement, manifest_rows).await?;
 
     let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
     let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
-    assert_eq!(left.entries.len(), document_ids.len());
+    assert_eq!(left.entries.len(), manifest_rows);
     assert_eq!(sorted_entries(&left), sorted_entries(&right));
     assert_eq!(left.digest, right.digest);
 
@@ -113,14 +111,14 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     drive(
         DeleteMetadataDocumentOperation::new(
             Actor {
-                node_id: nodes[0].net.node_id(),
+                node_id: leader,
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             },
             group_id,
             deleted_id,
         ),
-        nodes[0].context.as_ref(),
+        leader_node.context.as_ref(),
     )
     .await?;
 
@@ -146,7 +144,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
                 // (tombstone included) and the digest must be identical.
                 assert_eq!(
                     left.entries.len(),
-                    document_ids.len(),
+                    manifest_rows,
                     "the delete keeps a tombstone row"
                 );
                 assert_eq!(sorted_entries(&left), sorted_entries(&right));
@@ -347,8 +345,9 @@ async fn install_realm_config(
     for strategy in &mut config.strategies {
         strategy.shard_count = 1;
     }
-    for node in nodes {
+    for (band, node) in nodes.iter().enumerate() {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+        config.seed_job_control(node.net.node_id(), band as u32);
     }
     for node in nodes {
         let actor = Actor {

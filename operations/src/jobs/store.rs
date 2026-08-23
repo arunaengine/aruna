@@ -6,17 +6,18 @@ use aruna_core::keyspaces::{
     JOB_ACTIVE_USER_KEYSPACE, JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ATTEMPT_CONTROL_KEYSPACE,
     JOB_DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE,
     JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
-    ROCRATE_JOB_STATE_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
+    ROCRATE_JOB_STATE_KEYSPACE, S3_PURGE_CHECKPOINT_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
-    AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobExecutionClass,
-    JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope, JobRecordError, JobResultPayload,
-    JobState, JobTransitionError, RunCrateStatus, UserAccess, attempt_control_key,
-    cleanup_dedup_key, cleanup_job_id, crate_job_id, encode_job_dedup_value, job_active_key,
-    job_due_index_key, job_entry_key, job_entry_prefix, job_lease_index_key, job_owner_cursor,
-    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
-    job_run_crate_key, parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key,
-    rocrate_plan_key, run_crate_dedup_key, validate_transition, workspace_credential_id,
+    AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError, JobErrorKind,
+    JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope,
+    JobRecordError, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
+    StoragePurgeCheckpoint, UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
+    crate_job_id, encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key,
+    job_entry_prefix, job_lease_index_key, job_owner_cursor, job_owner_index_key,
+    job_owner_index_prefix, job_prune_index_key, job_record_key, job_run_crate_key,
+    parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key,
+    run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -71,8 +72,13 @@ pub enum JobMutationError {
     Storage(String),
 }
 
-/// Schedule-index key by state: queued -> due/, claimed/running -> lease/, terminal -> prune/.
+/// Schedule-index key by state: queued -> due/, claimed/running -> lease/, settled -> prune/.
 fn job_schedule_key(record: &JobRecord) -> Key {
+    // A locally exhausted job earns no further sweep: it is scheduled for pruning.
+    if record.locally_exhausted {
+        let finished = record.finished_at_ms.unwrap_or(record.updated_at_ms);
+        return job_prune_index_key(finished.saturating_add(record.retention_ms), record.job_id);
+    }
     match record.state {
         JobState::Queued => job_due_index_key(record.due_at_ms, record.job_id),
         JobState::Claimed
@@ -234,7 +240,7 @@ pub(super) fn index_deltas(
         new_schedule,
         empty_value(),
     ));
-    if old.payload.is_rocrate() && !old.state.is_terminal() && new.state.is_terminal() {
+    if old.payload.is_rocrate() && !old.is_settled() && new.is_settled() {
         deletes.push((
             JOB_ACTIVE_USER_KEYSPACE.to_string(),
             job_active_key(new.created_by, new.job_id),
@@ -370,6 +376,46 @@ pub async fn put_staging_checkpoint(
     .await
 }
 
+pub async fn put_purge_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    checkpoint: &StoragePurgeCheckpoint,
+) -> Result<(), JobMutationError> {
+    let value = checkpoint
+        .to_bytes()
+        .map(ByteView::from)
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    put_job_checkpoint(
+        storage,
+        job_id,
+        token,
+        S3_PURGE_CHECKPOINT_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        value,
+    )
+    .await
+}
+
+pub async fn read_purge_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<StoragePurgeCheckpoint>, JobMutationError> {
+    read_raw(
+        storage,
+        S3_PURGE_CHECKPOINT_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        None,
+    )
+    .await
+    .map_err(JobMutationError::Storage)?
+    .map(|value| {
+        StoragePurgeCheckpoint::from_bytes(value.as_ref())
+            .map_err(|error| JobMutationError::Storage(error.to_string()))
+    })
+    .transpose()
+}
+
 pub async fn put_rocrate_checkpoint(
     storage: &StorageHandle,
     job_id: JobId,
@@ -472,7 +518,7 @@ pub async fn put_job_entry<T: Serialize>(
                 .await
                 .map_err(JobMutationError::Storage)?
                 .ok_or(JobMutationError::NotFound)?;
-            if record.state.is_terminal() {
+            if record.is_settled() {
                 return Err(JobMutationError::ReportFrozen);
             }
             guard_token(&record, token)?;
@@ -544,8 +590,7 @@ where
             if old.state != record.state {
                 validate_transition(old.execution_class, old.state, record.state)?;
             }
-            if !old.state.is_terminal() && record.state.is_terminal() && record.payload.is_rocrate()
-            {
+            if !old.is_settled() && record.is_settled() && record.payload.is_rocrate() {
                 let digest = report_digest(storage, txn_id, record.job_id).await?;
                 record.report_digest = Some(digest);
                 match record.result.as_mut() {
@@ -564,15 +609,35 @@ where
                     _ => {}
                 }
             }
-            let (writes, deletes) = index_deltas(&old, &record)
+            let settled = !old.is_settled() && record.is_settled();
+            let mut terminal_deletes = Vec::new();
+            if settled && let JobPayload::StoragePurge(spec) = &record.payload {
+                if let Some(delete) = crate::s3::purge_fence::owned_terminal_fence_delete(
+                    storage,
+                    txn_id,
+                    record.job_id,
+                    &spec.scope,
+                )
+                .await
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?
+                {
+                    terminal_deletes.push(delete);
+                }
+                terminal_deletes.push((
+                    S3_PURGE_CHECKPOINT_KEYSPACE.to_string(),
+                    ByteView::from(record.job_id.to_bytes().to_vec()),
+                ));
+            }
+            let (writes, mut deletes) = index_deltas(&old, &record)
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+            deletes.extend(terminal_deletes);
             batch_write(storage, writes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
             batch_delete(storage, deletes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
-            if !old.state.is_terminal() && record.state.is_terminal() {
+            if settled {
                 insert_crate_obligation(storage, txn_id, &record).await?;
                 insert_cleanup_obligation(storage, txn_id, &record).await?;
                 mark_crate_failed(storage, txn_id, &record).await?;
@@ -747,7 +812,7 @@ async fn cleanup_dedup_entry(
     let Some(dedup_key) = &old.dedup_key else {
         return Ok(());
     };
-    if old.payload.dedup_until_prune() || old.state.is_terminal() || !new.state.is_terminal() {
+    if old.payload.dedup_until_prune() || old.is_settled() || !new.is_settled() {
         return Ok(());
     }
     let key = job_dedup_index_key(old.created_by, dedup_key);
@@ -1182,19 +1247,32 @@ pub async fn cancel_running_job(
 
 pub enum RequeueOutcome {
     Requeued(JobRecord),
-    Failed(JobRecord),
+    /// `JOB_MAX_ATTEMPTS` spent: terminal `Failed` on a permanent verdict, otherwise
+    /// `Indeterminate` and locally exhausted.
+    Exhausted(JobRecord),
     /// A submitted external attempt lost its lease or the node restarted: requeuing
     /// would double-run the container, so the record is left for reconciliation.
     NeedsReconcile(JobRecord),
     Skipped,
 }
 
-/// Terminal `Failed` once `JOB_MAX_ATTEMPTS` is spent. An execution keeps a result
-/// payload so terminal cleanup and the run crate still see its workspace.
-fn fail_capped(record: &mut JobRecord, now_ms: u64) {
-    record.state = JobState::Failed;
-    record.finished_at_ms = Some(now_ms);
+/// `JOB_MAX_ATTEMPTS` are spent. Only a job-specific permanent verdict terminalizes;
+/// a retryable or absent one leaves the outcome `Indeterminate`, because exhausting
+/// this node's attempts proves nothing. An execution keeps a result payload so
+/// terminal cleanup and the run crate still see its workspace.
+fn exhaust_attempts(record: &mut JobRecord, now_ms: u64) {
+    let permanent = record
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.kind == JobErrorKind::Permanent);
     record.claim = None;
+    if permanent {
+        record.state = JobState::Failed;
+        record.finished_at_ms = Some(now_ms);
+    } else {
+        record.state = JobState::Indeterminate;
+        record.locally_exhausted = true;
+    }
     if record.result.is_some() || !matches!(record.payload, JobPayload::Execution(_)) {
         return;
     }
@@ -1233,7 +1311,7 @@ pub async fn requeue_job(
         if let Some(token) = token {
             guard_token(record, token)?;
         }
-        if record.state.is_terminal() {
+        if record.is_settled() {
             return Ok(JobMutation::Skip);
         }
         if let Some(now) = require_expired_before {
@@ -1261,7 +1339,7 @@ pub async fn requeue_job(
         if record.attempts >= JOB_MAX_ATTEMPTS
             && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
         {
-            fail_capped(record, now_ms);
+            exhaust_attempts(record, now_ms);
         } else {
             record.state = JobState::Queued;
             record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
@@ -1276,8 +1354,8 @@ pub async fn requeue_job(
         RequeueOutcome::NeedsReconcile(record)
     } else if !persisted {
         RequeueOutcome::Skipped
-    } else if record.state == JobState::Failed {
-        RequeueOutcome::Failed(record)
+    } else if record.is_settled() {
+        RequeueOutcome::Exhausted(record)
     } else {
         RequeueOutcome::Requeued(record)
     })
@@ -1316,6 +1394,42 @@ pub async fn release_job(
     .await?;
 
     Ok(if released {
+        ReleaseOutcome::Released(record)
+    } else {
+        ReleaseOutcome::Skipped
+    })
+}
+
+/// Requeue a dependency-blocked job without spending an attempt. Unlike a
+/// shutdown release, this records the reason and delays the next claim so a
+/// lagging projection is not hot-polled.
+pub async fn defer_job(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    retry_after_ms: u64,
+    error: JobError,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    let mut deferred = false;
+    let record = mutate_job(storage, job_id, |record| {
+        deferred = false;
+        guard_token(record, token)?;
+        if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        record.state = JobState::Queued;
+        record.claim = None;
+        record.due_at_ms = now_ms.saturating_add(retry_after_ms);
+        record.updated_at_ms = now_ms;
+        record.last_error = Some(error.clone());
+        record.progress = JobProgress::new(record.payload.progress_unit());
+        deferred = true;
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+
+    Ok(if deferred {
         ReleaseOutcome::Released(record)
     } else {
         ReleaseOutcome::Skipped
@@ -1801,8 +1915,8 @@ pub async fn transition_to_cancelling(
 #[derive(Debug)]
 pub enum ParkOutcome {
     Parked(JobRecord),
-    /// The park spent the last attempt, so the job is terminal `Failed` instead.
-    Failed(JobRecord),
+    /// The park spent the last attempt, so no further attempt runs on this node.
+    Exhausted(JobRecord),
 }
 
 /// Park an ambiguous external attempt in `Indeterminate`, keeping the claim so the
@@ -1824,7 +1938,7 @@ pub async fn mark_indeterminate(
         record.attempts = record.attempts.saturating_add(1);
         record.updated_at_ms = now_ms;
         if record.attempts >= JOB_MAX_ATTEMPTS {
-            fail_capped(record, now_ms);
+            exhaust_attempts(record, now_ms);
             capped = true;
         } else {
             record.state = JobState::Indeterminate;
@@ -1834,7 +1948,7 @@ pub async fn mark_indeterminate(
     .await?;
 
     Ok(if capped {
-        ParkOutcome::Failed(record)
+        ParkOutcome::Exhausted(record)
     } else {
         ParkOutcome::Parked(record)
     })
@@ -1953,7 +2067,7 @@ pub async fn requeue_before_attempt(
         record.claim = None;
         record.attempt_intent = None;
         if record.attempts >= JOB_MAX_ATTEMPTS {
-            fail_capped(record, now_ms);
+            exhaust_attempts(record, now_ms);
         } else {
             record.state = JobState::Queued;
             record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
@@ -2020,7 +2134,7 @@ pub async fn set_cancel_requested(
     let mut cancelled_now = false;
     let record = mutate_job(storage, job_id, |record| {
         cancelled_now = false;
-        if record.state.is_terminal() {
+        if record.is_settled() {
             return Ok(JobMutation::Skip);
         }
         // `has_run`, not `attempts == 0`: a job interrupted by a shutdown hands its lease
@@ -2045,7 +2159,7 @@ pub async fn set_cancel_requested(
 
     Ok(if cancelled_now {
         CancelRequestOutcome::Cancelled(record)
-    } else if record.state.is_terminal() {
+    } else if record.is_settled() {
         CancelRequestOutcome::AlreadyTerminal(record)
     } else {
         CancelRequestOutcome::Flagged(record)
@@ -2932,6 +3046,44 @@ mod tests {
         assert!(record.claim.is_none());
     }
 
+    #[tokio::test]
+    async fn deferred_dependency_does_not_spend_attempt() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0x44u8; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(record) = claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = record.claim.unwrap().claim_token;
+
+        let ReleaseOutcome::Released(deferred) = defer_job(
+            &storage,
+            job_id,
+            token,
+            6_000,
+            1_000,
+            JobError::retryable("metadata projection pending"),
+        )
+        .await
+        .unwrap() else {
+            panic!("job must be deferred")
+        };
+        assert_eq!(deferred.state, JobState::Queued);
+        assert_eq!(deferred.attempts, 0);
+        assert_eq!(deferred.due_at_ms, 7_000);
+        assert!(deferred.claim.is_none());
+        assert_eq!(
+            deferred
+                .last_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("metadata projection pending")
+        );
+    }
+
     // Retried payload work starts over, so persisted progress must start over too.
     #[tokio::test]
     async fn retry_resets_progress() {
@@ -2972,14 +3124,78 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Failed(failed) = requeue_job(&storage, job_id, None, 6_000, None, None)
-            .await
-            .unwrap()
+        let RequeueOutcome::Exhausted(failed) =
+            requeue_job(&storage, job_id, None, 6_000, None, None)
+                .await
+                .unwrap()
         else {
-            panic!("expected terminal failure");
+            panic!("expected local exhaustion");
+        };
+        assert_eq!(failed.state, JobState::Indeterminate);
+        assert!(failed.locally_exhausted);
+        assert!(failed.claim.is_none());
+        assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+    }
+
+    // A job-specific permanent verdict is the only exhaustion that terminalizes.
+    #[tokio::test]
+    async fn permanent_cap_fails() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xD4; 16]);
+        let mut record = queued_record(job_id);
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::generate(),
+            lease_expires_at_ms: 5_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        let RequeueOutcome::Exhausted(failed) = requeue_job(
+            &storage,
+            job_id,
+            None,
+            6_000,
+            None,
+            Some(JobError::permanent("input is not readable")),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected exhaustion");
         };
         assert_eq!(failed.state, JobState::Failed);
-        assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+        assert!(!failed.locally_exhausted);
+        assert_eq!(failed.finished_at_ms, Some(6_000));
+    }
+
+    // Exhaustion means no further automatic attempt: the sweep must not pick it up.
+    #[tokio::test]
+    async fn exhausted_stops_sweep() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xD5; 16]);
+        let mut record = queued_record(job_id);
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::generate(),
+            lease_expires_at_ms: 5_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+        requeue_job(&storage, job_id, None, 6_000, Some(6_000), None)
+            .await
+            .unwrap();
+
+        let swept = requeue_job(&storage, job_id, None, 9_000, Some(9_000), None)
+            .await
+            .unwrap();
+        assert!(matches!(swept, RequeueOutcome::Skipped));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
     }
 
     #[tokio::test]
@@ -3033,13 +3249,15 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Failed(failed) = requeue_job(&storage, job_id, None, 6_000, None, None)
-            .await
-            .unwrap()
+        let RequeueOutcome::Exhausted(failed) =
+            requeue_job(&storage, job_id, None, 6_000, None, None)
+                .await
+                .unwrap()
         else {
-            panic!("import must fail after exhausting attempts");
+            panic!("import must stop after exhausting attempts");
         };
-        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.state, JobState::Indeterminate);
+        assert!(failed.locally_exhausted);
         assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
     }
 
@@ -3727,14 +3945,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let ParkOutcome::Failed(failed) = capped else {
-            panic!("the last cycle must terminalize");
+        let ParkOutcome::Exhausted(failed) = capped else {
+            panic!("the last cycle must exhaust");
         };
-        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.state, JobState::Indeterminate);
+        assert!(failed.locally_exhausted);
         assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
     }
 
-    // Parking spends the attempt and terminalizes at the cap; without that a failure
+    // Parking spends the attempt and stops at the cap; without that a failure
     // repeating on every reconcile pass re-drives the job forever.
     #[tokio::test]
     async fn park_spends_attempt() {
@@ -3761,7 +3980,7 @@ mod tests {
             assert_eq!(parked.attempts, attempt);
         }
 
-        let ParkOutcome::Failed(failed) = mark_indeterminate(
+        let ParkOutcome::Exhausted(failed) = mark_indeterminate(
             &storage,
             job_id,
             token,
@@ -3770,11 +3989,12 @@ mod tests {
         )
         .await
         .unwrap() else {
-            panic!("the capped park must terminalize");
+            panic!("the capped park must exhaust");
         };
-        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.state, JobState::Indeterminate);
+        assert!(failed.locally_exhausted);
         assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
-        assert_eq!(failed.finished_at_ms, Some(7_000));
+        assert!(failed.finished_at_ms.is_none());
         assert!(failed.claim.is_none());
         assert!(
             matches!(failed.result, Some(JobResultPayload::Execution { .. })),
@@ -3783,7 +4003,7 @@ mod tests {
     }
 
     // Every cap site must leave the result payload terminal cleanup and the run crate
-    // read, not just the park that `fail_capped` was introduced for.
+    // read, not just the park that exhaustion was introduced for.
     #[tokio::test]
     async fn cap_sites_result() {
         let (_dir, storage) = temp_storage();
@@ -3800,12 +4020,12 @@ mod tests {
         record.workspace_bucket = Some("ws-test".to_string());
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Failed(failed) =
+        let RequeueOutcome::Exhausted(failed) =
             requeue_job(&storage, swept, None, 9_000, Some(9_000), None)
                 .await
                 .unwrap()
         else {
-            panic!("the sweep must terminalize at the cap");
+            panic!("the sweep must exhaust at the cap");
         };
         assert!(matches!(
             failed.result,
@@ -3821,7 +4041,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.state, JobState::Indeterminate);
+        assert!(failed.locally_exhausted);
         assert!(matches!(
             failed.result,
             Some(JobResultPayload::Execution { .. })

@@ -82,6 +82,7 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
         MetadataAuditOperation::Delete => "delete",
         MetadataAuditOperation::SetVisibility => "set_visibility",
         MetadataAuditOperation::PlaceReplicas => "place_replicas",
+        MetadataAuditOperation::WithdrawPersistentId => "withdraw_persistent_id",
     }
 }
 

@@ -345,6 +345,10 @@ pub struct JobStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_bucket: Option<String>,
     pub workspace_mode: String,
+    /// This node spent its attempts without a job-specific verdict: no further
+    /// automatic attempt runs here and the outcome is not a proven failure.
+    #[serde(default)]
+    pub locally_exhausted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_crate: Option<serde_json::Value>,
     /// Present only for a distributed external job, whose truth is the
@@ -392,6 +396,7 @@ fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
         result: job.result.clone(),
         workspace_bucket: job.workspace_bucket.clone(),
         workspace_mode: job.workspace_mode.name().to_string(),
+        locally_exhausted: job.locally_exhausted,
         run_crate: None,
         family: None,
     }
@@ -1713,6 +1718,7 @@ mod tests {
                 result: None,
                 workspace_bucket: None,
                 workspace_mode: WorkspaceMode::Kept,
+                locally_exhausted: false,
             },
             spec: LogicalJobSpec {
                 submission_id,

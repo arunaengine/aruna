@@ -388,6 +388,23 @@ version. A job-specific failure surfaces as `EXECUTOR_ERROR` and an
 infrastructure error as `SYSTEM_ERROR`, so the two classes stay distinguishable
 through the facade.
 
+A task read in the `BASIC` or `FULL` view carries read-only tags derived from the
+same job and family the native `GET /jobs/{id}` reports. They are stamped on
+every read and never stored, so a creation naming one of them is refused with
+`400` and the error code `reserved_tag`. `MINIMAL` is unchanged and still carries
+only `id` and `state`.
+
+| Tag | Meaning |
+| --- | --- |
+| `aruna-engine.org/job-id` | The native job id behind the task; always present |
+| `aruna-engine.org/logical-state` | The family's logical state, once a family is known |
+| `aruna-engine.org/executor-kind` | The executor kind of the placement this responder sealed |
+| `aruna-engine.org/estimated-transfer-bytes` | That placement's estimated input transfer, a decimal string |
+
+The last two are absent unless this responder itself sealed a plan naming a
+target, for the same reason the native family view reports no placement then: a
+plan another node sealed is not this node's to report.
+
 `POST /ga4gh/tes/v1/tasks` refuses with the same admission mapping as the native
 submit, not with a generic server error:
 

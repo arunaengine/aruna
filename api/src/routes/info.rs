@@ -19,7 +19,7 @@ use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::{
     GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
-use aruna_operations::metadata::stats::count_realm_documents;
+use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
     drive_realm_placement_mutation,
@@ -266,16 +266,23 @@ pub struct InterfaceStatus {
 }
 
 /// Realm information. `realm_id`, `description`, `oidc_providers`, the public
-/// interface urls and the metadata replication policy are what a client needs to
-/// reach the realm and obtain a token, so they stay public. Realm topology
-/// (`nodes`, `discovery`), quota policy and interface listen addresses need a
-/// token of this realm and are otherwise absent or empty.
+/// interface urls, metadata replication policy and aggregate public overview
+/// are public. The overview exposes only live document, group and configured
+/// membership counts; each nullable value is unknown rather than zero when this
+/// node cannot answer it. Realm topology (`nodes`, `discovery`), quota policy
+/// and interface listen addresses need a token of this realm and are otherwise
+/// absent or empty.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RealmInfoResponse {
     pub realm_id: String,
     pub description: String,
     pub metadata_replication: RealmMetadataReplicationResponse,
     pub oidc_providers: Vec<RealmOidcProviderResponse>,
+    /// Count-only realm overview, available to anonymous and authenticated
+    /// callers. The optional wrapper permits an older or otherwise unable node
+    /// to omit the whole extension without changing the rest of the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_overview: Option<RealmPublicOverview>,
     /// Realm discovery configuration. Realm-authenticated callers only.
     #[schema(value_type = Object)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -286,6 +293,20 @@ pub struct RealmInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<RealmQuotaConfig>,
     pub interfaces: InterfaceServicesStatus,
+}
+
+/// Public, count-only realm overview. Nullable fields mean this node could not
+/// answer; they never use zero as a stand-in for unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPublicOverview {
+    /// Lifecycle-live metadata documents in the realm. This is the registry
+    /// document count, not caller-filtered and not multiplied by replicas.
+    pub live_datasets: Option<u64>,
+    /// Groups stored for this realm.
+    pub groups: Option<u64>,
+    /// Nodes in the replicated realm configuration, regardless of DHT presence
+    /// or health.
+    pub nodes_configured: Option<u64>,
 }
 
 /// Realm-wide quota policy. Used both as the response for the current settings
@@ -392,6 +413,7 @@ impl RealmQuotaConfig {
 pub struct RealmPlacementConfigResponse {
     pub strategies: Vec<RealmPlacementStrategy>,
     pub default_strategy_id: Option<String>,
+    pub job_family_strategy_id: String,
     pub bindings: Vec<RealmPlacementBinding>,
     pub overrides: Vec<RealmPlacementOverride>,
     pub transitions: RealmTransitionHealthResponse,
@@ -527,6 +549,7 @@ impl RealmPlacementConfigResponse {
                 .map(RealmPlacementStrategy::from)
                 .collect(),
             default_strategy_id: document.default_strategy_id.map(|id| id.to_string()),
+            job_family_strategy_id: document.job_family_strategy_id.to_string(),
             bindings: document
                 .strategy_bindings
                 .iter()
@@ -867,7 +890,7 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
     path = "/info/realm",
     tag = "info",
     summary = "Read the realm's public settings and its node topology",
-    description = "Answers every caller, but answers a realm member with more. Without a usable token of this realm, and that includes a token of another realm or one this node cannot validate, the response is the public part: realm id, description, metadata replication policy, the OIDC providers a client needs to obtain a token, and the public interface urls. A bearer token of this realm additionally reveals the realm's discovery configuration, its quota policy, the node list and the interface listen addresses. Gated values are absent or empty, never restructured, so one parser handles both. The node list is the realm's configured membership read from this node's replicated realm configuration; `placement` is the node's entry in the placement map and `info` is the last node information document that reached this node, so it may lag or be absent. Liveness is a separate, deliberately conservative signal: presence is resolved through a bounded realm lookup with a four second budget, and if that lookup is stale, times out or fails, only this node counts as present. `present` true and `connection_status` `connected` therefore mean the peer was confirmed live by a fresh lookup just now; `configured` means no fresh confirmation, which is not evidence that the peer is down. Stale presence is candidate data and is never reported as a connection.",
+    description = "Answers every caller, but answers a realm member with more. Without a usable token of this realm, and that includes a token of another realm or one this node cannot validate, the response is the public part: realm id, description, metadata replication policy, the OIDC providers a client needs to obtain a token, public interface urls, and `public_overview`. That overview contains only three nullable aggregates: `live_datasets` is the realm's lifecycle-live metadata registry count, never caller-filtered or replica-multiplied; `groups` is the realm's stored group count; and `nodes_configured` is the membership count in this node's replicated realm configuration, never DHT presence or health. A null overview value means this node could not answer and is never encoded as zero. No resource titles, group membership, storage/capacity, bucket/object, or node-health detail is implied by these counts. A bearer token of this realm additionally reveals the realm's discovery configuration, its quota policy, the node list and the interface listen addresses, and receives the same public overview. Gated values are absent or empty, never restructured, so one parser handles both. The node list is the realm's configured membership read from this node's replicated realm configuration; `placement` is the node's entry in the placement map and `info` is the last node information document that reached this node, so it may lag or be absent. Liveness is a separate, deliberately conservative signal: presence is resolved through a bounded realm lookup with a four second budget, and if that lookup is stale, times out or fails, only this node counts as present. `present` true and `connection_status` `connected` therefore mean the peer was confirmed live by a fresh lookup just now; `configured` means no fresh confirmation, which is not evidence that the peer is down. Stale presence is candidate data and is never reported as a connection.",
     responses(
         (
             status = 200,
@@ -880,6 +903,11 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
                         "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                         "description": "Example realm",
                         "metadata_replication": {"default_replication_factor": 3},
+                        "public_overview": {
+                            "live_datasets": 4096,
+                            "groups": 12,
+                            "nodes_configured": 3
+                        },
                         "oidc_providers": [
                             {
                                 "id": "example",
@@ -901,6 +929,11 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
                         "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                         "description": "Example realm",
                         "metadata_replication": {"default_replication_factor": 3},
+                        "public_overview": {
+                            "live_datasets": 4096,
+                            "groups": 12,
+                            "nodes_configured": 3
+                        },
                         "oidc_providers": [],
                         "discovery": {"Dynamic": {"methods": [{"DhtSigned": {"ttl_secs": 3600, "refresh_after_secs": 1800}}]}},
                         "nodes": [
@@ -981,6 +1014,25 @@ pub async fn get_realm_info(
     let metadata_replication = RealmMetadataReplicationResponse {
         default_replication_factor: config.effective_default_metadata_replication_factor(),
     };
+    let live_datasets = match count_realm_documents(&state.get_ctx(), config.realm_id).await {
+        Ok(count) => count,
+        Err(error) => {
+            warn!(error = %error, "metadata document count unavailable for public realm overview");
+            None
+        }
+    };
+    let groups = match count_realm_groups(&state.get_ctx(), config.realm_id).await {
+        Ok(count) => Some(count),
+        Err(error) => {
+            warn!(error = %error, "group count unavailable for public realm overview");
+            None
+        }
+    };
+    let public_overview = Some(RealmPublicOverview {
+        live_datasets,
+        groups,
+        nodes_configured: u64::try_from(config.nodes.len()).ok(),
+    });
 
     let (discovery, nodes, quota) = if realm_authenticated {
         let present_nodes = load_realm_presence_best_effort(&state).await;
@@ -1013,6 +1065,7 @@ pub async fn get_realm_info(
                     discovery_url: provider.discovery_url,
                 })
                 .collect(),
+            public_overview,
             discovery,
             nodes,
             quota,
@@ -1124,7 +1177,7 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     path = "/info/realm/placement",
     tag = "info",
     summary = "Read the realm's placement strategies, bindings and overrides",
-    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403 whatever the caller holds. Returns the placement policy as stored in this node's copy of the realm configuration: the defined strategies with their replica count, distinctness requirement, affinity rules and shard count; the default strategy; the bindings that map a scope, the realm, a group, a document class or a metadata path prefix, to a strategy; and the per-subject overrides that pin or exclude individual nodes. This is policy, not a placement result: it says how replicas are chosen, not where any particular document currently sits.",
+    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403 whatever the caller holds. Returns the placement policy as stored in this node's copy of the realm configuration: the defined strategies with their replica count, distinctness requirement, affinity rules and shard count; the default strategy; the immutable job-family strategy id; the bindings that map a scope, the realm, a group, a document class or a metadata path prefix, to a strategy; and the per-subject overrides that pin or exclude individual nodes. `job_family_strategy_id` names a strategy that cannot be removed or have its shard count reshaped: those mutations fail with `JobFamilyImmutable`; removing a strategy that is still referenced fails with `StrategyReferenced`. This is policy, not a placement result: it says how replicas are chosen, not where any particular document currently sits.",
     responses(
         (
             status = 200,
@@ -1142,6 +1195,7 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
                     }
                 ],
                 "default_strategy_id": "01JABCDEF0123456789ABCDEFG",
+                "job_family_strategy_id": "01JABCDEF0123456789ABCDEFG",
                 "bindings": [
                     {"scope": {"kind": "class", "document_class": "metadata"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
                 ],
@@ -1195,7 +1249,7 @@ pub async fn get_realm_placement(
     path = "/info/realm/placement",
     tag = "info",
     summary = "Apply one change to the realm's placement policy",
-    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403. The body carries exactly one change, selected by its `mutation` field: define or replace a strategy, remove one, set the default, set or remove a binding for a scope, set or remove a per-subject override, or provision a metadata binding for a strategy. Provisioning is idempotent, an existing binding for the same scope and strategy is returned unchanged instead of allocating a second one. The whole placement policy after the change is returned, so a client never has to re-read to learn the new state. The change is written to the replicated realm configuration, which means it is durable here when the response is sent and reaches the other realm nodes asynchronously; it does not move any data by itself, existing replicas are relocated by later placement work. Removing a strategy that a binding or override still points at is refused with 409 rather than leaving a dangling reference, and a concurrent update of the same configuration is also 409, where retrying the request is the expected response.",
+    description = "Requires a bearer token of this realm with WRITE on the realm's configuration admin path, and only a management node serves it; every other node answers 403. The body carries exactly one change, selected by its `mutation` field: define or replace a strategy, remove one, set the default, set or remove a binding for a scope, set or remove a per-subject override, or provision a metadata binding for a strategy. Provisioning is idempotent, an existing binding for the same scope and strategy is returned unchanged instead of allocating a second one. The whole placement policy after the change is returned, so a client never has to re-read to learn the new state. `job_family_strategy_id` identifies the job-family strategy, which cannot be removed or have its shard count reshaped; those mutations fail with `JobFamilyImmutable`. The change is written to the replicated realm configuration, which means it is durable here when the response is sent and reaches the other realm nodes asynchronously; it does not move any data by itself, existing replicas are relocated by later placement work. Removing a strategy that a binding or override still points at fails with `StrategyReferenced` and is refused with 409 rather than leaving a dangling reference, and a concurrent update of the same configuration is also 409, where retrying the request is the expected response.",
     request_body(
         content = RealmPlacementMutationRequest,
         description = "Exactly one placement change, discriminated by `mutation`. Ids are ULIDs, node ids are hex-encoded, an override `subject` is a hex-encoded key prefix",
@@ -1251,6 +1305,7 @@ pub async fn get_realm_placement(
                     }
                 ],
                 "default_strategy_id": "01JABCDEF0123456789ABCDEFG",
+                "job_family_strategy_id": "01JABCDEF0123456789ABCDEFG",
                 "bindings": [
                     {"scope": {"kind": "realm"}, "strategy_id": "01JABCDEF0123456789ABCDEFG"}
                 ],
@@ -1351,6 +1406,9 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         MutateRealmPlacementError::Unauthorized { .. } => ServerError::Forbidden,
         MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
             format!("placement strategy {strategy_id} is currently referenced"),
+        ),
+        MutateRealmPlacementError::JobFamilyImmutable { strategy_id } => ServerError::Conflict(
+            format!("placement strategy {strategy_id} is the immutable job-family strategy"),
         ),
         error @ MutateRealmPlacementError::TransitionInFlight { .. } => {
             ServerError::Conflict(error.to_string())
@@ -1461,6 +1519,19 @@ pub struct UsageResponse {
     /// an absent count never reads as zero documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_documents: Option<u64>,
+    /// Exact lifecycle-live metadata documents whose root is neither a Profile
+    /// nor a Process Run. Present only on the group usage endpoint when all
+    /// purpose counts can be computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset_count: Option<u64>,
+    /// Exact lifecycle-live metadata documents whose root `@type` contains the
+    /// W3C Profiles Vocabulary Profile IRI. Group usage only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_count: Option<u64>,
+    /// Exact lifecycle-live non-Profile documents whose root conforms to the
+    /// bundled Process Run Crate profile. Group usage only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_run_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<GroupQuotaStatus>,
 }
@@ -1540,6 +1611,9 @@ impl UsageResponse {
             referenced_bytes: local.referenced_bytes,
             realm: realm.into(),
             metadata_documents: None,
+            dataset_count: None,
+            profile_count: None,
+            process_run_count: None,
             quota: None,
         }
     }
@@ -2065,9 +2139,12 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::keyspaces::GROUP_KEYSPACE;
     use aruna_core::structs::{
-        Actor, AuthContext, DocumentClass, NodeCapabilities, PlacementScope, QuotaConfig, RealmId,
+        Actor, AuthContext, DocumentClass, Group, NodeCapabilities, PlacementScope, QuotaConfig,
+        RealmId,
     };
     use aruna_operations::allocate_handle::allocate_placement_binding;
     use aruna_operations::claim_initial_realm_admin::{
@@ -2789,16 +2866,28 @@ mod tests {
     async fn realm_placement_strategy_default_binding_and_override_lifecycle() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = admin_auth(realm_id, admin);
+        let job_family_strategy_id = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap()
+        .job_family_strategy_id
+        .to_string();
         let (_, Json(initial)) =
             get_realm_placement(State(state.clone()), Extension(Some(auth.clone())))
                 .await
                 .unwrap();
+        assert_eq!(
+            serde_json::to_value(&initial).unwrap()["job_family_strategy_id"].as_str(),
+            Some(job_family_strategy_id.as_str())
+        );
         let initial_default = initial.default_strategy_id.unwrap();
         let strategy_id = Ulid::from_bytes([21; 16]);
         let scope = RealmPlacementBindingScope::Realm;
         let node_id = state.get_node_id().to_string();
 
-        let (_status, _body) = mutate_realm_placement(
+        let (_status, Json(after_upsert)) = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
             Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
@@ -2807,6 +2896,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            serde_json::to_value(after_upsert).unwrap()["job_family_strategy_id"].as_str(),
+            Some(job_family_strategy_id.as_str())
+        );
         let _ = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
@@ -3258,6 +3351,61 @@ mod tests {
         let quota = info.quota.expect("realm token sees quota");
         assert_eq!(quota.user_group_cap_overrides.len(), 1);
         assert_eq!(quota.user_group_cap_overrides[0].user_id, admin.to_string());
+    }
+
+    /// Signed-out callers receive only aggregate overview values. An
+    /// unavailable metadata count is serialized as null, never as a false zero.
+    #[tokio::test]
+    async fn anonymous_realm_info_exposes_count_only_public_overview() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let group = Group {
+            display_name: "Protected group title".to_string(),
+            group_id: Ulid::generate(),
+            realm_id,
+            roles: Default::default(),
+            owner: admin,
+        };
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: admin,
+            realm_id,
+        };
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: GROUP_KEYSPACE.to_string(),
+                key: group.group_id.to_bytes().to_vec().into(),
+                value: group.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected group write: {other:?}"),
+        }
+
+        let (status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(info.nodes.is_empty());
+        assert!(info.discovery.is_none());
+        assert!(info.quota.is_none());
+        let overview = info.public_overview.as_ref().expect("public overview");
+        assert_eq!(overview.live_datasets, None);
+        assert_eq!(overview.groups, Some(1));
+        assert_eq!(overview.nodes_configured, Some(1));
+
+        let body = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            key_set(&body["public_overview"]),
+            std::collections::HashSet::from(["live_datasets", "groups", "nodes_configured",])
+        );
+        assert!(body["public_overview"]["live_datasets"].is_null());
+        assert_ne!(body["public_overview"]["live_datasets"], 0);
+        assert!(body.get("discovery").is_none());
+        assert!(body.get("quota").is_none());
+        assert_eq!(body["nodes"], serde_json::json!([]));
+        assert!(!body.to_string().contains("Protected group title"));
     }
 
     #[tokio::test]

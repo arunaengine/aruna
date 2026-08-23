@@ -212,13 +212,10 @@ async fn cleanup_attempt(
     }
 }
 
+/// A live workspace key outlives a terminal job, so no revocation failure is
+/// treated as permanent: the only proven-final case is `NotFound`, already Ok.
 fn revoke_error(error: RevokeUserAccessError) -> JobError {
-    match &error {
-        RevokeUserAccessError::StorageError(_) => {
-            JobError::retryable(format!("workspace credential revoke failed: {error}"))
-        }
-        _ => JobError::permanent(format!("workspace credential revoke failed: {error}")),
-    }
+    JobError::retryable(format!("workspace credential revoke failed: {error}"))
 }
 
 fn cleanup_error(errors: [Option<JobError>; 3]) -> Option<JobError> {
@@ -602,10 +599,11 @@ mod tests {
 
         let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), access_key).await;
 
+        // A live workspace key must not be stranded by one revoke failure.
         assert!(matches!(
             outcome,
             JobRunOutcome::Failed(JobError {
-                kind: JobErrorKind::Permanent,
+                kind: JobErrorKind::Retryable,
                 ..
             })
         ));
