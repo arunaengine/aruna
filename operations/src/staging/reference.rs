@@ -68,7 +68,7 @@ pub enum MaterializeReferenceError {
     Purge(#[from] PurgeFenceError),
 }
 
-pub async fn materialize_reference(
+pub async fn stage_reference_blob(
     context: &DriverContext,
     input: MaterializeReferenceInput,
 ) -> Result<MaterializeReferenceResult, MaterializeReferenceError> {
@@ -273,13 +273,6 @@ fn source_metadata_matches(left: &SourceMetadata, right: &SourceMetadata) -> boo
         && left.content_type == right.content_type
         && left.etag == right.etag
         && left.last_modified == right.last_modified
-}
-
-pub async fn stage_reference_blob(
-    context: &DriverContext,
-    input: MaterializeReferenceInput,
-) -> Result<MaterializeReferenceResult, MaterializeReferenceError> {
-    materialize_reference(context, input).await
 }
 
 async fn apply_storage_effect(
@@ -807,7 +800,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_reference_retains_historical_hash_path_and_writes_blob_version() {
+    async fn reference_keeps_history() {
+        // The prior version's hash-path entry survives while the new reference
+        // version is written.
         let test_context = setup_driver_context().await;
         let context = &test_context.driver_context;
         let group_id = Ulid::generate();
@@ -849,7 +844,7 @@ mod tests {
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
 
-        let result = materialize_reference(
+        let result = stage_reference_blob(
             context,
             MaterializeReferenceInput {
                 group_id,
@@ -938,7 +933,7 @@ mod tests {
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
 
-        let result = materialize_reference(
+        let result = stage_reference_blob(
             context,
             MaterializeReferenceInput {
                 group_id,
@@ -1019,8 +1014,8 @@ mod tests {
             expected_bucket,
         };
 
-        let first = materialize_reference(context, input.clone()).await.unwrap();
-        let second = materialize_reference(context, input).await.unwrap();
+        let first = stage_reference_blob(context, input.clone()).await.unwrap();
+        let second = stage_reference_blob(context, input).await.unwrap();
         server.abort();
         let _ = server.await;
 
