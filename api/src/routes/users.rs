@@ -1256,7 +1256,8 @@ implemented."#,
         (status = 400, description = "Declared for malformed input; in practice an id that is not a user id is refused by the authorization check with 403 instead", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented, or the presented token failed validation", body = ErrorResponse),
         (status = 403, description = "The caller has no read access on that user's administration path; the same answer is given whether or not the user exists", body = ErrorResponse),
-        (status = 404, description = "This node holds no user with that id, and the caller is allowed to know that", body = ErrorResponse)
+        (status = 404, description = "This node holds no user with that id, and the caller is allowed to know that", body = ErrorResponse),
+        (status = 501, description = "The token was issued by another trusted realm; forwarding the read to the owning realm is not implemented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
