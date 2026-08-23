@@ -1,5 +1,5 @@
 // Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
