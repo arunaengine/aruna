@@ -1369,6 +1369,7 @@ fn storage_retryable(error: &StorageError) -> bool {
     matches!(
         error,
         StorageError::TransactionConflict
+            | StorageError::CleanupCapacity
             | StorageError::ReadError(_)
             | StorageError::WriteError(_)
             | StorageError::DeleteError
@@ -1675,6 +1676,9 @@ mod tests {
             StorageError::WriteError("io".to_string()),
             StorageError::DeleteError,
             StorageError::TransactionConflict,
+            // Capacity conditions prove no commit, so they stay infrastructure errors.
+            StorageError::CleanupCapacity,
+            StorageError::QueueFull,
         ] {
             assert!(storage_retryable(&error));
         }
