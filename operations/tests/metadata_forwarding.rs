@@ -639,7 +639,9 @@ async fn set_write_policy(
         expression: "permission == 'write'".to_string(),
         enabled: true,
     };
-    for node in nodes {
+    // Only the sync-eligible nodes are management members, and a realm-config
+    // write on any other node is refused before it can diverge.
+    for node in nodes.iter().filter(|node| node.sync_eligible) {
         drive(
             SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
                 actor: Actor {

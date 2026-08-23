@@ -411,7 +411,8 @@ pub async fn get_realm_policies(
     summary = "Replace the realm's request policy set",
     description = r#"Replaces the realm's request policy set wholesale with the submitted list.
 
-**Authentication**: realm bearer token with WRITE on the realm configuration path.
+**Authentication**: realm bearer token with WRITE on the realm configuration path, and only a
+management node serves it; every other node answers 403.
 
 **Behavior**
 - Policies missing from the request are removed, an entry without a `policy_id` is given a fresh
@@ -463,7 +464,7 @@ pub async fn get_realm_policies(
         ),
         (status = 400, description = "Unknown policy kind, malformed policy or hash, or a set that breaks the size or compile limits", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or the caller may not write the realm configuration", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, the caller may not write the realm configuration, or this is not a management node", body = ErrorResponse),
         (status = 409, description = "The stored set no longer matches expected_hash and nothing was written; re-read the set and retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -503,7 +504,9 @@ pub async fn set_realm_policies(
     .await
     .map_err(|error| match error {
         SetRealmPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
-        SetRealmPoliciesError::Unauthorized => ServerError::Forbidden,
+        SetRealmPoliciesError::Unauthorized | SetRealmPoliciesError::NotManagementNode => {
+            ServerError::Forbidden
+        }
         SetRealmPoliciesError::StaleHash => {
             ServerError::Conflict("stored realm policy set changed".to_string())
         }

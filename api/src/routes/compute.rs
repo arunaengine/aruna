@@ -356,7 +356,8 @@ pub async fn get_compute_config(
     summary = "Replace the realm compute configuration",
     description = r#"Replaces the stored realm compute configuration with the submitted one.
 
-**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path.
+**Authentication**: bearer token issued for this realm, with WRITE on the realm configuration path,
+and only a management node serves it; every other node answers 403.
 
 **Behavior**
 - The body replaces the stored configuration wholesale rather than patching it: links and group
@@ -442,7 +443,7 @@ pub async fn get_compute_config(
         })),
         (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, or a zero witness delay", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm, or the caller may not administer the realm configuration", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm, the caller may not administer the realm configuration, or this is not a management node", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse)
     ),
@@ -476,7 +477,9 @@ fn map_compute_error(error: SetRealmComputeError) -> ServerError {
     use aruna_core::errors::StorageError;
     match error {
         SetRealmComputeError::RealmConfigNotFound => ServerError::NotFound,
-        SetRealmComputeError::Unauthorized => ServerError::Forbidden,
+        SetRealmComputeError::Unauthorized | SetRealmComputeError::NotManagementNode => {
+            ServerError::Forbidden
+        }
         SetRealmComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
         SetRealmComputeError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict(

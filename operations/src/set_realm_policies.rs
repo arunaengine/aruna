@@ -24,6 +24,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::mutate_realm_placement::is_management;
 use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +85,8 @@ pub enum SetRealmPoliciesError {
     RealmConfigNotFound,
     #[error("caller may not write the realm configuration")]
     Unauthorized,
+    #[error("this node is not a realm management node")]
+    NotManagementNode,
     #[error("stored policy set changed")]
     StaleHash,
     #[error("invalid policy set: {reason}")]
@@ -157,6 +160,9 @@ impl SetRealmPoliciesOperation {
             return Err(SetRealmPoliciesError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
+        if !is_management(&document, self.config.actor.node_id) {
+            return Err(SetRealmPoliciesError::NotManagementNode);
+        }
 
         if let Some(expected) = self.config.expected_hash
             && policy_set_hash(&document.request_policies) != expected
@@ -427,13 +433,15 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::get_realm_config::GetRealmConfigOperation;
     use aruna_core::UserId;
+    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::request_policy::RequestPolicy;
     use aruna_core::structs::{
-        Actor, AuthContext, RealmAuthorizationDocument, RealmId, policy_admin_path,
+        Actor, AuthContext, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        RealmNodeKind, policy_admin_path,
     };
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -530,6 +538,54 @@ mod tests {
         .unwrap();
         seed_realm_admin(&context, &actor).await;
         (dir, context, actor)
+    }
+
+    /// Replaces the stored realm config with one that ranks the actor's node as
+    /// a plain server, which realm creation never produces.
+    async fn seed_server_config(context: &DriverContext, actor: &Actor) {
+        let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Server);
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: actor.realm_id,
+        };
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: document.to_bytes(actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_server_node() {
+        // A realm admin token still may not write the config on a server node:
+        // peers reject a realm-config event whose origin is not management.
+        let (_dir, context, actor) = setup_realm().await;
+        seed_server_config(&context, &actor).await;
+
+        let error = drive(
+            SetRealmPoliciesOperation::new(policies_config(
+                &actor,
+                vec![policy("permission == 'write'")],
+                None,
+            )),
+            &context,
+        )
+        .await
+        .expect_err("a server node is refused");
+        assert!(matches!(error, SetRealmPoliciesError::NotManagementNode));
+
+        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert!(read.request_policies.is_empty());
     }
 
     #[tokio::test]

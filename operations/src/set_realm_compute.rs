@@ -32,6 +32,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::mutate_realm_placement::is_management;
 use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +88,8 @@ pub enum SetRealmComputeError {
     RealmConfigNotFound,
     #[error("caller may not write the realm configuration")]
     Unauthorized,
+    #[error("this node is not a realm management node")]
+    NotManagementNode,
     #[error("invalid compute configuration: {reason}")]
     InvalidCompute { reason: String },
     #[error("missing active transaction")]
@@ -162,6 +165,9 @@ impl SetRealmComputeOperation {
             return Err(SetRealmComputeError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
+        if !is_management(&document, self.config.actor.node_id) {
+            return Err(SetRealmComputeError::NotManagementNode);
+        }
 
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
@@ -431,7 +437,7 @@ mod tests {
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::{
-        GroupComputeQuota, LocationLink, RealmAuthorizationDocument, RealmId,
+        GroupComputeQuota, LocationLink, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -494,6 +500,12 @@ mod tests {
         }
     }
 
+    fn management_config(realm_id: RealmId, actor: &Actor) -> RealmConfigDocument {
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        document
+    }
+
     async fn seed(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: actor.realm_id,
@@ -539,12 +551,7 @@ mod tests {
         let ctx = context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
-        seed(
-            &ctx,
-            &actor,
-            &RealmConfigDocument::new(realm_id, Vec::new(), 3),
-        )
-        .await;
+        seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
         seed_realm_admin(&ctx, &actor).await;
 
         let stored = drive(
@@ -576,12 +583,7 @@ mod tests {
         let ctx = context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
-        seed(
-            &ctx,
-            &actor,
-            &RealmConfigDocument::new(realm_id, Vec::new(), 3),
-        )
-        .await;
+        seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
         seed_realm_admin(&ctx, &actor).await;
 
         let invalid = RealmComputeConfig {
@@ -608,12 +610,7 @@ mod tests {
         let ctx = context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let actor = actor(realm_id);
-        seed(
-            &ctx,
-            &actor,
-            &RealmConfigDocument::new(realm_id, Vec::new(), 3),
-        )
-        .await;
+        seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
         let mut document = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         document.roles.clear();
         match ctx
@@ -637,6 +634,33 @@ mod tests {
         .await
         .expect_err("an unauthorized caller is refused");
         assert_eq!(error, SetRealmComputeError::Unauthorized);
+
+        let reread = drive(GetRealmConfigOperation::new(realm_id), &ctx)
+            .await
+            .expect("config reads");
+        assert_eq!(reread.compute, RealmComputeConfig::default());
+    }
+
+    #[tokio::test]
+    async fn refuses_server_node() {
+        // A realm admin token still may not write the config on a server node:
+        // peers reject a realm-config event whose origin is not management.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let actor = actor(realm_id);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Server);
+        seed(&ctx, &actor, &document).await;
+        seed_realm_admin(&ctx, &actor).await;
+
+        let error = drive(
+            SetRealmComputeOperation::new(compute_config(&actor, configured())),
+            &ctx,
+        )
+        .await
+        .expect_err("a server node is refused");
+        assert_eq!(error, SetRealmComputeError::NotManagementNode);
 
         let reread = drive(GetRealmConfigOperation::new(realm_id), &ctx)
             .await
