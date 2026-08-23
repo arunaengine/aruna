@@ -26,7 +26,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
-use tracing::trace;
+use tracing::{trace, warn};
 use ulid::Ulid;
 
 use crate::placement::placement_ref_for_target;
@@ -536,7 +536,12 @@ impl CreateGroupOperation {
     fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_outbox_schedule(),
-            Event::Task(TaskEvent::Error { .. }) => self.finish_after_outbox_schedule(),
+            // The group is committed either way; the outbox drains on its next
+            // wake, so a scheduling failure only delays replication.
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(%message, "Group document outbox drain was not scheduled");
+                self.finish_after_outbox_schedule()
+            }
             other => self.unexpected_event(
                 CreateGroupState::ScheduleDocumentSyncOutboxDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",

@@ -122,17 +122,27 @@ fn jitter_ms(family: &JobFamilyId, node: NodeId, base_delay_ms: u64) -> u64 {
 /// deadline is kept, so re-arming can only ever bring a round forward.
 pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u64) {
     let Some(net) = context.net_handle.as_ref() else {
+        debug!(?family, "No net handle; witness fallback not armed");
         return;
     };
     let realm_id = *net.realm_id();
     let local = net.node_id();
     let Some(config) = load_realm_config(context, realm_id).await else {
+        warn!(
+            ?family,
+            "Realm config unavailable; witness fallback not armed"
+        );
         return;
     };
     let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
+        warn!(
+            ?family,
+            "Family placement unresolved; witness fallback not armed"
+        );
         return;
     };
     let Some(rank) = witness_rank(view.holders(), &family, local) else {
+        debug!(?family, "Node is not a witness for this family");
         return;
     };
     let base = config.compute.witness_base_delay_ms;
@@ -142,7 +152,10 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
     };
     let existing = match read_deadline_index(context, &family).await {
         Ok(existing) => existing,
-        Err(_) => return,
+        Err(error) => {
+            warn!(?family, error = %error, "Witness deadline read failed");
+            return;
+        }
     };
     if existing
         .as_ref()

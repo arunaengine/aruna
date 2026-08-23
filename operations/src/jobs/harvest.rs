@@ -15,6 +15,7 @@ use aruna_core::structs::{
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use byteview::ByteView;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::create_metadata_document::{
@@ -133,6 +134,7 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
     // One restart per run at most: a provider that keeps rejecting its own
     // tokens must not be able to loop the listing back to the start forever.
     let mut restarted = false;
+    let mut warned_datestamp = false;
     let mut seen_tokens: HashSet<[u8; 32]> = HashSet::new();
     let started = tokio::time::Instant::now();
 
@@ -177,7 +179,19 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
 
         for record in &page.records {
             check_signals(ctx)?;
-            let datestamp_ms = parse_datestamp_ms(&record.header.datestamp).unwrap_or(0);
+            // An unparseable datestamp harvests as epoch zero; one warning per
+            // run names the offending value without flooding a large listing.
+            let datestamp_ms = parse_datestamp_ms(&record.header.datestamp).unwrap_or_else(|| {
+                if !warned_datestamp {
+                    warned_datestamp = true;
+                    warn!(
+                        datestamp = %record.header.datestamp,
+                        identifier = %record.header.identifier,
+                        "Unparseable OAI datestamp; harvesting the record as epoch zero"
+                    );
+                }
+                0
+            });
             overall_max = overall_max.max(datestamp_ms);
             apply_record(
                 ctx,
