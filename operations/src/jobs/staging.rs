@@ -131,7 +131,9 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                     checkpoint.phase = match spec.strategy {
                         StagingStrategy::Reference => StagingJobPhase::Registering,
                         StagingStrategy::Snapshot => StagingJobPhase::Writing,
-                        StagingStrategy::Sync => unreachable!(),
+                        StagingStrategy::Sync => {
+                            return permanent_error("sync is not a staging job strategy");
+                        }
                     };
                 }
                 Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {

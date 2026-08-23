@@ -15,7 +15,7 @@ use aruna_core::structs::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, band_start,
     normalize_node_placement_input,
 };
-use aruna_core::structured_id::PlacementHandle;
+use aruna_core::structured_id::{FieldError, PlacementHandle};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -127,14 +127,15 @@ impl CreateRealmOperation {
         config_doc.placement_handle_ranges.push(creator_range);
         seed_placement_defaults(&mut config_doc);
         // The band's reserved first handle is the creator's JobControl handle.
+        let handle = PlacementHandle::new(creator_range.start)?;
+        let strategy_id = config_doc
+            .default_strategy_id
+            .ok_or(CreateRealmError::DefaultStrategyMissing)?;
         config_doc.placement_bindings.push(PlacementBinding {
-            handle: PlacementHandle::new(creator_range.start)
-                .expect("the first grantable handle is allocatable"),
+            handle,
             scope: PlacementScope::Realm(realm_id),
             document_class: DocumentClass::JobControl,
-            strategy_id: config_doc
-                .default_strategy_id
-                .expect("seed_default_placement sets a default strategy"),
+            strategy_id,
             allocator_range_id: Some(creator_range.range_id),
             allocated_by: Some(self.config.actor.node_id),
             allocated_at_ms: Some(unix_timestamp_millis()),
@@ -473,6 +474,10 @@ pub enum CreateRealmError {
     NodeLocationTooLong,
     #[error("No transaction found")]
     NoTransactionFound,
+    #[error(transparent)]
+    InvalidHandle(#[from] FieldError),
+    #[error("realm config seed produced no default placement strategy")]
+    DefaultStrategyMissing,
     #[error("creating realm did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
