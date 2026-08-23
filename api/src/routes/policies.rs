@@ -316,16 +316,6 @@ async fn group_policies(
     }
 }
 
-async fn require_config_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<()> {
-    ensure_permission(
-        state,
-        auth,
-        format!("/{}/admin/config", state.get_realm_id()),
-        Permission::WRITE,
-    )
-    .await
-}
-
 async fn require_group_admin(
     state: &ServerState,
     auth: &AuthContext,
@@ -484,7 +474,6 @@ pub async fn set_realm_policies(
     Json(request): Json<SetPoliciesRequest>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
-    require_config_admin(&state, &auth).await?;
 
     let policies = request
         .policies
@@ -503,8 +492,9 @@ pub async fn set_realm_policies(
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
-                realm_id: auth.realm_id,
+                realm_id: state.get_realm_id(),
             },
+            auth_context: auth,
             policies,
             expected_hash,
         }),
@@ -513,6 +503,7 @@ pub async fn set_realm_policies(
     .await
     .map_err(|error| match error {
         SetRealmPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
+        SetRealmPoliciesError::Unauthorized => ServerError::Forbidden,
         SetRealmPoliciesError::StaleHash => {
             ServerError::Conflict("stored realm policy set changed".to_string())
         }
@@ -649,7 +640,6 @@ pub async fn set_group_policies(
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    require_group_admin(&state, &auth, group_id).await?;
 
     let policies = request
         .policies
@@ -668,8 +658,9 @@ pub async fn set_group_policies(
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
-                realm_id: auth.realm_id,
+                realm_id: state.get_realm_id(),
             },
+            auth_context: auth,
             group_id,
             policies,
             expected_hash,
@@ -679,6 +670,7 @@ pub async fn set_group_policies(
     .await
     .map_err(|error| match error {
         SetGroupPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
+        SetGroupPoliciesError::Unauthorized => ServerError::Forbidden,
         SetGroupPoliciesError::GroupAuthDocNotFound => ServerError::NotFound,
         SetGroupPoliciesError::StaleHash => {
             ServerError::Conflict("stored group policy set changed".to_string())

@@ -647,6 +647,11 @@ async fn set_write_policy(
                     user_id: realm.user_id,
                     realm_id: realm.realm_id,
                 },
+                auth_context: AuthContext {
+                    user_id: realm.user_id,
+                    realm_id: realm.realm_id,
+                    path_restrictions: None,
+                },
                 policies: vec![policy.clone()],
                 expected_hash: None,
             }),
@@ -900,7 +905,11 @@ async fn install_realm_config(
         config.seed_job_control(node.net.node_id(), band as u32);
     }
 
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    // The realm user administers this realm, so the admin role names it.
+    let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    for role in realm_auth.roles.values_mut() {
+        role.assigned_users.insert(realm.user_id);
+    }
     let trusted = HashSet::from([realm_id]);
     for node in nodes {
         let actor = Actor {

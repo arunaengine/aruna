@@ -274,6 +274,16 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "realm-admin WRITE checked inside ResolveQuarantineOperation",
     ),
     (
+        "policies.rs",
+        "set_group_policies",
+        "group-config WRITE checked inside SetGroupPoliciesOperation",
+    ),
+    (
+        "policies.rs",
+        "set_realm_policies",
+        "realm-config WRITE checked inside SetRealmPoliciesOperation",
+    ),
+    (
         "rocrate_import.rs",
         "upload_rocrate",
         "self-scoped: spools a hidden blob owned by the caller",
