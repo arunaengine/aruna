@@ -2296,8 +2296,9 @@ mod tests {
         InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, RealmPlacementBinding,
         RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
         RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
-        get_info, get_realm_info, get_realm_placement, get_usage, map_mutate_realm_placement_error,
-        map_set_realm_quota_error, mutate_realm_placement, presence_nodes, set_realm_quota,
+        get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
+        map_mutate_realm_placement_error, map_set_realm_quota_error, mutate_realm_placement,
+        presence_nodes, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -2312,7 +2313,7 @@ mod tests {
         Actor, AuthContext, DocumentClass, Group, NodeCapabilities, PlacementScope, QuotaConfig,
         RealmId,
     };
-    use aruna_operations::allocate_handle::allocate_placement_binding;
+    use aruna_operations::allocate_handle::{HandleAllocationError, allocate_placement_binding};
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
