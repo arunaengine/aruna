@@ -226,12 +226,38 @@ pub struct SyncListParams {
     path = "/data/sync-relationships",
     tag = "sync",
     summary = "Create a bucket sync relationship",
-    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused outright, because this surface cannot honour that confinement. The source always lives on this node and needs READ on the source bucket; the target node additionally checks WRITE on the target bucket before it accepts its half of the relationship, so a caller without write rights there is forbidden. Source and target must differ, bucket names must be non-empty and free of `/`, workspace buckets are refused, and a prefix, when given, must be a confined relative path. A 201 means the relationship record is durable here and its mirror is durable on the target node; no data has been copied yet. For `once` and `reference` mode an initial backfill run is queued as part of creation, and `continuous` instead replicates versions as they are written. Completion is observed by polling the relationship, whose `pending_jobs`, `last_synced_at` and counters advance as replication drains. `reference` mode forces `preserve` reference handling regardless of what the body asks for. An enabled relationship with the same source, target and mode already existing is a conflict. A target node that cannot be reached fails the whole creation with 502 and the caller may retry; a partially created mirror is repaired in the background.",
+    description = r#"Creates a bucket sync relationship from this node to a bucket on a target node.
+
+**Authentication**: realm bearer token; a token confined to a path subset is refused outright,
+because this surface cannot honor that confinement. The source always lives on this node and needs
+READ on the source bucket; the target node additionally checks WRITE on the target bucket before it
+accepts its half of the relationship, so a caller without write rights there is forbidden.
+
+**Behavior**
+- A 201 means the relationship record is durable here and its mirror is durable on the target node;
+  no data has been copied yet.
+- For `once` and `reference` mode an initial backfill run is queued as part of creation, and
+  `continuous` instead replicates versions as they are written.
+- `reference` mode forces `preserve` reference handling regardless of what the body asks for.
+- Completion is observed by polling the relationship, whose `pending_jobs`, `last_synced_at` and
+  counters advance as replication drains.
+
+**Limits** (all refused with 400)
+- Source and target must differ.
+- Bucket names must be non-empty and free of `/`, and workspace buckets are refused.
+- A prefix, when given, must be a confined relative path.
+
+**Errors**: an already existing enabled relationship with the same source, target and mode is a
+409. A target node that cannot be reached fails the whole creation with 502 and the caller may
+retry; a partially created mirror is repaired in the background."#,
     request_body(
         content = CreateSyncRequest,
         description = "Source endpoint on this node, target endpoint on the receiving node, and the sync mode. `reference_handling` defaults to `materialize` and `replicate_deletes` to false.",
         example = json!({
-            "source": {"bucket": "research-raw", "prefix": "2026/"},
+            "source": {
+                "bucket": "research-raw",
+                "prefix": "2026/"
+            },
             "target": {
                 "node_id": "2a3b4c5d6e7f80910a1b2c3d4e5f60710a1b2c3d4e5f60710a1b2c3d4e5f6071",
                 "bucket": "research-mirror",
@@ -257,7 +283,14 @@ pub struct SyncListParams {
                 "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "state": "enabled",
-                "status": {"counters": {"versions_synced": 0, "bytes_synced": 0, "failures": 0, "consecutive_failures": 0}}
+                "status": {
+                    "counters": {
+                        "versions_synced": 0,
+                        "bytes_synced": 0,
+                        "failures": 0,
+                        "consecutive_failures": 0
+                    }
+                }
             })
         ),
         (status = 400, description = "The endpoints are identical, a bucket name is empty or contains `/`, the bucket is a workspace bucket, the prefix is not a confined relative path, or the target node id does not parse", body = ErrorResponse),
@@ -409,10 +442,27 @@ pub async fn create_sync(
     path = "/data/sync-relationships",
     tag = "sync",
     summary = "List the sync relationships held on this node",
-    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only relationships created by the calling user are returned, so this is not a realm-wide view and another user's relationships are never listed. `outgoing` holds relationships whose source bucket lives on this node, `incoming` holds the mirror records this node keeps as a replication target; a relationship therefore appears in `outgoing` on one node and in `incoming` on the other. Detached serving stubs, left behind when a reference relationship is deleted, are hidden. The read is node-local and unpaginated: every matching record is returned in one response, and no ordering is guaranteed.",
+    description = r#"Lists the caller's own sync relationships held on this node, split by direction.
+
+**Authentication**: realm bearer token; a token confined to a path subset is refused.
+
+**Behavior**
+- Only relationships created by the calling user are returned, so this is not a realm-wide view and
+  another user's relationships are never listed.
+- `outgoing` holds relationships whose source bucket lives on this node, `incoming` holds the mirror
+  records this node keeps as a replication target; a relationship therefore appears in `outgoing` on
+  one node and in `incoming` on the other.
+- The `prefix` filter matches an overlap in either direction, so `2026/` matches both `2026/runs/`
+  and `2026`, and a relationship covering a whole bucket always matches.
+- Detached serving stubs, left behind when a reference relationship is deleted, are hidden.
+
+**Limits**
+- The read is node-local and unpaginated: every matching record is returned in one response, and no
+  ordering is guaranteed.
+- A `bucket` or `prefix` filter that is present but empty is refused with 400."#,
     params(
-        ("bucket" = Option<String>, Query, description = "Keep only relationships whose endpoint for the listed direction uses this bucket; the source bucket for outgoing, the target bucket for incoming. Omit for all buckets; an empty value is rejected"),
-        ("prefix" = Option<String>, Query, description = "Keep only relationships whose endpoint prefix overlaps this one, in either direction, so `2026/` matches both `2026/runs/` and `2026`. A relationship covering a whole bucket always matches. Omit for no prefix filter; an empty value is rejected"),
+        ("bucket" = Option<String>, Query, description = "Keep only relationships whose endpoint for the listed direction uses this bucket: source for outgoing, target for incoming. Omit for all buckets"),
+        ("prefix" = Option<String>, Query, description = "Keep only relationships whose endpoint prefix overlaps this one, in either direction. Omit for no prefix filter"),
         ("direction" = Option<String>, Query, description = "Which lists to populate: `out` for source-side relationships, `in` for mirrors held here, `both` for either. Defaults to `both`; the list that is not requested comes back empty")
     ),
     responses(
@@ -434,7 +484,12 @@ pub async fn create_sync(
                         "state": "enabled",
                         "status": {
                             "last_synced_at": "2026-04-09T15:02:44.907+00:00",
-                            "counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}
+                            "counters": {
+                                "versions_synced": 128,
+                                "bytes_synced": 4294967296_i64,
+                                "failures": 0,
+                                "consecutive_failures": 0
+                            }
                         }
                     }
                 ],
@@ -507,7 +562,21 @@ pub async fn list_sync(
     path = "/data/sync-relationships/{id}",
     tag = "sync",
     summary = "Read one sync relationship and its progress",
-    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the user who created the relationship may read it, and a relationship created by somebody else is refused rather than hidden. The lookup checks this node's source-side records first and then its mirror records, so the same id can be inspected from either end on the node that holds it; a node holding neither reports it as not found, as does a detached serving stub left behind by a deleted reference relationship. `pending_jobs` and `oldest_lag_ms` come from this node's own replication queue: `pending_jobs` counts the replication jobs still queued for this relationship and `oldest_lag_ms` is the age in milliseconds of the oldest of them, omitted once the queue holds none. `pending_jobs` reaching zero with no `last_error` is how a caller sees an accepted run finish; the counters advance only as replication reports back, so they lag the objects already written.",
+    description = r#"Reads one sync relationship with this node's replication progress for it.
+
+**Authentication**: realm bearer token; a token confined to a path subset is refused, and only the
+user who created the relationship may read it, so a relationship created by somebody else is
+refused rather than hidden.
+
+**Behavior**
+- The lookup checks this node's source-side records first and then its mirror records, so the same
+  id can be inspected from either end on the node that holds it; a node holding neither reports it
+  as not found, as does a detached serving stub left behind by a deleted reference relationship.
+- `pending_jobs` and `oldest_lag_ms` come from this node's own replication queue: `pending_jobs`
+  counts the replication jobs still queued for this relationship and `oldest_lag_ms` is the age in
+  milliseconds of the oldest of them, omitted once the queue holds none.
+- `pending_jobs` reaching zero with no `last_error` is how a caller sees an accepted run finish; the
+  counters advance only as replication reports back, so they lag the objects already written."#,
     params(("id" = String, Path, description = "Relationship id as a 26-character ULID, as returned when the relationship was created")),
     responses(
         (
@@ -527,7 +596,12 @@ pub async fn list_sync(
                     "state": "enabled",
                     "status": {
                         "last_synced_at": "2026-04-09T15:02:44.907+00:00",
-                        "counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}
+                        "counters": {
+                            "versions_synced": 128,
+                            "bytes_synced": 4294967296_i64,
+                            "failures": 0,
+                            "consecutive_failures": 0
+                        }
                     }
                 },
                 "pending_jobs": 1,
@@ -569,12 +643,33 @@ pub async fn get_sync(
     path = "/data/sync-relationships/{id}",
     tag = "sync",
     summary = "Change how a relationship handles referenced objects",
-    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the creator may change a relationship, and READ on the source bucket is checked as well. Only the source side can be changed: a mirror this node merely holds as a target reads as not found, so the call must go to the node that owns the source bucket. Reference handling is the only mutable field; the mode, endpoints and delete behaviour are fixed at creation. A relationship in `reference` mode only accepts `preserve`. Submitting the value the relationship already has returns it unchanged and touches nothing. Otherwise the target node's mirror is updated first and the local record second, so an unreachable target fails the whole change with 502, leaves the stored value as it was, and the caller may retry once the target is back. The new handling applies to versions replicated after the change; objects already copied or already left as references are not rewritten, and a relationship that has ever used `preserve` keeps serving the references it handed out even after switching to `materialize`.",
+    description = r#"Changes how an existing sync relationship handles referenced objects.
+
+**Authentication**: realm bearer token; a token confined to a path subset is refused. Only the
+creator may change a relationship, and READ on the source bucket is checked as well.
+
+**Behavior**
+- Only the source side can be changed: a mirror this node merely holds as a target reads as not
+  found, so the call must go to the node that owns the source bucket.
+- Submitting the value the relationship already has returns it unchanged and touches nothing.
+- Otherwise the target node's mirror is updated first and the local record second, so an
+  unreachable target fails the whole change with 502, leaves the stored value as it was, and the
+  caller may retry once the target is back.
+- The new handling applies to versions replicated after the change; objects already copied or
+  already left as references are not rewritten, and a relationship that has ever used `preserve`
+  keeps serving the references it handed out even after switching to `materialize`.
+
+**Limits**
+- Reference handling is the only mutable field; the mode, endpoints and delete behavior are fixed
+  at creation.
+- A relationship in `reference` mode accepts only `preserve`; anything else is refused with 400."#,
     params(("id" = String, Path, description = "Relationship id as a 26-character ULID; must name a relationship whose source bucket is on this node")),
     request_body(
         content = UpdateSyncRequest,
         description = "The new reference handling: `materialize` copies referenced source bytes, `preserve` replicates the reference itself, `skip` leaves referenced objects out of the sync.",
-        example = json!({"reference_handling": "preserve"})
+        example = json!({
+            "reference_handling": "preserve"
+        })
     ),
     responses(
         (
@@ -591,7 +686,14 @@ pub async fn get_sync(
                 "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "state": "enabled",
-                "status": {"counters": {"versions_synced": 128, "bytes_synced": 4294967296_i64, "failures": 0, "consecutive_failures": 0}}
+                "status": {
+                    "counters": {
+                        "versions_synced": 128,
+                        "bytes_synced": 4294967296_i64,
+                        "failures": 0,
+                        "consecutive_failures": 0
+                    }
+                }
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the relationship is in reference mode and the request asked for anything other than preserve", body = ErrorResponse),
@@ -674,14 +776,35 @@ pub async fn update_sync(
     path = "/data/sync-relationships/{id}/run",
     tag = "sync",
     summary = "Trigger a backfill run of an existing relationship",
-    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the creator may run a relationship, and READ on the source bucket is checked as well. Only the source node can run it: a mirror this node merely holds as a target reads as not found. A relationship left in the failed state is returned to enabled first, with its last error and consecutive-failure count cleared, so a run is also how a stalled relationship is resumed. The 202 means one backfill job covering the relationship's whole scope, the source bucket or its prefix, is durably queued on this node; nothing has been copied and no object has been compared yet. The call is idempotent per relationship: the queued job is keyed by the relationship and its scope, so triggering a run while one is already in flight does not start a second pass, it re-arms the drain over the same job. `queued` reports how many scope jobs were enqueued and is 1 on every success, not a count of objects. Progress and completion are observed by polling the relationship, whose `pending_jobs` returns to zero when the run has drained.",
+    description = r#"Queues one backfill run over the whole scope of an existing relationship.
+
+**Authentication**: realm bearer token; a token confined to a path subset is refused. Only the
+creator may run a relationship, and READ on the source bucket is checked as well.
+
+**Behavior**
+- Only the source node can run it: a mirror this node merely holds as a target reads as not found.
+- A relationship left in the failed state is returned to enabled first, with its last error and
+  consecutive-failure count cleared, so a run is also how a stalled relationship is resumed.
+- The 202 means one backfill job covering the relationship's whole scope, the source bucket or its
+  prefix, is durably queued on this node; nothing has been copied and no object has been compared
+  yet.
+- The call is idempotent per relationship: the queued job is keyed by the relationship and its
+  scope, so triggering a run while one is already in flight does not start a second pass, it
+  re-arms the drain over the same job.
+- `queued` reports how many scope jobs were enqueued and is 1 on every success, not a count of
+  objects.
+- Progress and completion are observed by polling the relationship, whose `pending_jobs` returns to
+  zero when the run has drained."#,
     params(("id" = String, Path, description = "Relationship id as a 26-character ULID; must name a relationship whose source bucket is on this node")),
     responses(
         (
             status = 202,
             description = "A backfill job for the relationship is durably queued; the copy itself happens afterwards",
             body = SyncRunResponse,
-            example = json!({"relationship_id": "01JSYNC0123456789ABCDEFGHJ", "queued": 1})
+            example = json!({
+                "relationship_id": "01JSYNC0123456789ABCDEFGHJ",
+                "queued": 1
+            })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the stored relationship has no usable source bucket", body = ErrorResponse),
         (status = 401, description = "No bearer token was presented", body = ErrorResponse),
@@ -730,7 +853,21 @@ pub async fn run_sync(
     path = "/data/sync-relationships/{id}",
     tag = "sync",
     summary = "Delete a sync relationship",
-    description = "Requires a bearer token issued for this realm; a token confined to a path subset is refused. Only the creator may delete a relationship, and WRITE is checked on whichever bucket this node holds for it: the source bucket for a source-side relationship, the target bucket for a mirror. Either end may be deleted from the node that holds it. Objects already synchronized are never removed, on either side; only the relationship goes away, and continuous replication simply stops. Deleting a source-side `reference` relationship leaves a detached serving stub behind so that data the target still holds as references stays readable; the stub is invisible to this API, so reading or deleting the same id afterwards is not found. Other modes are removed outright. The peer is asked to drop its half as part of the call, and a peer that cannot be reached does not fail the delete: the removal is retried in the background until the mirror is gone.",
+    description = r#"Deletes one end of a sync relationship from the node that holds it.
+
+**Authentication**: realm bearer token; a token confined to a path subset is refused. Only the
+creator may delete a relationship, and WRITE is checked on whichever bucket this node holds for it:
+the source bucket for a source-side relationship, the target bucket for a mirror.
+
+**Behavior**
+- Either end may be deleted from the node that holds it.
+- Objects already synchronized are never removed, on either side; only the relationship goes away,
+  and continuous replication simply stops.
+- Deleting a source-side `reference` relationship leaves a detached serving stub behind so that data
+  the target still holds as references stays readable; the stub is invisible to this API, so reading
+  or deleting the same id afterwards is not found. Other modes are removed outright.
+- The peer is asked to drop its half as part of the call, and a peer that cannot be reached does not
+  fail the delete: the removal is retried in the background until the mirror is gone."#,
     params(("id" = String, Path, description = "Relationship id as a 26-character ULID, from either end of the relationship")),
     responses(
         (status = 204, description = "The relationship is removed on this node and the peer's mirror is being dropped; the response has no body and synchronized objects are retained on both sides"),
