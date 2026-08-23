@@ -1854,7 +1854,7 @@ mod tests {
         assert_no_graph_mutation_or_sync(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::WriteError,
+            error: aruna_core::errors::StorageError::WriteError("boom".to_string()),
         }));
 
         assert_no_graph_mutation_or_sync(effects.as_slice());
@@ -1862,7 +1862,7 @@ mod tests {
         assert_eq!(
             operation.finalize(),
             Err(UpdateMetadataDocumentError::StorageError(
-                aruna_core::errors::StorageError::WriteError
+                aruna_core::errors::StorageError::WriteError("boom".to_string())
             ))
         );
     }

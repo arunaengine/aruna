@@ -148,12 +148,12 @@ pub enum StorageError {
     /// Distinct from a conflict: re-running the same effect only spins.
     #[error("Transaction cleanup capacity exhausted")]
     CleanupCapacity,
-    #[error("Keyspace error")]
-    KeyspaceError,
-    #[error("Read error")]
-    ReadError,
-    #[error("Write error")]
-    WriteError,
+    #[error("Keyspace error: {0}")]
+    KeyspaceError(String),
+    #[error("Read error: {0}")]
+    ReadError(String),
+    #[error("Write error: {0}")]
+    WriteError(String),
     #[error("Delete error")]
     DeleteError,
     #[error("Persist error: {0}")]

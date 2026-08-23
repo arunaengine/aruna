@@ -2029,7 +2029,7 @@ mod test {
         let mut tracker = TransactionTracker::default();
         let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
         let failed = Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         });
         tracker.observe(Some(TransactionEffect::Start), &started);
         tracker.observe(Some(TransactionEffect::Abort(id)), &failed);

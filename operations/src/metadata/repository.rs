@@ -437,7 +437,7 @@ pub fn parse_registry_read(
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError,
+            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
         )),
     }
 }
@@ -454,7 +454,7 @@ pub fn parse_materialization_status_read(
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError,
+            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
         )),
     }
 }
@@ -471,7 +471,7 @@ pub fn parse_graph_lifecycle_read(
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError,
+            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
         )),
     }
 }
@@ -495,7 +495,7 @@ pub fn parse_registry_iter(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::ReadError,
+            aruna_core::errors::StorageError::ReadError("unexpected event".to_string()),
         )),
     }
 }
@@ -530,7 +530,7 @@ pub async fn delete_index_keys(
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(count),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::WriteError,
+            aruna_core::errors::StorageError::WriteError("unexpected event".to_string()),
         )),
     }
 }

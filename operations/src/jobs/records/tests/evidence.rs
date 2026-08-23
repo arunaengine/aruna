@@ -432,7 +432,7 @@ fn refuses_partial_scan() {
     ));
 
     effects.extend(operation.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::ReadError,
+        error: StorageError::ReadError("boom".to_string()),
     })));
     assert!(operation.is_complete());
     assert!(
@@ -442,6 +442,8 @@ fn refuses_partial_scan() {
     );
     assert_eq!(
         operation.finalize(),
-        Err(RecordStoreError::Storage(StorageError::ReadError))
+        Err(RecordStoreError::Storage(StorageError::ReadError(
+            "boom".to_string()
+        )))
     );
 }

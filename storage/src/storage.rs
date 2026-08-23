@@ -191,7 +191,7 @@ impl Store {
                     .or_insert_with(|| ks.clone())
                     .clone())
             }
-            Err(_) => Err(StorageError::KeyspaceError),
+            Err(error) => Err(StorageError::KeyspaceError(error.to_string())),
         }
     }
 }
@@ -1922,7 +1922,7 @@ impl FjallStorage {
             .db
             .write_tx()
             .map(|tx| tx.durability(Some(self.persist_policy.as_fjall())))
-            .map_err(|_| StorageError::WriteError)
+            .map_err(|error| StorageError::WriteError(error.to_string()))
     }
 
     fn commit_buffered_write_tx(&self, tx: fjall::OptimisticWriteTx) -> Result<(), StorageError> {
@@ -1936,9 +1936,9 @@ impl FjallStorage {
                 Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
                 Err(StorageError::TransactionConflict)
             }
-            Err(_) => {
+            Err(error) => {
                 Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
-                Err(StorageError::WriteError)
+                Err(StorageError::WriteError(error.to_string()))
             }
         }
     }
@@ -2052,8 +2052,8 @@ impl FjallStorage {
                         key,
                         value: value_opt.map(|v| v.into()),
                     },
-                    Err(_e) => StorageEvent::Error {
-                        error: StorageError::ReadError,
+                    Err(error) => StorageEvent::Error {
+                        error: StorageError::ReadError(error.to_string()),
                     },
                 },
                 Some(Txn::Write(txn)) => match txn.get(keyspace, &key) {
@@ -2061,8 +2061,8 @@ impl FjallStorage {
                         key,
                         value: value_opt.map(|v| v.into()),
                     },
-                    Err(_e) => StorageEvent::Error {
-                        error: StorageError::ReadError,
+                    Err(error) => StorageEvent::Error {
+                        error: StorageError::ReadError(error.to_string()),
                     },
                 },
                 None => StorageEvent::Error {
@@ -2422,8 +2422,8 @@ fn store_read(store: &Store, keyspace: OptimisticTxKeyspace, key: ByteView) -> S
             key,
             value: value_opt.map(|v| v.into()),
         },
-        Err(_e) => StorageEvent::Error {
-            error: StorageError::ReadError,
+        Err(error) => StorageEvent::Error {
+            error: StorageError::ReadError(error.to_string()),
         },
     }
 }
@@ -2441,9 +2441,9 @@ fn batch_read_with<R: Readable>(
         };
         match reader.get(&keyspace, &key) {
             Ok(value_opt) => values.push((key, value_opt.map(Into::into))),
-            Err(_e) => {
+            Err(error) => {
                 return StorageEvent::Error {
-                    error: StorageError::ReadError,
+                    error: StorageError::ReadError(error.to_string()),
                 };
             }
         }
@@ -2483,8 +2483,8 @@ fn read_last_with<R: Readable>(
             values: vec![(ByteView::from(key.as_ref()), ByteView::from(value.as_ref()))],
             next_start_after: None,
         },
-        Err(_) => StorageEvent::Error {
-            error: StorageError::ReadError,
+        Err(error) => StorageEvent::Error {
+            error: StorageError::ReadError(error.to_string()),
         },
     }
 }
@@ -3162,7 +3162,9 @@ fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageEr
     let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
 
     while let Some(guard) = iter.next() {
-        let (key, value) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
+        let (key, value) = guard
+            .into_inner()
+            .map_err(|error| StorageError::ReadError(error.to_string()))?;
         values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
 
         if values.len() == limit {

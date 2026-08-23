@@ -214,7 +214,7 @@ async fn read_value(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(StorageError::ReadError.into()),
+        _ => Err(StorageError::ReadError("unexpected event".to_string()).into()),
     }
 }
 

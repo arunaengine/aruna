@@ -100,7 +100,7 @@ pub async fn materialize_reference(
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(StorageError::WriteError.into()),
+        _ => return Err(StorageError::WriteError("unexpected event".to_string()).into()),
     };
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
@@ -162,7 +162,11 @@ pub async fn materialize_reference(
                 Event::Storage(StorageEvent::Error { error }) => {
                     return Err(MaterializeReferenceError::Storage(error));
                 }
-                _ => return Err(MaterializeReferenceError::Storage(StorageError::WriteError)),
+                _ => {
+                    return Err(MaterializeReferenceError::Storage(
+                        StorageError::WriteError("unexpected event".to_string()),
+                    ));
+                }
             }
         }
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
@@ -223,7 +227,9 @@ pub async fn materialize_reference(
             Event::Storage(StorageEvent::Error { error }) => {
                 Err(MaterializeReferenceError::Storage(error))
             }
-            _ => Err(MaterializeReferenceError::Storage(StorageError::WriteError)),
+            _ => Err(MaterializeReferenceError::Storage(
+                StorageError::WriteError("unexpected event".to_string()),
+            )),
         }
     }
     .await;
@@ -283,7 +289,7 @@ async fn apply_storage_effect(
     match send_storage_effect(context, effect).await? {
         Event::Storage(StorageEvent::WriteResult { .. })
         | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        _ => Err(StorageError::WriteError.into()),
+        _ => Err(StorageError::WriteError("unexpected event".to_string()).into()),
     }
 }
 
@@ -374,7 +380,7 @@ async fn read_current_pointer(
             .transpose()
             .map_err(Into::into),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(StorageError::ReadError.into()),
+        _ => Err(StorageError::ReadError("unexpected event".to_string()).into()),
     }
 }
 
@@ -400,7 +406,7 @@ async fn read_blob_version(
             .transpose()
             .map_err(Into::into),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(StorageError::ReadError.into()),
+        _ => Err(StorageError::ReadError("unexpected event".to_string()).into()),
     }
 }
 
@@ -424,7 +430,7 @@ async fn guard_resolved_connector_unchanged(
             .map(|value| SourceConnector::from_bytes(value.as_ref()))
             .transpose()?,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(StorageError::ReadError.into()),
+        _ => return Err(StorageError::ReadError("unexpected event".to_string()).into()),
     };
 
     if current_connector.as_ref() != Some(resolved_connector) {
@@ -445,7 +451,7 @@ async fn guard_resolved_connector_unchanged(
             .map(|value| SourceConnectorSecret::from_bytes(value.as_ref()))
             .transpose()?,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(StorageError::ReadError.into()),
+        _ => return Err(StorageError::ReadError("unexpected event".to_string()).into()),
     };
 
     let current_secret_fingerprint = current_secret.as_ref().map(secret_fingerprint);
@@ -477,7 +483,7 @@ async fn guard_expected_bucket(
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()?,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(StorageError::ReadError.into()),
+        _ => return Err(StorageError::ReadError("unexpected event".to_string()).into()),
     };
     if expected.group_id != group_id
         || current.as_ref().map(BucketInfo::identity) != Some(expected.identity())

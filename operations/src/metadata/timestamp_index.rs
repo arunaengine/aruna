@@ -222,7 +222,9 @@ fn parse_iter(event: Event) -> Result<IndexBatch, StorageReadError> {
             next_start_after,
         }) => Ok((values, next_start_after)),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 

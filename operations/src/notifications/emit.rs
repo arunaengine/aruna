@@ -300,7 +300,7 @@ mod tests {
         ));
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
@@ -321,7 +321,7 @@ mod tests {
         ));
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         match effects.as_slice() {
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })] => {
@@ -353,7 +353,7 @@ mod tests {
         ));
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError,
+            error: StorageError::WriteError("boom".to_string()),
         }));
         match effects.as_slice() {
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })] => {

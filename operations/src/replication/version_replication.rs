@@ -3843,7 +3843,7 @@ mod tests {
         }));
 
         op.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::ReadError,
+            error: aruna_core::errors::StorageError::ReadError("boom".to_string()),
         }));
 
         assert!(matches!(

@@ -72,7 +72,9 @@ pub fn parse_mapping_read(event: Event) -> Result<Option<PersistentIdMapping>, P
             })
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
-        _ => Err(PersistentIdError::Storage(StorageError::ReadError)),
+        _ => Err(PersistentIdError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
@@ -223,9 +225,11 @@ pub async fn admin_withdraw_persistent_id(
             Ok(Some(mapping)) => mapping,
             Ok(None) => {
                 abort_transaction(ctx, txn_id).await;
-                let existing = read_mapping(ctx, document_id)
-                    .await?
-                    .ok_or(PersistentIdError::Storage(StorageError::ReadError))?;
+                let existing = read_mapping(ctx, document_id).await?.ok_or_else(|| {
+                    PersistentIdError::Storage(StorageError::ReadError(
+                        "persistent id mapping missing".to_string(),
+                    ))
+                })?;
                 return Ok((existing, false));
             }
             Err(error) => {

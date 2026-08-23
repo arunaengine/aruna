@@ -1369,8 +1369,8 @@ fn storage_retryable(error: &StorageError) -> bool {
     matches!(
         error,
         StorageError::TransactionConflict
-            | StorageError::ReadError
-            | StorageError::WriteError
+            | StorageError::ReadError(_)
+            | StorageError::WriteError(_)
             | StorageError::DeleteError
             | StorageError::PersistError(_)
             | StorageError::ChannelClosed
@@ -1663,6 +1663,27 @@ mod tests {
                 map(GetObjectError::ReferenceAdvanceExhausted).kind,
                 JobErrorKind::Permanent
             );
+        }
+    }
+
+    // Transient fjall faults now carry their source; classification must key on
+    // the variant, not on the payload.
+    #[test]
+    fn classifies_storage_retries() {
+        for error in [
+            StorageError::ReadError("io".to_string()),
+            StorageError::WriteError("io".to_string()),
+            StorageError::DeleteError,
+            StorageError::TransactionConflict,
+        ] {
+            assert!(storage_retryable(&error));
+        }
+
+        for error in [
+            StorageError::KeyspaceError("missing".to_string()),
+            StorageError::KeyNotFound,
+        ] {
+            assert!(!storage_retryable(&error));
         }
     }
 

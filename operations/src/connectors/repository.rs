@@ -147,7 +147,9 @@ pub fn parse_connector_iter(
             Ok((records, next_start_after))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
@@ -168,7 +170,9 @@ pub fn parse_blob_version_iter(
             Ok((records, next_start_after))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
@@ -188,7 +192,9 @@ pub(crate) fn parse_storage_read<T>(
             .map(|bytes| parse(bytes.as_ref()).map_err(StorageReadError::Conversion))
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError(
+            "unexpected event".to_string(),
+        ))),
     }
 }
 
